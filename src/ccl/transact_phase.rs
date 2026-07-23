@@ -285,10 +285,16 @@ fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
     e.walk_children_mut(|c| subst_var_with(c, name, replacement));
 }
 
-/// Match `final_or_default((⟨hist⟩, _))` over a **live** history — a bare
+/// Match `final_or_default((⟨hist⟩, _))` over a **commit-log** history — a bare
 /// reference to a `Txn`-domained letrec history binding — returning the read
 /// and the register-record field its history will occupy. `None` for a
-/// non-matching bound expression or a batch (enumerable-domain) register.
+/// non-matching bound expression or a non-`Txn` (induction-accumulator) register.
+///
+/// The domain test is the exact `Type::Txn` commit-sequencing domain, not a
+/// derived finiteness classification: a transactional register's history is
+/// `Fun(Txn, V)` by construction, and only such a read folds to an as-of join.
+/// (An induction accumulator's history — over any iteration extent — is left for
+/// `mut_elim`'s `ExtractLast` path.)
 fn live_register_read(bound_expr: &Expr) -> Option<(&Expr, String)> {
     let TypedExprNode::Apply {
         function: lod_fn,
@@ -309,11 +315,7 @@ fn live_register_read(bound_expr: &Expr) -> Option<(&Expr, String)> {
     let [reg_read, _init] = elts.as_slice() else {
         return None;
     };
-    if reg_read
-        .ty
-        .domain()
-        .is_none_or(|d| d.has_enumerable_extent())
-    {
+    if !matches!(reg_read.ty.domain(), Some(Type::Txn)) {
         return None;
     }
     let TypedExprNode::Var(hist) = &reg_read.node else {
@@ -394,111 +396,6 @@ fn project_reads(e: &mut Expr, used: &[&LiveRead], snap: &Name, snap_ty: &Type) 
         return;
     }
     e.walk_children_mut(|c| project_reads(c, used, snap, snap_ty));
-}
-
-/// After [`rewrite_live_reads`], reject a live-register read it could not resolve —
-/// a `let x = final_or_default((reg_k, _)) in body` where `reg_k` is a live
-/// commit log (`Txn`) and `x` is still *used* in `body`, sitting beside a live
-/// trigger. Such a read compiles to an `ExtractLast` over a never-terminating
-/// stream and would hang the endpoint with no diagnostic — the worst failure a
-/// database substrate can have.
-///
-/// `rewrite_live_reads` resolves a single-register reply, a multi-register
-/// snapshot reply, and a reply that combines the **request element with a register
-/// read** (`resp << balance + req`, via a `zip(trigger, as_of)` read) into as-of
-/// reads, *consuming* their `let`s — so none of those survive. This check is the
-/// backstop for any *other* fed-out-read shape the rewrite does not recognize.
-/// It is **not** a semantic classification (every recognized read is `AsOf`
-/// regardless of trigger finiteness — see [`as_live_read`]); it is a pure
-/// **hang-guard**. An *unrecognized* surviving `final_or_default` read falls
-/// through to an `ExtractLast` over the key's commit-value stream; beside a
-/// never-terminating `DataSource` trigger that stream never goes terminal, so the
-/// endpoint hangs with no diagnostic — the worst failure a database substrate can
-/// have. Beside a finite trigger the same fall-through terminates (harmless), so
-/// only the live-trigger case is rejected. A *dead* binding (its `x` unused — the
-/// harmless residue the phase can leave) is never pulled, so it is not flagged.
-pub fn check_live_reads_resolved(expr: &Expr) -> Result<(), String> {
-    if let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = &expr.node
-        && is_live_final_or_default(bound_expr)
-        && is_free_in_value(&binding.name, body)
-        && contains_live_trigger(body)
-    {
-        return Err(
-            "unsupported live cross-endpoint read: a reply reads a transactional register as of \
-             each request, but its shape was not resolved into an as-of read. Supported shapes: \
-             one register (`resp << balance`, or computed `resp << balance + 1`), several at one \
-             snapshot (`resp << a + b`), and the request combined with a register \
-             (`resp << balance + req`). Restructure the reply to one of these."
-                .to_string(),
-        );
-    }
-    let mut result = Ok(());
-    expr.walk_children(|c| {
-        if result.is_ok() {
-            result = check_live_reads_resolved(c);
-        }
-    });
-    result
-}
-
-/// Whether `expr` contains a broadcast (`trigger ≫ …`) or an `as_of` over a
-/// **live** trigger — one whose domain is a `DataSource` (a non-terminating
-/// request stream). This is the liveness signal `has_enumerable_extent` can't
-/// give (a `DataSource` is enumerable-from-the-type yet an http stream never
-/// terminates at runtime): an unresolved fed-out read left *beside* such a
-/// context would fall through to an `ExtractLast` over a never-terminating stream
-/// and hang, whereas beside a finite/batch trigger (a `[unit]` singleton or a
-/// bounded loop) the same fall-through terminates. This is the only place a
-/// `DataSource`/finiteness distinction survives, and it is operational
-/// (hang-avoidance), not semantic — the read's *meaning* is `AsOf` either way.
-fn contains_live_trigger(expr: &Expr) -> bool {
-    let live_domain = |t: &Expr| matches!(t.ty.domain(), Some(Type::DataSource(_)));
-    let here = match &expr.node {
-        // `trigger ≫ …` — the trigger is the first compose element.
-        TypedExprNode::Compose(elts) => elts.first().is_some_and(live_domain),
-        // `as_of((trigger, _))` — the trigger is the first tuple element.
-        TypedExprNode::Apply { function, argument }
-            if matches!(&function.node, TypedExprNode::Builtin(Builtin::AsOf)) =>
-        {
-            matches!(&argument.node, TypedExprNode::Tuple(elts)
-                if elts.first().is_some_and(live_domain))
-        }
-        _ => false,
-    };
-    if here {
-        return true;
-    }
-    let mut found = false;
-    expr.walk_children(|c| found |= contains_live_trigger(c));
-    found
-}
-
-/// Whether `e` is `final_or_default((reg_k, _))` over a **live** register (a
-/// non-enumerable `Txn` domain) — the read shape that never resolves terminally.
-fn is_live_final_or_default(e: &Expr) -> bool {
-    let TypedExprNode::Apply { function, argument } = &e.node else {
-        return false;
-    };
-    if !matches!(
-        &function.node,
-        TypedExprNode::Builtin(Builtin::FinalOrDefault)
-    ) {
-        return false;
-    }
-    let TypedExprNode::Tuple(elts) = &argument.node else {
-        return false;
-    };
-    let [reg_k, _init] = elts.as_slice() else {
-        return false;
-    };
-    reg_k
-        .ty
-        .domain()
-        .is_some_and(|d| !d.has_enumerable_extent())
 }
 
 /// Collect the α-unique [`Name`]s of every transactional register — a `Let`

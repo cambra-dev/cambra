@@ -769,10 +769,9 @@ fn bare_txn_read_outside_tx_rejected() {
 
 /// A *computed* live cross-endpoint read (`resp << last + 1`) compiles: the
 /// pre-lambda-elim live-read rewrite turns it into `as_of(…) ≫ (λ x → x + 1)`,
-/// whose reply lambda the elim pass point-frees. (When the rewrite ran *after*
-/// lambda-elim it faced a point-free `const` it could not lift, so a computed
-/// live read was rejected outright — the old `check_live_reads_resolved`
-/// band-aid.)
+/// whose reply lambda the elim pass point-frees. Running the rewrite before
+/// lambda-elim is what keeps the reply a liftable lambda rather than a
+/// point-free `const`.
 #[test]
 fn computed_live_cross_endpoint_read_compiles() {
     let code = indoc! {r#"
