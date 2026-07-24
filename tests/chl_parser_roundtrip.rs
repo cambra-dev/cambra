@@ -206,9 +206,9 @@ fn if_elif_else_module() {
 
 #[test]
 fn lambda_in_expression_context() {
-    let e = must_parse_expr("lambda x: x + 1");
+    let e = must_parse_expr("\\x -> x + 1");
     assert!(matches!(e.node, Expr::Lambda { .. }));
-    let e = must_parse_expr("lambda x, y: x + y");
+    let e = must_parse_expr("\\x, y -> x + y");
     if let Expr::Lambda { params, .. } = e.node {
         assert_eq!(params.len(), 2);
     } else {

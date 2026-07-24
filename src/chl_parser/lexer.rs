@@ -73,8 +73,6 @@ pub enum Token {
     In,
     #[token("def", priority = 3)]
     Def,
-    #[token("lambda", priority = 3)]
-    Lambda,
     #[token("return", priority = 3)]
     Return,
     #[token("yield", priority = 3)]
@@ -103,6 +101,10 @@ pub enum Token {
     PlusEq,
     #[token("-=")]
     MinusEq,
+    /// Lambda body arrow `->` (also the planned pair / map-entry arrow, §2.4).
+    /// Two chars, so maximal munch takes it over `-` then `>`.
+    #[token("->")]
+    Arrow,
     #[token("*=")]
     StarEq,
     #[token("//=")]
@@ -156,6 +158,9 @@ pub enum Token {
     Dot,
     #[token(";")]
     Semi,
+    /// Lambda binder introducer `\` (`\x -> body`).
+    #[token("\\")]
+    Backslash,
 
     // -- Literals ---------------------------------------------------------
     /// Decimal integer literal. `_` digit separators are not supported.
@@ -205,7 +210,6 @@ impl fmt::Display for Token {
             Token::For => "for",
             Token::In => "in",
             Token::Def => "def",
-            Token::Lambda => "lambda",
             Token::Return => "return",
             Token::Yield => "yield",
             Token::Pass => "pass",
@@ -220,6 +224,7 @@ impl fmt::Display for Token {
             Token::PlusPlus => "++",
             Token::PlusEq => "+=",
             Token::MinusEq => "-=",
+            Token::Arrow => "->",
             Token::StarEq => "*=",
             Token::DoubleSlashEq => "//=",
             Token::DoubleSlash => "//",
@@ -244,6 +249,7 @@ impl fmt::Display for Token {
             Token::ColonEq => ":=",
             Token::Dot => ".",
             Token::Semi => ";",
+            Token::Backslash => "\\",
             // Value-carrying tokens — chumsky's `select!` matches the
             // variant, not a specific value, so these typically appear
             // only in "found …" positions. Descriptive names keep
@@ -432,7 +438,7 @@ mod tests {
 
     #[test]
     fn keywords_beat_idents() {
-        let toks = tokens("if elif else for in def lambda not and or True False None");
+        let toks = tokens("if elif else for in def not and or True False None");
         assert_eq!(
             toks,
             vec![
@@ -442,7 +448,6 @@ mod tests {
                 Token::For,
                 Token::In,
                 Token::Def,
-                Token::Lambda,
                 Token::Not,
                 Token::And,
                 Token::Or,
@@ -451,6 +456,27 @@ mod tests {
                 Token::None,
                 Token::Newline,
             ]
+        );
+    }
+
+    #[test]
+    fn lambda_tokens() {
+        // `\` introduces a lambda binder; `->` separates it from the body.
+        // `->` wins over `-` then `>` by maximal munch.
+        assert_eq!(
+            tokens("\\x -> x"),
+            vec![
+                Token::Backslash,
+                Token::Ident("x".into()),
+                Token::Arrow,
+                Token::Ident("x".into()),
+                Token::Newline,
+            ]
+        );
+        // `lambda` is no longer a keyword — it lexes as an ordinary identifier.
+        assert_eq!(
+            tokens("lambda"),
+            vec![Token::Ident("lambda".into()), Token::Newline]
         );
     }
 

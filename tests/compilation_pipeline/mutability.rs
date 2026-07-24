@@ -480,7 +480,7 @@ fn rule3_unannotated_mut_alias_is_rejected() {
 /// escape where its writer set is no longer statically known.
 #[test]
 fn rule2_function_returning_mut_is_rejected() {
-    expect_mut_discipline_error("x := 0\nf = lambda z: x\nf", "inside a composite type");
+    expect_mut_discipline_error("x := 0\nf = \\z -> x\nf", "inside a composite type");
 }
 
 /// Rule 1: a `Mut` value must be a bare variable reference, so a conditional

@@ -130,7 +130,7 @@ True   False  None
 and    or     not
 if     elif   else
 for    in
-def    lambda return yield
+def    return yield
 with
 pass
 ```
@@ -138,8 +138,10 @@ pass
 `with` is a keyword: it introduces a transaction block, `with begin():`
 (§8.2). It does **not** carry Python's general context-manager meaning.
 
+A lambda is written `\x -> body` (§3.10); `\` and `->` are punctuation
+(§1.8), not keywords, so `lambda` is an ordinary identifier — it, along with
 `while`, `class`, `import`, `try`, `except`, `as`, `global`, `nonlocal`,
-`del`, `assert`, `raise`, `is` are **not** keywords in CHL today. Some are
+`del`, `assert`, `raise`, `is`, are **not** keywords in CHL today. Some are
 reserved for future use.
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
@@ -167,13 +169,13 @@ surface level.
 ### 1.8 Operators and punctuation
 
 ```
-+  -  *  //  ++
++  -  *  //  ++  ->
 &  |  ^
 == != <  <= >  >=
 =  += -= *= //=
 :=
 <<  <<=
-(  )  [  ]  {  }  ,  :  .  ;
+(  )  [  ]  {  }  ,  :  .  ;  \
 ```
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
@@ -189,13 +191,13 @@ parsing-then-erroring.
 `++` is not a Python token at all: it is CHL's collection-union operator
 (§3.3). There is no increment operator — `++` is always binary.
 
-> **Direction.** Tokens not lexed today **[Decided]**: `\` and `->` for
-> lambdas (§3.10), and `->` doubling as the pair / map-entry arrow (§2.4).
-> CHL surface syntax is **ASCII-only**: earlier sketches used `λ`/`→`/`↦`,
-> and those are dropped — non-ASCII source is a usability hazard, and dual
-> spellings fork a corpus into two dialects. (The CCL *symbolic rendering*
-> in design docs keeps its mathematical notation; that is documentation,
-> not source.)
+`\` introduces a lambda binder and `->` separates it from the body —
+`\x -> body` (§3.10).
+
+> **Direction.** `->` additionally becomes the pair / map-entry arrow
+> (`a -> b` for a two-tuple, `[k -> v, …]` for a map literal — §2.4,
+> **[Decided]**); the token is lexed today but that *use* is not yet
+> parsed.
 
 ### 1.9 Semicolons
 
@@ -308,7 +310,7 @@ noted:
 
 | Level | Operator(s) | Notes |
 |---:|---|---|
-| 1 | `lambda`, `yield` | prefix forms; non-associative |
+| 1 | `\x -> …` (lambda), `yield` | prefix forms; non-associative |
 | 2 | `<<` | feed operator (right-associative is not meaningful — see §3.7) |
 | 3 | `e₁ if cond else e₂` | ternary; *right*-associative |
 | 4 | `or` | short-circuit; n-ary flattening |
@@ -770,34 +772,29 @@ value type — so subscript and attribute access are uniformly
 ### 3.10 Lambda
 
 ```
-lambda x: body
-lambda x, y, z: body
-lambda x: T, y: U: body          -- typed parameters [Planned]
-lambda: body                     -- zero-arity
+\x -> body
+\x, y, z -> body
+\x: T -> body                    -- typed parameters [Planned]
+\ -> body                        -- zero-arity
 ```
 
-A lambda denotes an anonymous function value. Applying the lambda to
-a tuple of argument values gives the value of `body` in an environment
-where each parameter is bound to its corresponding argument
-positionally.
+`\` introduces the binders and `->` separates them from the body — e.g.
+`groupby(sales, \r -> r.region)`. A lambda denotes an anonymous function
+value; applying it to a tuple of argument values gives the value of `body`
+in an environment where each parameter is bound to its corresponding
+argument positionally.
 
 Like `def`-defined functions (§4.1), lambdas are uncurried: an n-arg
 lambda consumes all n arguments at once and is invoked through an
 n-arg call.
 
-Annotated lambda parameters mirror `def` parameters (§4.1). Refinement
-annotations are not yet writable in the surface syntax; some built-ins
-(e.g. `groupby`, §7.2) produce refined lambdas internally.
-
-> **Direction — `\x -> body` [Decided].** Python's `lambda x: body`
-> is retired in favour of `\x -> body`
-> (2026-06-29 §1, ASCII
-> revision 2026-07): `\` binds the parameter, `->` separates the body
-> — e.g. `groupby(sales, \r -> r.region)` — and `:` in a lambda head
-> is freed for its annotation role (`\x: T -> body`). An earlier
-> sketch made Unicode `λ x → body` primary; CHL is ASCII-only (§1.8).
-> `\x -> x -> 1` (a lambda returning a pair, §2.4) is unusual but
-> unambiguous — the first `->` closes the binder, the rest is body.
+Parameters are bare identifiers today. Because `->` (not `:`) terminates
+the binder list, `:` is free for a per-parameter annotation `\x: T -> body`
+(**[Planned]** — not yet parsed); refinement annotations are likewise not
+writable, though some built-ins (e.g. `groupby`, §7.2) produce refined
+lambdas internally. `\x -> x -> 1` (a lambda returning a pair, §2.4) is
+unusual but unambiguous — the first `->` closes the binder, the rest is
+body.
 
 ### 3.11 List, tuple, record literals
 
@@ -2055,7 +2052,7 @@ with parser-level support that lowering rejects:
   application (`Mut(V, Txn)`, `List(T)`) and capitalized primitive names
   (`Int`, `Bool`, `String`), with record types `{name: T, …}` and tuple types
   `{T, U}` writable in annotation position (§6.1). The remaining **Direction**
-  notes are unimplemented: `\`-lambdas (§3.10), `rec` bindings (§4.3),
+  notes are unimplemented: `rec` bindings (§4.3),
   membership `in` (§3.4), the `->` pair/map-entry syntax (§2.4), the `Feed(_)`
   forward-declaration surface (§3.7, §6.2), and
   transactions-as-contextual-parameters (§8.7). The north-star programs

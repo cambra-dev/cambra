@@ -606,7 +606,7 @@ x";
 
 #[test_log::test]
 fn test_incremental_aggregates() {
-    let code = "[sum(x) for x in groupby(source1(), lambda x: x // 10)]";
+    let code = "[sum(x) for x in groupby(source1(), \\x -> x // 10)]";
     let mut ctx = GlobalContext::default();
 
     let test_source = Rc::new(RefCell::new(TestDataSource::new(

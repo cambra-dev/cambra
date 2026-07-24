@@ -38,18 +38,18 @@ fn test_no_fan_outs(#[case] code: &str) {
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("inc = lambda x: x + 1\ninc(4)", Value::Int(5))]
-#[case("double = lambda x: x * 2\ndouble(7)", Value::Int(14))]
-#[case("neg = lambda x: -x\nneg(3)", Value::Int(-3))]
-#[case("identity = lambda x: x\nidentity(42)", Value::Int(42))]
+#[case("inc = \\x -> x + 1\ninc(4)", Value::Int(5))]
+#[case("double = \\x -> x * 2\ndouble(7)", Value::Int(14))]
+#[case("neg = \\x -> -x\nneg(3)", Value::Int(-3))]
+#[case("identity = \\x -> x\nidentity(42)", Value::Int(42))]
 fn test_scalar_udf(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("is_pos = lambda x: x > 0\nis_pos(5)", Value::Bool(true))]
-#[case("is_pos = lambda x: x > 0\nis_pos(-1)", Value::Bool(false))]
+#[case("is_pos = \\x -> x > 0\nis_pos(5)", Value::Bool(true))]
+#[case("is_pos = \\x -> x > 0\nis_pos(-1)", Value::Bool(false))]
 fn test_udf_bool_codomain(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -57,7 +57,7 @@ fn test_udf_bool_codomain(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // UDF called twice: body is duplicated at each call site (acceptable trade-off).
-#[case("f = lambda x: x + 1\nf(3) + f(4)", Value::Int(9))]
+#[case("f = \\x -> x + 1\nf(3) + f(4)", Value::Int(9))]
 fn test_udf_called_multiple_times(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -65,7 +65,7 @@ fn test_udf_called_multiple_times(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Nested call: f(f(3)) → f(6) → 12
-#[case("f = lambda x: x * 2\nf(f(3))", Value::Int(12))]
+#[case("f = \\x -> x * 2\nf(f(3))", Value::Int(12))]
 fn test_udf_nested_calls(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -92,14 +92,14 @@ fn test_collection_let_unaffected(#[case] code: &str, #[case] expected: Tile) {
 // The n-arm zip arm in operator_conversion dispatches between `ScalarFanIn`
 // (scalar upstream) and `FanIn` (function upstream), so bodies with nested
 // BinOps also compile cleanly under scalar call sites. Explicit currying
-// (`lambda x: lambda y: ...` or explicit `curry(f)`) is still tracked as
+// (`\\x -> \\y -> ...` or explicit `curry(f)`) is still tracked as
 // follow-up work.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("add = lambda x, y: x + y\nadd(3, 4)", Value::Int(7))]
-#[case("combine = lambda a, b: a * b + 1\ncombine(3, 4)", Value::Int(13))]
-#[case("add3 = lambda x, y, z: x + y + z\nadd3(1, 2, 3)", Value::Int(6))]
-#[case("mix = lambda x, y, z: x * y - z\nmix(4, 5, 2)", Value::Int(18))]
+#[case("add = \\x, y -> x + y\nadd(3, 4)", Value::Int(7))]
+#[case("combine = \\a, b -> a * b + 1\ncombine(3, 4)", Value::Int(13))]
+#[case("add3 = \\x, y, z -> x + y + z\nadd3(1, 2, 3)", Value::Int(6))]
+#[case("mix = \\x, y, z -> x * y - z\nmix(4, 5, 2)", Value::Int(18))]
 fn test_multi_arg_udf(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -113,7 +113,7 @@ fn test_multi_arg_udf(#[case] code: &str, #[case] expected: Value) {
 #[test]
 fn test_multi_arg_param_in_filter_predicate() {
     let code = "data = [1, 2, 30]\n\
-                pick = lambda lo, hi: sum([x for x in data if x >= lo])\n\
+                pick = \\lo, hi -> sum([x for x in data if x >= lo])\n\
                 pick(8, 0)";
     check_scalar(code, Value::Int(30));
 }
@@ -124,12 +124,12 @@ fn test_multi_arg_param_in_filter_predicate() {
 // consumption filters the collection by that predicate at the iteration
 // boundary. These exercise the dependent type *through to runtime values*.
 #[rstest]
-#[case("g = groupby([1,1,2,2,3], lambda x: x)\nsum(g(1))", Value::Int(2))] // {1,1}
-#[case("g = groupby([1,1,2,2,3], lambda x: x)\nsum(g(2))", Value::Int(4))] // {2,2}
-#[case("g = groupby([1,1,2,2,3], lambda x: x)\nsum(g(3))", Value::Int(3))] // {3}
-#[case("g = groupby([1,2,3,4,5], lambda x: x // 2)\nsum(g(0))", Value::Int(1))] // {1}
-#[case("g = groupby([1,2,3,4,5], lambda x: x // 2)\nsum(g(1))", Value::Int(5))] // {2,3}
-#[case("g = groupby([1,2,3,4,5], lambda x: x // 2)\nsum(g(2))", Value::Int(9))] // {4,5}
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1))", Value::Int(2))] // {1,1}
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(2))", Value::Int(4))] // {2,2}
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(3))", Value::Int(3))] // {3}
+#[case("g = groupby([1,2,3,4,5], \\x -> x // 2)\nsum(g(0))", Value::Int(1))] // {1}
+#[case("g = groupby([1,2,3,4,5], \\x -> x // 2)\nsum(g(1))", Value::Int(5))] // {2,3}
+#[case("g = groupby([1,2,3,4,5], \\x -> x // 2)\nsum(g(2))", Value::Int(9))] // {4,5}
 fn test_dependent_groupby_lookup(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

@@ -418,9 +418,9 @@ mod tests {
     // Lambdas — single-arg emits `λ x → body` directly; multi-arg uncurries
     // to a tupled-parameter lambda whose body binds each name to a
     // projection, keeping the tree free of nested `Lambda` chains.
-    #[case("lambda x: x + 1", "λ x → x + 1")]
+    #[case("\\x -> x + 1", "λ x → x + 1")]
     #[case(
-        "lambda x, y: x + y",
+        "\\x, y -> x + y",
         "λ __arg_tuple_0 → __arg_tuple_0.0 + __arg_tuple_0.1"
     )]
     // Nested multi-arg lambdas: the outer lambda's substitution inserts a
@@ -429,7 +429,7 @@ mod tests {
     // so the inserted reference does not collide with the inner binder.  The
     // outer takes id 1 because the inner is lowered first and consumes id 0.
     #[case(
-        "lambda x, y: lambda a, b: x + a",
+        "\\x, y -> \\a, b -> x + a",
         "λ __arg_tuple_1 → λ __arg_tuple_0 → __arg_tuple_1.0 + __arg_tuple_0.0"
     )]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
@@ -474,12 +474,12 @@ mod tests {
     #[rstest]
     // Variable collection and inline key lambda
     #[case(
-        "groupby(xs, lambda x: x)",
+        "groupby(xs, \\x -> x)",
         "λ __gb_k → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // List literal collection with a more complex key
     #[case(
-        "groupby([1, 2, 3], lambda x: x // 2)",
+        "groupby([1, 2, 3], \\x -> x // 2)",
         "λ __gb_k → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
     )]
     // Key is a variable reference (pre-defined function)

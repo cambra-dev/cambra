@@ -81,7 +81,7 @@ public entry points:
 The grammar is precedence-climbed for binary operators. From lowest to
 highest precedence:
 
-1. `lambda` / `yield`
+1. `\x -> …` (lambda) / `yield`
 2. `<<` (feed)
 3. ternary `a if b else c`
 4. `or`
