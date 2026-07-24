@@ -197,21 +197,21 @@ fn test_list_literal() {
 // A `def`/lambda parameter's type annotation is a **checking-mode declaration**
 // that lowering must carry to the lambda so inference enforces it at the call
 // site — mirroring variable ascription (`x: T = e`). Regression for a
-// long-standing lowering gap: `uncurry_params` attached only `Mut[…]`
+// long-standing lowering gap: `uncurry_params` attached only `Mut(…)`
 // annotations and dropped every other one, so a `def` param was inferred purely
 // from its body and any argument was accepted.
 #[test]
 fn test_def_param_annotation_enforced() {
     // A scalar annotation is enforced at the call site: an identity body infers
     // nothing on its own, so without the annotation any argument was accepted.
-    assert_eq!(infer_program("def g(a: int):\n    a\ng(1)"), int());
-    assert!(!infer_program_err("def g(a: int):\n    a\ng(\"x\")").is_empty());
-    // A `List[int]` annotation enforces the element type through the annotation.
+    assert_eq!(infer_program("def g(a: Int):\n    a\ng(1)"), int());
+    assert!(!infer_program_err("def g(a: Int):\n    a\ng(\"x\")").is_empty());
+    // A `List(Int)` annotation enforces the element type through the annotation.
     assert_eq!(
-        infer_program("def g(a: List[int]):\n    sum(a)\ng([1, 2, 3])"),
+        infer_program("def g(a: List(Int)):\n    sum(a)\ng([1, 2, 3])"),
         int()
     );
-    assert!(!infer_program_err("def g(a: List[int]):\n    sum(a)\ng([\"a\", \"b\"])").is_empty());
+    assert!(!infer_program_err("def g(a: List(Int)):\n    sum(a)\ng([\"a\", \"b\"])").is_empty());
     // An unannotated param still infers purely from use.
     assert_eq!(infer_program("def g(a):\n    a\ng(\"x\")"), string());
 }
@@ -220,13 +220,13 @@ fn test_def_param_annotation_enforced() {
 fn test_multiarg_def_param_annotation_enforced() {
     // Each tupled parameter's annotation is enforced independently.
     assert_eq!(
-        infer_program("def g(a: int, b: str):\n    a\ng(1, \"x\")"),
+        infer_program("def g(a: Int, b: String):\n    a\ng(1, \"x\")"),
         int()
     );
     // Wrong type on `a` is rejected.
-    assert!(!infer_program_err("def g(a: int, b: str):\n    a\ng(\"x\", \"y\")").is_empty());
+    assert!(!infer_program_err("def g(a: Int, b: String):\n    a\ng(\"x\", \"y\")").is_empty());
     // Wrong type on `b` is rejected.
-    assert!(!infer_program_err("def g(a: int, b: str):\n    a\ng(1, 2)").is_empty());
+    assert!(!infer_program_err("def g(a: Int, b: String):\n    a\ng(1, 2)").is_empty());
     // Fully unannotated params still infer from use.
     assert_eq!(infer_program("def g(a, b):\n    a + b\ng(1, 2)"), int());
 }

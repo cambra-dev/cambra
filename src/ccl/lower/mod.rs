@@ -570,9 +570,8 @@ pub fn lower_expr(
                 "only integer subscripts are supported",
             )),
         },
-        // Record literal `{field: expr, ...}` — keys are bare identifiers.
-        // Lowered to a `Record` constructor: `{x: 1, y: "foo"}` becomes
-        // `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
+        // Record value `(name=expr, ...)`. Lowered to a `Record` constructor:
+        // `(x=1, y="foo")` becomes `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
         ChlExpr::Record(fields) => {
             let mut out = Vec::with_capacity(fields.len());
             for RecordField {
@@ -592,11 +591,6 @@ pub fn lower_expr(
             }
             Ok(Expr::new(TypedExprNode::Record(out)))
         }
-        // Dict literal with expression keys is not supported as a record.
-        ChlExpr::Dict(_) => Err(LoweringError::unsupported(
-            expr.span,
-            "dict literals (with non-identifier keys) are not yet supported",
-        )),
         // A colon-free brace group `{T, U}` is structural *type* syntax; it
         // has no term-level value. (It is accepted in annotation position as a
         // tuple type — see `lower_type_annotation`.)
@@ -604,6 +598,14 @@ pub fn lower_expr(
             expr.span,
             "`{…}` is type syntax (a tuple type `{T, U}`); \
              use `[…]` for a collection or `(…)` for a tuple value",
+        )),
+        // A brace record `{name: T}` is structural *type* syntax (a record
+        // type); a record *value* is written with parentheses. (Accepted in
+        // annotation position — see `lower_type_annotation`.)
+        ChlExpr::BraceRecord(_) => Err(LoweringError::unsupported(
+            expr.span,
+            "`{…}` is type syntax (a record type `{name: T}`); \
+             a record value is written `(name=value)`",
         )),
         // Attribute access `r.field` → `Apply(r, Proj(Field("field")))`.
         ChlExpr::Attribute { target, attr, .. } => Ok(Expr::apply(

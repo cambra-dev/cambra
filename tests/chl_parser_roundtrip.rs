@@ -95,13 +95,18 @@ fn joined_comprehension_from_survey() {
 }
 
 #[test]
-fn records_and_dicts() {
-    // Bare-ident keys → Record.
-    let r = must_parse_expr("{x: 1, y: 2}");
+fn records_and_brace_types() {
+    // A record *value* is `(name=value, …)`.
+    let r = must_parse_expr("(x=1, y=2)");
     assert!(matches!(r.node, Expr::Record(_)));
-    // String keys → Dict.
-    let d = must_parse_expr(r#"{"name": "alice", "age": 30}"#);
-    assert!(matches!(d.node, Expr::Dict(_)));
+    // Bare-ident brace keys → record *type* (`BraceRecord`).
+    let rt = must_parse_expr("{x: 1, y: 2}");
+    assert!(matches!(rt.node, Expr::BraceRecord(_)));
+    // Expression-key braces are not a valid type — a map is `[k -> v]`.
+    assert!(
+        !parse_module(r#"{"name": "alice"}"#).errors.is_empty(),
+        "expression-key braces should be a parse error"
+    );
 }
 
 #[test]

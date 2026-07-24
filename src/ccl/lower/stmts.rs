@@ -905,7 +905,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
             lower_type_application(annotation.span, head, args)
         }
         // Record type `{name: T, …}`.
-        ChlExpr::Record(fields) => {
+        ChlExpr::BraceRecord(fields) => {
             let mut out = Vec::with_capacity(fields.len());
             for field in fields {
                 out.push((
@@ -1332,6 +1332,19 @@ x";
         assert!(
             message.contains("type syntax"),
             "expected a type-syntax hint, got: {message}"
+        );
+    }
+
+    /// A brace record `{name: T}` is a record *type*; a record *value* is
+    /// `(name=value)`, so the brace form is rejected in value position.
+    #[test]
+    fn test_brace_record_as_value_rejected() {
+        let stmts = parse_module("{name: 1}");
+        let err = expect_one_lowering_error(&stmts);
+        let LoweringError::Unsupported { message, .. } = &err;
+        assert!(
+            message.contains("(name=value)"),
+            "expected a paren-record hint, got: {message}"
         );
     }
 }

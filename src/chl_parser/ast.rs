@@ -17,11 +17,11 @@
 //!   [`Stmt::If`] with one `branches` entry per `if`/`elif` and one
 //!   optional `else_body`, rather than `rustpython_ast`'s nested
 //!   `else: [If(...)]` representation.
-//! - **Records vs. dicts are syntactically distinct.** `{x: 1, y: 2}` (bare
-//!   identifier keys) parses as [`Expr::Record`]; `{"name": "alice"}`
-//!   (expression keys) parses as [`Expr::Dict`]. This matches how CHL already
-//!   interprets the two forms semantically and eliminates a re-classification
-//!   pass.
+//! - **Records are parens; braces are types.** A record *value* `(x=1, y=2)`
+//!   parses as [`Expr::Record`]. A brace literal is type syntax: `{x: T}`
+//!   (bare-identifier keys) is [`Expr::BraceRecord`] (a record type) and
+//!   `{T, U}` is [`Expr::BraceGroup`] (a tuple type). Lowering reads the brace
+//!   forms as types in annotation position and rejects them in value position.
 //! - **Feed / Define get their own variants.** `x << v` is [`Expr::Feed`] and
 //!   `x <<= v` is [`Stmt::Define`], rather than being a `BinOp(LShift)` and an
 //!   `AugAssign(LShift)` that lowering has to special-case.
@@ -342,23 +342,27 @@ pub enum Expr {
     /// `(e0)` parses as parenthesised `e0`, not as a tuple.
     Tuple(Vec<Spanned<Expr>>),
 
-    /// Record literal with bare-identifier keys: `{x: 1, y: 2}`.
+    /// Record **value** with named fields: `(x=1, y=2)`.
     ///
-    /// CHL treats this as a named-field product type, distinct from
-    /// [`Expr::Dict`] (which has expression keys).
+    /// The product constructor is the parentheses (see `docs/chl-spec.md`);
+    /// a record is a product with named fields, a tuple one with anonymous
+    /// fields, both delimited by `( … )`.
     Record(Vec<RecordField>),
 
-    /// Dict literal with expression keys: `{"name": "alice", expr: value}`.
-    Dict(Vec<(Spanned<Expr>, Spanned<Expr>)>),
-
-    /// A colon-free brace group: `{e0, e1, …}` (no `key: value` entries).
+    /// A brace record: `{x: T, y: U}` (bare-identifier keys with `:` values).
     ///
-    /// Term-level braces are reserved for structural **type** syntax
-    /// (see `docs/chl-spec.md`):
-    /// a tuple type `{T, U}`. This variant captures that spelling so a type
-    /// annotation can name a tuple type; lowering interprets it as a
+    /// Term-level braces are reserved for structural **type** syntax (see
+    /// `docs/chl-spec.md`), so this is a record *type*: lowering reads it as a
+    /// [`crate::ccl::Type::Record`] in annotation position and rejects it in
+    /// value position (a record *value* is `(x=1, y=2)`, [`Expr::Record`]).
+    BraceRecord(Vec<RecordField>),
+
+    /// A colon-free brace group: `{T, U}` (no `key: value` entries).
+    ///
+    /// Term-level braces are reserved for structural **type** syntax (see
+    /// `docs/chl-spec.md`): a tuple type `{T, U}`. Lowering interprets it as a
     /// [`crate::ccl::Type::Tuple`] in annotation position and rejects it in
-    /// value position (there is no term-level brace-group value).
+    /// value position.
     BraceGroup(Vec<Spanned<Expr>>),
 
     /// Subscript: `target[index]`.
@@ -427,7 +431,8 @@ pub enum Lit {
     None,
 }
 
-/// A field in an [`Expr::Record`]: `name: value`.
+/// A named field: `name=value` in an [`Expr::Record`] value, or `name: T` in
+/// an [`Expr::BraceRecord`] record type.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordField {
     pub name: SmolStr,
