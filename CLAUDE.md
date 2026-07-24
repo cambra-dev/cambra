@@ -11,10 +11,13 @@ cargo fmt        # Run formatter
 cargo build      # Build the project
 cargo clippy --all-targets -- -D warnings            # Lint (debug) — fast inner-loop check, NOT the full gate
 cargo clippy --release --all-targets -- -D warnings  # Lint (release) — CI runs this too; catches debug-only (cfg(debug_assertions)) breakage the debug pass misses
+./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + tests. Skips the release clippy pass, doc, shellcheck, doc-refs. ~1/3 the time of the full gate — use this while iterating.
 ./ci.sh --fix    # Authoritative gate: fmt + BOTH clippy passes + doc + tests, auto-formatting first. Must pass before pushing a PR.
 cargo test -q --no-fail-fast      # Run all tests
 cargo test <name>  # Run a specific test by name
 ```
+
+For the tight edit→check loop, prefer `./ci.sh fast` (or a bare `cargo test <name>`) over the full `./ci.sh`; run the full gate before pushing.
 
 CI lints in **both** debug and release (`ci_clippy` and `ci_clippy_release` in `ci.sh`). Passing the plain debug `cargo clippy` is **not** sufficient — a release-only failure (e.g. a `#[cfg(debug_assertions)]`-gated item referenced by ungated code) passes locally but fails GitHub CI. Run `./ci.sh` to catch both.
 
@@ -145,7 +148,7 @@ Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k
 
 ### Workflow
 
-After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. **Before creating or pushing a PR, run `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers: clippy in *both* debug and release mode plus the doc build. A green debug `cargo clippy` is not enough (see Build Commands above).
+After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. While iterating, `./ci.sh fast` (fmt + debug clippy + tests) is the quick check — roughly a third of the full gate's time. **Before creating or pushing a PR, run the full `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers and that `fast` skips: clippy in *both* debug and release mode plus the doc build. A green debug `cargo clippy` (or `./ci.sh fast`) is not enough (see Build Commands above).
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
 
