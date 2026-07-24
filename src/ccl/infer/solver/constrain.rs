@@ -390,7 +390,7 @@ fn constrain_go(
         // Implicit deref (read): a `Mut` handle meeting any non-`Mut` demand —
         // concrete OR an inference variable — reads its value. This MUST precede
         // the `Infer` arms below: `+`/`<` etc. are polymorphic (`∀α. α → α → α`),
-        // so `cnt + 1` emits `Mut[Int, D] <: ?α`; dereffing here flows `Int` onto
+        // so `cnt + 1` emits `Mut(Int, D) <: ?α`; dereffing here flows `Int` onto
         // `?α`, whereas the `(_, Infer)` arm would record the handle itself as a
         // lower bound and coalesce `?α` to a `Mut`.
         (
@@ -1543,7 +1543,7 @@ mod tests {
 
     #[test]
     fn mut_reads_transparently_as_value() {
-        // Mut[Int, D] <: Int — a read derefs to the value…
+        // Mut(Int, D) <: Int — a read derefs to the value…
         let m = mut_ty(prim(BaseType::Int), prim(BaseType::UInt));
         let mut cache = ConstrainCache::new();
         assert!(constrain_subtype(&m, &prim(BaseType::Int), &mut cache).is_ok());
@@ -1557,7 +1557,7 @@ mod tests {
 
     #[test]
     fn mut_derefs_at_a_variable_not_the_handle() {
-        // THE crux (plan decision #1): `cnt + 1` emits `Mut[Int, D] <: ?α`. The
+        // THE crux (plan decision #1): `cnt + 1` emits `Mut(Int, D) <: ?α`. The
         // deref arm fires *before* the `Infer` arm, so `?α` coalesces to `Int`,
         // NOT to a `Mut` handle — the deliberate contrast with
         // `feed_var_coalesces_to_feed`. If the deref arm were placed after the
@@ -1574,7 +1574,7 @@ mod tests {
 
     #[test]
     fn mut_meets_mut_invariantly() {
-        // Mut[?v0,?d0] <: Mut[?v1,?d1] equates values AND domains (pass-by-ref):
+        // Mut(?v0,?d0) <: Mut(?v1,?d1) equates values AND domains (pass-by-ref):
         // the callee's per-call domain resolves to the argument mutable variable's domain,
         // and the value is invariant (read + write). A value flowing into v1
         // reaches v0 through the two-way edge, so a conflicting read of v0 fails.
@@ -1601,7 +1601,7 @@ mod tests {
 
     #[test]
     fn value_meets_mut_demand_derefs() {
-        // Int <: Mut[Int, D] — a plain value meeting a `Mut` demand derefs to the
+        // Int <: Mut(Int, D) — a plain value meeting a `Mut` demand derefs to the
         // value (the discipline check, not the solver, rejects passing a
         // non-variable to a `Mut` parameter). A conflicting value still fails.
         let m = mut_ty(prim(BaseType::Int), prim(BaseType::UInt));

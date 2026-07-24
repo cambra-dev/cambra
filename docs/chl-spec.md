@@ -1340,9 +1340,10 @@ CHL types are inferred; user-written annotations refine the inferred
 type.
 
 Built-in surface types. (The names below are this spec's vocabulary
-for talking about the checker; annotations are writable today only on
-`def` parameters and `x: T = e` bindings, and the checker recognises
-only a subset of these types in annotation position.)
+for talking about the checker; annotations are writable on `def`
+parameters and `x: T = e` bindings. As everywhere in this document,
+an **unmarked** entry is accepted in annotation position today; a
+marked one carries its status per "How to read this document".)
 
 - `Int` — signed 64-bit integer.
 - `Bool` — `True` or `False`.
@@ -1350,11 +1351,16 @@ only a subset of these types in annotation position.)
 - `None` — unit type, one inhabitant.
 - `List(T)` — finite collection of `T`-values, indexed by `[0, n)`.
   The index → element mapping is part of the value (so `xs[i]` is
-  well-defined); iteration order, however, is unspecified (§3).
+  well-defined); iteration order, however, is unspecified (§3). Written
+  `List(T)` or `List(_)`.
 - `{T₀, T₁, …}` — tuple type (structural `{…}` type syntax — §6.1).
 - `{name: T, …}` — record type. Two records are the same type iff they
   have the same field names with the same field types.
-- `Dict(K, V)` — finite-map type.
+- `Mut(V)` / `Mut(V, Txn)` — mutable-variable / transactional-register
+  type (§6.2, §8).
+- `Dict(K, V)` — finite-map type. **[Planned]** — dict literals parse
+  but are rejected at lowering (§3.11), and `Dict(…)` is not accepted
+  as an annotation.
 - `{T₀, T₁, …} ⇒ U` — function type. A function takes exactly one
   argument (§3.8): an n-parameter function's domain is the
   corresponding tuple type, and a keyword-argument function's domain
@@ -1451,12 +1457,11 @@ regardless (a function taking a mutable variable, a map *of* feeds), so
 they are types rather than introducer keywords.
 
 `Mut(V)` and `Mut(V, Txn)` are **implemented** — mutation and transactions
-are specified in §8, and the two supporting rules below hold today. (The
-compiler currently spells type application with brackets — `Mut[V, Txn]` —
-and accepts lowercase primitives; see §8's spelling note.) `Feed(V)` exists
-as an internal type — what `defer()` and `http_serve` produce (§3.7) — but
-its *forward-declaration surface* `h: Feed(_)` is **[Decided]**, not yet
-accepted at lowering (§3.7, §7.3).
+are specified in §8, and the two supporting rules below hold today. `Feed(V)`
+exists as an internal type — what `defer()` and `http_serve` produce (§3.7) —
+but its *forward-declaration surface* `h: Feed(_)` is **[Decided]**, not yet
+accepted at lowering (§3.7, §7.3); `Feed` as a written type constructor is
+likewise not yet resolved in annotations.
 
 Two supporting rules (implemented):
 
@@ -1670,15 +1675,6 @@ order, and the transaction commit order `Txn` — not three mechanisms. A
 **feed** (`<<`, §3.7) is the *same* kind of object under a different
 merge law (§8.4): a mutable variable is *last-write-wins*, a feed is
 *append-only*.
-
-> **Spelling note.** Examples below use the canonical target spellings
-> — type application in **parentheses** (`Mut(Int, Txn)`, §6.1)
-> and **capitalized** type names (`Int`, `Bool`, `String`, §6.1). The
-> compiler *currently* accepts only the transitional forms instead:
-> square-bracket type application (`Mut[Int, Txn]`) and lowercase
-> primitives (`int`, `bool`, `str`). Those are known warts converging to
-> the forms shown here; the semantics are identical, and this note is the
-> one place the divergence is called out rather than repeated per example.
 
 ### 8.1 Mutation is explicit: the `:=` operator
 
@@ -2051,12 +2047,13 @@ with parser-level support that lowering rejects:
   `storefront` `/stats` rollup uses it).
 - **The target syntax at large** — the mutation and transaction
   **core is implemented** (`:=`, `with begin():`, `Mut(…, Txn)` registers,
-  feeds — §8), currently spelled with transitional bracket type
-  application and lowercase primitives (§8's spelling note). The remaining
-  **Direction** notes are unimplemented: `\`-lambdas (§3.10), `rec`
-  bindings (§4.3), membership `in` (§3.4), parenthesized type application
-  and capitalized type names (§6.1), the `->` pair/map-entry syntax (§2.4),
-  the `Feed(_)` forward-declaration surface (§3.7, §6.2), and
+  feeds — §8), now spelled in the canonical target syntax: parenthesised type
+  application (`Mut(V, Txn)`, `List(T)`) and capitalized primitive names
+  (`Int`, `Bool`, `String`), with record types `{name: T, …}` and tuple types
+  `{T, U}` writable in annotation position (§6.1). The remaining **Direction**
+  notes are unimplemented: `\`-lambdas (§3.10), `rec` bindings (§4.3),
+  membership `in` (§3.4), the `->` pair/map-entry syntax (§2.4), the `Feed(_)`
+  forward-declaration surface (§3.7, §6.2), and
   transactions-as-contextual-parameters (§8.7). The north-star programs
   pin the target; the sequencing is tracked
 

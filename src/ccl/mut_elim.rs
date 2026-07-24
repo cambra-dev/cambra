@@ -74,7 +74,7 @@ pub fn run(expr: Expr) -> Expr {
     // re-points to the extracted final value) are stale afterward. Erase them
     // so no history reaches the strict `typecheck` (mirroring how
     // `channelize` erases a feed history). On this branch every mutable variable is an
-    // induction accumulator consumed here; the transactional `Mut[V, Txn]` erasure
+    // induction accumulator consumed here; the transactional `Mut(V, Txn)` erasure
     // lands with `transact_phase`.
     erase_mut(&mut out);
     // Release-mode post-conditions (not `debug_assert!`): these are the phase's
@@ -665,7 +665,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
 /// *without* touching the continuation — the reusable core shared by the
 /// induction path ([`transform_loop`], which wraps it in a nested `LetRec`) and
 /// the transaction path ([`crate::ccl::transact_phase`], which merges the
-/// `binding` into a shared `Mut[_, Txn]` letrec so a commit decision can read an
+/// `binding` into a shared `Mut(_, Txn)` letrec so a commit decision can read an
 /// induction accumulator at its request position — the `cnt(r)` cross-domain
 /// read). The caller applies `renames` to its continuation, recurses, prepends
 /// `reads`, and hoists `feed_views`. The `hist`/type/`accs` fields let the

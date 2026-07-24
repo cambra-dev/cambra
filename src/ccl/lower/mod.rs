@@ -276,7 +276,7 @@ pub struct LoweringContext {
     /// a reference inserted by an outer substitution.
     next_synthetic_id: usize,
 
-    /// Names declared **transactional** via a `Mut[V, Txn]` annotation. A write
+    /// Names declared **transactional** via a `Mut(V, Txn)` annotation. A write
     /// to such a variable is only legal inside
     /// a `with begin():` block, and so is a *read*: a transactional register may
     /// be read only inside a `with begin():` block, which pins a
@@ -287,7 +287,7 @@ pub struct LoweringContext {
     /// Base-name keyed, and used *only* at lowering time: it decides the `with
     /// begin():` register-write shape (a `MutWrite` marker) and the out-of-block
     /// read diagnostic. Downstream register *identity* — which registers
-    /// `transact_phase` folds — is instead the `Mut[_, Txn]` type on the
+    /// `transact_phase` folds — is instead the `Mut(_, Txn)` type on the
     /// α-unique binding (see [`crate::ccl::transact_phase::collect_txn_registers`]),
     /// so this set is no longer handed to the phase.
     pub(super) transactional_vars: HashSet<String>,
@@ -379,11 +379,11 @@ impl LoweringContext {
     /// Snapshot the transactional registry on entering a nested binding scope
     /// (a function/lambda body or a nested statement block).
     ///
-    /// Within the scope a `Mut[V, Txn]` introduction adds to the set;
+    /// Within the scope a `Mut(V, Txn)` introduction adds to the set;
     /// [`restore_transactional`] reverts it on exit, giving the name-keyed set
     /// the lexical-scope discipline it otherwise lacks — mirroring how `uniquify`
     /// threads its env stack so a shadowed name reverts to its outer meaning. A
-    /// `Mut[V, Txn]` local declared inside a `def` body would otherwise leak into
+    /// `Mut(V, Txn)` local declared inside a `def` body would otherwise leak into
     /// the transactional set and falsely gate a like-spelled outer local. Needed
     /// because the set is keyed by pre-uniquify base name (a pre-inference
     /// tracker: the `with begin():` block structure it gates is erased by
@@ -403,12 +403,12 @@ impl LoweringContext {
         self.transactional_vars = snapshot;
     }
 
-    /// Declare `name` transactional (introduced by a `Mut[V, Txn]` annotation).
+    /// Declare `name` transactional (introduced by a `Mut(V, Txn)` annotation).
     pub(super) fn register_transactional(&mut self, name: impl Into<String>) {
         self.transactional_vars.insert(name.into());
     }
 
-    /// Whether `name` was declared transactional via a `Mut[V, Txn]` annotation.
+    /// Whether `name` was declared transactional via a `Mut(V, Txn)` annotation.
     pub(super) fn is_transactional_register(&self, name: &str) -> bool {
         self.transactional_vars.contains(name)
     }
@@ -596,6 +596,14 @@ pub fn lower_expr(
         ChlExpr::Dict(_) => Err(LoweringError::unsupported(
             expr.span,
             "dict literals (with non-identifier keys) are not yet supported",
+        )),
+        // A colon-free brace group `{T, U}` is structural *type* syntax; it
+        // has no term-level value. (It is accepted in annotation position as a
+        // tuple type — see `lower_type_annotation`.)
+        ChlExpr::BraceGroup(_) => Err(LoweringError::unsupported(
+            expr.span,
+            "`{…}` is type syntax (a tuple type `{T, U}`); \
+             use `[…]` for a collection or `(…)` for a tuple value",
         )),
         // Attribute access `r.field` → `Apply(r, Proj(Field("field")))`.
         ChlExpr::Attribute { target, attr, .. } => Ok(Expr::apply(

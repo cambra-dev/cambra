@@ -1,5 +1,5 @@
 //! The transactional slice of the unified phase: rewrite every `with begin():`
-//! writer of a `Mut[V, Txn]` register into a **`get_prev_txn`-guarded `LetRec`** —
+//! writer of a `Mut(V, Txn)` register into a **`get_prev_txn`-guarded `LetRec`** —
 //! histories + commit records over the [`Type::Txn`] commit domain — which
 //! [`crate::ccl::planning::plan_loops`] then destructures into the
 //! `Transact{keys, writers, domain: Txn}` carrier the commit engine consumes.
@@ -11,7 +11,7 @@
 //! transaction loop. Lowering emits each `with begin():` block — standalone or
 //! as a `for` body — as a direct-mirror `ExprStmt(For{target, iter, block}, cont)`
 //! whose block writes transactional registers (recognized by their α-unique register
-//! [`Name`] — the `Mut[_, Txn]` bindings [`collect_txn_registers`] gathers from the
+//! [`Name`] — the `Mut(_, Txn)` bindings [`collect_txn_registers`] gathers from the
 //! typed tree). This phase:
 //!
 //! 1. **strips** every such `For` site, building one [`WriterSite`] per site
@@ -50,11 +50,11 @@
 //! The in-block feed mirrors the induction phase's in-loop feeds
 //! ([`crate::ccl::mut_elim`]).
 //!
-//! **Register-ness is the `Mut[_, Txn]` type; register identity is the α-unique
-//! binder [`Name`].** The type demarcates the *class* (every `Mut[_, Txn]` binding
+//! **Register-ness is the `Mut(_, Txn)` type; register identity is the α-unique
+//! binder [`Name`].** The type demarcates the *class* (every `Mut(_, Txn)` binding
 //! is a register); the binder name picks out *which* register.
 //! [`collect_txn_registers`] walks the inlined, typed tree for `Let` bindings whose
-//! type (or [`crate::ccl::TypedBinding::user_annotation`]) is `Mut[_, Txn]` and
+//! type (or [`crate::ccl::TypedBinding::user_annotation`]) is `Mut(_, Txn)` and
 //! collects their α-unique [`Name`]s; every membership test here (footprint
 //! collection, `contains_txn_write`, `block_writes_txn`) is exact-`Name`. This
 //! is immune to shadowing — an unrelated local spelled like a register has a
@@ -400,20 +400,20 @@ fn project_reads(e: &mut Expr, used: &[&LiveRead], snap: &Name, snap_ty: &Type) 
 
 /// Collect the α-unique [`Name`]s of every transactional register — a `Let`
 /// binding whose type or [`crate::ccl::TypedBinding::user_annotation`] is
-/// `Mut[_, Txn]`. The type classifies a binding as a register; the binder `Name`
+/// `Mut(_, Txn)`. The type classifies a binding as a register; the binder `Name`
 /// *is* its identity — this is the source of truth [`run`] keys on (replacing the
 /// lowering-time base-name registry).
 ///
 /// Run on the **inlined, typed** tree: a cross-function writer
-/// (`def transfer(src: Mut[int, Txn], …)`) has already been beta-reduced to its
+/// (`def transfer(src: Mut(Int, Txn), …)`) has already been beta-reduced to its
 /// call site, so its writes name the caller's register binding (`a`/`b`), and the
-/// stores themselves are the caller's top-level `Mut[_, Txn]` `let`s — which
+/// stores themselves are the caller's top-level `Mut(_, Txn)` `let`s — which
 /// this finds. A register's value slot (`binding.ty`) coalesces to the value
-/// type `V`, with the `Mut[_, Txn]` carried on the annotation and the
+/// type `V`, with the `Mut(_, Txn)` carried on the annotation and the
 /// references; either position is checked, so detection does not depend on which
 /// one holds the wrapper.
 pub fn collect_txn_registers(expr: &Expr) -> HashSet<Name> {
-    /// Whether `ty` is (a refinement of) `Mut[_, Txn]`.
+    /// Whether `ty` is (a refinement of) `Mut(_, Txn)`.
     fn is_txn_register(ty: &Type) -> bool {
         match ty {
             Type::History { domain, .. } => is_txn_domain(domain),
@@ -446,7 +446,7 @@ pub fn collect_txn_registers(expr: &Expr) -> HashSet<Name> {
 }
 
 /// The value type `V` of a register reference. A transactional register's binding and
-/// its in-block references are `Mut[V, Txn]`-typed after inference, but the
+/// its in-block references are `Mut(V, Txn)`-typed after inference, but the
 /// histories and commit records this phase emits — and the `final_or_default`
 /// reads it rebinds — are over `V`. Peel a `Mut` wrapper (through transparent
 /// outer refinements) to its value type; leave a non-`Mut` type untouched.
@@ -518,11 +518,11 @@ struct FeedSite {
     value_ty: Type,
 }
 
-/// Rewrite every `with begin():` writer of a `Mut[_, Txn]` register into one shared
+/// Rewrite every `with begin():` writer of a `Mut(_, Txn)` register into one shared
 /// commit `Transact`. A no-op (returns the input untouched) on programs that
 /// write no transactional register.
 ///
-/// `txn_registers` is the set of α-unique register [`Name`]s — the `Mut[_, Txn]`
+/// `txn_registers` is the set of α-unique register [`Name`]s — the `Mut(_, Txn)`
 /// bindings on the inlined, typed tree (see
 /// [`collect_txn_registers`]). Keying on the exact binder identity (not the surface
 /// base name) makes the fold immune to an unrelated local variable merely
@@ -575,7 +575,7 @@ pub fn run(expr: Expr, txn_registers: &HashSet<Name>) -> Expr {
     for k in &key_names {
         assert!(
             key_init.contains_key(k),
-            "transact_phase: register key `{k}` has no `let` binding to fold (its `Mut[_, Txn]` \
+            "transact_phase: register key `{k}` has no `let` binding to fold (its `Mut(_, Txn)` \
              declaration must be a top-level `let`)"
         );
     }
@@ -1003,7 +1003,7 @@ fn prepend_effects(effects: Vec<Expr>, rest: Expr) -> Expr {
 ///
 /// Lowering's nested-`with` check is textual — it catches a literal `with`
 /// inside a `with`, but not a by-reference transactional writer
-/// (`def do_it(p: Mut[_, Txn]): with begin(): p -= 1`) *called* inside a block.
+/// (`def do_it(p: Mut(_, Txn)): with begin(): p -= 1`) *called* inside a block.
 /// After inlining, that callee's own `Begin` lands inside the outer block, where
 /// stripping would fold the inner site incorrectly. Detect it here, on the
 /// inlined tree, *before* [`run`]'s [`strip`] consumes the blocks: a `Begin` may
@@ -1032,7 +1032,7 @@ pub fn check_no_nested_transactions(
 }
 
 /// Reject an **induction-only transaction**: a `with begin():` block that writes
-/// an induction accumulator (`Mut[…]`, non-`Txn`) but no transactional register.
+/// an induction accumulator (`Mut(…)`, non-`Txn`) but no transactional register.
 ///
 /// Such a block provides no atomicity — its only effect is an induction write
 /// that would be lifted onto the enclosing loop anyway (see [`partition_block`]),
@@ -1057,7 +1057,7 @@ pub fn check_no_induction_only_transactions(
             "`{name}` is written inside a `with begin():` block that commits no transactional \
              register, so the block provides no atomicity. If `{name}` is an induction \
              accumulator, move its write outside the block; if it should be a transactional \
-             register, declare it `Mut[…, Txn]` and write it alongside a register in the block"
+             register, declare it `Mut(…, Txn)` and write it alongside a register in the block"
         ));
     }
     let mut result = Ok(());
@@ -1070,7 +1070,7 @@ pub fn check_no_induction_only_transactions(
 }
 
 /// Reject a **guarded in-block induction write**: an induction accumulator
-/// (`Mut[…]`, non-`Txn`) written inside an `if cond:` guard within a `with
+/// (`Mut(…)`, non-`Txn`) written inside an `if cond:` guard within a `with
 /// begin():` block. Only a *bare, top-level-spine* in-block induction write is
 /// supported — [`partition_block`] lifts it verbatim onto the enclosing loop, so it
 /// is exactly the out-of-block form (block placement is inert for it). A *guarded*
@@ -1093,7 +1093,7 @@ pub fn check_no_guarded_induction_writes(
              block — a guarded in-block induction write is not supported (committing it would \
              need commit-gated carry-forward). Move the write to the block's top level (a bare \
              in-block induction write is exactly the out-of-block form), or if it should be \
-             committed atomically declare `{name}` as `Mut[…, Txn]`"
+             committed atomically declare `{name}` as `Mut(…, Txn)`"
         ));
     }
     let mut result = Ok(());
@@ -2058,10 +2058,10 @@ fn build_letrec(
 ///
 /// **Splice point** — the letrec is spliced at the *tail*: below every `let`
 /// binding kept from the continuation, above the trailing register reads. Register-key
-/// declarations (`let x: Mut[_, Txn] = init`, always top-level) are **dropped**
+/// declarations (`let x: Mut(_, Txn) = init`, always top-level) are **dropped**
 /// (their inits ride `key_init` and are consumed by the history bindings) and
 /// each key is re-bound at the tail. This is what fixes a key declared *above* a
-/// writer's source binding (`pool: Mut[…]; reqs = […]; for r in reqs: …`):
+/// writer's source binding (`pool: Mut(…); reqs = […]; for r in reqs: …`):
 /// splicing at the key would leave `reqs` bound below the letrec — a dangling
 /// reference the strict typecheck does not catch. Keeping every non-key `let`
 /// above the splice guarantees each writer's source is in scope. Mirrors the
@@ -2154,7 +2154,7 @@ fn splice_letrec(
     };
     let mut inner = tail;
     for k in key_names.iter().rev() {
-        // The init's type is the register's value type `V` (the `Mut[V, Txn]` wrapper
+        // The init's type is the register's value type `V` (the `Mut(V, Txn)` wrapper
         // rode the binding/annotation, not the init RHS); `register_value_ty` peels
         // it defensively. `erase_mut` sweeps any surviving `Var(x)` reference type.
         let v = register_value_ty(&key_init[k].ty);
@@ -2212,7 +2212,7 @@ mod tests {
     use super::*;
     use crate::ccl::{ArithmeticKind, BinOpKind, symbolic::symbolic};
 
-    /// The typed direct-mirror tree for `pool: Mut[int, Txn] = 100; for r in
+    /// The typed direct-mirror tree for `pool: Mut(Int, Txn) = 100; for r in
     /// [10]: with begin(): pool = pool - r` as lowering + inference leave it:
     /// `let pool = 100 in ExprStmt(For{r, [10], ExprStmt(Begin{pool := pool - r;
     /// unit}, unit)}, unit)` — the `with begin():` block is a `Begin` marker on

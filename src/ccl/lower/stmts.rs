@@ -164,7 +164,7 @@ pub(super) fn lower_stmts_inner(
 
     // A nested block is its own scope: snapshot *both* the transactional
     // registry and the `mut_param_fns` set so declarations local to this block —
-    // a `Mut[…, Txn]` register, or a `Mut`-param `def`'s curried call shape —
+    // a `Mut(…, Txn)` register, or a `Mut`-param `def`'s curried call shape —
     // revert on exit and do not leak into an enclosing or sibling scope.
     // Induction mutability carries no lowering-time registry (it is the
     // `Type::History` on the binding, checked post-inference). This block's
@@ -222,7 +222,7 @@ pub(super) fn lower_final_stmt(
             // Build outer bindings: caller's bindings + all names from rest.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
-            // A non-yielding loop that mutates a declared `Mut[…]`
+            // A non-yielding loop that mutates a declared `Mut(…)`
             // accumulator is a valid *final* statement — the loop runs and its
             // final mutable-variable value is simply unobserved (`Unit`). Mirror
             // `lower_middle_stmt`'s mutation-loop dispatch here, with `Unit` as
@@ -449,19 +449,19 @@ pub(super) fn lower_middle_stmt(
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
             if mut_annotation_parts(annotation).is_some() {
-                // `x: Mut[V] = init` / `x: Mut[V, Txn] = init` — a `Mut`
+                // `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut`
                 // annotation with the *immutable* `=` operator. This is
                 // contradictory under the cutover: `=` is a plain immutable
                 // binding, and every mutable (induction or transactional) is
                 // introduced solely with `:=`. Reject and point at `:=` (the
                 // value type — and `Txn` — still ride the annotation:
-                // `x: Mut[V] := init`, `x: Mut[V, Txn] := init`).
+                // `x: Mut(V) := init`, `x: Mut(V, Txn) := init`).
                 return Err(LoweringError::unsupported(
                     stmt.span,
                     format!(
-                        "`{name}: Mut[…] = …` introduces a mutable with the immutable \
-                         `=` operator; use `:=` instead (e.g. `{name}: Mut[V] := init`, \
-                         `{name}: Mut[V, Txn] := init`, or a bare `{name} := init` to \
+                        "`{name}: Mut(…) = …` introduces a mutable with the immutable \
+                         `=` operator; use `:=` instead (e.g. `{name}: Mut(V) := init`, \
+                         `{name}: Mut(V, Txn) := init`, or a bare `{name} := init` to \
                          infer the value type)"
                     ),
                 ));
@@ -475,9 +475,9 @@ pub(super) fn lower_middle_stmt(
         //    `MutWrite` marker (which the check requires to target a mutable variable, and
         //    the unified phase normalizes: a recurrence in a loop, a shadowing
         //    advance at the top level);
-        //  - otherwise (a fresh name, or an annotated `x: T := e` / `x: Mut[V] := e`
+        //  - otherwise (a fresh name, or an annotated `x: T := e` / `x: Mut(V) := e`
         //    declaration) it is an *introduction* — a `let` whose binding is
-        //    stamped `Mut[V, _]` so inference binds `x` at `Mut` and reads deref
+        //    stamped `Mut(V, _)` so inference binds `x` at `Mut` and reads deref
         //    (domain inferred for an induction accumulator).
         // In-loop writes are handled by `lower_direct_mirror_loop`, not here.
         ChlStmt::MutAssign {
@@ -513,8 +513,8 @@ pub(super) fn lower_middle_stmt(
             // Otherwise this is an *introduction*. Resolve the optional
             // annotation to `(value type, transactional?)`:
             //   (none)             → induction accumulator, value type inferred
-            //   `x: Mut[V] := e`   → induction accumulator at value type `V`
-            //   `x: Mut[V, Txn]`   → transactional register at value type `V`
+            //   `x: Mut(V) := e`   → induction accumulator at value type `V`
+            //   `x: Mut(V, Txn)`   → transactional register at value type `V`
             //   `x: T := e`        → induction accumulator at value type `T`
             let (value_ty, is_txn) = match annotation {
                 None => (Type::Hole, false),
@@ -523,7 +523,7 @@ pub(super) fn lower_middle_stmt(
                     None => (lower_type_annotation(ann)?, false),
                 },
             };
-            // Stamp the binding `Mut[V, D]` (so inference binds `x` at `Mut` and
+            // Stamp the binding `Mut(V, D)` (so inference binds `x` at `Mut` and
             // its references deref to `V`). `D = Txn` for a transactional register
             // (fixed here, never inferred), which also registers `x` so its
             // `with begin():` writes lower to `MutWrite` and its bare reads are
@@ -635,7 +635,7 @@ pub(super) fn lower_middle_stmt(
 
             // A loop with no visible accumulator, no `<<` feed, and no `yield`
             // still may mutate a `Mut` variable through a *call* — `for x:
-            // bump(cnt)`, where `bump(c: Mut[…])` writes `c`. Lowering runs
+            // bump(cnt)`, where `bump(c: Mut(…))` writes `c`. Lowering runs
             // before inference, so we can't see the write hidden inside the
             // call; emit a direct-mirror `For` marker (its body a plain
             // side-effect statement) and let the post-inline letrec phase
@@ -727,7 +727,7 @@ pub(super) fn name_target_as_name(target: &Spanned<AssignTarget>) -> Option<&str
     }
 }
 
-/// Reject a `Mut[V, Txn]` **register** write that lands *outside* a `with
+/// Reject a `Mut(V, Txn)` **register** write that lands *outside* a `with
 /// begin():` block — the write-side mirror of the out-of-block read gate in
 /// [`super::lower_expr`]. A register's history is the commit order, so a bare
 /// write outside a block would become a plain sequential `let` shadow that
@@ -738,7 +738,7 @@ pub(super) fn name_target_as_name(target: &Spanned<AssignTarget>) -> Option<&str
 /// binder wins), not the register, so it is never gated — mirroring the read
 /// gate's `is_shadowed` guard against the base-name registry.
 ///
-/// The dual case — an induction `Mut[V]` mutable variable written *inside* a block, which
+/// The dual case — an induction `Mut(V)` mutable variable written *inside* a block, which
 /// `transact_phase` would silently swallow — is rejected at the block-body write
 /// site in [`super::transactions::write_or_let`]; that check needs no induction
 /// registry, because inside a block the only legal `:=` / `+=` target is a
@@ -760,54 +760,55 @@ pub(super) fn check_mut_write_context(
     Ok(())
 }
 
-/// If `annotation` is a `Mut[…]` form, extract its declared *value* type and
-/// whether it is **transactional** (`Mut[V, Txn]`).
+/// If `annotation` is a `Mut(…)` form, extract its declared *value* type and
+/// whether it is **transactional** (`Mut(V, Txn)`).
 ///
-/// - `Mut[V]` / `Mut[_]` → `(V, false)` — an induction-domain accumulator whose
-///   sequencing domain is inferred from its writing loop (`Mut[_]` → `(Hole,
+/// - `Mut(V)` / `Mut(_)` → `(V, false)` — an induction-domain accumulator whose
+///   sequencing domain is inferred from its writing loop (`Mut(_)` → `(Hole,
 ///   false)`, value type inferred).
-/// - `Mut[V, Txn]` → `(V, true)` — a transactional register over the commit
-///   order (the two-slot form parses as a tuple index `(V, Txn)`).
+/// - `Mut(V, Txn)` → `(V, true)` — a transactional register over the commit
+///   order.
 ///
 /// `Txn` is the only explicit sequencing domain supported; any other second
 /// slot is a lowering error. Returns `None` for a non-`Mut` annotation.
 pub(super) fn mut_annotation_parts(
     annotation: &Spanned<ChlExpr>,
 ) -> Option<Result<(Type, bool), LoweringError>> {
-    let ChlExpr::Subscript { target, index } = &annotation.node else {
+    // `Mut(…)` is type application — a call with a bare-name head (application
+    // is parenthesised at both levels; see `lower_type_annotation`).
+    let ChlExpr::Call { func, args } = &annotation.node else {
         return None;
     };
-    let ChlExpr::Name(head) = &target.node else {
+    let ChlExpr::Name(head) = &func.node else {
         return None;
     };
     if head.as_str() != "Mut" {
         return None;
     }
-    // `Mut[V, Txn]` parses as a tuple index `(V, Txn)`.
-    if let ChlExpr::Tuple(parts) = &index.node {
-        if parts.len() != 2 {
-            return Some(Err(LoweringError::unsupported(
-                annotation.span,
-                "Mut[…] takes one or two arguments: `Mut[V]` or `Mut[V, Txn]`",
-            )));
+    match args.as_slice() {
+        [value] => Some(lower_type_annotation(value).map(|t| (t, false))),
+        [value, domain] => {
+            let value_ty = match lower_type_annotation(value) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(match &domain.node {
+                ChlExpr::Name(d) if d.as_str() == "Txn" => Ok((value_ty, true)),
+                _ => Err(LoweringError::unsupported(
+                    domain.span,
+                    "the only explicit `Mut` sequencing domain is `Txn` (`Mut(V, Txn)`); \
+                     omit it (`Mut(V)`) to infer a loop's induction domain",
+                )),
+            })
         }
-        let value_ty = match lower_type_annotation(&parts[0]) {
-            Ok(t) => t,
-            Err(e) => return Some(Err(e)),
-        };
-        return Some(match &parts[1].node {
-            ChlExpr::Name(d) if d.as_str() == "Txn" => Ok((value_ty, true)),
-            _ => Err(LoweringError::unsupported(
-                parts[1].span,
-                "the only explicit `Mut` sequencing domain is `Txn` (`Mut[V, Txn]`); \
-                 omit it (`Mut[V]`) to infer a loop's induction domain",
-            )),
-        });
+        _ => Some(Err(LoweringError::unsupported(
+            annotation.span,
+            "`Mut` takes one or two arguments: `Mut(V)` or `Mut(V, Txn)`",
+        ))),
     }
-    Some(lower_type_annotation(index).map(|t| (t, false)))
 }
 
-/// Pre-register every `x: Mut[V, Txn] := e` transactional-register introduction
+/// Pre-register every `x: Mut(V, Txn) := e` transactional-register introduction
 /// (and every pass-by-reference-`Mut` `def`) in `stmts` with the lowering
 /// context.
 ///
@@ -828,10 +829,10 @@ pub(super) fn mut_annotation_parts(
 pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) {
     for stmt in stmts {
         match &stmt.node {
-            // `x: Mut[V, Txn] := e` — a transactional-register introduction.
+            // `x: Mut(V, Txn) := e` — a transactional-register introduction.
             // Register `x` so a following loop's `with begin(): x := …` write is
             // recognised as a commit and a bare read of `x` is gated. A bare
-            // `:=`, `x: T := e`, or `x: Mut[V] := e` is an induction accumulator and is
+            // `:=`, `x: T := e`, or `x: Mut(V) := e` is an induction accumulator and is
             // intentionally *not* registered (its mutability is checked
             // post-inference).
             ChlStmt::MutAssign {
@@ -842,7 +843,7 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                 let AssignTarget::Name(id) = &target.node else {
                     continue;
                 };
-                // A malformed `Mut[…]` annotation (`Err`) surfaces its real error
+                // A malformed `Mut(…)` annotation (`Err`) surfaces its real error
                 // when the `MutAssign` itself is lowered; not registering it here
                 // is harmless.
                 if matches!(mut_annotation_parts(annotation), Some(Ok((_, true)))) {
@@ -871,64 +872,124 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
     }
 }
 
-/// Whether a type annotation is a pass-by-reference `Mut[…]` form.
+/// Whether a type annotation is a pass-by-reference `Mut(…)` form.
 fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
     mut_annotation_parts(annotation).is_some()
 }
 
 /// Lower a CHL type annotation expression to a CCL [`Type`].
 ///
-/// Handles the primitive type names: `int` → [`Type::Base`]([`BaseType::Int`]),
-/// `str` → `String`, `bool` → `Bool`, `None` (the constant) → `Unit`, and the
-/// wildcard `_` → [`Type::Hole`] ("infer this slot" — inference normalizes an
-/// annotation `Hole` to a fresh variable, so the slot is unconstrained; see
-/// `bind_annotation`).
+/// Recognised forms:
+/// - Capitalized primitive names (`Caps` means type — `docs/chl-spec.md`):
+///   `Int` → [`Type::Base`]([`BaseType::Int`]), `String` → `String`,
+///   `Bool` → `Bool`.
+/// - `None` (the constant) → `Unit`, and the wildcard `_` → [`Type::Hole`]
+///   ("infer this slot" — inference normalizes an annotation `Hole` to a fresh
+///   variable, so the slot is unconstrained; see `bind_annotation`).
+/// - Type application `List(T)` — a type constructor applied to argument types.
+///   Application is parenthesised at both the term and type level
+///   (`docs/chl-spec.md`).
+/// - A record type `{name: T, …}` and a tuple type `{T, U}`
+///   (`Expr::BraceGroup`).
 pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
-        ChlExpr::Name(id) => match id.as_str() {
-            "int" => Ok(Type::Base(BaseType::Int)),
-            "str" => Ok(Type::Base(BaseType::String)),
-            "bool" => Ok(Type::Base(BaseType::Bool)),
-            "_" => Ok(Type::Hole),
-            _ => Err(LoweringError::unsupported(
-                annotation.span,
-                format!("unknown type annotation: {id}"),
-            )),
-        },
+        ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
+            LoweringError::unsupported(annotation.span, format!("unknown type annotation: {id}"))
+        }),
         ChlExpr::Lit(ChlLit::None) => Ok(Type::Base(BaseType::Unit)),
-        // Subscripted type constructors, e.g. `List[T]`. The wildcard is
-        // accepted anywhere, so `List[_]` recurses to an element `Hole`.
-        ChlExpr::Subscript { target, index } => {
-            let ChlExpr::Name(head) = &target.node else {
-                return Err(LoweringError::unsupported(
-                    target.span,
-                    "subscripted type annotation must have a simple name head \
-                     (e.g. `List[…]`)",
-                ));
-            };
-            match head.as_str() {
-                // A list type is a mapping `index-range ⇒ element`; the length
-                // (domain) is unknown at annotation time, so it is a `Hole`
-                // (inferred, like the value slot of a bare `_`). The element
-                // type is the subscript index lowered recursively.
-                "List" => Ok(Type::Fun {
-                    name: None,
-                    domain: Box::new(Type::Hole),
-                    codomain: Box::new(lower_type_annotation(index)?),
-                }),
-                // `Mut[…]` in annotation position is handled by
-                // `mut_annotation_parts` before this function is reached;
-                // seeing it here means a `Mut[…]` nested inside another type,
-                // which is not supported yet.
-                other => Err(LoweringError::unsupported(
-                    annotation.span,
-                    format!("unknown subscripted type annotation: `{other}[…]`"),
-                )),
-            }
+        // Type application `List(T)`: a type constructor applied to argument
+        // types. Application uses parentheses at both levels
+        // (`docs/chl-spec.md`).
+        ChlExpr::Call { func, args } => {
+            let head = type_ctor_head(func)?;
+            lower_type_application(annotation.span, head, args)
         }
+        // Record type `{name: T, …}`.
+        ChlExpr::Record(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for field in fields {
+                out.push((
+                    field.name.as_str().to_string(),
+                    lower_type_annotation(&field.value)?,
+                ));
+            }
+            Ok(Type::Record(out))
+        }
+        // Tuple type `{T, U}` (colon-free brace group).
+        ChlExpr::BraceGroup(parts) => Ok(Type::Tuple(
+            parts
+                .iter()
+                .map(lower_type_annotation)
+                .collect::<Result<_, _>>()?,
+        )),
+        // A parenthesised comma list `(T, U)` is a *term* product; the tuple
+        // *type* is written with braces `{T, U}` (`docs/chl-spec.md`).
+        ChlExpr::Tuple(_) => Err(LoweringError::unsupported(
+            annotation.span,
+            "a tuple type is written with braces: `{T, U}`",
+        )),
         _ => Err(LoweringError::unsupported(
             annotation.span,
             format!("unsupported type annotation form: {:?}", annotation.node),
+        )),
+    }
+}
+
+/// Resolve a capitalized primitive type name (`Caps` means type —
+/// `docs/chl-spec.md`), or the
+/// inference wildcard `_`. Returns `None` for any other identifier.
+fn name_type(id: &str) -> Option<Type> {
+    Some(match id {
+        "Int" => Type::Base(BaseType::Int),
+        "String" => Type::Base(BaseType::String),
+        "Bool" => Type::Base(BaseType::Bool),
+        "_" => Type::Hole,
+        _ => return None,
+    })
+}
+
+/// Extract the simple-name head of a type application (`List` in `List(T)`).
+/// A non-name head is unsupported.
+fn type_ctor_head(head: &Spanned<ChlExpr>) -> Result<&str, LoweringError> {
+    match &head.node {
+        ChlExpr::Name(id) => Ok(id.as_str()),
+        _ => Err(LoweringError::unsupported(
+            head.span,
+            "a type application must have a simple name head (e.g. `List(…)`)",
+        )),
+    }
+}
+
+/// Lower a type constructor `head` applied to `args`.
+fn lower_type_application(
+    span: Span,
+    head: &str,
+    args: &[Spanned<ChlExpr>],
+) -> Result<Type, LoweringError> {
+    match head {
+        // A list type is a mapping `index-range ⇒ element`; the length
+        // (domain) is unknown at annotation time, so it is a `Hole` (inferred,
+        // like the value slot of a bare `_`). The element type is the sole
+        // argument lowered recursively.
+        "List" => {
+            let [elem] = args else {
+                return Err(LoweringError::unsupported(
+                    span,
+                    "`List` takes one type argument: `List(T)`",
+                ));
+            };
+            Ok(Type::Fun {
+                name: None,
+                domain: Box::new(Type::Hole),
+                codomain: Box::new(lower_type_annotation(elem)?),
+            })
+        }
+        // `Mut(…)` in a nested position is handled by `mut_annotation_parts`
+        // before this function is reached; seeing it here means a `Mut` inside
+        // another type, which is not supported yet.
+        other => Err(LoweringError::unsupported(
+            span,
+            format!("unknown type application: `{other}(…)`"),
         )),
     }
 }
@@ -1258,5 +1319,19 @@ x";
         let stmts = parse_module("if x:\n    1");
         let err = expect_one_lowering_error(&stmts);
         assert!(matches!(err, LoweringError::Unsupported { .. }));
+    }
+
+    /// A colon-free brace group `{T, U}` is structural *type* syntax; it has no
+    /// term-level value, so it is rejected in value position (it is accepted as
+    /// a tuple type in annotation position — see `lower_type_annotation`).
+    #[test]
+    fn test_brace_group_as_value_rejected() {
+        let stmts = parse_module("{1, 2}");
+        let err = expect_one_lowering_error(&stmts);
+        let LoweringError::Unsupported { message, .. } = &err;
+        assert!(
+            message.contains("type syntax"),
+            "expected a type-syntax hint, got: {message}"
+        );
     }
 }

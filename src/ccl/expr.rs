@@ -368,7 +368,7 @@ pub enum TypedExprNode {
     /// self-cycle is a fold; a commit-record binding read through
     /// `get_prev_txn` is a transactional register) to pick the engine.
     /// The induction `mut_elim` emits it for every mutation loop, and
-    /// `transact_phase` emits it for every `Mut[V, Txn]` transaction block, both
+    /// `transact_phase` emits it for every `Mut(V, Txn)` transaction block, both
     /// as causal groups. The group then travels — bodies point-freed — through
     /// `channelize` and `lambda_elim`; `planning::plan_loops` runs *after*
     /// `lambda_elim` on the point-free normal form and lowers every recognized

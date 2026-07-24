@@ -293,7 +293,7 @@ o"#,
 // the channel latches 0, 1, 2 (the pre-write values) over the three iterations.
 #[case::pbr_feed_before_write(
 r#"
-def fw(c: Mut[int], o: Feed[int]):
+def fw(c: Mut(Int), o: Feed(Int)):
   o << c
   c += 1
 x := 0

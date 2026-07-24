@@ -171,7 +171,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
                 Some(binding) => binding.scheme.instantiate(ctx.level),
             };
             // The written value flows into the mutable variable's *value* type, not the
-            // `Mut` handle itself: peel `Mut[V, D]` to `V` before constraining.
+            // `Mut` handle itself: peel `Mut(V, D)` to `V` before constraining.
             // (The `(_, Mut)` lenient coercion arm would deref anyway, but the
             // explicit peel names the write semantics — a write updates `V`.)
             let mut_val = match peel_refinements_outer(&var_ty) {
@@ -532,7 +532,7 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
 }
 
 /// Deref a mutable variable reference to its value type: peel a
-/// (refinement-wrapped) `Mut[V, D]` (a [`HistoryKind::Overwrite`] history) to `V`.
+/// (refinement-wrapped) `Mut(V, D)` (a [`HistoryKind::Overwrite`] history) to `V`.
 /// A no-op on non-mutable types (including a feed channel, which reads as its
 /// whole stream, not a scalar value).
 fn deref_mut(ty: &Type) -> Type {
@@ -567,7 +567,7 @@ pub(super) fn emit_feed<C: Typing>(
     // type here. This wrapping into a `Fun` codomain buries the type where the
     // solver's `(Mut, _)` deref arm cannot reach it: two contributions to one
     // channel become `Fun` lower bounds that are *joined* (codomains lub'd),
-    // not constrained against a demand, so an undereferenced `Mut[V, D]` would
+    // not constrained against a demand, so an undereferenced `Mut(V, D)` would
     // collide with a plain-`V` feed to the same channel instead of dereffing.
     let value_ty = deref_mut(&ctx.subexpr(value)?);
     let contribution = fun(ctx.fresh(), value_ty);
@@ -754,14 +754,14 @@ pub(super) fn emit_let<C: Typing>(
     };
     // The type the variable is bound at over the body.
     //
-    // A `Mut` annotation (an induction accumulator introduction, e.g. `x: Mut[V] =
-    // init`) binds the *variable* at the mutable type `Mut[V, D]`, so its
+    // A `Mut` annotation (an induction accumulator introduction, e.g. `x: Mut(V) =
+    // init`) binds the *variable* at the mutable type `Mut(V, D)`, so its
     // references carry `Mut` and reads deref to `V` (the coercion arms in
     // `constrain.rs`). `normalize` mints the annotation's `Hole` value/domain
     // as fresh vars in Emit — so `?V` receives the initializer and every write
     // — and is the identity in Check. The initializer is the mutable variable's tick-0
     // read, so it is constrained `init <: V`; the constraint is skipped when
-    // `V` is an inferred `Hole` (a `Mut[_]` value under Check's
+    // `V` is an inferred `Hole` (a `Mut(_)` value under Check's
     // identity-normalize), which the already-resolved tree validates on its
     // own. The binding *slot* is left to coalesce, which fills a monomorphic
     // `let`'s slot from its bound expression (the mutable variable's value type `V`) —
@@ -770,11 +770,11 @@ pub(super) fn emit_let<C: Typing>(
     // `Mut` before the strict wall. Every other annotation reconciles the RHS
     // as before (`x: Int = expr`).
     let scheme_ty = match &binding.user_annotation {
-        // Only a *mutable* annotation (`x: Mut[V] = init`) binds the variable at
+        // Only a *mutable* annotation (`x: Mut(V) = init`) binds the variable at
         // the history type and constrains `init <: V`. A `Feed`-kind history
         // annotation is deliberately excluded: it is not a mutable-variable introduction,
         // so it falls through to the generic `Some(ann)` arm below (there is no
-        // `Feed[…]` initializer surface today, but gating on `Overwrite` keeps this
+        // `Feed(…)` initializer surface today, but gating on `Overwrite` keeps this
         // arm honest rather than silently mis-typing a channel as a value).
         Some(ann)
             if matches!(

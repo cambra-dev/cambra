@@ -5,9 +5,10 @@
 //! inference).  Exercises `Feed(_)` types, `<<` feed, and an annotation-only
 //! forward declaration (`h: Feed(_)` with no initializer).
 //!
-//! **Currently blocked.**  `Feed(_)` isn't a supported type-annotation form
-//! yet, and the forward declaration doesn't parse.  This pins the
-//! unsupported-annotation failure.
+//! **Currently blocked.**  `Feed` isn't a supported type constructor yet
+//! (type application resolves `List`, `Mut`; `Feed(_)` is rejected), and the
+//! annotation-only forward declaration doesn't parse.  This pins the
+//! unsupported-`Feed`-type failure.
 
 use super::common::expect_compile_error;
 
@@ -15,6 +16,6 @@ use super::common::expect_compile_error;
 fn fanout_currently_blocked() {
     expect_compile_error(
         include_str!("program.cambra"),
-        "unsupported type annotation form",
+        "unknown type application: `Feed(…)`",
     );
 }

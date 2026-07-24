@@ -200,7 +200,7 @@ pub enum Type {
     /// [`HistoryKind`]:
     ///
     /// - [`HistoryKind::Overwrite`] — a **mutable variable** (`:=` / `+=`). A reference
-    ///   reads through to its `value` (the scalar behind `Mut[Int, D]`; `cnt + 1`
+    ///   reads through to its `value` (the scalar behind `Mut(Int, D)`; `cnt + 1`
     ///   reads the `Int`), its writes may read the previous position
     ///   (`get_prev_seq` recurrence), and its trailing read is `final_or_default`
     ///   (a scalar). The unified phase materializes it with a carry-forward arm.
@@ -352,7 +352,7 @@ impl fmt::Display for Type {
                 kind,
             } => {
                 if *kind == HistoryKind::Overwrite {
-                    write!(f, "Mut[{value}, {domain}]")
+                    write!(f, "Mut({value}, {domain})")
                 } else {
                     write!(f, "feed({domain} ⇒ {value})")
                 }

@@ -583,7 +583,7 @@ pub fn compile_program(
     })?;
 
     // Transactional slice of the unified phase: rewrite every `with begin():`
-    // writer of a `Mut[_, Txn]` register into a `get_prev_txn`-guarded `LetRec`
+    // writer of a `Mut(_, Txn)` register into a `get_prev_txn`-guarded `LetRec`
     // (histories + commit records over the commit domain), which
     // `planning::plan_loops` destructures into the `Transact{…, Txn}` node
     // op-conversion compiles to the commit engine — unifying the transaction and
@@ -591,7 +591,7 @@ pub fn compile_program(
     // `mut_elim` so the induction phase never sees a transaction loop. See
     // src/ccl/design/mutability.md.
     //
-    // Register-ness is the `Mut[_, Txn]` type; register identity is the α-unique
+    // Register-ness is the `Mut(_, Txn)` type; register identity is the α-unique
     // binder `Name`. Both are read off the *inlined, typed* tree — so a
     // cross-function writer's registers (its `transfer(a, b)` writes already
     // beta-reduced to name `a`/`b`) are seen, and an unrelated local merely spelled

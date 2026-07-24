@@ -12,16 +12,16 @@ use crate::{
     chl_parser::ast::{Param, Span, Spanned},
 };
 
-/// If `param` is annotated `Mut[…]` (a pass-by-reference mutable-variable parameter),
-/// return its mutable type `Mut[V, D]` and whether it is **transactional**
-/// (`Mut[V, Txn]`). Returns `None` for any non-`Mut` annotation (or an
-/// unannotated parameter). Mirrors the `Mut[…]` stamping of an induction
+/// If `param` is annotated `Mut(…)` (a pass-by-reference mutable-variable parameter),
+/// return its mutable type `Mut(V, D)` and whether it is **transactional**
+/// (`Mut(V, Txn)`). Returns `None` for any non-`Mut` annotation (or an
+/// unannotated parameter). Mirrors the `Mut(…)` stamping of an induction
 /// introduction (`lower/stmts.rs :: mut_annotation_parts`).
 ///
 /// The sequencing domain is left inferred (`D = Hole` → a fresh variable,
 /// generalized per call site) even for a `Txn` register param: the call-site
-/// argument's `Mut[_, Txn]` type pins `D = Txn` by the invariant `(Mut, Mut)`
-/// edge, and leaving it open lets one `def bump(c: Mut[Int])` serve both an
+/// argument's `Mut(_, Txn)` type pins `D = Txn` by the invariant `(Mut, Mut)`
+/// edge, and leaving it open lets one `def bump(c: Mut(Int))` serve both an
 /// induction accumulator and a register. The transactional flag *is* returned
 /// so the body's `with begin():` writes register as transactional at lowering
 /// time (the block-classification decision runs before inference).
@@ -101,8 +101,8 @@ pub(super) fn uncurry_params(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if params.len() == 1 {
-        // A `Mut[…]`-annotated single parameter is a pass-by-reference mutable variable:
-        // bind it at `Mut[V, D]` so body references carry `Mut` (reads deref,
+        // A `Mut(…)`-annotated single parameter is a pass-by-reference mutable variable:
+        // bind it at `Mut(V, D)` so body references carry `Mut` (reads deref,
         // writes lower to `MutWrite`) and inference generalizes its domain per
         // call site. The annotation rides `user_annotation` too, so the
         // discipline check's rule 3 (no *unannotated* `Mut` binding) treats it
@@ -206,7 +206,7 @@ pub(super) fn lower_lambda(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     validate_function_params(lambda_span, params)?;
-    // Mutability of a `Mut[…]`-annotated parameter is its *type* (stamped by
+    // Mutability of a `Mut(…)`-annotated parameter is its *type* (stamped by
     // `uncurry_params`), checked post-inference — there is no induction registry
     // to mask here. But a plain parameter spelled like an outer transactional
     // register is a genuine local, so SHADOW every parameter over the body
@@ -261,14 +261,14 @@ pub(super) fn lower_function_body(
     // on exit), keyed on the pre-uniquify name a sibling function or outer
     // binding could reuse.
     //
-    //  - A `Mut[_, Txn]`-annotated parameter is a pass-by-reference transactional
+    //  - A `Mut(_, Txn)`-annotated parameter is a pass-by-reference transactional
     //    register: register it so a body `x := …` / `x += …` inside a `with
     //    begin():` block is classified as a commit (the cross-function writer
-    //    `def transfer(src, dst: Mut[_, Txn], …)`), and a bare read of it is gated.
-    //  - An induction `Mut[V]` parameter needs no registry — its mutability is
+    //    `def transfer(src, dst: Mut(_, Txn), …)`), and a bare read of it is gated.
+    //  - An induction `Mut(V)` parameter needs no registry — its mutability is
     //    its `Type::History` (stamped by `uncurry_params`), checked post-inference. It
     //    is recorded here only so it is *not* shadowed below: a mutable variable keeps its
-    //    gate, a plain local does not. A malformed `Mut[…]` annotation surfaces
+    //    gate, a plain local does not. A malformed `Mut(…)` annotation surfaces
     //    its error eagerly (before the body lowers).
     let snapshot = ctx.snapshot_transactional();
     let mut mut_param_names: HashSet<String> = HashSet::new();
@@ -292,7 +292,7 @@ pub(super) fn lower_function_body(
     // Shadow only the *non*-`Mut` parameters over the body: a plain param
     // spelled like an outer transactional register is a genuine local, so the
     // out-of-block read gate must skip it. A `Mut` param is a mutable variable in its own
-    // right, so it keeps its gate — reading a `Mut[_, Txn]` param outside a `with
+    // right, so it keeps its gate — reading a `Mut(_, Txn)` param outside a `with
     // begin():` block in the body is still an error.
     let shadowed_params: Vec<String> = outer_bindings
         .iter()
@@ -305,8 +305,8 @@ pub(super) fn lower_function_body(
         lower_stmts_inner(body, &outer_bindings, ctx, false)
     });
 
-    // Revert the transactional registry — drop every `Mut[_, Txn]` param
-    // registration and any `Mut[_, Txn]` local the body declared, keyed on the
+    // Revert the transactional registry — drop every `Mut(_, Txn)` param
+    // registration and any `Mut(_, Txn)` local the body declared, keyed on the
     // pre-uniquify name a sibling function could reuse.
     ctx.restore_transactional(snapshot);
 

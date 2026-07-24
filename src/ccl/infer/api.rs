@@ -335,7 +335,7 @@ pub enum InferError {
     /// second-class discipline's rule 3. `b = a` where `a` is mutable would
     /// alias the mutable variable; the design forbids it. To copy the current value,
     /// annotate the deref (`b: Int = a`); to seed a new mutable variable, introduce one
-    /// with `:=` (`b: Mut[Int] := a`). Reported by [`check_mut_discipline`].
+    /// with `:=` (`b: Mut(Int) := a`). Reported by [`check_mut_discipline`].
     UnannotatedMutBinding {
         /// The base name of the offending binding.
         name: String,
@@ -355,7 +355,7 @@ pub enum InferError {
     /// [`Type::History`] — a write to something that was never introduced as a
     /// mutable variable. Writes require a mutable (they never mean "shadow an
     /// immutable"); introduce the mutable variable with `:=` (or annotate a pass-by-reference
-    /// parameter `Mut[…]`). Reported by [`check_mut_write_targets`].
+    /// parameter `Mut(…)`). Reported by [`check_mut_write_targets`].
     MutWriteToNonMutable {
         /// The base name of the write target.
         name: String,
@@ -457,7 +457,7 @@ impl std::fmt::Debug for InferError {
                     "binding `{name}` is a mutable reference but is not annotated `Mut` \
                      (Mut second-class rule 3): to copy the current value annotate \
                      `{name}: <value type>`; to introduce a new mutable variable annotate \
-                     `{name}: Mut[...]`"
+                     `{name}: Mut(...)`"
                 )
             }
             InferError::MutArgNotMutable { at } => {
@@ -472,7 +472,7 @@ impl std::fmt::Debug for InferError {
                     f,
                     "cannot write `{name}` with `:=` / `+=`: `{name}` is not a mutable \
                      variable. Introduce it with `:=` (or, for a pass-by-reference \
-                     parameter, annotate it `Mut[...]`)"
+                     parameter, annotate it `Mut(...)`)"
                 )
             }
         }
@@ -658,7 +658,7 @@ fn collect_type_errors(
         }),
         Type::Infer(var) => {
             // Pre-desugar, an induction accumulator's domain is still `Infer` (a
-            // `Mut[V]` with no annotated domain — the unified phase resolves it
+            // `Mut(V)` with no annotated domain — the unified phase resolves it
             // to the writing loop's extent); the relaxation tolerates it (see
             // [`Strictness`]). Feed channel domains are the rigid `ChanDom`
             // handled below, not `Infer`.
@@ -803,7 +803,7 @@ pub fn check_pre_desugar(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// until the unified phase resolves it.
 ///
 /// The transient type can live on a **binder slot** rather than a node type — a
-/// dead mutable variable `let cnt: Mut[Int, _] = 0 in (cnt := 1)` carries `Mut` only on the
+/// dead mutable variable `let cnt: Mut(Int, _) = 0 in (cnt := 1)` carries `Mut` only on the
 /// `Let` binding (the `MutWrite` target is a bare `Name`, the value is `Int`,
 /// the `Let` node's type is `Unit`). The strict checker inspects binder types
 /// (`check_binder`), so the selector must too, or it under-detects and drives
@@ -865,7 +865,7 @@ fn peel_mut(ty: &Type) -> Option<(&Type, &Type)> {
 ///
 /// Rule 3 treats such an annotation as *unspecified*: it names no concrete
 /// type, so it does not disambiguate a value-copy from a mutable-variable re-seed the way
-/// `b: Int = a` / `b: Mut[Int] := a` do.
+/// `b: Int = a` / `b: Mut(Int) := a` do.
 fn annotation_peels_to_hole(ty: &Type) -> bool {
     match ty {
         Type::Hole => true,
@@ -961,7 +961,7 @@ fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
     // Rule 3: an *unspecified* binder whose resolved type is a mutable variable is an
     // alias (`b = a`) — rejected, to force disambiguation between copying the
     // value and seeding a new mutable variable. A *concrete* annotation is a deliberate
-    // choice and is allowed: `y: Mut[V] := cnt` seeds a new mutable variable (the `:=`
+    // choice and is allowed: `y: Mut(V) := cnt` seeds a new mutable variable (the `:=`
     // binder carries a `Mut` annotation); `y: Int = cnt` copies the value. The
     // value-copy's slot can still *coalesce* to `Mut`
     // (coalesce mirrors the RHS node's `Mut` type onto the binding slot, and the
@@ -1028,7 +1028,7 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
     // — a bare variable whose own (peeled) type is `Mut`. A non-variable (a
     // computed/selected `Mut`) has no single introduction to trace; a bare
     // variable of *non*-`Mut` type is a plain value that the lenient
-    // pass-by-reference coercion (`V <: Mut[V, D]`) would otherwise let a callee
+    // pass-by-reference coercion (`V <: Mut(V, D)`) would otherwise let a callee
     // "mutate" in name only, since the caller holds no mutable variable to observe the
     // write. Both break the design's "a `Mut` argument is a `Mut`-introduced
     // variable" guarantee.
@@ -1099,7 +1099,7 @@ pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<InferError>> {
 }
 
 /// Whether a binder denotes a mutable variable. An **explicit annotation is
-/// authoritative**: `x := e` and pass-by-reference `Mut[…]` parameters stamp
+/// authoritative**: `x := e` and pass-by-reference `Mut(…)` parameters stamp
 /// `Mut` on `user_annotation` (while the coalesced `.ty` slot is the value type
 /// — reads deref), and a *non-`Mut`* annotation (`y: int = x`) declares a value,
 /// so the binding is not a mutable variable even if a write-site demand coalesced its `.ty`
@@ -1562,7 +1562,7 @@ mod tests {
     /// A `MutWrite` to a `Mut`-typed binding is accepted.
     #[test]
     fn mut_write_to_mutable_ok() {
-        // let x : Mut[Int, _] = 0 in (x := 5)  =>  Ok
+        // let x : Mut(Int, _) = 0 in (x := 5)  =>  Ok
         let expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: "x".into(),

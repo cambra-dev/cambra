@@ -150,7 +150,7 @@ fn drive_single_int(code: &str) -> i64 {
 fn leading_deny_converges_no_stall() {
     // r=0 denies (guard `r != 0` false); r=1 commits q:=2; r=2 commits q:=3.
     let v = drive_single_int(
-        "out = defer()\nq: Mut[int, Txn] := 0\nfor r in [0, 1, 2]:\n    with begin():\n        if r != 0:\n            q := r + 1\nwith begin():\n    out << q\nout",
+        "out = defer()\nq: Mut(Int, Txn) := 0\nfor r in [0, 1, 2]:\n    with begin():\n        if r != 0:\n            q := r + 1\nwith begin():\n    out << q\nout",
     );
     assert!(
         [0, 2, 3].contains(&v),
@@ -164,7 +164,7 @@ fn leading_deny_converges_no_stall() {
 #[test]
 fn middle_deny_converges_no_stall() {
     let v = drive_single_int(
-        "out = defer()\nq: Mut[int, Txn] := 0\nfor r in [1, 0, 2]:\n    with begin():\n        if r != 0:\n            q := r + 1\nwith begin():\n    out << q\nout",
+        "out = defer()\nq: Mut(Int, Txn) := 0\nfor r in [1, 0, 2]:\n    with begin():\n        if r != 0:\n            q := r + 1\nwith begin():\n    out << q\nout",
     );
     assert!(
         [0, 2, 3].contains(&v),

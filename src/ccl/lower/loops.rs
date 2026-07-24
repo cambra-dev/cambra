@@ -256,7 +256,7 @@ fn lower_for_body_stmts(
                 if mut_annotation_parts(annotation).is_some() {
                     return Err(LoweringError::unsupported(
                         stmt.span,
-                        "a `Mut[…]` declaration inside a for-loop body is not \
+                        "a `Mut(…)` declaration inside a for-loop body is not \
                          supported; declare the accumulator before the loop",
                     ));
                 }
@@ -636,7 +636,7 @@ pub(super) fn lower_direct_mirror_loop(
                 // an accumulator is a `MutWrite` (the recurrence the phase
                 // threads); a `:=` to any other name is a per-iteration local
                 // `let`. An annotated `:=` intro inside the loop is rejected, like
-                // the `Mut[…]` declaration below — accumulators are declared
+                // the `Mut(…)` declaration below — accumulators are declared
                 // before the loop.
                 ChlStmt::MutAssign {
                     target,
@@ -662,7 +662,7 @@ pub(super) fn lower_direct_mirror_loop(
                 // `y: T = value` — an ordinary annotated per-iteration local, the
                 // annotated counterpart of the plain `y = value` binding above.
                 // Lowers to an annotated shadowing `let` (never a `MutWrite`: a
-                // `Mut[…]` accumulator must be declared *before* the loop, matching
+                // `Mut(…)` accumulator must be declared *before* the loop, matching
                 // `lower_for_body_stmts`).
                 ChlStmt::AnnAssign {
                     target,
@@ -673,7 +673,7 @@ pub(super) fn lower_direct_mirror_loop(
                     if mut_annotation_parts(annotation).is_some() {
                         return Err(LoweringError::unsupported(
                             stmt.span,
-                            "a `Mut[…]` declaration inside a for-loop body is not \
+                            "a `Mut(…)` declaration inside a for-loop body is not \
                              supported; declare the accumulator before the loop",
                         ));
                     }
@@ -956,7 +956,7 @@ in guarded_let"
     /// A `with begin():` block that neither writes a transactional register nor
     /// feeds a read does nothing observable and is rejected. Covers standalone,
     /// middle, and loop-body positions — here `x`/`y` are plain locals, not
-    /// `Mut[_, Txn]` stores, and there is no feed.
+    /// `Mut(_, Txn)` stores, and there is no feed.
     #[test]
     fn test_with_begin_requires_effect() {
         for code in [
@@ -974,12 +974,12 @@ in guarded_let"
         }
     }
 
-    /// `store: Mut[int, Txn] := 0` lowers as a plain `let store = 0`, registering
+    /// `store: Mut(Int, Txn) := 0` lowers as a plain `let store = 0`, registering
     /// `store` transactional. A *bare* trailing read is then rejected — a
     /// transactional register may be read only inside a `with begin():` block.
     #[test]
     fn test_mut_txn_bare_read_rejected() {
-        let stmts = parse_module("store: Mut[int, Txn] := 0\nstore");
+        let stmts = parse_module("store: Mut(Int, Txn) := 0\nstore");
         let err = expect_one_lowering_error(&stmts);
         let LoweringError::Unsupported { message: msg, .. } = &err;
         assert!(

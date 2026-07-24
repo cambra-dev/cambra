@@ -157,7 +157,7 @@ pub(super) fn lower_call(
 /// variable reference"), so it is lowered directly to a `Var` — bypassing the
 /// out-of-block transactional read gate in [`super::lower_expr`]. Whether it is
 /// a by-reference mutable-variable pass (e.g. `transfer(a, b, amt)` for
-/// `a: Mut[_, Txn]`) or an ordinary value read is decided downstream by the
+/// `a: Mut(_, Txn)`) or an ordinary value read is decided downstream by the
 /// callee's inferred parameter type; lowering cannot know the signature (it runs
 /// before inference). A non-bare argument is a computed value expression and
 /// lowers through [`super::lower_expr`], where the gate still applies.

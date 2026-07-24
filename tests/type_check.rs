@@ -332,14 +332,14 @@ fn test_tuple_index() {
 #[rstest]
 #[case::literal(
     r"
-x: int = 2
+x: Int = 2
 x
 ",
     BaseType::Int
 )]
 #[case::expr(
     r"
-x: int = 1 + 2
+x: Int = 1 + 2
 x
 ",
     BaseType::Int
@@ -364,10 +364,10 @@ fn test_ann_assign_ok(#[case] code: &str, #[case] expected: BaseType) {
 
 #[test]
 fn test_ann_assign_mismatch() {
-    // x: str = 2; x — mismatch: annotation says String but value is Int
+    // x: String = 2; x — mismatch: annotation says String but value is Int
     let err = infer_program_err(
         r#"
-x: str = 2
+x: String = 2
 x
 "#
         .trim(),

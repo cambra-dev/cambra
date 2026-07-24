@@ -1,6 +1,6 @@
-//! Transactional stores (`Mut[V, Txn]` + `with begin():`) — the commit-operator
+//! Transactional stores (`Mut(V, Txn)` + `with begin():`) — the commit-operator
 //! path. Batch (finite-loop and standalone) single-variable transactions run
-//! end-to-end: `x: Mut[V, Txn]` folds into one shared commit store, each `with
+//! end-to-end: `x: Mut(V, Txn)` folds into one shared commit store, each `with
 //! begin():` block is a writer. A transactional register is read only inside a
 //! `with begin():` block; the batch tests read a value with a trailing standalone
 //! read-only transaction (`out = defer(); …; with begin(): out << x`) and assert
@@ -12,7 +12,7 @@
 //! the one-element as-of stream at position 0, which under the batch scheduler
 //! observes the drained store (a scheduling coincidence, not a promise).
 //! Translated from the prototype's transaction suite (its `txn x = e` introducer
-//! is the `x: Mut[V, Txn] := e` annotation here).
+//! is the `x: Mut(V, Txn) := e` annotation here).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -87,7 +87,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::counter(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         for r in [10, 20, 30]:
             with begin():
                 pool := pool - r
@@ -102,7 +102,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::two_writers(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         for r in [30]:
             with begin():
                 pool := pool - r
@@ -120,7 +120,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::multi_stmt(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         for r in [30]:
             with begin():
                 fee = r // 10
@@ -142,7 +142,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::computed_init(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := sum([40, 30, 30])
+        pool: Mut(Int, Txn) := sum([40, 30, 30])
         for r in [60]:
             with begin():
                 pool := pool - r
@@ -159,7 +159,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::source_bound_after_store(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         reqs = [10, 20, 30]
         for r in reqs:
             with begin():
@@ -175,7 +175,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::standalone_single(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         with begin():
             pool := pool - 10
         with begin():
@@ -188,7 +188,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::standalone_sequential(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         with begin():
             pool := pool - 10
         with begin():
@@ -204,7 +204,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::standalone_then_loop(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         with begin():
             pool := pool - 1
         for r in [10, 20]:
@@ -222,7 +222,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::multi_writer_contention(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         for r in [10, 20]:
             with begin():
                 pool := pool - r
@@ -239,7 +239,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::three_writers(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         for r in [10]:
             with begin():
                 pool := pool - r
@@ -261,7 +261,7 @@ fn check_compile_error(code: &str, needle: &str) {
 #[case::multi_writer_grant_deny(
     indoc! {r#"
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         for r in [60]:
             with begin():
                 if pool >= r:
@@ -293,8 +293,8 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 #[case::multi_var(
     indoc! {r#"
         out = defer()
-        a: Mut[int, Txn] := 0
-        b: Mut[int, Txn] := 0
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
         for x in [1, 2, 3]:
             with begin():
                 a := a + x
@@ -310,8 +310,8 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 #[case::multi_var_cross_read(
     indoc! {r#"
         out = defer()
-        a: Mut[int, Txn] := 5
-        b: Mut[int, Txn] := 0
+        a: Mut(Int, Txn) := 5
+        b: Mut(Int, Txn) := 0
         for x in [1, 2, 3]:
             with begin():
                 b := b + a
@@ -327,8 +327,8 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 #[case::read_your_writes_cross_key(
     indoc! {r#"
         out = defer()
-        a: Mut[int, Txn] := 0
-        b: Mut[int, Txn] := 0
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
         for x in [1, 2, 3]:
             with begin():
                 a := a + x
@@ -344,7 +344,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 #[case::read_your_writes_same_key(
     indoc! {r#"
         out = defer()
-        a: Mut[int, Txn] := 0
+        a: Mut(Int, Txn) := 0
         for x in [10, 20]:
             with begin():
                 a := a + x
@@ -360,8 +360,8 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 #[case::multi_var_readonly_key(
     indoc! {r#"
         out = defer()
-        limit: Mut[int, Txn] := 25
-        total: Mut[int, Txn] := 0
+        limit: Mut(Int, Txn) := 25
+        total: Mut(Int, Txn) := 0
         for x in [10, 20, 30]:
             with begin():
                 if total + x <= limit:
@@ -377,8 +377,8 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 #[case::multi_writer_disjoint_keys(
     indoc! {r#"
         out = defer()
-        a: Mut[int, Txn] := 0
-        b: Mut[int, Txn] := 0
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
         for x in [1, 2]:
             with begin():
                 a := a + x
@@ -398,9 +398,9 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 #[case::multi_writer_overlapping_keys(
     indoc! {r#"
         out = defer()
-        a: Mut[int, Txn] := 0
-        b: Mut[int, Txn] := 0
-        c: Mut[int, Txn] := 0
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        c: Mut(Int, Txn) := 0
         for x in [1, 2]:
             with begin():
                 a := a + x
@@ -421,9 +421,9 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 #[case::read_three_vars_one_snapshot(
     indoc! {r#"
         out = defer()
-        a: Mut[int, Txn] := 0
-        b: Mut[int, Txn] := 0
-        c: Mut[int, Txn] := 0
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        c: Mut(Int, Txn) := 0
         for x in [1, 2, 3]:
             with begin():
                 a := a + x
@@ -469,7 +469,7 @@ fn progress_feed_inside_tx() {
     check_tile(
         indoc! {r#"
             out = defer()
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             for r in [10, 20, 30]:
                 with begin():
                     pool := pool - r
@@ -489,7 +489,7 @@ fn progress_feed_grant_deny() {
     check_tile(
         indoc! {r#"
             out = defer()
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             for r in [70, 50]:
                 with begin():
                     if pool >= r:
@@ -523,7 +523,7 @@ fn bool_valued_store() {
     check_tile(
         indoc! {r#"
             out = defer()
-            flag: Mut[bool, Txn] := False
+            flag: Mut(Bool, Txn) := False
             for x in [1, 2]:
                 with begin():
                     flag := True
@@ -541,7 +541,7 @@ fn string_valued_store() {
     check_tile(
         indoc! {r#"
             out = defer()
-            name: Mut[str, Txn] := "init"
+            name: Mut(String, Txn) := "init"
             for x in [1, 2]:
                 with begin():
                     name := "bob"
@@ -567,8 +567,8 @@ fn two_reply_feeds_one_transaction() {
         indoc! {r#"
             outa = defer()
             outb = defer()
-            a: Mut[int, Txn] := 0
-            b: Mut[int, Txn] := 0
+            a: Mut(Int, Txn) := 0
+            b: Mut(Int, Txn) := 0
             for x in [1, 2, 3]:
                 with begin():
                     a := a + x
@@ -640,7 +640,7 @@ fn multi_writer_single_defer_feed() {
     // pool is conserved (final 70).
     let tile = run_pipeline(indoc! {r#"
             out = defer()
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
                     pool := pool - r
@@ -663,7 +663,7 @@ fn three_writers_single_defer_feed() {
     // (final 40 = 100 − 10 − 20 − 30).
     let tile = run_pipeline(indoc! {r#"
             out = defer()
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
                     pool := pool - r
@@ -691,7 +691,7 @@ fn three_writers_single_defer_feed() {
 fn grant_deny_two_writers_single_commit() {
     let tile = run_pipeline(indoc! {r#"
             out = defer()
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             for r in [70]:
                 with begin():
                     if pool >= r:
@@ -734,7 +734,7 @@ fn sustained_contention_conserves_pool() {
     let ones = "[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]";
     let code = formatdoc! {"
         out = defer()
-        pool: Mut[int, Txn] := 1000
+        pool: Mut(Int, Txn) := 1000
         for r in {ones}:
             with begin():
                 pool := pool - r
@@ -758,7 +758,7 @@ fn sustained_contention_conserves_pool() {
 fn bare_txn_read_outside_tx_rejected() {
     check_compile_error(
         indoc! {r#"
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             with begin():
                 pool := pool - 10
             pool
@@ -777,7 +777,7 @@ fn computed_live_cross_endpoint_read_compiles() {
     let code = indoc! {r#"
         set_reqs, set_resps = http_serve("0", "POST", "/s")
         get_reqs, get_resps = http_serve("0", "GET", "/g")
-        last: Mut[int, Txn] := 0
+        last: Mut(Int, Txn) := 0
         for msg in set_reqs:
             with begin():
                 last := last + 1
@@ -803,7 +803,7 @@ fn live_read_combining_request_and_store_compiles() {
     let code = indoc! {r#"
         set_reqs, set_resps = http_serve("0", "POST", "/set")
         get_reqs, get_resps = http_serve("0", "GET", "/get")
-        a: Mut[str, Txn] := "a0"
+        a: Mut(String, Txn) := "a0"
         for msg in set_reqs:
             with begin():
                 a := msg
@@ -835,7 +835,7 @@ fn live_reply_combines_request_and_store() {
 
     let code = indoc! {r#"
         resps = defer()
-        store: Mut[int, Txn] := 0
+        store: Mut(Int, Txn) := 0
         for r in [10, 20, 30]:
             with begin():
                 store := store + r
@@ -881,7 +881,7 @@ fn live_reply_combines_request_and_store() {
 fn old_tx_marker_rejected() {
     check_compile_error(
         indoc! {r#"
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             with tx():
                 pool := pool - 10
         "#},
@@ -894,7 +894,7 @@ fn old_tx_marker_rejected() {
 fn nested_transactions_rejected() {
     check_compile_error(
         indoc! {r#"
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             with begin():
                 with begin():
                     pool := pool - 1
@@ -911,8 +911,8 @@ fn nested_transactions_rejected() {
 fn tx_if_else_with_writes_rejected() {
     check_compile_error(
         indoc! {r#"
-            a: Mut[int, Txn] := 0
-            b: Mut[int, Txn] := 0
+            a: Mut(Int, Txn) := 0
+            b: Mut(Int, Txn) := 0
             for x in [1, 2, 3]:
                 with begin():
                     if x >= 2:
@@ -929,7 +929,7 @@ fn tx_if_else_with_writes_rejected() {
 fn tx_if_elif_rejected() {
     check_compile_error(
         indoc! {r#"
-            a: Mut[int, Txn] := 0
+            a: Mut(Int, Txn) := 0
             for x in [1, 2, 3]:
                 with begin():
                     if x >= 3:
@@ -950,8 +950,8 @@ fn tx_if_elif_rejected() {
 fn multiple_if_guards_in_block_rejected() {
     check_compile_error(
         indoc! {r#"
-            a: Mut[int, Txn] := 0
-            b: Mut[int, Txn] := 0
+            a: Mut(Int, Txn) := 0
+            b: Mut(Int, Txn) := 0
             out = defer()
             for r in [5]:
                 with begin():
@@ -968,7 +968,7 @@ fn multiple_if_guards_in_block_rejected() {
 }
 
 /// `Txn` is never inferred: a transactional register must be spelled
-/// `Mut[V, Txn]`. A fully-inferred bare `:=` mutable variable is an *induction* accumulator, so
+/// `Mut(V, Txn)`. A fully-inferred bare `:=` mutable variable is an *induction* accumulator, so
 /// writing it inside a `with begin():` block is rejected — the block did not
 /// silently promote it to a `Txn` register.
 #[test]
@@ -984,7 +984,7 @@ fn txn_domain_never_inferred() {
     );
 }
 
-/// C2: an induction accumulator (`Mut[…]`, non-`Txn`) written inside a `with
+/// C2: an induction accumulator (`Mut(…)`, non-`Txn`) written inside a `with
 /// begin():` block is rejected at lowering — `transact_phase` folds only
 /// transactional writes, so an induction write would be silently swallowed
 /// (a block-local shadow that dies at block end, computing `[0, 0, …]`).
@@ -992,7 +992,7 @@ fn txn_domain_never_inferred() {
 fn induction_write_inside_begin_block_rejected() {
     check_compile_error(
         indoc! {r#"
-            cnt: Mut[int] := 0
+            cnt: Mut(Int) := 0
             with begin():
                 cnt := cnt + 1
             cnt
@@ -1010,8 +1010,8 @@ fn induction_write_inside_begin_block_rejected() {
 fn guarded_induction_write_inside_begin_block_rejected() {
     check_compile_error(
         indoc! {r#"
-            pool: Mut[int, Txn] := 100
-            cnt: Mut[int] := 0
+            pool: Mut(Int, Txn) := 100
+            cnt: Mut(Int) := 0
             for r in [10, 20]:
                 with begin():
                     pool := pool - r
@@ -1030,7 +1030,7 @@ fn guarded_induction_write_inside_begin_block_rejected() {
 fn out_of_block_txn_write_rejected() {
     check_compile_error(
         indoc! {r#"
-            store: Mut[int, Txn] := 100
+            store: Mut(Int, Txn) := 100
             store := 50
             0
         "#},
@@ -1038,14 +1038,14 @@ fn out_of_block_txn_write_rejected() {
     );
 }
 
-/// C3, by-reference flavor: a `Mut[_, Txn]` writer body that assigns its register
+/// C3, by-reference flavor: a `Mut(_, Txn)` writer body that assigns its register
 /// *without* a `with begin():` block is rejected at lowering of the body.
 #[test]
 fn by_ref_txn_write_without_block_rejected() {
     check_compile_error(
         indoc! {r#"
-            store: Mut[int, Txn] := 0
-            def w(p: Mut[int, Txn]):
+            store: Mut(Int, Txn) := 0
+            def w(p: Mut(Int, Txn)):
                 p := 50
             w(store)
             0
@@ -1064,8 +1064,8 @@ fn txn_writer_called_inside_block_rejected() {
     check_compile_error(
         indoc! {r#"
             out = defer()
-            pool: Mut[int, Txn] := 100
-            def do_it(p: Mut[int, Txn]):
+            pool: Mut(Int, Txn) := 100
+            def do_it(p: Mut(Int, Txn)):
                 with begin():
                     p := p - 10
             with begin():
@@ -1080,7 +1080,7 @@ fn txn_writer_called_inside_block_rejected() {
 }
 
 /// PR-2 registry leak (same class as PR-1's mutable-registry leak): a
-/// `Mut[_, Txn]` register declared *inside* a `def` body must not leak into the
+/// `Mut(_, Txn)` register declared *inside* a `def` body must not leak into the
 /// transactional registry and falsely gate a like-spelled top-level local. The
 /// def-body scope snapshots and restores *both* register registries, so `reg`
 /// outside `f` is an ordinary local (assignable, readable).
@@ -1089,7 +1089,7 @@ fn txn_register_in_def_body_does_not_leak_to_outer_local() {
     check_scalar(
         indoc! {r#"
             def f(x):
-                reg: Mut[int, Txn] := 0
+                reg: Mut(Int, Txn) := 0
                 x
             reg = 5
             reg
@@ -1105,7 +1105,7 @@ fn txn_register_in_def_body_does_not_leak_to_outer_local() {
 fn transaction_handle_binding_rejected() {
     check_compile_error(
         indoc! {r#"
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             for r in [10]:
                 with t = begin():
                     pool := pool - r
@@ -1122,7 +1122,7 @@ fn transaction_handle_binding_rejected() {
 fn bare_register_arg_to_ordinary_fn_is_gated() {
     check_compile_error(
         indoc! {r#"
-            store: Mut[int, Txn] := 0
+            store: Mut(Int, Txn) := 0
             def f(x):
                 x + 1
             f(store)
@@ -1132,7 +1132,7 @@ fn bare_register_arg_to_ordinary_fn_is_gated() {
 }
 
 // ---------------------------------------------------------------------------
-// Register identity is the `Mut[_, Txn]` type on the α-unique binding, not the
+// Register identity is the `Mut(_, Txn)` type on the α-unique binding, not the
 // surface base name — so a local variable merely *spelled* like a register is
 // not confused for it (A1: a compiler panic; A2: a spurious rejection).
 // ---------------------------------------------------------------------------
@@ -1149,7 +1149,7 @@ fn like_named_comprehension_var_does_not_panic() {
     check_tile(
         indoc! {r#"
             out = defer()
-            store: Mut[int, Txn] := 100
+            store: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
                     store := store - sum([store for store in [1, 2, 3]])
@@ -1172,7 +1172,7 @@ fn like_named_loop_var_is_not_a_store_read() {
     check_tile(
         indoc! {r#"
             out = defer()
-            store: Mut[int, Txn] := 0
+            store: Mut(Int, Txn) := 0
             for store in [1, 2, 3]:
                 out << store + 1
             out
@@ -1192,8 +1192,8 @@ fn mixed_txn_and_induction_reply_reads_accumulator() {
     check_tile(
         indoc! {r#"
             resps = defer()
-            store: Mut[int, Txn] := 0
-            cnt: Mut[int] := 0
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 with begin():
                     store := store + r
@@ -1214,8 +1214,8 @@ fn mixed_txn_and_induction_store_accumulates() {
     check_tile(
         indoc! {r#"
             out = defer()
-            store: Mut[int, Txn] := 0
-            cnt: Mut[int] := 0
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 with begin():
                     store := store + r
@@ -1239,8 +1239,8 @@ fn mixed_txn_and_induction_write_inside_block() {
     check_tile(
         indoc! {r#"
             resps = defer()
-            store: Mut[int, Txn] := 0
-            cnt: Mut[int] := 0
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 with begin():
                     store := store + r
@@ -1260,8 +1260,8 @@ fn mixed_txn_and_induction_write_inside_block_store_accumulates() {
     check_tile(
         indoc! {r#"
             out = defer()
-            store: Mut[int, Txn] := 0
-            cnt: Mut[int] := 0
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 with begin():
                     store := store + r
@@ -1285,8 +1285,8 @@ fn commit_decision_reads_induction_accumulator() {
     check_tile(
         indoc! {r#"
             out = defer()
-            store: Mut[int, Txn] := 0
-            cnt: Mut[int] := 0
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 cnt := cnt + 1
                 with begin():
@@ -1320,7 +1320,7 @@ fn commit_decision_reads_cross_loop_accumulator_broadcast() {
             for i in [1, 2, 3]:
                 cnt := cnt + 1
             out = defer()
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             for r in [10, 20]:
                 with begin():
                     pool := pool - cnt
@@ -1348,7 +1348,7 @@ fn broadcast_read_races_a_second_writer() {
             for i in [1, 2, 3]:
                 cnt := cnt + 1
             out = defer()
-            pool: Mut[int, Txn] := 100
+            pool: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
                     pool := pool - cnt
@@ -1379,7 +1379,7 @@ fn broadcast_off_async_source_sibling_loop() {
         for x in src():
             cnt := cnt + 1
         out = defer()
-        pool: Mut[int, Txn] := 100
+        pool: Mut(Int, Txn) := 100
         for r in [10]:
             with begin():
                 pool := pool - cnt
@@ -1432,8 +1432,8 @@ fn commit_decision_reads_induction_accumulator_with_reply() {
     check_tile(
         indoc! {r#"
             resps = defer()
-            store: Mut[int, Txn] := 0
-            cnt: Mut[int] := 0
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 cnt := cnt + 1
                 with begin():
@@ -1458,8 +1458,8 @@ fn commit_gated_reply_reading_induction_counter() {
     check_tile(
         indoc! {r#"
             resps = defer()
-            pool: Mut[int, Txn] := 100
-            cnt: Mut[int] := 0
+            pool: Mut(Int, Txn) := 100
+            cnt: Mut(Int) := 0
             for r in [70, 50, 20]:
                 cnt := cnt + 1
                 with begin():
@@ -1483,8 +1483,8 @@ fn commit_ordered_reply_reading_induction_counter() {
     check_tile(
         indoc! {r#"
             resps = defer()
-            store: Mut[int, Txn] := 0
-            cnt: Mut[int] := 0
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 cnt := cnt + 1
                 with begin():
@@ -1508,7 +1508,7 @@ fn in_block_reply_with_deny_is_dense() {
     check_tile(
         indoc! {r#"
             resp = defer()
-            q: Mut[int, Txn] := 0
+            q: Mut(Int, Txn) := 0
             for r in [0, 1, 2]:
                 with begin():
                     if r != 0:
@@ -1538,7 +1538,7 @@ fn live_read_progresses_past_deny() {
 
     let code = indoc! {r#"
         resps = defer()
-        total: Mut[int, Txn] := 0
+        total: Mut(Int, Txn) := 0
         for r in [10, 0, 20]:
             with begin():
                 if r != 0:
@@ -1611,23 +1611,23 @@ fn live_read_progresses_past_deny() {
 }
 
 /// Cross-function transactional writer: `def transfer(src, dst, amt)` writes two
-/// `Mut[_, Txn]` registers inside one `with begin():` block. Inlining
+/// `Mut(_, Txn)` registers inside one `with begin():` block. Inlining
 /// beta-reduces the call so the writes name the caller's `a`/`b` bindings, which
 /// `collect_txn_registers` finds on the inlined, typed tree (the whole point of
-/// keying register identity by the `Mut[_, Txn]` type, not a base name). After
+/// keying register identity by the `Mut(_, Txn)` type, not a base name). After
 /// `transfer(a, b, 30)`: `a` = 100 − 30 = 70, `b` = 0 + 30 = 30 — the trailing
 /// read-only transaction reads `a + b` = 100, the conserved total.
 #[test]
 fn cross_function_transfer_conserves_total() {
     check_tile(
         indoc! {r#"
-            def transfer(src: Mut[int, Txn], dst: Mut[int, Txn], amt):
+            def transfer(src: Mut(Int, Txn), dst: Mut(Int, Txn), amt):
                 with begin():
                     src := src - amt
                     dst := dst + amt
             out = defer()
-            a: Mut[int, Txn] := 100
-            b: Mut[int, Txn] := 0
+            a: Mut(Int, Txn) := 100
+            b: Mut(Int, Txn) := 0
             transfer(a, b, 30)
             with begin():
                 out << a + b
@@ -1637,8 +1637,8 @@ fn cross_function_transfer_conserves_total() {
     );
 }
 
-// A heterogeneous multi-key register: a `Mut[str, Txn]` and a
-// `Mut[int, Txn]` committed together in one block. Regression for the
+// A heterogeneous multi-key register: a `Mut(String, Txn)` and a
+// `Mut(Int, Txn)` committed together in one block. Regression for the
 // register-wide value extent (`build_commit_store`), which is the union of the
 // distinct per-key extents rather than whichever key was iterated last —
 // reading either key returns its own type. `label` is declared first, so a
@@ -1649,8 +1649,8 @@ fn heterogeneous_multi_key_store_reads_string_key() {
     check_tile(
         indoc! {r#"
             out = defer()
-            label: Mut[str, Txn] := "init"
-            count: Mut[int, Txn] := 0
+            label: Mut(String, Txn) := "init"
+            count: Mut(Int, Txn) := 0
             for x in [1, 2, 3]:
                 with begin():
                     count := count + x
