@@ -6,7 +6,12 @@ ci_fmt() {
   if ((fix)); then cargo fmt; fi
   cargo fmt --check
 }
-# --all-targets lints test code too and warms the cache for cargo test
+# --all-targets lints the test/example/bench code too, not just the lib. It does
+# *not* speed up the later `cargo test` compile: clippy runs via clippy-driver,
+# which cargo fingerprints separately from plain rustc, so `test` rebuilds those
+# targets regardless. That extra target-checking is why `ci_fast` drops
+# `--all-targets` for the local iteration loop (it is kept here so the full gate
+# still lints test code).
 ci_clippy() { cargo clippy --all-targets -- -D warnings; }
 # Same lint, in release. The debug checks never compile the test target in
 # release, so a `#[cfg(debug_assertions)]`-gated item referenced by ungated code
@@ -26,6 +31,28 @@ ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a 
 ci_doc_refs() {
   python3 .github/scripts/doc-refs/test_check_doc_refs.py
   python3 .github/scripts/doc-refs/check_doc_refs.py
+}
+
+# Fast inner-loop gate for local iteration: format, lint (debug, lib+bins only),
+# and test. Deliberately skips the phases whose cost is compile-bound and rarely
+# relevant mid-iteration — the *release* clippy pass (~2x the debug one; only
+# catches `cfg(debug_assertions)`-gated breakage), the doc build, shellcheck, and
+# the doc-ref check — and drops clippy's `--all-targets` (see `ci_clippy`: it
+# doubles the debug clippy time to check test targets `cargo test` then rebuilds
+# anyway). Roughly a third of a full `./ci.sh` after a one-file edit. Run the
+# full `./ci.sh` before pushing — CI gates on everything, and the release clippy
+# pass in particular fails there if skipped locally. `--fix` still applies.
+ci_fast() {
+  local failed=0
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_fmt || failed=1
+  # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`.
+  # shellcheck disable=SC2310
+  { cargo clippy -- -D warnings; } || failed=1
+  # shellcheck disable=SC2310
+  ci_test || failed=1
+  exit "${failed}"
 }
 
 ci_all() {
