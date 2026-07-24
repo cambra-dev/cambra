@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
-use crate::ccl::symbolic::{symbolic, symbolic_typed};
+use crate::ccl::symbolic::symbolic;
 use crate::ccl::{Expr, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode};
 use crate::util::ScopeStack;
 
@@ -1160,20 +1160,33 @@ fn check_mut_write_targets_go(
     expr.walk_children(|c| check_mut_write_targets_go(c, muts, errors));
 }
 
-/// In debug mode only, typecheck the expression and panic if any errors are found.
+/// Per-operation post-rewrite typecheck — a **debugging aid**, off by default.
 ///
-/// Routes through [`check_pre_desugar`], which self-selects strictness: a
+/// Pass-internal helpers (lambda elimination, substitution, simplify) call this
+/// after each rewrite to localize *which* operation first produced an ill-typed
+/// tree. Routes through [`check_pre_desugar`], which self-selects strictness: a
 /// (sub)tree carrying defer artifacts (a `Feed`/`Infer` channel type — which
 /// `substitute` now sees, since inline runs before desugar) is checked at the
 /// relaxed `PreDesugar` level; a fully-desugared tree is checked strictly (the
 /// `typecheck` bar).
+///
+/// Gated behind the opt-in `deep-typecheck` feature. `compile_program` already
+/// runs [`check_pre_desugar`] at every *pass boundary* — those walls are the
+/// always-on correctness net — so this per-op version only adds localization.
+/// It is O(subtree) and fires once per rewrite, so on nested comprehensions it
+/// is superlinear (O(rewrites) × O(subtree)) and dominated debug/test compile
+/// time; release built it out entirely. Enable it (`cargo test --features
+/// deep-typecheck`) to bisect a miscompile to its introducing operation.
 pub fn debug_typecheck(expr: &Expr) {
-    debug_assert_eq!(
+    #[cfg(feature = "deep-typecheck")]
+    assert_eq!(
         check_pre_desugar(expr),
         Ok(()),
         "Failed post-transform typecheck: {}",
-        symbolic_typed(expr)
+        crate::ccl::symbolic::symbolic_typed(expr)
     );
+    #[cfg(not(feature = "deep-typecheck"))]
+    let _ = expr;
 }
 
 // Helper to run typechecking inline when building an Expr

@@ -15,6 +15,16 @@ readme = "README.md"
 # to a crate's dev-dependencies to enable.
 test-helpers = []
 
+# Run the *per-operation* post-rewrite typecheck ([`debug_typecheck`]) that
+# pass-internal helpers (lambda elimination, substitution, simplify) invoke
+# after each rewrite. It is a debugging aid that localizes *which* operation
+# first produced an ill-typed tree; `compile_program`'s pass-boundary
+# `check_pre_desugar` walls remain the always-on correctness net. Off by default
+# (even in debug): the check is O(subtree) and fires per rewrite, so on nested
+# comprehensions it was superlinear and dominated debug/test compile time.
+# Enable when bisecting a miscompile: `cargo test --features deep-typecheck`.
+deep-typecheck = []
+
 [dev-dependencies]
 microbench = "0.5.0"
 rstest = { version = "0.26.1", features = ["async-timeout"] }
