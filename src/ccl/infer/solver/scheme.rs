@@ -267,9 +267,7 @@ fn freshen_refinement_predicate(
 ) -> Refinement {
     let mut pred = (*r.predicate).clone();
     freshen_expr_type_slots(&mut pred, lim, target, cache);
-    Refinement {
-        predicate: Rc::new(pred),
-    }
+    Refinement::born(Rc::new(pred))
 }
 
 /// Freshen every type slot reachable from an expression — `expr.ty`, the user

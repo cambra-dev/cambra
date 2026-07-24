@@ -295,12 +295,7 @@ pub(crate) mod test_helpers {
     /// predicate.  The predicate must have type `base ⇒ Bool` so the
     /// refinement is well-formed.
     pub(crate) fn refined_ty(base: Type, predicate: Expr) -> Type {
-        Type::Refinement(
-            Box::new(base),
-            Refinement {
-                predicate: Rc::new(predicate),
-            },
-        )
+        Type::Refinement(Box::new(base), Refinement::born(Rc::new(predicate)))
     }
 
     /// Build an `Apply { argument, function: <builtin> }` whose function

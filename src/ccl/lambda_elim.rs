@@ -791,9 +791,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let pred_on_source = typed_compose(vec![target_elim.clone(), pred_elem]);
             let source_domain = target_elim.ty.domain().unwrap();
             let source_codomain = target_elim.ty.codomain().unwrap();
-            let refinement = Refinement {
-                predicate: Rc::new(pred_on_source),
-            };
+            let refinement = Refinement::born(Rc::new(pred_on_source));
             let refined_domain = Type::Refinement(Box::new(source_domain), refinement);
             let refined_source = target_elim.with_ty(Type::fun(refined_domain, source_codomain));
             let body_elim = elim_lambda(ctx, &param.name, &param.ty, true_body)?;
@@ -1303,7 +1301,8 @@ mod tests {
             BinOpKind::Compare(CompareKind::Greater),
             Expr::var("x"),
         ));
-        let refinement = Refinement { predicate: pred };
+        // A predicate this call site is creating, so `born` — see `Refinement`.
+        let refinement = Refinement::born(pred);
 
         // Tuple([Int, {Int | __elem > x}]): the predicate rides only the second
         // component, so `any`-vs-`all` is observable.

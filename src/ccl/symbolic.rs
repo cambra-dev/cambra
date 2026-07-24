@@ -800,9 +800,7 @@ in x"
             "x",
             Type::Refinement(
                 Box::new(Type::Base(BaseType::Int)),
-                Refinement {
-                    predicate: Rc::new(Expr::lit(Lit::Bool(true))),
-                },
+                Refinement::born(Rc::new(Expr::lit(Lit::Bool(true)))),
             ),
             Expr::var("x"),
         ),

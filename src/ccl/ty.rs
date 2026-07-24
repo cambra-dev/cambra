@@ -582,6 +582,18 @@ pub struct Refinement {
     /// `Rc` sharing keeps that cheap); nothing mutates a predicate in place,
     /// so a predicate that flows around is never resolved out from under a
     /// hash key.
+    ///
+    /// **Rewriting predicates in a pass? Do not assign a freshly-built `Rc`
+    /// here per occurrence.** One predicate term rides many type slots as a
+    /// *shared* `Rc` (a comprehension's filtered domain appears on its source,
+    /// map, cast, and consumer-contract types); rebuilding each occurrence
+    /// independently splits that sharing, and while that's invisible to
+    /// correctness it makes planning recompile one predicate once per
+    /// occurrence — superlinearly, on nested comprehensions. Route rewrites
+    /// through [`crate::ccl::ccl_utils::walk_refined_predicates_mut`] /
+    /// [`crate::ccl::ccl_utils::PredMemo`], which preserve the sharing across a
+    /// pass. Use [`Refinement::born`] only for a genuinely *new* predicate.
+    /// Guarded by `tests/predicate_sharing.rs`.
     pub predicate: Rc<TypedExpr>,
 }
 
@@ -603,6 +615,18 @@ pub type PredicateId = *const TypedExpr;
 pub const REFINEMENT_BINDER: &str = "__elem";
 
 impl Refinement {
+    /// Construct a refinement over a **genuinely new** predicate term — one this
+    /// call site is *creating*, with no prior refinement identity to preserve
+    /// (a freshly-emitted filter, a synthesized loop-join condition, a compiled
+    /// predicate). Prefer this to a `Refinement { predicate }` literal so the
+    /// intent is legible: `born` is *wrong* for a **rewrite** of an existing
+    /// predicate, which must instead flow through
+    /// [`crate::ccl::ccl_utils::PredMemo`] to keep occurrences that shared one
+    /// `Rc` sharing one `Rc` (see the note on [`Refinement::predicate`]).
+    pub fn born(predicate: Rc<TypedExpr>) -> Self {
+        Refinement { predicate }
+    }
+
     /// The [`PredicateId`] of this refinement's predicate term.
     pub fn predicate_id(&self) -> PredicateId {
         Rc::as_ptr(&self.predicate)
