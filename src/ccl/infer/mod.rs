@@ -90,6 +90,7 @@ pub use schemes::OperatorSchemes;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ccl::FieldKey;
+use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::infer::solver::{CoalesceError, ConstrainError, prim};
 use crate::ccl::{BaseType, Lit, Type};
 
@@ -250,7 +251,23 @@ pub(crate) fn run(
     }
     // Stamp the resolved binder types onto free `Var` references a discharge
     // substituted into refinement predicates (see `retype_predicate_slots`).
-    retype_predicate_slots(expr, &HashMap::new());
+    //
+    // Sharing tripwire: `retype` is a *rewrite-only* pass (it restamps existing
+    // predicates, never introduces new refinement types), so the distinct
+    // predicate-`Rc` count is non-increasing across it. A regression that
+    // restamps each occurrence independently — instead of threading its
+    // `PredMemo` — would split the sharing and grow this count, tripping here at
+    // the exact phase. (Cheap: address-set arithmetic, debug builds only. The
+    // end-to-end guard is `tests/predicate_sharing.rs`.)
+    #[cfg(debug_assertions)]
+    let pred_rcs_before_retype = crate::ccl::ccl_utils::distinct_predicate_rcs(expr);
+    retype_predicate_slots(expr, &HashMap::new(), &mut PredMemo::new());
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        crate::ccl::ccl_utils::distinct_predicate_rcs(expr) <= pred_rcs_before_retype,
+        "retype split refinement-predicate `Rc` sharing (a rewrite-only pass must not \
+         increase the distinct-predicate count) — see `ccl_utils::PredMemo`",
+    );
     // Scope-validity check (design §6.2): every coalesced node's type is
     // well-formed in the lexical scope at that node — every free term-variable
     // of its refinement predicates is bound by an enclosing Pi binder
@@ -311,9 +328,7 @@ pub(crate) mod test_helpers {
         );
         Type::Refinement(
             Box::new(Type::Base(BaseType::Int)),
-            Refinement {
-                predicate: Rc::new(pred),
-            },
+            Refinement::born(Rc::new(pred)),
         )
     }
 

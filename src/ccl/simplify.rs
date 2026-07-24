@@ -47,9 +47,7 @@
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
 //! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
 
-use std::collections::HashMap;
-
-use crate::ccl::ccl_utils::{is_builtin, walk_refined_predicates_mut};
+use crate::ccl::ccl_utils::{PredMemo, is_builtin, walk_refined_predicates_mut};
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
 use crate::ccl::{
@@ -123,7 +121,17 @@ fn is_iteration(expr: &Expr) -> bool {
 /// nested-`Compose` leftovers from the hash-join rewrite's
 /// `replace_tuple_project_with_id`.)
 pub fn simplify(mut expr: Expr) -> Expr {
-    while simplify_once(&mut expr).0 {}
+    // One [`PredMemo`] per `simplify_once` tree-walk (fresh each iteration, since
+    // the previous iteration's rebuilds are this one's origins): every
+    // occurrence of a shared predicate `Rc` in the tree simplifies once and
+    // stays shared. A fresh memo *per node* (the previous shape) re-shared only
+    // within a node and split the sharing across the tree.
+    loop {
+        let mut memo = PredMemo::new();
+        if !simplify_once(&mut expr, &mut memo).0 {
+            break;
+        }
+    }
     expr
 }
 
@@ -137,7 +145,7 @@ pub fn simplify(mut expr: Expr) -> Expr {
 ///   Passing it to [`apply_simplification_rules`] lets the discard-rule guard
 ///   read it in O(1) instead of re-scanning the whole subtree at every node —
 ///   the re-scan was O(n²) over the long compose chains planning emits.
-fn simplify_once(expr: &mut Expr) -> (bool, bool) {
+fn simplify_once(expr: &mut Expr, memo: &mut PredMemo) -> (bool, bool) {
     let mut changed = false;
     // A refinement's predicate is itself an immutable `Expr`; simplify *every*
     // predicate reachable from this node's type, rebuilding each as a fresh
@@ -148,10 +156,10 @@ fn simplify_once(expr: &mut Expr) -> (bool, bool) {
     // occurrences that shared a predicate term. A predicate's own iteration-containment is
     // irrelevant to the term-tree guard (`iterate` sources live in the term
     // tree, never inside predicates), so the iteration bit is discarded here.
-    walk_refined_predicates_mut(&mut expr.ty, &mut HashMap::new(), &mut |pred, _| {
-        changed |= simplify_once(pred).0;
+    walk_refined_predicates_mut(&mut expr.ty, memo, &mut |pred, memo| {
+        changed |= simplify_once(pred, memo).0;
     });
-    let (children_changed, children_have_iteration) = recurse_simplify(expr);
+    let (children_changed, children_have_iteration) = recurse_simplify(expr, memo);
     changed |= children_changed;
     let contains_iteration = children_have_iteration || is_iteration(expr);
     changed |= apply_simplification_rules(expr, contains_iteration);
@@ -163,9 +171,9 @@ fn simplify_once(expr: &mut Expr) -> (bool, bool) {
 /// Returns `(changed, contains_iteration)`: whether any child was modified,
 /// and whether any child's subtree contains an `iterate` source (OR-ed up so
 /// the parent need not re-scan its descendants).
-fn recurse_simplify(expr: &mut Expr) -> (bool, bool) {
+fn recurse_simplify(expr: &mut Expr, memo: &mut PredMemo) -> (bool, bool) {
     let (mut changed, has_iteration) = expr.fold_children_mut((false, false), |(c, it), e| {
-        let (child_changed, child_has_iteration) = simplify_once(e);
+        let (child_changed, child_has_iteration) = simplify_once(e, memo);
         (c | child_changed, it | child_has_iteration)
     });
     // After simplifying children, propagate the Let body's type up to the Let
