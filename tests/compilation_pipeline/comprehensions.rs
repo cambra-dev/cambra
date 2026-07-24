@@ -20,6 +20,15 @@ use crate::helpers::*;
 #[case("[42 for x in [10, 20]]", make_int_list(&[42, 42]))]
 #[case("[y for y in [x for x in [10, 20]]]", make_int_list(&[10, 20]))]
 #[case("[x + 2 for x in [10, 20]]", make_int_list(&[12, 22]))]
+// Nested *filtered* comprehensions (filter over a filtered comprehension). At
+// depth ≥3 this used to panic in lambda-elim: a refinement predicate carrying a
+// nested refinement over `__elem` made `is_free` mis-report the (bound) element
+// binder as free, tripping the "value-dependent dependent function" guard.
+#[case("[a for a in [b for b in [1, 2, 3, 4] if b < 3] if a < 3]", make_int_list(&[1, 2]))]
+#[case(
+    "[a for a in [b for b in [c for c in [1, 2, 3, 4] if c < 3] if b < 3] if a < 3]",
+    make_int_list(&[1, 2])
+)]
 fn test_comprehensions(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }

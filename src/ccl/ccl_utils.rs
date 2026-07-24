@@ -691,6 +691,17 @@ fn count_free_in_type_with_visited(
     ty: &Type,
     visited: &mut HashSet<PredicateId>,
 ) -> usize {
+    // The only variable a type can bind is the refinement element binder
+    // ([`crate::ccl::REFINEMENT_BINDER`]): it occurs *only* inside refinement
+    // predicates, and each such occurrence is bound by its enclosing refinement.
+    // So it is never free in a type — counting its (bound) occurrences would
+    // falsely report the binder as free, e.g. tripping lambda-elim's
+    // "value-dependent dependent function" guard when a predicate merely carries
+    // a nested refinement over `__elem`. Every *other* name in a predicate is a
+    // free reference to the enclosing lexical scope and is counted.
+    if name.is_elem() {
+        return 0;
+    }
     let mut count = 0;
     walk_refined_predicates(ty, visited, &mut |pred, vis| {
         count += count_free_with_visited(name, pred, vis);
