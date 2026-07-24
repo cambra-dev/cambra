@@ -736,13 +736,24 @@ impl Subst {
 
             Type::Refinement(base, r) => {
                 let original = r.predicate_id();
+                // The refinement implicitly binds REFINEMENT_BINDER in its bare
+                // predicate, so the substitution acts *under* that binder.
+                let restricted = self.shadow(&Name::elem());
                 if let Some(rebuilt) = memo.get(&original) {
                     r.predicate = Rc::clone(rebuilt);
+                } else if !restricted.0.keys().any(|k| is_free(k, &r.predicate)) {
+                    // Vacuous — no substituted binder occurs free in the
+                    // predicate — so keep the original `Rc`, leaving a predicate
+                    // this substitution doesn't touch *shared* across its
+                    // occurrences (mirrors [`Self::force_refinement`]'s transport
+                    // path). Without this, every `substitute` in a pass like
+                    // `lambda_elim` would rebuild every predicate it merely walks
+                    // past into a fresh `Rc`, splitting the sharing inference
+                    // established — the regression [`crate::ccl::ccl_utils::PredMemo`]
+                    // prevents on the memo side, here on the in-place-rewrite side.
                 } else {
-                    // The refinement implicitly binds REFINEMENT_BINDER in
-                    // its bare predicate, so rewrite under that binder.
                     let mut pred = (*r.predicate).clone();
-                    self.shadow(&Name::elem()).rewrite_expr_go(&mut pred, memo);
+                    restricted.rewrite_expr_go(&mut pred, memo);
                     let rebuilt = Rc::new(pred);
                     memo.insert(original, Rc::clone(&rebuilt));
                     r.predicate = rebuilt;

@@ -2148,9 +2148,7 @@ fn extract_for_defer(
                             let pred_lambda = Expr::lambda(&param.name, param.ty.clone(), pred);
                             let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
                                 .with_ty(Type::Base(BaseType::Bool));
-                            let refinement_struct = Refinement {
-                                predicate: Rc::new(pred_on_source),
-                            };
+                            let refinement_struct = Refinement::born(Rc::new(pred_on_source));
                             let mut refined_argument = new_argument.clone();
                             refine_source_domain(&mut refined_argument, refinement_struct, ctx);
                             // stamp the channel at
@@ -2363,9 +2361,8 @@ fn extract_for_defer(
                                         Expr::lambda(&param.name, param.ty.clone(), pred);
                                     let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
                                         .with_ty(Type::Base(BaseType::Bool));
-                                    let refinement_struct = Refinement {
-                                        predicate: Rc::new(pred_on_source),
-                                    };
+                                    let refinement_struct =
+                                        Refinement::born(Rc::new(pred_on_source));
                                     let mut refined_prefix = source_prefix.clone();
                                     refine_source_domain(
                                         &mut refined_prefix,

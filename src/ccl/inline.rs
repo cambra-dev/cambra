@@ -65,7 +65,8 @@
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
 use crate::ccl::{
-    Expr, Lit, Name, Refinement, Type, TypedExprNode, ccl_utils::walk_refined_predicates_mut,
+    Expr, Lit, Name, Refinement, Type, TypedExprNode,
+    ccl_utils::{PredMemo, walk_refined_predicates_mut},
     lambda_elim::substitute,
 };
 
@@ -550,7 +551,11 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
 /// substitution proper is the engine's job and runs inside
 /// [`inline_and_beta_reduce`] via `lambda_elim::substitute`.
 fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr) {
-    walk_refined_predicates_mut(ty, &mut std::collections::HashMap::new(), &mut |pred, _| {
+    // Per-call memo: `inline_in_type_predicates` runs on one node's type at a
+    // time, and only rebuilds predicates that actually contain the inlined
+    // binder, so it shares within a type but does not (need to) span the pass.
+    // A cross-node re-split here would be caught by `distinct_predicate_rcs`.
+    walk_refined_predicates_mut(ty, &mut PredMemo::new(), &mut |pred, _| {
         let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
         *pred = inline_and_beta_reduce(old, name, lambda);
     });
@@ -681,7 +686,7 @@ mod tests {
         use crate::ccl::Refinement;
         use std::rc::Rc;
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement { predicate: pred };
+        let refinement = Refinement::born(pred);
         let ty = Type::Refinement(Box::new(Type::Base(BaseType::Int)), refinement);
         assert!(!is_iterable_domain(&ty));
     }
@@ -691,7 +696,7 @@ mod tests {
         use crate::ccl::Refinement;
         use std::rc::Rc;
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement { predicate: pred };
+        let refinement = Refinement::born(pred);
         let ty = Type::Refinement(Box::new(Type::UIntRange(3)), refinement);
         assert!(is_iterable_domain(&ty));
     }
@@ -746,7 +751,7 @@ mod tests {
         use crate::ccl::Refinement;
         use std::rc::Rc;
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement { predicate: pred };
+        let refinement = Refinement::born(pred);
         let inner_fun = Type::Fun {
             name: None,
             domain: Box::new(Type::Base(BaseType::Int)),
