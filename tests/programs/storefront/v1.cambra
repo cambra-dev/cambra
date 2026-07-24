@@ -17,30 +17,35 @@
 # orders cannot both spend the last of the budget.  Pre-sale orders carry discount=0, so
 # no sale-start timestamp is needed — the ledger anchors itself.
 #
-# `quote`'s postcondition is inherited unchanged, and it is why the cost
+# `quote`'s static assert is inherited unchanged, and it is why the cost
 # floor exists: the unclamped half-off sale violates `p >= item.cost * qty`
 # on the low-margin "poster" (sale 5 < cost 9), so the naive discount is
-# rejected at compile time.  The oversell refinement and the below-cost
+# rejected at compile time.  The Qty refinement and the below-cost
 # contract hold across the upgrade by construction.
 
-catalog = [
+# Type aliases, not new types.
+Dollars = Int
+Qty = {Int where _ >= 0}
+ItemPricing = {{price: Dollars, cost: Dollars} where _.price >= _.cost}
+
+catalog: Map(String, ItemPricing) = [
     "tee-black" -> (price=25, cost=11),
     "hoodie"    -> (price=60, cost=34),
     "poster"    -> (price=10, cost=9),   # low margin: the discount clamps here
 ]
 
-inventory: Mut(Map(String, {Int where _ >= 0}), Txn) := [
+# The type of catalog keys.
+SKU = {String where _ in catalog.keys()}
+
+# A mutable, transactional map, like a column in a database.
+# A full map has an entry for every element of its domain,
+# so lookups are statically guaranteed to never miss.
+# Negative stock is prevented by the type checker on `Qty`.
+inventory: Mut(FullMap(SKU, Qty), Txn) := [
     "tee-black" -> 500,
     "hoodie"    -> 200,
     "poster"    -> 1000,
 ]
-
-# Committed order lines.  Fed only inside committing transactions, so `o.time`
-# in /stats is the feeding transaction's commit time (aborted feeds never
-# appear in the collection).  Line items record the discount granted (zero at
-# list price), so promo accounting can aggregate spend without re-deriving
-# list prices from the catalog.
-orders: Feed({sku: String, qty: Int, price: Int, discount: Int})
 
 import http
 
@@ -55,12 +60,10 @@ stats_reqs,   stats_resps   = http.serve("8080", "GET", "/stats")
 def is_promo_spent() => Bool requires Transaction:
     promo_budget = 1000
     now = summon(Transaction).current_time()
-    past = orders.restrict(\o -> o.time < now)
+    past = orders.filter(\o -> o.time < now)
     promo_budget <= sum([o.discount for o in past])
 
-def quote(item: {price: Int, cost: Int}, qty: Int) => Int requires Transaction:
-    assert qty > 0
-    assert item.price >= item.cost
+def quote(item: ItemPricing, qty: Qty) => Dollars requires Transaction:
     list_price = item.price * qty
     sale = list_price // 2
     floor = item.cost * qty
@@ -68,64 +71,63 @@ def quote(item: {price: Int, cost: Int}, qty: Int) => Int requires Transaction:
             list_price
         else:
             max([sale, floor])
-    assert p >= item.cost * qty
+    # Checked at compile time: both branches provably respect the cost floor.
+    static assert p >= item.cost * qty
     p
 
-# Reserve stock for one order line.  The write only typechecks because the
-# `stock >= qty` guard proves the decrement stays non-negative (see
-# nonneg_inventory) — deleting the guard makes the program ill-typed, not the
-# store go negative.
-def reserve(sku: String, qty: Int) => Bool requires Transaction:
-    assert qty > 0
-    match inventory[sku]:
-        case `some(stock):
-            if stock >= qty:
-                inventory[sku] := stock - qty
-                true
-            else:
-                false
-        case `none: false
+def reserve(sku: SKU, qty: Qty) => Bool requires Transaction:
+    stock = inventory[sku] # Always present because of the `SKU` type.
+    if stock >= qty:
+        inventory[sku] := stock - qty # Typechecks only under the check above.
+        true
+    else:
+        false
 
-for req in order_reqs:
-    # The qty > 0 preconditions on reserve/quote force validation at the
-    # trust boundary: the calls don't typecheck until the guard is here.
-    result = if req.body.qty <= 0:
-            http.bad_request("qty must be positive")
-        else:
-            match catalog[req.body.sku]:
-                case `none: http.not_found("no such sku")
-                case `some(item):
-                    with begin():
-                        if reserve(req.body.sku, req.body.qty):
-                            price = quote(item, req.body.qty)
-                            orders << (sku=req.body.sku, qty=req.body.qty, price=price,
-                                       discount=item.price * req.body.qty - price)
-                            http.ok(str(price))
-                        else:
-                            # 409, not 400: the request was well-formed but
-                            # refused by current resource state.
-                            http.conflict("out of stock")
-    order_resps[req.id] = result
+# The loops below run concurrently, as requests come in for each endpoint.
 
 for req in restock_reqs:
-    result = if req.body.qty <= 0:
-            http.bad_request("qty must be positive")
-        else:
-            with begin():
-                match inventory[req.body.sku]:
-                    case `some(stock):
-                        inventory[req.body.sku] := stock + req.body.qty
-                        http.ok("restocked")
-                    case `none: http.not_found("no such sku")
+    result = with begin():
+        # `req.body.sku` is inferred to be in the catalog, checked by HTTP lib.
+        stock = inventory[req.body.sku]
+        # `qty` is inferred to be a non-neg int, checked by HTTP lib.
+        inventory[req.body.sku] := stock + req.body.qty
+        http.ok("restocked")
+
     restock_resps[req.id] = result
 
-# Revenue per SKU as a view at the request's own transaction time: restrict
-# the order feed to transactions that committed before this one began, then
-# roll up (see ledger_balance for the idiom in isolation).  Unrestricted, the
-# rollup is only defined once the order stream is exhausted — for a server,
-# never.
+# Committed order lines; each carries its transaction's commit time.
+orders: Feed({sku: SKU, qty: Qty, price: Dollars, discount: Dollars, time: Time})
+
+for req in order_reqs:
+    # The HTTP lib uses inferred type constraints to validate and parse requests,
+    # rejecting malformed requests.
+    result = match catalog[req.body.sku]:
+        case `none:
+            http.not_found("no such sku")
+        case `some(item):
+            with txn = begin():
+                # `req.body.sku` is refined to the SKU type by the enclosing conditional.
+                if reserve(req.body.sku, req.body.qty):
+                    price = quote(item, req.body.qty)
+                    # Feed the collection of orders.
+                    orders << (
+                        sku = req.body.sku,
+                        qty = req.body.qty,
+                        price = price,
+                        discount = item.price * req.body.qty - price,
+                        time = txn.current_time(),
+                    )
+                    http.ok(str(price))
+                else:
+                    http.conflict("out of stock")
+
+    order_resps[req.id] = result
+
+# Revenue per SKU, as of this request's own transaction time.
 for req in stats_reqs:
     with txn = begin():
-        paid = orders.restrict(\o -> o.time < txn.current_time())
-        revenue = [key -> sum([o.price for o in g]) for key -> g in groupby(paid, \o -> o.sku)]
+        paid = orders.filter(\o -> o.time < txn.current_time())
+        revenue = [key -> sum([o.price for o in g])
+            for key -> g in groupby(paid, \o -> o.sku)]
+
     stats_resps[req.id] = revenue
