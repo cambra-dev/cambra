@@ -2868,3 +2868,119 @@ y = a if d else box([1, 2, 3, 4, 5])
         "the two joins keep their witnesses apart: {ty}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lookup: `Option`, its constructors, and the subscript pair
+// ---------------------------------------------------------------------------
+
+/// `Option(T)` is the tagged variant `some(T) | none` — no new type constructor,
+/// just the `Variant` the conditionals stack landed. `some`/`none` are lowercase
+/// *data constructors* (chl-spec, "Direction: term/type syntax split"), so each
+/// builds a one-tag variant that widens into the two-tag `Option` on demand.
+#[test]
+fn option_constructors_build_a_tagged_variant() {
+    // The payload rides in untouched, singleton and all: wrapping a value in a
+    // tag computes nothing about it, so `some(1)` carries the `1`.
+    assert_eq!(infer_program("some(1)").to_string(), "[.some(1)]");
+    assert_eq!(infer_program("none").to_string(), "[.none]");
+    // Both widen into an `Option(Int)` annotation. The ascription is one-way, so
+    // the program keeps its narrower type — as every other annotation here does.
+    assert_eq!(
+        infer_program("x: Option(Int) = some(1)\nx").to_string(),
+        "[.some(1)]"
+    );
+    assert_eq!(
+        infer_program("x: Option(Int) = none\nx").to_string(),
+        "[.none]"
+    );
+    // The payload still flows: a `some(String)` is not an `Option(Int)`.
+    assert!(
+        !infer_program_err("x: Option(Int) = some(\"a\")\nx").is_empty(),
+        "some(String) must not satisfy Option(Int)"
+    );
+}
+
+/// A **binder** spelled `none` shadows the constructor. (A same-named *binding*
+/// does not — the constructor wins, as it does for every other name lowering
+/// claims: `sum`, `groupby`, `set`, and the rest.)
+#[test]
+fn a_binder_shadows_the_none_constructor() {
+    assert_eq!(
+        infer_program("[none + 1 for none in [1,2,3]]").to_string(),
+        "([0, 2] ⤇ Int)"
+    );
+}
+
+/// An integer-*literal* subscript keeps meaning tuple projection. A tuple is a
+/// heterogeneous product rather than a finite function, and lowering has no types
+/// with which to tell `t[0]` from `xs[0]`, so this case is unchanged.
+#[test]
+fn integer_literal_subscript_is_still_tuple_projection() {
+    // Projection selects an element rather than computing one, so the element's
+    // own singleton survives the projection.
+    assert_eq!(infer_program("t = (1, \"a\")\nt.0"), int_lit(1));
+    assert_eq!(infer_program("t = (1, \"a\")\nt.1"), str_lit("a"));
+}
+
+/// A non-literal subscript is **application** — subscript and call are one
+/// operation, evaluating a finite function at a point (chl-spec §3.9) — so it
+/// inherits the proof obligation: the index must be in the collection's domain.
+/// An unconstrained index is not, and that is the whole point of the pair.
+///
+/// Checked **at the call site**. A parameter annotation is a *bound* on the param
+/// rather than its type, so an un-applied `f` still has an open index variable and
+/// nothing to reject yet — same as any un-applied function over an inferred parameter.
+/// Applying it is what closes the variable and fires the obligation.
+#[test]
+fn total_subscript_demands_a_provable_index() {
+    for program in [
+        // A bare `Int` is not provably a member of `[0, 3)`.
+        "def f(a: Array(3, Int), i: Int):\n    a[i]\nf([1,2,3], 5)",
+        // Nor is a bare key provably present in a map's key domain.
+        "def f(m: Map(Int, Int), k: Int):\n    m[k]\nf(groupby([1,2,3], \\x -> x), 5)",
+    ] {
+        assert!(
+            !infer_program_err(program).is_empty(),
+            "an unprovable index must be rejected, not silently allowed: {program}"
+        );
+    }
+}
+
+/// `[…]` means **collection lookup only**, and `.0` / `.name` mean projection. The
+/// spellings are disjoint, so lowering never has to guess which operation a subscript
+/// was — a guess it had no types to make, and which previously made `xs[0]` mean tuple
+/// projection and fail with a structural mismatch.
+///
+/// Neither lookup form type-checks yet: a collection's domain is not a type an ordinary
+/// value inhabits (an `Array(3, 𝑇)`'s is the range `[0, 3)`), so no index carries the
+/// membership proof a total lookup needs. Both are rejected, which is the honest state
+/// until the discharge lands (`src/ccl/design/collections.md`, "Lookup: membership
+/// discharge"). What this pins is that the *rejection* is uniform — `xs[0]`, `xs[i]` and
+/// `xs(0)` are one operation and fail alike — so none of them is quietly reinterpreted.
+#[test]
+fn subscript_is_lookup_and_dot_is_projection() {
+    // Projection: both keys, on the shapes that have them.
+    assert_eq!(infer_program("t = (1, \"a\")\nt.0"), int_lit(1));
+    assert_eq!(infer_program("t = (1, \"a\")\nt.1").to_string(), "\"a\"");
+    assert_eq!(infer_program("r = (a=1, b=2)\nr.b"), int_lit(2));
+
+    // Subscripting a tuple is *not* projection: a tuple is a heterogeneous product,
+    // not a finite function.
+    assert!(
+        !infer_program_err("t = (1, \"a\")\nt[0]").is_empty(),
+        "a tuple has no domain to look up in"
+    );
+
+    // Lookup on a collection is one operation however it is spelled, and all three
+    // spellings fail the same undischarged-membership edge.
+    for program in [
+        "xs = [10, 20, 30]\nxs[0]",
+        "xs = [10, 20, 30]\ni = 0\nxs[i]",
+        "xs = [10, 20, 30]\nxs(0)",
+    ] {
+        assert!(
+            !infer_program_err(program).is_empty(),
+            "no index proves membership yet, so `{program}` must be rejected"
+        );
+    }
+}

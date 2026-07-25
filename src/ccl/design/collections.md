@@ -547,11 +547,24 @@ is its carried domain, and enumerability comes from the `⤇`, not the witness.
 
 ## Lookup: membership discharge
 
-> **[Planned]** — no lookup path exists today (surface subscript is
-> integer-literal tuple projection). The surface operators — proven `c[k] : 𝑇`
-> and checked `c[k]? : Option(𝑇)` — are specified in
-> [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access). This section is the **discharge
-> mechanic** they rest on: the single rule that decides which one type-checks.
+> **[Planned]** — the two surface operators, proven `c[k] : 𝑇` and checked
+> `c[k]? : Option(𝑇)`, are specified in
+> [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access).
+> `c[k]` *parses and lowers* today — to exactly what the application `c(k)` lowers
+> to, since they are one operation — and `c[k]?` reports a not-implemented error.
+> What is missing is the **discharge**, which is this section: the single rule that
+> decides which of the two type-checks. Until it lands no index can carry the proof,
+> so every `c[k]` is rejected with a hint naming `c[k]?`.
+>
+> Note what a range domain costs here. A keyed domain is a *refinement*
+> `{𝐾 | 𝑘 ▷ keydom#id}`, so a key interoperates with `𝐾` by refinement drop and the
+> discharge has ordinary machinery to work with. A range domain is the primitive
+> `UIntRange(𝑛)`, which relates only by **equality** — no refined integer is a
+> `UIntRange` — so there is no rule by which `{𝑖 | 𝑖 < 𝑛}` could discharge against it.
+> The uniformity claimed below is therefore a claim about the *rule*, not yet about the
+> representation: realizing it for ranges means either a subtyping arm relating the two
+> or making a range domain a refinement like the keyed one. Deciding that is part of
+> this step, not a detail of it.
 
 Lookup is uniform across ranges and keys: `𝑐[𝑥]` is well-typed when `𝑥`'s type
 proves `𝑥 ∈ dom(𝑐)`, and its result totality is *whether that proof
@@ -581,9 +594,9 @@ Option(𝑇)` where the bound cannot be discharged (`List`, unknown length — b
 Set/Map — `arr[i]:T` / `lst[i]?:Option(T)` and `m[k]:V` / `m[k]?:Option(V)` are
 the *same* split on whether the domain-membership refinement discharges, spelled
 with the two operators `[]` / `[]?` ([chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access)).
-(Neither lookup path exists today — surface subscript is integer-literal tuple
-projection — so this is new, but it is a single mechanic, not one per collection
-kind.)
+(Neither *discharge* exists today, so this is new — but it is a single mechanic, not
+one per collection kind. `[]` itself already lowers as application; a tuple is
+projected with `.0` and is not a lookup at all.)
 
 `Option` is the tagged variant `some(𝑣) | none`, matched with `match` — the
 `Variant` / `VariantProject` / `VariantWrap` CCL nodes the conditionals stack

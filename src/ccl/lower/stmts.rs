@@ -1082,6 +1082,14 @@ fn lower_type_application(
                 lower_type_annotation(v)?,
             ))
         }
+        // `Option(T)` = the tagged variant `some(T) | none` — what a *checked*
+        // lookup `c[k]?` returns (`Type::option_of`, `docs/chl-spec.md`, "3.9 Subscript and attribute access").
+        "Option" => {
+            let [value] = args else {
+                return Err(arity_err("one value type"));
+            };
+            Ok(Type::option_of(lower_type_annotation(value)?))
+        }
         // `Set(K)` = `Map(K, unit)` — a keyed collection whose codomain is
         // `unit`, so the key domain is the payload (`Type::set_of`).
         "Set" => {

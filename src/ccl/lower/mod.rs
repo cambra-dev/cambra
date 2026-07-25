@@ -81,7 +81,7 @@ use std::{
 
 use crate::{
     ccl::{
-        Branch, Expr, Lit, TypedExprNode,
+        Branch, Expr, Lit, Type, TypedExprNode,
         lineage::{Nature, RewriteLabel},
     },
     chl_parser::ast::{Expr as ChlExpr, RecordField, Span, Spanned, Stmt as ChlStmt},
@@ -668,6 +668,17 @@ fn lower_expr_inner(
                     format!("read transactional variable `{name}` inside a `with begin():` block"),
                 ));
             }
+            // `none` is a *data constructor*, not a variable: the absent case of
+            // `Option(_)`, carrying `unit`. (Not to be confused with `None`, which
+            // is CHL's unit value — the capitalization split of
+            // `docs/chl-spec.md`, "6.1 Direction: term/type syntax split [Decided]".)
+            //
+            // Like every other name lowering claims (`sum`, `groupby`, `set`, …) the
+            // constructor wins over a same-named *binding*; only a **binder** shadows
+            // it, which `is_shadowed` already tracks.
+            if name == Type::NONE && !ctx.is_shadowed(name) {
+                return Ok(Expr::variant_ctor(Type::NONE, Expr::lit(Lit::Unit)));
+            }
             Ok(Expr::var(name.to_string()))
         }
         ChlExpr::BinOp { left, op, right } => lower_binop(left, *op, right, ctx),
@@ -688,7 +699,11 @@ fn lower_expr_inner(
             let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
             Ok(Expr::tuple(items?))
         }
-        ChlExpr::Subscript { target, index } => lower_subscript(target, index, ctx),
+        ChlExpr::Subscript {
+            target,
+            index,
+            checked,
+        } => lower_subscript(target, index, *checked, expr.span, ctx),
         // Record value `(name=expr, ...)`. Lowered to a `Record` constructor:
         // `(x=1, y="foo")` becomes `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
         ChlExpr::Record(fields) => {

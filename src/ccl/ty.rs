@@ -1125,7 +1125,7 @@ pub mod witness_ctx {
 /// related to it ([`KindObligations`]): the shape decides containment, and the key type
 /// rides out as an obligation, so a still-open key type is pinned rather than silently
 /// ignored.
-fn keyed_domain_key(domain: &Type) -> Option<&Type> {
+pub(crate) fn keyed_domain_key(domain: &Type) -> Option<&Type> {
     let Type::Refinement(base, r) = domain else {
         return None;
     };
@@ -1689,6 +1689,29 @@ impl Type {
     /// ([`TypeKind::Enumerated`]).
     pub fn list_of(elem: Type) -> Self {
         TypeKind::UIntRanges.into_data_fun(None, elem)
+    }
+    /// The tag of [`Option`](Self::option_of)'s present case, carrying the value.
+    pub const SOME: &'static str = "some";
+    /// The tag of [`Option`](Self::option_of)'s absent case, carrying `unit`.
+    pub const NONE: &'static str = "none";
+
+    /// `Option(𝑇)` — the tagged variant `some(𝑇) | none`.
+    ///
+    /// A plain [`Variant`](Self::Variant) over two named tags, not a new
+    /// constructor: `Option` is what a *checked* lookup (`c[k]?`) returns, and the
+    /// language already has tagged sums with a runtime
+    /// ([`VariantCtor`](crate::ccl::TypedExprNode::VariantCtor) and the
+    /// `VariantWrap`/`VariantProject` operators). The absent case carries `unit`
+    /// because every tag carries a payload; `none` is *not* unit itself — it is a
+    /// lowercase data *constructor*, where `Option(T)` is the capitalized type.
+    pub fn option_of(value: Type) -> Self {
+        Type::Variant(vec![
+            (FieldKey::Name(Self::SOME.into()), value),
+            (
+                FieldKey::Name(Self::NONE.into()),
+                Type::Base(BaseType::Unit),
+            ),
+        ])
     }
 
     /// The type of a **collection**: the dependent sum `Σ (𝐷: Any). 𝐷 ⤇ elem` — a
