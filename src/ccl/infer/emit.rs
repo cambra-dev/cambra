@@ -977,14 +977,21 @@ pub(super) fn emit_list<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Typ
     if elts.is_empty() {
         return Ok(fun(Type::UIntRange(0), prim(BaseType::Unit)));
     }
-    // Element type: derive from the first; constrain remaining to it.
-    let first_ty = ctx.subexpr(&mut elts[0])?;
-    for rest in &mut elts[1..] {
-        let r_ty = ctx.subexpr(rest)?;
-        // Two-way constrain == equality. Mirrors the existing pass's
-        // implicit assumption that list elements are homogeneous.
-        ctx.require_eq(&r_ty, &first_ty, &|| "List element".to_string())?;
+    // Element type: the **join** of the elements, not a type the first one fixes and
+    // the rest must equal. Every element flows one-way into a shared variable, so
+    // the element type is what they have in common.
+    //
+    // Equality was too strong. Two elements can legitimately differ while sharing a
+    // type — most sharply when they carry different *refinements*, since refinements
+    // intersect at a join and so simply drop out of what is common. Heterogeneous
+    // elements are still rejected: two distinct atoms at one position collide as
+    // `IncompatibleBounds` at coalesce, reported there rather than here.
+    let elem_ty = ctx.fresh();
+    for elt in elts.iter_mut() {
+        let t = ctx.subexpr(elt)?;
+        ctx.require_sub(&t, &elem_ty, &|| "List element".to_string())?;
     }
+    let first_ty = elem_ty;
     let n = elts.len();
     // Deref a bare mutable read to its value, as in `emit_tuple`: the list's
     // element (codomain) type takes the dereferenced element type so no `Mut`
@@ -1055,7 +1062,9 @@ pub(super) fn emit_case<C: Typing>(
 /// body's type. The pattern binding (if any) is already in scope.
 fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, InferError> {
     let guard_ty = ctx.subexpr(&mut b.guard)?;
-    ctx.require_eq(&guard_ty, &prim(BaseType::Bool), &|| {
+    // One-way: a guard must *be* a `Bool`, not be exactly `Bool`. A refined boolean
+    // is still a boolean, and a refinement drops on the way up.
+    ctx.require_sub(&guard_ty, &prim(BaseType::Bool), &|| {
         "Case guard".to_string()
     })?;
     ctx.subexpr(&mut b.body)
