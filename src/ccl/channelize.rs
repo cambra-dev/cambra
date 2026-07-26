@@ -1815,9 +1815,17 @@ fn collection_union_type(feeds: &[Expr]) -> Type {
                     // 0's codomain is only sound under that invariant. Name it:
                     // a future feed path bypassing the shared-channel constraint
                     // would otherwise mis-type the union to operand 0 silently.
+                    //
+                    // Compared modulo **refinements**: the invariant is that the
+                    // operands share an element *type*, and contributions
+                    // legitimately differ in what each one additionally knows about
+                    // its own value (`c << 1` and `c << 2` contribute
+                    // `{Int | __elem == 1}` and `{Int | __elem == 2}`). The channel's
+                    // element type is what they have in common, which is what
+                    // operand 0's codomain stands in for.
                     Some(c) => debug_assert_eq!(
-                        c.without_pi_names(),
-                        codomain.without_pi_names(),
+                        crate::ccl::ccl_utils::strip_refinements(&c.without_pi_names()),
+                        crate::ccl::ccl_utils::strip_refinements(&codomain.without_pi_names()),
                         "collection_union_type: feed operands disagree on element \
                          type ({c} vs {codomain}); inference should have unified \
                          them into the channel's shared value var"

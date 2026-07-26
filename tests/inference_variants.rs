@@ -20,6 +20,15 @@ use cambra::interpreter::BaseType;
 fn int() -> Type {
     Type::Base(BaseType::Int)
 }
+/// The type of the integer literal `n` — its **singleton**, `{Int | __elem == n}`
+/// (rendered `n`). A literal is typed by which literal it is.
+fn int_lit(n: i64) -> Type {
+    cambra::ccl::infer::lit_singleton(&Lit::Int(n))
+}
+/// The type of the string literal `s` — see [`int_lit`].
+fn str_lit_ty_local(s: &str) -> Type {
+    cambra::ccl::infer::lit_singleton(&Lit::String(s.to_string()))
+}
 fn string() -> Type {
     Type::Base(BaseType::String)
 }
@@ -91,7 +100,7 @@ fn run_full(mut expr: TypedExpr) -> Result<TypedExpr, Vec<InferError>> {
 #[test]
 fn variant_ctor_int() {
     let ty = run(TypedExpr::variant_ctor("Some", lit_int(5))).expect("inference ok");
-    assert_eq!(ty, variant(&[("Some", int())]));
+    assert_eq!(ty, variant(&[("Some", int_lit(5))]));
 }
 
 /// `.None(())` infers to `[None(Unit)]`.
@@ -106,7 +115,10 @@ fn variant_ctor_unit() {
 fn variant_ctor_nested_payload() {
     let payload = TypedExpr::tuple(vec![lit_int(1), lit_string("x")]);
     let ty = run(TypedExpr::variant_ctor("Pair", payload)).expect("inference ok");
-    assert_eq!(ty, variant(&[("Pair", Type::Tuple(vec![int(), string()]))]));
+    assert_eq!(
+        ty,
+        variant(&[("Pair", Type::Tuple(vec![int_lit(1), str_lit_ty_local("x")]))])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +266,8 @@ fn match_fills_arm_binding_and_body_var_types() {
     let some_pat = some_arm.pattern.as_ref().expect("Some arm has a pattern");
     assert_eq!(
         some_pat.binding.ty,
-        int(),
-        "pattern binding.ty must be the narrowed payload (Int), got {}",
+        int_lit(3),
+        "pattern binding.ty must be the narrowed payload (the scrutinee's `3`), got {}",
         some_pat.binding.ty
     );
 
@@ -269,8 +281,8 @@ fn match_fills_arm_binding_and_body_var_types() {
     assert_eq!(name.base(), "n");
     assert_eq!(
         left.ty,
-        int(),
-        "Var(n).ty inside arm body must be Int, got {}",
+        int_lit(3),
+        "Var(n).ty inside arm body must be the scrutinee's payload, got {}",
         left.ty
     );
 }
@@ -300,8 +312,10 @@ fn match_with_guard() {
         var("n"),
     )];
     let scrutinee = TypedExpr::variant_ctor("Some", lit_int(3));
+    // The arm returns its binding, and the binding is the scrutinee's payload — so
+    // the match's type is the payload's own, singleton included.
     let ty = run(TypedExpr::match_expr(scrutinee, arms)).expect("guarded match ok");
-    assert_eq!(ty, int());
+    assert_eq!(ty, int_lit(3));
 }
 
 /// Match with non-Bool guard should fail.

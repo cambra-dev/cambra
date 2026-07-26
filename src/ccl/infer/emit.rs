@@ -8,7 +8,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::FieldKey;
-use crate::ccl::ccl_utils::cast_target_refinement;
+use crate::ccl::ccl_utils::{cast_target_refinement, strip_refinements};
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::symbolic::symbolic;
@@ -19,7 +19,7 @@ use crate::ccl::{
 
 use super::context::InferCtx;
 use super::typing::{Typing, peel_refinements_outer};
-use super::{lit_base, product, variant_type};
+use super::{lit_singleton, product, variant_type};
 
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
@@ -28,7 +28,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
     let ty = match &mut expr.node {
-        TypedExprNode::Lit(lit) => lit_base(lit),
+        TypedExprNode::Lit(lit) => lit_singleton(lit),
 
         // Resolve a variable through its bound scheme. A monomorphic binder
         // freshens nothing and returns its type verbatim. A *polymorphic* `let`
@@ -180,9 +180,22 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
             };
             let value_ty = ctx.subexpr(value)?;
             let write_label = name.clone();
-            ctx.require_sub(&value_ty, &mut_val, &|| {
-                format!("write to mutable variable `{write_label}`")
-            })?;
+            // Both sides stripped of refinements. A refinement is a fact about *a
+            // value*, and a register is not one value — it is the sequence its
+            // initializer and every write produce, so its value type is the **join**
+            // over all of them, which no single contribution's refinement survives.
+            // Taking one would assert the register never changes, which is what
+            // declaring it mutable denies.
+            //
+            // Stripping the *target* too keeps the diagnostic honest when
+            // `name` is not a register at all (`x = 0; x += 1`): that is a
+            // mutability-discipline error, and a spurious type error here would
+            // pre-empt it with a worse message.
+            ctx.require_sub(
+                &strip_refinements(&value_ty),
+                &strip_refinements(&mut_val),
+                &|| format!("write to mutable variable `{write_label}`"),
+            )?;
             Type::Base(BaseType::Unit)
         }
 
@@ -302,6 +315,20 @@ fn emit_bare_predicate<C: Typing>(
 
 /// Apply a binary scheme: instantiate, build the expected call shape,
 /// constrain_subtype. Returns the fresh result variable.
+///
+/// Operand types enter **stripped of refinements**, and that is load-bearing rather
+/// than tidying. An operator scheme relates *base* types — arithmetic is
+/// `∀α. α → α → α`, one variable shared across both operands and the result — so any
+/// refinement reaching α propagates to the result, claiming the operator preserved
+/// it. No binary operator does: `+` on two values that are each `2` produces `4`, not
+/// a `2`. The claim is invisible while both operands merely *join* (distinct
+/// refinements intersect to none), and wrong the moment they do not — `x + x` keeps
+/// `x`'s refinement, because intersecting a set with itself is that set.
+///
+/// A refinement is a fact about a *value*; carrying it across an operator that
+/// computes a new value is exactly the mistake this prevents. (An operator that
+/// genuinely refines its result — a future constant fold — states that itself,
+/// rather than inheriting it by variable sharing.)
 fn apply_binary_scheme<C: Typing>(
     ctx: &mut C,
     scheme: &PolyScheme,
@@ -311,11 +338,20 @@ fn apply_binary_scheme<C: Typing>(
 ) -> Result<Type, InferError> {
     let body = ctx.instantiate(scheme);
     let result = ctx.fresh();
-    let expected = fun(left.clone(), fun(right.clone(), result.clone()));
+    let expected = fun(
+        strip_refinements(left),
+        fun(strip_refinements(right), result.clone()),
+    );
     ctx.require_sub(&body, &expected, at)?;
     Ok(result)
 }
 
+/// Unlike [`apply_binary_scheme`], the operand keeps its refinements, and the
+/// asymmetry is deliberate on both counts. The unary *operators* are monomorphic
+/// (`Int → Int`, `Bool → Bool`), so nothing is shared with the result and a refined
+/// operand simply flows into the base. The other user is **aggregates**, whose
+/// operand is a *collection* — its refinements describe that collection's domain (a
+/// filtered source), which the rule must see, not discard.
 /// Apply a unary scheme. Used for UnaryOp and Aggregate. For an
 /// aggregate the scheme is the full operator type `(α → γ) → γ`, so the
 /// operand is the input collection (function) itself.
@@ -791,7 +827,12 @@ pub(super) fn emit_let<C: Typing>(
             {
                 let value_ty = value.as_ref().clone();
                 let label = binding.name.clone();
-                ctx.require_sub(&bound_ty, &value_ty, &|| {
+                // The initializer is one contribution to the register's value type,
+                // not its definition (see the `MutWrite` arm). Stripped so `x := 0`
+                // does not pin the register to `{Int | __elem == 0}` — which would
+                // reject every later write of a computed value, and fail the
+                // invariant `History` edge against a `Mut(Int)` parameter.
+                ctx.require_sub(&strip_refinements(&bound_ty), &value_ty, &|| {
                     format!("initializer of mutable `{label}`")
                 })?;
             }
@@ -1037,6 +1078,17 @@ pub(super) fn emit_case<C: Typing>(
         ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
     }
 
+    // A `Case` selects one arm at runtime, so its type cannot carry any *one* arm's
+    // refinement — `if c: 1 else: 2` is an `Int`, not "the 1". The arms are therefore
+    // related one-way to the first arm's type **stripped of refinements**, rather
+    // than required to equal it outright, which two arms carrying different
+    // singletons never could.
+    //
+    // Not a fresh join variable, deliberately: a `Mut` arm deref-coerces on the way
+    // into one, so the node's type would stop being a `Mut` and the second-class
+    // rule-1 check (`x if c else y` on two registers) would have nothing to fire on.
+    // Deriving from an arm keeps the constructor visible; stripping keeps the value
+    // honest.
     let mut result_ty: Option<Type> = None;
     for b in branches.iter_mut() {
         // A pattern binds its payload (the var just written to `binding.ty`)
@@ -1051,8 +1103,8 @@ pub(super) fn emit_case<C: Typing>(
             None => emit_case_branch(b, ctx)?,
         };
         match &result_ty {
-            None => result_ty = Some(body_ty),
-            Some(prev) => ctx.require_eq(&body_ty, prev, &|| "Case arm".to_string())?,
+            None => result_ty = Some(strip_refinements(&body_ty)),
+            Some(prev) => ctx.require_sub(&body_ty, prev, &|| "Case arm".to_string())?,
         }
     }
     Ok(result_ty.expect("non-empty branches"))

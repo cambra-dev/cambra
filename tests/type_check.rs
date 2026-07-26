@@ -14,8 +14,8 @@
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
-    FieldKey, HistoryKind, Type,
-    infer::{InferError, TypeInferenceContext, infer},
+    FieldKey, HistoryKind, Lit, Type,
+    infer::{InferError, TypeInferenceContext, infer, lit_singleton},
     lower::{LoweringContext, lower_stmts},
 };
 use cambra::chl_parser::{self, ast as chl_ast};
@@ -120,6 +120,24 @@ fn int() -> Type {
     Type::Base(BaseType::Int)
 }
 
+/// The type of the integer literal `n` — its **singleton**,
+/// `{Int | __elem == n}` (rendered `n`). A literal is typed by what it is, not
+/// merely by its base ([`lit_singleton`]), so a test that expects a program to
+/// evaluate to a known constant should say which one.
+fn int_lit(n: i64) -> Type {
+    lit_singleton(&Lit::Int(n))
+}
+
+/// The type of the string literal `s` — see [`int_lit`].
+fn str_lit(s: &str) -> Type {
+    lit_singleton(&Lit::String(s.to_string()))
+}
+
+/// The type of the boolean literal `b` — see [`int_lit`].
+fn bool_lit(b: bool) -> Type {
+    lit_singleton(&Lit::Bool(b))
+}
+
 /// Convenience alias for `Type::Base(BaseType::String)`.
 fn string() -> Type {
     Type::Base(BaseType::String)
@@ -134,13 +152,16 @@ fn bool_ty() -> Type {
 // Literal tests
 // ---------------------------------------------------------------------------
 
+/// A literal is typed by **which** literal it is: its base refined by the singleton
+/// `__elem == lit`. `unit` is the exception — one inhabitant, so the singleton would
+/// say nothing its base does not.
 #[rstest]
-#[case::int("2", BaseType::Int)]
-#[case::string(r#""hi""#, BaseType::String)]
-#[case::bool_lit("True", BaseType::Bool)]
-#[case::none("None", BaseType::Unit)]
-fn test_literal(#[case] code: &str, #[case] expected: BaseType) {
-    assert_eq!(infer_program(code), Type::Base(expected));
+#[case::int("2", int_lit(2))]
+#[case::string(r#""hi""#, str_lit("hi"))]
+#[case::bool_lit("True", bool_lit(true))]
+#[case::none("None", Type::Base(BaseType::Unit))]
+fn test_literal(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -160,22 +181,28 @@ fn test_binary_op(#[case] code: &str, #[case] expected: BaseType) {
 // Let binding / scoping tests
 // ---------------------------------------------------------------------------
 
+/// A binding propagates its value's type unchanged, singleton and all — `x = 2`
+/// makes `x` *the* `2`. The chain case shows the other half: `y + x` joins two
+/// singletons, and a join intersects refinements, so the sum is plain `Int`.
 #[rstest]
-#[case::simple("x = 2\nx", BaseType::Int)]
-#[case::chain("x = 2\ny = x\ny + x", BaseType::Int)]
-fn test_let(#[case] code: &str, #[case] expected: BaseType) {
-    assert_eq!(infer_program(code), Type::Base(expected));
+#[case::simple("x = 2\nx", int_lit(2))]
+#[case::chain("x = 2\ny = x\ny + x", int())]
+fn test_let(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
 }
 
 // ---------------------------------------------------------------------------
 // Unary operator tests
 // ---------------------------------------------------------------------------
 
+/// `-2` folds to the literal `-2` at lowering, so it is a literal like any other and
+/// carries its own singleton. `not True` does not fold — a unary operator computes a
+/// *new* value, and its result takes no refinement from its operand.
 #[rstest]
-#[case::neg("-2", BaseType::Int)]
-#[case::not("not True", BaseType::Bool)]
-fn test_unary_op(#[case] code: &str, #[case] expected: BaseType) {
-    assert_eq!(infer_program(code), Type::Base(expected));
+#[case::neg("-2", int_lit(-2))]
+#[case::not("not True", bool_ty())]
+fn test_unary_op(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +231,7 @@ fn test_list_literal() {
 fn test_def_param_annotation_enforced() {
     // A scalar annotation is enforced at the call site: an identity body infers
     // nothing on its own, so without the annotation any argument was accepted.
-    assert_eq!(infer_program("def g(a: Int):\n    a\ng(1)"), int());
+    assert_eq!(infer_program("def g(a: Int):\n    a\ng(1)"), int_lit(1));
     assert!(!infer_program_err("def g(a: Int):\n    a\ng(\"x\")").is_empty());
     // A `List(Int)` annotation enforces the element type through the annotation.
     assert_eq!(
@@ -213,7 +240,7 @@ fn test_def_param_annotation_enforced() {
     );
     assert!(!infer_program_err("def g(a: List(Int)):\n    sum(a)\ng([\"a\", \"b\"])").is_empty());
     // An unannotated param still infers purely from use.
-    assert_eq!(infer_program("def g(a):\n    a\ng(\"x\")"), string());
+    assert_eq!(infer_program("def g(a):\n    a\ng(\"x\")"), str_lit("x"));
 }
 
 #[test]
@@ -221,7 +248,7 @@ fn test_multiarg_def_param_annotation_enforced() {
     // Each tupled parameter's annotation is enforced independently.
     assert_eq!(
         infer_program("def g(a: Int, b: String):\n    a\ng(1, \"x\")"),
-        int()
+        int_lit(1)
     );
     // Wrong type on `a` is rejected.
     assert!(!infer_program_err("def g(a: Int, b: String):\n    a\ng(\"x\", \"y\")").is_empty());
@@ -316,50 +343,53 @@ fn test_aggregate(#[case] code: &str, #[case] expected: BaseType) {
 fn test_tuple() {
     assert_eq!(
         infer_program(r#"(1, "a")"#),
-        Type::Tuple(vec![int(), string()])
+        Type::Tuple(vec![int_lit(1), str_lit("a")])
     );
 }
 
 #[test]
 fn test_tuple_index() {
-    assert_eq!(infer_program(r#"(1, "a")[0]"#), int());
+    assert_eq!(infer_program(r#"(1, "a")[0]"#), int_lit(1));
 }
 
 // ---------------------------------------------------------------------------
 // Type annotation tests
 // ---------------------------------------------------------------------------
 
+/// An ascription is one-way: it must *admit* the value, and the value keeps whatever
+/// more precise type it already had. So annotating a literal at its base does not
+/// widen it, while an expression that computes a new value has nothing to keep.
 #[rstest]
 #[case::literal(
     r"
 x: Int = 2
 x
 ",
-    BaseType::Int
+    int_lit(2)
 )]
 #[case::expr(
     r"
 x: Int = 1 + 2
 x
 ",
-    BaseType::Int
+    int()
 )]
 #[case::wildcard(
     r"
 x: _ = 2
 x
 ",
-    BaseType::Int
+    int_lit(2)
 )]
 #[case::wildcard_str(
     r#"
 x: _ = "hi"
 x
 "#,
-    BaseType::String
+    str_lit("hi")
 )]
-fn test_ann_assign_ok(#[case] code: &str, #[case] expected: BaseType) {
-    assert_eq!(infer_program(code), Type::Base(expected));
+fn test_ann_assign_ok(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
 }
 
 #[test]
@@ -697,8 +727,8 @@ fn test_generic_identity() {
 /// heterogeneous tuple, exercising the partial-tuple / projection rule.
 #[test]
 fn test_tuple_index_heterogeneous() {
-    assert_eq!(infer_program(r#"(1, "a")[0]"#), int());
-    assert_eq!(infer_program(r#"(1, "a")[1]"#), string());
+    assert_eq!(infer_program(r#"(1, "a")[0]"#), int_lit(1));
+    assert_eq!(infer_program(r#"(1, "a")[1]"#), str_lit("a"));
 }
 
 /// An unconstrained identity applied to a concrete value must resolve all
@@ -708,7 +738,7 @@ fn test_unconstrained_identity_applied_resolves() {
     // bind via Let so `f(5)` is a named call (lowering doesn't yet
     // support a lambda-literal in call position).
     let ty = infer_program("f = \\x -> x\nf(5)");
-    assert_eq!(ty, int());
+    assert_eq!(ty, int_lit(5));
 }
 
 /// A refined comprehension carries its filter predicate as a refinement on
@@ -909,8 +939,10 @@ b = make("s")
     let Type::Tuple(elems) = &ty else {
         panic!("expected a pair of feed handles, got {ty}");
     };
-    assert_eq!(*feed_value(&elems[0]), int());
-    assert_eq!(*feed_value(&elems[1]), string());
+    // The contributed value's type flows into the channel whole, so each handle's
+    // element type is the literal that was fed to it.
+    assert_eq!(*feed_value(&elems[0]), int_lit(1));
+    assert_eq!(*feed_value(&elems[1]), str_lit("s"));
 }
 
 // ---------------------------------------------------------------------------

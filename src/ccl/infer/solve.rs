@@ -181,9 +181,11 @@ fn assert_reads_stable(reads: &[ReadRecord]) {
 ///   specialization rewrites a predicate's interior uses (`p` → `p__mono1`)
 ///   — both lowering by the very machinery this guards, neither a stale
 ///   bound. The predicate *terms* are checked elsewhere (`check_scope_valid`
-///   and the post-inference `check` reconcile); here only the refinement
-///   *layer count* per position participates, so a whole layer appearing or
-///   vanishing across a pin is still caught.
+///   and the post-inference `check` reconcile).
+/// - **Refinement layers themselves are not counted.** A join alters them: two
+///   uses of a generalized binding deposit different refinements, whose join
+///   intersects to none, so a layer legitimately vanishes between an early read
+///   and the final graph. Only the base skeleton under the layers participates.
 #[cfg(debug_assertions)]
 fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
     // Peel refinement layers, counting them. The *base* under the witnesses is
@@ -195,12 +197,19 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
         }
         t
     }
+    // Layer *count* is deliberately not compared, only peeled away. A refinement
+    // layer is lattice content that a join legitimately alters: two uses of a
+    // generalized binding deposit different refinements (each literal argument its
+    // own singleton), and their join intersects the refinements to nothing — so the
+    // generic's resolution loses a layer between an early read and the final graph
+    // without any bound having gone stale. That is the join computing correctly, not
+    // the ordering violation this guards.
+    //
+    // What remains is the skeleton a *bound* determines — bases, ranges, sources, Pi
+    // binder names, and function/product/variant shape — which a join does not move.
     let (mut read_layers, mut now_layers) = (0, 0);
     let read = peel(read, &mut read_layers);
     let now = peel(now, &mut now_layers);
-    if read_layers != now_layers {
-        return false;
-    }
     match (read, now) {
         (Type::Infer(_) | Type::Hole, _) | (_, Type::Infer(_) | Type::Hole) => true,
         (Type::Base(a), Type::Base(b)) => a == b,
@@ -318,6 +327,13 @@ struct SpecializeFrame {
     /// resolved type, whose `PartialEq` is structural (refinement witnesses
     /// compare by type-blind predicate equality), so same-typed uses share
     /// one specialization.
+    ///
+    /// **A refinement makes two uses distinct**, so `f(1)` and `f(2)` mint separate
+    /// clones now that a literal carries its own singleton. Keying modulo refinements
+    /// would be the better rule — a refinement changes no code — but the clone is
+    /// pinned to its use type, so a shared clone would carry one use's refinement and
+    /// reject the others. Sharing needs the clone built at the stripped type
+    /// throughout, which is more than a key change.
     specs: Vec<Specialization>,
 }
 
@@ -1456,6 +1472,7 @@ fn retype_pred_expr(e: &mut Expr, scope: &HashMap<Name, Type>) {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
+    use crate::ccl::infer::{int_lit_ty, str_lit_ty};
     use crate::ccl::{BaseType, Type, TypedExpr, TypedExprNode};
 
     // ----- scope-validity check (design §6.2) -----
@@ -1530,13 +1547,7 @@ mod tests {
         let body = TypedExpr::new(TypedExprNode::Tuple(vec![use_int, use_str]));
         let mut e = TypedExpr::let_bind("id", id, body);
         let ty = run_inference(&mut e).expect("polymorphic identity type-checks");
-        assert_eq!(
-            ty,
-            Type::Tuple(vec![
-                Type::Base(BaseType::Int),
-                Type::Base(BaseType::String)
-            ])
-        );
+        assert_eq!(ty, Type::Tuple(vec![int_lit_ty(1), str_lit_ty("a")]));
     }
 
     #[test]
@@ -1557,18 +1568,20 @@ mod tests {
         let ty = run_inference(&mut e).expect("type-checks");
         assert_eq!(
             ty,
-            Type::Tuple(vec![
-                Type::Base(BaseType::Int),
-                Type::Base(BaseType::Int),
-                Type::Base(BaseType::String),
-            ])
+            Type::Tuple(vec![int_lit_ty(1), int_lit_ty(2), str_lit_ty("a"),])
         );
+        // A refinement makes two uses distinct, so a literal argument mints its own
+        // specialization — see the `specs` field doc. Sharing modulo refinements is
+        // the better rule and needs the clone built at the stripped type.
         let (specializations, used_names) = specialization_stats(&e);
-        assert_eq!(specializations, 2, "one specialization per distinct type");
+        assert_eq!(
+            specializations, 3,
+            "one specialization per distinct use type"
+        );
         assert_eq!(
             used_names.len(),
-            2,
-            "the three uses collapse onto two specializations"
+            3,
+            "a literal argument mints its own specialization, so none collapse"
         );
     }
 
@@ -1601,16 +1614,21 @@ mod tests {
         ]));
         let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
         let ty = run_inference(&mut e).expect("chained poly-calls-poly type-checks");
-        let pair = |b: BaseType| Type::Tuple(vec![Type::Base(b.clone()), Type::Base(b)]);
+        // `f` duplicates its argument, so each half of a pair is that argument's own
+        // type — the literal's singleton, not its base.
+        let pair = |t: Type| Type::Tuple(vec![t.clone(), t]);
         assert_eq!(
             ty,
-            Type::Tuple(vec![pair(BaseType::Int), pair(BaseType::String)])
+            Type::Tuple(vec![pair(int_lit_ty(1)), pair(str_lit_ty("a"))])
         );
         // Two `g` specializations, each demanding its own `f` specialization
         // — and every minted specialization is referenced.
+        // A refinement makes two uses distinct, so a literal argument mints its own
+        // specialization — see the `specs` field doc. Sharing modulo refinements is
+        // the better rule and needs the clone built at the stripped type.
         let (specializations, used_names) = specialization_stats(&e);
-        assert_eq!(specializations, 4, "two g + two f specializations");
-        assert_eq!(used_names.len(), 4, "all four specializations are used");
+        assert_eq!(specializations, 4, "per-use g + f specializations");
+        assert_eq!(used_names.len(), 4, "every specialization is used");
     }
 
     #[test]
@@ -1642,11 +1660,11 @@ mod tests {
         let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
         run_inference(&mut e).expect("chained poly with shared uses type-checks");
         let (specializations, used_names) = specialization_stats(&e);
-        assert_eq!(
-            specializations, 4,
-            "two g specializations (Int shared) + two f specializations"
-        );
-        assert_eq!(used_names.len(), 4);
+        // A refinement makes two uses distinct, so a literal argument mints its own
+        // specialization — see the `specs` field doc. Sharing modulo refinements is
+        // the better rule and needs the clone built at the stripped type.
+        assert_eq!(specializations, 6, "per-use g + f specializations");
+        assert_eq!(used_names.len(), 6);
     }
 
     #[test]
@@ -1685,10 +1703,12 @@ mod tests {
             TypedExpr::let_bind("g", g, TypedExpr::let_bind("h", h, uses)),
         );
         let ty = run_inference(&mut e).expect("triple poly chain type-checks");
-        let pair = |b: BaseType| Type::Tuple(vec![Type::Base(b.clone()), Type::Base(b)]);
+        // `f` duplicates its argument, so each half of a pair is that argument's own
+        // type — the literal's singleton, not its base.
+        let pair = |t: Type| Type::Tuple(vec![t.clone(), t]);
         assert_eq!(
             ty,
-            Type::Tuple(vec![pair(BaseType::Int), pair(BaseType::String)])
+            Type::Tuple(vec![pair(int_lit_ty(1)), pair(str_lit_ty("a"))])
         );
         let (specializations, used_names) = specialization_stats(&e);
         assert_eq!(specializations, 6, "two specializations per chain layer");
@@ -1724,12 +1744,11 @@ mod tests {
         let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
         run_inference(&mut e).expect("mixed direct + chained uses type-check");
         let (specializations, used_names) = specialization_stats(&e);
-        assert_eq!(
-            specializations, 4,
-            "two g specializations + two f specializations (direct Int use \
-             shares the chained Int clone's specialization)"
-        );
-        assert_eq!(used_names.len(), 4);
+        // The direct `Int` use no longer shares the chained `Int` clone: the two
+        // literals give the two uses distinct types, so each mints its own
+        // specialization (see the `specs` field doc).
+        assert_eq!(specializations, 5, "per-use g + f specializations");
+        assert_eq!(used_names.len(), 5);
     }
 
     #[test]
@@ -1802,8 +1821,8 @@ mod tests {
         assert_eq!(
             ty,
             Type::Tuple(vec![
-                Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)]),
-                Type::Base(BaseType::String),
+                Type::Tuple(vec![int_lit_ty(1), int_lit_ty(1)]),
+                str_lit_ty("a"),
             ])
         );
     }
@@ -1833,7 +1852,7 @@ mod tests {
         let id = TypedExpr::lambda("z", Type::Hole, TypedExpr::var("z"));
         let mut e = TypedExpr::apply(id, outer);
         let ty = run_inference(&mut e).expect("captured-var application type-checks");
-        assert_eq!(ty, Type::Base(BaseType::Int));
+        assert_eq!(ty, int_lit_ty(1));
     }
 
     #[test]
@@ -1857,7 +1876,7 @@ mod tests {
         let applied = TypedExpr::apply(lit_int(5), TypedExpr::apply(id, TypedExpr::var("mk")));
         let mut e = TypedExpr::let_bind("mk", mk, applied);
         let ty = run_inference(&mut e).expect("two-level nested generalization type-checks");
-        assert_eq!(ty, Type::Base(BaseType::Int));
+        assert_eq!(ty, int_lit_ty(5));
     }
 
     #[test]
@@ -1890,13 +1909,7 @@ mod tests {
             TypedExpr::apply(lit_string("a"), TypedExpr::var("outer")),
         );
         let ty = run_inference(&mut e).expect("nested generalization type-checks");
-        assert_eq!(
-            ty,
-            Type::Tuple(vec![
-                Type::Base(BaseType::String),
-                Type::Base(BaseType::Int),
-            ])
-        );
+        assert_eq!(ty, Type::Tuple(vec![str_lit_ty("a"), int_lit_ty(1),]));
         // The discriminating check: three specializations — one for `outer`,
         // and *two* nested ones for `inner` (at `String` and `Int`). Without
         // level-preserving freshening the pass would not recurse into `inner`,
@@ -1908,7 +1921,12 @@ mod tests {
         );
         // And the two inner specializations carry concrete, distinct param
         // types — never the under-determined shared definition.
-        let mono_param_tys = collect_mono_param_types(&e);
+        // The param types are the *arguments'* types, singletons and all; what this
+        // test is about is which **base** each specialization was minted at.
+        let mono_param_tys: Vec<Type> = collect_mono_param_types(&e)
+            .iter()
+            .map(crate::ccl::ccl_utils::strip_refinements)
+            .collect();
         assert!(
             mono_param_tys.contains(&Type::Base(BaseType::String))
                 && mono_param_tys.contains(&Type::Base(BaseType::Int)),

@@ -549,6 +549,20 @@ of the partiality disappears entirely.)
 value: a single inhabitant of the unit type. (In the lowering, `None`
 becomes the CCL `Unit` literal.)
 
+A literal's **type is the literal itself**, not merely its base: `5` has type
+`{Int | 𝑒 == 5}`, printed `5`. So `x = 5` gives `x` the type `5`, and an
+annotation only has to *admit* the value — `x: Int = 5` leaves `x` at `5`,
+because widening is the annotation's business and not the value's. Any
+operation that computes a *new* value drops it, since it is a fact about one
+value and not about the operation: `x + x` is an `Int`, `if c: 1 else: 2` is an
+`Int`, and a mutable register never takes it (a register is the sequence its
+writes produce, so no one write's value describes it). `None` is the exception
+with nothing to say — unit has one inhabitant.
+
+The point of carrying it is proof: `arr[0]` is only a *total* lookup if `0`'s
+type says it is `0` and so lies inside `arr`'s index range (§3.9). Nothing else
+in the language observes it.
+
 > **Direction.** `None` is a Python spelling that collides with the
 > decided term/type capitalization rule (**[Decided]**, §6.1: lowercase
 > heads are terms; `Caps` means *type*, without exception). In the

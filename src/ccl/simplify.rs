@@ -217,12 +217,18 @@ fn take(expr: &mut Expr) -> Expr {
 /// lifted to `Apply(BinOp(...), Const)` no longer hides the operator from
 /// rewriting, and a BinOp inside a lambda body that has been desugared to
 /// `Apply(Tuple, Builtin(BinOp(Add)))` is rewritten via its `Builtin` head.
+/// Whether `ty` is `String`, **ignoring refinements**. A refined string
+/// (`{String | __elem == "a"}`, the singleton a literal carries) is still a string,
+/// and which runtime operator `+` dispatches to is a question about the base.
+fn is_string(ty: &Type) -> bool {
+    crate::ccl::ccl_utils::strip_refinements(ty) == Type::Base(BaseType::String)
+}
+
 fn try_string_add_to_concat(expr: &mut Expr) -> bool {
     match &mut expr.node {
         // Pre-lambda-elim form: a raw BinOp node still in the tree.
         TypedExprNode::BinOp { left, op, .. }
-            if *op == BinOpKind::Arithmetic(ArithmeticKind::Add)
-                && left.ty == Type::Base(BaseType::String) =>
+            if *op == BinOpKind::Arithmetic(ArithmeticKind::Add) && is_string(&left.ty) =>
         {
             *op = BinOpKind::Concat;
             true
@@ -235,7 +241,7 @@ fn try_string_add_to_concat(expr: &mut Expr) -> bool {
         {
             if let Type::Fun { domain: arg_ty, .. } = &expr.ty
                 && let Type::Tuple(elts) = arg_ty.as_ref()
-                && elts.first() == Some(&Type::Base(BaseType::String))
+                && elts.first().is_some_and(is_string)
             {
                 *op = BinOpKind::Concat;
                 return true;

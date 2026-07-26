@@ -155,7 +155,15 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 // 30s: among the heaviest compiles here; like `test_joins`, reaches ~9.5s wall on a slow CI VM.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[case("1", "1:Int", Tile::Scalar(ColumnValue::Ints(vec![1])))]
+// A literal's type is its singleton, and by this point planning has compiled the
+// predicate to point-free form — so it renders as the operator chain rather than the
+// `__elem == 1` the type layer wrote. Nothing executes it (see the `keydom` note on
+// `case_21`); it is a carried refinement that happens to survive to here.
+#[case(
+    "1",
+    "1:{Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}",
+    Tile::Scalar(ColumnValue::Ints(vec![1]))
+)]
 #[case("1 + 2", "(1, 2) ▷ add:Int", Tile::Scalar(ColumnValue::Ints(vec![3])))]
 #[case(
     "1 + 2 - 3 * 4",
@@ -184,7 +192,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "y = 10; [x + y for x in [1,2,3]]",
-    "let y : Int = 10\nin iterate ≫ [1, 2, 3] ≫ (id, y ▷ const) ▷ zip ≫ add:([0, 2] ⇒ Int)",
+    "let y : {Int | __elem ▷ ((id, 10 ▷ const) ▷ zip ≫ eq)} = 10\nin iterate ≫ [1, 2, 3] ≫ (id, y ▷ const) ▷ zip ≫ add:([0, 2] ⇒ Int)",
     make_int_list(&[11,12,13])
 )]
 #[case(

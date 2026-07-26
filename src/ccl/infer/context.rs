@@ -262,53 +262,29 @@ impl Typing for InferCtx {
         // reconciliation is identical: annotation wins on success, conflict
         // surfaces as AnnotationMismatch.
         //
-        // Two-way constrain_subtype == equality. This eagerly detects
-        // conflicts (a body constrains the binder to T, the annotation says
-        // U ≠ T → propagation fails immediately → AnnotationMismatch).
-        // One-way-only would defer the conflict to coalesce.
+        // **One-way**: `inferred <: ann`. An ascription `x: T = e` needs exactly
+        // that — the value must be usable where `T` is expected — and nothing more.
         //
-        // KNOWN OVER-RESTRICTION: an ascription `x: T = e` only *needs*
-        // `inferred <: T` (the value is usable where T is expected). The
-        // reverse direction (`T <: inferred`) additionally rejects a value
-        // whose inferred type is a *strict subtype* of the annotation — e.g.
-        // a variant inferred as `{A}` annotated at the wider `{A | B}`, which
-        // is a sound widening. So the right rule for any annotation with a
-        // non-trivial subtyping lattice (variants, `UIntRange`) is one-way
-        // `inferred <: ann` in positive position.
+        // The reverse direction (`ann <: inferred`) additionally rejected a value
+        // whose inferred type is a *strict subtype* of its annotation, which is a
+        // sound widening, not an error: `x: Int = 1` with `1 : {Int | __elem == 1}`,
+        // or a variant inferred as `{A}` annotated at the wider `{A | B}`. It was
+        // kept for eager conflict detection, and was harmless only while every
+        // source annotation was a `Type::Base` leaf, where the two directions
+        // coincide. They no longer do.
         //
-        // The over-restriction is currently unreachable, but NOT for the
-        // reason the old comment here claimed (it referenced the long-removed
-        // `Type::Union` and a `normalize_annotation` Union→fresh_var step that
-        // no longer exists — `normalize_annotation` now recurses structurally
-        // through `Type::Variant`). The actual reason: `lower_type_annotation`
-        // (`lower.rs`) only lowers `int`/`str`/`bool`/`None` annotations from
-        // source, all of which are `Type::Base` leaves where two-way ≡ one-way
-        // (distinct bases are incomparable; equal bases compare reflexively).
-        // The other annotation producer — `channelize`' filter-feed
-        // `Fun(Refinement(Hole, r), Hole)` shapes — is Hole-based: normalized
-        // Holes become fresh vars, where the two directions record symmetric
-        // bounds (the intended "annotation wins" propagation) rather than
-        // rejecting anything.
-        //
-        // Switching to one-way is a soundness-and-completeness change to the
-        // inference core, untestable from source today; make it one-way, with
-        // AST-level tests, when variant/range annotations become
-        // source-reachable. (The `#[ignore]`d `variant_param_accepts_subtype`
-        // in `tests/inference_variants.rs` exercises the widening at an apply
-        // site; with the Apply edges now one-way it infers the widened variant
-        // correctly and fails only on variant tag *ordering*.)
+        // Information still flows *from* the annotation, so "annotation wins" is
+        // preserved: against a `Hole`-based annotation (`channelize`'s filter-feed
+        // `Fun(Refinement(Hole, r), Hole)`) the forward edge demands the
+        // annotation's refinement of an inferred variable, and the refinement rule
+        // flows that deficit onto it rather than rejecting. What changes is *when* a
+        // genuine conflict surfaces: at coalesce rather than immediately.
         let ann_simple = self.normalize_annotation(ann);
         // Snapshot the inferred type before the annotation bounds are added so
         // the error shows what was actually inferred, not the partially
         // modified state after a failed constrain_subtype.
         let inferred_ty = coalesce_for_error(inferred);
         constrain_subtype(inferred, &ann_simple, &mut self.cache).map_err(|_| {
-            InferError::AnnotationMismatch {
-                annotation: ann.clone(),
-                inferred: inferred_ty.clone(),
-            }
-        })?;
-        constrain_subtype(&ann_simple, inferred, &mut self.cache).map_err(|_| {
             InferError::AnnotationMismatch {
                 annotation: ann.clone(),
                 inferred: inferred_ty,

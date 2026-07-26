@@ -88,16 +88,18 @@ pub use check::check;
 pub use schemes::OperatorSchemes;
 
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use crate::ccl::FieldKey;
 use crate::ccl::infer::solver::{CoalesceError, ConstrainError, prim};
-use crate::ccl::{BaseType, Lit, Type};
+use crate::ccl::{BaseType, BinOpKind, CompareKind, Lit, Refinement, Type, TypedExpr};
 
 use context::InferCtx;
 use emit::emit_node;
 use solve::{coalesce_pass, resolve_var_type, retype_predicate_slots};
 
-#[cfg(debug_assertions)]
+// `Name` is no longer debug-only: `lit_singleton` builds its predicate over the
+// refinement binder in every build.
 use crate::ccl::Name;
 #[cfg(debug_assertions)]
 use solve::check_scope_valid;
@@ -210,6 +212,66 @@ pub(super) fn lit_base(lit: &Lit) -> Type {
         Lit::Bool(_) => prim(BaseType::Bool),
         Lit::Unit => prim(BaseType::Unit),
     }
+}
+
+/// The type of a literal: its base refined by the **singleton** predicate
+/// `__elem == lit`, so `5 : {Int | __elem == 5}`.
+///
+/// A literal knows more about itself than its base type does, and that knowledge is
+/// what a proof obligation needs: `a[0]` can only discharge against `Array(3, 𝑇)`'s
+/// index range if `0`'s type says it *is* `0`. Typing `5` as plain `Int` throws that
+/// away at the one place it is free to keep.
+///
+/// Carried as an ordinary [`Type::Refinement`] rather than a `Literal(base, value)`
+/// type, so every existing rule applies unchanged and none has to learn a new case:
+/// the refinement drops on the way up (a literal stays usable wherever its base is),
+/// refinements intersect at a join (so `[1, 2]` has element type `Int`) and union at
+/// a meet, and the predicate compiles like any other.
+///
+/// The predicate is built **typed**, not with `Hole`s. Only *node* annotations get
+/// their embedded predicates re-inferred (`emit_annotation_predicates`), and
+/// this one rides a type made here rather than written by a user, so an untyped
+/// predicate would strand unresolved variables at the post-inference wall. Every type
+/// involved is known: both sides are the base and the comparison is `Bool`. The inner
+/// literal takes [`lit_base`] — refining *it* too would not terminate.
+pub fn lit_singleton(lit: &Lit) -> Type {
+    let base = lit_base(lit);
+    // `unit` has a single inhabitant, so a singleton adds nothing to its base.
+    if matches!(lit, Lit::Unit) {
+        return base;
+    }
+    let predicate = TypedExpr::binop(
+        TypedExpr::var(Name::elem()).with_ty(base.clone()),
+        BinOpKind::Compare(CompareKind::Equals),
+        TypedExpr::lit(lit.clone()).with_ty(base.clone()),
+    )
+    .with_ty(prim(BaseType::Bool));
+    Type::Refinement(
+        Box::new(base),
+        Refinement {
+            predicate: Rc::new(predicate),
+        },
+    )
+}
+
+/// Test shorthand for an integer literal's *type* — its singleton, `{Int | __elem == n}`.
+/// Tests assert the *real* answer rather than the base, since downstream work depends
+/// on a literal carrying what it is.
+#[cfg(test)]
+pub(crate) fn int_lit_ty(n: i64) -> Type {
+    lit_singleton(&Lit::Int(n))
+}
+
+/// Test shorthand for a string literal's type — see [`int_lit_ty`].
+#[cfg(test)]
+pub(crate) fn str_lit_ty(s: &str) -> Type {
+    lit_singleton(&Lit::String(s.to_string()))
+}
+
+/// Test shorthand for a boolean literal's type — see [`int_lit_ty`].
+#[cfg(test)]
+pub(crate) fn bool_lit_ty(b: bool) -> Type {
+    lit_singleton(&Lit::Bool(b))
 }
 
 /// Run Cambra's type inference on `expr`.
@@ -403,20 +465,14 @@ mod tests {
         });
         let mut e = app;
         let ty = run_inference(&mut e).expect("inference succeeds");
-        assert_eq!(ty, Type::Base(BaseType::Int));
+        assert_eq!(ty, int_lit_ty(42));
     }
 
     #[test]
     fn smoke_tuple_literal() {
         let mut e = TypedExpr::new(TypedExprNode::Tuple(vec![lit_int(1), lit_string("x")]));
         let ty = run_inference(&mut e).expect("inference succeeds");
-        assert_eq!(
-            ty,
-            Type::Tuple(vec![
-                Type::Base(BaseType::Int),
-                Type::Base(BaseType::String)
-            ])
-        );
+        assert_eq!(ty, Type::Tuple(vec![int_lit_ty(1), str_lit_ty("x")]));
     }
 
     #[test]
@@ -429,8 +485,8 @@ mod tests {
         assert_eq!(
             ty,
             Type::Record(vec![
-                ("a".to_string(), Type::Base(BaseType::Int)),
-                ("b".to_string(), Type::Base(BaseType::String)),
+                ("a".to_string(), int_lit_ty(1)),
+                ("b".to_string(), str_lit_ty("x")),
             ])
         );
     }
@@ -448,6 +504,6 @@ mod tests {
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),
         });
         let ty = run_inference(&mut e).expect("inference succeeds");
-        assert_eq!(ty, Type::Base(BaseType::Int));
+        assert_eq!(ty, int_lit_ty(42));
     }
 }
