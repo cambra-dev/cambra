@@ -42,7 +42,7 @@ use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::inspector_model::{Diagnostic, SnapshotPayload, diagnostics_from_compile_errors};
 use cambra::interpreter::Consumer;
 
-use crate::snapshot_json;
+use crate::{snapshot_json, snapshot_json_pretty};
 
 /// The CodeMirror frontend, embedded at compile time. This is the built,
 /// self-contained single-file bundle (`web/dist/index.html`, produced by
@@ -99,6 +99,11 @@ fn degraded_snapshot_json(name: &str, code: &str, diagnostics: Vec<Diagnostic>) 
         .expect("degraded snapshot payload serializes")
 }
 
+fn degraded_snapshot_json_pretty(name: &str, code: &str, diagnostics: Vec<Diagnostic>) -> String {
+    serde_json::to_string_pretty(&SnapshotPayload::degraded(name, code, diagnostics))
+        .expect("degraded snapshot payload serializes")
+}
+
 /// Compile `code` once and return the `/api/snapshot` body — the full payload
 /// on success, the degraded form (source + diagnostics, no stages) on failure.
 ///
@@ -111,6 +116,21 @@ pub fn snapshot_body(code: &str, name: &str) -> String {
     match compile_program(&mut ctx, code, consumer) {
         Ok(compiled) => snapshot_json(&compiled, name),
         Err(errors) => degraded_snapshot_json(name, code, diagnostics_from_compile_errors(&errors)),
+    }
+}
+
+/// Pretty-printed [`snapshot_body`] — what `--dump-snapshot` prints, and
+/// therefore the exact bytes of the committed golden fixtures (see
+/// [`crate::snapshot_json_pretty`] for why the binary owns this format).
+/// The HTTP route keeps the compact form.
+pub fn snapshot_body_pretty(code: &str, name: &str) -> String {
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    match compile_program(&mut ctx, code, consumer) {
+        Ok(compiled) => snapshot_json_pretty(&compiled, name),
+        Err(errors) => {
+            degraded_snapshot_json_pretty(name, code, diagnostics_from_compile_errors(&errors))
+        }
     }
 }
 

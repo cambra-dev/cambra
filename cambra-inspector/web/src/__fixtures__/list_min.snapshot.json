@@ -1,430 +1,430 @@
 {
-    "source": {
-        "name": "cambra-inspector/examples/list_min.chl",
-        "text": "[1, 2, 3, 4]\n"
-    },
-    "definitions": [],
-    "scopes": [],
-    "diagnostics": [],
-    "meta": {
-        "tick": null,
-        "snapshotKind": "post-inference",
-        "schema": 3
-    },
-    "stages": [
+  "source": {
+    "name": "cambra-inspector/examples/list_min.chl",
+    "text": "[1, 2, 3, 4]\n"
+  },
+  "definitions": [],
+  "scopes": [],
+  "diagnostics": [],
+  "meta": {
+    "tick": null,
+    "snapshotKind": "post-inference",
+    "schema": 3
+  },
+  "stages": [
+    {
+      "id": "pre-inference",
+      "label": "IR (PRE-INFERENCE)",
+      "kind": "holes",
+      "ir": {
+        "label": "List",
+        "annotations": [],
+        "nodeId": 5,
+        "span": {
+          "start": 1,
+          "end": 12
+        },
+        "rewritten": null,
+        "type": "_",
+        "tiling": null,
+        "children": [
+          {
+            "edge": "0",
+            "node": {
+              "label": "Lit(Int(1))",
+              "annotations": [],
+              "nodeId": 1,
+              "span": {
+                "start": 1,
+                "end": 2
+              },
+              "rewritten": null,
+              "type": "_",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "1",
+            "node": {
+              "label": "Lit(Int(2))",
+              "annotations": [],
+              "nodeId": 2,
+              "span": {
+                "start": 4,
+                "end": 5
+              },
+              "rewritten": null,
+              "type": "_",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "2",
+            "node": {
+              "label": "Lit(Int(3))",
+              "annotations": [],
+              "nodeId": 3,
+              "span": {
+                "start": 7,
+                "end": 8
+              },
+              "rewritten": null,
+              "type": "_",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "3",
+            "node": {
+              "label": "Lit(Int(4))",
+              "annotations": [],
+              "nodeId": 4,
+              "span": {
+                "start": 10,
+                "end": 11
+              },
+              "rewritten": null,
+              "type": "_",
+              "tiling": null,
+              "children": []
+            }
+          }
+        ]
+      },
+      "spanIndex": [
         {
-            "id": "pre-inference",
-            "label": "IR (PRE-INFERENCE)",
-            "kind": "holes",
-            "ir": {
-                "label": "List",
-                "annotations": [],
-                "nodeId": 5,
-                "span": {
-                    "start": 1,
-                    "end": 12
-                },
-                "rewritten": null,
-                "type": "_",
-                "tiling": null,
-                "children": [
-                    {
-                        "edge": "0",
-                        "node": {
-                            "label": "Lit(Int(1))",
-                            "annotations": [],
-                            "nodeId": 1,
-                            "span": {
-                                "start": 1,
-                                "end": 2
-                            },
-                            "rewritten": null,
-                            "type": "_",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "1",
-                        "node": {
-                            "label": "Lit(Int(2))",
-                            "annotations": [],
-                            "nodeId": 2,
-                            "span": {
-                                "start": 4,
-                                "end": 5
-                            },
-                            "rewritten": null,
-                            "type": "_",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "2",
-                        "node": {
-                            "label": "Lit(Int(3))",
-                            "annotations": [],
-                            "nodeId": 3,
-                            "span": {
-                                "start": 7,
-                                "end": 8
-                            },
-                            "rewritten": null,
-                            "type": "_",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "3",
-                        "node": {
-                            "label": "Lit(Int(4))",
-                            "annotations": [],
-                            "nodeId": 4,
-                            "span": {
-                                "start": 10,
-                                "end": 11
-                            },
-                            "rewritten": null,
-                            "type": "_",
-                            "tiling": null,
-                            "children": []
-                        }
-                    }
-                ]
-            },
-            "spanIndex": [
-                {
-                    "span": {
-                        "start": 1,
-                        "end": 12
-                    },
-                    "nodeId": 5
-                },
-                {
-                    "span": {
-                        "start": 1,
-                        "end": 2
-                    },
-                    "nodeId": 1
-                },
-                {
-                    "span": {
-                        "start": 4,
-                        "end": 5
-                    },
-                    "nodeId": 2
-                },
-                {
-                    "span": {
-                        "start": 7,
-                        "end": 8
-                    },
-                    "nodeId": 3
-                },
-                {
-                    "span": {
-                        "start": 10,
-                        "end": 11
-                    },
-                    "nodeId": 4
-                }
-            ]
+          "span": {
+            "start": 1,
+            "end": 12
+          },
+          "nodeId": 5
         },
         {
-            "id": "post-inference",
-            "label": "IR (POST-INFERENCE)",
-            "kind": "typed",
-            "ir": {
-                "label": "List",
-                "annotations": [],
-                "nodeId": 5,
-                "span": {
-                    "start": 1,
-                    "end": 12
-                },
-                "rewritten": null,
-                "type": "([0, 3] \u21d2 Int)",
-                "tiling": null,
-                "children": [
-                    {
-                        "edge": "0",
-                        "node": {
-                            "label": "Lit(Int(1))",
-                            "annotations": [],
-                            "nodeId": 1,
-                            "span": {
-                                "start": 1,
-                                "end": 2
-                            },
-                            "rewritten": null,
-                            "type": "1",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "1",
-                        "node": {
-                            "label": "Lit(Int(2))",
-                            "annotations": [],
-                            "nodeId": 2,
-                            "span": {
-                                "start": 4,
-                                "end": 5
-                            },
-                            "rewritten": null,
-                            "type": "2",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "2",
-                        "node": {
-                            "label": "Lit(Int(3))",
-                            "annotations": [],
-                            "nodeId": 3,
-                            "span": {
-                                "start": 7,
-                                "end": 8
-                            },
-                            "rewritten": null,
-                            "type": "3",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "3",
-                        "node": {
-                            "label": "Lit(Int(4))",
-                            "annotations": [],
-                            "nodeId": 4,
-                            "span": {
-                                "start": 10,
-                                "end": 11
-                            },
-                            "rewritten": null,
-                            "type": "4",
-                            "tiling": null,
-                            "children": []
-                        }
-                    }
-                ]
-            },
-            "spanIndex": [
-                {
-                    "span": {
-                        "start": 1,
-                        "end": 12
-                    },
-                    "nodeId": 5
-                },
-                {
-                    "span": {
-                        "start": 1,
-                        "end": 2
-                    },
-                    "nodeId": 1
-                },
-                {
-                    "span": {
-                        "start": 4,
-                        "end": 5
-                    },
-                    "nodeId": 2
-                },
-                {
-                    "span": {
-                        "start": 7,
-                        "end": 8
-                    },
-                    "nodeId": 3
-                },
-                {
-                    "span": {
-                        "start": 10,
-                        "end": 11
-                    },
-                    "nodeId": 4
-                }
-            ]
+          "span": {
+            "start": 1,
+            "end": 2
+          },
+          "nodeId": 1
         },
         {
-            "id": "post-desugar",
-            "label": "IR (POST-DESUGAR)",
-            "kind": "typed",
-            "ir": {
-                "label": "List",
-                "annotations": [],
-                "nodeId": 5,
-                "span": {
-                    "start": 1,
-                    "end": 12
-                },
-                "rewritten": null,
-                "type": "([0, 3] \u21d2 Int)",
-                "tiling": null,
-                "children": [
-                    {
-                        "edge": "0",
-                        "node": {
-                            "label": "Lit(Int(1))",
-                            "annotations": [],
-                            "nodeId": 1,
-                            "span": {
-                                "start": 1,
-                                "end": 2
-                            },
-                            "rewritten": null,
-                            "type": "1",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "1",
-                        "node": {
-                            "label": "Lit(Int(2))",
-                            "annotations": [],
-                            "nodeId": 2,
-                            "span": {
-                                "start": 4,
-                                "end": 5
-                            },
-                            "rewritten": null,
-                            "type": "2",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "2",
-                        "node": {
-                            "label": "Lit(Int(3))",
-                            "annotations": [],
-                            "nodeId": 3,
-                            "span": {
-                                "start": 7,
-                                "end": 8
-                            },
-                            "rewritten": null,
-                            "type": "3",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "3",
-                        "node": {
-                            "label": "Lit(Int(4))",
-                            "annotations": [],
-                            "nodeId": 4,
-                            "span": {
-                                "start": 10,
-                                "end": 11
-                            },
-                            "rewritten": null,
-                            "type": "4",
-                            "tiling": null,
-                            "children": []
-                        }
-                    }
-                ]
-            },
-            "spanIndex": [
-                {
-                    "span": {
-                        "start": 1,
-                        "end": 12
-                    },
-                    "nodeId": 5
-                },
-                {
-                    "span": {
-                        "start": 1,
-                        "end": 2
-                    },
-                    "nodeId": 1
-                },
-                {
-                    "span": {
-                        "start": 4,
-                        "end": 5
-                    },
-                    "nodeId": 2
-                },
-                {
-                    "span": {
-                        "start": 7,
-                        "end": 8
-                    },
-                    "nodeId": 3
-                },
-                {
-                    "span": {
-                        "start": 10,
-                        "end": 11
-                    },
-                    "nodeId": 4
-                }
-            ]
+          "span": {
+            "start": 4,
+            "end": 5
+          },
+          "nodeId": 2
+        },
+        {
+          "span": {
+            "start": 7,
+            "end": 8
+          },
+          "nodeId": 3
+        },
+        {
+          "span": {
+            "start": 10,
+            "end": 11
+          },
+          "nodeId": 4
         }
-    ],
-    "paneLinks": [
+      ]
+    },
+    {
+      "id": "post-inference",
+      "label": "IR (POST-INFERENCE)",
+      "kind": "typed",
+      "ir": {
+        "label": "List",
+        "annotations": [],
+        "nodeId": 5,
+        "span": {
+          "start": 1,
+          "end": 12
+        },
+        "rewritten": null,
+        "type": "([0, 3] ⇒ Int)",
+        "tiling": null,
+        "children": [
+          {
+            "edge": "0",
+            "node": {
+              "label": "Lit(Int(1))",
+              "annotations": [],
+              "nodeId": 1,
+              "span": {
+                "start": 1,
+                "end": 2
+              },
+              "rewritten": null,
+              "type": "1",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "1",
+            "node": {
+              "label": "Lit(Int(2))",
+              "annotations": [],
+              "nodeId": 2,
+              "span": {
+                "start": 4,
+                "end": 5
+              },
+              "rewritten": null,
+              "type": "2",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "2",
+            "node": {
+              "label": "Lit(Int(3))",
+              "annotations": [],
+              "nodeId": 3,
+              "span": {
+                "start": 7,
+                "end": 8
+              },
+              "rewritten": null,
+              "type": "3",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "3",
+            "node": {
+              "label": "Lit(Int(4))",
+              "annotations": [],
+              "nodeId": 4,
+              "span": {
+                "start": 10,
+                "end": 11
+              },
+              "rewritten": null,
+              "type": "4",
+              "tiling": null,
+              "children": []
+            }
+          }
+        ]
+      },
+      "spanIndex": [
         {
-            "from": "pre-inference",
-            "to": "post-inference",
-            "edges": [
-                [
-                    1,
-                    1
-                ],
-                [
-                    2,
-                    2
-                ],
-                [
-                    3,
-                    3
-                ],
-                [
-                    4,
-                    4
-                ],
-                [
-                    5,
-                    5
-                ]
-            ]
+          "span": {
+            "start": 1,
+            "end": 12
+          },
+          "nodeId": 5
         },
         {
-            "from": "post-inference",
-            "to": "post-desugar",
-            "edges": [
-                [
-                    1,
-                    1
-                ],
-                [
-                    2,
-                    2
-                ],
-                [
-                    3,
-                    3
-                ],
-                [
-                    4,
-                    4
-                ],
-                [
-                    5,
-                    5
-                ]
-            ]
+          "span": {
+            "start": 1,
+            "end": 2
+          },
+          "nodeId": 1
+        },
+        {
+          "span": {
+            "start": 4,
+            "end": 5
+          },
+          "nodeId": 2
+        },
+        {
+          "span": {
+            "start": 7,
+            "end": 8
+          },
+          "nodeId": 3
+        },
+        {
+          "span": {
+            "start": 10,
+            "end": 11
+          },
+          "nodeId": 4
         }
-    ]
+      ]
+    },
+    {
+      "id": "post-desugar",
+      "label": "IR (POST-DESUGAR)",
+      "kind": "typed",
+      "ir": {
+        "label": "List",
+        "annotations": [],
+        "nodeId": 5,
+        "span": {
+          "start": 1,
+          "end": 12
+        },
+        "rewritten": null,
+        "type": "([0, 3] ⇒ Int)",
+        "tiling": null,
+        "children": [
+          {
+            "edge": "0",
+            "node": {
+              "label": "Lit(Int(1))",
+              "annotations": [],
+              "nodeId": 1,
+              "span": {
+                "start": 1,
+                "end": 2
+              },
+              "rewritten": null,
+              "type": "1",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "1",
+            "node": {
+              "label": "Lit(Int(2))",
+              "annotations": [],
+              "nodeId": 2,
+              "span": {
+                "start": 4,
+                "end": 5
+              },
+              "rewritten": null,
+              "type": "2",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "2",
+            "node": {
+              "label": "Lit(Int(3))",
+              "annotations": [],
+              "nodeId": 3,
+              "span": {
+                "start": 7,
+                "end": 8
+              },
+              "rewritten": null,
+              "type": "3",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "3",
+            "node": {
+              "label": "Lit(Int(4))",
+              "annotations": [],
+              "nodeId": 4,
+              "span": {
+                "start": 10,
+                "end": 11
+              },
+              "rewritten": null,
+              "type": "4",
+              "tiling": null,
+              "children": []
+            }
+          }
+        ]
+      },
+      "spanIndex": [
+        {
+          "span": {
+            "start": 1,
+            "end": 12
+          },
+          "nodeId": 5
+        },
+        {
+          "span": {
+            "start": 1,
+            "end": 2
+          },
+          "nodeId": 1
+        },
+        {
+          "span": {
+            "start": 4,
+            "end": 5
+          },
+          "nodeId": 2
+        },
+        {
+          "span": {
+            "start": 7,
+            "end": 8
+          },
+          "nodeId": 3
+        },
+        {
+          "span": {
+            "start": 10,
+            "end": 11
+          },
+          "nodeId": 4
+        }
+      ]
+    }
+  ],
+  "paneLinks": [
+    {
+      "from": "pre-inference",
+      "to": "post-inference",
+      "edges": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          5
+        ]
+      ]
+    },
+    {
+      "from": "post-inference",
+      "to": "post-desugar",
+      "edges": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          5
+        ]
+      ]
+    }
+  ]
 }

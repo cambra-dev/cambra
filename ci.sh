@@ -125,6 +125,15 @@ ci_fixtures() {
         drifted=1
       fi
     done
+    # Orphan check: a committed fixture with no manifest row would otherwise be
+    # compared against nothing and rot silently.
+    for committed in "${fix}"/*.snapshot.json; do
+      name="$(basename "${committed}")"
+      if [[ ! -f "${tmp}/${name}" ]]; then
+        echo "ci_fixtures FAILED: orphan fixture: ${name} is committed but has no row in cambra-inspector/scripts/fixtures.manifest (add the row or delete the fixture)" >&2
+        drifted=1
+      fi
+    done
     exit "${drifted}"
   )
 }

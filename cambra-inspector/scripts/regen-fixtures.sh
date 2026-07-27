@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Regenerate the frontend's golden `/api/snapshot` fixtures from the real
-# backend. Each fixture is the `--dump-snapshot` output for an example program,
-# pretty-printed for reviewable diffs. Run after ANY backend change to the
-# snapshot schema; commit the result. `store.test.ts` keys its assertions on
-# node labels/types (not raw NodeIds), so ordinary id churn does not require
-# touching the tests — but a shape change will, by design.
+# backend. Each fixture is the `--dump-snapshot` output for an example program —
+# pretty-printed by the binary itself (serde_json, pinned by Cargo.lock), so no
+# external formatter owns the committed bytes: piping through e.g. `python3 -m
+# json.tool` would tie the corpus to the local Python version and to colorizing
+# env vars (FORCE_COLOR), either of which silently rewrites every fixture.
+# Run after ANY backend change to the snapshot schema; commit the result.
+# `store.test.ts` keys its assertions on node labels/types (not raw NodeIds),
+# so ordinary id churn does not require touching the tests — but a shape change
+# will, by design.
 #
 # The corpus (fixture -> example mapping) lives in fixtures.manifest next to
 # this script — shared with the cargo golden tests (tests/goldens.rs) so the
@@ -29,10 +33,9 @@ while read -r name example; do
   prog="cambra-inspector/examples/${example}.chl"
   out="${FIX}/${name}.snapshot.json"
   echo "regen ${out}  <-  ${prog}"
-  # `< /dev/null`: the pipeline must not inherit the loop's stdin, or it eats
+  # `< /dev/null`: the command must not inherit the loop's stdin, or it eats
   # the rest of the manifest and only the first fixture regenerates.
-  cargo run -q -p cambra-inspector -- "${prog}" --dump-snapshot < /dev/null \
-    | python3 -m json.tool > "${out}"
+  cargo run -q -p cambra-inspector -- "${prog}" --dump-snapshot < /dev/null > "${out}"
 done < "${MANIFEST}"
 
 echo "done. Review the diff: git diff ${FIX}"

@@ -39,6 +39,22 @@ pub fn snapshot_json(compiled: &CompiledProgram, name: &str) -> String {
     serde_json::to_string(&payload).expect("snapshot payload serializes")
 }
 
+/// Pretty-printed [`snapshot_json`] — the byte format of the committed golden
+/// fixtures (`web/src/__fixtures__/`).
+///
+/// The binary owns these bytes deliberately: the fixtures are byte-compared by
+/// `ci.sh`'s `ci_fixtures` gate, so their formatter must be pinned by
+/// Cargo.lock, not an external tool (they were previously piped through
+/// `python3 -m json.tool`, whose output is Python-version-dependent and
+/// colorizes under `FORCE_COLOR` — either silently rewrites the whole corpus).
+/// Serializes the typed payload directly — never round-trip through
+/// `serde_json::Value`, which would reorder keys.
+pub fn snapshot_json_pretty(compiled: &CompiledProgram, name: &str) -> String {
+    let snapshot = Snapshot::new(compiled);
+    let payload = snapshot.build_payload(name);
+    serde_json::to_string_pretty(&payload).expect("snapshot payload serializes")
+}
+
 /// Compile `code` and serialize the resulting diagnostics to JSON.
 ///
 /// The web half of the dual-use diagnostics: the same `CompileError`s

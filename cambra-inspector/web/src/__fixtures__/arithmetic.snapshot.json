@@ -1,1894 +1,1894 @@
 {
-    "source": {
-        "name": "cambra-inspector/examples/arithmetic.chl",
-        "text": "# Let-bindings + arithmetic. A simple post-inference tree:\n# Lit nodes carry \": Int\", BinOp nodes show operator dispatch.\ng = 10\ndef f(p, q):\n  p + q + g\nf(1, 2)\n"
+  "source": {
+    "name": "cambra-inspector/examples/arithmetic.chl",
+    "text": "# Let-bindings + arithmetic. A simple post-inference tree:\n# Lit nodes carry \": Int\", BinOp nodes show operator dispatch.\ng = 10\ndef f(p, q):\n  p + q + g\nf(1, 2)\n"
+  },
+  "definitions": [
+    {
+      "useSpan": {
+        "start": 144,
+        "end": 145
+      },
+      "defSpan": {
+        "start": 135,
+        "end": 136
+      },
+      "name": "p"
     },
-    "definitions": [
+    {
+      "useSpan": {
+        "start": 148,
+        "end": 149
+      },
+      "defSpan": {
+        "start": 138,
+        "end": 139
+      },
+      "name": "q"
+    },
+    {
+      "useSpan": {
+        "start": 152,
+        "end": 153
+      },
+      "defSpan": {
+        "start": 122,
+        "end": 123
+      },
+      "name": "g"
+    },
+    {
+      "useSpan": {
+        "start": 154,
+        "end": 155
+      },
+      "defSpan": {
+        "start": 129,
+        "end": 154
+      },
+      "name": "f"
+    }
+  ],
+  "scopes": [
+    {
+      "span": {
+        "start": 129,
+        "end": 154
+      },
+      "bindings": [
         {
-            "useSpan": {
-                "start": 144,
-                "end": 145
-            },
-            "defSpan": {
-                "start": 135,
-                "end": 136
-            },
-            "name": "p"
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 144,
+        "end": 153
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
         },
         {
-            "useSpan": {
-                "start": 148,
-                "end": 149
-            },
-            "defSpan": {
-                "start": 138,
-                "end": 139
-            },
-            "name": "q"
+          "name": "p",
+          "defSpan": {
+            "start": 135,
+            "end": 136
+          },
+          "type": "Int"
         },
         {
-            "useSpan": {
-                "start": 152,
-                "end": 153
-            },
-            "defSpan": {
-                "start": 122,
-                "end": 123
-            },
-            "name": "g"
+          "name": "q",
+          "defSpan": {
+            "start": 138,
+            "end": 139
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 144,
+        "end": 153
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
         },
         {
-            "useSpan": {
-                "start": 154,
-                "end": 155
-            },
-            "defSpan": {
+          "name": "p",
+          "defSpan": {
+            "start": 135,
+            "end": 136
+          },
+          "type": "Int"
+        },
+        {
+          "name": "q",
+          "defSpan": {
+            "start": 138,
+            "end": 139
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 144,
+        "end": 149
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        },
+        {
+          "name": "p",
+          "defSpan": {
+            "start": 135,
+            "end": 136
+          },
+          "type": "Int"
+        },
+        {
+          "name": "q",
+          "defSpan": {
+            "start": 138,
+            "end": 139
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 144,
+        "end": 145
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        },
+        {
+          "name": "p",
+          "defSpan": {
+            "start": 135,
+            "end": 136
+          },
+          "type": "Int"
+        },
+        {
+          "name": "q",
+          "defSpan": {
+            "start": 138,
+            "end": 139
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 148,
+        "end": 149
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        },
+        {
+          "name": "p",
+          "defSpan": {
+            "start": 135,
+            "end": 136
+          },
+          "type": "Int"
+        },
+        {
+          "name": "q",
+          "defSpan": {
+            "start": 138,
+            "end": 139
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 152,
+        "end": 153
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        },
+        {
+          "name": "p",
+          "defSpan": {
+            "start": 135,
+            "end": 136
+          },
+          "type": "Int"
+        },
+        {
+          "name": "q",
+          "defSpan": {
+            "start": 138,
+            "end": 139
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 154,
+        "end": 161
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        },
+        {
+          "name": "f",
+          "defSpan": {
+            "start": 129,
+            "end": 154
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 154,
+        "end": 161
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        },
+        {
+          "name": "f",
+          "defSpan": {
+            "start": 129,
+            "end": 154
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 154,
+        "end": 155
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        },
+        {
+          "name": "f",
+          "defSpan": {
+            "start": 129,
+            "end": 154
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 156,
+        "end": 157
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        },
+        {
+          "name": "f",
+          "defSpan": {
+            "start": 129,
+            "end": 154
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 159,
+        "end": 160
+      },
+      "bindings": [
+        {
+          "name": "g",
+          "defSpan": {
+            "start": 122,
+            "end": 123
+          },
+          "type": "Int"
+        },
+        {
+          "name": "f",
+          "defSpan": {
+            "start": 129,
+            "end": 154
+          },
+          "type": "Int"
+        }
+      ]
+    }
+  ],
+  "diagnostics": [],
+  "meta": {
+    "tick": null,
+    "snapshotKind": "post-inference",
+    "schema": 3
+  },
+  "stages": [
+    {
+      "id": "pre-inference",
+      "label": "IR (PRE-INFERENCE)",
+      "kind": "holes",
+      "ir": {
+        "label": "Let(g)",
+        "annotations": [],
+        "nodeId": 24,
+        "span": {
+          "start": 122,
+          "end": 128
+        },
+        "rewritten": {
+          "via": "Lower",
+          "nature": "machinery",
+          "label": "lower.image"
+        },
+        "type": "_",
+        "tiling": null,
+        "children": [
+          {
+            "edge": "0",
+            "node": {
+              "label": "Lit(Int(10))",
+              "annotations": [],
+              "nodeId": 23,
+              "span": {
+                "start": 126,
+                "end": 128
+              },
+              "rewritten": null,
+              "type": "_",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "1",
+            "node": {
+              "label": "Let(f)",
+              "annotations": [],
+              "nodeId": 22,
+              "span": {
                 "start": 129,
                 "end": 154
-            },
-            "name": "f"
-        }
-    ],
-    "scopes": [
+              },
+              "rewritten": {
+                "via": "Lower",
+                "nature": "machinery",
+                "label": "lower.image"
+              },
+              "type": "_",
+              "tiling": null,
+              "children": [
+                {
+                  "edge": "0",
+                  "node": {
+                    "label": "Lambda(__arg_tuple_0)",
+                    "annotations": [],
+                    "nodeId": 21,
+                    "span": {
+                      "start": 129,
+                      "end": 154
+                    },
+                    "rewritten": {
+                      "via": "Lower",
+                      "nature": "machinery",
+                      "label": "lower.image"
+                    },
+                    "type": "(_ ⇒ _)",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "BinOp(Arithmetic(Add))",
+                          "annotations": [],
+                          "nodeId": 10,
+                          "span": {
+                            "start": 144,
+                            "end": 153
+                          },
+                          "rewritten": null,
+                          "type": "_",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "BinOp(Arithmetic(Add))",
+                                "annotations": [],
+                                "nodeId": 8,
+                                "span": {
+                                  "start": 144,
+                                  "end": 149
+                                },
+                                "rewritten": null,
+                                "type": "_",
+                                "tiling": null,
+                                "children": [
+                                  {
+                                    "edge": "0",
+                                    "node": {
+                                      "label": "Apply",
+                                      "annotations": [],
+                                      "nodeId": 6,
+                                      "span": {
+                                        "start": 144,
+                                        "end": 145
+                                      },
+                                      "rewritten": null,
+                                      "type": "_",
+                                      "tiling": null,
+                                      "children": [
+                                        {
+                                          "edge": "0",
+                                          "node": {
+                                            "label": "Proj(Index(0))",
+                                            "annotations": [],
+                                            "nodeId": 14,
+                                            "span": {
+                                              "start": 129,
+                                              "end": 154
+                                            },
+                                            "rewritten": {
+                                              "via": "Lower",
+                                              "nature": "machinery",
+                                              "label": "lower.uncurry_proj"
+                                            },
+                                            "type": "_",
+                                            "tiling": null,
+                                            "children": []
+                                          }
+                                        },
+                                        {
+                                          "edge": "1",
+                                          "node": {
+                                            "label": "Var(__arg_tuple_0)",
+                                            "annotations": [],
+                                            "nodeId": 15,
+                                            "span": {
+                                              "start": 129,
+                                              "end": 154
+                                            },
+                                            "rewritten": {
+                                              "via": "Lower",
+                                              "nature": "machinery",
+                                              "label": "lower.uncurry_proj"
+                                            },
+                                            "type": "_",
+                                            "tiling": null,
+                                            "children": []
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "edge": "1",
+                                    "node": {
+                                      "label": "Apply",
+                                      "annotations": [],
+                                      "nodeId": 7,
+                                      "span": {
+                                        "start": 148,
+                                        "end": 149
+                                      },
+                                      "rewritten": null,
+                                      "type": "_",
+                                      "tiling": null,
+                                      "children": [
+                                        {
+                                          "edge": "0",
+                                          "node": {
+                                            "label": "Proj(Index(1))",
+                                            "annotations": [],
+                                            "nodeId": 19,
+                                            "span": {
+                                              "start": 129,
+                                              "end": 154
+                                            },
+                                            "rewritten": {
+                                              "via": "Lower",
+                                              "nature": "machinery",
+                                              "label": "lower.uncurry_proj"
+                                            },
+                                            "type": "_",
+                                            "tiling": null,
+                                            "children": []
+                                          }
+                                        },
+                                        {
+                                          "edge": "1",
+                                          "node": {
+                                            "label": "Var(__arg_tuple_0)",
+                                            "annotations": [],
+                                            "nodeId": 20,
+                                            "span": {
+                                              "start": 129,
+                                              "end": 154
+                                            },
+                                            "rewritten": {
+                                              "via": "Lower",
+                                              "nature": "machinery",
+                                              "label": "lower.uncurry_proj"
+                                            },
+                                            "type": "_",
+                                            "tiling": null,
+                                            "children": []
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                ]
+                              }
+                            },
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Var(g)",
+                                "annotations": [],
+                                "nodeId": 9,
+                                "span": {
+                                  "start": 152,
+                                  "end": 153
+                                },
+                                "rewritten": null,
+                                "type": "_",
+                                "tiling": null,
+                                "children": []
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "edge": "1",
+                  "node": {
+                    "label": "Apply",
+                    "annotations": [],
+                    "nodeId": 5,
+                    "span": {
+                      "start": 154,
+                      "end": 161
+                    },
+                    "rewritten": null,
+                    "type": "_",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Var(f)",
+                          "annotations": [],
+                          "nodeId": 4,
+                          "span": {
+                            "start": 154,
+                            "end": 155
+                          },
+                          "rewritten": {
+                            "via": "Lower",
+                            "nature": "machinery",
+                            "label": "lower.image"
+                          },
+                          "type": "_",
+                          "tiling": null,
+                          "children": []
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "Tuple",
+                          "annotations": [],
+                          "nodeId": 3,
+                          "span": {
+                            "start": 156,
+                            "end": 160
+                          },
+                          "rewritten": {
+                            "via": "Lower",
+                            "nature": "machinery",
+                            "label": "lower.call_tuple"
+                          },
+                          "type": "_",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "Lit(Int(1))",
+                                "annotations": [],
+                                "nodeId": 1,
+                                "span": {
+                                  "start": 156,
+                                  "end": 157
+                                },
+                                "rewritten": null,
+                                "type": "_",
+                                "tiling": null,
+                                "children": []
+                              }
+                            },
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Lit(Int(2))",
+                                "annotations": [],
+                                "nodeId": 2,
+                                "span": {
+                                  "start": 159,
+                                  "end": 160
+                                },
+                                "rewritten": null,
+                                "type": "_",
+                                "tiling": null,
+                                "children": []
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "spanIndex": [
         {
-            "span": {
+          "span": {
+            "start": 122,
+            "end": 128
+          },
+          "nodeId": 24
+        },
+        {
+          "span": {
+            "start": 126,
+            "end": 128
+          },
+          "nodeId": 23
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 22
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 21
+        },
+        {
+          "span": {
+            "start": 144,
+            "end": 153
+          },
+          "nodeId": 10
+        },
+        {
+          "span": {
+            "start": 144,
+            "end": 149
+          },
+          "nodeId": 8
+        },
+        {
+          "span": {
+            "start": 144,
+            "end": 145
+          },
+          "nodeId": 6
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 14
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 15
+        },
+        {
+          "span": {
+            "start": 148,
+            "end": 149
+          },
+          "nodeId": 7
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 19
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 20
+        },
+        {
+          "span": {
+            "start": 152,
+            "end": 153
+          },
+          "nodeId": 9
+        },
+        {
+          "span": {
+            "start": 154,
+            "end": 161
+          },
+          "nodeId": 5
+        },
+        {
+          "span": {
+            "start": 154,
+            "end": 155
+          },
+          "nodeId": 4
+        },
+        {
+          "span": {
+            "start": 156,
+            "end": 160
+          },
+          "nodeId": 3
+        },
+        {
+          "span": {
+            "start": 156,
+            "end": 157
+          },
+          "nodeId": 1
+        },
+        {
+          "span": {
+            "start": 159,
+            "end": 160
+          },
+          "nodeId": 2
+        }
+      ]
+    },
+    {
+      "id": "post-inference",
+      "label": "IR (POST-INFERENCE)",
+      "kind": "typed",
+      "ir": {
+        "label": "Let(g)",
+        "annotations": [],
+        "nodeId": 24,
+        "span": {
+          "start": 122,
+          "end": 128
+        },
+        "rewritten": {
+          "via": "Lower",
+          "nature": "machinery",
+          "label": "lower.image"
+        },
+        "type": "Int",
+        "tiling": null,
+        "children": [
+          {
+            "edge": "0",
+            "node": {
+              "label": "Lit(Int(10))",
+              "annotations": [],
+              "nodeId": 23,
+              "span": {
+                "start": 126,
+                "end": 128
+              },
+              "rewritten": null,
+              "type": "10",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "1",
+            "node": {
+              "label": "Let(__mono)",
+              "annotations": [],
+              "nodeId": 44,
+              "span": {
                 "start": 129,
                 "end": 154
-            },
-            "bindings": [
+              },
+              "rewritten": {
+                "via": "Mono",
+                "nature": "expansion",
+                "label": "infer.mono_wrappers"
+              },
+              "type": "Int",
+              "tiling": null,
+              "children": [
                 {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
+                  "edge": "0",
+                  "node": {
+                    "label": "Lambda(__arg_tuple_0)",
+                    "annotations": [],
+                    "nodeId": 34,
+                    "span": {
+                      "start": 129,
+                      "end": 154
                     },
-                    "type": "Int"
+                    "rewritten": {
+                      "via": "Mono",
+                      "nature": "expansion",
+                      "label": "infer.mono_specialize"
+                    },
+                    "type": "((1, Int) ⇒ Int)",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "BinOp(Arithmetic(Add))",
+                          "annotations": [],
+                          "nodeId": 35,
+                          "span": {
+                            "start": 144,
+                            "end": 153
+                          },
+                          "rewritten": {
+                            "via": "Mono",
+                            "nature": "expansion",
+                            "label": "infer.mono_specialize"
+                          },
+                          "type": "Int",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "BinOp(Arithmetic(Add))",
+                                "annotations": [],
+                                "nodeId": 36,
+                                "span": {
+                                  "start": 144,
+                                  "end": 149
+                                },
+                                "rewritten": {
+                                  "via": "Mono",
+                                  "nature": "expansion",
+                                  "label": "infer.mono_specialize"
+                                },
+                                "type": "Int",
+                                "tiling": null,
+                                "children": [
+                                  {
+                                    "edge": "0",
+                                    "node": {
+                                      "label": "Apply",
+                                      "annotations": [],
+                                      "nodeId": 37,
+                                      "span": {
+                                        "start": 144,
+                                        "end": 145
+                                      },
+                                      "rewritten": {
+                                        "via": "Mono",
+                                        "nature": "expansion",
+                                        "label": "infer.mono_specialize"
+                                      },
+                                      "type": "1",
+                                      "tiling": null,
+                                      "children": [
+                                        {
+                                          "edge": "0",
+                                          "node": {
+                                            "label": "Proj(Index(0))",
+                                            "annotations": [],
+                                            "nodeId": 38,
+                                            "span": {
+                                              "start": 129,
+                                              "end": 154
+                                            },
+                                            "rewritten": {
+                                              "via": "Mono",
+                                              "nature": "expansion",
+                                              "label": "infer.mono_specialize"
+                                            },
+                                            "type": "((1, 2) ⇒ 1)",
+                                            "tiling": null,
+                                            "children": []
+                                          }
+                                        },
+                                        {
+                                          "edge": "1",
+                                          "node": {
+                                            "label": "Var(__arg_tuple_0)",
+                                            "annotations": [],
+                                            "nodeId": 39,
+                                            "span": {
+                                              "start": 129,
+                                              "end": 154
+                                            },
+                                            "rewritten": {
+                                              "via": "Mono",
+                                              "nature": "expansion",
+                                              "label": "infer.mono_specialize"
+                                            },
+                                            "type": "(1, 2)",
+                                            "tiling": null,
+                                            "children": []
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "edge": "1",
+                                    "node": {
+                                      "label": "Apply",
+                                      "annotations": [],
+                                      "nodeId": 40,
+                                      "span": {
+                                        "start": 148,
+                                        "end": 149
+                                      },
+                                      "rewritten": {
+                                        "via": "Mono",
+                                        "nature": "expansion",
+                                        "label": "infer.mono_specialize"
+                                      },
+                                      "type": "2",
+                                      "tiling": null,
+                                      "children": [
+                                        {
+                                          "edge": "0",
+                                          "node": {
+                                            "label": "Proj(Index(1))",
+                                            "annotations": [],
+                                            "nodeId": 41,
+                                            "span": {
+                                              "start": 129,
+                                              "end": 154
+                                            },
+                                            "rewritten": {
+                                              "via": "Mono",
+                                              "nature": "expansion",
+                                              "label": "infer.mono_specialize"
+                                            },
+                                            "type": "((1, 2) ⇒ 2)",
+                                            "tiling": null,
+                                            "children": []
+                                          }
+                                        },
+                                        {
+                                          "edge": "1",
+                                          "node": {
+                                            "label": "Var(__arg_tuple_0)",
+                                            "annotations": [],
+                                            "nodeId": 42,
+                                            "span": {
+                                              "start": 129,
+                                              "end": 154
+                                            },
+                                            "rewritten": {
+                                              "via": "Mono",
+                                              "nature": "expansion",
+                                              "label": "infer.mono_specialize"
+                                            },
+                                            "type": "(1, 2)",
+                                            "tiling": null,
+                                            "children": []
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                ]
+                              }
+                            },
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Var(g)",
+                                "annotations": [],
+                                "nodeId": 43,
+                                "span": {
+                                  "start": 152,
+                                  "end": 153
+                                },
+                                "rewritten": {
+                                  "via": "Mono",
+                                  "nature": "expansion",
+                                  "label": "infer.mono_specialize"
+                                },
+                                "type": "10",
+                                "tiling": null,
+                                "children": []
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "edge": "1",
+                  "node": {
+                    "label": "Apply",
+                    "annotations": [],
+                    "nodeId": 5,
+                    "span": {
+                      "start": 154,
+                      "end": 161
+                    },
+                    "rewritten": null,
+                    "type": "Int",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Var(__mono)",
+                          "annotations": [],
+                          "nodeId": 4,
+                          "span": {
+                            "start": 154,
+                            "end": 155
+                          },
+                          "rewritten": {
+                            "via": "Lower",
+                            "nature": "machinery",
+                            "label": "lower.image"
+                          },
+                          "type": "((1, Int) ⇒ Int)",
+                          "tiling": null,
+                          "children": []
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "Tuple",
+                          "annotations": [],
+                          "nodeId": 3,
+                          "span": {
+                            "start": 156,
+                            "end": 160
+                          },
+                          "rewritten": {
+                            "via": "Lower",
+                            "nature": "machinery",
+                            "label": "lower.call_tuple"
+                          },
+                          "type": "(1, 2)",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "Lit(Int(1))",
+                                "annotations": [],
+                                "nodeId": 1,
+                                "span": {
+                                  "start": 156,
+                                  "end": 157
+                                },
+                                "rewritten": null,
+                                "type": "1",
+                                "tiling": null,
+                                "children": []
+                              }
+                            },
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Lit(Int(2))",
+                                "annotations": [],
+                                "nodeId": 2,
+                                "span": {
+                                  "start": 159,
+                                  "end": 160
+                                },
+                                "rewritten": null,
+                                "type": "2",
+                                "tiling": null,
+                                "children": []
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
                 }
-            ]
+              ]
+            }
+          }
+        ]
+      },
+      "spanIndex": [
+        {
+          "span": {
+            "start": 122,
+            "end": 128
+          },
+          "nodeId": 24
         },
         {
-            "span": {
-                "start": 144,
-                "end": 153
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "p",
-                    "defSpan": {
-                        "start": 135,
-                        "end": 136
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "q",
-                    "defSpan": {
-                        "start": 138,
-                        "end": 139
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 126,
+            "end": 128
+          },
+          "nodeId": 23
         },
         {
-            "span": {
-                "start": 144,
-                "end": 153
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "p",
-                    "defSpan": {
-                        "start": 135,
-                        "end": 136
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "q",
-                    "defSpan": {
-                        "start": 138,
-                        "end": 139
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 44
         },
         {
-            "span": {
-                "start": 144,
-                "end": 149
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "p",
-                    "defSpan": {
-                        "start": 135,
-                        "end": 136
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "q",
-                    "defSpan": {
-                        "start": 138,
-                        "end": 139
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 34
         },
         {
-            "span": {
-                "start": 144,
-                "end": 145
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "p",
-                    "defSpan": {
-                        "start": 135,
-                        "end": 136
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "q",
-                    "defSpan": {
-                        "start": 138,
-                        "end": 139
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 144,
+            "end": 153
+          },
+          "nodeId": 35
         },
         {
-            "span": {
-                "start": 148,
-                "end": 149
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "p",
-                    "defSpan": {
-                        "start": 135,
-                        "end": 136
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "q",
-                    "defSpan": {
-                        "start": 138,
-                        "end": 139
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 144,
+            "end": 149
+          },
+          "nodeId": 36
         },
         {
-            "span": {
-                "start": 152,
-                "end": 153
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "p",
-                    "defSpan": {
-                        "start": 135,
-                        "end": 136
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "q",
-                    "defSpan": {
-                        "start": 138,
-                        "end": 139
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 144,
+            "end": 145
+          },
+          "nodeId": 37
         },
         {
-            "span": {
-                "start": 154,
-                "end": 161
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "f",
-                    "defSpan": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 38
         },
         {
-            "span": {
-                "start": 154,
-                "end": 161
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "f",
-                    "defSpan": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 39
         },
         {
-            "span": {
-                "start": 154,
-                "end": 155
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "f",
-                    "defSpan": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 148,
+            "end": 149
+          },
+          "nodeId": 40
         },
         {
-            "span": {
-                "start": 156,
-                "end": 157
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "f",
-                    "defSpan": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 41
         },
         {
-            "span": {
-                "start": 159,
-                "end": 160
-            },
-            "bindings": [
-                {
-                    "name": "g",
-                    "defSpan": {
-                        "start": 122,
-                        "end": 123
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "f",
-                    "defSpan": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 42
+        },
+        {
+          "span": {
+            "start": 152,
+            "end": 153
+          },
+          "nodeId": 43
+        },
+        {
+          "span": {
+            "start": 154,
+            "end": 161
+          },
+          "nodeId": 5
+        },
+        {
+          "span": {
+            "start": 154,
+            "end": 155
+          },
+          "nodeId": 4
+        },
+        {
+          "span": {
+            "start": 156,
+            "end": 160
+          },
+          "nodeId": 3
+        },
+        {
+          "span": {
+            "start": 156,
+            "end": 157
+          },
+          "nodeId": 1
+        },
+        {
+          "span": {
+            "start": 159,
+            "end": 160
+          },
+          "nodeId": 2
         }
-    ],
-    "diagnostics": [],
-    "meta": {
-        "tick": null,
-        "snapshotKind": "post-inference",
-        "schema": 3
+      ]
     },
-    "stages": [
-        {
-            "id": "pre-inference",
-            "label": "IR (PRE-INFERENCE)",
-            "kind": "holes",
-            "ir": {
-                "label": "Let(g)",
-                "annotations": [],
-                "nodeId": 24,
-                "span": {
-                    "start": 122,
-                    "end": 128
-                },
-                "rewritten": {
-                    "via": "Lower",
-                    "nature": "machinery",
-                    "label": "lower.image"
-                },
-                "type": "_",
-                "tiling": null,
-                "children": [
-                    {
+    {
+      "id": "post-desugar",
+      "label": "IR (POST-DESUGAR)",
+      "kind": "typed",
+      "ir": {
+        "label": "Let(g)",
+        "annotations": [],
+        "nodeId": 24,
+        "span": {
+          "start": 122,
+          "end": 128
+        },
+        "rewritten": {
+          "via": "Lower",
+          "nature": "machinery",
+          "label": "lower.image"
+        },
+        "type": "Int",
+        "tiling": null,
+        "children": [
+          {
+            "edge": "0",
+            "node": {
+              "label": "Lit(Int(10))",
+              "annotations": [],
+              "nodeId": 23,
+              "span": {
+                "start": 126,
+                "end": 128
+              },
+              "rewritten": null,
+              "type": "10",
+              "tiling": null,
+              "children": []
+            }
+          },
+          {
+            "edge": "1",
+            "node": {
+              "label": "BinOp(Arithmetic(Add))",
+              "annotations": [],
+              "nodeId": 46,
+              "span": {
+                "start": 144,
+                "end": 153
+              },
+              "rewritten": {
+                "via": "Inline",
+                "nature": "expansion",
+                "label": "inline.beta"
+              },
+              "type": "Int",
+              "tiling": null,
+              "children": [
+                {
+                  "edge": "0",
+                  "node": {
+                    "label": "BinOp(Arithmetic(Add))",
+                    "annotations": [],
+                    "nodeId": 47,
+                    "span": {
+                      "start": 144,
+                      "end": 149
+                    },
+                    "rewritten": {
+                      "via": "Inline",
+                      "nature": "expansion",
+                      "label": "inline.beta"
+                    },
+                    "type": "Int",
+                    "tiling": null,
+                    "children": [
+                      {
                         "edge": "0",
                         "node": {
-                            "label": "Lit(Int(10))",
-                            "annotations": [],
-                            "nodeId": 23,
-                            "span": {
-                                "start": 126,
-                                "end": 128
+                          "label": "Apply",
+                          "annotations": [],
+                          "nodeId": 48,
+                          "span": {
+                            "start": 144,
+                            "end": 145
+                          },
+                          "rewritten": {
+                            "via": "Inline",
+                            "nature": "expansion",
+                            "label": "inline.beta"
+                          },
+                          "type": "1",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "Proj(Index(0))",
+                                "annotations": [],
+                                "nodeId": 49,
+                                "span": {
+                                  "start": 129,
+                                  "end": 154
+                                },
+                                "rewritten": {
+                                  "via": "Inline",
+                                  "nature": "expansion",
+                                  "label": "inline.beta"
+                                },
+                                "type": "((1, 2) ⇒ 1)",
+                                "tiling": null,
+                                "children": []
+                              }
                             },
-                            "rewritten": null,
-                            "type": "_",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "1",
-                        "node": {
-                            "label": "Let(f)",
-                            "annotations": [],
-                            "nodeId": 22,
-                            "span": {
-                                "start": 129,
-                                "end": 154
-                            },
-                            "rewritten": {
-                                "via": "Lower",
-                                "nature": "machinery",
-                                "label": "lower.image"
-                            },
-                            "type": "_",
-                            "tiling": null,
-                            "children": [
-                                {
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Tuple",
+                                "annotations": [],
+                                "nodeId": 50,
+                                "span": {
+                                  "start": 129,
+                                  "end": 154
+                                },
+                                "rewritten": {
+                                  "via": "Inline",
+                                  "nature": "expansion",
+                                  "label": "inline.beta"
+                                },
+                                "type": "(1, 2)",
+                                "tiling": null,
+                                "children": [
+                                  {
                                     "edge": "0",
                                     "node": {
-                                        "label": "Lambda(__arg_tuple_0)",
-                                        "annotations": [],
-                                        "nodeId": 21,
-                                        "span": {
-                                            "start": 129,
-                                            "end": 154
-                                        },
-                                        "rewritten": {
-                                            "via": "Lower",
-                                            "nature": "machinery",
-                                            "label": "lower.image"
-                                        },
-                                        "type": "(_ \u21d2 _)",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "BinOp(Arithmetic(Add))",
-                                                    "annotations": [],
-                                                    "nodeId": 10,
-                                                    "span": {
-                                                        "start": 144,
-                                                        "end": 153
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "_",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "BinOp(Arithmetic(Add))",
-                                                                "annotations": [],
-                                                                "nodeId": 8,
-                                                                "span": {
-                                                                    "start": 144,
-                                                                    "end": 149
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "_",
-                                                                "tiling": null,
-                                                                "children": [
-                                                                    {
-                                                                        "edge": "0",
-                                                                        "node": {
-                                                                            "label": "Apply",
-                                                                            "annotations": [],
-                                                                            "nodeId": 6,
-                                                                            "span": {
-                                                                                "start": 144,
-                                                                                "end": 145
-                                                                            },
-                                                                            "rewritten": null,
-                                                                            "type": "_",
-                                                                            "tiling": null,
-                                                                            "children": [
-                                                                                {
-                                                                                    "edge": "0",
-                                                                                    "node": {
-                                                                                        "label": "Proj(Index(0))",
-                                                                                        "annotations": [],
-                                                                                        "nodeId": 14,
-                                                                                        "span": {
-                                                                                            "start": 129,
-                                                                                            "end": 154
-                                                                                        },
-                                                                                        "rewritten": {
-                                                                                            "via": "Lower",
-                                                                                            "nature": "machinery",
-                                                                                            "label": "lower.uncurry_proj"
-                                                                                        },
-                                                                                        "type": "_",
-                                                                                        "tiling": null,
-                                                                                        "children": []
-                                                                                    }
-                                                                                },
-                                                                                {
-                                                                                    "edge": "1",
-                                                                                    "node": {
-                                                                                        "label": "Var(__arg_tuple_0)",
-                                                                                        "annotations": [],
-                                                                                        "nodeId": 15,
-                                                                                        "span": {
-                                                                                            "start": 129,
-                                                                                            "end": 154
-                                                                                        },
-                                                                                        "rewritten": {
-                                                                                            "via": "Lower",
-                                                                                            "nature": "machinery",
-                                                                                            "label": "lower.uncurry_proj"
-                                                                                        },
-                                                                                        "type": "_",
-                                                                                        "tiling": null,
-                                                                                        "children": []
-                                                                                    }
-                                                                                }
-                                                                            ]
-                                                                        }
-                                                                    },
-                                                                    {
-                                                                        "edge": "1",
-                                                                        "node": {
-                                                                            "label": "Apply",
-                                                                            "annotations": [],
-                                                                            "nodeId": 7,
-                                                                            "span": {
-                                                                                "start": 148,
-                                                                                "end": 149
-                                                                            },
-                                                                            "rewritten": null,
-                                                                            "type": "_",
-                                                                            "tiling": null,
-                                                                            "children": [
-                                                                                {
-                                                                                    "edge": "0",
-                                                                                    "node": {
-                                                                                        "label": "Proj(Index(1))",
-                                                                                        "annotations": [],
-                                                                                        "nodeId": 19,
-                                                                                        "span": {
-                                                                                            "start": 129,
-                                                                                            "end": 154
-                                                                                        },
-                                                                                        "rewritten": {
-                                                                                            "via": "Lower",
-                                                                                            "nature": "machinery",
-                                                                                            "label": "lower.uncurry_proj"
-                                                                                        },
-                                                                                        "type": "_",
-                                                                                        "tiling": null,
-                                                                                        "children": []
-                                                                                    }
-                                                                                },
-                                                                                {
-                                                                                    "edge": "1",
-                                                                                    "node": {
-                                                                                        "label": "Var(__arg_tuple_0)",
-                                                                                        "annotations": [],
-                                                                                        "nodeId": 20,
-                                                                                        "span": {
-                                                                                            "start": 129,
-                                                                                            "end": 154
-                                                                                        },
-                                                                                        "rewritten": {
-                                                                                            "via": "Lower",
-                                                                                            "nature": "machinery",
-                                                                                            "label": "lower.uncurry_proj"
-                                                                                        },
-                                                                                        "type": "_",
-                                                                                        "tiling": null,
-                                                                                        "children": []
-                                                                                    }
-                                                                                }
-                                                                            ]
-                                                                        }
-                                                                    }
-                                                                ]
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Var(g)",
-                                                                "annotations": [],
-                                                                "nodeId": 9,
-                                                                "span": {
-                                                                    "start": 152,
-                                                                    "end": 153
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "_",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            }
-                                        ]
+                                      "label": "Lit(Int(1))",
+                                      "annotations": [],
+                                      "nodeId": 55,
+                                      "span": {
+                                        "start": 156,
+                                        "end": 157
+                                      },
+                                      "rewritten": {
+                                        "via": "Inline",
+                                        "nature": "expansion",
+                                        "label": "inline.beta"
+                                      },
+                                      "type": "1",
+                                      "tiling": null,
+                                      "children": []
                                     }
-                                },
-                                {
+                                  },
+                                  {
                                     "edge": "1",
                                     "node": {
-                                        "label": "Apply",
-                                        "annotations": [],
-                                        "nodeId": 5,
-                                        "span": {
-                                            "start": 154,
-                                            "end": 161
-                                        },
-                                        "rewritten": null,
-                                        "type": "_",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Var(f)",
-                                                    "annotations": [],
-                                                    "nodeId": 4,
-                                                    "span": {
-                                                        "start": 154,
-                                                        "end": 155
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Lower",
-                                                        "nature": "machinery",
-                                                        "label": "lower.image"
-                                                    },
-                                                    "type": "_",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "Tuple",
-                                                    "annotations": [],
-                                                    "nodeId": 3,
-                                                    "span": {
-                                                        "start": 156,
-                                                        "end": 160
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Lower",
-                                                        "nature": "machinery",
-                                                        "label": "lower.call_tuple"
-                                                    },
-                                                    "type": "_",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "Lit(Int(1))",
-                                                                "annotations": [],
-                                                                "nodeId": 1,
-                                                                "span": {
-                                                                    "start": 156,
-                                                                    "end": 157
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "_",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Lit(Int(2))",
-                                                                "annotations": [],
-                                                                "nodeId": 2,
-                                                                "span": {
-                                                                    "start": 159,
-                                                                    "end": 160
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "_",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            }
-                                        ]
+                                      "label": "Lit(Int(2))",
+                                      "annotations": [],
+                                      "nodeId": 56,
+                                      "span": {
+                                        "start": 159,
+                                        "end": 160
+                                      },
+                                      "rewritten": {
+                                        "via": "Inline",
+                                        "nature": "expansion",
+                                        "label": "inline.beta"
+                                      },
+                                      "type": "2",
+                                      "tiling": null,
+                                      "children": []
                                     }
-                                }
-                            ]
+                                  }
+                                ]
+                              }
+                            }
+                          ]
                         }
-                    }
-                ]
-            },
-            "spanIndex": [
-                {
-                    "span": {
-                        "start": 122,
-                        "end": 128
-                    },
-                    "nodeId": 24
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "Apply",
+                          "annotations": [],
+                          "nodeId": 51,
+                          "span": {
+                            "start": 148,
+                            "end": 149
+                          },
+                          "rewritten": {
+                            "via": "Inline",
+                            "nature": "expansion",
+                            "label": "inline.beta"
+                          },
+                          "type": "2",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "Proj(Index(1))",
+                                "annotations": [],
+                                "nodeId": 52,
+                                "span": {
+                                  "start": 129,
+                                  "end": 154
+                                },
+                                "rewritten": {
+                                  "via": "Inline",
+                                  "nature": "expansion",
+                                  "label": "inline.beta"
+                                },
+                                "type": "((1, 2) ⇒ 2)",
+                                "tiling": null,
+                                "children": []
+                              }
+                            },
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Tuple",
+                                "annotations": [],
+                                "nodeId": 53,
+                                "span": {
+                                  "start": 129,
+                                  "end": 154
+                                },
+                                "rewritten": {
+                                  "via": "Inline",
+                                  "nature": "expansion",
+                                  "label": "inline.beta"
+                                },
+                                "type": "(1, 2)",
+                                "tiling": null,
+                                "children": [
+                                  {
+                                    "edge": "0",
+                                    "node": {
+                                      "label": "Lit(Int(1))",
+                                      "annotations": [],
+                                      "nodeId": 57,
+                                      "span": {
+                                        "start": 156,
+                                        "end": 157
+                                      },
+                                      "rewritten": {
+                                        "via": "Inline",
+                                        "nature": "expansion",
+                                        "label": "inline.beta"
+                                      },
+                                      "type": "1",
+                                      "tiling": null,
+                                      "children": []
+                                    }
+                                  },
+                                  {
+                                    "edge": "1",
+                                    "node": {
+                                      "label": "Lit(Int(2))",
+                                      "annotations": [],
+                                      "nodeId": 58,
+                                      "span": {
+                                        "start": 159,
+                                        "end": 160
+                                      },
+                                      "rewritten": {
+                                        "via": "Inline",
+                                        "nature": "expansion",
+                                        "label": "inline.beta"
+                                      },
+                                      "type": "2",
+                                      "tiling": null,
+                                      "children": []
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
                 },
                 {
+                  "edge": "1",
+                  "node": {
+                    "label": "Var(g)",
+                    "annotations": [],
+                    "nodeId": 54,
                     "span": {
-                        "start": 126,
-                        "end": 128
+                      "start": 152,
+                      "end": 153
                     },
-                    "nodeId": 23
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
+                    "rewritten": {
+                      "via": "Inline",
+                      "nature": "expansion",
+                      "label": "inline.beta"
                     },
-                    "nodeId": 22
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 21
-                },
-                {
-                    "span": {
-                        "start": 144,
-                        "end": 153
-                    },
-                    "nodeId": 10
-                },
-                {
-                    "span": {
-                        "start": 144,
-                        "end": 149
-                    },
-                    "nodeId": 8
-                },
-                {
-                    "span": {
-                        "start": 144,
-                        "end": 145
-                    },
-                    "nodeId": 6
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 14
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 15
-                },
-                {
-                    "span": {
-                        "start": 148,
-                        "end": 149
-                    },
-                    "nodeId": 7
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 19
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 20
-                },
-                {
-                    "span": {
-                        "start": 152,
-                        "end": 153
-                    },
-                    "nodeId": 9
-                },
-                {
-                    "span": {
-                        "start": 154,
-                        "end": 161
-                    },
-                    "nodeId": 5
-                },
-                {
-                    "span": {
-                        "start": 154,
-                        "end": 155
-                    },
-                    "nodeId": 4
-                },
-                {
-                    "span": {
-                        "start": 156,
-                        "end": 160
-                    },
-                    "nodeId": 3
-                },
-                {
-                    "span": {
-                        "start": 156,
-                        "end": 157
-                    },
-                    "nodeId": 1
-                },
-                {
-                    "span": {
-                        "start": 159,
-                        "end": 160
-                    },
-                    "nodeId": 2
+                    "type": "10",
+                    "tiling": null,
+                    "children": []
+                  }
                 }
-            ]
+              ]
+            }
+          }
+        ]
+      },
+      "spanIndex": [
+        {
+          "span": {
+            "start": 122,
+            "end": 128
+          },
+          "nodeId": 24
         },
         {
-            "id": "post-inference",
-            "label": "IR (POST-INFERENCE)",
-            "kind": "typed",
-            "ir": {
-                "label": "Let(g)",
-                "annotations": [],
-                "nodeId": 24,
-                "span": {
-                    "start": 122,
-                    "end": 128
-                },
-                "rewritten": {
-                    "via": "Lower",
-                    "nature": "machinery",
-                    "label": "lower.image"
-                },
-                "type": "Int",
-                "tiling": null,
-                "children": [
-                    {
-                        "edge": "0",
-                        "node": {
-                            "label": "Lit(Int(10))",
-                            "annotations": [],
-                            "nodeId": 23,
-                            "span": {
-                                "start": 126,
-                                "end": 128
-                            },
-                            "rewritten": null,
-                            "type": "10",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "1",
-                        "node": {
-                            "label": "Let(__mono)",
-                            "annotations": [],
-                            "nodeId": 44,
-                            "span": {
-                                "start": 129,
-                                "end": 154
-                            },
-                            "rewritten": {
-                                "via": "Mono",
-                                "nature": "expansion",
-                                "label": "infer.mono_wrappers"
-                            },
-                            "type": "Int",
-                            "tiling": null,
-                            "children": [
-                                {
-                                    "edge": "0",
-                                    "node": {
-                                        "label": "Lambda(__arg_tuple_0)",
-                                        "annotations": [],
-                                        "nodeId": 34,
-                                        "span": {
-                                            "start": 129,
-                                            "end": 154
-                                        },
-                                        "rewritten": {
-                                            "via": "Mono",
-                                            "nature": "expansion",
-                                            "label": "infer.mono_specialize"
-                                        },
-                                        "type": "((1, Int) \u21d2 Int)",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "BinOp(Arithmetic(Add))",
-                                                    "annotations": [],
-                                                    "nodeId": 35,
-                                                    "span": {
-                                                        "start": 144,
-                                                        "end": 153
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Mono",
-                                                        "nature": "expansion",
-                                                        "label": "infer.mono_specialize"
-                                                    },
-                                                    "type": "Int",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "BinOp(Arithmetic(Add))",
-                                                                "annotations": [],
-                                                                "nodeId": 36,
-                                                                "span": {
-                                                                    "start": 144,
-                                                                    "end": 149
-                                                                },
-                                                                "rewritten": {
-                                                                    "via": "Mono",
-                                                                    "nature": "expansion",
-                                                                    "label": "infer.mono_specialize"
-                                                                },
-                                                                "type": "Int",
-                                                                "tiling": null,
-                                                                "children": [
-                                                                    {
-                                                                        "edge": "0",
-                                                                        "node": {
-                                                                            "label": "Apply",
-                                                                            "annotations": [],
-                                                                            "nodeId": 37,
-                                                                            "span": {
-                                                                                "start": 144,
-                                                                                "end": 145
-                                                                            },
-                                                                            "rewritten": {
-                                                                                "via": "Mono",
-                                                                                "nature": "expansion",
-                                                                                "label": "infer.mono_specialize"
-                                                                            },
-                                                                            "type": "1",
-                                                                            "tiling": null,
-                                                                            "children": [
-                                                                                {
-                                                                                    "edge": "0",
-                                                                                    "node": {
-                                                                                        "label": "Proj(Index(0))",
-                                                                                        "annotations": [],
-                                                                                        "nodeId": 38,
-                                                                                        "span": {
-                                                                                            "start": 129,
-                                                                                            "end": 154
-                                                                                        },
-                                                                                        "rewritten": {
-                                                                                            "via": "Mono",
-                                                                                            "nature": "expansion",
-                                                                                            "label": "infer.mono_specialize"
-                                                                                        },
-                                                                                        "type": "((1, 2) \u21d2 1)",
-                                                                                        "tiling": null,
-                                                                                        "children": []
-                                                                                    }
-                                                                                },
-                                                                                {
-                                                                                    "edge": "1",
-                                                                                    "node": {
-                                                                                        "label": "Var(__arg_tuple_0)",
-                                                                                        "annotations": [],
-                                                                                        "nodeId": 39,
-                                                                                        "span": {
-                                                                                            "start": 129,
-                                                                                            "end": 154
-                                                                                        },
-                                                                                        "rewritten": {
-                                                                                            "via": "Mono",
-                                                                                            "nature": "expansion",
-                                                                                            "label": "infer.mono_specialize"
-                                                                                        },
-                                                                                        "type": "(1, 2)",
-                                                                                        "tiling": null,
-                                                                                        "children": []
-                                                                                    }
-                                                                                }
-                                                                            ]
-                                                                        }
-                                                                    },
-                                                                    {
-                                                                        "edge": "1",
-                                                                        "node": {
-                                                                            "label": "Apply",
-                                                                            "annotations": [],
-                                                                            "nodeId": 40,
-                                                                            "span": {
-                                                                                "start": 148,
-                                                                                "end": 149
-                                                                            },
-                                                                            "rewritten": {
-                                                                                "via": "Mono",
-                                                                                "nature": "expansion",
-                                                                                "label": "infer.mono_specialize"
-                                                                            },
-                                                                            "type": "2",
-                                                                            "tiling": null,
-                                                                            "children": [
-                                                                                {
-                                                                                    "edge": "0",
-                                                                                    "node": {
-                                                                                        "label": "Proj(Index(1))",
-                                                                                        "annotations": [],
-                                                                                        "nodeId": 41,
-                                                                                        "span": {
-                                                                                            "start": 129,
-                                                                                            "end": 154
-                                                                                        },
-                                                                                        "rewritten": {
-                                                                                            "via": "Mono",
-                                                                                            "nature": "expansion",
-                                                                                            "label": "infer.mono_specialize"
-                                                                                        },
-                                                                                        "type": "((1, 2) \u21d2 2)",
-                                                                                        "tiling": null,
-                                                                                        "children": []
-                                                                                    }
-                                                                                },
-                                                                                {
-                                                                                    "edge": "1",
-                                                                                    "node": {
-                                                                                        "label": "Var(__arg_tuple_0)",
-                                                                                        "annotations": [],
-                                                                                        "nodeId": 42,
-                                                                                        "span": {
-                                                                                            "start": 129,
-                                                                                            "end": 154
-                                                                                        },
-                                                                                        "rewritten": {
-                                                                                            "via": "Mono",
-                                                                                            "nature": "expansion",
-                                                                                            "label": "infer.mono_specialize"
-                                                                                        },
-                                                                                        "type": "(1, 2)",
-                                                                                        "tiling": null,
-                                                                                        "children": []
-                                                                                    }
-                                                                                }
-                                                                            ]
-                                                                        }
-                                                                    }
-                                                                ]
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Var(g)",
-                                                                "annotations": [],
-                                                                "nodeId": 43,
-                                                                "span": {
-                                                                    "start": 152,
-                                                                    "end": 153
-                                                                },
-                                                                "rewritten": {
-                                                                    "via": "Mono",
-                                                                    "nature": "expansion",
-                                                                    "label": "infer.mono_specialize"
-                                                                },
-                                                                "type": "10",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            }
-                                        ]
-                                    }
-                                },
-                                {
-                                    "edge": "1",
-                                    "node": {
-                                        "label": "Apply",
-                                        "annotations": [],
-                                        "nodeId": 5,
-                                        "span": {
-                                            "start": 154,
-                                            "end": 161
-                                        },
-                                        "rewritten": null,
-                                        "type": "Int",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Var(__mono)",
-                                                    "annotations": [],
-                                                    "nodeId": 4,
-                                                    "span": {
-                                                        "start": 154,
-                                                        "end": 155
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Lower",
-                                                        "nature": "machinery",
-                                                        "label": "lower.image"
-                                                    },
-                                                    "type": "((1, Int) \u21d2 Int)",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "Tuple",
-                                                    "annotations": [],
-                                                    "nodeId": 3,
-                                                    "span": {
-                                                        "start": 156,
-                                                        "end": 160
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Lower",
-                                                        "nature": "machinery",
-                                                        "label": "lower.call_tuple"
-                                                    },
-                                                    "type": "(1, 2)",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "Lit(Int(1))",
-                                                                "annotations": [],
-                                                                "nodeId": 1,
-                                                                "span": {
-                                                                    "start": 156,
-                                                                    "end": 157
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "1",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Lit(Int(2))",
-                                                                "annotations": [],
-                                                                "nodeId": 2,
-                                                                "span": {
-                                                                    "start": 159,
-                                                                    "end": 160
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "2",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                ]
-            },
-            "spanIndex": [
-                {
-                    "span": {
-                        "start": 122,
-                        "end": 128
-                    },
-                    "nodeId": 24
-                },
-                {
-                    "span": {
-                        "start": 126,
-                        "end": 128
-                    },
-                    "nodeId": 23
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 44
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 34
-                },
-                {
-                    "span": {
-                        "start": 144,
-                        "end": 153
-                    },
-                    "nodeId": 35
-                },
-                {
-                    "span": {
-                        "start": 144,
-                        "end": 149
-                    },
-                    "nodeId": 36
-                },
-                {
-                    "span": {
-                        "start": 144,
-                        "end": 145
-                    },
-                    "nodeId": 37
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 38
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 39
-                },
-                {
-                    "span": {
-                        "start": 148,
-                        "end": 149
-                    },
-                    "nodeId": 40
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 41
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 42
-                },
-                {
-                    "span": {
-                        "start": 152,
-                        "end": 153
-                    },
-                    "nodeId": 43
-                },
-                {
-                    "span": {
-                        "start": 154,
-                        "end": 161
-                    },
-                    "nodeId": 5
-                },
-                {
-                    "span": {
-                        "start": 154,
-                        "end": 155
-                    },
-                    "nodeId": 4
-                },
-                {
-                    "span": {
-                        "start": 156,
-                        "end": 160
-                    },
-                    "nodeId": 3
-                },
-                {
-                    "span": {
-                        "start": 156,
-                        "end": 157
-                    },
-                    "nodeId": 1
-                },
-                {
-                    "span": {
-                        "start": 159,
-                        "end": 160
-                    },
-                    "nodeId": 2
-                }
-            ]
+          "span": {
+            "start": 126,
+            "end": 128
+          },
+          "nodeId": 23
         },
         {
-            "id": "post-desugar",
-            "label": "IR (POST-DESUGAR)",
-            "kind": "typed",
-            "ir": {
-                "label": "Let(g)",
-                "annotations": [],
-                "nodeId": 24,
-                "span": {
-                    "start": 122,
-                    "end": 128
-                },
-                "rewritten": {
-                    "via": "Lower",
-                    "nature": "machinery",
-                    "label": "lower.image"
-                },
-                "type": "Int",
-                "tiling": null,
-                "children": [
-                    {
-                        "edge": "0",
-                        "node": {
-                            "label": "Lit(Int(10))",
-                            "annotations": [],
-                            "nodeId": 23,
-                            "span": {
-                                "start": 126,
-                                "end": 128
-                            },
-                            "rewritten": null,
-                            "type": "10",
-                            "tiling": null,
-                            "children": []
-                        }
-                    },
-                    {
-                        "edge": "1",
-                        "node": {
-                            "label": "BinOp(Arithmetic(Add))",
-                            "annotations": [],
-                            "nodeId": 46,
-                            "span": {
-                                "start": 144,
-                                "end": 153
-                            },
-                            "rewritten": {
-                                "via": "Inline",
-                                "nature": "expansion",
-                                "label": "inline.beta"
-                            },
-                            "type": "Int",
-                            "tiling": null,
-                            "children": [
-                                {
-                                    "edge": "0",
-                                    "node": {
-                                        "label": "BinOp(Arithmetic(Add))",
-                                        "annotations": [],
-                                        "nodeId": 47,
-                                        "span": {
-                                            "start": 144,
-                                            "end": 149
-                                        },
-                                        "rewritten": {
-                                            "via": "Inline",
-                                            "nature": "expansion",
-                                            "label": "inline.beta"
-                                        },
-                                        "type": "Int",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Apply",
-                                                    "annotations": [],
-                                                    "nodeId": 48,
-                                                    "span": {
-                                                        "start": 144,
-                                                        "end": 145
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Inline",
-                                                        "nature": "expansion",
-                                                        "label": "inline.beta"
-                                                    },
-                                                    "type": "1",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "Proj(Index(0))",
-                                                                "annotations": [],
-                                                                "nodeId": 49,
-                                                                "span": {
-                                                                    "start": 129,
-                                                                    "end": 154
-                                                                },
-                                                                "rewritten": {
-                                                                    "via": "Inline",
-                                                                    "nature": "expansion",
-                                                                    "label": "inline.beta"
-                                                                },
-                                                                "type": "((1, 2) \u21d2 1)",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Tuple",
-                                                                "annotations": [],
-                                                                "nodeId": 50,
-                                                                "span": {
-                                                                    "start": 129,
-                                                                    "end": 154
-                                                                },
-                                                                "rewritten": {
-                                                                    "via": "Inline",
-                                                                    "nature": "expansion",
-                                                                    "label": "inline.beta"
-                                                                },
-                                                                "type": "(1, 2)",
-                                                                "tiling": null,
-                                                                "children": [
-                                                                    {
-                                                                        "edge": "0",
-                                                                        "node": {
-                                                                            "label": "Lit(Int(1))",
-                                                                            "annotations": [],
-                                                                            "nodeId": 55,
-                                                                            "span": {
-                                                                                "start": 156,
-                                                                                "end": 157
-                                                                            },
-                                                                            "rewritten": {
-                                                                                "via": "Inline",
-                                                                                "nature": "expansion",
-                                                                                "label": "inline.beta"
-                                                                            },
-                                                                            "type": "1",
-                                                                            "tiling": null,
-                                                                            "children": []
-                                                                        }
-                                                                    },
-                                                                    {
-                                                                        "edge": "1",
-                                                                        "node": {
-                                                                            "label": "Lit(Int(2))",
-                                                                            "annotations": [],
-                                                                            "nodeId": 56,
-                                                                            "span": {
-                                                                                "start": 159,
-                                                                                "end": 160
-                                                                            },
-                                                                            "rewritten": {
-                                                                                "via": "Inline",
-                                                                                "nature": "expansion",
-                                                                                "label": "inline.beta"
-                                                                            },
-                                                                            "type": "2",
-                                                                            "tiling": null,
-                                                                            "children": []
-                                                                        }
-                                                                    }
-                                                                ]
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "Apply",
-                                                    "annotations": [],
-                                                    "nodeId": 51,
-                                                    "span": {
-                                                        "start": 148,
-                                                        "end": 149
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Inline",
-                                                        "nature": "expansion",
-                                                        "label": "inline.beta"
-                                                    },
-                                                    "type": "2",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "Proj(Index(1))",
-                                                                "annotations": [],
-                                                                "nodeId": 52,
-                                                                "span": {
-                                                                    "start": 129,
-                                                                    "end": 154
-                                                                },
-                                                                "rewritten": {
-                                                                    "via": "Inline",
-                                                                    "nature": "expansion",
-                                                                    "label": "inline.beta"
-                                                                },
-                                                                "type": "((1, 2) \u21d2 2)",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Tuple",
-                                                                "annotations": [],
-                                                                "nodeId": 53,
-                                                                "span": {
-                                                                    "start": 129,
-                                                                    "end": 154
-                                                                },
-                                                                "rewritten": {
-                                                                    "via": "Inline",
-                                                                    "nature": "expansion",
-                                                                    "label": "inline.beta"
-                                                                },
-                                                                "type": "(1, 2)",
-                                                                "tiling": null,
-                                                                "children": [
-                                                                    {
-                                                                        "edge": "0",
-                                                                        "node": {
-                                                                            "label": "Lit(Int(1))",
-                                                                            "annotations": [],
-                                                                            "nodeId": 57,
-                                                                            "span": {
-                                                                                "start": 156,
-                                                                                "end": 157
-                                                                            },
-                                                                            "rewritten": {
-                                                                                "via": "Inline",
-                                                                                "nature": "expansion",
-                                                                                "label": "inline.beta"
-                                                                            },
-                                                                            "type": "1",
-                                                                            "tiling": null,
-                                                                            "children": []
-                                                                        }
-                                                                    },
-                                                                    {
-                                                                        "edge": "1",
-                                                                        "node": {
-                                                                            "label": "Lit(Int(2))",
-                                                                            "annotations": [],
-                                                                            "nodeId": 58,
-                                                                            "span": {
-                                                                                "start": 159,
-                                                                                "end": 160
-                                                                            },
-                                                                            "rewritten": {
-                                                                                "via": "Inline",
-                                                                                "nature": "expansion",
-                                                                                "label": "inline.beta"
-                                                                            },
-                                                                            "type": "2",
-                                                                            "tiling": null,
-                                                                            "children": []
-                                                                        }
-                                                                    }
-                                                                ]
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            }
-                                        ]
-                                    }
-                                },
-                                {
-                                    "edge": "1",
-                                    "node": {
-                                        "label": "Var(g)",
-                                        "annotations": [],
-                                        "nodeId": 54,
-                                        "span": {
-                                            "start": 152,
-                                            "end": 153
-                                        },
-                                        "rewritten": {
-                                            "via": "Inline",
-                                            "nature": "expansion",
-                                            "label": "inline.beta"
-                                        },
-                                        "type": "10",
-                                        "tiling": null,
-                                        "children": []
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                ]
-            },
-            "spanIndex": [
-                {
-                    "span": {
-                        "start": 122,
-                        "end": 128
-                    },
-                    "nodeId": 24
-                },
-                {
-                    "span": {
-                        "start": 126,
-                        "end": 128
-                    },
-                    "nodeId": 23
-                },
-                {
-                    "span": {
-                        "start": 144,
-                        "end": 153
-                    },
-                    "nodeId": 46
-                },
-                {
-                    "span": {
-                        "start": 144,
-                        "end": 149
-                    },
-                    "nodeId": 47
-                },
-                {
-                    "span": {
-                        "start": 144,
-                        "end": 145
-                    },
-                    "nodeId": 48
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 49
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 50
-                },
-                {
-                    "span": {
-                        "start": 156,
-                        "end": 157
-                    },
-                    "nodeId": 55
-                },
-                {
-                    "span": {
-                        "start": 159,
-                        "end": 160
-                    },
-                    "nodeId": 56
-                },
-                {
-                    "span": {
-                        "start": 148,
-                        "end": 149
-                    },
-                    "nodeId": 51
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 52
-                },
-                {
-                    "span": {
-                        "start": 129,
-                        "end": 154
-                    },
-                    "nodeId": 53
-                },
-                {
-                    "span": {
-                        "start": 156,
-                        "end": 157
-                    },
-                    "nodeId": 57
-                },
-                {
-                    "span": {
-                        "start": 159,
-                        "end": 160
-                    },
-                    "nodeId": 58
-                },
-                {
-                    "span": {
-                        "start": 152,
-                        "end": 153
-                    },
-                    "nodeId": 54
-                }
-            ]
+          "span": {
+            "start": 144,
+            "end": 153
+          },
+          "nodeId": 46
+        },
+        {
+          "span": {
+            "start": 144,
+            "end": 149
+          },
+          "nodeId": 47
+        },
+        {
+          "span": {
+            "start": 144,
+            "end": 145
+          },
+          "nodeId": 48
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 49
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 50
+        },
+        {
+          "span": {
+            "start": 156,
+            "end": 157
+          },
+          "nodeId": 55
+        },
+        {
+          "span": {
+            "start": 159,
+            "end": 160
+          },
+          "nodeId": 56
+        },
+        {
+          "span": {
+            "start": 148,
+            "end": 149
+          },
+          "nodeId": 51
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 52
+        },
+        {
+          "span": {
+            "start": 129,
+            "end": 154
+          },
+          "nodeId": 53
+        },
+        {
+          "span": {
+            "start": 156,
+            "end": 157
+          },
+          "nodeId": 57
+        },
+        {
+          "span": {
+            "start": 159,
+            "end": 160
+          },
+          "nodeId": 58
+        },
+        {
+          "span": {
+            "start": 152,
+            "end": 153
+          },
+          "nodeId": 54
         }
-    ],
-    "paneLinks": [
-        {
-            "from": "pre-inference",
-            "to": "post-inference",
-            "edges": [
-                [
-                    1,
-                    1
-                ],
-                [
-                    2,
-                    2
-                ],
-                [
-                    3,
-                    3
-                ],
-                [
-                    4,
-                    4
-                ],
-                [
-                    5,
-                    5
-                ],
-                [
-                    6,
-                    37
-                ],
-                [
-                    7,
-                    40
-                ],
-                [
-                    8,
-                    36
-                ],
-                [
-                    9,
-                    43
-                ],
-                [
-                    10,
-                    35
-                ],
-                [
-                    14,
-                    38
-                ],
-                [
-                    15,
-                    39
-                ],
-                [
-                    19,
-                    41
-                ],
-                [
-                    20,
-                    42
-                ],
-                [
-                    21,
-                    34
-                ],
-                [
-                    22,
-                    44
-                ],
-                [
-                    23,
-                    23
-                ],
-                [
-                    24,
-                    24
-                ]
-            ]
-        },
-        {
-            "from": "post-inference",
-            "to": "post-desugar",
-            "edges": [
-                [
-                    1,
-                    55
-                ],
-                [
-                    1,
-                    57
-                ],
-                [
-                    2,
-                    56
-                ],
-                [
-                    2,
-                    58
-                ],
-                [
-                    23,
-                    23
-                ],
-                [
-                    24,
-                    24
-                ],
-                [
-                    35,
-                    46
-                ],
-                [
-                    36,
-                    47
-                ],
-                [
-                    37,
-                    48
-                ],
-                [
-                    38,
-                    49
-                ],
-                [
-                    39,
-                    50
-                ],
-                [
-                    40,
-                    51
-                ],
-                [
-                    41,
-                    52
-                ],
-                [
-                    42,
-                    53
-                ],
-                [
-                    43,
-                    54
-                ]
-            ]
-        }
-    ]
+      ]
+    }
+  ],
+  "paneLinks": [
+    {
+      "from": "pre-inference",
+      "to": "post-inference",
+      "edges": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          5
+        ],
+        [
+          6,
+          37
+        ],
+        [
+          7,
+          40
+        ],
+        [
+          8,
+          36
+        ],
+        [
+          9,
+          43
+        ],
+        [
+          10,
+          35
+        ],
+        [
+          14,
+          38
+        ],
+        [
+          15,
+          39
+        ],
+        [
+          19,
+          41
+        ],
+        [
+          20,
+          42
+        ],
+        [
+          21,
+          34
+        ],
+        [
+          22,
+          44
+        ],
+        [
+          23,
+          23
+        ],
+        [
+          24,
+          24
+        ]
+      ]
+    },
+    {
+      "from": "post-inference",
+      "to": "post-desugar",
+      "edges": [
+        [
+          1,
+          55
+        ],
+        [
+          1,
+          57
+        ],
+        [
+          2,
+          56
+        ],
+        [
+          2,
+          58
+        ],
+        [
+          23,
+          23
+        ],
+        [
+          24,
+          24
+        ],
+        [
+          35,
+          46
+        ],
+        [
+          36,
+          47
+        ],
+        [
+          37,
+          48
+        ],
+        [
+          38,
+          49
+        ],
+        [
+          39,
+          50
+        ],
+        [
+          40,
+          51
+        ],
+        [
+          41,
+          52
+        ],
+        [
+          42,
+          53
+        ],
+        [
+          43,
+          54
+        ]
+      ]
+    }
+  ]
 }

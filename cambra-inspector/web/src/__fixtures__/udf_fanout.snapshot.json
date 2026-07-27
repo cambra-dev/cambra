@@ -1,1641 +1,1641 @@
 {
-    "source": {
-        "name": "cambra-inspector/examples/udf_fanout.chl",
-        "text": "# Inline fan-out (RT-3 shape). A scalar UDF called at two sites *at the same\n# type*: monomorphization makes one specialization, then `inline` duplicates the\n# body per call site \u2014 one copy preserves the input ids, the other is a\n# freshened `Replicated` copy tagged `Derived { via: Inline }`. This is what\n# makes the `post-inference -> post-desugar` stageLinks window non-empty.\nadd1 = \\x -> x + 1\na = add1(10)\nb = add1(20)\na + b\n"
+  "source": {
+    "name": "cambra-inspector/examples/udf_fanout.chl",
+    "text": "# Inline fan-out (RT-3 shape). A scalar UDF called at two sites *at the same\n# type*: monomorphization makes one specialization, then `inline` duplicates the\n# body per call site — one copy preserves the input ids, the other is a\n# freshened `Replicated` copy tagged `Derived { via: Inline }`. This is what\n# makes the `post-inference -> post-desugar` stageLinks window non-empty.\nadd1 = \\x -> x + 1\na = add1(10)\nb = add1(20)\na + b\n"
+  },
+  "definitions": [
+    {
+      "useSpan": {
+        "start": 396,
+        "end": 397
+      },
+      "defSpan": {
+        "start": 391,
+        "end": 392
+      },
+      "name": "x"
     },
-    "definitions": [
+    {
+      "useSpan": {
+        "start": 406,
+        "end": 410
+      },
+      "defSpan": {
+        "start": 383,
+        "end": 387
+      },
+      "name": "add1"
+    },
+    {
+      "useSpan": {
+        "start": 419,
+        "end": 423
+      },
+      "defSpan": {
+        "start": 383,
+        "end": 387
+      },
+      "name": "add1"
+    },
+    {
+      "useSpan": {
+        "start": 428,
+        "end": 429
+      },
+      "defSpan": {
+        "start": 402,
+        "end": 403
+      },
+      "name": "a"
+    },
+    {
+      "useSpan": {
+        "start": 432,
+        "end": 433
+      },
+      "defSpan": {
+        "start": 415,
+        "end": 416
+      },
+      "name": "b"
+    }
+  ],
+  "scopes": [
+    {
+      "span": {
+        "start": 396,
+        "end": 401
+      },
+      "bindings": [
         {
-            "useSpan": {
-                "start": 396,
-                "end": 397
-            },
-            "defSpan": {
-                "start": 391,
-                "end": 392
-            },
-            "name": "x"
-        },
-        {
-            "useSpan": {
-                "start": 406,
-                "end": 410
-            },
-            "defSpan": {
-                "start": 383,
-                "end": 387
-            },
-            "name": "add1"
-        },
-        {
-            "useSpan": {
-                "start": 419,
-                "end": 423
-            },
-            "defSpan": {
-                "start": 383,
-                "end": 387
-            },
-            "name": "add1"
-        },
-        {
-            "useSpan": {
-                "start": 428,
-                "end": 429
-            },
-            "defSpan": {
-                "start": 402,
-                "end": 403
-            },
-            "name": "a"
-        },
-        {
-            "useSpan": {
-                "start": 432,
-                "end": 433
-            },
-            "defSpan": {
-                "start": 415,
-                "end": 416
-            },
-            "name": "b"
+          "name": "x",
+          "defSpan": {
+            "start": 391,
+            "end": 392
+          },
+          "type": "(Int ⇒ Int)"
         }
-    ],
-    "scopes": [
+      ]
+    },
+    {
+      "span": {
+        "start": 396,
+        "end": 397
+      },
+      "bindings": [
         {
-            "span": {
-                "start": 396,
+          "name": "x",
+          "defSpan": {
+            "start": 391,
+            "end": 392
+          },
+          "type": "(Int ⇒ Int)"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 400,
+        "end": 401
+      },
+      "bindings": [
+        {
+          "name": "x",
+          "defSpan": {
+            "start": 391,
+            "end": 392
+          },
+          "type": "(Int ⇒ Int)"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 402,
+        "end": 414
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 406,
+        "end": 414
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 406,
+        "end": 410
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 411,
+        "end": 413
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 415,
+        "end": 427
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        },
+        {
+          "name": "a",
+          "defSpan": {
+            "start": 402,
+            "end": 403
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 419,
+        "end": 427
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        },
+        {
+          "name": "a",
+          "defSpan": {
+            "start": 402,
+            "end": 403
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 419,
+        "end": 423
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        },
+        {
+          "name": "a",
+          "defSpan": {
+            "start": 402,
+            "end": 403
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 424,
+        "end": 426
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        },
+        {
+          "name": "a",
+          "defSpan": {
+            "start": 402,
+            "end": 403
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 428,
+        "end": 433
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        },
+        {
+          "name": "a",
+          "defSpan": {
+            "start": 402,
+            "end": 403
+          },
+          "type": "Int"
+        },
+        {
+          "name": "b",
+          "defSpan": {
+            "start": 415,
+            "end": 416
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 428,
+        "end": 433
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        },
+        {
+          "name": "a",
+          "defSpan": {
+            "start": 402,
+            "end": 403
+          },
+          "type": "Int"
+        },
+        {
+          "name": "b",
+          "defSpan": {
+            "start": 415,
+            "end": 416
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 428,
+        "end": 429
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        },
+        {
+          "name": "a",
+          "defSpan": {
+            "start": 402,
+            "end": 403
+          },
+          "type": "Int"
+        },
+        {
+          "name": "b",
+          "defSpan": {
+            "start": 415,
+            "end": 416
+          },
+          "type": "Int"
+        }
+      ]
+    },
+    {
+      "span": {
+        "start": 432,
+        "end": 433
+      },
+      "bindings": [
+        {
+          "name": "add1",
+          "defSpan": {
+            "start": 383,
+            "end": 387
+          },
+          "type": "Int"
+        },
+        {
+          "name": "a",
+          "defSpan": {
+            "start": 402,
+            "end": 403
+          },
+          "type": "Int"
+        },
+        {
+          "name": "b",
+          "defSpan": {
+            "start": 415,
+            "end": 416
+          },
+          "type": "Int"
+        }
+      ]
+    }
+  ],
+  "diagnostics": [],
+  "meta": {
+    "tick": null,
+    "snapshotKind": "post-inference",
+    "schema": 3
+  },
+  "stages": [
+    {
+      "id": "pre-inference",
+      "label": "IR (PRE-INFERENCE)",
+      "kind": "holes",
+      "ir": {
+        "label": "Let(add1)",
+        "annotations": [],
+        "nodeId": 16,
+        "span": {
+          "start": 383,
+          "end": 401
+        },
+        "rewritten": {
+          "via": "Lower",
+          "nature": "machinery",
+          "label": "lower.image"
+        },
+        "type": "_",
+        "tiling": null,
+        "children": [
+          {
+            "edge": "0",
+            "node": {
+              "label": "Lambda(x)",
+              "annotations": [],
+              "nodeId": 15,
+              "span": {
+                "start": 390,
                 "end": 401
-            },
-            "bindings": [
+              },
+              "rewritten": null,
+              "type": "(_ ⇒ _)",
+              "tiling": null,
+              "children": [
                 {
-                    "name": "x",
-                    "defSpan": {
-                        "start": 391,
-                        "end": 392
+                  "edge": "0",
+                  "node": {
+                    "label": "BinOp(Arithmetic(Add))",
+                    "annotations": [],
+                    "nodeId": 14,
+                    "span": {
+                      "start": 396,
+                      "end": 401
                     },
-                    "type": "(Int \u21d2 Int)"
+                    "rewritten": null,
+                    "type": "_",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Var(x)",
+                          "annotations": [],
+                          "nodeId": 12,
+                          "span": {
+                            "start": 396,
+                            "end": 397
+                          },
+                          "rewritten": null,
+                          "type": "_",
+                          "tiling": null,
+                          "children": []
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "Lit(Int(1))",
+                          "annotations": [],
+                          "nodeId": 13,
+                          "span": {
+                            "start": 400,
+                            "end": 401
+                          },
+                          "rewritten": null,
+                          "type": "_",
+                          "tiling": null,
+                          "children": []
+                        }
+                      }
+                    ]
+                  }
                 }
-            ]
-        },
-        {
-            "span": {
-                "start": 396,
-                "end": 397
-            },
-            "bindings": [
-                {
-                    "name": "x",
-                    "defSpan": {
-                        "start": 391,
-                        "end": 392
-                    },
-                    "type": "(Int \u21d2 Int)"
-                }
-            ]
-        },
-        {
-            "span": {
-                "start": 400,
-                "end": 401
-            },
-            "bindings": [
-                {
-                    "name": "x",
-                    "defSpan": {
-                        "start": 391,
-                        "end": 392
-                    },
-                    "type": "(Int \u21d2 Int)"
-                }
-            ]
-        },
-        {
-            "span": {
+              ]
+            }
+          },
+          {
+            "edge": "1",
+            "node": {
+              "label": "Let(a)",
+              "annotations": [],
+              "nodeId": 11,
+              "span": {
                 "start": 402,
                 "end": 414
-            },
-            "bindings": [
+              },
+              "rewritten": {
+                "via": "Lower",
+                "nature": "machinery",
+                "label": "lower.image"
+              },
+              "type": "_",
+              "tiling": null,
+              "children": [
                 {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
+                  "edge": "0",
+                  "node": {
+                    "label": "Apply",
+                    "annotations": [],
+                    "nodeId": 10,
+                    "span": {
+                      "start": 406,
+                      "end": 414
                     },
-                    "type": "Int"
+                    "rewritten": null,
+                    "type": "_",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Var(add1)",
+                          "annotations": [],
+                          "nodeId": 9,
+                          "span": {
+                            "start": 406,
+                            "end": 410
+                          },
+                          "rewritten": {
+                            "via": "Lower",
+                            "nature": "machinery",
+                            "label": "lower.image"
+                          },
+                          "type": "_",
+                          "tiling": null,
+                          "children": []
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "Lit(Int(10))",
+                          "annotations": [],
+                          "nodeId": 8,
+                          "span": {
+                            "start": 411,
+                            "end": 413
+                          },
+                          "rewritten": null,
+                          "type": "_",
+                          "tiling": null,
+                          "children": []
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "edge": "1",
+                  "node": {
+                    "label": "Let(b)",
+                    "annotations": [],
+                    "nodeId": 7,
+                    "span": {
+                      "start": 415,
+                      "end": 427
+                    },
+                    "rewritten": {
+                      "via": "Lower",
+                      "nature": "machinery",
+                      "label": "lower.image"
+                    },
+                    "type": "_",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Apply",
+                          "annotations": [],
+                          "nodeId": 6,
+                          "span": {
+                            "start": 419,
+                            "end": 427
+                          },
+                          "rewritten": null,
+                          "type": "_",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "Var(add1)",
+                                "annotations": [],
+                                "nodeId": 5,
+                                "span": {
+                                  "start": 419,
+                                  "end": 423
+                                },
+                                "rewritten": {
+                                  "via": "Lower",
+                                  "nature": "machinery",
+                                  "label": "lower.image"
+                                },
+                                "type": "_",
+                                "tiling": null,
+                                "children": []
+                              }
+                            },
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Lit(Int(20))",
+                                "annotations": [],
+                                "nodeId": 4,
+                                "span": {
+                                  "start": 424,
+                                  "end": 426
+                                },
+                                "rewritten": null,
+                                "type": "_",
+                                "tiling": null,
+                                "children": []
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "BinOp(Arithmetic(Add))",
+                          "annotations": [],
+                          "nodeId": 3,
+                          "span": {
+                            "start": 428,
+                            "end": 433
+                          },
+                          "rewritten": null,
+                          "type": "_",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "Var(a)",
+                                "annotations": [],
+                                "nodeId": 1,
+                                "span": {
+                                  "start": 428,
+                                  "end": 429
+                                },
+                                "rewritten": null,
+                                "type": "_",
+                                "tiling": null,
+                                "children": []
+                              }
+                            },
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Var(b)",
+                                "annotations": [],
+                                "nodeId": 2,
+                                "span": {
+                                  "start": 432,
+                                  "end": 433
+                                },
+                                "rewritten": null,
+                                "type": "_",
+                                "tiling": null,
+                                "children": []
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
                 }
-            ]
+              ]
+            }
+          }
+        ]
+      },
+      "spanIndex": [
+        {
+          "span": {
+            "start": 383,
+            "end": 401
+          },
+          "nodeId": 16
         },
         {
-            "span": {
-                "start": 406,
+          "span": {
+            "start": 390,
+            "end": 401
+          },
+          "nodeId": 15
+        },
+        {
+          "span": {
+            "start": 396,
+            "end": 401
+          },
+          "nodeId": 14
+        },
+        {
+          "span": {
+            "start": 396,
+            "end": 397
+          },
+          "nodeId": 12
+        },
+        {
+          "span": {
+            "start": 400,
+            "end": 401
+          },
+          "nodeId": 13
+        },
+        {
+          "span": {
+            "start": 402,
+            "end": 414
+          },
+          "nodeId": 11
+        },
+        {
+          "span": {
+            "start": 406,
+            "end": 414
+          },
+          "nodeId": 10
+        },
+        {
+          "span": {
+            "start": 406,
+            "end": 410
+          },
+          "nodeId": 9
+        },
+        {
+          "span": {
+            "start": 411,
+            "end": 413
+          },
+          "nodeId": 8
+        },
+        {
+          "span": {
+            "start": 415,
+            "end": 427
+          },
+          "nodeId": 7
+        },
+        {
+          "span": {
+            "start": 419,
+            "end": 427
+          },
+          "nodeId": 6
+        },
+        {
+          "span": {
+            "start": 419,
+            "end": 423
+          },
+          "nodeId": 5
+        },
+        {
+          "span": {
+            "start": 424,
+            "end": 426
+          },
+          "nodeId": 4
+        },
+        {
+          "span": {
+            "start": 428,
+            "end": 433
+          },
+          "nodeId": 3
+        },
+        {
+          "span": {
+            "start": 428,
+            "end": 429
+          },
+          "nodeId": 1
+        },
+        {
+          "span": {
+            "start": 432,
+            "end": 433
+          },
+          "nodeId": 2
+        }
+      ]
+    },
+    {
+      "id": "post-inference",
+      "label": "IR (POST-INFERENCE)",
+      "kind": "typed",
+      "ir": {
+        "label": "Let(__mono)",
+        "annotations": [],
+        "nodeId": 30,
+        "span": {
+          "start": 383,
+          "end": 401
+        },
+        "rewritten": {
+          "via": "Mono",
+          "nature": "expansion",
+          "label": "infer.mono_wrappers"
+        },
+        "type": "Int",
+        "tiling": null,
+        "children": [
+          {
+            "edge": "0",
+            "node": {
+              "label": "Lambda(x)",
+              "annotations": [],
+              "nodeId": 26,
+              "span": {
+                "start": 390,
+                "end": 401
+              },
+              "rewritten": {
+                "via": "Mono",
+                "nature": "expansion",
+                "label": "infer.mono_specialize"
+              },
+              "type": "(Int ⇒ Int)",
+              "tiling": null,
+              "children": [
+                {
+                  "edge": "0",
+                  "node": {
+                    "label": "BinOp(Arithmetic(Add))",
+                    "annotations": [],
+                    "nodeId": 27,
+                    "span": {
+                      "start": 396,
+                      "end": 401
+                    },
+                    "rewritten": {
+                      "via": "Mono",
+                      "nature": "expansion",
+                      "label": "infer.mono_specialize"
+                    },
+                    "type": "Int",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Var(x)",
+                          "annotations": [],
+                          "nodeId": 28,
+                          "span": {
+                            "start": 396,
+                            "end": 397
+                          },
+                          "rewritten": {
+                            "via": "Mono",
+                            "nature": "expansion",
+                            "label": "infer.mono_specialize"
+                          },
+                          "type": "10",
+                          "tiling": null,
+                          "children": []
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "Lit(Int(1))",
+                          "annotations": [],
+                          "nodeId": 29,
+                          "span": {
+                            "start": 400,
+                            "end": 401
+                          },
+                          "rewritten": {
+                            "via": "Mono",
+                            "nature": "expansion",
+                            "label": "infer.mono_specialize"
+                          },
+                          "type": "1",
+                          "tiling": null,
+                          "children": []
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "edge": "1",
+            "node": {
+              "label": "Let(a)",
+              "annotations": [],
+              "nodeId": 11,
+              "span": {
+                "start": 402,
                 "end": 414
-            },
-            "bindings": [
+              },
+              "rewritten": {
+                "via": "Lower",
+                "nature": "machinery",
+                "label": "lower.image"
+              },
+              "type": "Int",
+              "tiling": null,
+              "children": [
                 {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
+                  "edge": "0",
+                  "node": {
+                    "label": "Apply",
+                    "annotations": [],
+                    "nodeId": 10,
+                    "span": {
+                      "start": 406,
+                      "end": 414
                     },
-                    "type": "Int"
+                    "rewritten": null,
+                    "type": "Int",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Var(__mono)",
+                          "annotations": [],
+                          "nodeId": 9,
+                          "span": {
+                            "start": 406,
+                            "end": 410
+                          },
+                          "rewritten": {
+                            "via": "Lower",
+                            "nature": "machinery",
+                            "label": "lower.image"
+                          },
+                          "type": "(Int ⇒ Int)",
+                          "tiling": null,
+                          "children": []
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "Lit(Int(10))",
+                          "annotations": [],
+                          "nodeId": 8,
+                          "span": {
+                            "start": 411,
+                            "end": 413
+                          },
+                          "rewritten": null,
+                          "type": "10",
+                          "tiling": null,
+                          "children": []
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "edge": "1",
+                  "node": {
+                    "label": "Let(b)",
+                    "annotations": [],
+                    "nodeId": 7,
+                    "span": {
+                      "start": 415,
+                      "end": 427
+                    },
+                    "rewritten": {
+                      "via": "Lower",
+                      "nature": "machinery",
+                      "label": "lower.image"
+                    },
+                    "type": "Int",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Apply",
+                          "annotations": [],
+                          "nodeId": 6,
+                          "span": {
+                            "start": 419,
+                            "end": 427
+                          },
+                          "rewritten": null,
+                          "type": "Int",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "Var(__mono)",
+                                "annotations": [],
+                                "nodeId": 5,
+                                "span": {
+                                  "start": 419,
+                                  "end": 423
+                                },
+                                "rewritten": {
+                                  "via": "Lower",
+                                  "nature": "machinery",
+                                  "label": "lower.image"
+                                },
+                                "type": "(Int ⇒ Int)",
+                                "tiling": null,
+                                "children": []
+                              }
+                            },
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Lit(Int(20))",
+                                "annotations": [],
+                                "nodeId": 4,
+                                "span": {
+                                  "start": 424,
+                                  "end": 426
+                                },
+                                "rewritten": null,
+                                "type": "20",
+                                "tiling": null,
+                                "children": []
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "BinOp(Arithmetic(Add))",
+                          "annotations": [],
+                          "nodeId": 3,
+                          "span": {
+                            "start": 428,
+                            "end": 433
+                          },
+                          "rewritten": null,
+                          "type": "Int",
+                          "tiling": null,
+                          "children": [
+                            {
+                              "edge": "0",
+                              "node": {
+                                "label": "Var(a)",
+                                "annotations": [],
+                                "nodeId": 1,
+                                "span": {
+                                  "start": 428,
+                                  "end": 429
+                                },
+                                "rewritten": null,
+                                "type": "Int",
+                                "tiling": null,
+                                "children": []
+                              }
+                            },
+                            {
+                              "edge": "1",
+                              "node": {
+                                "label": "Var(b)",
+                                "annotations": [],
+                                "nodeId": 2,
+                                "span": {
+                                  "start": 432,
+                                  "end": 433
+                                },
+                                "rewritten": null,
+                                "type": "Int",
+                                "tiling": null,
+                                "children": []
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
                 }
-            ]
+              ]
+            }
+          }
+        ]
+      },
+      "spanIndex": [
+        {
+          "span": {
+            "start": 383,
+            "end": 401
+          },
+          "nodeId": 30
         },
         {
-            "span": {
-                "start": 406,
-                "end": 410
-            },
-            "bindings": [
-                {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 390,
+            "end": 401
+          },
+          "nodeId": 26
         },
         {
-            "span": {
-                "start": 411,
-                "end": 413
-            },
-            "bindings": [
-                {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 396,
+            "end": 401
+          },
+          "nodeId": 27
         },
         {
-            "span": {
+          "span": {
+            "start": 396,
+            "end": 397
+          },
+          "nodeId": 28
+        },
+        {
+          "span": {
+            "start": 400,
+            "end": 401
+          },
+          "nodeId": 29
+        },
+        {
+          "span": {
+            "start": 402,
+            "end": 414
+          },
+          "nodeId": 11
+        },
+        {
+          "span": {
+            "start": 406,
+            "end": 414
+          },
+          "nodeId": 10
+        },
+        {
+          "span": {
+            "start": 406,
+            "end": 410
+          },
+          "nodeId": 9
+        },
+        {
+          "span": {
+            "start": 411,
+            "end": 413
+          },
+          "nodeId": 8
+        },
+        {
+          "span": {
+            "start": 415,
+            "end": 427
+          },
+          "nodeId": 7
+        },
+        {
+          "span": {
+            "start": 419,
+            "end": 427
+          },
+          "nodeId": 6
+        },
+        {
+          "span": {
+            "start": 419,
+            "end": 423
+          },
+          "nodeId": 5
+        },
+        {
+          "span": {
+            "start": 424,
+            "end": 426
+          },
+          "nodeId": 4
+        },
+        {
+          "span": {
+            "start": 428,
+            "end": 433
+          },
+          "nodeId": 3
+        },
+        {
+          "span": {
+            "start": 428,
+            "end": 429
+          },
+          "nodeId": 1
+        },
+        {
+          "span": {
+            "start": 432,
+            "end": 433
+          },
+          "nodeId": 2
+        }
+      ]
+    },
+    {
+      "id": "post-desugar",
+      "label": "IR (POST-DESUGAR)",
+      "kind": "typed",
+      "ir": {
+        "label": "Let(a)",
+        "annotations": [],
+        "nodeId": 11,
+        "span": {
+          "start": 402,
+          "end": 414
+        },
+        "rewritten": {
+          "via": "Lower",
+          "nature": "machinery",
+          "label": "lower.image"
+        },
+        "type": "Int",
+        "tiling": null,
+        "children": [
+          {
+            "edge": "0",
+            "node": {
+              "label": "BinOp(Arithmetic(Add))",
+              "annotations": [],
+              "nodeId": 32,
+              "span": {
+                "start": 396,
+                "end": 401
+              },
+              "rewritten": {
+                "via": "Inline",
+                "nature": "expansion",
+                "label": "inline.beta"
+              },
+              "type": "Int",
+              "tiling": null,
+              "children": [
+                {
+                  "edge": "0",
+                  "node": {
+                    "label": "Lit(Int(10))",
+                    "annotations": [],
+                    "nodeId": 33,
+                    "span": {
+                      "start": 396,
+                      "end": 397
+                    },
+                    "rewritten": {
+                      "via": "Inline",
+                      "nature": "expansion",
+                      "label": "inline.beta"
+                    },
+                    "type": "10",
+                    "tiling": null,
+                    "children": []
+                  }
+                },
+                {
+                  "edge": "1",
+                  "node": {
+                    "label": "Lit(Int(1))",
+                    "annotations": [],
+                    "nodeId": 34,
+                    "span": {
+                      "start": 400,
+                      "end": 401
+                    },
+                    "rewritten": {
+                      "via": "Inline",
+                      "nature": "expansion",
+                      "label": "inline.beta"
+                    },
+                    "type": "1",
+                    "tiling": null,
+                    "children": []
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "edge": "1",
+            "node": {
+              "label": "Let(b)",
+              "annotations": [],
+              "nodeId": 7,
+              "span": {
                 "start": 415,
                 "end": 427
-            },
-            "bindings": [
+              },
+              "rewritten": {
+                "via": "Lower",
+                "nature": "machinery",
+                "label": "lower.image"
+              },
+              "type": "Int",
+              "tiling": null,
+              "children": [
                 {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
+                  "edge": "0",
+                  "node": {
+                    "label": "BinOp(Arithmetic(Add))",
+                    "annotations": [],
+                    "nodeId": 36,
+                    "span": {
+                      "start": 396,
+                      "end": 401
                     },
-                    "type": "Int"
+                    "rewritten": {
+                      "via": "Inline",
+                      "nature": "expansion",
+                      "label": "inline.beta"
+                    },
+                    "type": "Int",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Lit(Int(20))",
+                          "annotations": [],
+                          "nodeId": 37,
+                          "span": {
+                            "start": 396,
+                            "end": 397
+                          },
+                          "rewritten": {
+                            "via": "Inline",
+                            "nature": "expansion",
+                            "label": "inline.beta"
+                          },
+                          "type": "20",
+                          "tiling": null,
+                          "children": []
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "Lit(Int(1))",
+                          "annotations": [],
+                          "nodeId": 38,
+                          "span": {
+                            "start": 400,
+                            "end": 401
+                          },
+                          "rewritten": {
+                            "via": "Inline",
+                            "nature": "expansion",
+                            "label": "inline.beta"
+                          },
+                          "type": "1",
+                          "tiling": null,
+                          "children": []
+                        }
+                      }
+                    ]
+                  }
                 },
                 {
-                    "name": "a",
-                    "defSpan": {
-                        "start": 402,
-                        "end": 403
+                  "edge": "1",
+                  "node": {
+                    "label": "BinOp(Arithmetic(Add))",
+                    "annotations": [],
+                    "nodeId": 3,
+                    "span": {
+                      "start": 428,
+                      "end": 433
                     },
-                    "type": "Int"
+                    "rewritten": null,
+                    "type": "Int",
+                    "tiling": null,
+                    "children": [
+                      {
+                        "edge": "0",
+                        "node": {
+                          "label": "Var(a)",
+                          "annotations": [],
+                          "nodeId": 1,
+                          "span": {
+                            "start": 428,
+                            "end": 429
+                          },
+                          "rewritten": null,
+                          "type": "Int",
+                          "tiling": null,
+                          "children": []
+                        }
+                      },
+                      {
+                        "edge": "1",
+                        "node": {
+                          "label": "Var(b)",
+                          "annotations": [],
+                          "nodeId": 2,
+                          "span": {
+                            "start": 432,
+                            "end": 433
+                          },
+                          "rewritten": null,
+                          "type": "Int",
+                          "tiling": null,
+                          "children": []
+                        }
+                      }
+                    ]
+                  }
                 }
-            ]
+              ]
+            }
+          }
+        ]
+      },
+      "spanIndex": [
+        {
+          "span": {
+            "start": 402,
+            "end": 414
+          },
+          "nodeId": 11
         },
         {
-            "span": {
-                "start": 419,
-                "end": 427
-            },
-            "bindings": [
-                {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "a",
-                    "defSpan": {
-                        "start": 402,
-                        "end": 403
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 396,
+            "end": 401
+          },
+          "nodeId": 32
         },
         {
-            "span": {
-                "start": 419,
-                "end": 423
-            },
-            "bindings": [
-                {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "a",
-                    "defSpan": {
-                        "start": 402,
-                        "end": 403
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 396,
+            "end": 397
+          },
+          "nodeId": 33
         },
         {
-            "span": {
-                "start": 424,
-                "end": 426
-            },
-            "bindings": [
-                {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "a",
-                    "defSpan": {
-                        "start": 402,
-                        "end": 403
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 400,
+            "end": 401
+          },
+          "nodeId": 34
         },
         {
-            "span": {
-                "start": 428,
-                "end": 433
-            },
-            "bindings": [
-                {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "a",
-                    "defSpan": {
-                        "start": 402,
-                        "end": 403
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "b",
-                    "defSpan": {
-                        "start": 415,
-                        "end": 416
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 415,
+            "end": 427
+          },
+          "nodeId": 7
         },
         {
-            "span": {
-                "start": 428,
-                "end": 433
-            },
-            "bindings": [
-                {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "a",
-                    "defSpan": {
-                        "start": 402,
-                        "end": 403
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "b",
-                    "defSpan": {
-                        "start": 415,
-                        "end": 416
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 396,
+            "end": 401
+          },
+          "nodeId": 36
         },
         {
-            "span": {
-                "start": 428,
-                "end": 429
-            },
-            "bindings": [
-                {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "a",
-                    "defSpan": {
-                        "start": 402,
-                        "end": 403
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "b",
-                    "defSpan": {
-                        "start": 415,
-                        "end": 416
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 396,
+            "end": 397
+          },
+          "nodeId": 37
         },
         {
-            "span": {
-                "start": 432,
-                "end": 433
-            },
-            "bindings": [
-                {
-                    "name": "add1",
-                    "defSpan": {
-                        "start": 383,
-                        "end": 387
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "a",
-                    "defSpan": {
-                        "start": 402,
-                        "end": 403
-                    },
-                    "type": "Int"
-                },
-                {
-                    "name": "b",
-                    "defSpan": {
-                        "start": 415,
-                        "end": 416
-                    },
-                    "type": "Int"
-                }
-            ]
+          "span": {
+            "start": 400,
+            "end": 401
+          },
+          "nodeId": 38
+        },
+        {
+          "span": {
+            "start": 428,
+            "end": 433
+          },
+          "nodeId": 3
+        },
+        {
+          "span": {
+            "start": 428,
+            "end": 429
+          },
+          "nodeId": 1
+        },
+        {
+          "span": {
+            "start": 432,
+            "end": 433
+          },
+          "nodeId": 2
         }
-    ],
-    "diagnostics": [],
-    "meta": {
-        "tick": null,
-        "snapshotKind": "post-inference",
-        "schema": 3
+      ]
+    }
+  ],
+  "paneLinks": [
+    {
+      "from": "pre-inference",
+      "to": "post-inference",
+      "edges": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          5,
+          5
+        ],
+        [
+          6,
+          6
+        ],
+        [
+          7,
+          7
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          9,
+          9
+        ],
+        [
+          10,
+          10
+        ],
+        [
+          11,
+          11
+        ],
+        [
+          12,
+          28
+        ],
+        [
+          13,
+          29
+        ],
+        [
+          14,
+          27
+        ],
+        [
+          15,
+          26
+        ],
+        [
+          16,
+          30
+        ]
+      ]
     },
-    "stages": [
-        {
-            "id": "pre-inference",
-            "label": "IR (PRE-INFERENCE)",
-            "kind": "holes",
-            "ir": {
-                "label": "Let(add1)",
-                "annotations": [],
-                "nodeId": 16,
-                "span": {
-                    "start": 383,
-                    "end": 401
-                },
-                "rewritten": {
-                    "via": "Lower",
-                    "nature": "machinery",
-                    "label": "lower.image"
-                },
-                "type": "_",
-                "tiling": null,
-                "children": [
-                    {
-                        "edge": "0",
-                        "node": {
-                            "label": "Lambda(x)",
-                            "annotations": [],
-                            "nodeId": 15,
-                            "span": {
-                                "start": 390,
-                                "end": 401
-                            },
-                            "rewritten": null,
-                            "type": "(_ \u21d2 _)",
-                            "tiling": null,
-                            "children": [
-                                {
-                                    "edge": "0",
-                                    "node": {
-                                        "label": "BinOp(Arithmetic(Add))",
-                                        "annotations": [],
-                                        "nodeId": 14,
-                                        "span": {
-                                            "start": 396,
-                                            "end": 401
-                                        },
-                                        "rewritten": null,
-                                        "type": "_",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Var(x)",
-                                                    "annotations": [],
-                                                    "nodeId": 12,
-                                                    "span": {
-                                                        "start": 396,
-                                                        "end": 397
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "_",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "Lit(Int(1))",
-                                                    "annotations": [],
-                                                    "nodeId": 13,
-                                                    "span": {
-                                                        "start": 400,
-                                                        "end": 401
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "_",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        }
-                    },
-                    {
-                        "edge": "1",
-                        "node": {
-                            "label": "Let(a)",
-                            "annotations": [],
-                            "nodeId": 11,
-                            "span": {
-                                "start": 402,
-                                "end": 414
-                            },
-                            "rewritten": {
-                                "via": "Lower",
-                                "nature": "machinery",
-                                "label": "lower.image"
-                            },
-                            "type": "_",
-                            "tiling": null,
-                            "children": [
-                                {
-                                    "edge": "0",
-                                    "node": {
-                                        "label": "Apply",
-                                        "annotations": [],
-                                        "nodeId": 10,
-                                        "span": {
-                                            "start": 406,
-                                            "end": 414
-                                        },
-                                        "rewritten": null,
-                                        "type": "_",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Var(add1)",
-                                                    "annotations": [],
-                                                    "nodeId": 9,
-                                                    "span": {
-                                                        "start": 406,
-                                                        "end": 410
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Lower",
-                                                        "nature": "machinery",
-                                                        "label": "lower.image"
-                                                    },
-                                                    "type": "_",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "Lit(Int(10))",
-                                                    "annotations": [],
-                                                    "nodeId": 8,
-                                                    "span": {
-                                                        "start": 411,
-                                                        "end": 413
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "_",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            }
-                                        ]
-                                    }
-                                },
-                                {
-                                    "edge": "1",
-                                    "node": {
-                                        "label": "Let(b)",
-                                        "annotations": [],
-                                        "nodeId": 7,
-                                        "span": {
-                                            "start": 415,
-                                            "end": 427
-                                        },
-                                        "rewritten": {
-                                            "via": "Lower",
-                                            "nature": "machinery",
-                                            "label": "lower.image"
-                                        },
-                                        "type": "_",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Apply",
-                                                    "annotations": [],
-                                                    "nodeId": 6,
-                                                    "span": {
-                                                        "start": 419,
-                                                        "end": 427
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "_",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "Var(add1)",
-                                                                "annotations": [],
-                                                                "nodeId": 5,
-                                                                "span": {
-                                                                    "start": 419,
-                                                                    "end": 423
-                                                                },
-                                                                "rewritten": {
-                                                                    "via": "Lower",
-                                                                    "nature": "machinery",
-                                                                    "label": "lower.image"
-                                                                },
-                                                                "type": "_",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Lit(Int(20))",
-                                                                "annotations": [],
-                                                                "nodeId": 4,
-                                                                "span": {
-                                                                    "start": 424,
-                                                                    "end": 426
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "_",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "BinOp(Arithmetic(Add))",
-                                                    "annotations": [],
-                                                    "nodeId": 3,
-                                                    "span": {
-                                                        "start": 428,
-                                                        "end": 433
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "_",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "Var(a)",
-                                                                "annotations": [],
-                                                                "nodeId": 1,
-                                                                "span": {
-                                                                    "start": 428,
-                                                                    "end": 429
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "_",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Var(b)",
-                                                                "annotations": [],
-                                                                "nodeId": 2,
-                                                                "span": {
-                                                                    "start": 432,
-                                                                    "end": 433
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "_",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                ]
-            },
-            "spanIndex": [
-                {
-                    "span": {
-                        "start": 383,
-                        "end": 401
-                    },
-                    "nodeId": 16
-                },
-                {
-                    "span": {
-                        "start": 390,
-                        "end": 401
-                    },
-                    "nodeId": 15
-                },
-                {
-                    "span": {
-                        "start": 396,
-                        "end": 401
-                    },
-                    "nodeId": 14
-                },
-                {
-                    "span": {
-                        "start": 396,
-                        "end": 397
-                    },
-                    "nodeId": 12
-                },
-                {
-                    "span": {
-                        "start": 400,
-                        "end": 401
-                    },
-                    "nodeId": 13
-                },
-                {
-                    "span": {
-                        "start": 402,
-                        "end": 414
-                    },
-                    "nodeId": 11
-                },
-                {
-                    "span": {
-                        "start": 406,
-                        "end": 414
-                    },
-                    "nodeId": 10
-                },
-                {
-                    "span": {
-                        "start": 406,
-                        "end": 410
-                    },
-                    "nodeId": 9
-                },
-                {
-                    "span": {
-                        "start": 411,
-                        "end": 413
-                    },
-                    "nodeId": 8
-                },
-                {
-                    "span": {
-                        "start": 415,
-                        "end": 427
-                    },
-                    "nodeId": 7
-                },
-                {
-                    "span": {
-                        "start": 419,
-                        "end": 427
-                    },
-                    "nodeId": 6
-                },
-                {
-                    "span": {
-                        "start": 419,
-                        "end": 423
-                    },
-                    "nodeId": 5
-                },
-                {
-                    "span": {
-                        "start": 424,
-                        "end": 426
-                    },
-                    "nodeId": 4
-                },
-                {
-                    "span": {
-                        "start": 428,
-                        "end": 433
-                    },
-                    "nodeId": 3
-                },
-                {
-                    "span": {
-                        "start": 428,
-                        "end": 429
-                    },
-                    "nodeId": 1
-                },
-                {
-                    "span": {
-                        "start": 432,
-                        "end": 433
-                    },
-                    "nodeId": 2
-                }
-            ]
-        },
-        {
-            "id": "post-inference",
-            "label": "IR (POST-INFERENCE)",
-            "kind": "typed",
-            "ir": {
-                "label": "Let(__mono)",
-                "annotations": [],
-                "nodeId": 30,
-                "span": {
-                    "start": 383,
-                    "end": 401
-                },
-                "rewritten": {
-                    "via": "Mono",
-                    "nature": "expansion",
-                    "label": "infer.mono_wrappers"
-                },
-                "type": "Int",
-                "tiling": null,
-                "children": [
-                    {
-                        "edge": "0",
-                        "node": {
-                            "label": "Lambda(x)",
-                            "annotations": [],
-                            "nodeId": 26,
-                            "span": {
-                                "start": 390,
-                                "end": 401
-                            },
-                            "rewritten": {
-                                "via": "Mono",
-                                "nature": "expansion",
-                                "label": "infer.mono_specialize"
-                            },
-                            "type": "(Int \u21d2 Int)",
-                            "tiling": null,
-                            "children": [
-                                {
-                                    "edge": "0",
-                                    "node": {
-                                        "label": "BinOp(Arithmetic(Add))",
-                                        "annotations": [],
-                                        "nodeId": 27,
-                                        "span": {
-                                            "start": 396,
-                                            "end": 401
-                                        },
-                                        "rewritten": {
-                                            "via": "Mono",
-                                            "nature": "expansion",
-                                            "label": "infer.mono_specialize"
-                                        },
-                                        "type": "Int",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Var(x)",
-                                                    "annotations": [],
-                                                    "nodeId": 28,
-                                                    "span": {
-                                                        "start": 396,
-                                                        "end": 397
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Mono",
-                                                        "nature": "expansion",
-                                                        "label": "infer.mono_specialize"
-                                                    },
-                                                    "type": "10",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "Lit(Int(1))",
-                                                    "annotations": [],
-                                                    "nodeId": 29,
-                                                    "span": {
-                                                        "start": 400,
-                                                        "end": 401
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Mono",
-                                                        "nature": "expansion",
-                                                        "label": "infer.mono_specialize"
-                                                    },
-                                                    "type": "1",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        }
-                    },
-                    {
-                        "edge": "1",
-                        "node": {
-                            "label": "Let(a)",
-                            "annotations": [],
-                            "nodeId": 11,
-                            "span": {
-                                "start": 402,
-                                "end": 414
-                            },
-                            "rewritten": {
-                                "via": "Lower",
-                                "nature": "machinery",
-                                "label": "lower.image"
-                            },
-                            "type": "Int",
-                            "tiling": null,
-                            "children": [
-                                {
-                                    "edge": "0",
-                                    "node": {
-                                        "label": "Apply",
-                                        "annotations": [],
-                                        "nodeId": 10,
-                                        "span": {
-                                            "start": 406,
-                                            "end": 414
-                                        },
-                                        "rewritten": null,
-                                        "type": "Int",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Var(__mono)",
-                                                    "annotations": [],
-                                                    "nodeId": 9,
-                                                    "span": {
-                                                        "start": 406,
-                                                        "end": 410
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Lower",
-                                                        "nature": "machinery",
-                                                        "label": "lower.image"
-                                                    },
-                                                    "type": "(Int \u21d2 Int)",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "Lit(Int(10))",
-                                                    "annotations": [],
-                                                    "nodeId": 8,
-                                                    "span": {
-                                                        "start": 411,
-                                                        "end": 413
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "10",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            }
-                                        ]
-                                    }
-                                },
-                                {
-                                    "edge": "1",
-                                    "node": {
-                                        "label": "Let(b)",
-                                        "annotations": [],
-                                        "nodeId": 7,
-                                        "span": {
-                                            "start": 415,
-                                            "end": 427
-                                        },
-                                        "rewritten": {
-                                            "via": "Lower",
-                                            "nature": "machinery",
-                                            "label": "lower.image"
-                                        },
-                                        "type": "Int",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Apply",
-                                                    "annotations": [],
-                                                    "nodeId": 6,
-                                                    "span": {
-                                                        "start": 419,
-                                                        "end": 427
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "Int",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "Var(__mono)",
-                                                                "annotations": [],
-                                                                "nodeId": 5,
-                                                                "span": {
-                                                                    "start": 419,
-                                                                    "end": 423
-                                                                },
-                                                                "rewritten": {
-                                                                    "via": "Lower",
-                                                                    "nature": "machinery",
-                                                                    "label": "lower.image"
-                                                                },
-                                                                "type": "(Int \u21d2 Int)",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Lit(Int(20))",
-                                                                "annotations": [],
-                                                                "nodeId": 4,
-                                                                "span": {
-                                                                    "start": 424,
-                                                                    "end": 426
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "20",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "BinOp(Arithmetic(Add))",
-                                                    "annotations": [],
-                                                    "nodeId": 3,
-                                                    "span": {
-                                                        "start": 428,
-                                                        "end": 433
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "Int",
-                                                    "tiling": null,
-                                                    "children": [
-                                                        {
-                                                            "edge": "0",
-                                                            "node": {
-                                                                "label": "Var(a)",
-                                                                "annotations": [],
-                                                                "nodeId": 1,
-                                                                "span": {
-                                                                    "start": 428,
-                                                                    "end": 429
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "Int",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        },
-                                                        {
-                                                            "edge": "1",
-                                                            "node": {
-                                                                "label": "Var(b)",
-                                                                "annotations": [],
-                                                                "nodeId": 2,
-                                                                "span": {
-                                                                    "start": 432,
-                                                                    "end": 433
-                                                                },
-                                                                "rewritten": null,
-                                                                "type": "Int",
-                                                                "tiling": null,
-                                                                "children": []
-                                                            }
-                                                        }
-                                                    ]
-                                                }
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                ]
-            },
-            "spanIndex": [
-                {
-                    "span": {
-                        "start": 383,
-                        "end": 401
-                    },
-                    "nodeId": 30
-                },
-                {
-                    "span": {
-                        "start": 390,
-                        "end": 401
-                    },
-                    "nodeId": 26
-                },
-                {
-                    "span": {
-                        "start": 396,
-                        "end": 401
-                    },
-                    "nodeId": 27
-                },
-                {
-                    "span": {
-                        "start": 396,
-                        "end": 397
-                    },
-                    "nodeId": 28
-                },
-                {
-                    "span": {
-                        "start": 400,
-                        "end": 401
-                    },
-                    "nodeId": 29
-                },
-                {
-                    "span": {
-                        "start": 402,
-                        "end": 414
-                    },
-                    "nodeId": 11
-                },
-                {
-                    "span": {
-                        "start": 406,
-                        "end": 414
-                    },
-                    "nodeId": 10
-                },
-                {
-                    "span": {
-                        "start": 406,
-                        "end": 410
-                    },
-                    "nodeId": 9
-                },
-                {
-                    "span": {
-                        "start": 411,
-                        "end": 413
-                    },
-                    "nodeId": 8
-                },
-                {
-                    "span": {
-                        "start": 415,
-                        "end": 427
-                    },
-                    "nodeId": 7
-                },
-                {
-                    "span": {
-                        "start": 419,
-                        "end": 427
-                    },
-                    "nodeId": 6
-                },
-                {
-                    "span": {
-                        "start": 419,
-                        "end": 423
-                    },
-                    "nodeId": 5
-                },
-                {
-                    "span": {
-                        "start": 424,
-                        "end": 426
-                    },
-                    "nodeId": 4
-                },
-                {
-                    "span": {
-                        "start": 428,
-                        "end": 433
-                    },
-                    "nodeId": 3
-                },
-                {
-                    "span": {
-                        "start": 428,
-                        "end": 429
-                    },
-                    "nodeId": 1
-                },
-                {
-                    "span": {
-                        "start": 432,
-                        "end": 433
-                    },
-                    "nodeId": 2
-                }
-            ]
-        },
-        {
-            "id": "post-desugar",
-            "label": "IR (POST-DESUGAR)",
-            "kind": "typed",
-            "ir": {
-                "label": "Let(a)",
-                "annotations": [],
-                "nodeId": 11,
-                "span": {
-                    "start": 402,
-                    "end": 414
-                },
-                "rewritten": {
-                    "via": "Lower",
-                    "nature": "machinery",
-                    "label": "lower.image"
-                },
-                "type": "Int",
-                "tiling": null,
-                "children": [
-                    {
-                        "edge": "0",
-                        "node": {
-                            "label": "BinOp(Arithmetic(Add))",
-                            "annotations": [],
-                            "nodeId": 32,
-                            "span": {
-                                "start": 396,
-                                "end": 401
-                            },
-                            "rewritten": {
-                                "via": "Inline",
-                                "nature": "expansion",
-                                "label": "inline.beta"
-                            },
-                            "type": "Int",
-                            "tiling": null,
-                            "children": [
-                                {
-                                    "edge": "0",
-                                    "node": {
-                                        "label": "Lit(Int(10))",
-                                        "annotations": [],
-                                        "nodeId": 33,
-                                        "span": {
-                                            "start": 396,
-                                            "end": 397
-                                        },
-                                        "rewritten": {
-                                            "via": "Inline",
-                                            "nature": "expansion",
-                                            "label": "inline.beta"
-                                        },
-                                        "type": "10",
-                                        "tiling": null,
-                                        "children": []
-                                    }
-                                },
-                                {
-                                    "edge": "1",
-                                    "node": {
-                                        "label": "Lit(Int(1))",
-                                        "annotations": [],
-                                        "nodeId": 34,
-                                        "span": {
-                                            "start": 400,
-                                            "end": 401
-                                        },
-                                        "rewritten": {
-                                            "via": "Inline",
-                                            "nature": "expansion",
-                                            "label": "inline.beta"
-                                        },
-                                        "type": "1",
-                                        "tiling": null,
-                                        "children": []
-                                    }
-                                }
-                            ]
-                        }
-                    },
-                    {
-                        "edge": "1",
-                        "node": {
-                            "label": "Let(b)",
-                            "annotations": [],
-                            "nodeId": 7,
-                            "span": {
-                                "start": 415,
-                                "end": 427
-                            },
-                            "rewritten": {
-                                "via": "Lower",
-                                "nature": "machinery",
-                                "label": "lower.image"
-                            },
-                            "type": "Int",
-                            "tiling": null,
-                            "children": [
-                                {
-                                    "edge": "0",
-                                    "node": {
-                                        "label": "BinOp(Arithmetic(Add))",
-                                        "annotations": [],
-                                        "nodeId": 36,
-                                        "span": {
-                                            "start": 396,
-                                            "end": 401
-                                        },
-                                        "rewritten": {
-                                            "via": "Inline",
-                                            "nature": "expansion",
-                                            "label": "inline.beta"
-                                        },
-                                        "type": "Int",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Lit(Int(20))",
-                                                    "annotations": [],
-                                                    "nodeId": 37,
-                                                    "span": {
-                                                        "start": 396,
-                                                        "end": 397
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Inline",
-                                                        "nature": "expansion",
-                                                        "label": "inline.beta"
-                                                    },
-                                                    "type": "20",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "Lit(Int(1))",
-                                                    "annotations": [],
-                                                    "nodeId": 38,
-                                                    "span": {
-                                                        "start": 400,
-                                                        "end": 401
-                                                    },
-                                                    "rewritten": {
-                                                        "via": "Inline",
-                                                        "nature": "expansion",
-                                                        "label": "inline.beta"
-                                                    },
-                                                    "type": "1",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            }
-                                        ]
-                                    }
-                                },
-                                {
-                                    "edge": "1",
-                                    "node": {
-                                        "label": "BinOp(Arithmetic(Add))",
-                                        "annotations": [],
-                                        "nodeId": 3,
-                                        "span": {
-                                            "start": 428,
-                                            "end": 433
-                                        },
-                                        "rewritten": null,
-                                        "type": "Int",
-                                        "tiling": null,
-                                        "children": [
-                                            {
-                                                "edge": "0",
-                                                "node": {
-                                                    "label": "Var(a)",
-                                                    "annotations": [],
-                                                    "nodeId": 1,
-                                                    "span": {
-                                                        "start": 428,
-                                                        "end": 429
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "Int",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            },
-                                            {
-                                                "edge": "1",
-                                                "node": {
-                                                    "label": "Var(b)",
-                                                    "annotations": [],
-                                                    "nodeId": 2,
-                                                    "span": {
-                                                        "start": 432,
-                                                        "end": 433
-                                                    },
-                                                    "rewritten": null,
-                                                    "type": "Int",
-                                                    "tiling": null,
-                                                    "children": []
-                                                }
-                                            }
-                                        ]
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                ]
-            },
-            "spanIndex": [
-                {
-                    "span": {
-                        "start": 402,
-                        "end": 414
-                    },
-                    "nodeId": 11
-                },
-                {
-                    "span": {
-                        "start": 396,
-                        "end": 401
-                    },
-                    "nodeId": 32
-                },
-                {
-                    "span": {
-                        "start": 396,
-                        "end": 397
-                    },
-                    "nodeId": 33
-                },
-                {
-                    "span": {
-                        "start": 400,
-                        "end": 401
-                    },
-                    "nodeId": 34
-                },
-                {
-                    "span": {
-                        "start": 415,
-                        "end": 427
-                    },
-                    "nodeId": 7
-                },
-                {
-                    "span": {
-                        "start": 396,
-                        "end": 401
-                    },
-                    "nodeId": 36
-                },
-                {
-                    "span": {
-                        "start": 396,
-                        "end": 397
-                    },
-                    "nodeId": 37
-                },
-                {
-                    "span": {
-                        "start": 400,
-                        "end": 401
-                    },
-                    "nodeId": 38
-                },
-                {
-                    "span": {
-                        "start": 428,
-                        "end": 433
-                    },
-                    "nodeId": 3
-                },
-                {
-                    "span": {
-                        "start": 428,
-                        "end": 429
-                    },
-                    "nodeId": 1
-                },
-                {
-                    "span": {
-                        "start": 432,
-                        "end": 433
-                    },
-                    "nodeId": 2
-                }
-            ]
-        }
-    ],
-    "paneLinks": [
-        {
-            "from": "pre-inference",
-            "to": "post-inference",
-            "edges": [
-                [
-                    1,
-                    1
-                ],
-                [
-                    2,
-                    2
-                ],
-                [
-                    3,
-                    3
-                ],
-                [
-                    4,
-                    4
-                ],
-                [
-                    5,
-                    5
-                ],
-                [
-                    6,
-                    6
-                ],
-                [
-                    7,
-                    7
-                ],
-                [
-                    8,
-                    8
-                ],
-                [
-                    9,
-                    9
-                ],
-                [
-                    10,
-                    10
-                ],
-                [
-                    11,
-                    11
-                ],
-                [
-                    12,
-                    28
-                ],
-                [
-                    13,
-                    29
-                ],
-                [
-                    14,
-                    27
-                ],
-                [
-                    15,
-                    26
-                ],
-                [
-                    16,
-                    30
-                ]
-            ]
-        },
-        {
-            "from": "post-inference",
-            "to": "post-desugar",
-            "edges": [
-                [
-                    1,
-                    1
-                ],
-                [
-                    2,
-                    2
-                ],
-                [
-                    3,
-                    3
-                ],
-                [
-                    7,
-                    7
-                ],
-                [
-                    11,
-                    11
-                ],
-                [
-                    27,
-                    32
-                ],
-                [
-                    27,
-                    36
-                ],
-                [
-                    28,
-                    33
-                ],
-                [
-                    28,
-                    37
-                ],
-                [
-                    29,
-                    34
-                ],
-                [
-                    29,
-                    38
-                ]
-            ]
-        }
-    ]
+    {
+      "from": "post-inference",
+      "to": "post-desugar",
+      "edges": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          7,
+          7
+        ],
+        [
+          11,
+          11
+        ],
+        [
+          27,
+          32
+        ],
+        [
+          27,
+          36
+        ],
+        [
+          28,
+          33
+        ],
+        [
+          28,
+          37
+        ],
+        [
+          29,
+          34
+        ],
+        [
+          29,
+          38
+        ]
+      ]
+    }
+  ]
 }

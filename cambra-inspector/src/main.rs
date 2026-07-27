@@ -67,7 +67,10 @@ fn run() -> Result<(), String> {
     };
 
     if dump_snapshot {
-        println!("{}", cambra_inspector::server::snapshot_body(&code, &name));
+        println!(
+            "{}",
+            cambra_inspector::server::snapshot_body_pretty(&code, &name)
+        );
         return Ok(());
     }
 
