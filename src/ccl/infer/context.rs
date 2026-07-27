@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype, fresh_var, fun, type_level,
@@ -80,6 +81,7 @@ pub(super) struct InferCtx {
     /// `in_let_rhs`) so RHS-local variables are minted deeper than the
     /// defining scope and become generalizable at the binding site.
     pub(super) level: Level,
+    pred_memo: PredMemo,
 }
 
 impl InferCtx {
@@ -90,6 +92,7 @@ impl InferCtx {
             cache: ConstrainCache::new(),
             schemes: OperatorSchemes::new(),
             level: 0,
+            pred_memo: Default::default(),
         }
     }
 
@@ -157,6 +160,10 @@ impl InferCtx {
 }
 
 impl Typing for InferCtx {
+    fn pred_memo(&mut self) -> &mut PredMemo {
+        &mut self.pred_memo
+    }
+
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, InferError> {
         emit_node(child, self)
     }

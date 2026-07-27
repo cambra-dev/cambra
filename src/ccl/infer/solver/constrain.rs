@@ -979,9 +979,7 @@ mod tests {
         let mk = || {
             Type::Refinement(
                 Box::new(prim(BaseType::Int)),
-                Refinement {
-                    predicate: Rc::new(TypedExpr::lit(Lit::Bool(true))),
-                },
+                Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
             )
         };
         let lhs = mk();
@@ -1002,9 +1000,7 @@ mod tests {
         let mk = || {
             Type::Refinement(
                 Box::new(prim(BaseType::Int)),
-                Refinement {
-                    predicate: Rc::new(TypedExpr::lit(Lit::Bool(true))),
-                },
+                Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
             )
         };
         let a = mk();
@@ -1035,9 +1031,7 @@ mod tests {
         // A structurally *different* predicate must not collapse into it.
         let c = Type::Refinement(
             Box::new(prim(BaseType::Int)),
-            Refinement {
-                predicate: Rc::new(TypedExpr::lit(Lit::Bool(false))),
-            },
+            Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(false)))),
         );
         assert_ne!(a, c, "distinct predicates must stay distinct");
     }
@@ -1623,9 +1617,7 @@ mod tests {
             BinOpKind::Compare(CompareKind::Greater),
             rhs,
         );
-        Refinement {
-            predicate: Rc::new(pred),
-        }
+        Refinement::born(Rc::new(pred))
     }
 
     fn coalesce(ty: &Type) -> Type {

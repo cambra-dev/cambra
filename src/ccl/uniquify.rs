@@ -33,7 +33,7 @@
 //! Predicates are immutable `Rc<TypedExpr>`, so uniquifying one **rebuilds**
 //! it. A predicate term shared by `Rc` across occurrences (lowering's clones
 //! share predicate terms deliberately) is rebuilt **once** — keyed by
-//! [`PredicateId`] in `memo` — and every occurrence is re-pointed at the same
+//! [`crate::ccl::PredicateId`] in `memo` — and every occurrence is re-pointed at the same
 //! rebuilt `Rc`, preserving the sharing.
 //!
 //! A variable that resolves to no binder is left raw — it is either a
@@ -59,16 +59,15 @@
 
 use std::collections::HashMap;
 
-use std::rc::Rc;
-
-use crate::ccl::{Expr, Name, PredicateId, Type, TypedBinding, TypedExprNode};
+use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
 
 /// α-uniquify every binder in `expr` (see module docs). Runs once per
 /// program, immediately after lowering and before defer desugaring.
 pub fn run(mut expr: Expr) -> Expr {
     let mut u = Uniquifier {
         env: HashMap::new(),
-        memo: HashMap::new(),
+        memo: PredMemo::new(),
     };
     u.expr(&mut expr);
     debug_assert!(
@@ -90,15 +89,12 @@ struct Uniquifier {
     /// uniquified once, and every occurrence is re-pointed at the same
     /// rebuilt term.
     ///
-    /// The `keepalive` clone is load-bearing: [`Uniquifier::ty`] overwrites
-    /// `r.predicate` with the rebuilt result, which drops the *original* `Rc`
-    /// if this was its only strong reference. Without a clone held here, that
-    /// free can hand the address straight back to an unrelated `Rc::new`
-    /// later in the same walk, so a subsequent, unrelated predicate landing
-    /// on that address would collide with this entry and wrongly inherit its
-    /// `rebuilt` value — [`PredicateId`] is only a sound stand-in for
-    /// identity while the address it names cannot be reused.
-    memo: HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>,
+    /// Uniquification is a predicate-*rebuilding* pass like every other, so it
+    /// memoizes with the shared [`PredMemo`] — including its keepalive
+    /// discipline, without which overwriting `r.predicate` could free an address
+    /// a later `Rc::new` in the same walk reclaims, colliding an unrelated
+    /// predicate with this entry.
+    memo: PredMemo,
 }
 
 impl Uniquifier {
@@ -222,19 +218,11 @@ impl Uniquifier {
     /// (see module docs), with every occurrence re-pointed at the rebuilt `Rc`
     /// via `memo`.
     fn ty(&mut self, t: &mut Type) {
-        if let Type::Refinement(_, r) = t {
-            let original_rc = Rc::clone(&r.predicate);
-            let original = Rc::as_ptr(&original_rc);
-            if let Some((_, rebuilt)) = self.memo.get(&original) {
-                r.predicate = Rc::clone(rebuilt);
-            } else {
-                let mut pred = (*r.predicate).clone();
-                self.expr(&mut pred);
-                let rebuilt = Rc::new(pred);
-                self.memo
-                    .insert(original, (original_rc, Rc::clone(&rebuilt)));
-                r.predicate = rebuilt;
-            }
+        if let Type::Refinement(_, r) = t
+            && let Some((origin, mut pred)) = self.memo.begin(r)
+        {
+            self.expr(&mut pred);
+            self.memo.finish(r, origin, pred);
         }
         t.walk_children_mut(|c| self.ty(c));
     }

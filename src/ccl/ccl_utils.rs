@@ -768,99 +768,159 @@ where
 /// a transform-only pass.
 ///
 /// Keyed on [`PredicateId`] (the origin `Rc`'s address). Sound only while that
-/// address cannot be reused during the pass, which [`Self::record`] guarantees
-/// by retaining a `keepalive` clone of every origin `Rc` for the memo's
-/// lifetime: without it, overwriting a `refinement.predicate` could drop the
-/// origin `Rc`, freeing an address a later `Rc::new` in the same pass could
-/// reclaim, so an unrelated predicate landing there would collide and inherit
-/// this entry's rebuild.
+/// address cannot be reused during the pass, which the [`Origin`] token
+/// guarantees: every entry retains its origin `Rc` for the memo's lifetime.
+/// Without that, overwriting a `refinement.predicate` could drop the origin
+/// `Rc`, freeing an address a later `Rc::new` in the same pass could reclaim, so
+/// an unrelated predicate landing there would collide and inherit this entry's
+/// rebuild. This is why a pass uses `PredMemo` rather than a bare map — the
+/// keepalive is not optional bookkeeping.
 #[derive(Default)]
 pub struct PredMemo(HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>);
+
+/// A predicate's **origin** `Rc`, captured before its slot was overwritten —
+/// the memo key, and the keepalive pinning that key's address.
+///
+/// Only [`PredMemo::begin`] mints one and only [`PredMemo::finish`] /
+/// [`PredMemo::finish_unchanged`] consume one, so it cannot be confused with a
+/// rebuild: the "did you pass the origin or the rebuild?" mistake the raw
+/// `record(Rc, Rc)` shape invited is not expressible.
+pub struct Origin(Rc<Expr>);
 
 impl PredMemo {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The rebuilt predicate for `refinement`'s origin `Rc`, if an occurrence
-    /// sharing it was already rebuilt in this pass. Clones the shared `Rc` out
-    /// so the caller holds **no** borrow of the memo across its own transform —
-    /// which is what lets a pass whose transform needs `&mut Ctx` (with the memo
-    /// living in that `Ctx`) look up, transform, then [`record`] without a
-    /// borrow conflict.
+    /// Open a rebuild of `refinement`'s predicate.
     ///
-    /// [`record`]: Self::record
-    pub fn rebuilt_for(&self, refinement: &Refinement) -> Option<Rc<Expr>> {
-        self.0
-            .get(&refinement.predicate_id())
-            .map(|(_, rebuilt)| Rc::clone(rebuilt))
+    /// On a **hit** — an occurrence sharing this origin `Rc` was already rebuilt
+    /// in this pass — re-points `refinement` at that single rebuild and returns
+    /// `None`: sharing preserved, transform skipped. On a **miss**, returns the
+    /// [`Origin`] token together with a mutable copy for the caller to transform,
+    /// to be handed back to [`finish`](Self::finish) (or
+    /// [`finish_unchanged`](Self::finish_unchanged)).
+    ///
+    /// The copy is owned, so the caller holds **no** borrow of the memo across
+    /// its own transform — which is what lets a pass whose transform needs
+    /// `&mut Ctx` (with the memo living in that `Ctx`) drive this protocol
+    /// without a borrow conflict.
+    pub fn begin(&self, refinement: &mut Refinement) -> Option<(Origin, Expr)> {
+        if let Some((_, rebuilt)) = self.0.get(&refinement.predicate_id()) {
+            refinement.predicate = Rc::clone(rebuilt);
+            return None;
+        }
+        let origin = Origin(Rc::clone(&refinement.predicate));
+        let copy = (*refinement.predicate).clone();
+        Some((origin, copy))
     }
 
-    /// Record that every occurrence sharing `original` rebuilds to `rebuilt`.
-    /// Retains `original` as the keepalive pinning its address for the memo's
-    /// lifetime (see the type-level note on address reuse) — pass the origin
-    /// `Rc` you cloned *before* overwriting the slot, not the rebuilt one.
-    pub fn record(&mut self, original: Rc<Expr>, rebuilt: Rc<Expr>) {
-        let key = Rc::as_ptr(&original);
-        self.0.insert(key, (original, rebuilt));
+    /// Close a rebuild: install `rebuilt` into `refinement` and record
+    /// `origin ↦ rebuilt`, so every later occurrence sharing `origin` is
+    /// re-pointed at this same term.
+    pub fn finish(&mut self, refinement: &mut Refinement, origin: Origin, rebuilt: Expr) {
+        let rebuilt = Rc::new(rebuilt);
+        refinement.predicate = Rc::clone(&rebuilt);
+        self.insert(origin, rebuilt);
+    }
+
+    /// Close a rebuild the transform left **untouched**: keep the origin `Rc` in
+    /// the slot and record `origin ↦ origin`.
+    ///
+    /// This is strictly better than rebuilding an identical term. It preserves
+    /// sharing a pass *already* had rather than re-establishing it (a predicate a
+    /// pass merely walks past is never reallocated, so occurrences it never
+    /// visits stay pointer-equal to ones it did), and it turns the caller's
+    /// "would this transform do anything?" test — `subst`'s `is_free` scan, say —
+    /// from once per *occurrence* into once per distinct predicate.
+    pub fn finish_unchanged(&mut self, refinement: &mut Refinement, origin: Origin) {
+        let kept = Rc::clone(&origin.0);
+        refinement.predicate = Rc::clone(&kept);
+        self.insert(origin, kept);
+    }
+
+    /// Retain `origin` as the keepalive pinning its address for the memo's
+    /// lifetime (see the type-level note on address reuse) while mapping it to
+    /// `rebuilt`.
+    fn insert(&mut self, origin: Origin, rebuilt: Rc<Expr>) {
+        let key = Rc::as_ptr(&origin.0);
+        self.0.insert(key, (origin.0, rebuilt));
     }
 }
 
-/// Rebuilding analog of [`walk_refined_predicates`]: invoke `f` on a *mutable
-/// copy* of each predicate and reinstall the (possibly rewritten) result as a
-/// fresh `Rc`, **preserving sharing** via a pass-scoped [`PredMemo`] (which the
-/// callback also receives, so it can recurse when a predicate's own
-/// subexpressions carry further refinements). Every occurrence that shared one
-/// predicate term is re-pointed at the same rebuilt term.
+/// Every refinement reachable from `expr`'s type slots, one entry per distinct
+/// predicate `Rc`, in walk order. Coverage is [`Expr::walk_type_slots`]' — every
+/// node's `ty`, `user_annotation`, `Cast` target, and binder-declared types — so
+/// a refinement riding *only* a binder slot or a cast target (where a
+/// comprehension filter's predicate lives) is reached.
 ///
-/// The caller **must** pass one memo for the whole pass, not a fresh one per
-/// call — see [`PredMemo`] for why.
+/// Deduplicated by [`PredicateId`], so occurrences sharing one `Rc` yield one
+/// entry: the result's length is the sharing metric ([`distinct_predicate_rcs`]),
+/// while [`Refinement`]'s own structural `PartialEq` lets a caller ask the
+/// sharper question — whether two of those *distinct* `Rc`s denote the same
+/// refinement, i.e. whether sharing was split (see `tests/predicate_sharing.rs`).
+pub fn reachable_refinements(expr: &Expr) -> Vec<Refinement> {
+    fn in_type(ty: &Type, out: &mut Vec<Refinement>, seen: &mut HashSet<PredicateId>) {
+        if let Type::Refinement(_, r) = ty
+            && seen.insert(r.predicate_id())
+        {
+            out.push(r.clone());
+            // A predicate's own subexpressions carry further refinements.
+            in_expr(&r.predicate, out, seen);
+        }
+        ty.walk_children(|c| in_type(c, out, seen));
+    }
+    fn in_expr(e: &Expr, out: &mut Vec<Refinement>, seen: &mut HashSet<PredicateId>) {
+        e.walk_type_slots(|ty| in_type(ty, out, seen));
+        e.walk_children(|c| in_expr(c, out, seen));
+    }
+    let mut out = Vec::new();
+    in_expr(expr, &mut out, &mut HashSet::new());
+    out
+}
+
 /// Count the **distinct** refinement-predicate `Rc`s reachable from `expr`'s
-/// type slots (every node's `.ty`, `user_annotation`, and binder-slot types).
-/// Pure address-set arithmetic — no structural hashing — so it is cheap enough
-/// for a `debug_assert!` guard.
+/// type slots ([`reachable_refinements`]). Pure address-set arithmetic — no
+/// structural hashing — so it is cheap enough for a `debug_assert!` guard.
 ///
 /// This is the per-phase sharing check: a *sharing-preserving* transform maps N
 /// distinct origin predicate `Rc`s to ≤ N distinct rebuilt `Rc`s, so this count
 /// is **non-increasing** across a transform-only pass (one that rewrites but
 /// does not introduce predicates). A pass that splits sharing strictly
 /// increases it, tripping the guard at the exact phase that regressed.
+///
+/// A count is a *necessary* check, not a sufficient one — it cannot see a split
+/// that a pass pairs with an equal-sized collapse elsewhere. The end-to-end
+/// guard in `tests/predicate_sharing.rs` closes that by asserting no two
+/// distinct `Rc`s are structurally equal, which names the defect directly.
 pub fn distinct_predicate_rcs(expr: &Expr) -> usize {
-    fn in_type(ty: &Type, seen: &mut HashSet<PredicateId>) {
-        if let Type::Refinement(_, r) = ty
-            && seen.insert(r.predicate_id())
-        {
-            // A predicate's own subexpressions carry further refinements.
-            in_expr(&r.predicate, seen);
-        }
-        ty.walk_children(|c| in_type(c, seen));
-    }
-    fn in_expr(e: &Expr, seen: &mut HashSet<PredicateId>) {
-        in_type(&e.ty, seen);
-        if let Some(a) = &e.user_annotation {
-            in_type(a, seen);
-        }
-        e.walk_children(|c| in_expr(c, seen));
-    }
-    let mut seen = HashSet::new();
-    in_expr(expr, &mut seen);
-    seen.len()
+    reachable_refinements(expr).len()
 }
 
+/// Rebuilding analog of [`walk_refined_predicates`]: invoke `f` on a *mutable
+/// copy* of each predicate and reinstall the result, **preserving sharing** via a
+/// pass-scoped [`PredMemo`] (which the callback also receives, so it can recurse
+/// when a predicate's own subexpressions carry further refinements). Every
+/// occurrence that shared one predicate term is re-pointed at the same term.
+///
+/// `f` returns whether it **changed** the copy. Returning `false` keeps the
+/// origin `Rc` in place ([`PredMemo::finish_unchanged`]), so a caller that merely
+/// walks past a predicate does not reallocate it — which is what lets sharing
+/// survive across the nodes such a caller visits, not just within one type.
+///
+/// The caller **must** pass one memo for the whole pass, not a fresh one per
+/// call — see [`PredMemo`] for why.
 pub fn walk_refined_predicates_mut<F>(ty: &mut Type, memo: &mut PredMemo, f: &mut F)
 where
-    F: FnMut(&mut Expr, &mut PredMemo),
+    F: FnMut(&mut Expr, &mut PredMemo) -> bool,
 {
-    if let Type::Refinement(_, refinement) = ty {
-        if let Some(rebuilt) = memo.rebuilt_for(refinement) {
-            refinement.predicate = rebuilt;
+    if let Type::Refinement(_, refinement) = ty
+        && let Some((origin, mut pred)) = memo.begin(refinement)
+    {
+        if f(&mut pred, memo) {
+            memo.finish(refinement, origin, pred);
         } else {
-            let original = Rc::clone(&refinement.predicate);
-            let mut pred = (*refinement.predicate).clone();
-            f(&mut pred, memo);
-            let rebuilt = Rc::new(pred);
-            memo.record(original, Rc::clone(&rebuilt));
-            refinement.predicate = rebuilt;
+            memo.finish_unchanged(refinement, origin);
         }
     }
     ty.walk_children_mut(|child| walk_refined_predicates_mut(child, memo, f));

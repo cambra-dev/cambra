@@ -1201,6 +1201,53 @@ impl TypedExpr {
         }
     }
 
+    /// Invoke `f` on every [`Type`] slot this node carries **directly**: its own
+    /// `ty`, its `user_annotation`, a [`TypedExprNode::Cast`]'s `target`, and the
+    /// declared type of every binder it introduces
+    /// ([`walk_binders`](Self::walk_binders)). Does not recurse into child
+    /// expressions.
+    ///
+    /// This is the single source of truth for "which type slots a node carries",
+    /// and it exists because those slots are **independent** values: a refinement
+    /// riding a lambda's domain also rides `param.ty`, and a cast's refinement
+    /// rides both `ty` and `target`, but each slot holds its *own* immutable
+    /// predicate `Rc`. So a pass that rewrites or measures predicates must reach
+    /// all of them — `ty` alone silently misses the slot a comprehension filter's
+    /// predicate actually lives in (`Cast.target`, which downstream
+    /// `lambda_elim` and operator conversion read). Enumerate here rather than
+    /// re-deriving the set per pass: a new type-slot-bearing variant then updates
+    /// one place instead of every such pass, and a pass cannot acquire a blind
+    /// spot by omission.
+    ///
+    /// Callers that also need slots reachable *through* a type (a `Fun` domain, a
+    /// refinement predicate's own type slots) compose this with
+    /// [`Type::walk_children`] — see
+    /// [`crate::ccl::ccl_utils::distinct_predicate_rcs`].
+    pub fn walk_type_slots(&self, mut f: impl FnMut(&Type)) {
+        f(&self.ty);
+        if let Some(annotation) = &self.user_annotation {
+            f(annotation);
+        }
+        if let TypedExprNode::Cast { target, .. } = &self.node {
+            f(target);
+        }
+        self.walk_binders(|b| f(&b.ty));
+    }
+
+    /// Mutable analog of [`walk_type_slots`](Self::walk_type_slots), for passes
+    /// that rewrite type slots in place. Kept in lockstep with it — any new
+    /// type-slot-bearing variant must appear in both.
+    pub fn walk_type_slots_mut(&mut self, mut f: impl FnMut(&mut Type)) {
+        f(&mut self.ty);
+        if let Some(annotation) = &mut self.user_annotation {
+            f(annotation);
+        }
+        if let TypedExprNode::Cast { target, .. } = &mut self.node {
+            f(target);
+        }
+        self.walk_binders_mut(|b| f(&mut b.ty));
+    }
+
     /// Mutable analog of [`fold_children`](Self::fold_children).
     ///
     /// Threads `init` through `f` while visiting each direct child by mutable

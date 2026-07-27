@@ -2,6 +2,7 @@
 // Check pass: post-inference structural re-validation
 // ---------------------------------------------------------------------------
 
+use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fresh_var, prim};
 use crate::ccl::symbolic::symbolic;
@@ -53,6 +54,7 @@ pub(super) struct CheckCtx {
     schemes: OperatorSchemes,
     level: Level,
     errors: Vec<InferError>,
+    pred_memo: PredMemo,
 }
 
 impl CheckCtx {
@@ -64,11 +66,16 @@ impl CheckCtx {
             schemes: OperatorSchemes::new(),
             level: 0,
             errors: Vec::new(),
+            pred_memo: Default::default(),
         }
     }
 }
 
 impl Typing for CheckCtx {
+    fn pred_memo(&mut self) -> &mut PredMemo {
+        &mut self.pred_memo
+    }
+
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, InferError> {
         // Recurse to collect the child's own errors, then hand back its
         // *recorded* type (not the rule-derived, throwaway-laden one) so the

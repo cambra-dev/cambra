@@ -627,6 +627,20 @@ impl Refinement {
         Refinement { predicate }
     }
 
+    /// Construct a refinement **deliberately sharing** an existing predicate
+    /// term: a second occurrence of *the same* refinement, in another type slot.
+    /// This is what lowering does when one filtered domain rides a source, a map,
+    /// a cast target, and a consumer contract — one allocation, several slots —
+    /// and it is the sharing every rebuilding pass then has to preserve.
+    ///
+    /// Distinct from [`born`](Self::born) in intent, not mechanism: `born` says
+    /// "this predicate did not exist before", this says "this predicate already
+    /// exists and I mean to alias it". Together they are the only two spellings —
+    /// a `Refinement { predicate }` literal states neither.
+    pub fn sharing(predicate: &Rc<TypedExpr>) -> Self {
+        Refinement::born(Rc::clone(predicate))
+    }
+
     /// The [`PredicateId`] of this refinement's predicate term.
     pub fn predicate_id(&self) -> PredicateId {
         Rc::as_ptr(&self.predicate)
@@ -958,9 +972,7 @@ mod tests {
                 ccl_utils::refined_fn_type(Type::Hole, filter(op), Type::Hole),
             )
         };
-        let refinement = |pred: TypedExpr| Refinement {
-            predicate: Rc::new(pred),
-        };
+        let refinement = |pred: TypedExpr| Refinement::born(Rc::new(pred));
 
         let gt = refinement(cast_pred(CompareKind::Greater));
         let gt_twin = refinement(cast_pred(CompareKind::Greater));

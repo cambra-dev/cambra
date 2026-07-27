@@ -13,20 +13,30 @@
 //! which later makes planning recompile one predicate once per occurrence,
 //! superlinearly.
 //!
+//! **What is asserted, and why it is not a threshold.** A split leaves a
+//! recognizable shape: one origin term rebuilt into several `Rc`-distinct copies
+//! that are *structurally equal*. Asserting "no two distinct predicate `Rc`s are
+//! structurally equal" names that defect directly. A bound on the distinct-`Rc`
+//! count cannot: it needs a magic number, it drifts as unrelated changes shift
+//! the count, and slack in it silently tolerates the very growth it is meant to
+//! catch.
+//!
 //! We measure at **post-inference** (cheap — milliseconds), which is where the
 //! sharing is established and preserved; the downstream slowdown a regression
-//! causes is in planning, but the *cause* is visible here as an inflated count.
+//! causes is in planning, but the *cause* is visible here as duplicated terms.
 
-use cambra::ccl::ccl_utils::distinct_predicate_rcs;
+use cambra::ccl::ccl_utils::{distinct_predicate_rcs, reachable_refinements};
 use cambra::ccl::infer::{TypeInferenceContext, infer};
 use cambra::ccl::lower::{LoweringContext, lower_stmts};
+use cambra::ccl::symbolic::symbolic;
 use cambra::ccl::uniquify;
+use cambra::ccl::{BaseType, Expr, Lit, Refinement, Type, TypedExprNode};
 use cambra::chl_parser;
+use std::rc::Rc;
 
 /// Parse → lower → uniquify → infer `code` (the pipeline prefix through type
-/// inference; comprehensions over literals need no source registration), then
-/// count the distinct refinement-predicate `Rc`s in the inferred tree.
-fn distinct_rcs_post_infer(code: &str) -> usize {
+/// inference; comprehensions over literals need no source registration).
+fn infer_source(code: &str) -> Expr {
     let module = chl_parser::parse_module(code)
         .value
         .expect("parse should succeed");
@@ -37,56 +47,140 @@ fn distinct_rcs_post_infer(code: &str) -> usize {
     expr = uniquify::run(expr);
     let mut ictx = TypeInferenceContext::new();
     infer(&mut expr, &mut ictx).expect("inference should succeed");
-    distinct_predicate_rcs(&expr)
+    expr
 }
 
-/// A doubly-nested comprehension whose filtered domains ride many type slots.
-/// Under the sharing bug this reached ~9 independent `Rc`s *per* structural
-/// predicate (dozens total, multiplying downstream); with sharing preserved it
-/// is one `Rc` per predicate the program actually contains — a small handful.
-#[test]
-fn nested_comprehension_shares_predicate_rcs() {
-    let code = "[a + b
-        for a in [c + d for c in ['a'] for d in ['b', 'c'] if c < d]
-        for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
-    if a != b]";
-    let n = distinct_rcs_post_infer(code);
-    assert!(
-        n <= 8,
-        "nested-comprehension predicate `Rc`s not shared: {n} distinct (expected one per \
-         distinct predicate the program contains; a larger count means an inference pass \
-         rebuilt predicates per-occurrence instead of preserving `Rc` sharing)"
+/// Group `expr`'s `Rc`-distinct refinements by `Refinement`'s own (structural,
+/// type-blind) equality and report every group with more than one member: each
+/// surplus member is one refinement that entered inference as a single `Rc` and
+/// left it as several — which is exactly what defeats planning's `Rc`-keyed
+/// compile memo.
+///
+/// (Two *independently authored* predicates that happened to coincide would be a
+/// false positive, so the programs below use pairwise-distinct filters — any
+/// duplicate group is a genuine split.)
+fn splits(expr: &Expr) -> (usize, String) {
+    let mut groups: Vec<(Refinement, usize)> = Vec::new();
+    for r in reachable_refinements(expr) {
+        match groups.iter_mut().find(|(q, _)| *q == r) {
+            Some(g) => g.1 += 1,
+            None => groups.push((r, 1)),
+        }
+    }
+    let surplus = groups.iter().map(|(_, n)| n - 1).sum();
+    let detail = groups
+        .iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(r, n)| format!("\n  {n}x  {}", symbolic(&r.predicate)))
+        .collect();
+    (surplus, detail)
+}
+
+/// Assert every structurally-distinct predicate in `code` survives inference as
+/// exactly one `Rc`.
+fn assert_no_split(code: &str) {
+    let expr = infer_source(code);
+    let (surplus, detail) = splits(&expr);
+    assert_eq!(
+        surplus,
+        0,
+        "inference left {surplus} redundant predicate `Rc`(s) of {} distinct: a structural \
+         predicate was rebuilt per-occurrence instead of staying shared, which makes planning \
+         recompile it once per occurrence.{detail}",
+        distinct_predicate_rcs(&expr),
     );
 }
 
-/// Sharing must not degrade *multiplicatively* with nesting depth: adding a
-/// `for … if a_i == a_{i+1}` binder is a bounded, additive increment to the
-/// distinct-`Rc` count, not a multiplicative blowup (the regression that made
-/// planning superlinear).
+/// The motivating case. Two levels of nesting are required: in a *singly*-nested
+/// comprehension every predicate also rides some node's `ty`, so a pass that
+/// misses the binder slots and cast targets happens to cost nothing. At two
+/// levels, a filter predicate reachable only through a `Cast.target` appears —
+/// and that is the slot `lambda_elim` and operator conversion read it from.
 #[test]
-fn filtered_join_nesting_stays_additive() {
-    let counts: Vec<usize> = (2..=6)
-        .map(|n| {
-            let binders: Vec<String> = (0..n).map(|i| format!("a{i}")).collect();
-            let sum = binders.join(" + ");
-            let fors: String = binders
-                .iter()
-                .map(|b| format!("for {b} in [1, 2, 3]"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let conds: String = binders
-                .windows(2)
-                .map(|w| format!("if {} == {}", w[0], w[1]))
-                .collect::<Vec<_>>()
-                .join(" ");
-            distinct_rcs_post_infer(&format!("[{sum} {fors} {conds}]"))
-        })
-        .collect();
-    for w in counts.windows(2) {
-        assert!(
-            w[1] <= w[0] + 4,
-            "distinct predicate `Rc`s grew multiplicatively across nesting depth: {counts:?} \
-             (sharing lost — an inference pass is rebuilding predicates per-occurrence)"
-        );
+fn nested_comprehension_shares_predicate_rcs() {
+    assert_no_split(
+        "[a + b
+            for a in [c + d for c in ['a'] for d in ['b', 'c'] if c < d]
+            for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
+        if a != b]",
+    );
+}
+
+/// Sharing must survive at every nesting depth, not just the one depth a fixture
+/// happens to pin: the regression that made planning superlinear grew with depth.
+/// Each `for … if a_i == a_{i+1}` binder contributes one distinct filter
+/// predicate, and it must stay one `Rc`.
+#[test]
+fn filtered_join_nesting_stays_shared() {
+    for n in 2..=6 {
+        let binders: Vec<String> = (0..n).map(|i| format!("a{i}")).collect();
+        let sum = binders.join(" + ");
+        let fors: String = binders
+            .iter()
+            .map(|b| format!("for {b} in [1, 2, 3]"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let conds: String = binders
+            .windows(2)
+            .map(|w| format!("if {} == {}", w[0], w[1]))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_no_split(&format!("[{sum} {fors} {conds}]"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Coverage of the metric itself.
+//
+// The assertions above are only as good as the traversal behind them: a metric
+// blind to a type slot cannot observe a split there, and `Expr::walk_children`
+// deliberately descends into *neither* binder-declared types nor a `Cast`'s
+// `target` — the slot a comprehension filter's predicate actually lives in. A
+// count-based guard with that blind spot stays green while the predicates it
+// was written to protect are split. These pin each slot on a hand-built node,
+// so they cannot go vacuous the way a program fixture can: once sharing is
+// preserved, a cast's `target` and its `ty` hold the *same* `Rc` and a
+// `ty`-only walk reaches everything.
+// ---------------------------------------------------------------------------
+
+/// `{Int | true}` over a fresh predicate `Rc`.
+fn refined_int() -> Type {
+    Type::Refinement(
+        Box::new(Type::Base(BaseType::Int)),
+        Refinement::born(Rc::new(Expr::lit(Lit::Bool(true)))),
+    )
+}
+
+/// A predicate riding only a `Cast`'s `target`. `Expr::walk_children` visits a
+/// cast's `value` but not its `target`, and downstream (`lambda_elim`, operator
+/// conversion) reads the predicate from `target`.
+#[test]
+fn metric_counts_predicate_on_cast_target() {
+    let expr = Expr::cast(Expr::lit(Lit::Int(1)), refined_int());
+    assert_eq!(distinct_predicate_rcs(&expr), 1);
+}
+
+/// A predicate riding only a `Lambda`'s `param.ty`. `Expr::lambda` also stamps
+/// the refinement onto the node's own `ty` (as the `Fun` domain), which *is*
+/// traversed — so the node type is cleared to isolate the binder slot.
+#[test]
+fn metric_counts_predicate_on_lambda_param_slot() {
+    let expr = Expr::lambda("x", refined_int(), Expr::var("x")).with_ty(Type::Hole);
+    assert_eq!(distinct_predicate_rcs(&expr), 1);
+}
+
+/// A predicate riding only a `Let`'s `binding.ty`. `Expr::let_bind` copies
+/// `bound_expr.ty` into `binding.ty`, so the bound expression's own type slot is
+/// cleared to isolate the binder slot.
+#[test]
+fn metric_counts_predicate_on_let_binding_slot() {
+    let mut expr = Expr::let_bind(
+        "x",
+        Expr::lit(Lit::Int(1)).with_ty(refined_int()),
+        Expr::var("x"),
+    );
+    if let TypedExprNode::Let { bound_expr, .. } = &mut expr.node {
+        bound_expr.ty = Type::Hole;
+    }
+    assert_eq!(distinct_predicate_rcs(&expr), 1);
 }

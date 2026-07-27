@@ -2802,9 +2802,7 @@ mod tests {
         // predicate referencing `outer_n`:
         //   `Var("__chan")` with user_annotation = Fun(Refinement(Hole, pred(outer_n)), Hole)
         let pred = var("outer_n");
-        let refinement = Refinement {
-            predicate: Rc::new(pred),
-        };
+        let refinement = Refinement::born(Rc::new(pred));
         let annotated = TypedExpr {
             node: TypedExprNode::Var(Name::raw("__chan")),
             ty: Type::Hole,
@@ -2832,9 +2830,7 @@ mod tests {
     #[test]
     fn collect_free_vars_descends_into_ty_refinement_predicates() {
         let pred = var("inner_k");
-        let refinement = Refinement {
-            predicate: Rc::new(pred),
-        };
+        let refinement = Refinement::born(Rc::new(pred));
         let typed = TypedExpr {
             node: TypedExprNode::Lit(Lit::Unit),
             ty: Type::Fun {
