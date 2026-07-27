@@ -881,8 +881,8 @@ fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
 ///
 /// Recognised forms:
 /// - Capitalized primitive names (`Caps` means type — `docs/chl-spec.md`):
-///   `Int` → [`Type::Base`]([`BaseType::Int`]), `String` → `String`,
-///   `Bool` → `Bool`.
+///   any [`BaseType`] spelling ([`BaseType::keyword`]) → [`Type::Base`], i.e.
+///   `Int`, `UInt`, `String`, `Bool`, `Unit`.
 /// - `None` (the constant) → `Unit`, and the wildcard `_` → [`Type::Hole`]
 ///   ("infer this slot" — inference normalizes an annotation `Hole` to a fresh
 ///   variable, so the slot is unconstrained; see `bind_annotation`).
@@ -939,13 +939,15 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
 /// `docs/chl-spec.md`), or the
 /// inference wildcard `_`. Returns `None` for any other identifier.
 fn name_type(id: &str) -> Option<Type> {
-    Some(match id {
-        "Int" => Type::Base(BaseType::Int),
-        "String" => Type::Base(BaseType::String),
-        "Bool" => Type::Base(BaseType::Bool),
-        "_" => Type::Hole,
-        _ => return None,
-    })
+    if let Some(base) = BaseType::from_keyword(id) {
+        return Some(Type::Base(base));
+    }
+    // `_` is the inference wildcard, not a primitive, so it is not a
+    // `BaseType`; handle it alongside the primitive round-trip.
+    match id {
+        "_" => Some(Type::Hole),
+        _ => None,
+    }
 }
 
 /// Extract the simple-name head of a type application (`List` in `List(T)`).

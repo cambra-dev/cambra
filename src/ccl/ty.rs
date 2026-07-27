@@ -280,17 +280,7 @@ fn synthetic_payloads(tags: &[(FieldKey, Type)]) -> Option<Vec<Type>> {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Type::Base(b) => write!(
-                f,
-                "{}",
-                match b {
-                    BaseType::Int => "Int",
-                    BaseType::UInt => "UInt",
-                    BaseType::String => "String",
-                    BaseType::Bool => "Bool",
-                    BaseType::Unit => "Unit",
-                }
-            ),
+            Type::Base(b) => write!(f, "{}", b.keyword()),
             // `n == 0` means an empty range (e.g. the domain of `[]`); render
             // it as `∅` instead of computing `n - 1` and underflowing.
             Type::UIntRange(0) => write!(f, "∅"),
