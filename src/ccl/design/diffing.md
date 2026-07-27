@@ -227,6 +227,38 @@ A source-only node is **deleted**; a target-only node is **new**. A relocated
 subtree is reported as moved once, at its root — its descendants stay in place
 relative to it.
 
+### Reading a diff
+
+A [`Diff`](../diff.rs) renders itself: it prints as an annotated tree of the
+**new** program, so the output doubles as the shape a unified `Versioned` tree
+would take, followed by whatever the old program had that the new one dropped.
+
+```text
+2 shared · 1 changed · 1 moved · 0 deleted · 16 new
+
+~ let a = 1…
+  = 1
+  + let b = Sum(λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ i → i *…
+    + Sum(λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ i → i * 2))    (+12 nodes)
+    + a + b
+      = a »
+      + b
+```
+
+Markers are `=` unchanged, `~` content changed, `+` new, `-` deleted, and a
+trailing `»` for a node whose placement changed. Two rules keep it readable:
+an unchanged subtree is not descended into (it is unchanged all the way down),
+and a wholly-new or wholly-deleted region collapses to its root with a node
+count. A node that gained or lost only *itself* — a wrapper around content that
+survived — is deliberately *not* collapsed: above, the new `a + b` is shown with
+the reused `a` under it, because claiming that `a` changed would be false.
+
+Each node is shown by rendering its subterm with `symbolic` and keeping the
+first line, cut to a fixed width. A leaf prints exactly; an interior node prints
+its head. That costs `O(𝑛²)` text and is an inspection surface, not a hot path —
+but it means the rendering cannot drift out of step with the AST the way a
+second, shallow node vocabulary would.
+
 ### Worked example
 
 `1 if v > 0 else 2` → `1 if v > 1 else 2`, diffed at the lowered stage. The

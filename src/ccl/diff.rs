@@ -58,7 +58,7 @@
 //! greedily rather than solving a global assignment — GumTree does the same.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::Discriminant;
 
 use super::TypedExpr;
@@ -117,7 +117,7 @@ pub struct Match<'a> {
 
 /// The classified correspondence between two programs. All references borrow
 /// the two input trees.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Diff<'a> {
     /// Every node correspondence, in source pre-order.
     pub matched: Vec<Match<'a>>,
@@ -125,6 +125,10 @@ pub struct Diff<'a> {
     pub deleted: Vec<&'a TypedExpr>,
     /// Target-only nodes: introduced by the new program.
     pub new: Vec<&'a TypedExpr>,
+    /// The old program's root — retained so a [`Diff`] can render itself.
+    pub src_root: &'a TypedExpr,
+    /// The new program's root.
+    pub dst_root: &'a TypedExpr,
 }
 
 impl<'a> Diff<'a> {
@@ -822,7 +826,13 @@ mod ted {
 
 fn classify<'a>(s: &Indexed<'a>, d: &Indexed<'a>, m: &Matching) -> Diff<'a> {
     let in_place = align_children(s, d, m);
-    let mut out = Diff::default();
+    let mut out = Diff {
+        matched: Vec::new(),
+        deleted: Vec::new(),
+        new: Vec::new(),
+        src_root: s.nodes[0].expr,
+        dst_root: d.nodes[0].expr,
+    };
     for (u, &dst) in m.src_to_dst.iter().enumerate() {
         match dst {
             Some(w) => out.matched.push(Match {
@@ -930,6 +940,187 @@ fn longest_increasing(seq: &[usize]) -> Vec<usize> {
     }
     out.reverse();
     out
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// How wide a single node's term rendering may get before it is elided.
+const RENDER_WIDTH: usize = 68;
+
+/// One node's own line in a rendered diff: the head of its symbolic form.
+///
+/// A node is shown by rendering its whole subterm with
+/// [`symbolic`](crate::ccl::symbolic::symbolic) and keeping the first line, cut
+/// to [`RENDER_WIDTH`]. That reads naturally — a leaf prints exactly, an
+/// interior node prints its head (`let a = 1 in …`) — and it costs nothing to
+/// keep in step with the AST, which a second shallow-label vocabulary would
+/// not. The price is `O(n²)` text for the whole tree; this is a debugging and
+/// inspection surface, not a hot path.
+fn head(e: &TypedExpr) -> String {
+    let full = crate::ccl::symbolic::symbolic(e);
+    let line = full.lines().next().unwrap_or("").trim_end();
+    let mut out: String = line.chars().take(RENDER_WIDTH).collect();
+    if line.chars().count() > RENDER_WIDTH || full.lines().nth(1).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Renders as an annotated tree of the **new** program, plus whatever the old
+/// program had that the new one dropped.
+///
+/// Every node of the new program is marked with what the diff concluded about
+/// it, so the output doubles as the shape a unified `Versioned` tree would
+/// take. An inserted or deleted subtree is shown by its **root** only, with its
+/// node count — printing every node of a pasted-in block is noise, and the root
+/// is the actionable unit.
+///
+/// ```text
+/// 15 shared · 3 changed · 1 moved · 0 deleted · 4 new
+///
+/// ~ let a = 1 in let b = sum(…) in a + b…
+///   = 1
+///   + let b = sum([i ▷ (λ i → i * 2) for …    (+13 nodes)
+///   ~ a + b
+///     = a
+/// ```
+///
+/// Markers: `=` unchanged, `~` content changed, `+` new, `-` deleted, and a
+/// trailing `»` on a node whose placement changed.
+impl std::fmt::Display for Diff<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let by_dst: HashMap<*const TypedExpr, &Match> = self
+            .matched
+            .iter()
+            .map(|m| (m.dst as *const TypedExpr, m))
+            .collect();
+        let inserted: HashSet<*const TypedExpr> =
+            self.new.iter().map(|e| *e as *const TypedExpr).collect();
+
+        writeln!(
+            f,
+            "{} shared · {} changed · {} moved · {} deleted · {} new",
+            self.shared().count(),
+            self.updated().count(),
+            self.moved().count(),
+            self.deleted.len(),
+            self.new.len(),
+        )?;
+        writeln!(f)?;
+
+        render_node(f, self.dst_root, 0, &by_dst, &inserted)?;
+
+        // Anything the old program had that the new one does not.
+        let gone: HashSet<*const TypedExpr> = self
+            .deleted
+            .iter()
+            .map(|e| *e as *const TypedExpr)
+            .collect();
+        let mut roots: Vec<(&TypedExpr, bool)> = Vec::new();
+        collect_deleted_roots(self.src_root, &gone, &mut roots);
+        if !roots.is_empty() {
+            writeln!(f)?;
+            for (e, whole) in roots {
+                let note = if whole { size_note(e) } else { String::new() };
+                writeln!(f, "- {}{note}", head(e))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Is every node of `e`'s subtree in `set`?
+///
+/// This is what decides whether a wholly-inserted or wholly-deleted region may
+/// collapse to its root in the rendering. A node in `set` whose *interior* is
+/// still matched is a different thing entirely — a wrapper that appeared or
+/// vanished around content that survived — and collapsing it would claim its
+/// surviving children changed too.
+fn subtree_entirely_in(e: &TypedExpr, set: &HashSet<*const TypedExpr>) -> bool {
+    set.contains(&(e as *const TypedExpr)) && e.all_children(|c| subtree_entirely_in(c, set))
+}
+
+/// `    (+N nodes)` when `e` has descendants, so an elided subtree still
+/// reports how much it stands for; empty for a leaf.
+fn size_note(e: &TypedExpr) -> String {
+    let mut n = 0;
+    fn count(e: &TypedExpr, n: &mut usize) {
+        *n += 1;
+        e.walk_children(|c| count(c, n));
+    }
+    e.walk_children(|c| count(c, &mut n));
+    if n == 0 {
+        String::new()
+    } else {
+        format!("    (+{n} nodes)")
+    }
+}
+
+fn render_node(
+    f: &mut std::fmt::Formatter<'_>,
+    e: &TypedExpr,
+    depth: usize,
+    by_dst: &HashMap<*const TypedExpr, &Match>,
+    inserted: &HashSet<*const TypedExpr>,
+) -> std::fmt::Result {
+    let indent = "  ".repeat(depth);
+    match by_dst.get(&(e as *const TypedExpr)) {
+        // Target-only. A wholly-new region collapses to its root; a new node
+        // wrapping content that survived is shown with that content under it.
+        None if subtree_entirely_in(e, inserted) => {
+            writeln!(f, "{indent}+ {}{}", head(e), size_note(e))
+        }
+        None => {
+            writeln!(f, "{indent}+ {}", head(e))?;
+            for c in child_exprs(e) {
+                render_node(f, c, depth + 1, by_dst, inserted)?;
+            }
+            Ok(())
+        }
+        Some(m) => {
+            let mark = match m.content {
+                Content::Same => '=',
+                Content::Changed => '~',
+            };
+            let moved = if m.placement == Placement::Moved {
+                " »"
+            } else {
+                ""
+            };
+            writeln!(f, "{indent}{mark} {}{moved}", head(e))?;
+            // An unchanged subtree is unchanged all the way down; descending
+            // would print it verbatim for no information.
+            if m.content == Content::Changed {
+                for c in child_exprs(e) {
+                    render_node(f, c, depth + 1, by_dst, inserted)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Collect the topmost deleted nodes of `root`, each flagged with whether its
+/// whole subtree went with it. A wholly-deleted region is reported once, at its
+/// root; a deleted node whose children survived is reported alone, and the walk
+/// continues through it to find whatever else was dropped further down.
+fn collect_deleted_roots<'a>(
+    e: &'a TypedExpr,
+    gone: &HashSet<*const TypedExpr>,
+    out: &mut Vec<(&'a TypedExpr, bool)>,
+) {
+    if gone.contains(&(e as *const TypedExpr)) {
+        let whole = subtree_entirely_in(e, gone);
+        out.push((e, whole));
+        if whole {
+            return;
+        }
+    }
+    for c in child_exprs(e) {
+        collect_deleted_roots(c, gone, out);
+    }
 }
 
 #[cfg(test)]
@@ -1393,6 +1584,58 @@ mod tests {
         assert!(
             r.shared().count() >= 6,
             "the untouched body is still shared"
+        );
+    }
+
+    #[test]
+    fn render_collapses_whole_regions_but_not_wrappers() {
+        // `a = 1; a` gains a statement that both introduces new structure and
+        // reuses `a`. The wholly-new `sum(…)` subtree collapses to one line
+        // with a node count; the new `a + b` does *not*, because `a` survived
+        // underneath it and hiding that would claim it changed.
+        let v1 = lower("a = 1\na\n");
+        let v2 = lower("a = 1\nb = sum([i * 2 for i in [1,2,3]])\na + b\n");
+        let out = diff(&v1, &v2).to_string();
+
+        assert!(
+            out.starts_with("2 shared · 1 changed"),
+            "summary line: {out}"
+        );
+        assert!(
+            out.contains("(+"),
+            "a wholly-new subtree collapses with a node count:\n{out}"
+        );
+        // The surviving `a` is still shown, under the new node that wraps it.
+        assert!(
+            out.lines().any(|l| l.trim_start().starts_with("= a")),
+            "the reused `a` is rendered as shared:\n{out}"
+        );
+        // Every line after the summary carries exactly one marker.
+        for l in out.lines().skip(2).filter(|l| !l.trim().is_empty()) {
+            let m = l.trim_start().chars().next().unwrap();
+            assert!("=~+-".contains(m), "unmarked line {l:?} in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn render_does_not_overstate_a_deletion() {
+        // `let c = 9 in …` is dropped, but the statements under it survive. The
+        // deleted wrapper must be reported on its own — not as a subtree of
+        // everything it used to contain.
+        let v1 = lower("a = 1\nc = 9\nb = 2\na + b + c\n");
+        let v2 = lower("a = 1\nb = 2\na + b\n");
+        let d = diff(&v1, &v2);
+        let out = d.to_string();
+
+        let deleted_lines: Vec<&str> = out.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(
+            deleted_lines.len(),
+            d.deleted.len(),
+            "one line per deleted node when none of them collapse:\n{out}"
+        );
+        assert!(
+            deleted_lines.iter().all(|l| !l.contains("(+")),
+            "no deleted node claims a subtree it did not take with it:\n{out}"
         );
     }
 
