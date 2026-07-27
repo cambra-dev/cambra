@@ -315,13 +315,7 @@ impl Eq for dyn DataSourceDomainExtentImpl {}
 
 impl std::fmt::Display for BaseType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BaseType::Int => write!(f, "Int"),
-            BaseType::UInt => write!(f, "UInt"),
-            BaseType::String => write!(f, "String"),
-            BaseType::Bool => write!(f, "Bool"),
-            BaseType::Unit => write!(f, "Unit"),
-        }
+        write!(f, "{}", self.keyword())
     }
 }
 

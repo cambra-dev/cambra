@@ -24,6 +24,38 @@ pub enum BaseType {
     Unit,
 }
 
+impl BaseType {
+    /// The CHL/CCL surface spelling of this primitive (`Caps` means type —
+    /// `docs/chl-spec.md`). Single source of truth for the reader
+    /// ([`from_keyword`](Self::from_keyword)) and every `Display`/pretty site,
+    /// so a new variant fails to compile until all of them are updated rather
+    /// than silently diverging.
+    pub const fn keyword(&self) -> &'static str {
+        match self {
+            BaseType::Int => "Int",
+            BaseType::UInt => "UInt",
+            BaseType::String => "String",
+            BaseType::Bool => "Bool",
+            BaseType::Unit => "Unit",
+        }
+    }
+
+    /// Inverse of [`keyword`](Self::keyword): recognise a primitive-type name.
+    /// Total round-trip over every variant (`from_keyword(b.keyword()) ==
+    /// Some(b)`), so all five spellings — `UInt` and `Unit` included — are
+    /// accepted wherever a primitive annotation is read.
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        Some(match s {
+            "Int" => BaseType::Int,
+            "UInt" => BaseType::UInt,
+            "String" => BaseType::String,
+            "Bool" => BaseType::Bool,
+            "Unit" => BaseType::Unit,
+            _ => return None,
+        })
+    }
+}
+
 /// Errors about types that can be used by any phase of compilation
 pub enum TypeError {
     /// Generic type error
@@ -524,4 +556,25 @@ pub enum ProjKey {
     Index(usize),
     /// Named record-field projection: `.fieldname`.
     Field(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `from_keyword` is a total inverse of `keyword` over every variant — the
+    /// law that lets the reader and all writer sites share one spelling table.
+    #[test]
+    fn base_type_keyword_round_trips() {
+        for b in [
+            BaseType::Int,
+            BaseType::UInt,
+            BaseType::String,
+            BaseType::Bool,
+            BaseType::Unit,
+        ] {
+            assert_eq!(BaseType::from_keyword(b.keyword()), Some(b));
+        }
+        assert_eq!(BaseType::from_keyword("List"), None);
+    }
 }

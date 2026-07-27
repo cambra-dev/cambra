@@ -11,7 +11,7 @@
 //! ```
 
 use crate::interpreter::{
-    ArithmeticKind, BaseType, BinOpKind, CompareKind, Extent, LogicKind,
+    ArithmeticKind, BinOpKind, CompareKind, Extent, LogicKind,
     tile_operators::{TileOperator, TileProducer},
 };
 pub use crate::pretty_tree::{InspectNode, render, render_with_max_depth};
@@ -78,13 +78,7 @@ impl VizOptions {
 /// Format an Extent compactly for display.
 pub fn fmt_extent(extent: &Extent) -> String {
     match extent {
-        Extent::Base(base) => match base {
-            BaseType::Int => "Int".to_string(),
-            BaseType::UInt => "UInt".to_string(),
-            BaseType::String => "String".to_string(),
-            BaseType::Bool => "Bool".to_string(),
-            BaseType::Unit => "Unit".to_string(),
-        },
+        Extent::Base(base) => base.keyword().to_string(),
         Extent::Function { domain, codomain } => {
             let d = fmt_extent(domain);
             let c = fmt_extent(codomain);
