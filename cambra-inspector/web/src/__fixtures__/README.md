@@ -73,3 +73,9 @@ cargo golden test compares each committed fixture against a fresh dump.
 `store.test.ts` keys its assertions on node **labels/types**, not raw NodeIds, so
 ordinary id churn does not require touching the tests — but a shape change will,
 by design (and `wireValidate.ts` enforces the shape).
+
+Re-blessing pins more than it looks like. Every node's `type` is `Display for
+Type`'s rendering (`src/ccl/ty.rs` hands `collect_str` that string), so the
+corpus pins the type notation on every node in every pane — a literal's
+singleton spelling included. Changing that notation is a corpus-wide re-bless,
+not a formatting tweak.

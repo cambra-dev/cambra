@@ -145,6 +145,7 @@ ci_fixtures() {
         echo "ci_fixtures FAILED: fixture drift: ${name} (committed ${committed_size} bytes vs regenerated ${regen_size} bytes)" >&2
         diff -u "${fix}/${name}" "${f}" | head -n 12 >&2 || true
         echo "  re-bless via: cambra-inspector/scripts/regen-fixtures.sh, then commit the diff" >&2
+        echo "  (if web/src/ changed too: cd cambra-inspector/web && npm run build, then commit dist/index.html — ci_web compares it)" >&2
         drifted=1
       fi
     done
