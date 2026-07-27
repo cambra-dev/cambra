@@ -11,17 +11,22 @@
 //!    *shared*. Larger subtrees are claimed first; once a node is matched its
 //!    descendants are matched with it (paired by hash, which is correct for the
 //!    order-insensitive nodes too).
-//! 2. **Bottom-up container recovery.** An interior node left unmatched is
-//!    paired with the best same-kind candidate in the other tree whose
-//!    already-matched descendants exceed a similarity threshold. This is what
-//!    keeps an inserted statement from desynchronizing the whole `let`-spine
-//!    below it: the unchanged tail anchors in step 1, and the containers above
-//!    it are recovered here rather than reported as wholesale rewrites.
-//! 3. **Optimal recovery inside a recovered pair.** Two containers paired in
-//!    step 2 still have unmatched descendants — near-identical subtrees whose
-//!    hashes differ somewhere inside. [`recover`] maps those *optimally*, by
-//!    tree edit distance ([`ted`]), so an edit deep inside a large subtree does
-//!    not read as a wholesale replacement of everything around it.
+//! 2. **Root anchoring.** Two programs being diffed are two versions of *one*
+//!    program, so their roots correspond by construction ([`anchor_roots`]).
+//!    Nothing else can establish that — a root that gained a statement scores
+//!    too low for step 3 to pair it, and the whole program would read as
+//!    deleted-and-reinserted for a one-statement edit.
+//! 3. **Bottom-up container recovery.** An interior node left unmatched is
+//!    paired with the best same-kind candidate in the other tree that
+//!    *contains* enough of its already-matched descendants. This is what keeps
+//!    an inserted statement from desynchronizing the whole `let`-spine below
+//!    it: the unchanged tail anchors in step 1, and the containers above it are
+//!    recovered here rather than reported as wholesale rewrites.
+//! 4. **Optimal recovery inside a paired container.** Two containers paired in
+//!    step 2 or 3 still have unmatched descendants — near-identical subtrees
+//!    whose hashes differ somewhere inside. [`recover`] maps those *optimally*,
+//!    by tree edit distance ([`ted`]), so an edit deep inside a large subtree
+//!    does not read as a wholesale replacement of everything around it.
 //!
 //! The result is then classified along two independent axes ([`Match`]):
 //! whether the node's **content** changed ([`Content`]) and whether its
@@ -49,7 +54,7 @@
 //! This is the analysis, not a rewrite: it does **not** construct the unified
 //! `Versioned`-node tree (see `src/ccl/design/diffing.md`, "Beyond the
 //! analysis: Versioned nodes"). The one place it departs from full GumTree is
-//! candidate selection in step 2, which picks the best-scoring container
+//! candidate selection in step 3, which picks the best-scoring container
 //! greedily rather than solving a global assignment — GumTree does the same.
 
 use std::cmp::Reverse;
@@ -164,9 +169,33 @@ pub fn diff<'a>(src: &'a TypedExpr, dst: &'a TypedExpr) -> Diff<'a> {
     let mut m = Matching::new(s.len(), d.len());
 
     top_down(&s, &d, &mut m);
+    anchor_roots(&s, &d, &mut m);
     bottom_up(&s, &d, &mut m);
 
     classify(&s, &d, &m)
+}
+
+/// Anchor the two roots to each other when phase 1 has not already.
+///
+/// Two programs being diffed are two *versions of one program*, so their roots
+/// correspond by construction — neither has anywhere else to go. Bottom-up
+/// recovery cannot reach that conclusion on its own: its Dice test weighs a
+/// container's matched descendants against the *combined* size of both
+/// subtrees, so a root that gained one substantial statement scores below
+/// [`SIMILARITY_THRESHOLD`] and the entire program reads as
+/// deleted-and-reinserted for a one-statement edit. Anchoring the roots turns
+/// that back into an insertion, and gives phase 3 a pair to align the spine
+/// inside.
+///
+/// Requiring the same node kind keeps the anchor honest: two genuinely
+/// unrelated programs (a `BinOp` against a `Lit`) still correspond nowhere.
+fn anchor_roots(s: &Indexed, d: &Indexed, m: &mut Matching) {
+    const ROOT: usize = 0;
+    if m.src_matched(ROOT) || m.dst_matched(ROOT) || s.nodes[ROOT].kind != d.nodes[ROOT].kind {
+        return;
+    }
+    m.map(ROOT, ROOT);
+    recover(s, d, ROOT, ROOT, m);
 }
 
 /// Compile two source programs to `stage` and diff them — the end-to-end entry
@@ -531,6 +560,11 @@ fn bottom_up(s: &Indexed, d: &Indexed, m: &mut Matching) {
             continue;
         }
 
+        // Two questions, two measures. *Containment* decides whether `w` is a
+        // plausible counterpart at all; *tightness* picks between the plausible
+        // ones. Conflating them is what made a container that gained a
+        // statement look implausible — see the note on the two below.
+        let src_desc = f64::from(s.nodes[u].size - 1);
         let mut best: Option<(usize, f64)> = None;
         for w in 0..d.len() {
             if d.nodes[w].children.is_empty()
@@ -543,16 +577,26 @@ fn bottom_up(s: &Indexed, d: &Indexed, m: &mut Matching) {
             if common == 0 {
                 continue;
             }
-            let denom = (s.nodes[u].size - 1 + d.nodes[w].size - 1) as f64;
-            let dice = 2.0 * common as f64 / denom;
+            let dst_desc = f64::from(d.nodes[w].size - 1);
+            // Containment (the overlap coefficient): "is one of these two
+            // essentially inside the other?" Normalizing by the *smaller*
+            // subtree is what makes it survive an edit that grows or shrinks
+            // one side — the case Dice alone gets wrong.
+            let contained = common as f64 / src_desc.min(dst_desc);
+            if contained < SIMILARITY_THRESHOLD {
+                continue;
+            }
+            // Tightness (Dice): among the plausible candidates — which are
+            // necessarily nested in one another, since they all contain the
+            // same matched descendants — the growing denominator prefers the
+            // innermost, i.e. the container that fits `u` best.
+            let dice = 2.0 * common as f64 / (src_desc + dst_desc);
             if best.is_none_or(|(_, b)| dice > b) {
                 best = Some((w, dice));
             }
         }
 
-        if let Some((w, dice)) = best
-            && dice >= SIMILARITY_THRESHOLD
-        {
+        if let Some((w, _)) = best {
             m.map(u, w);
             recover(s, d, u, w, m);
         }
@@ -1183,20 +1227,29 @@ mod tests {
         // build it directly.
         let some1 = TypedExpr::variant_ctor("Some", int(1));
 
-        // Payload change `1 -> 2`: nothing under the ctor is matched, so there
-        // is no seed for container recovery and the ctor is rebuilt.
+        // Payload change `1 -> 2`. Nothing under the ctor is isomorphic, so
+        // there is no seed for container recovery — but the two ctors are the
+        // two programs' *roots*, which correspond by construction, and phase 3
+        // then aligns the payloads. The edit reads as an update, not a rebuild.
         let some2 = TypedExpr::variant_ctor("Some", int(2));
         let r = diff(&some1, &some2);
-        assert!(
-            r.deleted
-                .iter()
-                .any(|e| matches!(e.node, TypedExprNode::Lit(Lit::Int(1))))
-        );
-        assert!(
-            r.new
-                .iter()
-                .any(|e| matches!(e.node, TypedExprNode::Lit(Lit::Int(2))))
-        );
+        assert!(r.deleted.is_empty() && r.new.is_empty(), "{r:?}");
+        assert!(r.updated().any(|m| {
+            matches!(m.src.node, TypedExprNode::Lit(Lit::Int(1)))
+                && matches!(m.dst.node, TypedExprNode::Lit(Lit::Int(2)))
+        }));
+
+        // Same one level down, where the ctor is not itself a root: the tuple
+        // roots correspond, and recovery reaches the payload through them.
+        let nested =
+            |n: i64| TypedExpr::tuple(vec![int(0), TypedExpr::variant_ctor("Some", int(n))]);
+        let (n1, n2) = (nested(1), nested(2));
+        let r = diff(&n1, &n2);
+        assert!(r.deleted.is_empty() && r.new.is_empty(), "{r:?}");
+        assert!(r.updated().any(|m| {
+            matches!(m.src.node, TypedExprNode::Lit(Lit::Int(1)))
+                && matches!(m.dst.node, TypedExprNode::Lit(Lit::Int(2)))
+        }));
 
         // Tag change `Some -> None`: the payload `1` stays shared and seeds
         // bottom-up recovery, so the ctor is recognized as *updated* (the tag
@@ -1290,6 +1343,56 @@ mod tests {
             r.shared()
                 .any(|m| matches!(m.src.node, TypedExprNode::Lit(Lit::Int(1)))),
             "the unchanged literal 1 should be shared",
+        );
+    }
+
+    #[test]
+    fn adding_a_statement_is_an_insertion_not_a_rewrite() {
+        // `a = 1; a` gains a substantial statement. The root `let` has only two
+        // descendants and the new one brings a dozen, so a similarity test that
+        // weighs the two subtrees *together* scores the root far too low to
+        // pair — and the whole program reads as deleted-and-reinserted for a
+        // one-statement edit. The roots correspond by construction instead.
+        let v1 = lower("a = 1\na\n");
+        let v2 = lower("a = 1\nb = sum([i * 2 for i in [1,2,3]])\na + b\n");
+        let r = diff(&v1, &v2);
+        assert!(
+            r.deleted.is_empty(),
+            "nothing was removed, so nothing should be deleted: {:?}",
+            r.deleted
+        );
+        assert!(
+            r.updated().any(
+                |m| std::ptr::eq(m.src, &v1) && matches!(m.src.node, TypedExprNode::Let { .. })
+            ),
+            "the root corresponds, as an update",
+        );
+        // The pre-existing `a = 1` value is still recognized.
+        assert!(
+            r.shared()
+                .any(|m| matches!(m.src.node, TypedExprNode::Lit(Lit::Int(1)))),
+        );
+    }
+
+    #[test]
+    fn a_container_that_grew_still_corresponds() {
+        // The same shape one level down, where root anchoring cannot help: a
+        // `def` body gains a statement. The enclosing container is matched on
+        // *containment* of what it already had, not on its size relative to
+        // what was added.
+        let v1 = lower("def f(x):\n    a = 1\n    a + x\nf(2)\n");
+        let v2 = lower(
+            "def f(x):\n    a = 1\n    b = sum([i * 2 for i in [1,2,3]])\n    a + x + b\nf(2)\n",
+        );
+        let r = diff(&v1, &v2);
+        assert!(
+            r.deleted.is_empty(),
+            "the grown container corresponds rather than being rebuilt: {:?}",
+            r.deleted
+        );
+        assert!(
+            r.shared().count() >= 6,
+            "the untouched body is still shared"
         );
     }
 

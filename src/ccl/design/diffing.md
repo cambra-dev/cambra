@@ -142,7 +142,7 @@ declared) and the associative–commutative folding of `Record` /
 
 `diff` computes a node correspondence between two trees and classifies it. It is
 a GumTree-style matcher (Falleri et al., *Fine-grained and accurate source code
-differencing*, ASE 2014) run over the content hash, in four phases.
+differencing*, ASE 2014) run over the content hash, in five phases.
 
 **1. Top-down anchoring.** Map the largest subtrees whose content hash is equal.
 Equal hash means isomorphic modulo α, so the whole subtree is shared and its
@@ -160,33 +160,53 @@ longest agreeing chain of ancestor node kinds, then the closest depth. An
 arbitrary choice here manufactures a spurious move *plus* a spurious
 delete/insert pair for the copy it displaced.
 
-**2. Bottom-up container recovery.** An interior node left unmatched is paired
-with the best same-kind candidate in the other tree whose already-matched
-descendants exceed a similarity threshold (Dice ≥ 0.5, GumTree's default),
-processed children-before-parents. This is what keeps an inserted statement from
-desynchronizing the whole `let`-spine below it: the unchanged tail anchors in
-phase 1, and the containers above it are recovered here instead of being
-reported as wholesale rewrites.
+**2. Root anchoring.** Two programs being diffed are two versions of *one*
+program, so their roots correspond by construction and are anchored to each
+other if phase 1 has not already done it. Nothing else can establish that: a
+root that gained a statement fails phase 3's similarity test (see below), and
+the result is that the entire program reads as deleted-and-reinserted for a
+one-statement edit. The anchor requires the two roots to be the same node kind,
+so two genuinely unrelated programs still correspond nowhere.
 
-**3. Optimal recovery inside a matched pair.** Phases 1–2 match by whole-subtree
-equality and by container similarity; neither can pair two subtrees that are
-nearly identical but differ somewhere inside. That gap is what makes a one-token
-edit read as a delete plus an insert. This phase closes it: as each container
-pair is recovered in phase 2, compute the minimum-cost edit mapping between the
+**3. Bottom-up container recovery.** An interior node left unmatched is paired
+with the best same-kind candidate in the other tree that *contains* enough of
+its already-matched descendants, processed children-before-parents. This is what
+keeps an inserted statement from desynchronizing the whole `let`-spine below it:
+the unchanged tail anchors in phase 1, and the containers above it are recovered
+here instead of being reported as wholesale rewrites.
+
+*Containment and tightness are separate questions.* GumTree gates this on the
+Dice coefficient, `2·common / (|desc 𝑢| + |desc 𝑤|)`, which asks "how much of
+these two subtrees is shared" — and that is the wrong question when one side
+deliberately grew. A container that gained a statement has its own contribution
+swamped by the new material and scores below the threshold, so the very edit the
+phase exists to absorb is the one it rejects. The gate is therefore the
+**overlap coefficient**, `common / min(|desc 𝑢|, |desc 𝑤|)`: "is one of these
+essentially inside the other", which is exactly the insertion (and, symmetrically,
+the deletion) question. Dice stays as the *ranking* among candidates that pass —
+the candidates all contain the same matched descendants and so are nested in one
+another, and Dice's growing denominator picks the innermost, the container that
+fits tightest.
+
+**4. Optimal recovery inside a paired container.** Phases 1–3 match by
+whole-subtree equality and by container similarity; neither can pair two
+subtrees that are nearly identical but differ somewhere inside. That gap is what
+makes a one-token edit read as a delete plus an insert. This phase closes it: as
+each container pair is established, compute the minimum-cost edit mapping between the
 two subtrees and adopt every pair it aligns whose nodes are same-kind and still
 unmatched. Node labels are content hashes, so relabelling is free when the
-hashes agree and costs one otherwise. Phase-2 pairs are the only ones that need
-this — a phase-1 pair is isomorphic by construction, so there is nothing left
-unmatched beneath it.
+hashes agree and costs one otherwise. Pairs from phases 2 and 3 are the only
+ones that need this — a phase-1 pair is isomorphic by construction, so there is
+nothing left unmatched beneath it.
 
 The mapping is *optimal* under unit edit costs, computed with the Zhang–Shasha
 dynamic program. GumTree reaches for RTED, which computes the same optimal
 mapping faster by choosing a better decomposition strategy — the difference is
 asymptotic cost, not the result. Pairs above a size ceiling (100 nodes,
 GumTree's default) are skipped, since tree edit distance is `O(𝑛²𝑚²)` in the
-worst case; those keep only what phases 1–2 found.
+worst case; those keep only what phases 1–3 found.
 
-**4. Classification along two axes.** Every correspondence is labelled with
+**5. Classification along two axes.** Every correspondence is labelled with
 whether its **content** changed and whether its **placement** did. These are
 independent: a node can keep its content and move, or stay put and change.
 
