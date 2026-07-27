@@ -18,7 +18,11 @@ ci_clippy() { cargo clippy --all-targets -- -D warnings; }
 # (e.g. a test calling a debug-only fn) only breaks here. `-- -D warnings` is
 # scoped to our crate, not deps.
 ci_clippy_release() { cargo clippy --release --all-targets -- -D warnings; }
-ci_test() { cargo test -q; }
+# `DEEP_TYPECHECK=1` turns on the opt-in per-operation typecheck (see the
+# `deep-typecheck` feature). The GitHub workflow sets it so automated runs keep
+# exercising that check; it stays off for a bare local `./ci.sh` because it is
+# superlinear on nested comprehensions (that cost is why it is gated).
+ci_test() { cargo test -q ${DEEP_TYPECHECK:+--features deep-typecheck}; }
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc --no-deps
