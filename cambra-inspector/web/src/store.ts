@@ -6,7 +6,7 @@
 // re-renders its own slice of that resolved state. There is exactly one source
 // of truth, so the panes never talk to each other directly.
 
-import { buildIndices, type Indices } from "./indices";
+import { buildIndices, buildSpanIndex, type Indices } from "./indices";
 import {
   buildLinkGraph,
   resolveLinks,
@@ -77,9 +77,11 @@ export class Store {
 
     this.indicesByStage = new Map();
     for (const stage of this.stages) {
+      // Schema 4: the span index is not on the wire — rebuild it from the stage
+      // tree (`buildSpanIndex` mirrors Rust's `SpanIndex::build`).
       this.indicesByStage.set(
         stage.id,
-        buildIndices(stage.ir, stage.spanIndex, snapshot.definitions),
+        buildIndices(stage.ir, buildSpanIndex(stage.ir), snapshot.definitions),
       );
     }
 

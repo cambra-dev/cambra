@@ -9,7 +9,7 @@
   "meta": {
     "tick": null,
     "snapshotKind": "post-inference",
-    "schema": 3
+    "schema": 4
   },
   "stages": [
     {
@@ -93,44 +93,7 @@
             }
           }
         ]
-      },
-      "spanIndex": [
-        {
-          "span": {
-            "start": 1,
-            "end": 12
-          },
-          "nodeId": 5
-        },
-        {
-          "span": {
-            "start": 1,
-            "end": 2
-          },
-          "nodeId": 1
-        },
-        {
-          "span": {
-            "start": 4,
-            "end": 5
-          },
-          "nodeId": 2
-        },
-        {
-          "span": {
-            "start": 7,
-            "end": 8
-          },
-          "nodeId": 3
-        },
-        {
-          "span": {
-            "start": 10,
-            "end": 11
-          },
-          "nodeId": 4
-        }
-      ]
+      }
     },
     {
       "id": "post-inference",
@@ -213,44 +176,7 @@
             }
           }
         ]
-      },
-      "spanIndex": [
-        {
-          "span": {
-            "start": 1,
-            "end": 12
-          },
-          "nodeId": 5
-        },
-        {
-          "span": {
-            "start": 1,
-            "end": 2
-          },
-          "nodeId": 1
-        },
-        {
-          "span": {
-            "start": 4,
-            "end": 5
-          },
-          "nodeId": 2
-        },
-        {
-          "span": {
-            "start": 7,
-            "end": 8
-          },
-          "nodeId": 3
-        },
-        {
-          "span": {
-            "start": 10,
-            "end": 11
-          },
-          "nodeId": 4
-        }
-      ]
+      }
     },
     {
       "id": "post-desugar",
@@ -333,44 +259,7 @@
             }
           }
         ]
-      },
-      "spanIndex": [
-        {
-          "span": {
-            "start": 1,
-            "end": 12
-          },
-          "nodeId": 5
-        },
-        {
-          "span": {
-            "start": 1,
-            "end": 2
-          },
-          "nodeId": 1
-        },
-        {
-          "span": {
-            "start": 4,
-            "end": 5
-          },
-          "nodeId": 2
-        },
-        {
-          "span": {
-            "start": 7,
-            "end": 8
-          },
-          "nodeId": 3
-        },
-        {
-          "span": {
-            "start": 10,
-            "end": 11
-          },
-          "nodeId": 4
-        }
-      ]
+      }
     }
   ],
   "paneLinks": [

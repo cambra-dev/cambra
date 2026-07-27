@@ -35,7 +35,20 @@
 //!   of an undecided shape, the field is left out until an `outline` query
 //!   exists.
 //! * `meta.tick` — `null` (the live seam); `snapshotKind` is `"post-inference"`,
-//!   `schema` is `3`.
+//!   `schema` is `4`.
+//!
+//! # Schema 4: the span index is no longer shipped
+//!
+//! Schema 4 drops the per-stage `spanIndex` array from the wire. It was pure
+//! derived data: a pre-order walk of the stage's IR tree emitting one
+//! `{span, nodeId}` per node origin span (see [`SpanIndex::build`](super::index::SpanIndex::build)),
+//! and every wire node already carries its origin span inline (`InspectNode.span`).
+//! Shipping it duplicated span bytes already on the tree and coupled the fixture
+//! corpus to churn that carried no information the client could not rebuild. The
+//! frontend now reconstructs the index on load from the stage tree
+//! (`web/src/indices.ts`). The internal [`SpanIndex`](super::index::SpanIndex)
+//! type and the server-side query path (`Snapshot::resolve` et al.) are
+//! unchanged — only the wire stopped embedding its entries.
 
 use crate::chl_parser::ast::Span;
 
@@ -49,7 +62,7 @@ use crate::pretty_tree::InspectNode;
 /// The current `/api/snapshot` wire-format version, emitted as `meta.schema` on
 /// both the success and degraded payloads. See [`Meta::schema`] for the
 /// versioning contract and the current version's field set.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The `GET /api/snapshot` bulk payload — the whole static read-only model.
 ///
@@ -72,21 +85,34 @@ pub struct SnapshotPayload {
     /// Snapshot metadata + the live-protocol seams.
     pub meta: Meta,
     /// The ordered pipeline stages (upstream → downstream), each carrying its
-    /// own IR tree + span index. The three stages
+    /// own IR tree. The three stages
     /// `["pre-inference", "post-inference", "post-desugar"]`.
+    ///
+    /// On the live wire this is always the full pipeline. A fixture dump
+    /// ([`prune_for_fixture`](Self::prune_for_fixture)) may retain a subset (in
+    /// pipeline order) to slim the committed golden bytes.
     pub stages: Vec<StageEntry>,
     /// The dense node→node links between adjacent stages — each adjacent pane
     /// pair's `LineageMap` shipped verbatim, self-edges included. One entry per
     /// adjacent pair, in order: `{ from: "pre-inference", to: "post-inference" }`
     /// (the monomorphization boundary) and `{ from: "post-inference", to:
     /// "post-desugar" }` (the inline/desugar boundary).
-    pub pane_links: Vec<PaneLinkEntry>,
+    ///
+    /// `Option` solely for the fixture-slimming path: `None` **omits** the field
+    /// from the payload (see [`prune_for_fixture`](Self::prune_for_fixture)),
+    /// which the fixture validator alone accepts. The **live wire always ships
+    /// it** (`Some`) — the frontend's link graph consumes shipped edges — so a
+    /// missing `paneLinks` on a live payload is a bug, never "no links".
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub pane_links: Option<Vec<PaneLinkEntry>>,
 }
 
 /// One IR pipeline stage in the multi-pane snapshot.
 ///
-/// Carries its own self-contained IR tree and span index — each stage resolves
-/// against its own (`Expr`, `SourceProjection`) pair.
+/// Carries its own self-contained IR tree — each stage resolves against its own
+/// (`Expr`, `SourceProjection`) pair. The span→node index is **not** shipped
+/// (schema 4): every node carries its origin span inline on `ir`, and the
+/// frontend rebuilds the index from the tree (see the module's schema-4 note).
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
@@ -102,8 +128,6 @@ pub struct StageEntry {
     pub kind: &'static str,
     /// The full IR expand-tree for this stage.
     pub ir: InspectNode,
-    /// Every `(span → nodeId)` entry of this stage's span index.
-    pub span_index: Vec<SpanEntry>,
 }
 
 /// The dense node→node links between two adjacent pipeline stages — the
@@ -134,17 +158,6 @@ pub struct SourceInfo {
     pub name: String,
     /// The full source text.
     pub text: String,
-}
-
-/// One `{ span, nodeId }` row of `spanIndex`.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
-pub struct SpanEntry {
-    /// The origin span.
-    pub span: Span,
-    /// The node indexed under it.
-    pub node_id: crate::ccl::provenance::NodeId,
 }
 
 /// One `{ useSpan, defSpan, name }` row of `definitions`. The schema's optional
@@ -292,14 +305,16 @@ pub struct Meta {
     /// The wire-format version. A client reads this to detect an incompatible
     /// payload before parsing the rest.
     ///
-    /// **Schema 3** is the field set of [`SnapshotPayload`] documented on that
+    /// **Schema 4** is the field set of [`SnapshotPayload`] documented on that
     /// type (`source`, `definitions`, `scopes`, `diagnostics`, `meta`, `stages`,
     /// `paneLinks`), with the live seams (`meta.tick`, value summaries) always
     /// null. Each `stages[].ir` node carries its native attribution: the spans
     /// channel on the `span` field plus a `rewritten` tag
     /// (`null | { via, nature, label }`). `paneLinks` ships each adjacent pane
     /// pair's `LineageMap` **dense** (self-edges included), so the consumer
-    /// follows edges only. There are three stages / two windows.
+    /// follows edges only. There are three stages / two windows. Schema 4
+    /// removed the per-stage `spanIndex` array (derivable from the stage tree —
+    /// see the module's schema-4 note); schema 3 shipped it.
     ///
     /// **Bump the version** on any *breaking* wire change — a field removed,
     /// renamed, or retyped, or a value-shape change an old client would
@@ -309,27 +324,17 @@ pub struct Meta {
     pub schema: u32,
 }
 
-/// Build the IR expand-tree and span-index entries for one pipeline stage.
+/// Build the full IR expand-tree for one pipeline stage.
 ///
-/// Parameterized by `(Expr, SourceProjection)` so every stage goes through the same
-/// shared path: the tree via [`build_inspect_tree`] (the single source-linking
-/// tree-builder) and the index via [`SpanIndex::build`].
-fn build_stage_ir_and_index(
-    ir: &Expr,
-    projection: &SourceProjection,
-) -> (InspectNode, Vec<SpanEntry>) {
-    use super::index::SpanIndex;
+/// Parameterized by `(Expr, SourceProjection)` so every stage goes through the
+/// same shared source-linking tree-builder ([`build_inspect_tree`]). Schema 4
+/// no longer ships a span→node index: every node carries its origin span inline
+/// on the tree and the frontend rebuilds the index from it.
+fn build_stage_ir(ir: &Expr, projection: &SourceProjection) -> InspectNode {
     use super::query::{build_inspect_tree, tree_height};
 
-    let span_entries = SpanIndex::build(ir, projection)
-        .entries()
-        .map(|(span, node_id)| SpanEntry { span, node_id })
-        .collect();
-
     // Expand the full IR tree (ship-everything: descend to max depth).
-    let ir_node = build_inspect_tree(ir, projection, tree_height(ir));
-
-    (ir_node, span_entries)
+    build_inspect_tree(ir, projection, tree_height(ir))
 }
 
 impl Snapshot<'_> {
@@ -340,7 +345,7 @@ impl Snapshot<'_> {
     ///
     /// * `stages` — the pipeline stages in upstream → downstream order:
     ///   `"pre-inference"`, `"post-inference"`, `"post-desugar"`, each with its
-    ///   own IR tree + span index.
+    ///   own IR tree.
     /// * `paneLinks` — per consecutive stage pair, the dense edges of the
     ///   pane-pair `LineageMap` folded at that boundary, self-edges included (see
     ///   [`dense_edges`](super::stage::dense_edges)).
@@ -348,7 +353,7 @@ impl Snapshot<'_> {
     /// * `scopes` — [`NameBinderIndex::scopes`](crate::inspector_model::NameBinderIndex::scopes),
     ///   each binding's `type` joined via [`Snapshot::type_of`] on its def-span.
     /// * `diagnostics` — empty.
-    /// * `meta` — `tick: None`, `snapshotKind: "post-inference"`, `schema: 3`.
+    /// * `meta` — `tick: None`, `snapshotKind: "post-inference"`, `schema: 4`.
     pub fn build_payload(&self, name: impl Into<String>) -> SnapshotPayload {
         let source = SourceInfo {
             name: name.into(),
@@ -392,19 +397,15 @@ impl Snapshot<'_> {
             .collect();
 
         // Build the pipeline stages (upstream → downstream) from the bundled
-        // stage projections — each ships its own IR tree + span index.
+        // stage projections — each ships its own IR tree.
         let stages = self
             .stages()
             .iter()
-            .map(|stage| {
-                let (ir, span_index) = build_stage_ir_and_index(stage.ir, &stage.projection);
-                StageEntry {
-                    id: stage.id,
-                    label: stage.label,
-                    kind: stage.kind,
-                    ir,
-                    span_index,
-                }
+            .map(|stage| StageEntry {
+                id: stage.id,
+                label: stage.label,
+                kind: stage.kind,
+                ir: build_stage_ir(stage.ir, &stage.projection),
             })
             .collect();
 
@@ -439,7 +440,9 @@ impl Snapshot<'_> {
                 schema: SCHEMA_VERSION,
             },
             stages,
-            pane_links,
+            // The live wire always ships the links; fixture slimming may elide
+            // them afterwards via `prune_for_fixture`.
+            pane_links: Some(pane_links),
         }
     }
 }
@@ -478,7 +481,76 @@ impl SnapshotPayload {
                 schema: SCHEMA_VERSION,
             },
             stages: Vec::new(),
-            pane_links: Vec::new(),
+            // Degraded ships an empty (but present) array — the frontend reads
+            // it unconditionally; only fixture slimming ever omits the field.
+            pane_links: Some(Vec::new()),
+        }
+    }
+}
+
+/// Fixture-only payload slimming: which panes a golden dump retains and whether
+/// it ships `paneLinks`.
+///
+/// This exists **solely** for the `--dump-snapshot` fixture path (driven by
+/// `cambra-inspector/scripts/fixtures.manifest`). The live server and the
+/// default `--dump-snapshot` always emit the full wire ([`FixtureRetention::FULL`]).
+/// Slimming trims what the byte-exact golden corpus pins on the big, volatile
+/// programs (paneLinks are ~4 lines/edge with super-linear growth in the
+/// collapsed desugar window; stages are the bulk of the bytes) without touching
+/// the live contract — see [`SnapshotPayload::prune_for_fixture`].
+#[derive(Clone, Debug)]
+pub struct FixtureRetention {
+    /// Stage ids to retain (in the payload's existing pipeline order), or `None`
+    /// to keep every stage.
+    pub panes: Option<Vec<String>>,
+    /// Whether to ship `paneLinks`. `false` omits the field entirely (the
+    /// fixture validator alone accepts an absent `paneLinks`).
+    pub links: bool,
+}
+
+impl FixtureRetention {
+    /// The full wire: every pane, links shipped. The live default.
+    pub const FULL: FixtureRetention = FixtureRetention {
+        panes: None,
+        links: true,
+    };
+
+    /// Is this the full wire (no pruning)? A fast path so `prune_for_fixture`
+    /// (and its callers) can skip work on the common live/default dump.
+    pub fn is_full(&self) -> bool {
+        self.panes.is_none() && self.links
+    }
+}
+
+impl Default for FixtureRetention {
+    fn default() -> Self {
+        FixtureRetention::FULL
+    }
+}
+
+impl SnapshotPayload {
+    /// Slim a freshly-built payload for the committed golden corpus, per a
+    /// [`FixtureRetention`] spec. **Fixture path only** — never applied to a
+    /// live/served payload.
+    ///
+    /// * `panes = Some(keep)` retains only the listed stages (preserving the
+    ///   payload's pipeline order) and drops any `paneLinks` window that
+    ///   references a dropped pane (so the slimmed payload still validates).
+    /// * `links = false` omits `paneLinks` entirely (the field, not an empty
+    ///   array — an empty array would lie that the wire carries no edges).
+    pub fn prune_for_fixture(&mut self, retention: &FixtureRetention) {
+        if retention.is_full() {
+            return;
+        }
+        if let Some(keep) = &retention.panes {
+            self.stages.retain(|s| keep.iter().any(|k| k == s.id));
+            if let Some(links) = &mut self.pane_links {
+                links
+                    .retain(|l| keep.iter().any(|k| k == l.from) && keep.iter().any(|k| k == l.to));
+            }
+        }
+        if !retention.links {
+            self.pane_links = None;
         }
     }
 }

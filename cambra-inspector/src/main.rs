@@ -5,13 +5,23 @@
 //! ```text
 //! cambra-inspector <program.chl> [--port N]
 //! cambra-inspector <program.chl> --dump-snapshot   # print /api/snapshot and exit
+//! cambra-inspector <program.chl> --dump-snapshot [--panes a,b] [--elide-pane-links]
 //! ```
 //! With no file argument, serves a tiny built-in demo program so the server is
 //! immediately curl-able. `--dump-snapshot` is a one-shot that prints the
 //! snapshot JSON and exits (used to regenerate the frontend's golden fixtures
 //! without the never-exiting server).
+//!
+//! The two fixture-slimming flags apply **only** with `--dump-snapshot` and only
+//! shape the committed golden corpus (driven by
+//! `cambra-inspector/scripts/fixtures.manifest`); the live server always emits
+//! the full wire:
+//! * `--panes <comma-list>` — retain only these pipeline stages (default: all).
+//! * `--elide-pane-links` — omit `paneLinks` from the payload (default: keep).
 
 use std::process::ExitCode;
+
+use cambra::inspector_model::FixtureRetention;
 
 /// The fallback program served when no file argument is given — just enough to
 /// exercise the snapshot endpoint.
@@ -33,6 +43,9 @@ fn run() -> Result<(), String> {
     let mut path: Option<String> = None;
     let mut port = DEFAULT_PORT;
     let mut dump_snapshot = false;
+    // Fixture-slimming flags (dump-only): retained panes and paneLinks elision.
+    let mut panes: Option<Vec<String>> = None;
+    let mut elide_pane_links = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -42,8 +55,15 @@ fn run() -> Result<(), String> {
                 port = val.parse().map_err(|_| format!("invalid port: {val}"))?;
             }
             "--dump-snapshot" => dump_snapshot = true,
+            "--panes" => {
+                let val = args.next().ok_or("--panes requires a comma-list")?;
+                panes = Some(val.split(',').map(str::to_string).collect());
+            }
+            "--elide-pane-links" => elide_pane_links = true,
             "-h" | "--help" => {
-                println!("usage: cambra-inspector <program.chl> [--port N | --dump-snapshot]");
+                println!(
+                    "usage: cambra-inspector <program.chl> [--port N | --dump-snapshot [--panes a,b] [--elide-pane-links]]"
+                );
                 return Ok(());
             }
             other if other.starts_with("--") => {
@@ -67,11 +87,19 @@ fn run() -> Result<(), String> {
     };
 
     if dump_snapshot {
+        let retention = FixtureRetention {
+            panes,
+            links: !elide_pane_links,
+        };
         println!(
             "{}",
-            cambra_inspector::server::snapshot_body_pretty(&code, &name)
+            cambra_inspector::server::snapshot_body_pretty(&code, &name, &retention)
         );
         return Ok(());
+    }
+
+    if panes.is_some() || elide_pane_links {
+        return Err("--panes/--elide-pane-links are only valid with --dump-snapshot".to_string());
     }
 
     cambra_inspector::server::serve(&code, &name, port).map_err(|e| format!("serving: {e}"))

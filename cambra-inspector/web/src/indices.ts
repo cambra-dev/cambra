@@ -31,6 +31,29 @@ function spanContains(start: number, end: number, off: number): boolean {
   return start <= off && off < end;
 }
 
+// Rebuild the span→node index from a stage's IR tree.
+//
+// Schema 4 stopped shipping the per-stage `spanIndex` on the wire: it was pure
+// derived data — a pre-order walk emitting one `{span, nodeId}` per node origin
+// span — and every wire node already carries its origin span inline on `node.span`.
+// Shipping it churned the byte-exact fixture corpus with no information the
+// client could not reconstruct. This mirrors Rust's `SpanIndex::build`
+// (`src/inspector_model/index.rs`): a pre-order walk emitting one entry per node
+// that has a span. (Rust's index can carry several origin spans for a single
+// fan-in node; the wire only ever carried each node's *primary* — narrowest —
+// span, so the rebuilt index indexes each node under that one span, exactly what
+// the wire could express. `depth` is not stored here — the spatial queries
+// recover it from `depthById`.)
+export function buildSpanIndex(ir: InspectNode | null): SpanIndexEntry[] {
+  const out: SpanIndexEntry[] = [];
+  const walk = (node: InspectNode): void => {
+    if (node.span !== null) out.push({ span: node.span, nodeId: node.nodeId });
+    for (const edge of node.children) walk(edge.node);
+  };
+  if (ir) walk(ir);
+  return out;
+}
+
 export function buildIndices(
   ir: InspectNode | null,
   spanIndex: SpanIndexEntry[],

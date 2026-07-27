@@ -348,7 +348,7 @@ impl<'a> Snapshot<'a> {
     /// The whole anchor IR tree as an [`InspectNode`], rooted at the snapshot
     /// root. Descends the full tree (ships everything), reusing
     /// [`expand_node`](Self::expand_node) at the tree's height. Test-only: the
-    /// payload now ships per-stage trees (`build_stage_ir_and_index`), not a
+    /// payload now ships per-stage trees (`build_stage_ir`), not a
     /// single top-level `ir`; the span↔CCL coverage tests still walk it.
     #[cfg(test)]
     pub(super) fn expand_root(&self) -> InspectNode {

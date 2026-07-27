@@ -1,10 +1,31 @@
-# The golden-fixture corpus: `<fixture-basename> <example-basename>` per line.
+# The golden-fixture corpus, one row per line:
+#   <fixture-basename> <example-basename> [panes=<comma-list>|all] [links=all|none]
 #
 # Single source of truth for which example programs have committed snapshot
 # fixtures (web/src/__fixtures__/<fixture>.snapshot.json). Read by BOTH
 # regen-fixtures.sh (the regen/fix path and the ci.sh drift gate) and the cargo
 # golden tests (cambra-inspector/tests/goldens.rs), so the two can never
 # disagree about the corpus. Keep it bounded — every entry adds regen churn.
+#
+# Retention spec (optional, default `panes=all links=all` = full wire):
+#   panes=a,b   retain only these pipeline stages (subset, in pipeline order)
+#   links=none  elide `paneLinks` from the committed fixture (the field is
+#               OMITTED, never an empty array — an empty array would lie that
+#               the live wire ships no edges)
+# Slimming trims what the byte-exact corpus pins on the big, volatile programs:
+# `paneLinks` is ~4 lines/edge and grows super-linearly in the collapsed desugar
+# window (813 edges over 39×77 nodes in txn_multi_read), and stages are ~73% of
+# that fixture's bytes. It never changes the LIVE wire — `--dump-snapshot`
+# without flags, and the served payload, stay full. goldens.rs applies the SAME
+# per-row flags to its fresh dumps (so committed == fresh stays exact) and adds
+# structural link/pane assertions over a FULL dump to keep the bug-catching that
+# the pinned bytes used to provide.
+#
+# KEEP FULL (do not slim): list_min and arithmetic are the end-to-end canaries
+# that pin the whole wire (all panes + all links) so at least one small fixture
+# always exercises the complete payload byte-for-byte. The web vitest suite also
+# imports arithmetic/polymorphic/udf_fanout/list_min/failed and walks their
+# stage trees + paneLinks, so those must remain full-wire.
 arithmetic arithmetic
 polymorphic polymorphic
 list_min list_min
@@ -14,8 +35,11 @@ failed type_error
 # inline fan-out (RT-3): Derived(Inline) copies + window-2 stageLinks edges.
 udf_fanout udf_fanout
 # transactional store read at 2 sites per block (RT-4a subst_env freshening).
-txn_multi_read txn_multi_read
+# Slimmed: the largest fixture (heavy desugar synthesis); pins only the panes it
+# uniquely exercises. goldens.rs asserts its dense window structurally.
+txn_multi_read txn_multi_read panes=post-inference,post-desugar links=none
 # loop accumulator read at 2 sites (RT-4 letrec subst_env/scaffolding).
-mutation_loop mutation_loop
+# Slimmed for the same reason as txn_multi_read.
+mutation_loop mutation_loop panes=post-inference,post-desugar links=none
 # UDF-of-defer: try_lift_defer fires, lifted feed head keeps its id (RT-5).
 defer_lift defer_lift

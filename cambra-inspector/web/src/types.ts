@@ -93,8 +93,10 @@ export interface Meta {
 }
 
 // One ordered pipeline stage (upstream -> downstream). Each stage carries its
-// own self-contained IR tree and span index; it resolves against its own
-// (Expr, ProvenanceTable) projection on the backend (B2/B4).
+// own self-contained IR tree; it resolves against its own (Expr,
+// ProvenanceTable) projection on the backend (B2/B4). Schema 4 no longer ships
+// a span index — the frontend rebuilds it from `ir` (see `buildSpanIndex` in
+// indices.ts).
 export interface StageEntry {
   id: string;
   label: string;
@@ -102,7 +104,6 @@ export interface StageEntry {
   // typed tree — post-inference and post-desugar both).
   kind: string;
   ir: InspectNode | null;
-  spanIndex: SpanIndexEntry[];
 }
 
 // The dense node->node links between two adjacent stages — each adjacent pane
@@ -117,9 +118,12 @@ export interface PaneLink {
   edges: [number, number][];
 }
 
-// Schema 3: the multi-pane payload drives entirely off `stages`/`paneLinks`
-// (the schema-1 top-level `ir`/`spanIndex` aliases are gone). Both arrays are
-// always present — empty on the degraded (failed-compile) payload.
+// Schema 4: the multi-pane payload drives entirely off `stages`/`paneLinks`
+// (the schema-1 top-level `ir`/`spanIndex` aliases are gone; schema 4 also
+// dropped the per-stage `spanIndex`, rebuilt client-side). On a LIVE payload
+// both arrays are always present — empty on the degraded (failed-compile)
+// payload. A slimmed golden fixture may retain a pane subset and omit
+// `paneLinks` entirely; such fixtures are never fed to `Store`.
 export interface Snapshot {
   source: Source;
   definitions: Definition[];

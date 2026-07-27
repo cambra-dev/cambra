@@ -39,7 +39,9 @@
 use std::io;
 
 use cambra::ccl::context::{GlobalContext, compile_program};
-use cambra::inspector_model::{Diagnostic, SnapshotPayload, diagnostics_from_compile_errors};
+use cambra::inspector_model::{
+    Diagnostic, FixtureRetention, SnapshotPayload, diagnostics_from_compile_errors,
+};
 use cambra::interpreter::Consumer;
 
 use crate::{snapshot_json, snapshot_json_pretty};
@@ -99,9 +101,15 @@ fn degraded_snapshot_json(name: &str, code: &str, diagnostics: Vec<Diagnostic>) 
         .expect("degraded snapshot payload serializes")
 }
 
-fn degraded_snapshot_json_pretty(name: &str, code: &str, diagnostics: Vec<Diagnostic>) -> String {
-    serde_json::to_string_pretty(&SnapshotPayload::degraded(name, code, diagnostics))
-        .expect("degraded snapshot payload serializes")
+fn degraded_snapshot_json_pretty(
+    name: &str,
+    code: &str,
+    diagnostics: Vec<Diagnostic>,
+    retention: &FixtureRetention,
+) -> String {
+    let mut payload = SnapshotPayload::degraded(name, code, diagnostics);
+    payload.prune_for_fixture(retention);
+    serde_json::to_string_pretty(&payload).expect("degraded snapshot payload serializes")
 }
 
 /// Compile `code` once and return the `/api/snapshot` body — the full payload
@@ -123,14 +131,21 @@ pub fn snapshot_body(code: &str, name: &str) -> String {
 /// therefore the exact bytes of the committed golden fixtures (see
 /// [`crate::snapshot_json_pretty`] for why the binary owns this format).
 /// The HTTP route keeps the compact form.
-pub fn snapshot_body_pretty(code: &str, name: &str) -> String {
+///
+/// `retention` slims the committed fixture on the big/volatile corpus programs
+/// (pane subset and/or elided `paneLinks`). Pass [`FixtureRetention::FULL`] for
+/// the whole wire — the default `--dump-snapshot` and every live path do.
+pub fn snapshot_body_pretty(code: &str, name: &str, retention: &FixtureRetention) -> String {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     match compile_program(&mut ctx, code, consumer) {
-        Ok(compiled) => snapshot_json_pretty(&compiled, name),
-        Err(errors) => {
-            degraded_snapshot_json_pretty(name, code, diagnostics_from_compile_errors(&errors))
-        }
+        Ok(compiled) => snapshot_json_pretty(&compiled, name, retention),
+        Err(errors) => degraded_snapshot_json_pretty(
+            name,
+            code,
+            diagnostics_from_compile_errors(&errors),
+            retention,
+        ),
     }
 }
 
@@ -182,20 +197,21 @@ pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{assert_degraded_snapshot_shape, assert_snapshot_shape};
+    use crate::test_support::{
+        FixtureContext, assert_degraded_snapshot_shape, assert_snapshot_shape,
+    };
     use serde_json::Value;
 
-    /// A valid program's snapshot body is the full payload: per-stage IR trees +
-    /// populated `spanIndex`, empty `diagnostics`, and
-    /// `meta.snapshotKind: "post-inference"`. Schema 2 retired the top-level
-    /// `ir`/`spanIndex`; the per-stage contract is pinned by
-    /// [`assert_snapshot_shape`].
+    /// A valid program's snapshot body is the full payload: per-stage IR trees,
+    /// empty `diagnostics`, and `meta.snapshotKind: "post-inference"`. Schema 4
+    /// ships no per-stage `spanIndex` (the frontend rebuilds it); the per-stage
+    /// contract is pinned by [`assert_snapshot_shape`].
     #[test]
-    fn snapshot_body_success_has_ir_and_indices() {
+    fn snapshot_body_success_has_ir_trees() {
         let bodies = build_bodies("1 + 2\n", "prog.chl");
         let v: Value = serde_json::from_str(&bodies.snapshot).expect("valid JSON");
 
-        assert_snapshot_shape(&v);
+        assert_snapshot_shape(&v, FixtureContext::Live);
         let anchor = v["stages"]
             .as_array()
             .expect("stages is an array")
@@ -207,8 +223,8 @@ mod tests {
             "the post-inference stage carries an ir tree"
         );
         assert!(
-            !anchor["spanIndex"].as_array().expect("array").is_empty(),
-            "the post-inference stage spanIndex is populated"
+            anchor.get("spanIndex").is_none(),
+            "schema 4 ships no per-stage spanIndex"
         );
         assert_eq!(v["meta"]["snapshotKind"], "post-inference");
         assert!(
@@ -235,7 +251,7 @@ mod tests {
         assert!(v["scopes"].as_array().expect("array").is_empty());
         assert_eq!(v["meta"]["snapshotKind"], "failed");
         assert!(v["meta"]["tick"].is_null());
-        assert_eq!(v["meta"]["schema"], 3);
+        assert_eq!(v["meta"]["schema"], 4);
 
         // source preserved.
         assert_eq!(v["source"]["name"], "bad.chl");

@@ -27,7 +27,9 @@ describe("validateSnapshot: real fixtures", () => {
     ["defer_lift", deferLiftJson],
   ] as const) {
     it(`${name} validates and round-trips identity`, () => {
-      const snap = validateSnapshot(json);
+      // Real fixtures may be slimmed (txn_multi_read / mutation_loop), so
+      // validate under the fixture-slimming relaxation the loader uses.
+      const snap = validateSnapshot(json, { fixtureSlimming: true });
       expect(snap).toBe(json);
       expect(snap.meta.schema).toBe(SCHEMA_VERSION);
     });
@@ -78,7 +80,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
       { id: "pre-inference", label: "IR (PRE-INFERENCE)", kind: "holes" },
       { id: "post-inference", label: "IR (POST-INFERENCE)", kind: "typed" },
       { id: "post-desugar", label: "IR (POST-DESUGAR)", kind: "typed" },
-    ].map((s) => ({ ...s, ir: minimalNode(), spanIndex: [] })),
+    ].map((s) => ({ ...s, ir: minimalNode() })),
     paneLinks: [
       { from: "pre-inference", to: "post-inference", edges: [] },
       { from: "post-inference", to: "post-desugar", edges: [] },
@@ -96,8 +98,8 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     expect(() => validateSnapshot(missing)).toThrow(/meta\.schema/);
 
     const stale = minimalDegraded();
-    (stale.meta as Record<string, unknown>).schema = 2;
-    expect(() => validateSnapshot(stale)).toThrow(/meta\.schema.*exactly 3/);
+    (stale.meta as Record<string, unknown>).schema = 3;
+    expect(() => validateSnapshot(stale)).toThrow(/meta\.schema.*exactly 4/);
   });
 
   it("throws on the retired schema-1 top-level ir / spanIndex", () => {
@@ -110,6 +112,28 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     expect(() => validateSnapshot(withIndex)).toThrow(/snapshot\.spanIndex.*absent/);
   });
 
+  it("throws on a per-stage spanIndex (schema 4 rebuilds it client-side)", () => {
+    const bad = minimalSuccess();
+    (bad.stages as Record<string, unknown>[])[0].spanIndex = [];
+    expect(() => validateSnapshot(bad)).toThrow(/stages\[0\]\.spanIndex.*absent/);
+  });
+
+  it("throws when a live (non-slimming) payload omits paneLinks", () => {
+    const bad = minimalSuccess();
+    delete bad.paneLinks;
+    expect(() => validateSnapshot(bad)).toThrow(/paneLinks.*present/);
+  });
+
+  it("accepts a slimmed fixture: a pane subset with paneLinks omitted", () => {
+    const slim = minimalSuccess();
+    // Keep only post-inference + post-desugar, drop paneLinks entirely.
+    slim.stages = (slim.stages as { id: string }[]).filter((s) => s.id !== "pre-inference");
+    delete slim.paneLinks;
+    expect(() => validateSnapshot(slim, { fixtureSlimming: true })).not.toThrow();
+    // The same slimmed payload is rejected on the strict (live) path.
+    expect(() => validateSnapshot(slim)).toThrow(/paneLinks.*present/);
+  });
+
   it("throws when a successful payload's stages deviate from the pinned list", () => {
     const wrongOrder = minimalSuccess();
     (wrongOrder.stages as { id: string }[]).reverse();
@@ -117,7 +141,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
 
     const wrongKind = minimalSuccess();
     (wrongKind.stages as { kind: string }[])[0].kind = "pre-inference"; // the schema-1 value
-    expect(() => validateSnapshot(wrongKind)).toThrow(/stages.*kinds/);
+    expect(() => validateSnapshot(wrongKind)).toThrow(/stages.*kind/);
 
     const wrongWindows = minimalSuccess();
     (wrongWindows.paneLinks as unknown[]).pop();

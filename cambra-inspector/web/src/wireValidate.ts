@@ -1,4 +1,4 @@
-// Runtime validator for the `/api/snapshot` wire shape (schema 3).
+// Runtime validator for the `/api/snapshot` wire shape (schema 4).
 //
 // The fixtures (and, in production, the fetched payload) are untyped JSON. A
 // bare `json as Snapshot` cast gives zero runtime checking, so a backend wire
@@ -9,22 +9,22 @@
 //
 // This is the TS twin of the Rust `assert_snapshot_shape`
 // (`cambra-inspector/src/lib.rs`) — the two languages pin ONE wire contract:
-// schema exactly 3; a successful payload ships the three pipeline stages in
-// order with their kinds and the two adjacent paneLinks windows (dense —
-// self-edges legal, every edge endpoint a live node id in its pane); a degraded
+// schema exactly 4; a successful payload ships the three pipeline stages in
+// order with their kinds (no per-stage `spanIndex` — schema 4 rebuilds it
+// client-side) and the two adjacent paneLinks windows (dense — self-edges
+// legal, every edge endpoint a live node id in its pane); a degraded
 // (`snapshotKind: "failed"`) payload ships empty stages/paneLinks; and every
 // node's `rewritten` tag stays inside the pinned vocabulary. Extend both
 // validators together.
+//
+// The `fixtureSlimming` option (mirroring Rust's `FixtureContext::Fixture`)
+// relaxes the contract for a committed golden fixture ONLY: panes may be a
+// non-empty ordered subset and `paneLinks` may be omitted entirely (elided for
+// slimming). It never loosens the live path — production callers pass no options
+// and get the full contract, so a live payload that drops a pane or paneLinks
+// still fails.
 
-import type {
-  InspectEdge,
-  InspectNode,
-  PaneLink,
-  Snapshot,
-  Span,
-  SpanIndexEntry,
-  StageEntry,
-} from "./types";
+import type { InspectEdge, InspectNode, PaneLink, Snapshot, Span, StageEntry } from "./types";
 
 class WireError extends Error {
   constructor(path: string, expected: string, got: unknown) {
@@ -34,10 +34,22 @@ class WireError extends Error {
 }
 
 /** The wire-format version this frontend speaks (`meta.schema`). */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
-// The stage contract of a successful schema-3 payload (mirrors the Rust
-// assert_snapshot_shape constants).
+/** Options for {@link validateSnapshot}. */
+export interface ValidateOptions {
+  /**
+   * Validate a committed golden fixture, which may be slimmed: a non-empty
+   * ordered pane subset, and `paneLinks` omitted entirely (elided for the
+   * fixture corpus). NEVER pass this for a live payload — the live wire always
+   * ships every pane and its links, and slimming only relaxes the fixture path.
+   */
+  fixtureSlimming?: boolean;
+}
+
+// The stage contract of a successful live payload (mirrors the Rust
+// assert_snapshot_shape constants). A slimmed fixture may retain an ordered
+// subset of the stages / windows.
 const STAGE_IDS = ["pre-inference", "post-inference", "post-desugar"] as const;
 const STAGE_KINDS = ["holes", "typed", "typed"] as const;
 const STAGE_WINDOWS = [
@@ -135,23 +147,18 @@ function validateNodeOrNull(v: unknown, path: string): InspectNode | null {
   return validateNode(v, path);
 }
 
-function validateSpanIndex(v: unknown, path: string): SpanIndexEntry[] {
-  const entries = arr(v, path);
-  entries.forEach((e, i) => {
-    const o = obj(e, `${path}[${i}]`);
-    validateSpan(o.span, `${path}[${i}].span`);
-    num(o.nodeId, `${path}[${i}].nodeId`);
-  });
-  return v as SpanIndexEntry[];
-}
-
 function validateStage(v: unknown, path: string): StageEntry {
   const o = obj(v, path);
   str(o.id, `${path}.id`);
   str(o.label, `${path}.label`);
   str(o.kind, `${path}.kind`);
   validateNodeOrNull(o.ir, `${path}.ir`);
-  validateSpanIndex(o.spanIndex, `${path}.spanIndex`);
+  // Schema 4 dropped the per-stage span index (rebuilt client-side from `ir`).
+  // Its *absence* is part of the contract — a payload still shipping it is not
+  // the schema this frontend speaks.
+  if (o.spanIndex !== undefined) {
+    throw new WireError(`${path}.spanIndex`, "absent (schema 4 rebuilds it client-side)", o.spanIndex);
+  }
   return v as StageEntry;
 }
 
@@ -201,12 +208,28 @@ function collectNodeIds(node: InspectNode | null, out: Set<number>): void {
   for (const c of node.children) collectNodeIds(c.node, out);
 }
 
+/** Is `sub` a subsequence of `full` (same relative order, gaps allowed)? */
+function isOrderedSubsequence<T>(sub: T[], full: readonly T[], eq: (a: T, b: T) => boolean): boolean {
+  let i = 0;
+  for (const x of sub) {
+    while (i < full.length && !eq(x, full[i])) i++;
+    if (i === full.length) return false;
+    i++;
+  }
+  return true;
+}
+
 /**
  * Validate an untyped JSON value against the Snapshot wire shape. Throws an
  * Error naming the failing path on the first missing/mistyped required field;
  * returns the value typed as `Snapshot` on success.
+ *
+ * Pass `{ fixtureSlimming: true }` ONLY when validating a committed golden
+ * fixture (see {@link ValidateOptions}); production callers omit it and get the
+ * strict live contract.
  */
-export function validateSnapshot(json: unknown): Snapshot {
+export function validateSnapshot(json: unknown, options: ValidateOptions = {}): Snapshot {
+  const slimming = options.fixtureSlimming === true;
   const o = obj(json, "");
 
   const source = obj(o.source, "source");
@@ -267,9 +290,19 @@ export function validateSnapshot(json: unknown): Snapshot {
   }
 
   const stages = arr(o.stages, "stages").map((s, i) => validateStage(s, `stages[${i}]`));
-  const paneLinks = arr(o.paneLinks, "paneLinks").map((l, i) =>
-    validatePaneLink(l, `paneLinks[${i}]`),
-  );
+  // A slimmed fixture may OMIT paneLinks entirely (elided). Absent is accepted
+  // only under fixtureSlimming; the live wire always ships the (possibly empty)
+  // array.
+  const paneLinksRaw = o.paneLinks;
+  if (paneLinksRaw === undefined) {
+    if (!slimming) {
+      throw new WireError("paneLinks", "present (the live wire always ships it)", paneLinksRaw);
+    }
+  }
+  const paneLinks: PaneLink[] =
+    paneLinksRaw === undefined
+      ? []
+      : arr(paneLinksRaw, "paneLinks").map((l, i) => validatePaneLink(l, `paneLinks[${i}]`));
 
   if (snapshotKind === "failed") {
     // Degraded payload: source + diagnostics only, no pipeline stages.
@@ -280,24 +313,46 @@ export function validateSnapshot(json: unknown): Snapshot {
       throw new WireError("paneLinks", "empty on a degraded payload", o.paneLinks);
     }
   } else {
-    // Successful payload: exactly the three pipeline stages in order, with
-    // their kinds, and the two adjacent paneLinks windows.
+    // Successful payload. Live: exactly the three pipeline stages in order with
+    // their kinds, and the two adjacent paneLinks windows. Fixture slimming:
+    // panes may be a non-empty ordered subset and paneLinks a subset (or absent).
     const ids = stages.map((s) => s.id);
-    if (ids.length !== STAGE_IDS.length || ids.some((id, i) => id !== STAGE_IDS[i])) {
-      throw new WireError("stages", `ids [${STAGE_IDS.join(", ")}] in order`, ids);
+    const idsOk = slimming
+      ? ids.length > 0 && isOrderedSubsequence(ids, STAGE_IDS, (a, b) => a === b)
+      : ids.length === STAGE_IDS.length && ids.every((id, i) => id === STAGE_IDS[i]);
+    if (!idsOk) {
+      throw new WireError(
+        "stages",
+        slimming
+          ? `a non-empty subset of [${STAGE_IDS.join(", ")}] in order`
+          : `ids [${STAGE_IDS.join(", ")}] in order`,
+        ids,
+      );
     }
-    const kinds = stages.map((s) => s.kind);
-    if (kinds.some((k, i) => k !== STAGE_KINDS[i])) {
-      throw new WireError("stages", `kinds [${STAGE_KINDS.join(", ")}]`, kinds);
-    }
-    const windows = paneLinks.map((l) => [l.from, l.to]);
-    if (
-      windows.length !== STAGE_WINDOWS.length ||
-      windows.some(([f, t], i) => f !== STAGE_WINDOWS[i][0] || t !== STAGE_WINDOWS[i][1])
-    ) {
+    // Each retained stage carries the kind its id mandates (subset-safe).
+    const kindById = new Map<string, string>(STAGE_IDS.map((id, i) => [id, STAGE_KINDS[i]]));
+    stages.forEach((s) => {
+      if (s.kind !== kindById.get(s.id)) {
+        throw new WireError(`stages (${s.id}).kind`, `${kindById.get(s.id)}`, s.kind);
+      }
+    });
+    const windows: string[][] = paneLinks.map((l) => [l.from, l.to]);
+    const eqWin = (a: readonly string[], b: readonly string[]): boolean =>
+      a[0] === b[0] && a[1] === b[1];
+    const windowsOk = slimming
+      ? isOrderedSubsequence<readonly string[]>(
+          windows,
+          STAGE_WINDOWS as readonly (readonly string[])[],
+          eqWin,
+        )
+      : windows.length === STAGE_WINDOWS.length &&
+        windows.every(([f, t], i) => f === STAGE_WINDOWS[i][0] && t === STAGE_WINDOWS[i][1]);
+    if (!windowsOk) {
       throw new WireError(
         "paneLinks",
-        `the windows ${STAGE_WINDOWS.map(([f, t]) => `${f}>${t}`).join(", ")} in order`,
+        `the windows ${STAGE_WINDOWS.map(([f, t]) => `${f}>${t}`).join(", ")}${
+          slimming ? " (subset, in order)" : " in order"
+        }`,
         windows,
       );
     }

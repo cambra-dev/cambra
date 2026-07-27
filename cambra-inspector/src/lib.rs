@@ -21,7 +21,7 @@
 pub mod server;
 
 use cambra::ccl::context::{CompiledProgram, GlobalContext, compile_program};
-use cambra::inspector_model::{Snapshot, diagnostics_from_compile_errors};
+use cambra::inspector_model::{FixtureRetention, Snapshot, diagnostics_from_compile_errors};
 use cambra::interpreter::Consumer;
 
 /// Build the `/api/snapshot` payload for a compiled program and serialize it to
@@ -49,9 +49,21 @@ pub fn snapshot_json(compiled: &CompiledProgram, name: &str) -> String {
 /// colorizes under `FORCE_COLOR` — either silently rewrites the whole corpus).
 /// Serializes the typed payload directly — never round-trip through
 /// `serde_json::Value`, which would reorder keys.
-pub fn snapshot_json_pretty(compiled: &CompiledProgram, name: &str) -> String {
+///
+/// `retention` slims the committed fixture on the big/volatile corpus programs
+/// (a pane subset and/or elided `paneLinks`, per
+/// `cambra-inspector/scripts/fixtures.manifest`). The live server never calls
+/// this with anything but [`FixtureRetention::FULL`] — the pruning is a fixture
+/// concern, applied *after* building the full payload so the build path stays
+/// single.
+pub fn snapshot_json_pretty(
+    compiled: &CompiledProgram,
+    name: &str,
+    retention: &FixtureRetention,
+) -> String {
     let snapshot = Snapshot::new(compiled);
-    let payload = snapshot.build_payload(name);
+    let mut payload = snapshot.build_payload(name);
+    payload.prune_for_fixture(retention);
     serde_json::to_string_pretty(&payload).expect("snapshot payload serializes")
 }
 
@@ -79,22 +91,41 @@ pub fn diagnose_json(ctx: &mut GlobalContext, code: &str, _name: &str) -> String
 
 /// Shared test helpers: structural validators for the `/api/snapshot` wire
 /// shape — the Rust mirror of the frontend's `validateSnapshot`
-/// (`web/src/wireValidate.ts`). Asserting the schema-3 contract in one place
+/// (`web/src/wireValidate.ts`). Asserting the schema-4 contract in one place
 /// lets both the lib and `server` test modules reuse it (the cross-language
 /// twin of the TS validator, since the two cannot literally share code).
+///
+/// The validator is parameterized by a [`FixtureContext`]: the **live** contract
+/// (all three panes, `paneLinks` present) is the default; the **fixture** context
+/// additionally accepts a slimmed golden dump (a non-empty ordered pane subset,
+/// and an absent `paneLinks` meaning "elided for fixture slimming"). Slimming
+/// only ever relaxes the fixture path — the live wire contract is unchanged.
 #[cfg(test)]
 pub(crate) mod test_support {
     use serde_json::Value;
 
+    /// Which contract a payload is validated against — see the module doc. The
+    /// live wire always ships the full pipeline; a fixture dump may be slimmed.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    pub(crate) enum FixtureContext {
+        /// A live/served payload: all panes, `paneLinks` present.
+        Live,
+        /// A committed golden fixture: panes may be an ordered subset and
+        /// `paneLinks` may be omitted (elided for slimming).
+        Fixture,
+    }
+
     /// The three pipeline stage ids, in upstream → downstream order — the exact
-    /// stage list a schema-3 successful payload ships.
+    /// stage list a live successful payload ships (a slimmed fixture may retain
+    /// an ordered subset).
     const STAGE_IDS: [&str; 3] = ["pre-inference", "post-inference", "post-desugar"];
     /// The per-stage `kind` discriminants, aligned with [`STAGE_IDS`]: the
     /// pre-inference tree is hole-typed (`"holes"`); the post-inference and
     /// post-desugar trees are both fully typed (`"typed"`).
     const STAGE_KINDS: [&str; 3] = ["holes", "typed", "typed"];
     /// The adjacent stage windows, in order — the exact `paneLinks` from/to
-    /// pairs a schema-3 successful payload ships.
+    /// pairs a live successful payload ships (a slimmed fixture may retain an
+    /// ordered subset, or omit `paneLinks` entirely).
     const STAGE_WINDOWS: [(&str, &str); 2] = [
         ("pre-inference", "post-inference"),
         ("post-inference", "post-desugar"),
@@ -120,60 +151,94 @@ pub(crate) mod test_support {
         }
     }
 
+    /// The `kind` a given stage id must carry (aligned with [`STAGE_IDS`]).
+    fn kind_for(id: &str) -> &'static str {
+        let i = STAGE_IDS
+            .iter()
+            .position(|s| *s == id)
+            .unwrap_or_else(|| panic!("unknown stage id {id:?}"));
+        STAGE_KINDS[i]
+    }
+
     /// Assert `v` is a structurally-valid **successful** `/api/snapshot` payload
-    /// (schema 3). Pins the full stage contract: schema 3, the retired top-level
-    /// `ir`/`spanIndex` absent, the three pipeline stages in order with their
-    /// kinds, each stage's `spanIndex` non-empty, the two windowed `paneLinks`
-    /// with matching from/to ids and every edge endpoint a live node id in its
-    /// respective pane (self-edges legal), and every node's `rewritten` tag in
-    /// the observed vocabulary. Panics naming the offending path otherwise. Does
-    /// not assert program-specific content — that is each caller's job.
-    pub(crate) fn assert_snapshot_shape(v: &Value) {
+    /// (schema 4) under `ctx`. Pins: schema 4, the retired top-level
+    /// `ir`/`spanIndex` absent, per-stage `spanIndex` absent (schema 4 no longer
+    /// ships it — the client rebuilds the index from the tree), the pipeline
+    /// stages in order with their kinds, the windowed `paneLinks` with matching
+    /// from/to ids and every edge endpoint a live node id in its respective pane
+    /// (self-edges legal), and every node's `rewritten` tag in the observed
+    /// vocabulary. Panics naming the offending path otherwise. Does not assert
+    /// program-specific content — that is each caller's job.
+    ///
+    /// [`FixtureContext::Live`] pins the full pipeline (all three panes,
+    /// `paneLinks` present); [`FixtureContext::Fixture`] additionally accepts a
+    /// slimmed golden dump (a non-empty ordered pane subset, and an absent
+    /// `paneLinks` meaning "elided for slimming").
+    pub(crate) fn assert_snapshot_shape(v: &Value, ctx: FixtureContext) {
         assert_common_shape(v);
 
         // Schema 2 retired the legacy top-level `ir`/`spanIndex` (byte-for-byte
         // duplicates of the post-inference stage). They must be *absent*, not
         // merely null — the client reads the stages, never the top level.
-        assert!(v.get("ir").is_none(), "schema 3 has no top-level ir");
+        assert!(v.get("ir").is_none(), "schema 4 has no top-level ir");
         assert!(
             v.get("spanIndex").is_none(),
-            "schema 3 has no top-level spanIndex"
+            "schema 4 has no top-level spanIndex"
         );
 
-        // The three pipeline stages, in pipeline order, with their kinds.
+        // The pipeline stages. Live: exactly the three in order. Fixture: a
+        // non-empty, in-pipeline-order subset (fixture slimming may drop panes).
         let stages = v["stages"].as_array().expect("stages is an array");
         let ids: Vec<&str> = stages
             .iter()
             .map(|s| s["id"].as_str().expect("stage id is a string"))
             .collect();
-        assert_eq!(
-            ids, STAGE_IDS,
-            "stages are the three pipeline stages in upstream → downstream order"
-        );
-        let kinds: Vec<&str> = stages
-            .iter()
-            .map(|s| s["kind"].as_str().expect("stage kind is a string"))
-            .collect();
-        assert_eq!(
-            kinds, STAGE_KINDS,
-            "stage kinds are holes (pre-inference) then typed (the two typed trees)"
-        );
+        match ctx {
+            FixtureContext::Live => assert_eq!(
+                ids, STAGE_IDS,
+                "stages are the three pipeline stages in upstream → downstream order"
+            ),
+            FixtureContext::Fixture => {
+                assert!(!ids.is_empty(), "a slimmed fixture retains ≥1 stage");
+                assert!(
+                    is_ordered_subsequence(&ids, &STAGE_IDS),
+                    "slimmed stages {ids:?} are a non-empty subset of {STAGE_IDS:?} in order"
+                );
+            }
+        }
+        // Each retained stage carries the kind its id mandates (subset-safe).
+        for (i, st) in stages.iter().enumerate() {
+            let id = st["id"].as_str().expect("stage id is a string");
+            let kind = st["kind"].as_str().expect("stage kind is a string");
+            assert_eq!(kind, kind_for(id), "stages[{i}] ({id}) has the wrong kind");
+        }
         for (i, st) in stages.iter().enumerate() {
             let at = format!("stages[{i}]");
             assert!(st["label"].is_string(), "{at}.label is a string");
             assert_inspect_node(&st["ir"], &format!("{at}.ir"));
-            assert_span_index(&st["spanIndex"], &format!("{at}.spanIndex"));
+            // Schema 4: no per-stage span index — the frontend rebuilds it.
             assert!(
-                !st["spanIndex"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("{at}.spanIndex is an array"))
-                    .is_empty(),
-                "{at}.spanIndex is non-empty for a successful compile"
+                st.get("spanIndex").is_none(),
+                "{at}.spanIndex is absent in schema 4 (rebuilt client-side)"
             );
             // Every rewrite tag a stage's tree carries uses the pinned
             // via/nature vocabulary.
             assert_rewrite_shape(&st["ir"], &at);
         }
+
+        // paneLinks. Live: always present. Fixture: may be *absent* (elided for
+        // slimming) — but if present, still validated.
+        let links = match v.get("paneLinks") {
+            None => {
+                assert_eq!(
+                    ctx,
+                    FixtureContext::Fixture,
+                    "paneLinks is absent — only a slimmed fixture may elide it"
+                );
+                return;
+            }
+            Some(l) => l.as_array().expect("paneLinks is an array"),
+        };
 
         // The live node-id set per stage, keyed by stage id, for endpoint-liveness
         // checks on the pane links below.
@@ -186,8 +251,6 @@ pub(crate) mod test_support {
             ids_by_stage.insert(id, set);
         }
 
-        // Exactly the two adjacent windows, in order, with matching from/to ids.
-        let links = v["paneLinks"].as_array().expect("paneLinks is an array");
         let windows: Vec<(&str, &str)> = links
             .iter()
             .map(|l| {
@@ -197,11 +260,17 @@ pub(crate) mod test_support {
                 )
             })
             .collect();
-        assert_eq!(
-            windows,
-            STAGE_WINDOWS.to_vec(),
-            "paneLinks are the two adjacent stage windows in pipeline order"
-        );
+        match ctx {
+            FixtureContext::Live => assert_eq!(
+                windows,
+                STAGE_WINDOWS.to_vec(),
+                "paneLinks are the two adjacent stage windows in pipeline order"
+            ),
+            FixtureContext::Fixture => assert!(
+                is_ordered_subsequence(&windows, &STAGE_WINDOWS),
+                "slimmed paneLinks {windows:?} are a subset of {STAGE_WINDOWS:?} in order"
+            ),
+        }
         for (i, link) in links.iter().enumerate() {
             let at = format!("paneLinks[{i}]");
             let (from, to) = windows[i];
@@ -235,15 +304,24 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Assert `v` is a structurally-valid **degraded** payload (schema 3): the
+    /// Is `sub` a subsequence of `full` (same relative order, gaps allowed)?
+    /// Used to accept a slimmed fixture's pane / window subset.
+    fn is_ordered_subsequence<T: PartialEq>(sub: &[T], full: &[T]) -> bool {
+        let mut it = full.iter();
+        sub.iter().all(|x| it.any(|y| y == x))
+    }
+
+    /// Assert `v` is a structurally-valid **degraded** payload (schema 4): the
     /// retired top-level `ir`/`spanIndex` absent, empty `stages`/`paneLinks`,
-    /// `snapshotKind: "failed"`.
+    /// `snapshotKind: "failed"`. A degraded payload always ships an (empty but
+    /// present) `paneLinks` array — only a slimmed *success* fixture ever omits
+    /// the field.
     pub(crate) fn assert_degraded_snapshot_shape(v: &Value) {
         assert_common_shape(v);
-        assert!(v.get("ir").is_none(), "schema 3 has no top-level ir");
+        assert!(v.get("ir").is_none(), "schema 4 has no top-level ir");
         assert!(
             v.get("spanIndex").is_none(),
-            "schema 3 has no top-level spanIndex"
+            "schema 4 has no top-level spanIndex"
         );
         assert!(
             v["stages"].as_array().expect("array").is_empty(),
@@ -315,17 +393,6 @@ pub(crate) mod test_support {
         }
     }
 
-    fn assert_span_index(v: &Value, at: &str) {
-        let entries = v.as_array().unwrap_or_else(|| panic!("{at} is an array"));
-        for (i, e) in entries.iter().enumerate() {
-            assert!(
-                e["span"]["start"].is_number() && e["span"]["end"].is_number(),
-                "{at}[{i}].span is {{start, end}}"
-            );
-            assert!(e["nodeId"].is_number(), "{at}[{i}].nodeId is a number");
-        }
-    }
-
     /// Recursively assert the `InspectNode` wire shape, including the
     /// first-class `type` field (`string | null`) and `{edge, node}` children.
     fn assert_inspect_node(v: &Value, at: &str) {
@@ -348,9 +415,10 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::assert_snapshot_shape;
+    use super::test_support::{FixtureContext, assert_snapshot_shape};
     use super::*;
     use cambra::ccl::context::{GlobalContext, compile_program};
+    use cambra::inspector_model::FixtureRetention;
     use cambra::interpreter::Consumer;
     use serde_json::Value;
 
@@ -369,12 +437,43 @@ f(1, 2)
         serde_json::from_str(&snapshot_json(&compiled, name)).expect("payload is valid JSON")
     }
 
-    /// The structural wire-shape contract (schema 3) — the Rust twin of the
+    /// The structural wire-shape contract (schema 4) — the Rust twin of the
     /// frontend's `validateSnapshot`. Program-specific facts are asserted by the
     /// focused tests below.
     #[test]
     fn snapshot_json_is_structurally_valid() {
-        assert_snapshot_shape(&snapshot_value(PROG, "prog.chl"));
+        assert_snapshot_shape(&snapshot_value(PROG, "prog.chl"), FixtureContext::Live);
+    }
+
+    /// A slimmed fixture dump — a pane subset with `paneLinks` elided — carries
+    /// no per-stage `spanIndex`, omits `paneLinks`, and validates under the
+    /// fixture context (the live contract would reject the subset). Exercises
+    /// both `prune_for_fixture` and the fixture-context validator relaxation.
+    #[test]
+    fn slimmed_fixture_payload_validates_in_fixture_context() {
+        let mut ctx = GlobalContext::default();
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        let compiled = compile_program(&mut ctx, PROG, consumer).expect("program compiles");
+        let retention = FixtureRetention {
+            panes: Some(vec![
+                "post-inference".to_string(),
+                "post-desugar".to_string(),
+            ]),
+            links: false,
+        };
+        let json = snapshot_json_pretty(&compiled, "prog.chl", &retention);
+        let v: Value = serde_json::from_str(&json).expect("payload is valid JSON");
+        assert_eq!(
+            v["stages"].as_array().expect("stages array").len(),
+            2,
+            "the pane subset retained exactly two stages"
+        );
+        assert!(v.get("paneLinks").is_none(), "elided paneLinks is absent");
+        assert!(
+            v["stages"][0].get("spanIndex").is_none(),
+            "schema 4 ships no per-stage spanIndex"
+        );
+        assert_snapshot_shape(&v, FixtureContext::Fixture);
     }
 
     /// meta seams + source round-trip + empty M1 diagnostics.
@@ -383,7 +482,7 @@ f(1, 2)
         let v = snapshot_value(PROG, "prog.chl");
         assert!(v["meta"]["tick"].is_null(), "meta.tick is null in M1");
         assert_eq!(v["meta"]["snapshotKind"], "post-inference");
-        assert_eq!(v["meta"]["schema"], 3);
+        assert_eq!(v["meta"]["schema"], 4);
         assert_eq!(v["source"]["name"], "prog.chl");
         assert_eq!(
             v["source"]["text"], PROG,
@@ -430,7 +529,8 @@ f(1, 2)
         );
     }
 
-    /// Three stages, ordered upstream → downstream, each with a populated index.
+    /// Three stages, ordered upstream → downstream, each carrying an IR tree and
+    /// no per-stage `spanIndex` (schema 4 rebuilds it client-side).
     #[test]
     fn snapshot_stages_ordered_upstream_to_downstream() {
         let v = snapshot_value(PROG, "prog.chl");
@@ -441,11 +541,12 @@ f(1, 2)
         assert_eq!(stages[2]["id"], "post-desugar");
         for (i, stage) in stages.iter().enumerate() {
             assert!(
-                !stage["spanIndex"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("stages[{i}].spanIndex is an array"))
-                    .is_empty(),
-                "stages[{i}].spanIndex is non-empty"
+                stage["ir"]["nodeId"].is_number(),
+                "stages[{i}].ir carries a tree"
+            );
+            assert!(
+                stage.get("spanIndex").is_none(),
+                "stages[{i}] ships no spanIndex in schema 4"
             );
         }
     }

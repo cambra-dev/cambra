@@ -62,8 +62,8 @@ pub use query::{
     GotoDefinition, Hover, Resolve, ScopeAt, ScopeBinding, Snapshot, Tick, ValueSummary,
 };
 pub use snapshot::{
-    DefinitionEntry, Diagnostic, DiagnosticLabel, Meta, SCHEMA_VERSION, ScopeBindingEntry,
-    ScopeEntry, SnapshotPayload, SourceInfo, SpanEntry, diagnostics_from_compile_errors,
+    DefinitionEntry, Diagnostic, DiagnosticLabel, FixtureRetention, Meta, SCHEMA_VERSION,
+    ScopeBindingEntry, ScopeEntry, SnapshotPayload, SourceInfo, diagnostics_from_compile_errors,
 };
 pub use stage::dense_edges;
 

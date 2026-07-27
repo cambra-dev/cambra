@@ -14,7 +14,10 @@ import { validateSnapshot } from "../wireValidate";
  */
 export function fixture(json: unknown): Snapshot {
   try {
-    return validateSnapshot(json);
+    // These are committed golden fixtures, some slimmed (a pane subset, elided
+    // paneLinks) — so validate under the fixture-slimming relaxation. A live
+    // payload must NOT use this; production code calls validateSnapshot directly.
+    return validateSnapshot(json, { fixtureSlimming: true });
   } catch (e) {
     throw new Error(
       `${String(e)}\n` +

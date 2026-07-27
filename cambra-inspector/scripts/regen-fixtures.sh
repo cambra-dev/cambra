@@ -35,15 +35,32 @@ MANIFEST="cambra-inspector/scripts/fixtures.manifest"
 FIX="${1:-cambra-inspector/web/src/__fixtures__}"
 mkdir -p "${FIX}"
 
-while read -r name example; do
+while read -r name example rest; do
   # Skip blank lines and comments.
   if [[ -z ${name} || ${name} == \#* ]]; then continue; fi
   prog="cambra-inspector/examples/${example}.chl"
   out="${FIX}/${name}.snapshot.json"
-  echo "regen ${out}  <-  ${prog}"
+  # Parse the optional per-row retention spec (`panes=a,b`, `links=none`) into
+  # dump flags. Defaults (`panes=all`, `links=all`) add no flags = full wire.
+  # goldens.rs parses the SAME spec and applies the SAME flags, so the committed
+  # fixture and a fresh dump stay byte-identical.
+  flags=()
+  for tok in ${rest}; do
+    case "${tok}" in
+      panes=all | links=all) ;;
+      panes=*) flags+=(--panes "${tok#panes=}") ;;
+      links=none) flags+=(--elide-pane-links) ;;
+      \#*) break ;; # an inline comment ends the spec
+      *)
+        echo "regen-fixtures.sh: unknown retention token '${tok}' on row '${name}'" >&2
+        exit 1
+        ;;
+    esac
+  done
+  echo "regen ${out}  <-  ${prog} ${flags[*]}"
   # `< /dev/null`: the command must not inherit the loop's stdin, or it eats
   # the rest of the manifest and only the first fixture regenerates.
-  cargo run -q -p cambra-inspector -- "${prog}" --dump-snapshot < /dev/null > "${out}"
+  cargo run -q -p cambra-inspector -- "${prog}" --dump-snapshot "${flags[@]}" < /dev/null > "${out}"
 done < "${MANIFEST}"
 
 echo "done. Review the diff: git diff ${FIX}"

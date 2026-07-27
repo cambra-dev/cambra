@@ -25,10 +25,35 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// One corpus row: the fixture basename and the example-program basename.
+/// One corpus row: the fixture basename, the example-program basename, and the
+/// optional fixture-slimming retention spec (`panes=…`, `links=none`) parsed
+/// from the manifest. The retention is applied to the fresh `--dump-snapshot`
+/// so a fresh dump byte-matches the (slimmed) committed fixture; the LIVE wire
+/// is never slimmed (see `scripts/fixtures.manifest`).
 struct CorpusEntry {
     fixture: String,
     example: String,
+    /// `--panes` comma-list, or `None` for all panes.
+    panes: Option<String>,
+    /// `true` ⇒ pass `--elide-pane-links` (omit `paneLinks` from the fixture).
+    elide_pane_links: bool,
+}
+
+impl CorpusEntry {
+    /// The `--dump-snapshot` flags this row's retention spec implies (empty for
+    /// a full-wire row). Shared by every fresh dump of a slimmed fixture so it
+    /// stays byte-identical to the committed copy.
+    fn dump_flags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+        if let Some(panes) = &self.panes {
+            flags.push("--panes".to_string());
+            flags.push(panes.clone());
+        }
+        if self.elide_pane_links {
+            flags.push("--elide-pane-links".to_string());
+        }
+        flags
+    }
 }
 
 /// The `cambra/` repo root (the parent of this crate's manifest dir) — the
@@ -43,8 +68,10 @@ fn repo_root() -> PathBuf {
 }
 
 /// Parse `scripts/fixtures.manifest` — the corpus's single source of truth,
-/// shared with `regen-fixtures.sh`. Lines are `<fixture> <example>`; `#`
-/// comments and blank lines are skipped.
+/// shared with `regen-fixtures.sh`. Lines are
+/// `<fixture> <example> [panes=<comma-list>|all] [links=all|none]`; `#`
+/// comments and blank lines are skipped. The retention tokens are parsed with
+/// the SAME grammar `regen-fixtures.sh` uses, so the two never disagree.
 fn corpus() -> Vec<CorpusEntry> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures.manifest");
     let text = std::fs::read_to_string(&path)
@@ -59,13 +86,23 @@ fn corpus() -> Vec<CorpusEntry> {
             let example = parts
                 .next()
                 .unwrap_or_else(|| panic!("manifest line {l:?} lacks an example name"));
-            assert!(
-                parts.next().is_none(),
-                "manifest line {l:?} has trailing fields"
-            );
+            let mut panes = None;
+            let mut elide_pane_links = false;
+            for tok in parts {
+                match tok {
+                    "panes=all" | "links=all" => {}
+                    "links=none" => elide_pane_links = true,
+                    _ if tok.starts_with("panes=") => {
+                        panes = Some(tok["panes=".len()..].to_string());
+                    }
+                    _ => panic!("manifest line {l:?} has unknown retention token {tok:?}"),
+                }
+            }
             CorpusEntry {
                 fixture: fixture.to_string(),
                 example: example.to_string(),
+                panes,
+                elide_pane_links,
             }
         })
         .collect();
@@ -73,14 +110,16 @@ fn corpus() -> Vec<CorpusEntry> {
     entries
 }
 
-/// Run `cambra-inspector <example>.chl --dump-snapshot` as a fresh process and
-/// return its raw stdout — exactly what `regen-fixtures.sh` pipes into a
-/// fixture (before pretty-printing).
-fn dump(example: &str) -> Vec<u8> {
+/// Run `cambra-inspector <example>.chl --dump-snapshot [flags]` as a fresh
+/// process and return its raw stdout. With `flags` = the row's retention this is
+/// exactly what `regen-fixtures.sh` pipes into a fixture (before pretty-printing).
+fn dump_with(example: &str, flags: &[String]) -> Vec<u8> {
     let prog = format!("cambra-inspector/examples/{example}.chl");
+    let mut args = vec![prog, "--dump-snapshot".to_string()];
+    args.extend(flags.iter().cloned());
     let output = Command::new(env!("CARGO_BIN_EXE_cambra-inspector"))
         .current_dir(repo_root())
-        .args([prog.as_str(), "--dump-snapshot"])
+        .args(&args)
         .output()
         .expect("the cambra-inspector binary spawns");
     assert!(
@@ -89,6 +128,13 @@ fn dump(example: &str) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
+}
+
+/// A full-wire dump (no slimming flags) — the live payload shape. Used by the
+/// structural assertions, which run against the whole `paneLinks` graph even
+/// when the committed fixture elides it.
+fn dump(example: &str) -> Vec<u8> {
+    dump_with(example, &[])
 }
 
 /// The determinism self-check the golden fixtures depend on: dumping the same
@@ -103,8 +149,9 @@ fn dump(example: &str) -> Vec<u8> {
 #[test]
 fn snapshot_dumps_are_cross_process_deterministic() {
     for entry in corpus() {
-        let first = dump(&entry.example);
-        let second = dump(&entry.example);
+        let flags = entry.dump_flags();
+        let first = dump_with(&entry.example, &flags);
+        let second = dump_with(&entry.example, &flags);
         if first != second {
             // Preserve both dumps for diffing before panicking.
             let dir = std::env::temp_dir();
@@ -205,7 +252,9 @@ fn committed_fixtures_match_fresh_dumps() {
         let committed: Value = serde_json::from_str(&committed)
             .unwrap_or_else(|e| panic!("{} is valid JSON: {e}", fixture_path.display()));
 
-        let raw = dump(&entry.example);
+        // Apply the row's retention flags so a slimmed fixture's fresh dump
+        // matches its (slimmed) committed copy byte-for-byte.
+        let raw = dump_with(&entry.example, &entry.dump_flags());
         let fresh: Value = serde_json::from_slice(&raw)
             .unwrap_or_else(|e| panic!("dump for {} is valid JSON: {e}", entry.example));
 
@@ -253,4 +302,94 @@ fn udf_fanout_corpus_program_produces_inline_fanout_edges() {
         }),
         "udf_fanout must yield a genuine (u != d) inline fan-out edge in window 2"
     );
+}
+
+/// Every `nodeId` in a stage's IR tree.
+fn stage_node_ids(stage: &Value) -> std::collections::HashSet<u64> {
+    fn walk(node: &Value, out: &mut std::collections::HashSet<u64>) {
+        if let Some(id) = node["nodeId"].as_u64() {
+            out.insert(id);
+        }
+        for c in node["children"].as_array().into_iter().flatten() {
+            walk(&c["node"], out);
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    walk(&stage["ir"], &mut out);
+    out
+}
+
+/// Dense-window sanity over a FULL (unpruned) dump's
+/// `post-inference → post-desugar` window — the structural bug-catcher that
+/// replaces the pinned edge bytes for the pane-slimmed fixtures (`txn_multi_read`,
+/// `mutation_loop`, whose committed goldens elide `paneLinks`). Mirrors the
+/// `udf_fanout` fan-out pattern, strengthened to the properties the pinned bytes
+/// used to guarantee: (a) the window carries genuine non-identity edges, (b) some
+/// upstream node fans out to ≥2 downstream nodes (the substitution copies these
+/// programs were chosen to exercise), and (c) every edge endpoint is a live node
+/// in its pane. Runs against the full dump precisely because the fixture no
+/// longer ships the edges.
+fn assert_dense_window_sanity(example: &str) {
+    let raw = dump(example); // full wire — the slimmed fixture omits paneLinks
+    let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
+    let stages = v["stages"].as_array().expect("stages is an array");
+    let stage = |id: &str| {
+        stages
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap_or_else(|| panic!("{example}: stage {id} present in the full dump"))
+    };
+    let up_ids = stage_node_ids(stage("post-inference"));
+    let down_ids = stage_node_ids(stage("post-desugar"));
+
+    let links = v["paneLinks"].as_array().expect("paneLinks is an array");
+    let window = links
+        .iter()
+        .find(|l| l["from"] == "post-inference" && l["to"] == "post-desugar")
+        .unwrap_or_else(|| {
+            panic!("{example}: the post-inference → post-desugar window is present")
+        });
+    let edges = window["edges"].as_array().expect("edges is an array");
+
+    let mut non_self = 0usize;
+    let mut fanout: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for e in edges {
+        let p = e.as_array().expect("edge is a pair");
+        let u = p[0].as_u64().expect("upstream id");
+        let d = p[1].as_u64().expect("downstream id");
+        assert!(
+            up_ids.contains(&u),
+            "{example}: edge upstream {u} is a live post-inference node"
+        );
+        assert!(
+            down_ids.contains(&d),
+            "{example}: edge downstream {d} is a live post-desugar node"
+        );
+        if u != d {
+            non_self += 1;
+        }
+        *fanout.entry(u).or_default() += 1;
+    }
+    assert!(
+        non_self > 0,
+        "{example}: window 2 must carry ≥1 genuine (u != d) edge"
+    );
+    assert!(
+        fanout.values().any(|&c| c >= 2),
+        "{example}: some upstream node must fan out to ≥2 downstream nodes"
+    );
+}
+
+/// `txn_multi_read` (pane-slimmed; its committed fixture omits `paneLinks`)
+/// still exercises the dense desugar-window fan-out structurally.
+#[test]
+fn txn_multi_read_produces_dense_desugar_window() {
+    assert_dense_window_sanity("txn_multi_read");
+}
+
+/// `mutation_loop` (pane-slimmed; its committed fixture omits `paneLinks`)
+/// still exercises the dense desugar-window fan-out structurally.
+#[test]
+fn mutation_loop_produces_dense_desugar_window() {
+    assert_dense_window_sanity("mutation_loop");
 }
