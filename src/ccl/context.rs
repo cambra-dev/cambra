@@ -703,6 +703,18 @@ pub enum CompileStage {
     ///
     /// [`Inferred`]: CompileStage::Inferred
     Inlined,
+    /// Mutability eliminated: `with begin():` blocks and mutation loops have
+    /// become causal `LetRec` recurrences over their sequencing domain, and
+    /// feeds have been routed into channels. `For`/`MutWrite`/`Begin`/`Defer`
+    /// are gone.
+    Channelized,
+    /// Point-free: lambdas replaced by combinators, so binders no longer appear
+    /// in the term at all.
+    LambdaElim,
+    /// Recurrences lowered onto the `Transact` carrier and joins planned — the
+    /// shape operator conversion consumes. The last stage before the tile
+    /// graph, and the one where compute sharing is decided.
+    Planned,
 }
 
 /// Compile `code` to the given [`CompileStage`], ready to pass to
@@ -718,13 +730,19 @@ pub enum CompileStage {
 /// ```
 ///
 /// The prefix here mirrors [`compile_program`]'s frontend, stopping at the
-/// requested stage rather than continuing to the operator graph. Every stage is
-/// *above* the mutability and channelization phases deliberately: those rewrite
-/// the user's loops and feeds into `LetRec` recurrences whose shape is an
-/// artifact of the compiler, not of the program the user edited.
+/// requested stage rather than continuing to the operator graph.
 ///
-/// Choosing a stage is choosing how much normalization to diff through — see
+/// Choosing a stage is choosing how much of the compiler's own rewriting to
+/// diff through, and it is a trade in both directions — a later stage
+/// normalizes more away but spreads a single edit over more of the tree. See
 /// [`CompileStage`] and `src/ccl/design/diffing.md`, "How much to normalize".
+///
+/// The transaction, mutability and channelization phases are not separately
+/// selectable: they are one rewrite of the user's loops and feeds into `LetRec`
+/// recurrences, and stopping between them exposes a half-rewritten tree no
+/// consumer wants. [`Channelized`] is the point where that rewrite is complete.
+///
+/// [`Channelized`]: CompileStage::Channelized
 pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileError>> {
     let mut ctx = GlobalContext::new();
     let mut errors: Vec<CompileError> = Vec::new();
@@ -785,12 +803,31 @@ pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileEr
         return Ok(expr);
     }
 
+    let expr = inline::inline_non_iterable_lambdas(expr);
+    if stage == CompileStage::Inlined {
+        return Ok(expr);
+    }
+
+    let txn_registers = transact_phase::collect_txn_registers(&expr);
+    let expr = transact_phase::run(expr, &txn_registers);
+    let expr = mut_elim::run(expr);
+    let mut expr = channelize::run(expr, /* input_typed= */ true).errs()?;
+    transact_phase::rewrite_live_reads(&mut expr);
+    if stage == CompileStage::Channelized {
+        return Ok(expr);
+    }
+
+    let expr = lambda_elim::run(expr).errs()?;
+    if stage == CompileStage::LambdaElim {
+        return Ok(expr);
+    }
+
     debug_assert_eq!(
         stage,
-        CompileStage::Inlined,
+        CompileStage::Planned,
         "every CompileStage must be handled before this point",
     );
-    Ok(inline::inline_non_iterable_lambdas(expr))
+    Ok(planning::run(planning::plan_loops(expr)))
 }
 
 /// Compile a CHL program and return its operator graph plus subscribed outputs.

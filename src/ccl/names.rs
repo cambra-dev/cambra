@@ -213,19 +213,26 @@ impl Name {
         }
     }
 
-    /// A globally-distinct string key for this name, suitable as a **register
-    /// record field label** for a [`crate::ccl::TypedExprNode::Transact`] key.
-    /// Unlike [`base`](Self::base) it folds the `uid` in, so two distinct
-    /// binders sharing a spelling (e.g. accumulators in sibling loops) get
-    /// distinct keys. A variable read of a register key projects this field of
-    /// the register record (`__reg.field_key`).
+    /// This name as a **register record field label** for a
+    /// [`crate::ccl::TypedExprNode::Transact`] key. A variable read of a
+    /// register key projects this field of the register record
+    /// (`__reg.field_key`).
+    ///
+    /// It is the plain [`base`](Self::base) spelling, and deliberately carries
+    /// no `uid`. The label has to be distinct only among the keys of *one*
+    /// register record — every consumer resolves it against a `keys_map` built
+    /// per [`Transact`](crate::ccl::TypedExprNode::Transact) node, so
+    /// accumulators in sibling loops live in different records and cannot
+    /// collide. Folding the `uid` in would buy global distinctness nothing
+    /// needs, at the cost of rendering a run-varying identity into a `String`:
+    /// once a name is a record label, uid-robust comparison is impossible, and
+    /// two compilations of one source disagree. That made program diffing at
+    /// and below loop planning unusable — see `src/ccl/design/diffing.md`.
+    ///
+    /// The per-record uniqueness this relies on is asserted where the record is
+    /// built, in [`crate::ccl::planning`].
     pub fn field_key(&self) -> String {
-        match self {
-            Name::Raw(s) => s.clone(),
-            Name::Unique { base, uid } => format!("{base}#{}", uid.0),
-            Name::Synthetic { kind, uid } => format!("{}#{}", kind.stem(), uid.0),
-            Name::Reserved(r) => r.spelling().to_string(),
-        }
+        self.base().to_string()
     }
 
     /// Is this a raw (un-uniquified) lowering name? The "still needs minting"

@@ -2207,6 +2207,12 @@ mod tests {
         // binder uids — must produce trees the differ cannot tell apart. A
         // failure means some pass has let a run-varying identity leak into the
         // hash, which would make every real diff untrustworthy.
+        //
+        // It covers every stage because that is exactly how the leak was found:
+        // `Transact` labelled its register record with `Name::field_key()`,
+        // which folded the binder uid into a `String`, and once a name is a
+        // record label no amount of uid-robustness in the hasher can see
+        // through it.
         let corpus = [
             ("pure", "a = 1\nb = 2\na + b\n"),
             ("comprehension", FILTER_AGG),
@@ -2221,6 +2227,9 @@ mod tests {
             CompileStage::Lowered,
             CompileStage::Inferred,
             CompileStage::Inlined,
+            CompileStage::Channelized,
+            CompileStage::LambdaElim,
+            CompileStage::Planned,
         ] {
             for (label, src) in corpus {
                 let (a, b) = (

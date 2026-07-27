@@ -154,6 +154,31 @@ and a resolved tree contains no `Infer`, so collapsing unresolved structure to
 one value is a safe fallback rather than a determinism hazard — the diff never
 runs mid-inference.
 
+### A rendered name is a hash the seam cannot reach
+
+Uid-robustness lives in exactly one place: a free variable is identified by
+`Name::base()`, never by its `uid`. That holds as long as a name *is* a `Name`.
+Once a pass renders one into a `String`, the hash sees an ordinary string and
+the seam no longer applies — nothing downstream can tell a run-varying identity
+from a user-written one.
+
+Loop planning used to do exactly that. The register record a `Transact` denotes
+was typed with `Name::field_key()` labels that folded the binder uid in, so one
+compilation produced `{acc#9: ([0, 2] ⇒ Int)}` and the next `{acc#19: …}`, with
+`.acc#9` against `.acc#19` reading it. Two compilations of the *same* source
+diffed as different, which made every stage from planning down unusable.
+
+The label had no need of a uid. It has to be distinct only among the keys of one
+register record — every consumer resolves it against a `keys_map` built per
+`Transact` node, so accumulators in sibling loops live in different records and
+cannot collide. `field_key` is now the plain spelling, and the per-record
+uniqueness it relies on is asserted where the record is built rather than left
+implicit in a global naming scheme.
+
+The general rule this leaves: **a name rendered into a string is an identity the
+hash cannot normalize**, so a pass that needs a label should derive it from
+something already stable, and state where its uniqueness is enforced.
+
 ### Order-insensitivity where the language is
 
 Records and `CollectionUnion` operands are *sets*, not sequences, so their child
@@ -382,6 +407,9 @@ type-aware, which is exactly what one core needs to handle all of them.
 | `Lowered` | `Raw` names, pre-uniquify, pre-inference; most types `Hole` | Closest to source, minimal diffs. Type sensitivity comes only from annotations and lowering-built types (cast refinements). |
 | `Inferred` | α-uniquified, every node carrying its resolved type | Everything above, plus type-level divergence the earlier stage cannot see. |
 | `Inlined` | inferred, then UDF-inlined | Everything above, with function boundaries erased — see "How much to normalize". |
+| `Channelized` | mutability eliminated: `LetRec` recurrences, feeds routed | The compiler's shape rather than the user's — `For`/`MutWrite`/`Begin`/`Defer` are gone. |
+| `LambdaElim` | point-free combinators | No binders in the term at all. |
+| `Planned` | recurrences on the `Transact` carrier, joins planned | The shape operator conversion consumes, and where compute sharing is decided. |
 
 The payoff of the later stage is real: in `x = 1` / `(x, x)` versus `x = "a"` /
 `(x, x)`, the bodies are structurally identical and hash *equal* before
@@ -394,22 +422,11 @@ whose shape is an artifact of the compiler, not of the program the user edited;
 a diff there would report churn the user cannot act on. `LetRec` and `Transact`
 are consequently unreachable from source at any of these stages.
 
-That is a choice, so it was measured rather than assumed. Diffing was tried at
-every remaining stage — after the transaction phase, after `mut_elim`, after
-channelization, after lambda elimination, after loop planning — on edits to a
-comprehension, an accumulator loop, a transactional register, and a generator.
-Two things came back.
-
-*The later stages cost locality and buy nothing.* Every pass that rewrites the
-user's shape spreads a single edit over more of the tree: an accumulator loop
-whose body gains a `* 2` reports two divergences up to and including
-`mut_elim`, and fourteen inserted nodes once lambda elimination has run; a
-generator whose guard changes goes from one divergence to three. Nothing in the
-corpus got *better* deeper down. The `LetRec` and `Transact` hash arms do work —
-they are exercised for real at those stages, which until this was run they never
-had been — so the stages are reachable, just not useful.
-
-*Loop planning is not diffable at all.* See "Open threads".
+The later stages are where `LetRec` and `Transact` finally appear, and they are
+selectable — but the whole pipeline is not. The transaction, mutability and
+channelization phases are one rewrite of the user's loops and feeds; stopping
+between them exposes a half-rewritten tree no consumer wants, so `Channelized`
+is the point at which that rewrite is complete.
 
 ## How much to normalize
 
@@ -434,6 +451,23 @@ Inlining is a trade, not an improvement: it makes moving code across a function
 boundary invisible, and in exchange reports an edit inside a shared helper once
 per call site, because the body it changed now appears once per call site. Take
 it when refactoring across functions is the noise you want gone.
+
+Below `Inlined` the trade keeps going the same way, and the measurements say so
+plainly. Every pass that rewrites the user's shape spreads one edit over more of
+the tree:
+
+| Edit | `Inlined` | `Channelized` | `LambdaElim` | `Planned` |
+| --- | --- | --- | --- | --- |
+| a literal | 1 | 1 | 1 | 1 |
+| a comprehension's filter threshold | 1 | 1 | 2 | 4 |
+| an accumulator loop's body | 2 (2 new) | 2 (2 new) | 2 (**14 new**) | 2 (14 new) |
+| a transactional register's write | 2 (2 new) | 2 (2 new) | 3 (8 new) | 3 (8 new) |
+
+So the default is the earliest stage that answers the question. The reason to
+reach past `Inlined` is not a better diff of the source — it is that `Planned`
+is the shape operator conversion consumes, so it is where a claim about *sharing
+compute* is actually a claim about the graph that runs. Diffing there answers a
+different question, not the same question better.
 
 ### What deliberately is *not* normalized
 
@@ -545,28 +579,6 @@ a `Cast` target's refinement predicate (a load-bearing term that
 `walk_children` treats as a type child). Both matches are exhaustive, so a new
 node variant is a compile error in both places — the duplication is visible
 rather than silent, which is why it stands.
-
-**`Transact` renders a binder uid into a string, and nothing can see through
-it.** Diffing at or below `planning::plan_loops` is unusable: two compilations
-of the *same* source report as different. The register record a `Transact`
-denotes is typed with `Name::field_key()` keys, which deliberately fold the uid
-in so two same-spelled binders get distinct fields — so one compilation types
-the node `{acc#9: ([0, 2] ⇒ Int)}` and the next `{acc#19: …}`, and the
-projection reading it is `.acc#9` against `.acc#19`.
-
-The hash cannot recover from that. Uid-robustness lives in one seam, which
-identifies a *`Name`* by `Name::base()`; by this point the name is a plain
-`String` in a record label and a `Proj(Field(_))` payload, indistinguishable
-from a user-written field. Normalizing `name#uid`-shaped strings in the hasher
-would be pattern-matching a rendering convention — fragile, and wrong the moment
-a user writes that spelling. The real fix is for the register record to keep
-names as `Name`s and defer rendering to operator conversion, which means a
-key type richer than `String` on `Type::Record`; that is a compiler change, and
-only worth making if diffing below planning is actually wanted.
-
-Every stage above planning is stable, and
-`every_stage_diffs_identical_source_as_identical` pins that for the three
-shipped ones across the corpus.
 
 **A `let`-spine encodes an order it does not have.** A run of independent
 bindings is a dependency DAG, but CCL spells it as nested `Let`s, so reordering

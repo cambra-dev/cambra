@@ -450,6 +450,22 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     for (_, field, stream_ty) in &taps {
         reg_field_tys.push((field.clone(), stream_ty.clone()));
     }
+    // `field_key` is a plain spelling, so distinctness within *this* record is
+    // the whole of what keeps two registers apart — nothing global backs it up.
+    // Every consumer resolves a footprint key by looking this label up in a
+    // per-node map, so a collision would silently alias two registers onto one
+    // store slot.
+    debug_assert!(
+        {
+            let mut seen: Vec<&str> = reg_field_tys.iter().map(|(f, _)| f.as_str()).collect();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            seen.len() == before
+        },
+        "register record has duplicate field labels: {:?}",
+        reg_field_tys.iter().map(|(f, _)| f).collect::<Vec<_>>(),
+    );
     let reg_ty = Type::Record(reg_field_tys);
 
     let mut transact = Expr::new(TypedExprNode::Transact {
