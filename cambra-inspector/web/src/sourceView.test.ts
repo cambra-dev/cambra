@@ -11,15 +11,15 @@ import { describe, expect, it } from "vitest";
 
 import { Store } from "./store";
 import { hoverPayloadAt, resolveSourceClick } from "./sourceView";
-import { validateSnapshot } from "./wireValidate";
-import { stageById, theNode } from "./__fixtures__/helpers";
+
+import { fixture, stageById, theNode } from "./__fixtures__/helpers";
 import type { Indices } from "./indices";
 
 import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
-const arithmetic = validateSnapshot(arithmeticJson);
-const listMin = validateSnapshot(listMinJson);
+const arithmetic = fixture(arithmeticJson);
+const listMin = fixture(listMinJson);
 
 function anchorOf(store: Store): Indices {
   const idx = store.indicesFor(store.sourceAnchorStageId!);

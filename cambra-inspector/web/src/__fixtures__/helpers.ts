@@ -3,6 +3,28 @@
 // NodeIds, so they survive id churn in the compiler.
 
 import type { InspectNode, Snapshot, StageEntry } from "../types";
+import { validateSnapshot } from "../wireValidate";
+
+/**
+ * Validate a golden fixture, enriching any wire error with the fixture
+ * lifecycle: these JSONs are regenerated artifacts, so a mismatch here usually
+ * means stale fixtures or a half-propagated schema change, not a frontend bug.
+ * Production code keeps calling `validateSnapshot` directly — a live payload
+ * error must not tell users to regenerate test fixtures.
+ */
+export function fixture(json: unknown): Snapshot {
+  try {
+    return validateSnapshot(json);
+  } catch (e) {
+    throw new Error(
+      `${String(e)}\n` +
+        "  This is a golden fixture. If the wire shape changed on purpose, regenerate via\n" +
+        "  cambra-inspector/scripts/regen-fixtures.sh, updating SCHEMA_VERSION (wireValidate.ts)\n" +
+        "  and any hand-written expectations together — re-bless discipline in\n" +
+        "  web/src/__fixtures__/README.md.",
+    );
+  }
+}
 
 /** The stage with the given id (throws if absent). */
 export function stageById(snap: Snapshot, id: string): StageEntry {

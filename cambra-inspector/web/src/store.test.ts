@@ -14,16 +14,16 @@
 import { describe, expect, it } from "vitest";
 
 import { Store } from "./store";
-import { validateSnapshot } from "./wireValidate";
-import { allNodes, stageById, theNode } from "./__fixtures__/helpers";
+import { SCHEMA_VERSION } from "./wireValidate";
+import { allNodes, fixture, stageById, theNode } from "./__fixtures__/helpers";
 
 import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
 import udfFanoutJson from "./__fixtures__/udf_fanout.snapshot.json";
 
-const arithmetic = validateSnapshot(arithmeticJson);
-const polymorphic = validateSnapshot(polymorphicJson);
-const udfFanout = validateSnapshot(udfFanoutJson);
+const arithmetic = fixture(arithmeticJson);
+const polymorphic = fixture(polymorphicJson);
+const udfFanout = fixture(udfFanoutJson);
 
 const STAGE_IDS = ["pre-inference", "post-inference", "post-desugar"];
 
@@ -35,7 +35,7 @@ describe("T3: wire-shape contract (golden fixture matches the TS types)", () => 
     ["polymorphic", polymorphic],
   ] as const) {
     it(`${name}: three ordered stages + the two paneLinks windows`, () => {
-      expect(snap.meta.schema).toBe(3);
+      expect(snap.meta.schema).toBe(SCHEMA_VERSION);
       expect(snap.stages.map((s) => s.id)).toEqual(STAGE_IDS);
       expect(snap.stages.map((s) => s.kind)).toEqual(["holes", "typed", "typed"]);
       expect(snap.paneLinks.map((l) => [l.from, l.to])).toEqual([
