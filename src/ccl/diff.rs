@@ -627,7 +627,7 @@ fn recover(s: &Indexed, d: &Indexed, u: usize, w: usize, m: &mut Matching) {
     if s.nodes[u].size > MAX_RECOVERY_SIZE || d.nodes[w].size > MAX_RECOVERY_SIZE {
         return;
     }
-    for (x, y) in ted::mapping(s, u, d, w) {
+    for (x, y) in ted::mapping(s, u, d, w, m) {
         if !m.src_matched(x) && !m.dst_matched(y) && s.nodes[x].kind == d.nodes[y].kind {
             m.map(x, y);
         }
@@ -722,13 +722,28 @@ mod ted {
         }
     }
 
-    /// Relabelling cost: free when the two nodes are the same computation.
-    fn relabel(a: &Indexed, ga: usize, b: &Indexed, gb: usize) -> u32 {
-        u32::from(a.nodes[ga].hash != b.nodes[gb].hash)
+    /// Relabelling cost.
+    ///
+    /// Free when the two nodes are the same computation, or when the earlier
+    /// phases already paired them. **Prohibitive** when either node is already
+    /// paired with somebody else: the edit distance is otherwise free to invent
+    /// an alignment that contradicts an anchor, and since only its *unmatched*
+    /// pairs are adopted, the contradiction survives as a silently wrong match
+    /// — a `let` in a spine mapped to its own inner `let`, say, because the
+    /// distance was happy to shift the whole chain by one. Three exceeds the
+    /// cost of deleting and inserting instead (two), so a conflicting pair is
+    /// never on an optimal script.
+    fn relabel(a: &Indexed, ga: usize, b: &Indexed, gb: usize, m: &super::Matching) -> u32 {
+        match (m.src_to_dst[ga], m.dst_to_src[gb]) {
+            (Some(y), _) if y == gb => 0,
+            (None, None) => u32::from(a.nodes[ga].hash != b.nodes[gb].hash),
+            _ => 3,
+        }
     }
 
     /// Fill the forest-distance table for keyroot pair `(ki, kj)`, writing any
     /// whole-subtree distances it settles into `tree`.
+    #[allow(clippy::too_many_arguments)]
     fn forest_dist(
         s: &Indexed,
         ps: &Post,
@@ -736,6 +751,7 @@ mod ted {
         pd: &Post,
         ki: usize,
         kj: usize,
+        m: &super::Matching,
         tree: &mut [u32],
     ) -> Forest {
         let (li, lj) = (ps.leftmost[ki], pd.leftmost[kj]);
@@ -759,7 +775,7 @@ mod ted {
                 if ps.leftmost[pi] == li && pd.leftmost[pj] == lj {
                     // Both are whole subtrees rooted here: this cell *is* the
                     // tree distance, so record it for the outer decomposition.
-                    let ren = f.get(i - 1, j - 1) + relabel(s, ps.global[pi], d, pd.global[pj]);
+                    let ren = f.get(i - 1, j - 1) + relabel(s, ps.global[pi], d, pd.global[pj], m);
                     let best = del.min(ins).min(ren);
                     f.set(i, j, best);
                     tree[(pi - 1) * pd.n() + (pj - 1)] = best;
@@ -777,13 +793,19 @@ mod ted {
     /// The node correspondence induced by a minimum-cost edit script between
     /// the subtree of `s` rooted at `su` and the subtree of `d` rooted at `dw`.
     /// Pairs are `(Indexed` index in `s`, `Indexed` index in `d)`.
-    pub(super) fn mapping(s: &Indexed, su: usize, d: &Indexed, dw: usize) -> Vec<(usize, usize)> {
+    pub(super) fn mapping(
+        s: &Indexed,
+        su: usize,
+        d: &Indexed,
+        dw: usize,
+        m: &super::Matching,
+    ) -> Vec<(usize, usize)> {
         let ps = Post::build(s, su);
         let pd = Post::build(d, dw);
         let mut tree = vec![0u32; ps.n() * pd.n()];
         for &ki in &ps.keyroots {
             for &kj in &pd.keyroots {
-                forest_dist(s, &ps, d, &pd, ki, kj, &mut tree);
+                forest_dist(s, &ps, d, &pd, ki, kj, m, &mut tree);
             }
         }
 
@@ -794,7 +816,7 @@ mod ted {
         let mut out = Vec::new();
         let mut todo = vec![(ps.n(), pd.n())];
         while let Some((ki, kj)) = todo.pop() {
-            let f = forest_dist(s, &ps, d, &pd, ki, kj, &mut tree);
+            let f = forest_dist(s, &ps, d, &pd, ki, kj, m, &mut tree);
             let (li, lj) = (ps.leftmost[ki], pd.leftmost[kj]);
             let (mut i, mut j) = (f.rows - 1, f.cols - 1);
             while i > 0 || j > 0 {
