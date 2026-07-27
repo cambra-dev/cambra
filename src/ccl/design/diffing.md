@@ -392,9 +392,24 @@ longer matches — types carry signal the term structure alone does not.
 deliberately. Those rewrite the user's loops and feeds into `LetRec` recurrences
 whose shape is an artifact of the compiler, not of the program the user edited;
 a diff there would report churn the user cannot act on. `LetRec` and `Transact`
-are consequently unreachable from source at any of these stages — the hash
-covers them structurally anyway, so the later stages are available if the
-versioning work turns out to want them.
+are consequently unreachable from source at any of these stages.
+
+That is a choice, so it was measured rather than assumed. Diffing was tried at
+every remaining stage — after the transaction phase, after `mut_elim`, after
+channelization, after lambda elimination, after loop planning — on edits to a
+comprehension, an accumulator loop, a transactional register, and a generator.
+Two things came back.
+
+*The later stages cost locality and buy nothing.* Every pass that rewrites the
+user's shape spreads a single edit over more of the tree: an accumulator loop
+whose body gains a `* 2` reports two divergences up to and including
+`mut_elim`, and fourteen inserted nodes once lambda elimination has run; a
+generator whose guard changes goes from one divergence to three. Nothing in the
+corpus got *better* deeper down. The `LetRec` and `Transact` hash arms do work —
+they are exercised for real at those stages, which until this was run they never
+had been — so the stages are reachable, just not useful.
+
+*Loop planning is not diffable at all.* See "Open threads".
 
 ## How much to normalize
 
@@ -530,6 +545,28 @@ a `Cast` target's refinement predicate (a load-bearing term that
 `walk_children` treats as a type child). Both matches are exhaustive, so a new
 node variant is a compile error in both places — the duplication is visible
 rather than silent, which is why it stands.
+
+**`Transact` renders a binder uid into a string, and nothing can see through
+it.** Diffing at or below `planning::plan_loops` is unusable: two compilations
+of the *same* source report as different. The register record a `Transact`
+denotes is typed with `Name::field_key()` keys, which deliberately fold the uid
+in so two same-spelled binders get distinct fields — so one compilation types
+the node `{acc#9: ([0, 2] ⇒ Int)}` and the next `{acc#19: …}`, and the
+projection reading it is `.acc#9` against `.acc#19`.
+
+The hash cannot recover from that. Uid-robustness lives in one seam, which
+identifies a *`Name`* by `Name::base()`; by this point the name is a plain
+`String` in a record label and a `Proj(Field(_))` payload, indistinguishable
+from a user-written field. Normalizing `name#uid`-shaped strings in the hasher
+would be pattern-matching a rendering convention — fragile, and wrong the moment
+a user writes that spelling. The real fix is for the register record to keep
+names as `Name`s and defer rendering to operator conversion, which means a
+key type richer than `String` on `Type::Record`; that is a compiler change, and
+only worth making if diffing below planning is actually wanted.
+
+Every stage above planning is stable, and
+`every_stage_diffs_identical_source_as_identical` pins that for the three
+shipped ones across the corpus.
 
 **A `let`-spine encodes an order it does not have.** A run of independent
 bindings is a dependency DAG, but CCL spells it as nested `Let`s, so reordering

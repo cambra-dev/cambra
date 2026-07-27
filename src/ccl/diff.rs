@@ -2201,6 +2201,42 @@ mod tests {
     }
 
     #[test]
+    fn every_stage_diffs_identical_source_as_identical() {
+        // The property the whole analysis rests on, over the shapes the corpus
+        // reaches: compiling one source twice — independent contexts, fresh
+        // binder uids — must produce trees the differ cannot tell apart. A
+        // failure means some pass has let a run-varying identity leak into the
+        // hash, which would make every real diff untrustworthy.
+        let corpus = [
+            ("pure", "a = 1\nb = 2\na + b\n"),
+            ("comprehension", FILTER_AGG),
+            ("generators", GENERATORS),
+            ("join", JOIN),
+            ("groupby", GROUPBY),
+            ("accumulator", ACCUM),
+            ("transaction", TXN),
+            ("source", "[\"> \" + line for line in stdin()]\n"),
+        ];
+        for stage in [
+            CompileStage::Lowered,
+            CompileStage::Inferred,
+            CompileStage::Inlined,
+        ] {
+            for (label, src) in corpus {
+                let (a, b) = (
+                    compile_to(src, stage).expect(label),
+                    compile_to(src, stage).expect(label),
+                );
+                assert!(
+                    diff(&a, &b).is_identical(),
+                    "{label} at {stage:?} is not stable across compilations:\n{}",
+                    diff(&a, &b)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn diff_programs_end_to_end_from_source() {
         // The public single-call entry: compile both sources to a stage and
         // diff, results delivered through the closure.
