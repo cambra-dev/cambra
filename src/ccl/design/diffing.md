@@ -84,6 +84,48 @@ that share a spelling compare equal. It is isolated in one function
 (`hash_free_var`) precisely so a finer cross-version binder correspondence can
 replace it without touching anything else.
 
+### Two hashes, two questions
+
+The free-variable rule is the one place the hash's meaning is a choice rather
+than a consequence of the term, and two different questions want two different
+answers.
+
+**Matching** asks *where else does this subterm appear?* — of two programs that
+do not share binder identities. That needs a **context-free** answer, so a
+subterm hashes the same wherever it sits: free variables go by **spelling**
+(`content_hash`). Everything the matcher does is built on this.
+
+**Classification** asks *is this the same computation?* — of two nodes already
+known to correspond. Spelling is both too strict and too loose for that. Too
+strict: renaming a binding is a denotational no-op, but every subterm mentioning
+it hashes differently, so `x = 1; x + 2` → `y = 1; y + 2` reports every mention
+changed even though the two roots hash equal. Too loose: two same-spelled
+variables bound to different things hash the same, which is exactly the trap the
+original model warned about — "the hash must be taken over the subterm together
+with its resolved bindings, not over AST text alone".
+
+So classification uses `resolved_hash`, which identifies a free variable by
+**which binder it resolves to**, taken up to the correspondence: each binder
+carries a *class* token shared by its counterpart in the other program, and a
+free variable hashes to its binder's class. A renamed binding is then invisible,
+and a same-spelled binding of something else is not confused with it. This
+presupposes a correspondence, which is why it classifies a matching rather than
+producing one.
+
+*What this deliberately is not.* Threading the binder chain from the root and
+using raw De Bruijn indices throughout looks equivalent and is not: inserting a
+binder *above* a subterm shifts the index of every reference that reaches past
+it, so adding one statement would report the entire tail below it as changed.
+Binder classes are stable under that, because they name the binder rather than
+the distance to it.
+
+*Direction of error.* Where the matching itself is suboptimal, resolved hashing
+reports change rather than sharing. Reordering two independent bindings, for
+instance, pairs the spine positionally, so the bindings genuinely do differ
+under the correspondence produced and the uses read as changed. That is the safe
+direction: over-reporting change costs a sharing opportunity, under-reporting it
+would make an unsound share.
+
 ### Standalone hashing is the matcher's precondition
 
 Every subterm is hashed *standalone*: free variables are resolved against the

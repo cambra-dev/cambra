@@ -37,15 +37,33 @@
 //! the *innermost* enclosing binder, so a shadowed `Raw` name resolves to the
 //! binder a reader would pick.
 //!
+//! # Two hashes, one traversal
+//!
+//! The free-variable seam ([`FreeVars`]) is the one place the hash's meaning is
+//! a choice, and the two choices answer different questions:
+//!
+//! * [`content_hash`] identifies a free variable by its **spelling**. That is
+//!   context-free — a subterm hashes the same wherever it sits and in whichever
+//!   program — which is exactly the property a matcher looking for a subterm's
+//!   twin needs.
+//! * [`resolved_hash`] identifies it by **which binder it resolves to**, taken
+//!   up to a correspondence between the two programs. That is what "the same
+//!   computation" actually means, but it presupposes a correspondence, so it is
+//!   for classifying a matching rather than producing one.
+//!
+//! Everything else — the traversal, the De Bruijn treatment of bound variables,
+//! the type-awareness — is shared. See `src/ccl/design/diffing.md`, "Two
+//! hashes, two questions".
+//!
 //! # Stage-agnostic by construction
 //!
 //! The hash is a pure function of a [`TypedExpr`] plus the binder-scoping rules
 //! of [`crate::ccl::scope`], which cover **every** [`TypedExprNode`] variant —
 //! including the ones (`LetRec`, `Transact`) that only appear at later pipeline
 //! stages. The single thing that differs between stages is how a *free*
-//! variable is identified, and that is isolated in [`hash_free_var`], which
-//! hashes a free variable by its stable **spelling** ([`Name::base`]) rather
-//! than its `uid`. This is robust across stages: lowering already uniquifies
+//! variable is identified, and that is isolated in the seam above, whose
+//! default hashes a free variable by its stable **spelling** ([`Name::base`])
+//! rather than its `uid`. This is robust across stages: lowering already uniquifies
 //! some subexpressions, so a free binder can be `Unique`/`Synthetic` with a
 //! run-varying `uid` even before the global uniquify pass — and the spelling is
 //! the identity that survives independent compilations. A finer cross-version
@@ -87,7 +105,37 @@ pub type NodeId = *const TypedExpr;
 /// [`hash_free_var`]. This is what makes a subterm match its twin in another
 /// program regardless of how deeply each sits — the GumTree precondition.
 pub fn content_hash(e: &TypedExpr) -> ContentHash {
-    ContentHash(hash_rel(e, &mut Vec::new()))
+    ContentHash(hash_rel(e, &mut Vec::new(), FreeVars::BySpelling))
+}
+
+/// The α-invariant hash of `e` with its free variables resolved **through the
+/// enclosing scope** rather than by spelling — the classification counterpart
+/// to [`content_hash`]. See `src/ccl/design/diffing.md`, "Two hashes, two
+/// questions".
+///
+/// `scope` lists the binders `e` sits under, innermost last, each paired with a
+/// *class* token that corresponding binders of the two programs share. A free
+/// variable then hashes to the class of the binder it resolves to, so a binding
+/// renamed between versions is invisible, and a same-spelled binding of
+/// something else is not mistaken for it.
+pub fn resolved_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
+    ContentHash(hash_rel(e, &mut Vec::new(), FreeVars::ByBinder(scope)))
+}
+
+/// How a variable that is *free* in the subterm being hashed is identified —
+/// the one place the hash's meaning is a choice rather than a consequence of
+/// the term.
+#[derive(Clone, Copy)]
+pub enum FreeVars<'r> {
+    /// By the binder's stable spelling ([`Name::base`]). Context-free: a
+    /// subterm hashes the same wherever it sits and in whichever program, which
+    /// is exactly what a matcher looking for a subterm's twin needs.
+    BySpelling,
+    /// By the identity of the binder it resolves to, taken up to a
+    /// correspondence between the two programs — `(name, class)` innermost
+    /// last. Context-sensitive, and only meaningful once a correspondence
+    /// exists, so this is for classifying a matching, not for producing one.
+    ByBinder(&'r [(&'r Name, u64)]),
 }
 
 /// The standalone [`content_hash`] of every subterm of `root`, keyed by node
@@ -104,21 +152,34 @@ fn collect(e: &TypedExpr, out: &mut HashMap<NodeId, ContentHash>) {
     e.walk_children(|c| collect(c, out));
 }
 
-/// The stage-specific seam: hash the identity of a variable that is *free* in
-/// the subterm under consideration.
+/// Hash the identity of a variable that is *free* in the subterm under
+/// consideration, per [`FreeVars`].
 ///
-/// Hash the stable **spelling** ([`Name::base`]), never the whole `Name`. A
-/// binder may be `Raw` in one lowering and `Unique`/`Synthetic` — carrying a
-/// globally-fresh, run-varying `uid` — in another: lowering uniquifies some
-/// subexpressions in place (e.g. comprehension sources via `uniquify::run`),
-/// and uids are non-deterministic *by design*. The spelling is the identity
-/// that is stable across independent compilations, so matching free variables
-/// by it is the (deliberately crude) cross-version binder correspondence this
-/// seam exists for. Its imprecision — two distinct binders that share a
-/// spelling (shadowing) compare equal — is the same caveat the bound/free
-/// split already carries; a finer correspondence can refine this one spot.
-fn hash_free_var(name: &Name, state: &mut DefaultHasher) {
-    name.base().hash(state);
+/// Never hash the whole `Name`. A binder may be `Raw` in one lowering and
+/// `Unique`/`Synthetic` — carrying a globally-fresh, run-varying `uid` — in
+/// another: lowering uniquifies some subexpressions in place (e.g.
+/// comprehension sources via `uniquify::run`), and uids are non-deterministic
+/// *by design*.
+///
+/// Under [`FreeVars::BySpelling`] the identity is the spelling, which is what
+/// survives independent compilation. Its imprecision — two distinct binders
+/// sharing a spelling compare equal — is why [`FreeVars::ByBinder`] exists.
+/// Under that variant a variable still free in the *whole program* (a source
+/// name, say) has nothing to resolve to, so it falls back to its spelling.
+fn hash_free_var(name: &Name, free: FreeVars<'_>, state: &mut DefaultHasher) {
+    match free {
+        FreeVars::BySpelling => name.base().hash(state),
+        FreeVars::ByBinder(scope) => match scope.iter().rev().find(|(n, _)| *n == name) {
+            Some((_, class)) => {
+                0u8.hash(state);
+                class.hash(state);
+            }
+            None => {
+                1u8.hash(state);
+                name.base().hash(state);
+            }
+        },
+    }
 }
 
 /// The domain-refinement predicate **term** carried by a cast `target` type,
@@ -145,7 +206,7 @@ pub(crate) fn cast_target_predicate(target: &Type) -> Option<&TypedExpr> {
 /// free-variable identity. `env` holds the in-scope binders, innermost last, so
 /// the first match scanning from the back is the lexically-closest binder —
 /// this is what makes shadowing resolve correctly.
-fn hash_name_ref(name: &Name, env: &[&Name], state: &mut DefaultHasher) {
+fn hash_name_ref(name: &Name, env: &[&Name], free: FreeVars<'_>, state: &mut DefaultHasher) {
     match env.iter().rev().position(|b| *b == name) {
         Some(debruijn) => {
             0u8.hash(state); // tag: bound
@@ -153,7 +214,7 @@ fn hash_name_ref(name: &Name, env: &[&Name], state: &mut DefaultHasher) {
         }
         None => {
             1u8.hash(state); // tag: free
-            hash_free_var(name, state);
+            hash_free_var(name, free, state);
         }
     }
 }
@@ -177,7 +238,12 @@ fn hash_name_ref(name: &Name, env: &[&Name], state: &mut DefaultHasher) {
 /// hazard (the diff never runs mid-inference).
 ///
 /// [`FieldKey`]: crate::ccl::FieldKey
-fn hash_type<'a>(ty: &'a Type, env: &mut Vec<&'a Name>, state: &mut DefaultHasher) {
+fn hash_type<'a>(
+    ty: &'a Type,
+    env: &mut Vec<&'a Name>,
+    free: FreeVars<'_>,
+    state: &mut DefaultHasher,
+) {
     use Type as T;
     std::mem::discriminant(ty).hash(state);
     match ty {
@@ -193,20 +259,20 @@ fn hash_type<'a>(ty: &'a Type, env: &mut Vec<&'a Name>, state: &mut DefaultHashe
         T::Fun {
             domain, codomain, ..
         } => {
-            hash_type(domain, env, state);
-            hash_type(codomain, env, state);
+            hash_type(domain, env, free, state);
+            hash_type(codomain, env, free, state);
         }
         T::Tuple(tys) => {
             tys.len().hash(state);
             for t in tys {
-                hash_type(t, env, state);
+                hash_type(t, env, free, state);
             }
         }
-        T::Record(fields) => hash_type_fields(fields, env, state),
-        T::Variant(fields) => hash_type_fields(fields, env, state),
+        T::Record(fields) => hash_type_fields(fields, env, free, state),
+        T::Variant(fields) => hash_type_fields(fields, env, free, state),
         T::Refinement(base, refinement) => {
-            hash_type(base, env, state);
-            hash_rel(&refinement.predicate, env).hash(state);
+            hash_type(base, env, free, state);
+            hash_rel(&refinement.predicate, env, free).hash(state);
         }
         T::History {
             value,
@@ -214,8 +280,8 @@ fn hash_type<'a>(ty: &'a Type, env: &mut Vec<&'a Name>, state: &mut DefaultHashe
             kind,
         } => {
             kind.hash(state);
-            hash_type(value, env, state);
-            hash_type(domain, env, state);
+            hash_type(value, env, free, state);
+            hash_type(domain, env, free, state);
         }
     }
 }
@@ -226,6 +292,7 @@ fn hash_type<'a>(ty: &'a Type, env: &mut Vec<&'a Name>, state: &mut DefaultHashe
 fn hash_type_fields<'a, K: Hash>(
     fields: &'a [(K, Type)],
     env: &mut Vec<&'a Name>,
+    free: FreeVars<'_>,
     state: &mut DefaultHasher,
 ) {
     let mut hs: Vec<u64> = fields
@@ -233,7 +300,7 @@ fn hash_type_fields<'a, K: Hash>(
         .map(|(key, t)| {
             let mut h = DefaultHasher::new();
             key.hash(&mut h);
-            hash_type(t, env, &mut h);
+            hash_type(t, env, free, &mut h);
             h.finish()
         })
         .collect();
@@ -242,11 +309,16 @@ fn hash_type_fields<'a, K: Hash>(
 }
 
 /// Hash an optional type, with a leading tag distinguishing `Some` from `None`.
-fn hash_opt_type<'a>(ty: Option<&'a Type>, env: &mut Vec<&'a Name>, state: &mut DefaultHasher) {
+fn hash_opt_type<'a>(
+    ty: Option<&'a Type>,
+    env: &mut Vec<&'a Name>,
+    free: FreeVars<'_>,
+    state: &mut DefaultHasher,
+) {
     match ty {
         Some(t) => {
             1u8.hash(state);
-            hash_type(t, env, state);
+            hash_type(t, env, free, state);
         }
         None => 0u8.hash(state),
     }
@@ -254,9 +326,14 @@ fn hash_opt_type<'a>(ty: Option<&'a Type>, env: &mut Vec<&'a Name>, state: &mut 
 
 /// Hash a binder's declared type and user annotation. The binder's *name* is
 /// folded into the De Bruijn environment by the caller, not hashed here.
-fn hash_binding<'a>(b: &'a TypedBinding, env: &mut Vec<&'a Name>, state: &mut DefaultHasher) {
-    hash_type(&b.ty, env, state);
-    hash_opt_type(b.user_annotation.as_ref(), env, state);
+fn hash_binding<'a>(
+    b: &'a TypedBinding,
+    env: &mut Vec<&'a Name>,
+    free: FreeVars<'_>,
+    state: &mut DefaultHasher,
+) {
+    hash_type(&b.ty, env, free, state);
+    hash_opt_type(b.user_annotation.as_ref(), env, free, state);
 }
 
 /// Hash a register-key *label* occurrence — a [`TypedExprNode::Transact`] key
@@ -269,7 +346,7 @@ fn hash_binding<'a>(b: &'a TypedBinding, env: &mut Vec<&'a Name>, state: &mut De
 /// variable of the same spelling.
 fn hash_key_ref(name: &Name, state: &mut DefaultHasher) {
     2u8.hash(state); // tag: register-key label
-    hash_free_var(name, state);
+    hash_free_var(name, FreeVars::BySpelling, state);
 }
 
 /// Hash everything about a node that is **not** a child term and not a name
@@ -284,7 +361,12 @@ fn hash_key_ref(name: &Name, state: &mut DefaultHasher) {
 ///
 /// Binder types are hashed *before* `env` is extended, because a binder's
 /// declared type lives in the enclosing scope.
-fn hash_payload<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, h: &mut DefaultHasher) {
+fn hash_payload<'a>(
+    e: &'a TypedExpr,
+    env: &mut Vec<&'a Name>,
+    free: FreeVars<'_>,
+    h: &mut DefaultHasher,
+) {
     use TypedExprNode as N;
     match &e.node {
         N::Lit(Lit::Int(n)) => n.hash(h),
@@ -315,7 +397,7 @@ fn hash_payload<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, h: &mut DefaultHa
         // domain-refinement predicate — a load-bearing term (a comprehension's
         // filter/join condition). A cast is precisely a type-level change, so
         // the target must participate.
-        N::Cast { target, .. } => hash_type(target, env, h),
+        N::Cast { target, .. } => hash_type(target, env, free, h),
         N::BinOp { op, .. } => op.hash(h),
         N::UnaryOp(kind, _) => kind.hash(h),
         N::Aggregate { kind, .. } => kind.hash(h),
@@ -325,13 +407,13 @@ fn hash_payload<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, h: &mut DefaultHa
         // the order-insensitive fold.
         N::Record(fields) => fields.len().hash(h),
 
-        N::Lambda { param, .. } => hash_binding(param, env, h),
-        N::Let { binding, .. } => hash_binding(binding, env, h),
-        N::For { target, .. } => hash_binding(target, env, h),
+        N::Lambda { param, .. } => hash_binding(param, env, free, h),
+        N::Let { binding, .. } => hash_binding(binding, env, free, h),
+        N::For { target, .. } => hash_binding(target, env, free, h),
         N::LetRec { bindings, .. } => {
             bindings.len().hash(h);
             for (b, _) in bindings {
-                hash_binding(b, env, h);
+                hash_binding(b, env, free, h);
             }
         }
         N::Case {
@@ -345,7 +427,7 @@ fn hash_payload<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, h: &mut DefaultHa
                     Some(p) => {
                         1u8.hash(h);
                         p.tag.hash(h);
-                        hash_binding(&p.binding, env, h);
+                        hash_binding(&p.binding, env, free, h);
                     }
                     None => 0u8.hash(h),
                 }
@@ -356,7 +438,7 @@ fn hash_payload<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, h: &mut DefaultHa
             writers,
             domain,
         } => {
-            hash_type(domain, env, h);
+            hash_type(domain, env, free, h);
             keys.len().hash(h);
             writers.len().hash(h);
             for w in writers {
@@ -383,17 +465,17 @@ fn hash_payload<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, h: &mut DefaultHa
 /// What *is* decided here is the associative–commutative folding of the
 /// set-shaped nodes (`Record`, `CollectionUnion`), which is a property of their
 /// algebra rather than of their scoping.
-fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>) -> u64 {
+fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, free: FreeVars<'_>) -> u64 {
     use TypedExprNode as N;
     let mut h = DefaultHasher::new();
     std::mem::discriminant(&e.node).hash(&mut h);
-    hash_payload(e, env, &mut h);
+    hash_payload(e, env, free, &mut h);
 
     // Name occurrences fold as they are met; child hashes are collected in walk
     // order so the AC nodes below can canonicalize theirs first.
     let mut children: Vec<u64> = Vec::new();
     for_each_scoped_item(e, &mut |item| match item {
-        ScopedItem::VarRef(name) => hash_name_ref(name, env, &mut h),
+        ScopedItem::VarRef(name) => hash_name_ref(name, env, free, &mut h),
         ScopedItem::KeyRef(name) => hash_key_ref(name, &mut h),
         ScopedItem::Child {
             expr: child,
@@ -401,7 +483,7 @@ fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>) -> u64 {
         } => {
             let depth = env.len();
             env.extend(binders.iter().map(|b| &b.name));
-            let hashed = hash_rel(child, env);
+            let hashed = hash_rel(child, env, free);
             env.truncate(depth);
             children.push(hashed);
         }
@@ -430,8 +512,8 @@ fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>) -> u64 {
     // so the hash is type-aware — refinements participate via `hash_rel` (see
     // `hash_type`). Pre-inference these `ty`s are `Hole` (a constant tag);
     // post-inference they carry the resolved type.
-    hash_type(&e.ty, env, &mut h);
-    hash_opt_type(e.user_annotation.as_ref(), env, &mut h);
+    hash_type(&e.ty, env, free, &mut h);
+    hash_opt_type(e.user_annotation.as_ref(), env, free, &mut h);
     h.finish()
 }
 
@@ -616,6 +698,42 @@ mod tests {
         assert_eq!(h(&refined(0)), h(&refined(0)), "same predicate matches");
         // The refinement is also distinct from its bare base type.
         assert_ne!(h(&refined(0)), h(&typed(Type::Base(BaseType::Int))));
+    }
+
+    #[test]
+    fn resolved_hash_follows_the_binder_not_the_spelling() {
+        // Two occurrences of a free variable agree iff the binders they resolve
+        // to correspond — whatever those binders happen to be called.
+        let x = Name::raw("x");
+        let y = Name::raw("y");
+        let (e_x, e_y) = (add(var("x"), int(1)), add(var("y"), int(1)));
+
+        // Same binder class, different spellings: the same computation.
+        assert_eq!(
+            resolved_hash(&e_x, &[(&x, 7)]),
+            resolved_hash(&e_y, &[(&y, 7)]),
+        );
+        // Same spelling, different binder classes: not the same computation.
+        assert_ne!(
+            resolved_hash(&e_x, &[(&x, 7)]),
+            resolved_hash(&e_x, &[(&x, 8)]),
+        );
+        // Unresolvable in either scope: falls back to the spelling, so these
+        // still differ from one another and agree with themselves.
+        assert_eq!(resolved_hash(&e_x, &[]), resolved_hash(&e_x, &[]));
+        assert_ne!(resolved_hash(&e_x, &[]), resolved_hash(&e_y, &[]));
+        // A binder in scope is not the same as no binder at all.
+        assert_ne!(resolved_hash(&e_x, &[(&x, 7)]), resolved_hash(&e_x, &[]));
+    }
+
+    #[test]
+    fn resolved_hash_still_resolves_inner_binders_positionally() {
+        // Binders *inside* the subterm keep their De Bruijn treatment — the
+        // scope only supplies what is free.
+        assert_eq!(
+            resolved_hash(&lam("x", var("x")), &[]),
+            resolved_hash(&lam("y", var("y")), &[]),
+        );
     }
 
     #[test]

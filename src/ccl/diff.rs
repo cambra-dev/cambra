@@ -61,9 +61,10 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::mem::Discriminant;
 
-use super::TypedExpr;
-use super::content_hash::{cast_target_predicate, content_hash};
+use super::content_hash::{cast_target_predicate, content_hash, resolved_hash};
 use super::context::{CompileError, CompileStage, compile_to};
+use super::scope::{ScopedItem, for_each_scoped_item};
+use super::{Name, TypedExpr};
 
 /// A node's bottom-up similarity must reach this fraction of its descendants
 /// for container recovery to pair it. The GumTree default.
@@ -846,8 +847,71 @@ mod ted {
 // Classification
 // ---------------------------------------------------------------------------
 
+/// The [`resolved_hash`] of every node of `t`, indexed the same way `t` is.
+///
+/// Walks top-down carrying the binders each node sits under, each tagged with
+/// the class `class_of` gives its owner, so a free variable inside a subterm
+/// hashes to *which binder it resolves to* rather than to how that binder
+/// happens to be spelled.
+///
+/// The binders a node puts over each of its children come from
+/// [`for_each_scoped_item`], the crate's single statement of CCL's binding
+/// structure — this walk does not restate them. It is keyed by child pointer
+/// because the differ descends into one child the scope walk does not: a cast
+/// target's refinement predicate, which is a type slot. That predicate sits in
+/// its cast's own scope, so an absent entry meaning "no binders" is exactly
+/// right for it.
+fn resolved_hashes(t: &Indexed<'_>, class_of: &dyn Fn(usize) -> u64) -> Vec<u64> {
+    fn go<'a>(
+        t: &Indexed<'a>,
+        i: usize,
+        scope: &mut Vec<(&'a Name, u64)>,
+        class_of: &dyn Fn(usize) -> u64,
+        out: &mut [u64],
+    ) {
+        out[i] = resolved_hash(t.nodes[i].expr, scope).0;
+
+        let mut introduced: HashMap<*const TypedExpr, Vec<&'a Name>> = HashMap::new();
+        for_each_scoped_item(t.nodes[i].expr, &mut |item| {
+            if let ScopedItem::Child { expr, binders } = item
+                && !binders.is_empty()
+            {
+                introduced.insert(
+                    expr as *const TypedExpr,
+                    binders.iter().map(|b| &b.name).collect(),
+                );
+            }
+        });
+
+        let class = class_of(i);
+        for &c in &t.nodes[i].children {
+            let added = introduced
+                .get(&(t.nodes[c].expr as *const TypedExpr))
+                .map_or(0, |names| {
+                    for n in names {
+                        scope.push((n, class));
+                    }
+                    names.len()
+                });
+            go(t, c, scope, class_of, out);
+            scope.truncate(scope.len() - added);
+        }
+    }
+
+    let mut out = vec![0u64; t.len()];
+    go(t, 0, &mut Vec::new(), class_of, &mut out);
+    out
+}
+
 fn classify<'a>(s: &Indexed<'a>, d: &Indexed<'a>, m: &Matching) -> Diff<'a> {
     let in_place = align_children(s, d, m);
+    // A binder's *class*: a token its counterpart in the other program shares.
+    // A src binder's class is the dst node it matched; an unmatched one gets a
+    // token out of dst's index range, so it can never look like a match.
+    let src_class = |u: usize| m.src_to_dst[u].unwrap_or(d.len() + u) as u64;
+    let dst_class = |w: usize| w as u64;
+    let src_resolved = resolved_hashes(s, &src_class);
+    let dst_resolved = resolved_hashes(d, &dst_class);
     let mut out = Diff {
         matched: Vec::new(),
         deleted: Vec::new(),
@@ -860,7 +924,7 @@ fn classify<'a>(s: &Indexed<'a>, d: &Indexed<'a>, m: &Matching) -> Diff<'a> {
             Some(w) => out.matched.push(Match {
                 src: s.nodes[u].expr,
                 dst: d.nodes[w].expr,
-                content: if s.nodes[u].hash == d.nodes[w].hash {
+                content: if src_resolved[u] == dst_resolved[w] {
                     Content::Same
                 } else {
                     Content::Changed
@@ -1658,6 +1722,47 @@ mod tests {
         assert!(
             deleted_lines.iter().all(|l| !l.contains("(+")),
             "no deleted node claims a subtree it did not take with it:\n{out}"
+        );
+    }
+
+    #[test]
+    fn renaming_a_binding_is_not_a_change() {
+        // Renaming is a denotational no-op, and the two roots hash equal, so
+        // the diff has to agree all the way down. It only does because
+        // classification resolves a free variable to *which binder it means*
+        // rather than to how that binder is spelled.
+        for (a, b) in [
+            ("x = 1\ny = x + 2\ny\n", "q = 1\ny = q + 2\ny\n"),
+            (
+                "users = [(name=\"a\", age=30)]\nsum([u.age for u in users])\n",
+                "users = [(name=\"a\", age=30)]\nsum([q.age for q in users])\n",
+            ),
+        ] {
+            let (v1, v2) = (lower(a), lower(b));
+            assert!(
+                diff(&v1, &v2).is_identical(),
+                "a pure rename must diff as identical:\n{a}\n{}",
+                diff(&v1, &v2)
+            );
+        }
+    }
+
+    #[test]
+    fn a_binder_inserted_above_a_subterm_does_not_change_it() {
+        // The trap the binder-class scheme exists to avoid. `b`'s binding and
+        // the tail below it still reach `a` through one more enclosing `let`
+        // than before; if a free variable were identified by its distance to
+        // its binder rather than by the binder itself, every reference reaching
+        // past the new one would shift and the whole tail would read as
+        // changed.
+        let v1 = lower("a = 1\nb = 2\na + b\n");
+        let v2 = lower("a = 1\nc = 9\nb = 2\na + b\n");
+        let r = diff(&v1, &v2);
+        assert!(r.deleted.is_empty(), "{r}");
+        assert!(
+            r.shared()
+                .any(|m| matches!(m.src.node, TypedExprNode::BinOp { .. })),
+            "the untouched `a + b` tail is still shared:\n{r}",
         );
     }
 
