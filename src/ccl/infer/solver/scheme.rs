@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr};
 
 use super::type_level;
 
@@ -270,9 +270,12 @@ fn freshen_refinement_predicate(
     Refinement::born(Rc::new(pred))
 }
 
-/// Freshen every type slot reachable from an expression — `expr.ty`, the user
-/// annotation, each binder's declared type, a `Cast`'s target — through one
-/// shared [`FreshenCache`], recursing into child terms. Used to freshen a
+/// Freshen every type slot reachable from an expression, through one shared
+/// [`FreshenCache`], recursing into child terms. Slot coverage is
+/// [`TypedExpr::walk_type_slots_mut`]'s — `expr.ty`, the user annotation, each
+/// binder's declared type, a `Cast`'s target — rather than enumerated here, so a
+/// new type-slot-bearing variant cannot leave a clone with a mix of fresh and
+/// original variables. Used to freshen a
 /// specialization clone's whole subtree (`infer::solve::specialize_use`)
 /// and, via [`freshen_refinement_predicate`], a refinement predicate's slots.
 ///
@@ -287,40 +290,7 @@ pub fn freshen_expr_type_slots(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) {
-    expr.ty = freshen_above(lim, &expr.ty, target, cache);
-    if let Some(annotation) = &mut expr.user_annotation {
-        *annotation = freshen_above(lim, annotation, target, cache);
-    }
-    match &mut expr.node {
-        TypedExprNode::Lambda { param, .. } => {
-            param.ty = freshen_above(lim, &param.ty, target, cache);
-        }
-        TypedExprNode::Cast {
-            target: cast_target,
-            ..
-        } => {
-            *cast_target = freshen_above(lim, cast_target, target, cache);
-        }
-        TypedExprNode::Let { binding, .. } => {
-            binding.ty = freshen_above(lim, &binding.ty, target, cache);
-        }
-        TypedExprNode::Case { branches, .. } => {
-            for b in branches.iter_mut() {
-                if let Some(p) = &mut b.pattern {
-                    p.binding.ty = freshen_above(lim, &p.binding.ty, target, cache);
-                }
-            }
-        }
-        TypedExprNode::LetRec { bindings, .. } => {
-            for (b, _) in bindings.iter_mut() {
-                b.ty = freshen_above(lim, &b.ty, target, cache);
-            }
-        }
-        TypedExprNode::For { target: t, .. } => {
-            t.ty = freshen_above(lim, &t.ty, target, cache);
-        }
-        _ => {}
-    }
+    expr.walk_type_slots_mut(|ty| *ty = freshen_above(lim, ty, target, cache));
     expr.walk_children_mut(|c| freshen_expr_type_slots(c, lim, target, cache));
 }
 

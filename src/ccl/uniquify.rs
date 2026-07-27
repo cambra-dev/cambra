@@ -94,6 +94,19 @@ struct Uniquifier {
     /// discipline, without which overwriting `r.predicate` could free an address
     /// a later `Rc::new` in the same walk reclaims, colliding an unrelated
     /// predicate with this entry.
+    ///
+    /// **Why reusing an entry is sound here**, given that the transform resolves
+    /// free variables against `env` — context the memo key does not name (see
+    /// [`PredMemo`]'s note on key-determined transforms). Lowering shares a
+    /// predicate `Rc` across slots only by *copying one refinement*, and where it
+    /// copies an already-lowered subtree it runs this pass on that subtree
+    /// **before** cloning (see the module docs' "mint before copy"). So every
+    /// occurrence sharing an `Rc` either sits in one scope, or is a copy whose
+    /// binders are already minted and whose free variables therefore resolve the
+    /// same way wherever the copy lands. Two occurrences that *should* uniquify
+    /// differently — the same predicate spelling under two different bindings —
+    /// arrive as distinct `Rc`s, which is what the scope-blind-equality test at the
+    /// bottom of this file pins.
     memo: PredMemo,
 }
 

@@ -831,7 +831,45 @@ pub struct PredMemo {
 /// `finish*` methods consume one, so it cannot be confused with a rebuild: the
 /// "did you pass the origin or the rebuild?" mistake the raw `record(Rc, Rc)`
 /// shape invited is not expressible.
-pub struct Origin(Rc<Expr>);
+///
+/// **An opened rebuild must be closed.** Dropping the token instead of passing it
+/// to a `finish*` is silent and lossy, not merely wasteful: the caller's transform
+/// result is discarded, the slot keeps its origin `Rc`, and nothing is memoized —
+/// so a pass that opened a rebuild and then returned early (a `?` between the two
+/// halves) leaves that occurrence un-rewritten while its siblings are rewritten.
+/// The `#[must_use]` on the opening methods catches ignoring the token; this
+/// type's `Drop` catches losing it on an early return.
+pub struct Origin(Option<Rc<Expr>>);
+
+impl Origin {
+    /// The retained origin `Rc`, defusing the drop check — the `finish*` methods'
+    /// single exit.
+    fn consume(mut self) -> Rc<Expr> {
+        self.0.take().expect("an Origin is consumed exactly once")
+    }
+
+    /// The origin `Rc` without consuming the token.
+    fn peek(&self) -> &Rc<Expr> {
+        self.0.as_ref().expect("an Origin is consumed exactly once")
+    }
+}
+
+impl Drop for Origin {
+    fn drop(&mut self) {
+        // Unwinding already: a second panic from a destructor aborts the process,
+        // which would bury the original failure.
+        if std::thread::panicking() {
+            return;
+        }
+        debug_assert!(
+            self.0.is_none(),
+            "a `PredMemo` rebuild was opened and never finished: the transform's result is \
+             discarded, the occurrence silently keeps its origin `Rc`, and nothing is \
+             memoized. Every `begin`/`begin_always` must reach a `finish`, \
+             `finish_shared`, or `finish_unchanged` — including on error paths."
+        );
+    }
+}
 
 impl PredMemo {
     pub fn new() -> Self {
@@ -851,6 +889,7 @@ impl PredMemo {
     /// its own transform — which is what lets a pass whose transform needs
     /// `&mut Ctx` (with the memo living in that `Ctx`) drive this protocol
     /// without a borrow conflict.
+    #[must_use = "an opened rebuild must be closed with a `finish*` — see `Origin`"]
     pub fn begin(&mut self, refinement: &mut Refinement) -> Option<(Origin, Expr)> {
         if let Some((_, rebuilt)) = self.entries.get(&refinement.predicate_id()) {
             let rebuilt = Rc::clone(rebuilt);
@@ -865,6 +904,7 @@ impl PredMemo {
     /// occurrence. Always returns the [`Origin`] token and a copy — there is no
     /// skip — to be closed with [`finish_shared`](Self::finish_shared), which
     /// unifies the term while leaving the per-occurrence work already done.
+    #[must_use = "an opened rebuild must be closed with a `finish*` — see `Origin`"]
     pub fn begin_always(&self, refinement: &Refinement) -> (Origin, Expr) {
         self.open(refinement)
     }
@@ -888,10 +928,14 @@ impl PredMemo {
     /// occurrences denote one refinement, and the winning term's embedded type
     /// slots are as good as the discarded one's.
     pub fn finish_shared(&mut self, refinement: &mut Refinement, origin: Origin, rebuilt: Expr) {
-        match self.entries.get(&Rc::as_ptr(&origin.0)) {
+        match self.entries.get(&Rc::as_ptr(origin.peek())) {
             Some((_, shared)) => {
                 let shared = Rc::clone(shared);
                 self.point_at(refinement, shared);
+                // The entry already retains its own keepalive for this key, so
+                // this token has nothing left to record — but it still has to be
+                // consumed rather than dropped (see `Origin`).
+                drop(origin.consume());
             }
             None => self.finish(refinement, origin, rebuilt),
         }
@@ -907,7 +951,7 @@ impl PredMemo {
     /// "would this transform do anything?" test — `subst`'s `is_free` scan, say —
     /// from once per *occurrence* into once per distinct predicate.
     pub fn finish_unchanged(&mut self, refinement: &mut Refinement, origin: Origin) {
-        let kept = Rc::clone(&origin.0);
+        let kept = Rc::clone(origin.peek());
         self.point_at(refinement, Rc::clone(&kept));
         self.insert(origin, kept);
     }
@@ -936,7 +980,7 @@ impl PredMemo {
     /// Mint the [`Origin`] token and the working copy for a miss.
     fn open(&self, refinement: &Refinement) -> (Origin, Expr) {
         (
-            Origin(Rc::clone(&refinement.predicate)),
+            Origin(Some(Rc::clone(&refinement.predicate))),
             (*refinement.predicate).clone(),
         )
     }
@@ -945,8 +989,8 @@ impl PredMemo {
     /// lifetime (see the type-level note on address reuse) while mapping it to
     /// `rebuilt`.
     fn insert(&mut self, origin: Origin, rebuilt: Rc<Expr>) {
-        let key = Rc::as_ptr(&origin.0);
-        self.entries.insert(key, (origin.0, rebuilt));
+        let origin = origin.consume();
+        self.entries.insert(Rc::as_ptr(&origin), (origin, rebuilt));
     }
 }
 

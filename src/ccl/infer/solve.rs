@@ -1576,6 +1576,15 @@ pub(super) fn retype_predicate_slots(
 /// combinator's job — this only supplies the per-predicate transform, so a new
 /// `Type` variant can never be silently missed and the `PredMemo` discipline is
 /// inherited rather than re-hand-rolled.
+/// **Why reusing an entry is sound here**, given that the stamp reads `scope` —
+/// context the memo key does not name (see [`PredMemo`]'s note on key-determined
+/// transforms). The stamp looks a binder up *by `Name`*, and binder names carry
+/// uids minted once at lowering, so a name denotes one binder with one resolved
+/// type. Copies preserve uids, so two copies of a subtree agree; and the one place
+/// copies get *different* types — a monomorphization clone — rebuilds its
+/// predicates as fresh `Rc`s while freshening (`freshen_refinement_predicate`), so
+/// clones never share an `Rc` to collapse. Occurrences sharing one `Rc` therefore
+/// stamp identically.
 fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>, memo: &mut PredMemo) {
     walk_refined_predicates_mut(ty, memo, &mut |pred, memo| {
         // Always reported as changed: retyping rewrites *type slots* inside the

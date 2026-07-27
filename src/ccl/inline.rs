@@ -551,6 +551,17 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &mut Pre
 /// inside a predicate must also *beta-reduce* the call sites it creates —
 /// substitution proper is the engine's job and runs inside
 /// [`inline_and_beta_reduce`] via `lambda_elim::substitute`.
+/// **Why one memo may span the whole sweep** even though the rewrite is
+/// scope-sensitive (see [`PredMemo`]'s note on key-determined transforms).
+/// `[name ↦ lambda]` must not fire under a binder that shadows `name`, and unlike
+/// `subst` — which descends into such a scope with a *restricted* substitution,
+/// and therefore needs a fresh memo per shrink — [`inline_and_beta_reduce`] does
+/// not descend at all: every binder arm that matches `name` returns its node with
+/// the body untouched. An occurrence inside a shadowed scope is thus never
+/// *visited*, so there is no hit to serve it the outer rebuild. That is a real
+/// dependency of this memo's scope on that skipping behaviour: an arm rewritten to
+/// descend-with-a-guard instead of skip would silently reintroduce the leak, and
+/// would need `Subst::recurse_shrunk`'s treatment.
 fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr, memo: &mut PredMemo) {
     walk_refined_predicates_mut(ty, memo, &mut |pred, memo| {
         // A predicate the inlined binder does not occur in is reported
