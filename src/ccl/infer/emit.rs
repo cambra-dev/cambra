@@ -1347,3 +1347,52 @@ pub(super) fn emit_transact<C: Typing>(
     }
     Ok(Type::Record(fields))
 }
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::ccl::{BinOpKind, CompareKind, Lit, TypedExpr};
+    use std::rc::Rc;
+
+    /// Finding 2: [`emit_bare_predicate`]'s transform is parameterized by
+    /// `domain`, which is not part of the memo key. `emit_cast` passes a *fresh*
+    /// inference variable per cast node, so two occurrences of one shared
+    /// predicate `Rc` are typed against two different domains — and the memo
+    /// makes the second one emit nothing at all, leaving its domain with none of
+    /// the constraints the predicate imposes on `REFINEMENT_BINDER`.
+    #[test]
+    fn each_occurrence_constrains_its_own_domain() {
+        // `__elem > 0` — using the element binder is what makes the predicate
+        // constrain the domain it is typed against.
+        let shared = Rc::new(TypedExpr::binop(
+            TypedExpr::var(Name::elem()),
+            BinOpKind::Compare(CompareKind::Greater),
+            TypedExpr::lit(Lit::Int(0)),
+        ));
+        let mut r1 = Refinement::sharing(&shared);
+        let mut r2 = Refinement::sharing(&shared);
+
+        let mut ctx = InferCtx::new(std::collections::HashMap::new());
+        let d1 = ctx.fresh();
+        let d2 = ctx.fresh();
+        emit_bare_predicate(&mut r1, &d1, &mut ctx).expect("first occurrence types");
+        emit_bare_predicate(&mut r2, &d2, &mut ctx).expect("second occurrence types");
+
+        let bound_count = |t: &Type| {
+            let Type::Infer(v) = t else {
+                panic!("fresh() yields a variable");
+            };
+            let b = v.bounds.borrow();
+            b.lower.len() + b.upper.len()
+        };
+        assert!(
+            bound_count(&d1) > 0,
+            "sanity: typing `__elem > 0` at `d1` constrains `d1`",
+        );
+        assert!(
+            bound_count(&d2) > 0,
+            "the second occurrence's domain must be constrained by the predicate \
+             too — the memo hit skipped emission and left `d2` unbounded",
+        );
+    }
+}
