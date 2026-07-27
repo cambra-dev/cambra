@@ -173,6 +173,8 @@ After making code changes, run the formatter before running the code; prefer run
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
 
+The inspector crate has its own pinned-expectation suites (wire fixtures + the census ratchet) with re-bless procedures; see `cambra-inspector/CLAUDE.md` before touching anything that moves them.
+
 ### Compact instructions
 
 When you are using compact, focus on test output and code changes.

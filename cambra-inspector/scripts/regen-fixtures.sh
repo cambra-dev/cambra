@@ -22,6 +22,14 @@
 # gate and the fix path can never disagree about how a fixture is produced.
 set -euo pipefail
 
+# Fail fast with an actionable message rather than a mid-loop "command not
+# found" after some fixtures were already rewritten. cargo is the script's
+# only external dependency (the binary pretty-prints its own output).
+command -v cargo > /dev/null 2>&1 || {
+  echo "regen-fixtures.sh: cargo not found on PATH — install the Rust toolchain (rustup) first" >&2
+  exit 1
+}
+
 cd "$(dirname "$0")/../.." || exit 1 # -> cambra/ repo root
 MANIFEST="cambra-inspector/scripts/fixtures.manifest"
 FIX="${1:-cambra-inspector/web/src/__fixtures__}"
@@ -39,3 +47,5 @@ while read -r name example; do
 done < "${MANIFEST}"
 
 echo "done. Review the diff: git diff ${FIX}"
+echo "If web/src/ changed too, rebuild and commit the bundle:"
+echo "  (cd cambra-inspector/web && npm run build)   # ci_web compares dist/index.html"
