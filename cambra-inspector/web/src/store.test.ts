@@ -14,14 +14,14 @@
 import { describe, expect, it } from "vitest";
 
 import { Store } from "./store";
-import { PANE_IDS, validateSnapshot } from "./wireValidate";
-import { allNodes, paneById, theNode } from "./__fixtures__/helpers";
+import { PANE_IDS } from "./wireValidate";
+import { allNodes, fixture, paneById, theNode } from "./__fixtures__/helpers";
 
 import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
 
-const arithmetic = validateSnapshot(arithmeticJson);
-const polymorphic = validateSnapshot(polymorphicJson);
+const arithmetic = fixture(arithmeticJson);
+const polymorphic = fixture(polymorphicJson);
 
 const sorted = (xs: string[]): string[] => [...xs].sort();
 
@@ -31,9 +31,11 @@ describe("T3: wire-shape contract (golden fixture matches the TS types)", () => 
     ["polymorphic", polymorphic],
   ] as const) {
     it(`${name}: the ordered panes + one paneLinks window per adjacent pair`, () => {
-      // A literal, not SCHEMA_VERSION: validateSnapshot already pinned the
-      // payload against the constant, so reading it here would assert it equals
-      // itself. The literal is what fails when the constant moves.
+      // A literal, not SCHEMA_VERSION: `fixture()` already refused to load a
+      // payload whose schema is not the constant, so reading the constant here
+      // would assert it equals itself. The literal is the only spelling of this
+      // line that can fail — it is what a version bump has to come back and
+      // update.
       expect(snap.meta.schema).toBe(1);
       expect(snap.panes.map((s) => s.id)).toEqual([...PANE_IDS]);
       expect(snap.panes.map((s) => s.kind)).toEqual([
