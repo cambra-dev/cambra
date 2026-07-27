@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 use crate::ccl::{
     BaseType, Builtin, Expr, Lit, Name, PredicateId, Refinement, Type, TypedExprNode,
 };
@@ -397,12 +398,14 @@ fn refine_with(base: Type, predicate: &Expr) -> Type {
 /// Count free occurrences of `name` in `expr`, including occurrences in
 /// any refinement predicates carried by the expression's type.
 ///
-/// A variable is *free* at a use site when no enclosing
-/// [`TypedExprNode::Lambda`] or [`TypedExprNode::Let`] inside `expr`
-/// shadows the name on the path to that use; the count is the number of
-/// such free uses.  [`TypedExprNode::Feed`] / [`TypedExprNode::Define`]
-/// nodes treat their `name` field as a use of the defer-handle variable,
-/// so writes to that defer count as occurrences too.
+/// A variable is *free* at a use site when no binder inside `expr` shadows the
+/// name on the path to that use; the count is the number of such free uses.
+/// The shadowing rules are not restated here — the walk folds over
+/// [`crate::ccl::scope::for_each_scoped_item`], which declares them once for the
+/// whole crate. Consequently [`TypedExprNode::Feed`] / [`TypedExprNode::Define`]
+/// / [`TypedExprNode::MutWrite`] target names count as occurrences (they are
+/// *uses* of the handle / mutable variable), while a
+/// [`TypedExprNode::Transact`] register key does not (it is a field label).
 ///
 /// A [`Type::Refinement`] is a binding form too — it binds
 /// [`crate::ccl::REFINEMENT_BINDER`] (`__elem`) in its predicate — so occurrences
@@ -446,115 +449,23 @@ fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<Predi
     // sharing improves) is still counted once.
     let mut in_type = 0;
     expr.walk_type_slots(|ty| in_type += count_free_in_type_with_visited(name, ty, visited));
-    let in_node = match &expr.node {
-        TypedExprNode::Var(n) => (n == name) as usize,
-
-        TypedExprNode::Lambda { param, body } => {
-            // Domain refinements ride the type lattice, so any free
-            // occurrences in a refinement predicate are counted by
-            // `count_free_in_type_with_visited` on `expr.ty` above (and live
-            // in the *outer* scope, unshadowed). Here `param.name` shadows
-            // `name` inside the lambda body.
-            if &param.name == name {
-                0
-            } else {
-                count_free_with_visited(name, body, visited)
+    // The term spine is a fold over the shared scoping walk: a child whose
+    // binder list mentions `name` is shadowed and contributes nothing;
+    // everything else recurses. Register-key labels (`KeyRef`) are not variable
+    // occurrences, so they do not count.
+    let mut in_node = 0;
+    for_each_scoped_item(expr, &mut |item| match item {
+        ScopedItem::VarRef(n) => in_node += (n == name) as usize,
+        ScopedItem::KeyRef(_) => {}
+        ScopedItem::Child {
+            expr: child,
+            binders,
+        } => {
+            if !binders.iter().any(|b| &b.name == name) {
+                in_node += count_free_with_visited(name, child, visited);
             }
         }
-
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            // `binding.name` shadows `name` inside `body` only.
-            count_free_with_visited(name, bound_expr, visited)
-                + if &binding.name == name {
-                    0
-                } else {
-                    count_free_with_visited(name, body, visited)
-                }
-        }
-
-        // Mutual recursion: every group binder scopes every binding body
-        // and the letrec body, so a group binder matching `name` shadows it
-        // across the whole group.
-        TypedExprNode::LetRec { bindings, body } => {
-            if bindings.iter().any(|(b, _)| &b.name == name) {
-                0
-            } else {
-                bindings
-                    .iter()
-                    .map(|(_, def)| count_free_with_visited(name, def, visited))
-                    .sum::<usize>()
-                    + count_free_with_visited(name, body, visited)
-            }
-        }
-
-        // The `name` field of Feed/Define/MutWrite is a *use* of the defer
-        // handle / mutable variable — `Feed("x", v)` (and `x := v`) is a
-        // write to `x`, so `x` is free here in addition to any free uses
-        // inside `value`.
-        TypedExprNode::Feed {
-            name: handle,
-            value,
-        }
-        | TypedExprNode::Define {
-            name: handle,
-            value,
-        }
-        | TypedExprNode::MutWrite {
-            name: handle,
-            value,
-        } => (handle == name) as usize + count_free_with_visited(name, value, visited),
-
-        // The loop target shadows `name` inside the body only; the source
-        // is evaluated in the outer scope.
-        TypedExprNode::For { target, iter, body } => {
-            count_free_with_visited(name, iter, visited)
-                + if &target.name == name {
-                    0
-                } else {
-                    count_free_with_visited(name, body, visited)
-                }
-        }
-
-        // A `Case` branch's structural pattern binds its payload name,
-        // shadowing `name` inside that branch's guard and body.
-        // `walk_children` only visits child Exprs and can't see that
-        // `pattern.binding.name` shadows `name`, so it would over-count
-        // free occurrences in shadowing branches. Handle `Case` explicitly.
-        // (Guard-only branches have `pattern: None` and never shadow.)
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            let scrut = scrutinee
-                .as_ref()
-                .map_or(0, |s| count_free_with_visited(name, s, visited));
-            scrut
-                + branches
-                    .iter()
-                    .map(|b| {
-                        if b.pattern.as_ref().is_some_and(|p| &p.binding.name == name) {
-                            0
-                        } else {
-                            count_free_with_visited(name, &b.guard, visited)
-                                + count_free_with_visited(name, &b.body, visited)
-                        }
-                    })
-                    .sum::<usize>()
-        }
-
-        // VariantCtor payload and all other variants: just sum counts
-        // across the direct children.  Atoms (Lit/Proj/Builtin/Source/
-        // Defer) have no children, so the fold returns 0.
-        _ => {
-            let mut sum = 0;
-            expr.walk_children(|e| sum += count_free_with_visited(name, e, visited));
-            sum
-        }
-    };
+    });
     in_node + in_type
 }
 
@@ -580,89 +491,25 @@ pub fn is_free_in_value(name: &Name, expr: &Expr) -> bool {
     count_free_in_value(name, expr) > 0
 }
 
-/// Value-only worker for [`is_free_in_value`]: mirrors [`count_free`]'s
-/// shadowing rules over the node tree but never descends into type slots (and so
-/// a refinement on a `Lambda` param — which lives in the type — is ignored).
+/// Value-only worker for [`is_free_in_value`]: the same fold over
+/// [`crate::ccl::scope::for_each_scoped_item`] as [`count_free`], minus the type
+/// slots (so a refinement on a `Lambda` param — which lives in the type — is
+/// ignored).
 fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
-    match &expr.node {
-        TypedExprNode::Var(n) => (n == name) as usize,
-        TypedExprNode::Lambda { param, body, .. } => {
-            if &param.name == name {
-                0
-            } else {
-                count_free_in_value(name, body)
+    let mut sum = 0;
+    for_each_scoped_item(expr, &mut |item| match item {
+        ScopedItem::VarRef(n) => sum += (n == name) as usize,
+        ScopedItem::KeyRef(_) => {}
+        ScopedItem::Child {
+            expr: child,
+            binders,
+        } => {
+            if !binders.iter().any(|b| &b.name == name) {
+                sum += count_free_in_value(name, child);
             }
         }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            count_free_in_value(name, bound_expr)
-                + if &binding.name == name {
-                    0
-                } else {
-                    count_free_in_value(name, body)
-                }
-        }
-        // See the LetRec arm of `count_free_with_visited`: group binders
-        // shadow `name` across every binding body and the letrec body.
-        TypedExprNode::LetRec { bindings, body } => {
-            if bindings.iter().any(|(b, _)| &b.name == name) {
-                0
-            } else {
-                bindings
-                    .iter()
-                    .map(|(_, def)| count_free_in_value(name, def))
-                    .sum::<usize>()
-                    + count_free_in_value(name, body)
-            }
-        }
-        TypedExprNode::Feed {
-            name: handle,
-            value,
-        }
-        | TypedExprNode::Define {
-            name: handle,
-            value,
-        }
-        | TypedExprNode::MutWrite {
-            name: handle,
-            value,
-        } => (handle == name) as usize + count_free_in_value(name, value),
-        // The loop target shadows `name` in the body only.
-        TypedExprNode::For { target, iter, body } => {
-            count_free_in_value(name, iter)
-                + if &target.name == name {
-                    0
-                } else {
-                    count_free_in_value(name, body)
-                }
-        }
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            scrutinee
-                .as_ref()
-                .map_or(0, |s| count_free_in_value(name, s))
-                + branches
-                    .iter()
-                    .map(|b| {
-                        if b.pattern.as_ref().is_some_and(|p| &p.binding.name == name) {
-                            0
-                        } else {
-                            count_free_in_value(name, &b.guard) + count_free_in_value(name, &b.body)
-                        }
-                    })
-                    .sum::<usize>()
-        }
-        _ => {
-            let mut sum = 0;
-            expr.walk_children(|e| sum += count_free_in_value(name, e));
-            sum
-        }
-    }
+    });
+    sum
 }
 
 /// Returns `true` if `name` appears free inside a refinement predicate

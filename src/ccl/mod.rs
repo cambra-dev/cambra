@@ -19,6 +19,7 @@ pub mod mut_elim;
 pub mod names;
 pub mod planning;
 pub mod provenance;
+pub mod scope;
 pub mod simplify;
 pub mod subst;
 pub mod symbolic;

@@ -49,6 +49,26 @@ After uniquification, shadowing ceases to exist for every downstream pass: plain
 
 Renaming happens at the name level only — the tree shape is untouched, so this does not over-normalize the way strict ANF or SSA conversion would.
 
+### Binding structure lives in one place
+
+Which children a node's binders scope over is stated once, in `ccl/scope.rs`'s `for_each_scoped_item`: it visits each direct child paired with the binders in scope for it, plus the name *occurrences* the node makes itself. Every scope-aware walk in the crate is a fold over it — free-occurrence counting (`ccl_utils`'s `count_free`, `count_free_in_value`), free-variable collection (`subst`'s `collect_expr_fv`), and capture-avoiding substitution (`Subst::rewrite_expr`, via the `for_each_scoped_child_mut` adapter).
+
+The rules themselves:
+
+- `Lambda` — `param` scopes over `body`.
+- `Let` — `binding` scopes over `body` only; `bound_expr` is outside it (CCL's `let` is non-recursive).
+- `LetRec` — every group binder scopes over every binding's definition and over `body`.
+- `For` — `target` scopes over `body`; `iter` is outside.
+- `Case` — each branch's `pattern.binding` scopes over that branch's `guard` and `body`, and nothing else.
+- `Feed` / `Define` / `MutWrite` — the `name` field is a *use* of the binder it names, not a binder.
+- `Transact` — introduces no binder; its keys are labels of the register record the node denotes, so they are surfaced as a distinct occurrence kind that free-*variable* analyses skip while an identity-sensitive consumer still folds them in.
+
+The walk's `match` is exhaustive with **no wildcard arm**, deliberately: before this existed, the walkers ended in `_ => walk_children(..)`, so a new binding form compiled clean in all of them and silently got the wrong scope in every one. Now it is a compile error until the new form declares its scope. `TypedExpr::walk_binders` — the enumeration of binding *slots*, which the scoped walk is checked against and which `uniquify`'s post-pass mint assertion runs on — is exhaustive for the same reason: a wildcard there would let a new binding form be invisible to the assertion that is supposed to catch a forgotten mint, which is the same failure mode one layer down.
+
+Two passes stay outside the fold and say why in their own docs: `ccl/uniquify.rs` *mints* binders rather than observing them, and substitution's transport mode (`Subst::apply_expr_inner`) rebuilds nodes rather than walking them.
+
+Consumers may rely on three properties of the walk, each asserted in `scope.rs`'s tests: the `Child` items come in `walk_children` order (so the `&mut` adapter can pair binder lists positionally), the binders it declares are exactly `walk_binders`', and a scope's children are consecutive with a binder-introducing scope entered only once. The last is what lets a consumer build per-scope state once per scope rather than once per child — `Subst::shadow_all` restricting a substitution across a `LetRec` group, for instance, which borrows instead of cloning whenever the group names nothing the substitution acts on.
+
 ### Application shape
 
 Function application is a single `Apply(Box<Expr>, Box<Expr>)` node. Single-argument CHL calls `f(a)` lower to `Apply(a, Var(f))` directly. Multi-argument CHL calls `f(a, b, ...)` lower to `Apply(Tuple([a, b, ...]), Var(f))` — the arguments are tupled so the call shape matches how multi-arg CHL lambdas are uncurried at lowering time (see [lowering.md](lowering.md)).

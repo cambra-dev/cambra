@@ -51,11 +51,13 @@
 //! correct — acting differently in different scopes is the whole job of a
 //! substitution, so scope cannot be left out of the key.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, is_free};
 use crate::ccl::provenance::NodeId;
+use crate::ccl::scope::{ScopedItem, for_each_scoped_child_mut, for_each_scoped_item};
 use crate::ccl::{Branch, Name, PredicateId, Type, TypedExpr, TypedExprNode};
 
 /// A term binder name.
@@ -506,9 +508,7 @@ impl Subst {
                 // Mutual recursion: every group binder is in scope in every
                 // binding body AND the letrec body, so all of them shadow the
                 // substitution throughout the group.
-                let inner = bindings
-                    .iter()
-                    .fold(self.clone(), |s, (b, _)| s.shadow(&b.name));
+                let inner = self.shadow_all(bindings.iter().map(|(b, _)| &b.name));
                 LetRec {
                     bindings: bindings
                         .iter()
@@ -527,11 +527,9 @@ impl Subst {
                     .iter()
                     .map(|b| {
                         // A structural pattern binds its payload name inside the
-                        // branch's guard and body.
-                        let inner = match &b.pattern {
-                            Some(p) => self.shadow(&p.binding.name),
-                            None => self.clone(),
-                        };
+                        // branch's guard and body; a guard-only branch binds
+                        // nothing, which `shadow_all` handles as the empty scope.
+                        let inner = self.shadow_all(b.pattern.iter().map(|p| &p.binding.name));
                         Branch {
                             pattern: b.pattern.clone(),
                             guard: inner.apply_expr(&b.guard),
@@ -664,105 +662,46 @@ impl Subst {
         // unrestricted substitution is the right one for it, and the binder
         // crossings below still only guard the children.
         e.walk_type_slots_mut(|ty| self.rewrite_type_go(ty, memo));
+        // The one node-local slot the type walk and the generic child descent
+        // both miss: the write target of a handle node, which is a *use* of a
+        // binder (see `crate::ccl::scope`, which declares it as such) rather
+        // than a type or a child, so a var-shaped mapping retargets it.
         match &mut e.node {
-            TypedExprNode::Var(_) => {}
-
-            TypedExprNode::Cast { value, .. } => {
-                self.rewrite_expr_go(value, memo);
-            }
-
-            TypedExprNode::Feed { name, value }
-            | TypedExprNode::Define { name, value }
-            | TypedExprNode::MutWrite { name, value } => {
-                *name = self.handle_target(name);
-                self.rewrite_expr_go(value, memo);
-            }
-
-            TypedExprNode::Lambda { param, body } => {
-                // `param.ty` was rewritten with the node's other type slots above
-                // — it is an independent `Rc` from the one on `e.ty`'s `Fun`
-                // domain, so it needs its own visit. Only the body is under the
-                // binder.
-                self.under_binder_mut(&param.name, body, memo);
-            }
-
-            TypedExprNode::For { target, iter, body } => {
-                self.rewrite_expr_go(iter, memo);
-                self.under_binder_mut(&target.name, body, memo);
-            }
-
-            TypedExprNode::Let {
-                binding,
-                bound_expr,
-                body,
-            } => {
-                self.rewrite_expr_go(bound_expr, memo);
-                self.under_binder_mut(&binding.name, body, memo);
-            }
-
-            TypedExprNode::LetRec { bindings, body } => {
-                // Every group binder scopes every binding body and the letrec
-                // body (mutual recursion) — shadow them all before descending
-                // anywhere inside the group.
-                let inner = bindings
-                    .iter()
-                    .fold(self.clone(), |s, (b, _)| s.shadow(&b.name));
-                for (b, _) in bindings.iter() {
-                    inner.assert_no_capture(&b.name);
-                }
-                for (_, def) in bindings.iter_mut() {
-                    inner.rewrite_expr_go(def, memo);
-                }
-                inner.rewrite_expr_go(body, memo);
-            }
-
-            TypedExprNode::Case {
-                scrutinee,
-                branches,
-            } => {
-                if let Some(sc) = scrutinee {
-                    self.rewrite_expr_go(sc, memo);
-                }
-                for b in branches.iter_mut() {
-                    let inner = match &b.pattern {
-                        Some(p) => self.shadow(&p.binding.name),
-                        None => self.clone(),
-                    };
-                    if let Some(p) = &b.pattern {
-                        inner.assert_no_capture(&p.binding.name);
-                    }
-                    inner.rewrite_expr_go(&mut b.guard, memo);
-                    inner.rewrite_expr_go(&mut b.body, memo);
-                }
-            }
-
-            TypedExprNode::Compose(elts) => {
-                for el in elts.iter_mut() {
-                    self.rewrite_expr_go(el, memo);
-                }
-                // Recompute the chain type from the rewritten ends, when both
-                // are concrete enough to read.
-                if let (Some(first), Some(last)) = (elts.first(), elts.last())
-                    && let (Some(d), Some(c)) = (first.ty.domain(), last.ty.codomain())
-                {
-                    e.ty = Type::fun(d, c);
-                }
-            }
-
-            // No binders introduced: recurse structurally into child terms.
-            _ => e.walk_children_mut(|c| self.rewrite_expr_go(c, memo)),
+            TypedExprNode::Feed { name, .. }
+            | TypedExprNode::Define { name, .. }
+            | TypedExprNode::MutWrite { name, .. } => *name = self.handle_target(name),
+            _ => {}
         }
-    }
 
-    /// In-place analogue of [`Self::under_binder`]: shadow, assert
-    /// no-capture, recurse into the binder's scope.
-    fn under_binder_mut(&self, binder: &Name, body: &mut TypedExpr, memo: &PredMemo<Subst>) {
-        let restricted = self.shadow(binder);
-        if !restricted.0.keys().any(|k| is_free(k, body)) {
-            return;
+        // Capture-avoiding descent: each child is rewritten under the
+        // substitution restricted by the binders that scope over it. Which
+        // binders those are is not decided here — `for_each_scoped_child_mut`
+        // is the crate's one statement of CCL's binding structure. An empty
+        // binder list needs no special case: `shadow_all` borrows and the
+        // recursive call is the unrestricted one.
+        //
+        // Inertness is *not* pre-tested here. The recursive call opens with the
+        // same test against the same substitution, so testing it here would walk
+        // every child subtree twice — and returning early on it would skip the
+        // Barendregt assertion below, which is the tripwire for a broken
+        // uid-preservation invariant and should fire wherever the binder is
+        // crossed, not only where the substitution happens to be live.
+        for_each_scoped_child_mut(e, &mut |child, binders| {
+            let inner = self.shadow_all(binders);
+            for b in binders {
+                inner.assert_no_capture(b);
+            }
+            inner.rewrite_expr_go(child, memo);
+        });
+
+        // `Compose`'s type is derived from its elements, so rewriting them can
+        // concretize it (substituting a `Var` whose type was a placeholder).
+        if let TypedExprNode::Compose(elts) = &e.node
+            && let (Some(first), Some(last)) = (elts.first(), elts.last())
+            && let (Some(d), Some(c)) = (first.ty.domain(), last.ty.codomain())
+        {
+            e.ty = Type::fun(d, c);
         }
-        restricted.assert_no_capture(binder);
-        restricted.rewrite_expr_go(body, memo);
     }
 
     /// The Barendregt no-capture invariant at a binder crossing (see
@@ -950,6 +889,28 @@ impl Subst {
         let mut m = self.0.clone();
         m.remove(binder);
         Subst(m)
+    }
+
+    /// This substitution restricted so it acts on **none** of `binders` — the
+    /// whole-scope form of [`Self::shadow`], for the nodes whose binders scope
+    /// over a child as a group (a `LetRec`'s mutual-recursion group, a `Case`
+    /// branch's payload, an empty list for a child in the node's own scope).
+    ///
+    /// Returns a borrow when the restriction is vacuous, which is the common
+    /// case: a substitution's domain is usually a single binder and the scope
+    /// being crossed usually does not name it. That matters because a scope's
+    /// children are yielded consecutively (see [`crate::ccl::scope`]), so the
+    /// restriction is recomputed once per child — folding [`Self::shadow`] over
+    /// the list instead would clone the map once per binder per child, since
+    /// `shadow` returns an owned `Subst` and so clones even on a miss.
+    pub fn shadow_all<'a>(&self, binders: impl IntoIterator<Item = &'a Name>) -> Cow<'_, Subst> {
+        let mut out = Cow::Borrowed(self);
+        for b in binders {
+            if out.0.contains_key(b) {
+                out.to_mut().0.remove(b);
+            }
+        }
+        out
     }
 
     /// Apply this substitution to a **type**, rewriting the term binders that
@@ -1142,11 +1103,11 @@ fn collect_type_fv(
     }
 }
 
-/// Collect the free term-variable names of an expression, respecting the
-/// binders introduced by lambdas / `let`s / loops / match arms (mirrors the
-/// shadowing rules of [`crate::ccl::ccl_utils::count_free`]). Also descends
-/// into each sub-expression's type slot, since predicate sub-terms may carry
-/// further refinements.
+/// Collect the free term-variable names of an expression — the accumulating
+/// dual of [`crate::ccl::ccl_utils::count_free`]'s by-name query, and the same
+/// fold over [`crate::ccl::scope::for_each_scoped_item`], so the two cannot
+/// disagree about what binds where. Also descends into each sub-expression's
+/// type slot, since predicate sub-terms may carry further refinements.
 fn collect_expr_fv(
     e: &TypedExpr,
     bound: &mut BTreeSet<Binder>,
@@ -1154,72 +1115,23 @@ fn collect_expr_fv(
     out: &mut BTreeSet<Binder>,
 ) {
     collect_type_fv(&e.ty, bound, visited, out);
-    match &e.node {
-        TypedExprNode::Var(n) => {
+    for_each_scoped_item(e, &mut |item| match item {
+        ScopedItem::VarRef(n) => {
             if !bound.contains(n) {
                 out.insert(n.clone());
             }
         }
-        TypedExprNode::Lambda { param, body } => {
-            with_binders(bound, [param.name.clone()], |bnd| {
-                collect_expr_fv(body, bnd, visited, out)
-            });
-        }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
+        // A register key is a field label, not a variable occurrence.
+        ScopedItem::KeyRef(_) => {}
+        ScopedItem::Child {
+            expr: child,
+            binders,
         } => {
-            collect_expr_fv(bound_expr, bound, visited, out);
-            with_binders(bound, [binding.name.clone()], |bnd| {
-                collect_expr_fv(body, bnd, visited, out)
+            with_binders(bound, binders.iter().map(|b| b.name.clone()), |bnd| {
+                collect_expr_fv(child, bnd, visited, out)
             });
         }
-        // Mutual recursion: every group binder is bound in every binding
-        // body and in the letrec body.
-        TypedExprNode::LetRec { bindings, body } => {
-            with_binders(bound, bindings.iter().map(|(b, _)| b.name.clone()), |bnd| {
-                for (_, def) in bindings {
-                    collect_expr_fv(def, bnd, visited, out);
-                }
-                collect_expr_fv(body, bnd, visited, out);
-            });
-        }
-        // The `name` of Feed/Define/MutWrite is a *use* of the defer handle
-        // / mutable variable.
-        TypedExprNode::Feed { name, value }
-        | TypedExprNode::Define { name, value }
-        | TypedExprNode::MutWrite { name, value } => {
-            if !bound.contains(name) {
-                out.insert(name.clone());
-            }
-            collect_expr_fv(value, bound, visited, out);
-        }
-        // The loop target binds only in the body.
-        TypedExprNode::For { target, iter, body } => {
-            collect_expr_fv(iter, bound, visited, out);
-            with_binders(bound, [target.name.clone()], |bnd| {
-                collect_expr_fv(body, bnd, visited, out);
-            });
-        }
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            if let Some(s) = scrutinee {
-                collect_expr_fv(s, bound, visited, out);
-            }
-            for b in branches {
-                let payload = b.pattern.iter().map(|p| p.binding.name.clone());
-                with_binders(bound, payload, |bnd| {
-                    collect_expr_fv(&b.guard, bnd, visited, out);
-                    collect_expr_fv(&b.body, bnd, visited, out);
-                });
-            }
-        }
-        // No binders introduced: recurse structurally into child terms.
-        _ => e.walk_children(|c| collect_expr_fv(c, bound, visited, out)),
-    }
+    });
 }
 
 /// A type is well-formed in context `ctx` iff every free term variable of its
