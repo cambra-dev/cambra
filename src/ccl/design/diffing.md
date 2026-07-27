@@ -269,6 +269,47 @@ A source-only node is **deleted**; a target-only node is **new**. A relocated
 subtree is reported as moved once, at its root — its descendants stay in place
 relative to it.
 
+### The actionable form: divergences and shared roots
+
+The classification is complete but not minimal. Every *ancestor* of an edit has
+changed content, and every *descendant* of an inserted subtree is itself new —
+one literal edited at the bottom of a forty-binding spine leaves forty-two
+changed nodes, of which exactly one is the edit. A consumer that read `matched`
+directly would have to re-derive the interesting set every time, so the differ
+derives it once.
+
+**`divergences()`** is the minimal set of places the two programs disagree, at
+the granularity a `Versioned` node would sit. No divergence contains another,
+so the set partitions the disagreement: everything not under one corresponds.
+Three kinds —
+
+- *Changed* — both programs have a node here, its content differs, and nothing
+  below it differs. A changed node with a changed descendant is not a site: the
+  deeper node is the better explanation. Insertions and deletions do **not**
+  suppress it, because a node whose own payload changed *and* which gained a
+  child has two separate things to say.
+- *Inserted* — the root of a subtree the new program has and the old does not.
+  Reported where the new region begins, not once per node in it. The walk
+  continues underneath: a matched node can sit inside a new region — a new
+  expression wrapping content that survived — and what diverges under it still
+  counts.
+- *Deleted* — the mirror image, at the root of what the old program had.
+
+For the forty-binding spine that is one divergence, against forty-two changed
+nodes.
+
+**`shared_roots()`** is the other side: every node whose content is unchanged
+and whose parent's is not — the largest subtrees the two versions have in
+common, and so the units of reuse. A `Same` node's whole subtree is `Same`, so
+its descendants add nothing.
+
+Reuse here means *the term is the same term*, which is what a unified tree
+needs. It does not mean the term evaluates to the same value in both versions:
+`let x = 1 in x` and `let x = 2 in x` share the body `x`, and that is right —
+the two `let`s are the divergence, and it is the binding that differs, not the
+read. Value-level sharing is the key-level storage question, decided at
+runtime, not a property of the tree.
+
 ### Reading a diff
 
 A [`Diff`](../diff.rs) renders itself: it prints as an annotated tree of the

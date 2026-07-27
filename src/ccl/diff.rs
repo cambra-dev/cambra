@@ -33,6 +33,13 @@
 //! **placement** did ([`Placement`]). A source-only node is **deleted**; a
 //! target-only node is **new**.
 //!
+//! That classification is complete but not minimal — every *ancestor* of an
+//! edit has changed content, and every *descendant* of an inserted subtree is
+//! new. [`Diff::divergences`] reduces it to the places the programs actually
+//! disagree, and [`Diff::shared_roots`] to the largest pieces they have in
+//! common. Those two are the actionable form, and what a `Versioned` tree would
+//! be built from.
+//!
 //! # Stage-agnostic: one core, two modes
 //!
 //! [`diff`] is a pure function of two [`TypedExpr`] trees — it does not care
@@ -165,6 +172,125 @@ impl<'a> Diff<'a> {
                 .iter()
                 .all(|m| m.content == Content::Same && m.placement == Placement::InPlace)
     }
+
+    /// The **minimal** set of places the two programs disagree, in new-program
+    /// order (deletions, which have no place there, come last).
+    ///
+    /// This is the actionable form of the diff, and the one a `Versioned` node
+    /// would be built from. `matched`/`deleted`/`new` are complete but not
+    /// minimal: every *ancestor* of an edit has changed content too, and every
+    /// *descendant* of an inserted subtree is itself new. One literal edited at
+    /// the bottom of a forty-binding spine leaves forty-two changed nodes, of
+    /// which exactly one is the edit. Divergences report that one.
+    ///
+    /// No divergence contains another, so the set partitions the disagreement
+    /// between the two programs: everything not under a divergence corresponds.
+    pub fn divergences(&self) -> Vec<Divergence<'a>> {
+        let by_dst: HashMap<*const TypedExpr, &Match<'a>> = self
+            .matched
+            .iter()
+            .map(|m| (m.dst as *const TypedExpr, m))
+            .collect();
+        let mut out = Vec::new();
+
+        // A changed node is a site only when nothing *below* it changed — the
+        // deeper node is the better explanation. Insertions and deletions are
+        // reported at their own roots and do not suppress it: a node whose
+        // payload changed *and* which gained a child has two things to say.
+        /// Returns whether anything in this subtree reported a change.
+        fn walk<'a>(
+            e: &'a TypedExpr,
+            parent_matched: bool,
+            by_dst: &HashMap<*const TypedExpr, &Match<'a>>,
+            out: &mut Vec<Divergence<'a>>,
+        ) -> bool {
+            let Some(m) = by_dst.get(&(e as *const TypedExpr)) else {
+                // Target-only. It is the *root* of an inserted region exactly
+                // when the node above it is not also new. Keep descending
+                // regardless: a matched node can sit inside a new region — the
+                // new expression wrapping content that survived — and whatever
+                // diverges under it still has to be reported.
+                if parent_matched {
+                    out.push(Divergence::Inserted(e));
+                }
+                let mut changed = false;
+                for c in child_exprs(e) {
+                    changed |= walk(c, false, by_dst, out);
+                }
+                return changed;
+            };
+            let mut changed_below = false;
+            for c in child_exprs(e) {
+                changed_below |= walk(c, true, by_dst, out);
+            }
+            if m.content == Content::Changed && !changed_below {
+                out.push(Divergence::Changed(**m));
+                return true;
+            }
+            changed_below || m.content == Content::Changed
+        }
+        walk(self.dst_root, true, &by_dst, &mut out);
+
+        let gone: HashSet<*const TypedExpr> = self
+            .deleted
+            .iter()
+            .map(|e| *e as *const TypedExpr)
+            .collect();
+        let mut roots: Vec<(&TypedExpr, bool)> = Vec::new();
+        collect_deleted_roots(self.src_root, &gone, &mut roots);
+        out.extend(roots.into_iter().map(|(e, _)| Divergence::Deleted(e)));
+        out
+    }
+
+    /// The largest subtrees the two programs have in common: every node whose
+    /// content is unchanged and whose parent's is not, in new-program order.
+    ///
+    /// These are the units of reuse — a `Same` node's whole subtree is `Same`,
+    /// so reporting the descendants as well would say nothing more.
+    ///
+    /// Reuse here means *the term is the same term*, which is what a unified
+    /// tree needs. It does **not** mean the term evaluates to the same value in
+    /// both versions: `let x = 1 in x` and `let x = 2 in x` share the body `x`,
+    /// and that is right — the two `let`s are a divergence, and it is the
+    /// binding that differs, not the read.
+    pub fn shared_roots(&self) -> Vec<&Match<'a>> {
+        let by_dst: HashMap<*const TypedExpr, &Match<'a>> = self
+            .matched
+            .iter()
+            .map(|m| (m.dst as *const TypedExpr, m))
+            .collect();
+        let mut out = Vec::new();
+        fn walk<'a, 'm>(
+            e: &TypedExpr,
+            by_dst: &HashMap<*const TypedExpr, &'m Match<'a>>,
+            out: &mut Vec<&'m Match<'a>>,
+        ) {
+            if let Some(m) = by_dst.get(&(e as *const TypedExpr))
+                && m.content == Content::Same
+            {
+                out.push(m);
+                return;
+            }
+            for c in child_exprs(e) {
+                walk(c, by_dst, out);
+            }
+        }
+        walk(self.dst_root, &by_dst, &mut out);
+        out
+    }
+}
+
+/// One place the two programs disagree, at the granularity a `Versioned` node
+/// would sit. Minimal by construction: no divergence contains another.
+#[derive(Debug, Clone, Copy)]
+pub enum Divergence<'a> {
+    /// Both programs have a node here and its content differs, with nothing
+    /// below it differing — this is where the change actually is.
+    Changed(Match<'a>),
+    /// A subtree the new program has and the old one does not, at its root.
+    Inserted(&'a TypedExpr),
+    /// A subtree the old program had and the new one does not, at its root.
+    Deleted(&'a TypedExpr),
 }
 
 /// Diff two programs (`src` = old, `dst` = new). See the module docs.
@@ -1764,6 +1890,97 @@ mod tests {
                 .any(|m| matches!(m.src.node, TypedExprNode::BinOp { .. })),
             "the untouched `a + b` tail is still shared:\n{r}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The divergence frontier
+    // -----------------------------------------------------------------------
+
+    /// A 40-binding `let` spine whose final expression uses a different
+    /// literal — one edit, as deep in the tree as this corpus goes.
+    fn deep_spine(tweak: bool) -> String {
+        let mut s = String::from("a0 = 1\n");
+        for i in 1..40 {
+            s.push_str(&format!("a{i} = a{} + {i}\n", i - 1));
+        }
+        s.push_str(&format!("a39 + {}\n", if tweak { 99 } else { 1 }));
+        s
+    }
+
+    #[test]
+    fn one_edit_is_one_divergence() {
+        // Every ancestor of an edit has changed content, so `matched` reports
+        // 42 changed nodes here. Exactly one of them is the edit.
+        let (v1, v2) = (lower(&deep_spine(false)), lower(&deep_spine(true)));
+        let r = diff(&v1, &v2);
+        assert!(
+            r.updated().count() > 40,
+            "the ancestors are all changed too"
+        );
+
+        let dv = r.divergences();
+        assert_eq!(dv.len(), 1, "{dv:?}");
+        let Divergence::Changed(m) = dv[0] else {
+            panic!("expected a content change, got {:?}", dv[0])
+        };
+        assert!(matches!(m.src.node, TypedExprNode::Lit(Lit::Int(1))));
+        assert!(matches!(m.dst.node, TypedExprNode::Lit(Lit::Int(99))));
+    }
+
+    #[test]
+    fn an_inserted_region_is_reported_at_its_root() {
+        // 16 new nodes, one insertion.
+        let v1 = lower("a = 1\na\n");
+        let v2 = lower("a = 1\nb = sum([i * 2 for i in [1,2,3]])\na + b\n");
+        let r = diff(&v1, &v2);
+        assert!(r.new.len() > 10, "the inserted block is substantial");
+
+        let inserted: Vec<_> = r
+            .divergences()
+            .into_iter()
+            .filter(|d| matches!(d, Divergence::Inserted(_)))
+            .collect();
+        assert_eq!(inserted.len(), 1, "{inserted:?}");
+        let Divergence::Inserted(e) = inserted[0] else {
+            unreachable!()
+        };
+        assert!(matches!(e.node, TypedExprNode::Let { .. }));
+    }
+
+    #[test]
+    fn identical_programs_have_no_divergences() {
+        let (v1, v2) = (lower(&deep_spine(false)), lower(&deep_spine(false)));
+        let r = diff(&v1, &v2);
+        assert!(r.divergences().is_empty());
+        // ...and reuse is the whole program, in one piece.
+        let roots = r.shared_roots();
+        assert_eq!(roots.len(), 1);
+        assert!(std::ptr::eq(roots[0].dst, &v2));
+    }
+
+    #[test]
+    fn shared_roots_are_maximal_and_disjoint() {
+        let v1 = lower("a = 1\nb = 2\na + b\n");
+        let v2 = lower("a = 1\nc = 9\nb = 2\na + b\n");
+        let r = diff(&v1, &v2);
+        let roots = r.shared_roots();
+        assert!(!roots.is_empty());
+
+        // No shared root sits inside another: each is the top of its region.
+        let tops: Vec<*const TypedExpr> = roots.iter().map(|m| m.dst as *const _).collect();
+        for m in &roots {
+            let mut inner = 0;
+            m.dst.walk_children(|c| {
+                fn any(e: &TypedExpr, tops: &[*const TypedExpr], n: &mut usize) {
+                    if tops.contains(&(e as *const TypedExpr)) {
+                        *n += 1;
+                    }
+                    e.walk_children(|c| any(c, tops, n));
+                }
+                any(c, &tops, &mut inner);
+            });
+            assert_eq!(inner, 0, "a shared root contains another: {}", head(m.dst));
+        }
     }
 
     /// Assert a construct survives the two properties that matter on real
