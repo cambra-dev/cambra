@@ -2146,6 +2146,61 @@ mod tests {
     }
 
     #[test]
+    fn inlining_erases_function_boundaries() {
+        // Extracting a subexpression into a `def` is invisible once the
+        // pipeline's own inlining has run: the two versions are the same tree.
+        let plain = "a = 1\n(a + 2) * 3\n";
+        let extracted = "def g(y):\n    y + 2\na = 1\ng(a) * 3\n";
+
+        let (v1, v2) = (
+            compile_to(plain, CompileStage::Inferred).unwrap(),
+            compile_to(extracted, CompileStage::Inferred).unwrap(),
+        );
+        assert!(
+            !diff(&v1, &v2).divergences().is_empty(),
+            "the function boundary is still part of the program here",
+        );
+
+        let (v1, v2) = (
+            compile_to(plain, CompileStage::Inlined).unwrap(),
+            compile_to(extracted, CompileStage::Inlined).unwrap(),
+        );
+        assert!(
+            diff(&v1, &v2).is_identical(),
+            "inlined, the two are the same program:\n{}",
+            diff(&v1, &v2)
+        );
+    }
+
+    #[test]
+    fn inlining_costs_locality_in_a_shared_helper() {
+        // The other side of that trade, stated as a test so it cannot be
+        // mistaken for a strict improvement: a body called twice is inlined
+        // twice, so one edit inside it diverges at both call sites.
+        let v1 = "def g(y):\n    y + 2\ng(1) * g(2)\n";
+        let v2 = "def g(y):\n    y + 5\ng(1) * g(2)\n";
+
+        let (a, b) = (
+            compile_to(v1, CompileStage::Inferred).unwrap(),
+            compile_to(v2, CompileStage::Inferred).unwrap(),
+        );
+        assert_eq!(
+            diff(&a, &b).divergences().len(),
+            1,
+            "one edit, one divergence, while the function is still a function",
+        );
+
+        let (a, b) = (
+            compile_to(v1, CompileStage::Inlined).unwrap(),
+            compile_to(v2, CompileStage::Inlined).unwrap(),
+        );
+        assert!(
+            diff(&a, &b).divergences().len() > 1,
+            "inlined, the same edit lands once per call site",
+        );
+    }
+
+    #[test]
     fn diff_programs_end_to_end_from_source() {
         // The public single-call entry: compile both sources to a stage and
         // diff, results delivered through the closure.

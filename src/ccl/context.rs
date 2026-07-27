@@ -688,6 +688,21 @@ pub enum CompileStage {
     /// `Begin`) and their `History` types, which the mutability and
     /// channelization phases below this stage erase.
     Inferred,
+    /// Type-inferred, then **UDF-inlined**: every call to a user-defined
+    /// function is replaced by its beta-reduced body, so function boundaries
+    /// stop being part of the program's identity.
+    ///
+    /// This is the pipeline's own [`inline`] pass used as a normalization, and
+    /// it is a deliberate trade, not a strict improvement. Extracting a
+    /// subexpression into a `def` (or inlining one back) becomes invisible —
+    /// the two versions compile to the same tree. In exchange, an edit *inside*
+    /// a function called `n` times is reported `n` times, because the body it
+    /// changed now appears `n` times. Pick this stage when refactoring across
+    /// function boundaries is the noise you want gone; pick [`Inferred`] when
+    /// locality inside shared helpers matters more.
+    ///
+    /// [`Inferred`]: CompileStage::Inferred
+    Inlined,
 }
 
 /// Compile `code` to the given [`CompileStage`], ready to pass to
@@ -703,10 +718,13 @@ pub enum CompileStage {
 /// ```
 ///
 /// The prefix here mirrors [`compile_program`]'s frontend, stopping at the
-/// requested stage rather than continuing to the operator graph. It stops
+/// requested stage rather than continuing to the operator graph. Every stage is
 /// *above* the mutability and channelization phases deliberately: those rewrite
 /// the user's loops and feeds into `LetRec` recurrences whose shape is an
 /// artifact of the compiler, not of the program the user edited.
+///
+/// Choosing a stage is choosing how much normalization to diff through — see
+/// [`CompileStage`] and `src/ccl/design/diffing.md`, "How much to normalize".
 pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileError>> {
     let mut ctx = GlobalContext::new();
     let mut errors: Vec<CompileError> = Vec::new();
@@ -763,7 +781,16 @@ pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileEr
             })
             .collect());
     }
-    Ok(expr)
+    if stage == CompileStage::Inferred {
+        return Ok(expr);
+    }
+
+    debug_assert_eq!(
+        stage,
+        CompileStage::Inlined,
+        "every CompileStage must be handled before this point",
+    );
+    Ok(inline::inline_non_iterable_lambdas(expr))
 }
 
 /// Compile a CHL program and return its operator graph plus subscribed outputs.

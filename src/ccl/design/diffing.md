@@ -373,14 +373,15 @@ delete and an insert.
 ## Which stage to diff
 
 `compile_to(code, stage)` compiles to a nominated pipeline stage and hands back
-the tree. Both supported stages run through the *same* `diff` core — nothing in
-the matcher is stage-specific, because the content hash is uid-robust and
-type-aware, which is exactly what one core needs to handle both.
+the tree. Every stage runs through the *same* `diff` core — nothing in the
+matcher is stage-specific, because the content hash is uid-robust and
+type-aware, which is exactly what one core needs to handle all of them.
 
 | Stage | Tree | What it shows |
 | --- | --- | --- |
 | `Lowered` | `Raw` names, pre-uniquify, pre-inference; most types `Hole` | Closest to source, minimal diffs. Type sensitivity comes only from annotations and lowering-built types (cast refinements). |
 | `Inferred` | α-uniquified, every node carrying its resolved type | Everything above, plus type-level divergence the earlier stage cannot see. |
+| `Inlined` | inferred, then UDF-inlined | Everything above, with function boundaries erased — see "How much to normalize". |
 
 The payoff of the later stage is real: in `x = 1` / `(x, x)` versus `x = "a"` /
 `(x, x)`, the bodies are structurally identical and hash *equal* before
@@ -391,9 +392,63 @@ longer matches — types carry signal the term structure alone does not.
 deliberately. Those rewrite the user's loops and feeds into `LetRec` recurrences
 whose shape is an artifact of the compiler, not of the program the user edited;
 a diff there would report churn the user cannot act on. `LetRec` and `Transact`
-are consequently unreachable from source at either stage — the hash covers them
-structurally anyway, so the later stages are available if the versioning work
-turns out to want them.
+are consequently unreachable from source at any of these stages — the hash
+covers them structurally anyway, so the later stages are available if the
+versioning work turns out to want them.
+
+## How much to normalize
+
+Two programs can be the same computation written differently. The more of that
+the diff sees through, the more the two versions share — and the less
+localized the answer becomes when they genuinely differ. Choosing a stage is
+choosing where on that curve to sit; the compiler's own passes do the work, so
+there is no separate rewriting system to keep honest.
+
+Measured on the refactors that actually occur, in divergences reported:
+
+| Edit | `Inferred` | `Inlined` |
+| --- | --- | --- |
+| rename a binding | 0 | 0 |
+| extract a subexpression into a `def` | 6 | **0** |
+| edit a body inside a `def` called once | 1 | 1 |
+| edit a body inside a `def` called **twice** | 1 | **4** |
+| reorder two independent bindings | 2 | 2 |
+| extract a subexpression into a `let` | 5 | 5 |
+
+Inlining is a trade, not an improvement: it makes moving code across a function
+boundary invisible, and in exchange reports an edit inside a shared helper once
+per call site, because the body it changed now appears once per call site. Take
+it when refactoring across functions is the noise you want gone.
+
+### What deliberately is *not* normalized
+
+**Extracting a subexpression into a `let`.** `(a + 2) * (a + 2)` and
+`let t = a + 2 in t * t` have the same value and are *not* the same program
+here: naming a subexpression is how CCL says "compute this once". The two
+compile to different operator graphs — one shared node against two — so for a
+system whose whole point is sharing compute between versions, this is a real
+change and reporting it is correct. (Which is also why the `Inlined` stage stops
+at UDFs: `inline` beta-reduces *function* bindings, not value bindings.)
+
+**Commutativity.** `a + b` and `b + a` differ by one divergence. Normalizing
+them would need type direction, because `+` is string concatenation as well as
+addition and is not commutative there — so it is available only post-inference,
+for a rare edit, at the cost of making the hash type-conditional. Not worth it.
+
+**Constant folding, β/η reduction beyond UDF inlining.** Each widens the
+equivalence class and costs locality the same way inlining does. Nothing
+observed yet asks for them; the roadmap is driven by missed sharing that shows
+up in practice, not by completeness.
+
+### The one that needs more than a stage
+
+Reordering two independent bindings is a true no-op — CCL's `let` is
+non-recursive and pure, so the operator graph depends on the dependency DAG, not
+on the written order — and no stage fixes it, because *the nesting is the
+order*. `let a = 1 in let b = 2 in body` and `let b = 2 in let a = 1 in body`
+have different tree shapes, and the matcher pairs the spine positionally, so the
+reads underneath resolve to non-corresponding binders and report as changed. See
+"Open threads".
 
 ---
 
@@ -475,6 +530,19 @@ a `Cast` target's refinement predicate (a load-bearing term that
 `walk_children` treats as a type child). Both matches are exhaustive, so a new
 node variant is a compile error in both places — the duplication is visible
 rather than silent, which is why it stands.
+
+**A `let`-spine encodes an order it does not have.** A run of independent
+bindings is a dependency DAG, but CCL spells it as nested `Let`s, so reordering
+two of them changes the tree shape and the matcher pairs the spine by depth.
+The reads underneath then resolve to non-corresponding binders and report as
+changed — conservative, but noise. Two ways out, neither cheap. A canonical
+pre-diff reordering needs a sort key that is stable under ordinary edits:
+sorting by content hash is chaotic (editing a literal permutes the spine), and
+sorting by binder spelling reintroduces rename sensitivity, though only
+degrading a rename to a *move*. The alternative is to stop spelling a binding
+group as a nest — an n-ary group node, which is an AST change well beyond
+diffing but would also give `Record`-style order-insensitivity for free. Worth
+deciding deliberately rather than by default.
 
 **The free-variable seam is crude.** Two distinct binders sharing a spelling
 compare equal. A real cross-version binder correspondence — matching v1's binder
