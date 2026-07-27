@@ -1114,9 +1114,7 @@ mod tests {
         // predicate lives in the lambda's *domain type* `{Int | y > 0}`, not on
         // a dedicated AST field. `substitute` must descend through the type
         // (via `substitute_in_type`) into the predicate body.
-        let refinement = Refinement {
-            predicate: Rc::new(refinement_pred),
-        };
+        let refinement = Refinement::born(Rc::new(refinement_pred));
         let refined_param = Type::Refinement(Box::new(int_ty()), refinement);
         let expr = Expr::lambda("x", int_ty(), Expr::var("x").with_ty(int_ty()))
             .with_ty(fun_ty(refined_param, int_ty()));
@@ -1248,9 +1246,7 @@ mod tests {
         let bool_ty = Type::Base(BaseType::Bool);
 
         // Uncorrelated refinement (a Bool constant predicate) on the param.
-        let refinement = Refinement {
-            predicate: Rc::new(Expr::lit(Lit::Bool(true)).with_ty(bool_ty)),
-        };
+        let refinement = Refinement::born(Rc::new(Expr::lit(Lit::Bool(true)).with_ty(bool_ty)));
         let refined_y_ty = Type::Refinement(Box::new(int_ty()), refinement);
         let body = var("y").with_ty(int_ty());
 

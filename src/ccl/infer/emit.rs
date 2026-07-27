@@ -3,7 +3,6 @@
 // ---------------------------------------------------------------------------
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use smol_str::SmolStr;
 
@@ -299,17 +298,36 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), I
 /// it as a fresh `Rc` on `r`. The caller holds `&mut Refinement` so the typed
 /// predicate lands on the syntactic node; the cast/annotation result type then
 /// clones the typed refinement, carrying the same slots.
+///
+/// **Emission is therefore a predicate-rebuilding pass**, and threads the
+/// pass-scoped [`PredMemo`](crate::ccl::ccl_utils::PredMemo) like every other
+/// one: the occurrences that enter it sharing one `Rc` leave sharing one `Rc`.
+/// Without the memo, the *first* pass over the tree splits sharing before any of
+/// the later ones can preserve it — a nested comprehension's inner filter
+/// predicate is reached twice (once on the term-level `Cast`'s `target`, once on
+/// the copy of that `Cast` inside the enclosing comprehension's own filter
+/// predicate), so it emerges from emit as two `Rc`s.
+///
+/// Sharing the memoized copy across occurrences also makes them share inference
+/// variables, which is exactly right: a bare predicate is closed but for
+/// `REFINEMENT_BINDER`, so two occurrences of *one* refinement `Rc` denote the
+/// same refinement over the same base and their slots have one solution. (This
+/// is the same precondition the resolution passes rely on — see
+/// `coalesce_type_predicates` — with sharing meaning literally the same term, so
+/// merging the constraint sets adds no information.)
 fn emit_bare_predicate<C: Typing>(
     r: &mut Refinement,
     domain: &Type,
     ctx: &mut C,
 ) -> Result<(), InferError> {
-    let mut pred = (*r.predicate).clone();
+    let Some((origin, mut pred)) = ctx.pred_memo().begin(r) else {
+        return Ok(());
+    };
     let pred_ty = ctx.scoped(&Name::elem(), domain, |ctx| ctx.subexpr(&mut pred))?;
     ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
         "refinement predicate".to_string()
     })?;
-    r.predicate = Rc::new(pred);
+    ctx.pred_memo().finish(r, origin, pred);
     Ok(())
 }
 

@@ -8,7 +8,9 @@
 use std::mem::take;
 
 use super::join::try_hash_join_rewrite;
-use super::predicates::{PredMemo, compile_refinement_predicates, fn_of_bare_predicate};
+use crate::ccl::ccl_utils::PredMemo;
+
+use super::predicates::{compile_refinement_predicates, fn_of_bare_predicate};
 use super::*;
 
 /// Walks `expr` and materializes every iteration site, choosing the best

@@ -157,7 +157,12 @@ fn simplify_once(expr: &mut Expr, memo: &mut PredMemo) -> (bool, bool) {
     // irrelevant to the term-tree guard (`iterate` sources live in the term
     // tree, never inside predicates), so the iteration bit is discarded here.
     walk_refined_predicates_mut(&mut expr.ty, memo, &mut |pred, memo| {
-        changed |= simplify_once(pred, memo).0;
+        let pred_changed = simplify_once(pred, memo).0;
+        changed |= pred_changed;
+        // Reporting "unchanged" keeps the origin `Rc` in the slot, so a predicate
+        // simplify has nothing to say about stays pointer-shared with every other
+        // occurrence — including ones in nodes this walk never reaches.
+        pred_changed
     });
     let (children_changed, children_have_iteration) = recurse_simplify(expr, memo);
     changed |= children_changed;
