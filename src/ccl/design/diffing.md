@@ -535,14 +535,37 @@ rather than silent, which is why it stands.
 bindings is a dependency DAG, but CCL spells it as nested `Let`s, so reordering
 two of them changes the tree shape and the matcher pairs the spine by depth.
 The reads underneath then resolve to non-corresponding binders and report as
-changed — conservative, but noise. Two ways out, neither cheap. A canonical
-pre-diff reordering needs a sort key that is stable under ordinary edits:
-sorting by content hash is chaotic (editing a literal permutes the spine), and
-sorting by binder spelling reintroduces rename sensitivity, though only
-degrading a rename to a *move*. The alternative is to stop spelling a binding
-group as a nest — an n-ary group node, which is an AST change well beyond
-diffing but would also give `Record`-style order-insensitivity for free. Worth
-deciding deliberately rather than by default.
+changed — conservative, but noise (two divergences for two reordered bindings).
+**Decided: leave it.** What follows is why, so the ground already covered is not
+covered again.
+
+*It is not a matcher-tuning problem.* Three plausible fixes were tried and
+measured, and none moved the reordering case:
+
+- running bottom-up container recovery *before* the root edit-distance step, so
+  a content-aware phase gets first refusal on container pairings — made it
+  worse (three reordered bindings went from two divergences to three);
+- ranking candidates by how many of their children are already matched to each
+  other — byte-identical results on every case in the corpus;
+- a rule that a `Let`'s identity is its *binding* rather than its body, pairing
+  each `Let` with the one whose bound expression its own matched — no change to
+  reordering, and worse on three bindings.
+
+The consistency is the finding: the nesting *is* the order, so no amount of
+matcher tuning recovers what the representation does not distinguish.
+
+*The two real options both cost more than the noise.* A canonical pre-diff
+reordering needs a sort key stable under ordinary edits, and neither candidate
+is: sorting by content hash is chaotic — editing one literal permutes the spine,
+trading reorder noise for value-edit noise, which is far more common — and
+sorting by binder spelling is stable under value edits but makes a rename that
+crosses another binding alphabetically produce exactly the noise being removed.
+Either way it moves noise rather than removing it. The other option is to stop
+spelling a binding group as a nest: an n-ary group node would make the order
+disappear at the source and give `Record`-style order-insensitivity for free,
+but it is a new concept threaded through parse, lowering, inference and every
+pass. That cost is only worth paying if something other than diffing wants it
+too — which is the trigger to revisit this.
 
 **The free-variable seam is crude.** Two distinct binders sharing a spelling
 compare equal. A real cross-version binder correspondence — matching v1's binder
