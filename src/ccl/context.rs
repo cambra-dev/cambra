@@ -674,6 +674,98 @@ pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
     );
 }
 
+/// A pipeline stage a program can be compiled to for diffing; the differ
+/// ([`crate::ccl::diff`]) accepts an [`Expr`] at either stage. See
+/// `src/ccl/design/diffing.md`, "Which stage to diff".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileStage {
+    /// Lowered CCL: `Raw` names, pre-α-uniquification, pre-inference. Closest
+    /// to source; most node types are still `Type::Hole`.
+    Lowered,
+    /// Type-inferred CCL: α-uniquified, every node annotated with its resolved
+    /// type — reflects type-level differences a `Lowered` diff cannot see.
+    /// Still carries the transient surface nodes (`Defer`/`Feed`/`For`/
+    /// `Begin`) and their `History` types, which the mutability and
+    /// channelization phases below this stage erase.
+    Inferred,
+}
+
+/// Compile `code` to the given [`CompileStage`], ready to pass to
+/// [`crate::ccl::diff::diff`]. Sources — the pre-registered `stdin()` and any
+/// discovered during lowering — are registered for inference, so the result is
+/// reachable end-to-end from source.
+///
+/// Pair two results for a program diff (each tree must outlive the borrow), or
+/// use [`crate::ccl::diff::diff_programs`] for the common case:
+/// ```ignore
+/// let (a, b) = (compile_to(s1, CompileStage::Inferred)?, compile_to(s2, CompileStage::Inferred)?);
+/// let d = crate::ccl::diff::diff(&a, &b);
+/// ```
+///
+/// The prefix here mirrors [`compile_program`]'s frontend, stopping at the
+/// requested stage rather than continuing to the operator graph. It stops
+/// *above* the mutability and channelization phases deliberately: those rewrite
+/// the user's loops and feeds into `LetRec` recurrences whose shape is an
+/// artifact of the compiler, not of the program the user edited.
+pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileError>> {
+    let mut ctx = GlobalContext::new();
+    let mut errors: Vec<CompileError> = Vec::new();
+
+    let parse_result = chl_parser::parse_module(code);
+    errors.extend(parse_result.errors.into_iter().map(CompileError::Parse));
+    let Some(module) = parse_result.value else {
+        return Err(errors);
+    };
+    if module.body.is_empty() {
+        errors.push(CompileError::Lower(LoweringError::unsupported(
+            chl_parser::ast::Span::new(0, code.len()),
+            "empty program: file contains no top-level statements",
+        )));
+        return Err(errors);
+    }
+
+    let lower_result = lower_stmts(&module.body, ctx.lowering_ctx());
+    errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
+    let Some(mut expr) = lower_result.value else {
+        return Err(errors);
+    };
+    // `Error` placeholders make the tree unfit for inference (and meaningless
+    // to diff), so bail on any earlier-stage error even at the `Lowered` stage.
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    if stage == CompileStage::Lowered {
+        return Ok(expr);
+    }
+
+    expr = uniquify::run(expr);
+    for (_name, source) in ctx.lowering_ctx().take_sources() {
+        let name = source.borrow().get_id().to_string();
+        let output_type = source.borrow().output_type();
+        ctx.inference_ctx().register_source_type(
+            &name,
+            Type::Fun {
+                name: None,
+                domain: Box::new(Type::DataSource(name.clone())),
+                codomain: Box::new(output_type),
+            },
+        );
+    }
+    // No lowering projection is threaded here — this entry point exists to hand a
+    // tree to the differ, not to render diagnostics — so an inference error keeps
+    // its blame node but degrades to a span-less `CompileError`.
+    if let Err(errors) = infer(&mut expr, ctx.inference_ctx()) {
+        return Err(errors
+            .into_iter()
+            .map(|located| CompileError::Infer {
+                error: located.error,
+                span: None,
+            })
+            .collect());
+    }
+    Ok(expr)
+}
+
 /// Compile a CHL program and return its operator graph plus subscribed outputs.
 ///
 /// Returns a [`CompiledProgram`] whose `outputs` vector contains one entry
