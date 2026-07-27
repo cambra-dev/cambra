@@ -1435,6 +1435,20 @@ mod tests {
     /// Run `cargo test -q --lib census_ratchet -- --nocapture` (or read the assert
     /// diff on failure), confirm the delta is an *intended* provenance change for
     /// the commit in flight, then update the affected row's expected map here.
+    ///
+    /// **Discipline:** for every changed row, update its comment to name the
+    /// pass responsible and the attribution shift (matching the existing rows'
+    /// style — each pinned number carries its explanation). A delta you cannot
+    /// explain this way is not a re-bless; it is a bug — stop and investigate
+    /// instead of updating the map.
+    ///
+    /// The ratchet deliberately pins **every** retained pane, including
+    /// pre-inference: that pane's counts pin the always-on lowering projection,
+    /// the release-critical `InferError` blame path — it is the last coverage
+    /// to thin. Rows are one explained line per pane; the cost of density is
+    /// negligible next to what it catches. (The *wire fixtures* are slimmed
+    /// instead — see `cambra-inspector/scripts/fixtures.manifest`; that corpus
+    /// and this one are independent ratchets, often moved by the same change.)
     #[test]
     fn census_ratchet() {
         use std::collections::BTreeMap;

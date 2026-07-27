@@ -288,6 +288,12 @@ impl serde::Serialize for Type {
     }
 }
 
+// This rendering IS the inspector wire format for types (the serde impl above
+// collect_str's it), and the golden fixtures pin it byte-exactly on every
+// `type` field — changing any notation here (`⇒`, `[0, N]`, `Mut(…)`, the
+// singleton spelling, braces)
+// is a deliberate corpus-wide re-bless: rerun
+// cambra-inspector/scripts/regen-fixtures.sh and commit the classified diff.
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
