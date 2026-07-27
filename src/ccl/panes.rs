@@ -890,6 +890,68 @@ mod tests {
         ("feed", 12),
     ];
 
+    /// Every conditional-induction shape reaches every pane pair clean.
+    ///
+    /// The leak gates and `assert_unique_node_ids` at a pane boundary run only
+    /// under [`CompiledProgram::materialize_panes`], so the compilation-pipeline
+    /// suite — which compiles but never materializes — cannot see a leak in a
+    /// rewrite it otherwise exercises heavily. The statement-`Case` arm of the
+    /// letrec phase is exactly that blind spot: it fans the post-`Case` remainder
+    /// and the entering read-your-writes env across every branch, so each shape
+    /// below stresses a different copy/consume pairing.
+    #[test]
+    fn conditional_induction_panes_are_leak_free() {
+        for (name, code) in [
+            // One conditional write: guard preserved into its own arm predicate,
+            // echoed (freshened) into the carry arm's.
+            (
+                "guard_only",
+                "x := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        x := x + i\nx\n",
+            ),
+            // Unconditional write *before* the `Case`: its inlined value sits in
+            // the read-your-writes env slot every branch clones.
+            (
+                "uncond_before",
+                "x := 0\nfor i in [1, 2, 3]:\n    x := x + 1\n    if i > 1:\n        x := x + 10\nx\n",
+            ),
+            // Unconditional write *after* the `Case`: the remainder is spliced
+            // onto every path, including the trailing carry arm.
+            (
+                "uncond_after",
+                "x := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        x := x + 10\n    x := x + 1\nx\n",
+            ),
+            // `if`/`else` writing one accumulator on both arms.
+            (
+                "if_else",
+                "t := 0\nfor x in [1, 2, 3]:\n    if x > 2:\n        t := t + x\n    else:\n        t := t + 1\nt\n",
+            ),
+            // Two accumulators, one unconditional and one conditional — the
+            // shape where a branch's write set matches the carry for *some*
+            // accumulator but not all.
+            (
+                "two_accumulators",
+                "cnt := 0\ntotal := 0\nfor i in [1, 2, 3]:\n    cnt := cnt + 1\n    if i > 1:\n        total := total + i\ncnt * 10 + total\n",
+            ),
+            // Sibling `if`s (not `elif`) on one accumulator: two guard-Cases in
+            // one body, so the second one's remainder is itself a spliced copy.
+            (
+                "sibling_ifs",
+                "a := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        a := a + i\n    if i < 3:\n        a := a + 100\na\n",
+            ),
+        ] {
+            let compiled = compile_ok(code);
+            let panes = compiled.materialize_panes();
+            for pair in panes.gated_pane_pairs() {
+                assert!(
+                    pair.leaks.is_empty(),
+                    "`{name}`: leaks between the {} panes: {:?}",
+                    pair.name,
+                    pair.leaks
+                );
+            }
+        }
+    }
+
     /// Rough compile-time and retained-memory sanity for pane capture. Ignored
     /// by default — it is a measurement, not an assertion.
     ///

@@ -1884,6 +1884,43 @@ mod tests {
         }
     }
 
+    /// Driver for the canary below: compile and unwrap.
+    fn compile_ok(code: &str) -> CompiledProgram {
+        let mut ctx = GlobalContext::default();
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        compile_program(&mut ctx, code, consumer).expect("compiles")
+    }
+
+    /// Lowering's own recording overhead, measured rather than gated.
+    ///
+    /// The lowering session installs in every build, recording at leaf grain
+    /// (an ordinary mint opens no frame, so `on_mint` stays a no-op) plus a copy
+    /// frame per uncurry / compare-chain site, followed by one O(nodes) fold.
+    /// This times a representative compile so a regression in that overhead is
+    /// observable. Nothing is asserted.
+    ///
+    /// Run manually, in release, which is the meaningful configuration:
+    /// `cargo test --release -- --ignored lowering_session_cost_canary --nocapture`.
+    #[test]
+    #[ignore = "measurement hook (not a gate); run manually with --release --nocapture"]
+    fn lowering_session_cost_canary() {
+        use std::time::Instant;
+        // A program exercising leaf recording (arithmetic/loop plumbing) plus a
+        // copy frame (the chained comparison's shared operand).
+        let code = "x := 0\nfor i in [1, 2, 3]:\n    x += i\n1 < x < 3\nx\n";
+        let iters = 2_000u32;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let _ = compile_ok(code);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "lowering-session canary: {iters} compiles in {elapsed:?} \
+             ({:?}/compile)",
+            elapsed / iters,
+        );
+    }
+
     #[test]
     fn rendered_errors_have_exact_format() {
         let code = "\
