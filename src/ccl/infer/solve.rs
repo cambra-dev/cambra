@@ -1029,16 +1029,21 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// preserved inline here via the same [`PredMemo`] protocol (`begin` / `finish`)
 /// the combinator uses.
 ///
-/// **Precondition the memo relies on.** `coalesce_node` is level- and
-/// scope-dependent, while the memo is keyed on the predicate `Rc` alone — so for
-/// two occurrences of one shared `Rc` reached under different scopes, whichever
-/// the walk hits first would win. That is sound because sharing means *literally
-/// the same term with the same inference variables*: resolution reads those
-/// variables out of the one live constraint graph, so both occurrences would
-/// resolve identically and the first result is the only result. It is the
-/// converse that must not happen — two refinements that should resolve
-/// differently must not share an `Rc` — which holds because a shared `Rc` is only
-/// ever created by copying one occurrence of one refinement.
+/// **Why this is a key-determined transform** (see [`PredMemo`]'s note on the
+/// distinction, which decides whether a pass may skip its transform on a memo
+/// hit). `coalesce_node` is level- and scope-dependent, and the memo is keyed on
+/// the predicate `Rc` alone — so for two occurrences of one shared `Rc` reached
+/// under different scopes, whichever the walk hits first wins. That is sound here
+/// because sharing means *literally the same term with the same inference
+/// variables*: resolution reads those variables out of the one live constraint
+/// graph, so both occurrences would resolve identically and the first result is
+/// the only result. It is the converse that must not happen — two refinements
+/// that should resolve differently must not share an `Rc` — which holds because a
+/// shared `Rc` is only ever created by copying one occurrence of one refinement.
+///
+/// Contrast constraint *emission*, where the same reasoning fails: it is
+/// parameterized by a domain minted per occurrence, so it must run at each one
+/// (`emit_bare_predicate`).
 fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) {
     match ty {
         Type::Refinement(inner, r) => {

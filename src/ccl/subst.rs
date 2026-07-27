@@ -565,15 +565,18 @@ impl Subst {
             *e = repl.as_expr();
             return;
         }
-        self.rewrite_type_go(&mut e.ty, memo);
-        if let Some(ann) = &mut e.user_annotation {
-            self.rewrite_type_go(ann, memo);
-        }
+        // *Every* type slot the node carries, not just `ty` and the annotation: a
+        // `Cast`'s `target` and each binder's declared type hold their own
+        // predicate `Rc`s, so rewriting only `ty` leaves those stale against it —
+        // the same defect the retype walk had. A binder's own type is in the
+        // *enclosing* scope (a binder does not bind in its own type), so the
+        // unrestricted substitution is the right one for it, and the binder
+        // crossings below still only guard the children.
+        e.walk_type_slots_mut(|ty| self.rewrite_type_go(ty, memo));
         match &mut e.node {
             TypedExprNode::Var(_) => {}
 
-            TypedExprNode::Cast { value, target } => {
-                self.rewrite_type_go(target, memo);
+            TypedExprNode::Cast { value, .. } => {
                 self.rewrite_expr_go(value, memo);
             }
 
@@ -585,9 +588,10 @@ impl Subst {
             }
 
             TypedExprNode::Lambda { param, body } => {
-                // The param's domain refinement is reached through `e.ty`'s
-                // `Fun` domain (rewritten above, rebuilding the predicate via
-                // `memo`); only the body is under the binder here.
+                // `param.ty` was rewritten with the node's other type slots above
+                // — it is an independent `Rc` from the one on `e.ty`'s `Fun`
+                // domain, so it needs its own visit. Only the body is under the
+                // binder.
                 self.under_binder_mut(&param.name, body, memo);
             }
 
@@ -615,10 +619,12 @@ impl Subst {
                 for (b, _) in bindings.iter() {
                     inner.assert_no_capture(&b.name);
                 }
-                for (_, def) in bindings.iter_mut() {
-                    inner.rewrite_expr_go(def, memo);
-                }
-                inner.rewrite_expr_go(body, memo);
+                self.recurse_shrunk(&inner, memo, |s, m| {
+                    for (_, def) in bindings.iter_mut() {
+                        s.rewrite_expr_go(def, m);
+                    }
+                    s.rewrite_expr_go(body, m);
+                });
             }
 
             TypedExprNode::Case {
@@ -636,8 +642,10 @@ impl Subst {
                     if let Some(p) = &b.pattern {
                         inner.assert_no_capture(&p.binding.name);
                     }
-                    inner.rewrite_expr_go(&mut b.guard, memo);
-                    inner.rewrite_expr_go(&mut b.body, memo);
+                    self.recurse_shrunk(&inner, memo, |s, m| {
+                        s.rewrite_expr_go(&mut b.guard, m);
+                        s.rewrite_expr_go(&mut b.body, m);
+                    });
                 }
             }
 
@@ -667,7 +675,41 @@ impl Subst {
             return;
         }
         restricted.assert_no_capture(binder);
-        restricted.rewrite_expr_go(body, memo);
+        self.recurse_shrunk(&restricted, memo, |s, m| s.rewrite_expr_go(body, m));
+    }
+
+    /// Recurse with `shrunk` in force, handing it `memo` **only if the
+    /// substitution did not actually change**.
+    ///
+    /// [`PredMemo`] is keyed on the predicate `Rc`'s address and nothing else, so
+    /// reusing a rebuild is sound only while everything else the transform depends
+    /// on is held fixed. For substitution that "everything else" is the active
+    /// substitution itself — and acting differently in different scopes is not an
+    /// incidental dependency, it is the *point*. A binder crossing that shadows a
+    /// substituted variable is precisely the substitution changing, so a memo
+    /// carried across it is wrong in both directions:
+    ///
+    /// - a rebuild recorded outside would be served to an occurrence inside, where
+    ///   the variable is rebound — discharging a binder the inner scope owns;
+    /// - a `finish_unchanged` recorded inside, where the substitution is inert,
+    ///   would tell a later occurrence outside that there is nothing to do.
+    ///
+    /// Scoping the memo to the substitution keeps the transform key-determined
+    /// *within* each memo, which is the property [`PredMemo`] requires, rather
+    /// than widening the key to carry a whole `Subst`. Sharing is unaffected in the
+    /// common case: with no shadowing, `shrunk == *self` and one memo spans the
+    /// whole walk.
+    fn recurse_shrunk(
+        &self,
+        shrunk: &Subst,
+        memo: &mut PredMemo,
+        f: impl FnOnce(&Subst, &mut PredMemo),
+    ) {
+        if shrunk == self {
+            f(shrunk, memo);
+        } else {
+            f(shrunk, &mut PredMemo::new());
+        }
     }
 
     /// The Barendregt no-capture invariant at a binder crossing (see
@@ -731,7 +773,7 @@ impl Subst {
                 self.rewrite_type_go(domain, memo);
                 let restricted = self.shadow(b);
                 restricted.assert_no_capture(b);
-                restricted.rewrite_type_go(codomain, memo);
+                self.recurse_shrunk(&restricted, memo, |s, m| s.rewrite_type_go(codomain, m));
             }
 
             Type::Refinement(base, r) => {
@@ -741,10 +783,16 @@ impl Subst {
                     // The refinement implicitly binds REFINEMENT_BINDER in its
                     // bare predicate, so the substitution acts *under* that
                     // binder. Cloning the map is only worth it on the paths that
-                    // use it — not on the memo-hit path above.
+                    // use it — not on the memo-hit path above. (In practice this
+                    // never shrinks — `REFINEMENT_BINDER` is reserved and no
+                    // `Subst` maps it — but it goes through `recurse_shrunk` so
+                    // the invariant holds by construction at every crossing
+                    // rather than by that argument.)
                     let restricted = self.shadow(&Name::elem());
                     if restricted.0.keys().any(|k| is_free(k, &pred)) {
-                        restricted.rewrite_expr_go(&mut pred, memo);
+                        self.recurse_shrunk(&restricted, memo, |s, m| {
+                            s.rewrite_expr_go(&mut pred, m)
+                        });
                         memo.finish(r, origin, pred);
                     } else {
                         // Vacuous — no substituted binder occurs free in the

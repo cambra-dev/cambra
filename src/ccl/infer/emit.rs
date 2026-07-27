@@ -299,35 +299,40 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), I
 /// predicate lands on the syntactic node; the cast/annotation result type then
 /// clones the typed refinement, carrying the same slots.
 ///
-/// **Emission is therefore a predicate-rebuilding pass**, and threads the
-/// pass-scoped [`PredMemo`](crate::ccl::ccl_utils::PredMemo) like every other
-/// one: the occurrences that enter it sharing one `Rc` leave sharing one `Rc`.
-/// Without the memo, the *first* pass over the tree splits sharing before any of
-/// the later ones can preserve it — a nested comprehension's inner filter
-/// predicate is reached twice (once on the term-level `Cast`'s `target`, once on
-/// the copy of that `Cast` inside the enclosing comprehension's own filter
-/// predicate), so it emerges from emit as two `Rc`s.
+/// **Emission is therefore a predicate-rebuilding pass**, and it preserves
+/// predicate `Rc` sharing — but as a *context-determined* one, so it uses
+/// [`PredMemo`](crate::ccl::ccl_utils::PredMemo)'s `begin_always` /
+/// `finish_shared` protocol rather than the skipping one.
 ///
-/// Sharing the memoized copy across occurrences also makes them share inference
-/// variables, which is exactly right: a bare predicate is closed but for
-/// `REFINEMENT_BINDER`, so two occurrences of *one* refinement `Rc` denote the
-/// same refinement over the same base and their slots have one solution. (This
-/// is the same precondition the resolution passes rely on — see
-/// `coalesce_type_predicates` — with sharing meaning literally the same term, so
-/// merging the constraint sets adds no information.)
+/// The distinction is load-bearing here. This function's result depends on
+/// `domain`, which is **not** part of the memo key: the element binder is bound to
+/// it, so the predicate's constraints land on *that* domain. `emit_cast` mints a
+/// fresh domain variable per cast node, so two occurrences of one shared
+/// predicate `Rc` are two genuinely different typing problems. Skipping emission
+/// on a memo hit would leave the second occurrence's domain carrying none of the
+/// constraints the predicate imposes on `REFINEMENT_BINDER` — silently
+/// under-determined rather than wrong-looking.
+///
+/// So emission runs at **every** occurrence, and only the resulting *term* is
+/// unified. That keeps sharing without borrowing an answer: without it the first
+/// pass over the tree splits sharing before any later pass can preserve it — a
+/// nested comprehension's inner filter is reached twice (once on the term-level
+/// `Cast`'s `target`, once on the copy of that `Cast` inside the enclosing
+/// comprehension's own filter predicate), so it would emerge from emit as two
+/// `Rc`s. Discarding this occurrence's copy in favour of the first's is sound
+/// because refinement identity is type-blind: the occurrences denote one
+/// refinement, and each has already discharged its own typing obligation.
 fn emit_bare_predicate<C: Typing>(
     r: &mut Refinement,
     domain: &Type,
     ctx: &mut C,
 ) -> Result<(), InferError> {
-    let Some((origin, mut pred)) = ctx.pred_memo().begin(r) else {
-        return Ok(());
-    };
+    let (origin, mut pred) = ctx.pred_memo().begin_always(r);
     let pred_ty = ctx.scoped(&Name::elem(), domain, |ctx| ctx.subexpr(&mut pred))?;
     ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
         "refinement predicate".to_string()
     })?;
-    ctx.pred_memo().finish(r, origin, pred);
+    ctx.pred_memo().finish_shared(r, origin, pred);
     Ok(())
 }
 

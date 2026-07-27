@@ -156,13 +156,16 @@ fn simplify_once(expr: &mut Expr, memo: &mut PredMemo) -> (bool, bool) {
     // occurrences that shared a predicate term. A predicate's own iteration-containment is
     // irrelevant to the term-tree guard (`iterate` sources live in the term
     // tree, never inside predicates), so the iteration bit is discarded here.
-    walk_refined_predicates_mut(&mut expr.ty, memo, &mut |pred, memo| {
-        let pred_changed = simplify_once(pred, memo).0;
-        changed |= pred_changed;
+    // Take the *combinator's* answer, not just the callback's: a rule firing
+    // inside a predicate is one way this changed something, and the memo
+    // re-pointing a slot is another that the callback cannot observe (see
+    // `walk_refined_predicates_mut`). Feeding only the callback's bit into the
+    // fixpoint would let a re-pointing go unnoticed for an iteration.
+    changed |= walk_refined_predicates_mut(&mut expr.ty, memo, &mut |pred, memo| {
         // Reporting "unchanged" keeps the origin `Rc` in the slot, so a predicate
         // simplify has nothing to say about stays pointer-shared with every other
         // occurrence — including ones in nodes this walk never reaches.
-        pred_changed
+        simplify_once(pred, memo).0
     });
     let (children_changed, children_have_iteration) = recurse_simplify(expr, memo);
     changed |= children_changed;

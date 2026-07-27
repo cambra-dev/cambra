@@ -314,7 +314,52 @@ each binder's declared type all hold independent predicate `Rc`s.
 `Expr::walk_type_slots{,_mut}` is the single source of truth for that set,
 precisely because hand-rolling it per pass is how a pass silently acquires a
 blind spot — `Cast.target`, where a comprehension filter's predicate actually
-lives, is the one that costs most.
+lives, is the one that costs most. `count_free`/`is_free` are on it too, and that
+is not cosmetic: several passes *skip work* when `is_free` says no, so a slot the
+free-variable walk cannot see is a slot those passes decline to rewrite.
+
+#### Reusing an entry is only sound for a key-determined transform
+
+The memo's key is the predicate `Rc`'s address **and nothing else**. Serving one
+occurrence's result to another is therefore only valid when the transform is a
+function of the predicate term. Passes divide on this, and the division decides
+which protocol they use:
+
+- **Key-determined** — `begin`/`finish`, where a hit *skips* the transform.
+  `uniquify`, `coalesce`, `retype`, `simplify`, `inline`, and `subst` within one
+  active substitution. Each depends on the term plus context invariant across the
+  occurrences sharing it: coalesce's predicates resolve out of one live constraint
+  graph, so two occurrences of one term resolve identically.
+- **Context-determined** — `begin_always`/`finish_shared`, where the transform
+  runs at *every* occurrence and only the resulting term is unified. Constraint
+  emission is the case: it binds `REFINEMENT_BINDER` to a domain supplied per
+  occurrence (`emit_cast` mints a fresh one per cast node), so skipping it would
+  leave that occurrence's domain without the constraints the predicate imposes on
+  it. Discarding the loser's term is sound because refinement identity is
+  type-blind.
+
+A third shape is neither, and wants the memo *scoped* rather than the key widened:
+when the context is part of the transform's identity instead of a parameter of it.
+`subst` is that case — acting differently in different scopes is the point of a
+substitution, so a memo carried across a binder crossing that shadows a
+substituted variable is wrong in both directions (an outer rebuild served inside,
+or an inner vacuity decision served outside). `subst::recurse_shrunk` gives the
+inner scope a fresh memo whenever the substitution actually shrinks, which keeps
+each memo key-determined and costs nothing in the common unshadowed case.
+
+Planning's predicate compilation is the borderline: it reads the refinement's
+`base`, which the key does not name, but only into the compiled term's *type*
+slots — so type-blind identity makes reuse sound *provided the bases agree*.
+Debug builds check exactly that on the hit path (`predicates::CompileMemo`) rather
+than leaving it argued.
+
+One consequence of the protocol worth stating: the `changed` bit a callback
+returns is not the whole answer. A callback that recurses back through the memo
+can have its copy mutated underneath it by a nested memo hit, with nothing of its
+own to report; discarding the copy would throw that re-pointing away and memoize
+the staleness. `walk_refined_predicates_mut` therefore also consults the memo's
+own revision counter, and returns a `changed` bit of its own for callers running a
+fixpoint.
 
 The invariant is guarded two ways: a debug-only tripwire around `retype` asserts
 the distinct-`Rc` count (`ccl_utils::distinct_predicate_rcs`) never *grows*

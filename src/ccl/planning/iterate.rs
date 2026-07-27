@@ -8,9 +8,7 @@
 use std::mem::take;
 
 use super::join::try_hash_join_rewrite;
-use crate::ccl::ccl_utils::PredMemo;
-
-use super::predicates::{compile_refinement_predicates, fn_of_bare_predicate};
+use super::predicates::{CompileMemo, compile_refinement_predicates, fn_of_bare_predicate};
 use super::*;
 
 /// Walks `expr` and materializes every iteration site, choosing the best
@@ -347,7 +345,7 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     // two sibling sites may be compiled again; that is safe because
     // `lambda_elim::run` is idempotent on an already-point-free predicate
     // (re-running finds no lambdas to eliminate).
-    compile_refinement_predicates(expr, &mut PredMemo::new());
+    compile_refinement_predicates(expr, &mut CompileMemo::new());
     let Some(domain_ty) = expr.ty.domain() else {
         return;
     };
