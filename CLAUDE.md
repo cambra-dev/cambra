@@ -163,6 +163,22 @@ When you are using compact, focus on test output and code changes.
    1. `git fetch origin`
    2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
 
+### Commit descriptions are PR bodies — author them as Markdown
+
+PRs here are often created with `gh pr create --fill`, so the
+PR body is the commit description *verbatim*, the PR body squashes to become
+the `main` commit message. GitHub renders that body as GitHub-Flavored Markdown,
+so write commit descriptions as Markdown,not as traditional column-wrapped git prose:
+
+- **Do not hard-wrap inside a paragraph.** Let each paragraph be one
+  soft-wrapped line and separate paragraphs with a blank line — otherwise every
+  wrap point renders as a ragged `<br>` on GitHub.
+- **Backtick every code construct** — type/identifier names, file paths,
+  field and flag names (`` `CompiledProgram` ``, `` `dead_code` ``,
+  `` `src/ccl/lineage.rs` ``).
+- Use real Markdown for structure where it helps: `-` bullet lists for
+  enumerations, blank lines between paragraphs.
+
 ### Updating PR descriptions
 
 `gh pr edit --body` fails with exit code 1 due to a Projects (classic) deprecation warning, even when the body update would otherwise succeed. Use the REST API instead:
