@@ -1276,34 +1276,55 @@ mod tests {
     // is_free / is_free_in_type
     // -----------------------------------------------------------------------
 
-    /// Regression test: `is_free_in_type` must use `any`, not `all`, for tuples.
+    /// Two properties of `is_free_in_type`, on one fixture so they contrast:
     ///
-    /// A variable is free in a tuple type if it appears in ANY component.
-    /// The old bug used `.all()`, so a variable appearing in only one component
-    /// of a multi-element tuple type would not be detected as free, causing
-    /// `substitute` to silently skip the substitution.
+    /// 1. A name is free in a tuple type if it appears in **any** component. The
+    ///    original bug here used `.all()`, so a variable appearing in only one
+    ///    component of a multi-element tuple went undetected and `substitute`
+    ///    silently skipped it.
+    /// 2. `REFINEMENT_BINDER` is **never** free in a type: a refinement is a
+    ///    binding form, and every `__elem` occurrence sits under the refinement
+    ///    that binds it. Reporting it free tripped the "value-dependent dependent
+    ///    function" guard below on any nested filter, whose predicate carries a
+    ///    refinement over `__elem`.
+    ///
+    /// One predicate exercises both — `__elem > x` mentions the bound element
+    /// binder and a free reference to the enclosing scope — so an implementation
+    /// that answered uniformly (everything free, or nothing free) fails one half.
     #[test]
-    fn is_free_detects_var_in_partial_tuple_refinement() {
+    fn is_free_in_type_sees_free_names_but_not_the_bound_element_binder() {
         use crate::ccl::Refinement;
         use std::rc::Rc;
 
-        // pred = Var("x") — the refinement predicate references x.
-        let pred = Rc::new(Expr::var("x"));
+        // pred = `__elem > x`: `__elem` is bound by the enclosing refinement,
+        // `x` is a free reference to whatever scope the type sits in.
+        let pred = Rc::new(Expr::binop(
+            Expr::var(Name::elem()),
+            BinOpKind::Compare(CompareKind::Greater),
+            Expr::var("x"),
+        ));
         let refinement = Refinement { predicate: pred };
 
-        // Tuple([Int, Refinement(Int, pred_x)]): x only appears in the second component.
+        // Tuple([Int, {Int | __elem > x}]): the predicate rides only the second
+        // component, so `any`-vs-`all` is observable.
         let tuple_ty = Type::Tuple(vec![
             int_ty(),
             Type::Refinement(Box::new(int_ty()), refinement),
         ]);
 
-        // Lit(42) typed with the tuple above — the expression node has no free vars,
-        // so the result depends entirely on is_free_in_type finding x in the type.
+        // Lit(42) typed with the tuple above — the expression node itself has no
+        // free vars, so both answers come entirely from `is_free_in_type`.
         let expr = Expr::lit(Lit::Int(42)).with_ty(tuple_ty);
 
         assert!(
             is_free(&Name::raw("x"), &expr),
             "x should be free: it appears in the refinement of the second tuple component"
+        );
+        assert!(
+            !is_free(&Name::elem(), &expr),
+            "the refinement element binder is bound by its refinement, so it is never \
+             free in a type — reporting it free is what falsely tripped the \
+             value-dependent-dependent-function guard on nested filters"
         );
     }
 }

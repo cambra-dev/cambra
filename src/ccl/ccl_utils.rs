@@ -415,6 +415,12 @@ fn refine_with(base: Type, predicate: &Expr) -> Type {
 /// nodes treat their `name` field as a use of the defer-handle variable,
 /// so writes to that defer count as occurrences too.
 ///
+/// A [`Type::Refinement`] is a binding form too — it binds
+/// [`crate::ccl::REFINEMENT_BINDER`] (`__elem`) in its predicate — so occurrences
+/// of that one name inside a type are **bound, never free** (see
+/// [`is_free_in_type`]). Every other name in a predicate is a free reference to
+/// the enclosing lexical scope and is counted.
+///
 /// Used by:
 /// - [`is_free`] — the bool wrapper for "does `name` appear at all?"
 /// - [`crate::ccl::channelize`] — to detect when a defer's value
@@ -678,6 +684,11 @@ fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
 /// it to detect when a term substitution would need to reach into a
 /// type-carried predicate (e.g. a `cast`-introduced domain refinement that
 /// closes over the substituted variable).
+///
+/// **Always `false` for [`crate::ccl::REFINEMENT_BINDER`]** — a type's only
+/// binding form is the refinement, and every `__elem` occurrence sits under the
+/// refinement that binds it, so the element binder is never a free reference to
+/// anything a substitution could supply.
 pub fn is_free_in_type(name: &Name, ty: &Type) -> bool {
     count_free_in_type_with_visited(name, ty, &mut HashSet::new()) > 0
 }
@@ -691,6 +702,17 @@ fn count_free_in_type_with_visited(
     ty: &Type,
     visited: &mut HashSet<PredicateId>,
 ) -> usize {
+    // The only variable a type can bind is the refinement element binder
+    // ([`crate::ccl::REFINEMENT_BINDER`]): it occurs *only* inside refinement
+    // predicates, and each such occurrence is bound by its enclosing refinement.
+    // So it is never free in a type — counting its (bound) occurrences would
+    // falsely report the binder as free, e.g. tripping lambda-elim's
+    // "value-dependent dependent function" guard when a predicate merely carries
+    // a nested refinement over `__elem`. Every *other* name in a predicate is a
+    // free reference to the enclosing lexical scope and is counted.
+    if name.is_elem() {
+        return 0;
+    }
     let mut count = 0;
     walk_refined_predicates(ty, visited, &mut |pred, vis| {
         count += count_free_with_visited(name, pred, vis);
