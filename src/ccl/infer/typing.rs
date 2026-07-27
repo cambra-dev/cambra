@@ -2,7 +2,7 @@
 // Typing: the structural typing-rule interface
 // ---------------------------------------------------------------------------
 
-use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::PolyScheme;
 use crate::ccl::{Expr, Name, Type};
@@ -32,7 +32,7 @@ pub(super) trait Typing {
     /// emit/check walk. Both modes rebuild every predicate they type
     /// ([`emit_bare_predicate`](super::emit)), so both need it; it lives on the
     /// ctx because that is the only thing scoped to the pass rather than a node.
-    fn pred_memo(&mut self) -> &mut PredMemo;
+    fn pred_memo(&self) -> TermMemo;
 
     /// Instantiate a polymorphic operator scheme at the current level.
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type;

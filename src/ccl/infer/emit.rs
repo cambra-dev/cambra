@@ -327,19 +327,20 @@ fn emit_bare_predicate<C: Typing>(
     domain: &Type,
     ctx: &mut C,
 ) -> Result<(), InferError> {
-    let (origin, mut pred) = ctx.pred_memo().begin_always(r);
-    // No `?` between opening and closing the rebuild: an early return would drop
-    // the `Origin`, discarding the typed copy and leaving this occurrence pointing
-    // at its un-emitted origin while its siblings are rebuilt (see `Origin`). The
-    // result is closed first, then propagated.
-    let typed = ctx
-        .scoped(&Name::elem(), domain, |ctx| ctx.subexpr(&mut pred))
-        .and_then(|pred_ty| {
-            ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
-                "refinement predicate".to_string()
-            })
-        });
-    ctx.pred_memo().finish_shared(r, origin, pred);
+    let memo = ctx.pred_memo();
+    // The closure cannot leave the rebuild half-done: there is no token to drop on
+    // an early return, so the error is captured and propagated after the term is
+    // installed rather than skipping the install.
+    let mut typed = Ok(());
+    memo.rebuild_always(r, |pred| {
+        typed = ctx
+            .scoped(&Name::elem(), domain, |ctx| ctx.subexpr(pred))
+            .and_then(|pred_ty| {
+                ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
+                    "refinement predicate".to_string()
+                })
+            });
+    });
     typed
 }
 

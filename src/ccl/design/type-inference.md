@@ -318,47 +318,64 @@ lives, is the one that costs most. `count_free`/`is_free` are on it too, and tha
 is not cosmetic: several passes *skip work* when `is_free` says no, so a slot the
 free-variable walk cannot see is a slot those passes decline to rewrite.
 
-#### Reusing an entry is only sound for a key-determined transform
+#### The memo key is the predicate *and the conditions it was rebuilt under*
 
-The memo's key is the predicate `Rc`'s address **and nothing else**. Serving one
-occurrence's result to another is therefore only valid when the transform is a
-function of the predicate term. Passes divide on this, and the division decides
-which protocol they use:
+Keying such a memo on the predicate `Rc`'s address alone is half a key: it answers
+"have I rebuilt this term?", while every pass needs "have I rebuilt this term
+**under the conditions I am rebuilding it under now**?". `PredMemo<C>` carries those
+conditions as `C`, and reuses an entry only when it was recorded under an equal
+`C`. Supplying the wrong `C` costs a sharing opportunity; it cannot produce a wrong
+answer — which is the point, because the key-only design did produce wrong answers
+(`subst` discharging a binder its inner scope owned; constraint emission skipping
+the emission that bounds an occurrence's own domain).
 
-- **Key-determined** — `begin`/`finish`, where a hit *skips* the transform.
-  `uniquify`, `coalesce`, `retype`, `simplify`, `inline`, and `subst` within one
-  active substitution. Each depends on the term plus context invariant across the
-  occurrences sharing it: coalesce's predicates resolve out of one live constraint
-  graph, so two occurrences of one term resolve identically.
-- **Context-determined** — `begin_always`/`finish_shared`, where the transform
-  runs at *every* occurrence and only the resulting term is unified. Constraint
-  emission is the case: it binds `REFINEMENT_BINDER` to a domain supplied per
-  occurrence (`emit_cast` mints a fresh one per cast node), so skipping it would
-  leave that occurrence's domain without the constraints the predicate imposes on
-  it. Discarding the loser's term is sound because refinement identity is
-  type-blind.
+What each pass supplies:
 
-A third shape is neither, and wants the memo *scoped* rather than the key widened:
-when the context is part of the transform's identity instead of a parameter of it.
-`subst` is that case — acting differently in different scopes is the point of a
-substitution, so a memo carried across a binder crossing that shadows a
-substituted variable is wrong in both directions (an outer rebuild served inside,
-or an inner vacuity decision served outside). `subst::recurse_shrunk` gives the
-inner scope a fresh memo whenever the substitution actually shrinks, which keeps
-each memo key-determined and costs nothing in the common unshadowed case.
+| pass | `C` | why |
+|---|---|---|
+| `simplify` | `()` | a function of the term, full stop |
+| `uniquify` | `()` | resolves against `env`, but lowering shares an `Rc` only by copying one refinement, and pre-uniquifies a subtree before cloning it |
+| `coalesce` | `()` | resolution reads one live constraint graph, so occurrences of one term resolve identically |
+| `retype` | `()` | stamps by `Name`; uids are minted once, and a monomorphization clone rebuilds its predicates while freshening |
+| `inline` | `()` | the rewrite is fixed per sweep, and a shadowed subtree is *skipped*, never descended into |
+| `subst` | `Subst` | acting differently in different scopes is the point of a substitution |
+| planning | `Type` | compilation reads the refinement's base |
 
-Planning's predicate compilation is the borderline: it reads the refinement's
-`base`, which the key does not name, but only into the compiled term's *type*
-slots — so type-blind identity makes reuse sound *provided the bases agree*.
-Debug builds check exactly that on the hit path (`predicates::CompileMemo`) rather
-than leaving it argued.
+The `()` rows are *claims*, and each one's justification lives at its call site —
+that is where to check it. Two are load-bearing in a way worth flagging: `inline`'s
+depends on its binder arms skipping rather than descending-with-a-guard, and
+`retype`'s on freshening giving clones distinct predicate `Rc`s.
 
-One consequence of the protocol worth stating: the `changed` bit a callback
-returns is not the whole answer. A callback that recurses back through the memo
-can have its copy mutated underneath it by a nested memo hit, with nothing of its
-own to report; discarding the copy would throw that re-pointing away and memoize
-the staleness. `walk_refined_predicates_mut` therefore also consults the memo's
-own revision counter, and returns a `changed` bit of its own for callers running a
+A pass that must share *allocations* without sharing *results* uses `TermMemo`
+instead. Constraint emission is the case: it binds `REFINEMENT_BINDER` to a domain
+`emit_cast` mints fresh per cast node, so no occurrence may reuse another's answer,
+yet all should still land on one term. `TermMemo` is a separate type rather than a
+flag, so which of the two a pass is entitled to is visible in its signature.
+
+#### The protocol is a closure, so a rebuild cannot be half-done
+
+`PredMemo::rebuild` and `TermMemo::rebuild_always` take the transform as a closure.
+An earlier token-based shape (`begin` handing out a token that a `finish` consumed)
+could be left open: dropping the token discarded the rebuild, left the occurrence
+on its origin `Rc`, and memoized nothing — so a pass that returned early between
+the halves rewrote every occurrence *but one*. Two such leaks existed; the closure
+form makes them unrepresentable.
+
+The closure is also what lets the memo be a cheap clonable handle
+(`Rc<RefCell<_>>`), which matters because three passes own their memo inside the
+very context their transform needs mutably — `uniquify`'s `self.expr` → `self.ty`,
+`coalesce_node` → `coalesce_type_predicates`, `subexpr` → `emit_node` →
+`emit_cast`. Reaching a handle needs only `&ctx`, and no borrow of the store is held
+across the callback, so those transforms re-enter the memo freely. Threading the
+memo as a plain parameter instead would mean changing `Typing::subexpr` and every
+emit rule.
+
+One consequence worth stating: the `changed` bit a callback returns is not the
+whole answer. A callback that re-enters the memo can have its copy mutated
+underneath it by a nested reuse, with nothing of its own to report; discarding the
+copy would throw that re-pointing away and memoize the staleness. `rebuild`
+therefore also consults the store's revision counter, and
+`walk_refined_predicates_mut` returns a `changed` bit for callers running a
 fixpoint.
 
 The invariant is guarded two ways: a debug-only tripwire around `retype` asserts

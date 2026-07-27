@@ -231,11 +231,14 @@ impl Uniquifier {
     /// (see module docs), with every occurrence re-pointed at the rebuilt `Rc`
     /// via `memo`.
     fn ty(&mut self, t: &mut Type) {
-        if let Type::Refinement(_, r) = t
-            && let Some((origin, mut pred)) = self.memo.begin(r)
-        {
-            self.expr(&mut pred);
-            self.memo.finish(r, origin, pred);
+        if let Type::Refinement(_, r) = t {
+            // A handle clone, so `self` stays freely borrowable for the rebuild —
+            // which re-enters this same memo through `self.expr` → `self.ty`.
+            let memo = self.memo.clone();
+            memo.rebuild(r, &(), |pred| {
+                self.expr(pred);
+                true
+            });
         }
         t.walk_children_mut(|c| self.ty(c));
     }

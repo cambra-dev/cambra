@@ -41,10 +41,15 @@
 //!   `Rc`, exactly as transport mode does.
 //!
 //! Both modes share the same discipline: a
-//! [`PredMemo`](crate::ccl::ccl_utils::PredMemo) keyed on the origin predicate's
-//! identity re-points every occurrence that shared one predicate term at the
-//! *same* result, so one rewrite is observed uniformly across the aliases and
-//! occurrences that entered a rewrite sharing one `Rc` leave sharing one `Rc`.
+//! [`PredMemo`](crate::ccl::ccl_utils::PredMemo) re-points every occurrence that
+//! shared one predicate term at the *same* result, so one rewrite is observed
+//! uniformly across the aliases and occurrences that entered sharing one `Rc` leave
+//! sharing one `Rc`. Its context (`C`) is **the active substitution**: an entry is
+//! reused only for an occurrence under the same one, so a rebuild made outside a
+//! scope that rebinds a substituted variable is never served to an occurrence
+//! inside it. That is what makes threading a single memo across binder crossings
+//! correct — acting differently in different scopes is the whole job of a
+//! substitution, so scope cannot be left out of the key.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -532,7 +537,7 @@ impl Subst {
         if self.is_id() {
             return;
         }
-        self.rewrite_expr_go(e, &mut PredMemo::new());
+        self.rewrite_expr_go(e, &PredMemo::new());
     }
 
     /// Discharge `binder ↦ term` over `e` **in place**, cloning `term` only
@@ -548,7 +553,7 @@ impl Subst {
         Subst::discharge(binder.clone(), term.clone()).rewrite_expr(e);
     }
 
-    fn rewrite_expr_go(&self, e: &mut TypedExpr, memo: &mut PredMemo) {
+    fn rewrite_expr_go(&self, e: &mut TypedExpr, memo: &PredMemo<Subst>) {
         // Inert subtree (no substituted binder free in value or type slots):
         // leave it untouched — predicates in particular stay un-rebuilt,
         // mirroring the transport mode's `Rc`-sharing guarantee.
@@ -619,12 +624,10 @@ impl Subst {
                 for (b, _) in bindings.iter() {
                     inner.assert_no_capture(&b.name);
                 }
-                self.recurse_shrunk(&inner, memo, |s, m| {
-                    for (_, def) in bindings.iter_mut() {
-                        s.rewrite_expr_go(def, m);
-                    }
-                    s.rewrite_expr_go(body, m);
-                });
+                for (_, def) in bindings.iter_mut() {
+                    inner.rewrite_expr_go(def, memo);
+                }
+                inner.rewrite_expr_go(body, memo);
             }
 
             TypedExprNode::Case {
@@ -642,10 +645,8 @@ impl Subst {
                     if let Some(p) = &b.pattern {
                         inner.assert_no_capture(&p.binding.name);
                     }
-                    self.recurse_shrunk(&inner, memo, |s, m| {
-                        s.rewrite_expr_go(&mut b.guard, m);
-                        s.rewrite_expr_go(&mut b.body, m);
-                    });
+                    inner.rewrite_expr_go(&mut b.guard, memo);
+                    inner.rewrite_expr_go(&mut b.body, memo);
                 }
             }
 
@@ -669,47 +670,13 @@ impl Subst {
 
     /// In-place analogue of [`Self::under_binder`]: shadow, assert
     /// no-capture, recurse into the binder's scope.
-    fn under_binder_mut(&self, binder: &Name, body: &mut TypedExpr, memo: &mut PredMemo) {
+    fn under_binder_mut(&self, binder: &Name, body: &mut TypedExpr, memo: &PredMemo<Subst>) {
         let restricted = self.shadow(binder);
         if !restricted.0.keys().any(|k| is_free(k, body)) {
             return;
         }
         restricted.assert_no_capture(binder);
-        self.recurse_shrunk(&restricted, memo, |s, m| s.rewrite_expr_go(body, m));
-    }
-
-    /// Recurse with `shrunk` in force, handing it `memo` **only if the
-    /// substitution did not actually change**.
-    ///
-    /// [`PredMemo`] is keyed on the predicate `Rc`'s address and nothing else, so
-    /// reusing a rebuild is sound only while everything else the transform depends
-    /// on is held fixed. For substitution that "everything else" is the active
-    /// substitution itself — and acting differently in different scopes is not an
-    /// incidental dependency, it is the *point*. A binder crossing that shadows a
-    /// substituted variable is precisely the substitution changing, so a memo
-    /// carried across it is wrong in both directions:
-    ///
-    /// - a rebuild recorded outside would be served to an occurrence inside, where
-    ///   the variable is rebound — discharging a binder the inner scope owns;
-    /// - a `finish_unchanged` recorded inside, where the substitution is inert,
-    ///   would tell a later occurrence outside that there is nothing to do.
-    ///
-    /// Scoping the memo to the substitution keeps the transform key-determined
-    /// *within* each memo, which is the property [`PredMemo`] requires, rather
-    /// than widening the key to carry a whole `Subst`. Sharing is unaffected in the
-    /// common case: with no shadowing, `shrunk == *self` and one memo spans the
-    /// whole walk.
-    fn recurse_shrunk(
-        &self,
-        shrunk: &Subst,
-        memo: &mut PredMemo,
-        f: impl FnOnce(&Subst, &mut PredMemo),
-    ) {
-        if shrunk == self {
-            f(shrunk, memo);
-        } else {
-            f(shrunk, &mut PredMemo::new());
-        }
+        restricted.rewrite_expr_go(body, memo);
     }
 
     /// The Barendregt no-capture invariant at a binder crossing (see
@@ -730,10 +697,10 @@ impl Subst {
         if self.is_id() {
             return;
         }
-        self.rewrite_type_go(ty, &mut PredMemo::new());
+        self.rewrite_type_go(ty, &PredMemo::new());
     }
 
-    fn rewrite_type_go(&self, ty: &mut Type, memo: &mut PredMemo) {
+    fn rewrite_type_go(&self, ty: &mut Type, memo: &PredMemo<Subst>) {
         match ty {
             Type::Base(_)
             | Type::UIntRange(_)
@@ -773,42 +740,32 @@ impl Subst {
                 self.rewrite_type_go(domain, memo);
                 let restricted = self.shadow(b);
                 restricted.assert_no_capture(b);
-                self.recurse_shrunk(&restricted, memo, |s, m| s.rewrite_type_go(codomain, m));
+                restricted.rewrite_type_go(codomain, memo);
             }
 
             Type::Refinement(base, r) => {
-                // A memo hit re-points at the single rebuild; on a miss, decide
-                // whether this substitution has anything to do here at all.
-                if let Some((origin, mut pred)) = memo.begin(r) {
-                    // The refinement implicitly binds REFINEMENT_BINDER in its
-                    // bare predicate, so the substitution acts *under* that
-                    // binder. Cloning the map is only worth it on the paths that
-                    // use it — not on the memo-hit path above. (In practice this
-                    // never shrinks — `REFINEMENT_BINDER` is reserved and no
-                    // `Subst` maps it — but it goes through `recurse_shrunk` so
-                    // the invariant holds by construction at every crossing
-                    // rather than by that argument.)
-                    let restricted = self.shadow(&Name::elem());
-                    if restricted.0.keys().any(|k| is_free(k, &pred)) {
-                        self.recurse_shrunk(&restricted, memo, |s, m| {
-                            s.rewrite_expr_go(&mut pred, m)
-                        });
-                        memo.finish(r, origin, pred);
-                    } else {
-                        // Vacuous — no substituted binder occurs free in the
-                        // predicate — so keep the origin `Rc`, leaving a
-                        // predicate this substitution doesn't touch *shared*
-                        // across its occurrences (mirrors
-                        // [`Self::force_refinement`]'s transport path). Without
-                        // it, every `substitute` in a pass like `lambda_elim`
-                        // would rebuild every predicate it merely walks past into
-                        // a fresh `Rc`, splitting the sharing inference
-                        // established. Recording it also makes the `is_free` scan
-                        // above run once per *distinct* predicate rather than
-                        // once per occurrence.
-                        memo.finish_unchanged(r, origin);
+                // The refinement implicitly binds REFINEMENT_BINDER in its bare
+                // predicate, so the substitution acts *under* that binder.
+                let restricted = self.shadow(&Name::elem());
+                // `restricted` is the memo's context: an entry is reused only for
+                // an occurrence under the *same* active substitution, so a rebuild
+                // made outside a scope that shadows a substituted binder is never
+                // served to an occurrence inside it (and a vacuous decision made
+                // inside is never served outside). That is what makes threading one
+                // memo across binder crossings correct — see `PredMemo`.
+                memo.rebuild(r, &restricted, |pred| {
+                    if !restricted.0.keys().any(|k| is_free(k, pred)) {
+                        // Vacuous: no substituted binder occurs free here, so report
+                        // no change and keep the origin `Rc` — a predicate this
+                        // substitution merely walks past stays shared with its other
+                        // occurrences (mirroring `force_refinement`'s transport
+                        // path). Memoizing the decision also makes this `is_free`
+                        // scan run once per distinct predicate, not per occurrence.
+                        return false;
                     }
-                }
+                    restricted.rewrite_expr_go(pred, memo);
+                    true
+                });
                 self.rewrite_type_go(base, memo);
             }
 

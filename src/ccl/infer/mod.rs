@@ -323,7 +323,7 @@ pub(crate) fn run(
     // end-to-end guard is `tests/predicate_sharing.rs`.)
     #[cfg(debug_assertions)]
     let pred_rcs_before_retype = crate::ccl::ccl_utils::distinct_predicate_rcs(expr);
-    retype_predicate_slots(expr, &HashMap::new(), &mut PredMemo::new());
+    retype_predicate_slots(expr, &HashMap::new(), &PredMemo::new());
     #[cfg(debug_assertions)]
     debug_assert!(
         crate::ccl::ccl_utils::distinct_predicate_rcs(expr) <= pred_rcs_before_retype,

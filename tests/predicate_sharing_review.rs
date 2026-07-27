@@ -193,12 +193,12 @@ fn is_free_sees_a_predicate_on_a_let_binding_slot() {
 /// which reports only whether a *rule fired*.
 #[test]
 fn walk_preserves_a_repointing_made_by_a_nested_memo_hit() {
-    let mut memo = PredMemo::new();
+    let memo: PredMemo = PredMemo::new();
 
     // An inner predicate `q`, rebuilt through the memo by some earlier occurrence.
     let q = Rc::new(gt(var("a"), int(0)));
     let mut t_q = refined(&q);
-    walk_refined_predicates_mut(&mut t_q, &mut memo, &mut |pred, _| {
+    walk_refined_predicates_mut(&mut t_q, &memo, &(), &mut |pred, _| {
         *pred = gt(var("a"), int(1)); // a real rewrite
         true
     });
@@ -209,9 +209,9 @@ fn walk_preserves_a_repointing_made_by_a_nested_memo_hit() {
     // slot. The transform has nothing to say about `p` itself.
     let p = Rc::new(int(1).with_ty(refined(&q)));
     let mut t_p = refined(&p);
-    walk_refined_predicates_mut(&mut t_p, &mut memo, &mut |pred, memo| {
+    walk_refined_predicates_mut(&mut t_p, &memo, &(), &mut |pred, memo| {
         // Recurse into the predicate's own type slots, as every caller does.
-        walk_refined_predicates_mut(&mut pred.ty, memo, &mut |_, _| false);
+        walk_refined_predicates_mut(&mut pred.ty, memo, &(), &mut |_, _| false);
         false // "no rule fired at this level"
     });
 

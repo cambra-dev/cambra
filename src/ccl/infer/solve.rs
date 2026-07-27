@@ -1026,14 +1026,14 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// that ctx, so the combinator's `&mut PredMemo` and the transform's `&mut ctx`
 /// would alias. Pulling the memo out would force it through `coalesce_node`'s
 /// whole recursion (far more threading than the ctx field). So the sharing is
-/// preserved inline here via the same [`PredMemo`] protocol (`begin` / `finish`)
-/// the combinator uses.
+/// preserved inline here via the same [`PredMemo::rebuild`] the combinator uses —
+/// which is possible because the memo is a handle, so reaching it needs only
+/// `&ctx` and the callback can re-enter it through `coalesce_node`'s own recursion.
 ///
-/// **Why this is a key-determined transform** (see [`PredMemo`]'s note on the
-/// distinction, which decides whether a pass may skip its transform on a memo
-/// hit). `coalesce_node` is level- and scope-dependent, and the memo is keyed on
-/// the predicate `Rc` alone — so for two occurrences of one shared `Rc` reached
-/// under different scopes, whichever the walk hits first wins. That is sound here
+/// **Why `C = ()`** (see [`PredMemo`]'s note on what `C` is). `coalesce_node` is
+/// level- and scope-dependent, so declaring no context means: for two occurrences
+/// of one shared `Rc` reached under different scopes, whichever the walk reaches
+/// first wins. That is sound here
 /// because sharing means *literally the same term with the same inference
 /// variables*: resolution reads those variables out of the one live constraint
 /// graph, so both occurrences would resolve identically and the first result is
@@ -1042,8 +1042,8 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// shared `Rc` is only ever created by copying one occurrence of one refinement.
 ///
 /// Contrast constraint *emission*, where the same reasoning fails: it is
-/// parameterized by a domain minted per occurrence, so it must run at each one
-/// (`emit_bare_predicate`).
+/// parameterized by a domain minted per occurrence, so it must run at each one and
+/// uses `TermMemo` instead (`emit_bare_predicate`).
 fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) {
     match ty {
         Type::Refinement(inner, r) => {
@@ -1052,10 +1052,14 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
             // coalescing an independent copy (which would split the sharing — see
             // [`PredMemo`]). `begin` hands back an owned copy and drops its
             // borrow, so `coalesce_node` can take `&mut ctx` below.
-            if let Some((origin, mut pred)) = ctx.pred_memo.begin(r) {
-                coalesce_node(&mut pred, level, ctx);
-                ctx.pred_memo.finish(r, origin, pred);
-            }
+            // A handle clone, so `ctx` stays freely borrowable for the rebuild —
+            // which re-enters this same memo through `coalesce_node` →
+            // `coalesce_type_predicates`.
+            let memo = ctx.pred_memo.clone();
+            memo.rebuild(r, &(), |pred| {
+                coalesce_node(pred, level, ctx);
+                true
+            });
             coalesce_type_predicates(inner, level, ctx);
         }
         Type::Fun {
@@ -1487,7 +1491,7 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
 pub(super) fn retype_predicate_slots(
     expr: &mut Expr,
     scope: &HashMap<Name, Type>,
-    memo: &mut PredMemo,
+    memo: &PredMemo,
 ) {
     // Every type slot the node carries, retyped in the *enclosing* scope — a
     // binder does not bind in its own type. Each slot (`ty`, the annotation, a
@@ -1585,8 +1589,8 @@ pub(super) fn retype_predicate_slots(
 /// predicates as fresh `Rc`s while freshening (`freshen_refinement_predicate`), so
 /// clones never share an `Rc` to collapse. Occurrences sharing one `Rc` therefore
 /// stamp identically.
-fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>, memo: &mut PredMemo) {
-    walk_refined_predicates_mut(ty, memo, &mut |pred, memo| {
+fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>, memo: &PredMemo) {
+    walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
         // Always reported as changed: retyping rewrites *type slots* inside the
         // predicate, and `Refinement`'s equality is type-blind — so a "did it
         // change?" test at the refinement level cannot see this pass's work.

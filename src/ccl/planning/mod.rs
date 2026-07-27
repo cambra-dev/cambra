@@ -107,7 +107,7 @@ pub fn run(mut expr: Expr) -> Expr {
     // post-planning typecheck's structural refinement match holds. It runs
     // after the recognizers (which already consumed the bare shapes they
     // match) and is idempotent on already-compiled predicates.
-    compile_refinement_predicates(&mut expr, &mut predicates::CompileMemo::new());
+    compile_refinement_predicates(&mut expr, &PredMemo::new());
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
     // boilerplate that [`join::try_hash_join_rewrite`] emits via
     // [`replace_tuple_project_with_id`].  `simplify` is marker-aware: its

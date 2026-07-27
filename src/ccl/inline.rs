@@ -303,7 +303,7 @@ fn inline_impl(expr: Expr) -> Expr {
                     // sweep touches. Scoped to *this* rewrite, not the `inline`
                     // pass: a different binder's rewrite maps the same origin
                     // `Rc` to a different result.
-                    &mut PredMemo::new(),
+                    &PredMemo::new(),
                 ));
             }
             TypedExprNode::Let {
@@ -363,7 +363,7 @@ fn inline_impl(expr: Expr) -> Expr {
 /// perturbs CCC simplify's input shape for list comprehensions, scalar UDFs,
 /// and BinOp paths in ways that need test-suite triage first.  Revisit if a
 /// case surfaces where the surviving anon-lambda blocks downstream work.
-fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &mut PredMemo) -> Expr {
+fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMemo) -> Expr {
     // Direct occurrence: replace the variable with the Lambda value.
     if let TypedExprNode::Var(ref n) = expr.node
         && n == name
@@ -551,19 +551,18 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &mut Pre
 /// inside a predicate must also *beta-reduce* the call sites it creates —
 /// substitution proper is the engine's job and runs inside
 /// [`inline_and_beta_reduce`] via `lambda_elim::substitute`.
-/// **Why one memo may span the whole sweep** even though the rewrite is
-/// scope-sensitive (see [`PredMemo`]'s note on key-determined transforms).
-/// `[name ↦ lambda]` must not fire under a binder that shadows `name`, and unlike
-/// `subst` — which descends into such a scope with a *restricted* substitution,
-/// and therefore needs a fresh memo per shrink — [`inline_and_beta_reduce`] does
-/// not descend at all: every binder arm that matches `name` returns its node with
-/// the body untouched. An occurrence inside a shadowed scope is thus never
-/// *visited*, so there is no hit to serve it the outer rebuild. That is a real
-/// dependency of this memo's scope on that skipping behaviour: an arm rewritten to
-/// descend-with-a-guard instead of skip would silently reintroduce the leak, and
-/// would need `Subst::recurse_shrunk`'s treatment.
-fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr, memo: &mut PredMemo) {
-    walk_refined_predicates_mut(ty, memo, &mut |pred, memo| {
+/// **Why `C = ()` is honest here** even though the rewrite is scope-sensitive (see
+/// [`PredMemo`]'s note on what `C` is). `[name ↦ lambda]` must not fire under a
+/// binder that shadows `name`, and unlike `subst` — which descends into such a
+/// scope with a *restricted* substitution, and so carries that substitution as its
+/// `C` — [`inline_and_beta_reduce`] does not descend at all: every binder arm that
+/// matches `name` returns its node with the body untouched. An occurrence inside a
+/// shadowed scope is therefore never *visited*, so there is nothing for the memo to
+/// serve it. This claim depends on that skipping: an arm rewritten to
+/// descend-with-a-guard would need the rewrite's scope in `C`, exactly as `subst`
+/// carries its `Subst`.
+fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr, memo: &PredMemo) {
+    walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
         // A predicate the inlined binder does not occur in is reported
         // *unchanged*, so it keeps its origin `Rc` and stays pointer-shared with
         // its occurrences on other nodes rather than being reallocated at each
@@ -1093,7 +1092,7 @@ mod tests {
         let lambda = TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
             .with_ty(fn_ty(int.clone(), int.clone()));
         let body = TypedExpr::var("f").with_ty(fn_ty(int.clone(), int));
-        let result = inline_and_beta_reduce(body, &Name::raw("f"), &lambda, &mut PredMemo::new());
+        let result = inline_and_beta_reduce(body, &Name::raw("f"), &lambda, &PredMemo::new());
         assert_eq!(result, lambda);
     }
 
@@ -1106,7 +1105,7 @@ mod tests {
         let arg = TypedExpr::lit(Lit::Int(3)).with_ty(int.clone());
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("f").with_ty(lambda.ty.clone()))
             .with_ty(int);
-        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda, &mut PredMemo::new());
+        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda, &PredMemo::new());
         assert_eq!(result, arg);
     }
 
@@ -1129,7 +1128,7 @@ mod tests {
             .with_ty(fn_ty(int.clone(), int.clone())),
         )
         .with_ty(int.clone());
-        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda, &mut PredMemo::new());
+        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda, &PredMemo::new());
         assert_eq!(result, TypedExpr::lit(Lit::Int(1)).with_ty(int));
     }
 
@@ -1153,7 +1152,7 @@ mod tests {
             shadowed.clone(),
             &Name::raw("f"),
             &replacement,
-            &mut PredMemo::new(),
+            &PredMemo::new(),
         );
         assert_eq!(result, shadowed);
     }

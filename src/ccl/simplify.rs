@@ -127,8 +127,8 @@ pub fn simplify(mut expr: Expr) -> Expr {
     // stays shared. A fresh memo *per node* (the previous shape) re-shared only
     // within a node and split the sharing across the tree.
     loop {
-        let mut memo = PredMemo::new();
-        if !simplify_once(&mut expr, &mut memo).0 {
+        let memo = PredMemo::new();
+        if !simplify_once(&mut expr, &memo).0 {
             break;
         }
     }
@@ -145,7 +145,7 @@ pub fn simplify(mut expr: Expr) -> Expr {
 ///   Passing it to [`apply_simplification_rules`] lets the discard-rule guard
 ///   read it in O(1) instead of re-scanning the whole subtree at every node —
 ///   the re-scan was O(n²) over the long compose chains planning emits.
-fn simplify_once(expr: &mut Expr, memo: &mut PredMemo) -> (bool, bool) {
+fn simplify_once(expr: &mut Expr, memo: &PredMemo) -> (bool, bool) {
     let mut changed = false;
     // A refinement's predicate is itself an immutable `Expr`; simplify *every*
     // predicate reachable from this node's type, rebuilding each as a fresh
@@ -161,7 +161,7 @@ fn simplify_once(expr: &mut Expr, memo: &mut PredMemo) -> (bool, bool) {
     // re-pointing a slot is another that the callback cannot observe (see
     // `walk_refined_predicates_mut`). Feeding only the callback's bit into the
     // fixpoint would let a re-pointing go unnoticed for an iteration.
-    changed |= walk_refined_predicates_mut(&mut expr.ty, memo, &mut |pred, memo| {
+    changed |= walk_refined_predicates_mut(&mut expr.ty, memo, &(), &mut |pred, memo| {
         // Reporting "unchanged" keeps the origin `Rc` in the slot, so a predicate
         // simplify has nothing to say about stays pointer-shared with every other
         // occurrence — including ones in nodes this walk never reaches.
@@ -179,7 +179,7 @@ fn simplify_once(expr: &mut Expr, memo: &mut PredMemo) -> (bool, bool) {
 /// Returns `(changed, contains_iteration)`: whether any child was modified,
 /// and whether any child's subtree contains an `iterate` source (OR-ed up so
 /// the parent need not re-scan its descendants).
-fn recurse_simplify(expr: &mut Expr, memo: &mut PredMemo) -> (bool, bool) {
+fn recurse_simplify(expr: &mut Expr, memo: &PredMemo) -> (bool, bool) {
     let (mut changed, has_iteration) = expr.fold_children_mut((false, false), |(c, it), e| {
         let (child_changed, child_has_iteration) = simplify_once(e, memo);
         (c | child_changed, it | child_has_iteration)
