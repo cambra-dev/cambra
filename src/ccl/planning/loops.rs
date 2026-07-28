@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use crate::ccl::{
     Builtin, Expr, F_COMMIT, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey,
     Type, TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::count_free,
+    ccl_utils::{count_free, strip_refinements},
     letrec::check_letrec_causal,
     mut_elim::{binding, fun_parts, let_in, tvar},
     symbolic::symbolic,
@@ -416,7 +416,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                     matches!(which, Builtin::GetPrevTxn),
                     "letrec recognition: transaction history guarded by get_prev_seq"
                 );
-                key_ty.push((b.name.clone(), init.ty.clone()));
+                key_ty.push((b.name.clone(), strip_refinements(&init.ty)));
                 keys.push(TransactKey { name: b.name, init });
             }
             TxnBinding::Commit => {

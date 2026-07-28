@@ -885,9 +885,14 @@ fn annotation_peels_to_hole(ty: &Type) -> bool {
 /// The three rules, all of which keep a mutable value statically traceable to
 /// a single introduction (so the writer set of every mutable variable is known):
 ///
-/// 1. A `Mut`-typed *value* must be a bare variable reference — no computed or
-///    conditional expression of `Mut` type, and no non-variable argument to a
-///    `Mut` parameter ([`InferError::MutNotBareVariable`]).
+/// 1. A `Mut`-typed *value* must be a bare variable reference — no computed
+///    expression of `Mut` type, and no non-variable argument to a `Mut`
+///    parameter ([`InferError::MutNotBareVariable`]). A *conditional* over two
+///    registers is not caught by the first clause: a mutable read derefs into
+///    the arms' join exactly as it derefs into a tuple element, so the selection
+///    types as a plain value and there is no `Mut` left on the node. What the
+///    rule is protecting — a selected register reaching a position that writes
+///    through it — is the second clause, which reads the argument's *node*.
 /// 2. `Mut` may not appear inside any composite type — only at a top-level
 ///    binding/parameter/expression position or a function *domain*
 ///    ([`InferError::MutInCompositeType`]).

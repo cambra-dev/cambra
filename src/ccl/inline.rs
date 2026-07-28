@@ -568,9 +568,6 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 /// Whether every refinement the parameter demands is already carried by the
 /// argument — so substituting the argument for the binder **discharges** the
 /// precondition rather than dropping it.
@@ -599,6 +596,10 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
     let supplied = layers(arg_ty);
     demanded.iter().all(|d| supplied.contains(d))
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

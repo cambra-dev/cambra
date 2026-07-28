@@ -1048,8 +1048,8 @@ pub(super) fn emit_list<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Typ
 /// tags ⊆ branch tags", and each αᵢ (the per-tag narrowed payload) is
 /// written straight into `Pattern::binding.ty` — coalesce resolves it in
 /// place. Every branch's guard is constrained to `Bool` (a pattern-only
-/// branch carries the literal-`true` guard), and all branch bodies are
-/// mutually constrained to a single result type.
+/// branch carries the literal-`true` guard), and every branch body flows
+/// one-way into one shared variable, so the node's type is the arms' **join**.
 pub(super) fn emit_case<C: Typing>(
     scrutinee: Option<&mut Expr>,
     branches: &mut [Branch],
@@ -1078,18 +1078,16 @@ pub(super) fn emit_case<C: Typing>(
         ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
     }
 
-    // A `Case` selects one arm at runtime, so its type cannot carry any *one* arm's
-    // refinement — `if c: 1 else: 2` is an `Int`, not "the 1". The arms are therefore
-    // related one-way to the first arm's type **stripped of refinements**, rather
-    // than required to equal it outright, which two arms carrying different
-    // singletons never could.
-    //
-    // Not a fresh join variable, deliberately: a `Mut` arm deref-coerces on the way
-    // into one, so the node's type would stop being a `Mut` and the second-class
-    // rule-1 check (`x if c else y` on two registers) would have nothing to fire on.
-    // Deriving from an arm keeps the constructor visible; stripping keeps the value
-    // honest.
-    let mut result_ty: Option<Type> = None;
+    // A `Case` selects one arm at runtime, so its type is what the arms have in
+    // common: the **join**, exactly as a list's element type is the join of its
+    // elements. Refinements ride in untouched and the join is what decides which
+    // survive — arms depositing different singletons intersect to none (`if c: 1
+    // else: 2` is an `Int`), while a restriction *every* arm establishes is kept
+    // (identical filtered comprehensions stay filtered). Relating each arm to a
+    // *stripped* sibling instead loses that, and for a collection arm — whose extent
+    // rides the contravariant `Fun` domain — it demands `D <: {D | p}`, rejecting two
+    // arms that are the same expression.
+    let result_ty = ctx.fresh();
     for b in branches.iter_mut() {
         // A pattern binds its payload (the var just written to `binding.ty`)
         // over the branch's guard and body. `scoped` restores the scope on
@@ -1102,44 +1100,9 @@ pub(super) fn emit_case<C: Typing>(
             Some((name, ty)) => ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?,
             None => emit_case_branch(b, ctx)?,
         };
-        match &result_ty {
-            None => result_ty = Some(strip_refinements(&body_ty)),
-            // BUG (pinned failing by
-            // `type_check::test_case_with_filtered_comprehension_arms_passes_consistency_wall`):
-            // the two sides of this relation are stripped *asymmetrically* — `prev` was
-            // stripped when it was stored, `body_ty` is not stripped here. For a scalar
-            // arm that is harmless, since a singleton is a subtype of its base
-            // (`{Int | __elem == 2} <: Int`). For an arm whose type is a **collection**
-            // it is not: a filtered comprehension is
-            // `{[0, N] | __elem ▷ p} ⇒ elem`, carrying its refinement on the `Fun`
-            // *domain*, and function subtyping is **contravariant** there — so relating
-            // a refined-domain arm to a stripped-domain `prev` demands
-            // `[0, N] <: {[0, N] | p}`, which does not hold. Two arms that are literally
-            // the same expression are rejected, and because this rule re-runs in Check
-            // mode over concrete recorded types the rejection lands on the
-            // post-inference consistency wall as an internal "compiler bug" panic
-            // (`ccl/context.rs`) rather than a user diagnostic.
-            //
-            // The fix is to strip **both** sides, making this the symmetric
-            // compare-modulo-refinements the rule intends (the same relation
-            // `check_node`'s reconcile and `channelize`'s feed-operand assert already
-            // use):
-            //
-            //     Some(prev) => ctx.require_sub(&strip_refinements(&body_ty), prev, &|| {
-            //         "Case arm".to_string()
-            //     })?,
-            //
-            // That also settles a second defect the asymmetry causes. With arms carrying
-            // *different* predicates the unstripped side deposits its witness on the
-            // shared variable and the stripped side deposits none, so the `Case` claims
-            // one arm's filter: `if c: [x for x in xs if x > 1] else: [x for x in xs if
-            // x < 3]` infers `{[0, 2] | x < 3} ⇒ Int`, an extent excluding `3` when the
-            // true branch contains it. Stripping both sides intersects the witnesses to
-            // none and yields `[0, 2] ⇒ Int` — the join, and sound.
-            Some(prev) => ctx.require_sub(&body_ty, prev, &|| "Case arm".to_string())?,
-        }
+        ctx.require_sub(&body_ty, &result_ty, &|| "Case arm".to_string())?;
     }
-    Ok(result_ty.expect("non-empty branches"))
+    Ok(result_ty)
 }
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the
@@ -1338,7 +1301,16 @@ pub(super) fn emit_transact<C: Typing>(
         let value_ty = ctx.fresh();
         let read_ty = fun(domain.clone(), value_ty.clone());
         let init_ty = ctx.subexpr(&mut k.init)?;
-        ctx.require_sub(&init_ty, &value_ty, &|| "transact init".to_string())?;
+        // Stripped, for the register law the `MutWrite` rule states: a register is
+        // not one value but the sequence its seed and every write produce, so its
+        // value type is the join over all of them and no single contribution's
+        // refinement survives. Here the seed is the value type's only *lower* bound
+        // (a writer's contribution is bounded above by it), so an unstripped seed
+        // would resolve the register — and every read of it — to the seed's
+        // singleton: `flag := False` would type the writers' `True` as `False`.
+        ctx.require_sub(&strip_refinements(&init_ty), &value_ty, &|| {
+            "transact init".to_string()
+        })?;
         fields.push((k.name.field_key(), read_ty));
         key_types.insert(k.name.clone(), value_ty);
     }

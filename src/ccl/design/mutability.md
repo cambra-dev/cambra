@@ -225,7 +225,13 @@ exactly as long as the compiler can statically resolve which introduction every 
 discipline:
 
 1. A `Mut`-typed expression must be a **bare variable reference** — an argument to a `Mut`
-   parameter is a variable, never a conditional or computed expression.
+   parameter is a variable, never a conditional or computed expression. The two halves catch
+   different things, because a *conditional* over two registers is not itself `Mut`-typed: a
+   mutable read derefs into the arms' join exactly as it derefs into a tuple element (see *Reads
+   are implicit derefs* above), so `x if c else y` reads their values and types as a plain `V`.
+   What the rule is protecting is the write capability travelling somewhere its target can't be
+   traced, and that is the **argument** half: `bump(x if c else y)` is rejected on the argument's
+   node, not its type.
 2. `Mut` may not appear **inside any composite type** — tuples, records, lists, function codomains
    (so it is never a return type), `Feed` payloads, or another `Mut`.
 3. An **unannotated binding may not have `Mut` type**: `b = a` is an error, not an alias. To copy

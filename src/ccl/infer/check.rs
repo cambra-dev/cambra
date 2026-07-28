@@ -281,9 +281,10 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
         // derives it from children; a literal is the one that could rebuild it, and
         // must not.
         TypedExprNode::Lit(lit) => {
-            // Recorded through `require_sub`, which *accumulates* into `ctx.errors`;
-            // `check` discards a propagated `Err` (see its `let _ =`), so returning
-            // one here would drop the diagnostic on the floor.
+            // Reported through `require_sub`, which *accumulates* into `ctx.errors`
+            // and returns `Ok` — that is how a rule reports without short-circuiting
+            // the walk (`check` collects a propagated `Err` too, but only a rule with
+            // nothing to accumulate into should use one).
             let base = lit_base(lit);
             let recorded = strip_refinements(&expr.ty);
             if recorded != base {
@@ -390,24 +391,18 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
     // constructors rebuild the same product), the subtype check is reflexive
     // and trivially holds, so skip the (deeper, allocating) `constrain_subtype`.
     if ty != expr.ty {
-        // **Modulo refinements.** This mode trusts already-resolved predicates (see
-        // `type_annotation_predicates`), and it must, for two reasons that both
-        // predate literals carrying singletons and are only made visible by them.
-        //
-        // First, the rules here recompute a type from *schemes*, which is lossier
-        // than the constraint solving that recorded it: a scheme joins where
-        // inference propagated, so a recomputed type routinely lacks a refinement
-        // the recorded one legitimately carries. Second, by the time this runs after
-        // planning, a recorded predicate has been compiled to point-free form, which
-        // no rebuilt pointful predicate can equal even when the two denote the same
-        // restriction.
-        //
-        // So the structural skeleton is what is checked, which is what this mode is
-        // for; refinements are inference's business and were reconciled there.
-        let (ty_s, recorded_s) = (strip_refinements(&ty), strip_refinements(&expr.ty));
-        if ty_s != recorded_s {
-            ctx.require_sub(&ty_s, &recorded_s, &|| format!("type of {label}"))?;
-        }
+        // Refinements included: this is the plain strict relation, like every other
+        // check here. A rule that rebuilds a node's type from its children rebuilds
+        // its refinements too, so a recorded refinement the reconstruction lacks is a
+        // real disagreement about the node — usually a **merge point that took one
+        // input's refinement** instead of the join of all of them, which is what makes
+        // an unrefined reconstruction meet a refined recorded type (`{Int | __elem == 0}`
+        // recorded on a `__txp.0 + 1`, say). Comparing modulo refinements here would
+        // hide exactly that class of bug, and it is the one this check is best placed
+        // to catch: every merge point in the pipeline — a `Case`'s arms, a list's
+        // elements, a register's seed and writes, a channel's contributions — joins,
+        // and the wall is what holds them to it.
+        ctx.require_sub(&ty, &expr.ty, &|| format!("type of {label}"))?;
     }
     Ok(ty)
 }

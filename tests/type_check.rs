@@ -644,9 +644,14 @@ fn test_ternary(#[case] code: &str, #[case] expected: BaseType) {
     assert_eq!(infer_program(code), Type::Base(expected));
 }
 
+/// Arms of different types are rejected — as two incompatible lower-bound atoms
+/// on the arms' join variable, which `coalesce_compact` reports as
+/// `IncompatibleBounds`. A `Case`'s type is the join of its arms (they flow
+/// one-way into one variable), so a collision surfaces at coalesce rather than
+/// eagerly at the arm relation — the same place a heterogeneous list literal or
+/// `CollectionUnion` reports it (see `test_collection_union_heterogeneous_rejected`).
 #[test]
 fn test_if_else_arm_type_mismatch() {
-    // Arms return different types — inference must report a type mismatch.
     let err = infer_program_err(
         r#"
 if True:
@@ -658,8 +663,8 @@ else:
     );
     assert!(
         err.iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. })),
-        "expected TypeMismatch, got {err:?}"
+            .any(|e| matches!(e, InferError::IncompatibleBounds { .. })),
+        "expected IncompatibleBounds, got {err:?}"
     );
 }
 
@@ -766,43 +771,137 @@ fn test_filtered_comprehension_has_refinement_on_domain() {
     }
 }
 
-/// A `Case` whose arms are *collections* must survive the post-inference
-/// consistency wall. **Currently failing** — see the `BUG` comment on
-/// `emit_case`'s arm relation in `src/ccl/infer/emit.rs`, which carries the
-/// one-line fix.
-///
-/// `emit_case` derives the node's result type from the first arm stripped of
-/// refinements, so two arms carrying different singletons (`if c: 1 else: 2`)
-/// can share one type. But it strips the two sides of the arm relation
-/// *asymmetrically*: `prev` is stripped, the arm being related to it is not.
-/// For a scalar arm that is harmless — a singleton is a subtype of its base.
-/// For a **collection** arm it is not: a filtered comprehension is
-/// `{[0, N] | predicate} ⇒ elem`, carrying its refinement on the function's
-/// **domain**, where subtyping is contravariant. Relating a refined-domain arm
-/// to a stripped-domain `prev` therefore demands `[0, N] <: {[0, N] | p}`,
-/// which does not hold — so two arms that are *literally the same expression*
-/// are rejected. Because the rule re-runs in Check mode over concrete recorded
-/// types, that lands on `check_pre_desugar`, a wall whose failures are compiler
-/// bugs and which `compile_program` panics on.
-#[test]
-fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
-    let code = r"
-xs = [1, 2, 3]
-c = 1 > 0
-if c:
-    [x for x in xs if x > 1]
-else:
-    [x for x in xs if x > 1]
-";
+/// Infer `code` and run the post-inference consistency wall over the result,
+/// returning the program's type. The wall's failures are compiler bugs, not user
+/// errors — `compile_program` panics on them — so a rule that types a program
+/// must also survive its own re-run in Check mode.
+fn infer_and_check(code: &str) -> Type {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     let stmts = parse_module(code.trim());
     let mut expr = lower_stmts(&stmts, &mut lctx)
         .into_result()
         .expect("lowering failed");
-    infer(&mut expr, &mut ictx).expect("inference failed");
+    let ty = infer(&mut expr, &mut ictx).expect("inference failed");
     check_pre_desugar(&expr)
         .expect("post-inference consistency wall must accept the inferred tree");
+    ty
+}
+
+/// A `Case` whose arms are *collections* survives the consistency wall, and the
+/// restriction **both** arms establish survives with it: two identical filtered
+/// comprehensions join to that same filtered extent, not to the bare `[0, 2]`.
+///
+/// A collection carries its extent as a refinement on its `Fun` *domain*, where
+/// subtyping is contravariant — which is why the arms must reach the node's type
+/// by a join rather than by relating each arm to a *stripped* sibling: stripping
+/// one side of a domain edge demands `[0, N] <: {[0, N] | p}` and rejects two arms
+/// that are the same expression, and stripping both discards an extent that no
+/// branch widens.
+#[test]
+fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
+    let ty = infer_and_check(
+        r"
+xs = [1, 2, 3]
+c = 1 > 0
+if c:
+    [x for x in xs if x > 1]
+else:
+    [x for x in xs if x > 1]
+",
+    );
+    let Type::Fun {
+        domain, codomain, ..
+    } = &ty
+    else {
+        panic!("expected a collection type, got {ty}");
+    };
+    assert!(
+        matches!(&**domain, Type::Refinement(..)),
+        "the filter both arms establish must survive the join, got {ty}"
+    );
+    assert_eq!(**codomain, int(), "expected an Int codomain, got {ty}");
+}
+
+/// The same relation, one construct over: a `List`'s elements join into a shared
+/// variable exactly as a `Case`'s arms do, so a list *of* filtered comprehensions
+/// has to clear the wall too. The reconcile compares the rule-derived type to the
+/// recorded one modulo refinements, and a join variable holds its operands' real
+/// (refined) types in its bounds — where erasing the two compared types cannot
+/// reach them.
+#[test]
+fn test_list_of_filtered_comprehensions_passes_consistency_wall() {
+    let ty = infer_and_check(
+        r"
+xs = [1, 2, 3]
+[[x for x in xs if x > 1]]
+",
+    );
+    let Type::Fun {
+        domain, codomain, ..
+    } = &ty
+    else {
+        panic!("expected a collection type, got {ty}");
+    };
+    assert_eq!(
+        **domain,
+        Type::UIntRange(1),
+        "expected a 1-element list, got {ty}"
+    );
+    assert!(
+        matches!(&**codomain, Type::Fun { domain: d, .. } if matches!(&**d, Type::Refinement(..))),
+        "the element's filtered extent must survive, got {ty}"
+    );
+}
+
+/// A `Case`'s type is the **join** of its arms, so a refinement survives exactly
+/// when every arm establishes it. Two arms that are the same literal *are* that
+/// literal; two different ones are only their base.
+#[rstest]
+#[case::same_literal("c = 1 > 0\n5 if c else 5", int_lit(5))]
+#[case::different_literals("c = 1 > 0\n1 if c else 2", int())]
+#[case::inside_a_tuple("c = 1 > 0\n(1, 2) if c else (3, 4)", Type::Tuple(vec![int(), int()]))]
+#[case::at_depth(
+    "c = 1 > 0\n((1, 2), 3) if c else ((4, 5), 6)",
+    Type::Tuple(vec![Type::Tuple(vec![int(), int()]), int()])
+)]
+fn test_case_arms_join(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_and_check(code), expected);
+}
+
+/// Arms whose extents differ. A function type's join *meets* its domain, so the
+/// two filters accumulate as two witnesses on one domain — the extent both arms
+/// admit — rather than one arm's filter being picked (which would claim positions
+/// the other branch does not produce). Nothing downstream can observe the choice
+/// yet: a logical `Case` over collections is rejected by lambda elimination, so
+/// this pins the typing rule, not a compiled extent.
+#[test]
+fn test_case_arms_with_different_filters_accumulate_witnesses() {
+    let ty = infer_and_check(
+        r"
+xs = [1, 2, 3]
+c = 1 > 0
+if c:
+    [x for x in xs if x > 1]
+else:
+    [x for x in xs if x < 3]
+",
+    );
+    let Type::Fun { domain, .. } = &ty else {
+        panic!("expected a collection type, got {ty}");
+    };
+    let mut layers = 0;
+    let mut cur = &**domain;
+    while let Type::Refinement(inner, _) = cur {
+        layers += 1;
+        cur = inner;
+    }
+    assert_eq!(layers, 2, "expected both arms' witnesses, got {ty}");
+    assert_eq!(
+        *cur,
+        Type::UIntRange(3),
+        "expected the source extent, got {ty}"
+    );
 }
 
 // ---------------------------------------------------------------------------

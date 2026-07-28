@@ -208,6 +208,13 @@ fn take(expr: &mut Expr) -> Expr {
     std::mem::replace(expr, Expr::lit(Lit::Int(0)))
 }
 
+/// Whether `ty` is `String`, **ignoring refinements**. A refined string
+/// (`{String | __elem == "a"}`, the singleton a literal carries) is still a string,
+/// and which runtime operator `+` dispatches to is a question about the base.
+fn is_string(ty: &Type) -> bool {
+    crate::ccl::ccl_utils::strip_refinements(ty) == Type::Base(BaseType::String)
+}
+
 /// Rewrite `String + String` from `Arithmetic(Add)` to `Concat`.
 ///
 /// Inference intentionally leaves the operator as `Add` (see
@@ -217,13 +224,6 @@ fn take(expr: &mut Expr) -> Expr {
 /// lifted to `Apply(BinOp(...), Const)` no longer hides the operator from
 /// rewriting, and a BinOp inside a lambda body that has been desugared to
 /// `Apply(Tuple, Builtin(BinOp(Add)))` is rewritten via its `Builtin` head.
-/// Whether `ty` is `String`, **ignoring refinements**. A refined string
-/// (`{String | __elem == "a"}`, the singleton a literal carries) is still a string,
-/// and which runtime operator `+` dispatches to is a question about the base.
-fn is_string(ty: &Type) -> bool {
-    crate::ccl::ccl_utils::strip_refinements(ty) == Type::Base(BaseType::String)
-}
-
 fn try_string_add_to_concat(expr: &mut Expr) -> bool {
     match &mut expr.node {
         // Pre-lambda-elim form: a raw BinOp node still in the tree.
