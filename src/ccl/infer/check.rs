@@ -3,8 +3,9 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
-use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fresh_var, prim};
+use crate::ccl::infer::{InferError, LocatedInferError};
+use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{BaseType, Expr, HistoryKind, Level, Name, Type, TypedExprNode};
 
@@ -53,12 +54,20 @@ use super::{lit_base, map_constrain_err};
 pub(super) struct CheckCtx {
     schemes: OperatorSchemes,
     level: Level,
-    errors: Vec<InferError>,
+    /// Accumulated errors, each blamed on the node whose rule raised it. Check
+    /// blames per error rather than through a single cursor because it never
+    /// short-circuits — the same discipline the coalesce walk uses, and the
+    /// reason [`Typing::raise`] attributes at the raise site.
+    errors: Vec<LocatedInferError>,
     pred_memo: TermMemo,
+    /// The node whose rule is running, maintained by [`check_node`] exactly as
+    /// `emit_node` maintains Emit's. Seeded with the tree's root at
+    /// construction, so a rule always has a node to blame.
+    current_node: NodeId,
 }
 
 impl CheckCtx {
-    fn new() -> Self {
+    fn new(root: NodeId) -> Self {
         // Level 0 matches inference (Stage 1 holds the level at 0) and the
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
@@ -67,6 +76,7 @@ impl CheckCtx {
             level: 0,
             errors: Vec::new(),
             pred_memo: Default::default(),
+            current_node: root,
         }
     }
 }
@@ -76,7 +86,11 @@ impl Typing for CheckCtx {
         self.pred_memo.clone()
     }
 
-    fn subexpr(&mut self, child: &mut Expr) -> Result<Type, InferError> {
+    fn current_node(&self) -> NodeId {
+        self.current_node
+    }
+
+    fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
         // Recurse to collect the child's own errors, then hand back its
         // *recorded* type (not the rule-derived, throwaway-laden one) so the
         // parent rule reasons about what was actually inferred. `check_node`
@@ -104,13 +118,14 @@ impl Typing for CheckCtx {
         sub: &Type,
         sup: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(), InferError> {
+    ) -> Result<(), LocatedInferError> {
         // Delegate to the solver's `constrain_subtype` — the single source of
         // truth for width/variance and (since refinements ride the lattice as
         // restriction witnesses) witness subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
         if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new()) {
-            self.errors.push(map_constrain_err(e, &at()));
+            let located = self.raise(map_constrain_err(e, &at()));
+            self.errors.push(located);
         }
         Ok(())
     }
@@ -159,7 +174,7 @@ impl Typing for CheckCtx {
         }
     }
 
-    fn bind_annotation(&mut self, _inferred: &Type, _ann: &Type) -> Result<(), InferError> {
+    fn bind_annotation(&mut self, _inferred: &Type, _ann: &Type) -> Result<(), LocatedInferError> {
         // The annotation was already folded into the binder's type during
         // inference; nothing to re-check here.
         Ok(())
@@ -174,7 +189,7 @@ impl Typing for CheckCtx {
         &mut self,
         t: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(Type, Type), InferError> {
+    ) -> Result<(Type, Type), LocatedInferError> {
         // Destructure the resolved type directly (no inference vars). Peel any
         // outer refinement witnesses the function picked up during solving,
         // and — pre-desugar only — read through a transparent handle to the
@@ -211,10 +226,11 @@ impl Typing for CheckCtx {
                 kind: HistoryKind::Append,
             } => Ok(((**domain).clone(), (**value).clone())),
             _ => {
-                self.errors.push(InferError::ExpectedFunction {
+                let located = self.raise(InferError::ExpectedFunction {
                     found: t.clone(),
                     at: at(),
                 });
+                self.errors.push(located);
                 // Continue with throwaways so the rest of the rule still runs
                 // (Check accumulates every error rather than failing fast).
                 Ok((self.fresh(), self.fresh()))
@@ -226,7 +242,7 @@ impl Typing for CheckCtx {
         &mut self,
         t: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(Type, Type), InferError> {
+    ) -> Result<(Type, Type), LocatedInferError> {
         // The recorded type already carries the shape; destructure it,
         // identically to `as_function` in Check.
         self.as_function(t, at)
@@ -237,7 +253,7 @@ impl Typing for CheckCtx {
         arg: &Type,
         domain: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(), InferError> {
+    ) -> Result<(), LocatedInferError> {
         // Sound one-way only: a refined argument may flow into an unrefined
         // parameter (dropping a restriction is admissible). Emit's reverse
         // direction (domain coalescing) is not the sound subtyping rule and so
@@ -251,7 +267,7 @@ impl Typing for CheckCtx {
         arg_ty: &Type,
         argument: &Expr,
         at: &dyn Fn() -> String,
-    ) -> Result<Type, InferError> {
+    ) -> Result<Type, LocatedInferError> {
         let (domain, codomain) = self.as_function(fn_ty, at)?;
         self.constrain_argument(arg_ty, &domain, at)?;
         // Re-run the discharge on the resolved codomain so the reconstructed
@@ -274,7 +290,20 @@ impl Typing for CheckCtx {
 
 /// Run one node's typing rule in Check mode: dispatch to the shared rule,
 /// then reconcile the rule-derived type against the node's recorded `Type`.
-fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
+fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferError> {
+    // Mark this node as the one whose rule is running, so every error the rule
+    // records or raises is blamed on it (`Typing::raise`); restored on exit,
+    // error path included. Mirrors `emit_node`'s wrapper.
+    let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
+    let out = check_node_rule(expr, ctx);
+    ctx.current_node = prev;
+    out
+}
+
+/// The body of [`check_node`]: one node's typing rule in Check mode — dispatch
+/// to the shared rule, then reconcile the rule-derived type against the node's
+/// recorded `Type`.
+fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferError> {
     let label = symbolic(expr);
     let ty = match &mut expr.node {
         // Verify the **base**, trust the refinement. A literal's singleton predicate
@@ -426,20 +455,71 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
 /// post-planning validation in `context.rs`) run once per pipeline stage.
 pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut cloned = expr.clone();
-    let mut ctx = CheckCtx::new();
+    let mut ctx = CheckCtx::new(cloned.node_id());
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
     // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned
-    // `Err` is collected rather than dropped. Discarding it, as this used to, meant a
-    // rule that reported the only way it could was reporting into the void: an empty
-    // `Case` reaching here was silently accepted, and any future rule that returns
-    // instead of accumulating would join it.
+    // `Err` is collected rather than dropped. Discarding it meant a rule that
+    // reported the only way it could was reporting into the void: an empty `Case`
+    // reaching here was silently accepted, and any future rule that returns instead
+    // of accumulating would join it.
     if let Err(e) = check_node(&mut cloned, &mut ctx) {
         ctx.errors.push(e);
     }
     if ctx.errors.is_empty() {
         Ok(())
     } else {
-        Err(ctx.errors)
+        // Check-mode failures are compiler bugs (a pass produced an ill-typed
+        // tree), and every caller either `.expect()`s them or renders them
+        // without source context, so the blame nodes are dropped here rather
+        // than plumbed through `typecheck`/`check_pre_desugar`. They are
+        // recorded per error, so surfacing them is a signature change away when
+        // a caller wants an underlined report.
+        Err(ctx.errors.into_iter().map(|e| e.error).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::{Lit, TypedExpr};
+
+    /// Check mode accumulates: it records every failing rule instead of
+    /// returning at the first, and each recorded error is blamed on the node
+    /// whose rule raised it.
+    ///
+    /// This is the property the shared rules give Check that emission does not
+    /// yet have (see `emit_node`'s `TODO(multi-error)`), so it is worth pinning:
+    /// two independently ill-typed applications must produce two errors on two
+    /// distinct nodes, not one error and an early return.
+    #[test]
+    fn check_accumulates_one_error_per_failing_node() {
+        // Applying a literal is an `ExpectedFunction` failure. Two of them,
+        // siblings, so neither can mask the other.
+        let bad_a = TypedExpr::apply(TypedExpr::lit(Lit::Int(1)), TypedExpr::lit(Lit::Int(2)));
+        let bad_b = TypedExpr::apply(
+            TypedExpr::lit(Lit::String("s".into())),
+            TypedExpr::lit(Lit::Int(3)),
+        );
+        let (a_id, b_id) = (bad_a.node_id(), bad_b.node_id());
+        let mut tree = TypedExpr::tuple(vec![bad_a, bad_b]);
+
+        let mut ctx = CheckCtx::new(tree.node_id());
+        let _ = check_node(&mut tree, &mut ctx);
+
+        let blamed: Vec<_> = ctx.errors.iter().map(|e| e.node_id).collect();
+        assert!(
+            blamed.contains(&a_id) && blamed.contains(&b_id),
+            "both failing applications are blamed, got {:?} for errors {:?}",
+            blamed,
+            ctx.errors
+        );
+        assert!(
+            ctx.errors
+                .iter()
+                .any(|e| matches!(e.error, InferError::ExpectedFunction { .. })),
+            "expected an ExpectedFunction, got {:?}",
+            ctx.errors
+        );
     }
 }

@@ -223,6 +223,20 @@ impl DerefMut for TypeInferenceContext {
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during limited type inference.
+///
+/// # The `at` / `ctx` / `origin` label fields are for *display*, not location
+///
+/// Several variants carry a rendered symbolic label (`at`, `ctx`, `origin`,
+/// `context`) naming the offending expression. Those are message text — they end
+/// up verbatim in this type's hand-written `Debug`, which is the human-facing
+/// message — and they predate the compiler having any way to point at a node.
+/// They are **not** the authoritative location: that is
+/// [`LocatedInferError::node_id`], which every error raised by inference now
+/// carries, and which `compile_program` resolves to a source span. A consumer
+/// that wants to *locate* an error reads the node; a consumer that wants to
+/// *print* it reads these. The labels are consequently redundant with the node
+/// for anything but rendering, and are kept only because the message text is
+/// built from them.
 #[derive(Clone, PartialEq)]
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
@@ -238,7 +252,7 @@ pub enum InferError {
     ExpectedFunction {
         /// The actual type of the non-function expression.
         found: Type,
-        /// Symbolic label of the expression where the error occurred.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A user-written annotation on a binding site conflicts with the inferred type.
@@ -258,26 +272,26 @@ pub enum InferError {
     /// Lowering never produces a 0-branch `Case`; this indicates a malformed
     /// AST constructed outside the normal lowering path.
     EmptyCase {
-        /// Symbolic label of the case expression.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A [`Type::Hole`] placeholder survived past inference.
     UnresolvedHole {
-        /// Symbolic label of the expression whose type contains the hole.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// An unresolved [`Type::Infer`] variable survived past inference.
     UnresolvedInfer {
         /// The unresolved variable's id.
         id: InferVarId,
-        /// Symbolic label of the expression whose type contains the variable.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A partial tuple or partial record was not resolved to a concrete type.
     UnresolvedPartial {
         /// Display string of the partial type.
         kind: String,
-        /// Symbolic label of the expression whose type is partial.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A node's coalesced type references a term binder that is not in scope
@@ -286,7 +300,7 @@ pub enum InferError {
     /// (a substitution that failed to discharge a binder), not a user-facing
     /// error: user scoping mistakes are rejected earlier with source context.
     ScopeViolation {
-        /// Symbolic label of the expression whose type is ill-scoped.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
         /// The ill-scoped type.
         ty: Type,
@@ -315,7 +329,7 @@ pub enum InferError {
     /// expression of `Mut` type (or a non-variable argument to a `Mut`
     /// parameter) is rejected. Reported by [`check_mut_discipline`].
     MutNotBareVariable {
-        /// Symbolic label of the offending expression.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A [`Type::History`] appears nested inside a composite type — the
@@ -326,7 +340,7 @@ pub enum InferError {
     /// child of another `Mut` breaks the "writer set is statically known"
     /// guarantee. Reported by [`check_mut_discipline`].
     MutInCompositeType {
-        /// Symbolic label of the expression or binding whose type is offending.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
         /// The composite type that illegally contains a `Mut`.
         ty: Type,
@@ -348,7 +362,7 @@ pub enum InferError {
     /// D]`) and be silently mutated in name only. Reported by
     /// [`check_mut_discipline`].
     MutArgNotMutable {
-        /// Symbolic label of the offending argument.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A `MutWrite` (`:=` / `+=`) targets a binding whose resolved type is not
@@ -363,7 +377,7 @@ pub enum InferError {
 }
 
 /// An [`InferError`] paired with the [`NodeId`](crate::ccl::provenance::NodeId)
-/// of the expression it was emitted at, when known.
+/// of the expression it was raised at.
 ///
 /// The location is *provenance metadata*, not part of the error's identity, so
 /// it rides beside `InferError` rather than inside it: `InferError` stays
@@ -373,9 +387,16 @@ pub enum InferError {
 /// This is what [`infer`] returns on failure, so the blame node travels *with*
 /// the error it belongs to. `compile_program` resolves each id to a source
 /// [`Span`](crate::chl_parser::ast::Span) against the `lowering_projection`
-/// while that projection is in scope. `node_id: None` means no precise node is
-/// known (a coalesce or scope-validity error), which renders as plain text with
-/// no source snippet.
+/// while that projection is in scope (that resolution may fail, which is why
+/// `CompileError::Infer`'s span is optional — the *node* never is).
+///
+/// The node is **not** optional, and the only way to build one of these is
+/// through the inference contexts' `raise` (the `Typing` trait's one error
+/// affordance) or the equivalent stamp in the coalesce walk, both of which
+/// supply the node whose rule is running.
+/// So there is no unlocated state to represent and no partially-constructed
+/// intermediate: an inference error that has lost track of its node is
+/// unrepresentable rather than merely discouraged.
 ///
 /// Deliberately concrete rather than a generic `Located<E>`: inference is the
 /// only pass whose errors carry a node today. The other unlocated pipeline
@@ -391,9 +412,8 @@ pub enum InferError {
 pub struct LocatedInferError {
     /// The underlying inference error.
     pub error: InferError,
-    /// The node the error was emitted at, or `None` when no precise node is
-    /// known (coalesce / scope-validity errors).
-    pub node_id: Option<crate::ccl::provenance::NodeId>,
+    /// The node whose typing rule raised the error.
+    pub node_id: crate::ccl::provenance::NodeId,
 }
 
 #[cfg(test)]
@@ -1308,10 +1328,59 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(matches!(errors[0].error, InferError::UnboundVariable(_)));
         assert_eq!(
-            errors[0].node_id,
-            Some(blamed),
+            errors[0].node_id, blamed,
             "an emit error is blamed on the node that raised it"
         );
+    }
+
+    /// Every emit-path error kind is blamed on the node that raised it, not on an
+    /// ancestor and not on nothing.
+    ///
+    /// `LocatedInferError`'s node is mandatory, so "is it located" is not the
+    /// question — *which* node is. Each case names the node whose rule should own
+    /// the failure; the assertion is that the innermost rule to see the error is
+    /// the one that stamps it.
+    #[test]
+    fn emit_errors_are_blamed_on_the_raising_node() {
+        // An unbound `Var` under two layers of structure: the `Var`'s own rule
+        // raises, so neither the `Tuple` nor the `Lit` sibling may take the blame.
+        let mut expr = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::var("nope")]);
+        let var_id = match &expr.node {
+            TypedExprNode::Tuple(elts) => elts[1].node_id(),
+            other => panic!("expected a Tuple, got {other:?}"),
+        };
+        let errors =
+            infer(&mut expr, &mut TypeInferenceContext::new()).expect_err("`nope` is unbound");
+        assert_eq!(errors[0].node_id, var_id);
+        assert!(matches!(errors[0].error, InferError::UnboundVariable(_)));
+
+        // An annotation conflict: `bind_annotation` raises while the annotated
+        // `let`'s rule is running, so the `let` node owns it.
+        let mut expr = Expr::new(TypedExprNode::Let {
+            binding: TypedBinding::new_annotated("x", Type::Base(BaseType::String)),
+            bound_expr: Box::new(Expr::lit(Lit::Int(1))),
+            body: Box::new(Expr::var("x")),
+        });
+        let let_id = expr.node_id();
+        let errors = infer(&mut expr, &mut TypeInferenceContext::new())
+            .expect_err("Int bound to a String annotation");
+        assert_eq!(errors[0].node_id, let_id);
+        assert!(matches!(
+            errors[0].error,
+            InferError::AnnotationMismatch { .. }
+        ));
+
+        // A constraint failure inside a `BinOp`: `require_sub` raises under the
+        // `BinOp`'s rule, so the operator node owns it rather than either operand.
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::BoolLogic(LogicKind::And),
+            Expr::lit(Lit::Int(2)),
+        );
+        let binop_id = expr.node_id();
+        let errors = infer(&mut expr, &mut TypeInferenceContext::new())
+            .expect_err("`and` over Int operands");
+        assert_eq!(errors[0].node_id, binop_id);
     }
 
     // -----------------------------------------------------------------------

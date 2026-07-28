@@ -297,24 +297,21 @@ pub(crate) fn run(
 ) -> Result<Type, Vec<LocatedInferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
-        let pre = InferCtx::new(HashMap::new());
+        let pre = InferCtx::new(HashMap::new(), expr.node_id());
         let translated: HashMap<String, Type> = sources
             .iter()
             .map(|(k, v)| (k.clone(), pre.normalize_annotation(v)))
             .collect();
-        InferCtx::new(translated)
+        // Seed the blame cursor with the root: every error is stamped with the
+        // node whose rule raised it, and the root is the outermost such node.
+        InferCtx::new(translated, expr.node_id())
     };
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.
-    // Emission is fail-fast, so there is at most one error; the frame that raised
-    // it claimed its blame node on the way out (`InferCtx::blame_error`).
-    emit_node(expr, &mut sub_ctx).map_err(|error| {
-        vec![LocatedInferError {
-            error,
-            node_id: sub_ctx.error_blame(),
-        }]
-    })?;
+    // Emission is fail-fast, so there is at most one error; it already carries
+    // the node whose rule raised it (`Typing::raise`).
+    emit_node(expr, &mut sub_ctx).map_err(|e| vec![e])?;
 
     // Pass 2: resolve each node's inference variables in place into expr.ty,
     // fill the binder slots that aren't any node's expr.ty (the `Let` binding

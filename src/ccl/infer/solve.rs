@@ -26,6 +26,7 @@ use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, coalesce_compact, compact_type,
     constrain_subtype, freshen_expr_type_slots, seed_chan_dom_pairings, simplify_type,
 };
+use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{Expr, Level, Name, Type, TypedBinding, TypedExprNode};
 
@@ -37,11 +38,23 @@ use super::{LocatedInferError, map_coalesce_err, map_constrain_err};
 /// (let bindings, lambdas, comprehensions) and worth showing as error context.
 /// Filters out bare variable names and simple expressions that add noise.
 ///
-/// TODO: revisit after the ariadne error-reporting changes land. Coalesce
-/// error context is currently stringly-typed (we stringify the expression
-/// via `symbolic` and then pattern-match on the string here); once errors
-/// carry `Span`s and structured locations, contexts should be `&Expr`
-/// (or a richer node-ref type) and this string-shaped filter goes away.
+/// TODO(structured-context): this filter decides "worth showing" by
+/// substring-matching pretty-printed CCL, because when it was written an error
+/// had no way to point at a node. Half of that is now fixed — a
+/// `LocatedInferError` carries the node its rule raised it at — but the
+/// *contributing sites* of a merged `IncompatibleBounds` are still labels:
+/// `origin: String` plus `context: Vec<String>` on the variant.
+///
+/// The remaining work, and why it is worth doing for this error kind
+/// specifically: a bounds conflict has no single blame site by nature (the same
+/// variable was constrained in several places, and the error *is* the
+/// collision), so one underline understates it. Threading a `NodeId` into the
+/// merge path — `context: Vec<NodeId>` instead of `Vec<String>` — lets the
+/// renderer emit a primary label at the origin plus a secondary label per
+/// contributing site, which is exactly the shape `ParseErrorInfo` already ships
+/// (`context: Vec<(String, Span)>`, rendered by `ParseError::to_report`). This
+/// filter then matches on node *kind* (`Let`/`Lambda`/`For`) rather than on
+/// whether a rendering contains `"let "`.
 fn is_significant_context(label: &str) -> bool {
     label.contains("let ") || label.contains("λ ") || label.contains('\n')
 }
@@ -51,7 +64,20 @@ fn is_significant_context(label: &str) -> bool {
 /// If an existing error has the same `(polarity, conflicting)` key, `label` is
 /// appended to its context vec (when it passes [`is_significant_context`])
 /// instead of pushing a duplicate.  All other error kinds are pushed as-is.
-fn push_coalesce_err(errors: &mut Vec<LocatedInferError>, new_err: InferError, label: String) {
+///
+/// `blame` is the node whose rule raised `new_err`. A merged
+/// `IncompatibleBounds` keeps the *first* contributing node: a bounds conflict
+/// has no single site by nature — the same variable was constrained in several
+/// places — so the blame is the site where the conflict was first detected and
+/// the later sites land in `context`. (Turning that context into node ids, so a
+/// report can underline every contributing site, is the follow-up the
+/// `is_significant_context` note above describes.)
+fn push_coalesce_err(
+    errors: &mut Vec<LocatedInferError>,
+    new_err: InferError,
+    label: String,
+    blame: NodeId,
+) {
     if let InferError::IncompatibleBounds {
         polarity: p,
         conflicting: ref c,
@@ -78,19 +104,16 @@ fn push_coalesce_err(errors: &mut Vec<LocatedInferError>, new_err: InferError, l
                 ctx_vec.push(label);
             }
         } else {
-            errors.push(unlocated(new_err));
+            errors.push(LocatedInferError {
+                error: new_err,
+                node_id: blame,
+            });
         }
     } else {
-        errors.push(unlocated(new_err));
-    }
-}
-
-/// An error with no blame node yet — the frame it was raised in fills that in
-/// (`CoalesceCtx::blame_frame`).
-fn unlocated(error: InferError) -> LocatedInferError {
-    LocatedInferError {
-        error,
-        node_id: None,
+        errors.push(LocatedInferError {
+            error: new_err,
+            node_id: blame,
+        });
     }
 }
 
@@ -111,16 +134,20 @@ pub(super) struct CoalesceCtx {
     /// the same name (the same shadowing discipline emission's `ScopeStack`
     /// applies).
     scope: Vec<ScopeEntry>,
-    /// Errors raised by the walk, each paired with the node it is blamed on.
-    /// Unlike emission, coalesce accumulates: it visits every node and collects
-    /// what it finds, so the blame has to be per error rather than a single
-    /// cursor — see [`blame_frame`](Self::blame_frame).
+    /// Errors raised by the walk, each paired with the node whose rule raised it.
+    /// Coalesce accumulates — it visits every node and collects what it finds —
+    /// so the blame is per error, stamped at the raise site from
+    /// [`current_node`](Self::current_node).
     errors: Vec<LocatedInferError>,
     /// Pass-scoped predicate-rewrite memo: keeps every refinement occurrence
     /// that entered the coalesce walk sharing one predicate `Rc` sharing a
     /// single coalesced `Rc` on the way out, instead of splitting into one
     /// independently-coalesced copy per node. See [`PredMemo`].
     pred_memo: PredMemo,
+    /// The node whose coalesce rule is running, maintained by
+    /// [`coalesce_node`] on both exit paths. The same discipline `emit_node` and
+    /// `check_node` use; seeded with the tree's root at construction.
+    current_node: NodeId,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
@@ -128,19 +155,10 @@ pub(super) struct CoalesceCtx {
 }
 
 impl CoalesceCtx {
-    /// Blame `expr` for every error raised inside the frame that started at
-    /// `frame` and that no inner frame has claimed.
-    ///
-    /// The same first-claim-wins rule the emission walk uses
-    /// (`InferCtx::blame_error`), lifted to an accumulating pass: the errors
-    /// added since `frame` were raised somewhere in this node's subtree, and the
-    /// innermost frame to run this — the one that actually raised them — is the
-    /// one whose id sticks. Errors already located pass through untouched, so a
-    /// parent never overwrites a child's more precise blame.
-    fn blame_frame(&mut self, frame: usize, expr: &Expr) {
-        for e in &mut self.errors[frame..] {
-            e.node_id.get_or_insert(expr.node_id());
-        }
+    /// Record `error`, blamed on the node whose rule is running — the coalesce
+    /// counterpart of [`Typing::raise`](super::typing::Typing::raise).
+    fn push_error(&mut self, error: InferError, label: String) {
+        push_coalesce_err(&mut self.errors, error, label, self.current_node);
     }
 
     /// Log one read for [`assert_reads_stable`] (debug builds; free in
@@ -502,6 +520,7 @@ fn with_shadows<R>(
 pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
+        current_node: expr.node_id(),
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
         #[cfg(debug_assertions)]
@@ -557,7 +576,7 @@ pub(super) fn check_scope_valid(
                 ty: expr.ty.clone(),
                 unbound: free.difference(scope).map(|n| n.to_string()).collect(),
             },
-            node_id: Some(expr.node_id()),
+            node_id: expr.node_id(),
         });
     }
     match &expr.node {
@@ -651,9 +670,13 @@ pub(super) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
 /// predicate's expression is coalesced (`coalesce_type_predicates` runs this
 /// walk over it).
 fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
-    let frame = ctx.errors.len();
+    // Mark this node as the one whose rule is running, so `push_error` stamps
+    // its errors with it; restored on exit. An inner rule overwrites the mark
+    // for its own extent, so an error is blamed on the node that raised it
+    // rather than on an ancestor. Mirrors `emit_node` / `check_node`.
+    let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
     coalesce_node_inner(expr, level, ctx);
-    ctx.blame_frame(frame, expr);
+    ctx.current_node = prev;
 }
 
 /// The body of [`coalesce_node`]; see the wrapper for the per-error blame
@@ -880,11 +903,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                         Ok(ty) => p.binding.ty = ty,
                         Err(err) => {
                             let label = format!("Case pattern `.{}` payload", p.tag);
-                            push_coalesce_err(
-                                &mut ctx.errors,
-                                map_coalesce_err(err, &label),
-                                label,
-                            );
+                            ctx.push_error(map_coalesce_err(err, &label), label);
                         }
                     }
                 }
@@ -921,7 +940,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 Ok(ty) => target.ty = ty,
                 Err(err) => {
                     let label = "For target".to_string();
-                    push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+                    ctx.push_error(map_coalesce_err(err, &label), label);
                 }
             }
         }
@@ -951,7 +970,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                     Ok(ty) => binding.ty = ty,
                     Err(err) => {
                         let label = format!("LetRec binding `{}`", binding.name);
-                        push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+                        ctx.push_error(map_coalesce_err(err, &label), label);
                     }
                 }
             }
@@ -981,7 +1000,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             ctx.record_read(&expr.ty, &ty, || label.clone());
             expr.ty = ty;
         }
-        Err(err) => push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label),
+        Err(err) => ctx.push_error(map_coalesce_err(err, &label), label),
     }
 
     // Codomain extraction (design §6.2 move site): a `let x = v in body` node's
@@ -1222,7 +1241,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         Ok(t) => t,
         Err(err) => {
             let label = symbolic(use_expr);
-            push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+            ctx.push_error(map_coalesce_err(err, &label), label);
             return;
         }
     };
@@ -1304,7 +1323,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         // failed to satisfy (and the node whose frame would claim it anyway).
         ctx.errors.push(LocatedInferError {
             error: map_constrain_err(e, "monomorphization specialization"),
-            node_id: Some(use_expr.node_id()),
+            node_id: use_expr.node_id(),
         });
     }
 
@@ -1736,7 +1755,7 @@ mod tests {
         assert_eq!(unbound, &["x".to_string()]);
         assert_eq!(
             located.node_id,
-            Some(e.node_id()),
+            e.node_id(),
             "the violation is blamed on the ill-scoped node itself"
         );
     }

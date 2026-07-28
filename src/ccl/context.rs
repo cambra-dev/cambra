@@ -802,16 +802,15 @@ pub fn compile_program(
     let infer_outcome = infer(&mut expr, ctx.inference_ctx());
     // On failure, resolve each error's own blame node to a source span *here* —
     // the lowering projection is in scope and holds the lowered attribution (this
-    // is the always-on release read: one hop, no fold). A `None` node (coalesce /
-    // scope-check errors) or an id the projection doesn't cover degrades to a
-    // span-less diagnostic.
+    // is the always-on release read: one hop, no fold). Every error names a node;
+    // an id the projection doesn't cover (a node minted after lowering, e.g. by
+    // monomorphization) degrades to a span-less diagnostic.
     if let Err(errors) = infer_outcome {
         return Err(errors
             .into_iter()
             .map(|located| {
-                let span = located
-                    .node_id
-                    .and_then(|id| lowering_projection.get(&id))
+                let span = lowering_projection
+                    .get(&located.node_id)
                     .and_then(|attr| attr.spans.first().copied());
                 CompileError::Infer {
                     error: located.error,
