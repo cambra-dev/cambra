@@ -18,7 +18,7 @@ use crate::ccl::{
 
 use super::context::InferCtx;
 use super::typing::{Typing, peel_refinements_outer};
-use super::{lit_singleton, product, variant_type};
+use super::{product, variant_type};
 
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
@@ -27,7 +27,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
     let ty = match &mut expr.node {
-        TypedExprNode::Lit(lit) => lit_singleton(lit),
+        TypedExprNode::Lit(lit) => ctx.lit_singleton(lit),
 
         // Resolve a variable through its bound scheme. A monomorphic binder
         // freshens nothing and returns its type verbatim. A *polymorphic* `let`

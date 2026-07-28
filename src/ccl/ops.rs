@@ -69,7 +69,7 @@ pub enum TypeError {
 ///
 /// Named `Lit` to avoid shadowing `crate::interpreter::Literal`, which is
 /// an unrelated operator struct.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Lit {
     /// An integer constant.
     Int(i64),

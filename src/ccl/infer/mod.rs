@@ -236,23 +236,34 @@ pub(super) fn lit_base(lit: &Lit) -> Type {
 /// involved is known: both sides are the base and the comparison is `Bool`. The inner
 /// literal takes [`lit_base`] — refining *it* too would not terminate.
 pub fn lit_singleton(lit: &Lit) -> Type {
-    let base = lit_base(lit);
-    // `unit` has a single inhabitant, so a singleton adds nothing to its base.
-    if matches!(lit, Lit::Unit) {
-        return base;
+    match singleton_predicate(lit) {
+        Some(predicate) => Type::Refinement(Box::new(lit_base(lit)), Refinement::born(predicate)),
+        None => lit_base(lit),
     }
-    let predicate = TypedExpr::binop(
-        TypedExpr::var(Name::elem()).with_ty(base.clone()),
-        BinOpKind::Compare(CompareKind::Equals),
-        TypedExpr::lit(lit.clone()).with_ty(base.clone()),
-    )
-    .with_ty(prim(BaseType::Bool));
-    Type::Refinement(
-        Box::new(base),
-        Refinement {
-            predicate: Rc::new(predicate),
-        },
-    )
+}
+
+/// The bare predicate of `lit`'s singleton — `__elem == lit` — or `None` for
+/// `unit`, whose single inhabitant makes a singleton add nothing to its base.
+///
+/// Split out from [`lit_singleton`] because the term is **ground**: fully typed at
+/// construction, closed but for [`crate::ccl::REFINEMENT_BINDER`], and a pure
+/// function of `lit`. That is what lets one `Rc` serve every occurrence of a
+/// literal value (`InferCtx::lit_singleton`) — nothing about an occurrence can
+/// make its singleton resolve differently, because there is nothing left to
+/// resolve.
+pub(crate) fn singleton_predicate(lit: &Lit) -> Option<Rc<TypedExpr>> {
+    if matches!(lit, Lit::Unit) {
+        return None;
+    }
+    let base = lit_base(lit);
+    Some(Rc::new(
+        TypedExpr::binop(
+            TypedExpr::var(Name::elem()).with_ty(base.clone()),
+            BinOpKind::Compare(CompareKind::Equals),
+            TypedExpr::lit(lit.clone()).with_ty(base.clone()),
+        )
+        .with_ty(prim(BaseType::Bool)),
+    ))
 }
 
 /// Test shorthand for an integer literal's *type* — its singleton, `{Int | __elem == n}`.
