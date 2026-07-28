@@ -14,25 +14,40 @@ Nothing here is implemented. The diff analysis it consumes is.
 
 ---
 
-## Why replay makes this a real problem
+## What an upgrade has to solve
 
-In an ordinary stack, upgrading is easy to describe: stop the old binary, start
-the new one, and the database is still there. State survives because it is
-*stored*.
+**State is stored.** A mutable variable *denotes* a function from a sequencing
+domain to a value ([mutability.md](mutability.md)) — derivation is the
+*specification* — but the runtime materializes it incrementally as an MVCC
+commit log `Txn ⇀ (Key ⇀ Value)` that compacts by the MVCC law and GCs its
+released prefix. Persisting state is making that existing structure durable, not
+inventing a snapshot format, and the object persisted is a **bounded history**
+rather than a point-in-time value. A restart loads it; it does not recompute the
+world.
 
-Cambra's state is not stored, it is **derived**. A mutable variable *is* a
-function from a sequencing domain to a value ([mutability.md](mutability.md)),
-so a register's contents are a function of the inputs that produced them. Start
-the program again and the history is recomputed from those inputs.
+So the hard part of an upgrade is not the past. It is the **transition**:
 
-That is what makes an upgrade non-trivial: **replaying yesterday's inputs
-through today's code rewrites yesterday**. If v0 priced an order at list and v1
-discounts it, restarting under v1 does not just change future prices — it
-changes what the ledger says happened last week.
+- **Replicas do not swap atomically.** Each picks up the new binary at its own
+  wall-clock moment. Without an agreed switch point they disagree about which
+  logic applied to which work, and the disagreement is invisible until something
+  downstream depends on it.
+- **Work is in flight.** A transaction that begins under one version and commits
+  after the swap has to belong to exactly one of them, by a rule stated in
+  advance rather than by whichever thread got there first.
+- **Draining is not acceptable.** The conventional answer — stop accepting, let
+  the old version finish, swap, resume — is downtime, and it gets worse the
+  busier the system is.
 
-So the artifact an upgrade needs is a program that replays the past *as it
-actually happened* and the future under the new logic. That is what branching
-builds, and it is why the feature exists at all.
+A version guard on the sequencing domain turns all three into one denotational
+fact: both arms are live at once, and each unit of work is assigned to an arm by
+its own position. There is no drain because nothing has to stop, and replicas
+agree because they compare against the same cut rather than against their own
+clocks.
+
+None of that needs the past to be recomputed. What the *past* buys — audit,
+shadow over history, correcting derived state after a fix — is a separate
+capability with a separate cost, and it is what
+["Retention"](#retention-what-keeping-inputs-buys) is about.
 
 ---
 
@@ -286,7 +301,7 @@ So defaulting to "now" is the obvious default, not the only safe value.
 
 ### Why the past is still out
 
-Not for lack of durable inputs — the retention window now supplies those. The
+Not for lack of durable inputs — a retention window supplies those. The
 blocker is **effects**: a response already sent cannot be unsent, so recomputing
 a past that had external consequences produces a history that disagrees with
 what the world already saw.
@@ -320,77 +335,72 @@ The runtime already has the concept: an as-of read "waits only for the
 
 ### What must be durable
 
-Everything about *state* is derived — a register is a function of the inputs, and
-the inputs are replayed. Three things are not derived, and have to outlive the
-process.
+**The store**, because that is how the program runs at all — it is the MVCC
+commit log made durable, retaining as much history as the program's own as-of
+reads can reach. How much that is is not a policy choice: the compiler derives
+it from the reads, and the runtime already computes the corresponding compaction
+and GC.
 
-**The inputs, with enough order to reproduce the conflicts.** Not a global
-arrival order: two events with disjoint footprints commute, so their relative
-order is unobservable and reproducing it is wasted work. What must be reproduced
-is the transitive closure of the *conflict* relation — which is what the commit
-operator already computes for validation. Per-key **write** order does not
-suffice: for `T₁` reading 𝐴 and writing 𝐵 against `T₂` writing 𝐴, per-key
-sequences record no relation between them, yet their order decides whether `T₁`
-saw the new 𝐴. The recorded unit is therefore a position per **footprint** key,
-over read ∪ write. That is bounded by the footprint, which the compiler knows
-completely — the same fact the concurrency section leans on for distributed
-commit, and the reason this stays shardable where a global clock would not.
+**The branch points**, as consistent cuts. They record something about the
+world — when an operator deployed — that no input contains, and a replica
+joining later has to arrive at the same answer as one that was already running.
 
-**The branch points**, as consistent cuts. They record something about the world
-— when an operator deployed — that no input contains.
+**The inputs, optionally**, and that is the subject of the next section.
 
-**Nothing else.** In particular, not the state itself, up to the retention
-window below.
+### Retention: what keeping inputs buys
 
-### Retention, and checkpoints beyond it
+Nothing above requires retaining inputs. A program that only ever runs *forward*
+needs the store and the cuts, and can discard every event once it has been
+folded in.
 
-Replaying from position 0 keeps state re-derivable and keeps the input log
-unbounded, which collides head-on with the store-bounding work (writer-window
-compaction, release-driven GC) whose whole purpose is to stop retaining
-everything. Both cannot hold.
+Keeping them is a separate dial, and it buys four things:
 
-The resolution is a **retention window**. Inputs are kept for the window; beyond
-it a **checkpoint** stands in for them. A checkpoint is the bounded store
-contents at a consistent cut, plus the cut — and since as-of reads can reach
-backwards, "bounded store contents" means whatever is still readable, which is
-exactly what store bounding already computes. So checkpointing is mostly
-persisting what is in memory at a frontier, not new machinery.
+- **Audit.** "Why is this balance 7?" is answerable only by replaying the inputs
+  that produced it through the logic that was live at the time — which is also
+  the one thing that requires *old versions' arms* to stay reachable.
+- **Shadow over history.** "What would v1 have done all along", as against the
+  cheaper "what will v1 do from here" — see below.
+- **Correction.** Re-deriving state after fixing a bug in the logic that
+  produced it. Bounded to internal state, for the reasons in "Why the past is
+  still out".
+- **Checkability.** The store is a materialization of a derivation. With the
+  inputs retained, the two can be compared and the materialization falsified;
+  without them, the cache is the only account of itself and a bug in incremental
+  maintenance is undetectable. This is the reason worth caring about even when
+  none of the other three are exercised.
 
-The window is a **dial, and the user sets it**, up to and including infinity.
-That is a cost decision — retaining inputs forever is what buys unlimited
-re-derivation — and not one the language should make. What matters is that one
-dial governs three things at once:
+The window is a **cost decision the user makes**, up to and including infinity.
+Retaining forever is what buys unlimited audit, and it is a real bill; retaining
+nothing is a perfectly coherent configuration that gives up the four items
+above and keeps everything else in this document.
 
-- **how far back state can be re-derived**,
-- **how far back a shadow is meaningful** — "what would v1 have done all along"
-  becomes "…since the window opened", and
-- **how many arms a merged program carries** (below).
+Two consequences of whatever value is chosen:
 
-### Why the window is what bounds the version chain
+**Replay needs the logic, not just the inputs.** So a merged program keeps an
+arm for each version whose branch point is inside the window, and drops it when
+the window passes. That bounds the version chain by retention rather than by
+history: v0 → v1 → v2 needs no squash policy, because the window is the policy.
 
-Replaying from a checkpoint rather than from 0 means v0's arm is only needed for
-the interval between the checkpoint and 𝑡ₙ. Take a checkpoint *at* the
-deployment and that interval is empty — and the merged program is not needed at
-all. Deploying v1 against a checkpoint is what an ordinary system does.
+**A shadow can only reach as far back as the window.** "What would v1 have done
+all along" degrades to "…since the window opened", which for a short window is
+close to "from here".
 
-So checkpoint-at-deploy would make this whole feature evaporate. What it costs
-is the thing the feature exists for: **re-derivability**. A checkpoint that
-replaces its inputs is a source of truth, not a cache, and with it go
-auditability ("why is this balance 7?" is answerable only by replaying the logic
-that was live at the time) and shadow, which needs replay from further back than
-the last checkpoint to say anything interesting.
+### When persisted state does not fit the new version
 
-Inside a retention window both hold at once, and the consequence is a clean
-answer to how versions stack: **a merged program needs an arm only for versions
-deployed inside the window.** Anything older folds into the checkpoint. The
-version chain is bounded by retention rather than by history, and v0 → v1 → v2
-needs no squash policy — the window does it.
+Deploying v1 against a store v0 wrote is an implicit claim that the store is a
+valid starting point for v1. Usually it is: the values are just values, and v1
+reads them the way v0 left them. Two cases where it is not.
 
-**One concrete failure mode.** A type-breaking store change makes an existing
-checkpoint unreadable. It then requires either a migration applied to the
-checkpoint or a full re-derive from inputs, which is possible only inside the
-window. That gives the type-breaking case an operational meaning rather than a
-flat rejection.
+**A type-breaking change.** v1 gives a register a type the persisted history is
+not in. A guard cannot express two types for one register, so this needs a
+**migration** — a function applied to the stored history — or a re-derive from
+inputs, which is possible only inside the retention window. The migration is the
+normal answer; the re-derive is the one available when the migration is not
+expressible.
+
+**A changed initializer.** A seed applies at position 0, which every branch point
+is after, so a changed seed is inert against an existing store. Not an error, but
+worth a diagnostic: it is a case where the edit does not mean what it looks like.
 
 ### What the default gives up
 
@@ -404,20 +414,16 @@ additions on top of a mechanism that already accepts the value.
 
 ### Shared — one history, both arms write it
 
-There is one `inventory`, and both versions write it. That is what an operator
-expects (you do not fork your database to ship a pricing change), and under a
-time selector it is not merely convenient — the version dimension has collapsed,
-so there is nothing to partition.
+There is one `inventory`, and both versions write it — the store carries on
+across the boundary, which is what an operator expects (you do not fork your
+database to ship a pricing change). Under a time selector this is not merely
+convenient: the version dimension has collapsed, so there is nothing to
+partition.
 
-Consequences worth accepting explicitly:
-
-- **A changed initializer is inert.** A seed applies at position 0, which is
-  always before the branch point.
-- **A type-breaking store change cannot be guarded.** The store has one type. It
-  is a rejection, or it needs an explicit migration; a guard cannot express two
-  types for one register.
-- **Adding a register is fine** — unwritten, it reads its seed. **Removing one is
-  fine if unread.**
+**Adding a register is fine** — absent from the store, it reads its seed.
+**Removing one is fine if unread**; its history stops being extended and ages
+out under the ordinary GC. Changes the store *cannot* absorb are in "When
+persisted state does not fit the new version" above.
 
 ### Partitioned — one history per arm
 
@@ -425,6 +431,21 @@ For two versions this is not a new type or a new domain: **instantiate the
 writer graph twice, share the subgraph the diff calls common, and give each its
 own store.** The "version dimension" is two copies, and sharing is ordinary
 graph sharing — the same thing compute sharing already is. `Mut` is untouched.
+
+The second store has to start somewhere, and there are two answers to different
+questions:
+
+- **Fork the existing store** at the branch point and run v1 forward from it.
+  Cheap, immediate, and copy-on-write — and it answers the question a deployment
+  decision actually asks: *given the state we are in, how will v1 behave?* This
+  is the default.
+- **Replay retained inputs** through v1 from the start of the window. Expensive,
+  bounded by retention, and answers a different question: *would v1 have
+  produced a different history?* That is an audit question, not a shipping one.
+
+The first is not an approximation of the second. v1 is going to run against
+v0's state whatever happens, so starting there is the faithful simulation of
+deploying it.
 
 The alternative — making `Version` a real index domain, so a register is
 `Version ⇒ Txn ⇒ 𝑉` and sharing is *constancy over that dimension* — is the
@@ -448,25 +469,16 @@ fork cost the diff rather than 2×.
 
 ---
 
-## Two things replay decides for us
+## The selector must be a deterministic function of inputs
 
-The replay model settles two questions that would otherwise be free choices, and
-in both cases the answer is not the obvious one.
+A canary routing 10% of traffic *randomly* routes differently every time it is
+re-run, so a replayed history disagrees with the one that happened, and two
+replicas disagree with each other. Either the selector is derived from something
+already in the input (a user-id hash), or the routing decision is itself
+recorded as an input and becomes part of what the system retains.
 
-**A shadow forks from the start of the retention window, not from the
-deployment.** Seeding v1's store from v0's current state looks natural and is the
-*unnatural* move here: it copies state the model says is a function of inputs.
-The natural thing is to replay every retained input through v1 — which is also
-the honest answer to "what would this change have done?", bounded by how far
-back the inputs go. So upgrade and shadow share the replay machinery entirely:
-upgrade replays one timeline with a cut-switched selector, shadow replays two.
-
-**The selector must be a deterministic function of inputs.** A canary routing
-10% of traffic *randomly* would route differently on replay, so the two runs
-would disagree about what happened. Either the selector is derived from
-something already in the input (a user-id hash), or the routing decision is
-itself recorded as an input. This is forced, not stylistic, and it is much
-cheaper to know before someone ships a random split.
+This is forced by replicas alone, before retention enters the picture, and it is
+much cheaper to know before someone ships a random split.
 
 ---
 
@@ -496,30 +508,40 @@ In dependency order.
    does not survive replay — the same class of error as rendering a run-varying
    identity into a stable-looking string. Without this, such divergences have no
    guard site and fall back to whole-region replacement.
-4. **A durable input log with per-footprint-key ordering**, and **checkpoints**
-   at consistent cuts beyond the retention window. Both are described above; the
-   engine already computes the footprints and the bounded store contents, so
-   this is mostly persistence rather than new analysis.
+4. **A durable store.** The runtime holds the MVCC commit log and already
+   computes its compaction and GC; persisting it is what makes a restart resume
+   rather than recompute, and it is a prerequisite for every configuration here.
+   Nothing in the analysis changes — this is persistence, not new analysis.
+5. **A durable input log with per-footprint-key ordering** — only if audit,
+   historical shadow, or correction are wanted. Optional in a way (4) is not,
+   and the engine already computes the footprints it needs to be ordered by.
 
 ---
 
 ## Milestones
 
 **M1 — merge (upgrade).** Two programs plus a branch point in, one CCL tree out:
-guards at the divergences, everything else shared literally. Testable with no
-persistence, because replay *is* the model — run the merged program over a full
-input stream and assert the prefix matches v0's output and the suffix v1's.
-Needs (1) and (2) above; the corpus is `http_counter` and the accumulator loops,
-since the transactional serving programs are still gap programs.
+guards at the divergences, everything else shared literally. Testable ahead of
+durable state, because a single process run *is* a timeline — feed one input
+stream through the merged program with the cut partway along, and assert the
+prefix matches v0's output and the suffix v1's. That is the transition semantics
+under test, which is the part that matters; persistence changes where the
+timeline starts, not what the guard does. Needs (1) and (2) above; the corpus is
+`http_counter` and the accumulator loops, since the transactional serving
+programs are still gap programs.
 
 **M2 — measure the sharing.** What fraction of the merged graph is one node,
 plus divergence reachability over the registers. This is the actual value
 proposition and nothing currently quantifies it.
 
-**M3 — shadow.** Partitioned state, no selector, v0 owns every effect.
+**M3 — shadow.** Partitioned state, no selector, v0 owns every effect. Forked
+from the live store, which needs (4) but not (5): the question is "given the
+state we are in, how will v1 behave?", and answering it does not require
+retaining a single input. The historical variant comes with (5) and is not part
+of this milestone.
 
 Shadow before canary, and before fork generally. It is the differentiated
-capability — answering "what would this change have done to production?" without
+capability — answering "what will this change do to production?" without
 deploying it is hard to get anywhere else. It has no routing and no
 effect-ownership complexity, since v0 owns everything. And it is precisely where
 sharing pays: both arms process every input, so the marginal *compute* is
@@ -542,18 +564,19 @@ said 𝑋 and v1 said 𝑌 — not on any position or timestamp, so each arm hav
 own commit clock costs nothing here. Divergence in *state* and divergence in
 *effects* are probably different reports.
 
-**Are replayed effects suppressed, and by what?** The model rests on replay, and
-every serving program has sinks — replaying last week's requests would re-send
-last week's responses. There must be a rule, and it is a *third* phase the
-document does not have: during replay no version owns effects; past the frontier
-the live one does. It also weakens M1's test, which can assert on the replayed
-prefix only because a test has no already-emitted past; production replay cannot
-observe that prefix at all. This is the largest gap here.
+**Are replayed effects suppressed, and by what?** Only arises once inputs are
+retained and something replays them, but then it arises hard: every serving
+program has sinks, and replaying last week's requests would re-send last week's
+responses. Effect ownership is defined per *version*; replay needs it defined
+per *phase* as well — during a replay no version owns effects, and past the
+frontier the live one does. The largest gap in the retention half of this
+document, and the reason audit is further off than the forward-running
+configurations.
 
-**How does a merge over more than two versions work?** The retention window
-implies a merged program carries an arm per version deployed inside it, so N
-arms — but the diff is pairwise and the partitioned-state realization is written
-for two. An N-way guard and a merge over N trees with maximal sharing are both
+**How does a merge over more than two versions work?** Only with retention: a
+forward-running program needs one arm, but keeping inputs means keeping an arm
+per version whose branch point is still inside the window, so N. The diff is
+pairwise and the partitioned-state realization is written for two. An N-way guard and a merge over N trees with maximal sharing are both
 undescribed. Chaining pairwise diffs is the obvious approach and is not
 obviously the right one.
 
@@ -594,7 +617,8 @@ advances past a branch point, that arm becomes unreachable and should be
 collected — which is a live rewrite of a running program, or a redeploy. Neither
 is obviously right.
 
-**Diagnostics for unguardable divergences.** A changed seed is inert; a changed
-batch region silently rewrites its part of the past on replay. Both are cases
-where the user's edit does not mean what they think. The merge should say so,
-and the wording matters more than the mechanism.
+**Diagnostics for unguardable divergences.** A changed seed is inert against an
+existing store; a changed batch region takes effect wholesale at the next
+restart rather than at the cut. Both are cases where the user's edit does not
+mean what it looks like. The merge should say so, and the wording matters more
+than the mechanism.
