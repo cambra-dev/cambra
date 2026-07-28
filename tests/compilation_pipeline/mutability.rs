@@ -468,6 +468,38 @@ fn cross_channel_cycle_is_rejected() {
     expect_compile_error(code, "mutually recursive cycle");
 }
 
+/// A `Mut`-discipline violation renders with source context, not as a bare
+/// `error: …` line.
+///
+/// These are user errors, and every one of them used to reach the terminal
+/// span-less: the check walks reported an error naming the offending expression
+/// only as a pre-rendered label, so `CompileError::Infer` carried `span: None`
+/// and the ariadne path was skipped. They now carry the node their rule raised
+/// them at, which `compile_program` resolves against the lowering projection —
+/// so this asserts the *report*, not just the message: the underlined source line
+/// is what tells a user where to look.
+#[test]
+fn mut_discipline_error_renders_with_source_context() {
+    let code = "a := 0\nb = a\nb";
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let errs = match compile_program(&mut ctx, code, consumer) {
+        Ok(_) => panic!("expected a Mut-discipline error, but the program compiled"),
+        Err(e) => e,
+    };
+    let rendered = render_errors(&errs, "mut.chl", code);
+    assert!(
+        rendered.contains("not annotated `Mut`"),
+        "expected the rule-3 message, got:\n{rendered}"
+    );
+    // The ariadne report quotes the offending line and points at it; a span-less
+    // diagnostic would contain neither.
+    assert!(
+        rendered.contains("b = a") && rendered.contains("mut.chl:2"),
+        "expected an underlined report at line 2, got:\n{rendered}"
+    );
+}
+
 /// Rule 3: an unannotated copy of a mutable variable (`b = a`) aliases it — rejected, to
 /// force the author to disambiguate a value copy (`b: Int = a`) from seeding a
 /// new mutable variable (`b: Mut(Int) := a`).

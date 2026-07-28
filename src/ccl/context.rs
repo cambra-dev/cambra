@@ -13,8 +13,8 @@ use crate::{
     ccl::{
         Expr, Type, channelize,
         infer::{
-            InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
-            check_pre_desugar, infer, typecheck,
+            InferError, LocatedInferError, TypeInferenceContext, check_mut_discipline,
+            check_mut_write_targets, check_pre_desugar, infer, typecheck,
         },
         inline, lambda_elim,
         lineage::{Leak, RecorderSession, SourceProjection, collapse_lowering},
@@ -193,6 +193,37 @@ impl CompileError {
     }
 }
 
+/// Resolve each inference error's blame node to a source span and wrap it as a
+/// [`CompileError`].
+///
+/// The single conversion from an inference error to a compile error: every
+/// inference error carries the node its rule raised it at, and this is where that
+/// node becomes a span — one hop through the lowering projection, no fold, on the
+/// always-on release path. There is deliberately no span-less alternative
+/// conversion: a caller that has inference errors is inside `compile_program`,
+/// where the projection is in scope, so "forgot to resolve" cannot happen by
+/// picking the wrong helper.
+///
+/// `span: None` survives only for a node the projection does not cover — one
+/// minted after lowering (monomorphization, or a pass that mints while checking a
+/// rewritten tree) — which renders as a plain `error: …` line.
+fn resolve_infer_errors(
+    errs: Vec<LocatedInferError>,
+    projection: &SourceProjection,
+) -> Vec<CompileError> {
+    errs.into_iter()
+        .map(|located| {
+            let span = projection
+                .get(&located.node_id)
+                .and_then(|attr| attr.spans.first().copied());
+            CompileError::Infer {
+                error: located.error,
+                span,
+            }
+        })
+        .collect()
+}
+
 /// Build an ariadne report for an inference error pinned to a source span.
 ///
 /// Mirrors the parse/lower report builders: the `Debug` impl of [`InferError`]
@@ -268,18 +299,6 @@ impl From<ConversionError> for CompileError {
 /// per inference error.
 pub trait IntoCompileErrors {
     fn into_compile_errors(self) -> Vec<CompileError>;
-}
-
-impl IntoCompileErrors for Vec<InferError> {
-    fn into_compile_errors(self) -> Vec<CompileError> {
-        // Fallback for callers without the `lowering_projection` (i.e. not
-        // `compile_program`): no span resolution, so `span: None`. The
-        // `compile_program` path resolves spans explicitly and constructs the
-        // `Infer` variant itself rather than going through `.errs()`.
-        self.into_iter()
-            .map(|error| CompileError::Infer { error, span: None })
-            .collect()
-    }
 }
 
 impl IntoCompileErrors for lambda_elim::LambdaElimError {
@@ -818,18 +837,7 @@ pub fn compile_program(
     // an id the projection doesn't cover (a node minted after lowering, e.g. by
     // monomorphization) degrades to a span-less diagnostic.
     if let Err(errors) = infer_outcome {
-        return Err(errors
-            .into_iter()
-            .map(|located| {
-                let span = lowering_projection
-                    .get(&located.node_id)
-                    .and_then(|attr| attr.spans.first().copied());
-                CompileError::Infer {
-                    error: located.error,
-                    span,
-                }
-            })
-            .collect());
+        return Err(resolve_infer_errors(errors, &lowering_projection));
     }
     debug!("Inferred:\n{}", symbolic(&expr));
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
@@ -844,9 +852,9 @@ pub fn compile_program(
     check_pre_desugar(&expr).map_err(|errs| {
         if errs
             .iter()
-            .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
+            .all(|e| matches!(e.error, InferError::UnresolvedInfer { .. }))
         {
-            errs.into_compile_errors()
+            resolve_infer_errors(errs, &lowering_projection)
         } else {
             panic!("Inference created invalid expr: {errs:?}")
         }
@@ -860,7 +868,7 @@ pub fn compile_program(
     // `user_annotation`s. Unlike the surrounding `check_pre_desugar` walls
     // (compiler-bug backstops), these are user errors: aliasing or nesting a
     // mutable reference.
-    check_mut_discipline(&expr).map_err(|errs| errs.into_compile_errors())?;
+    check_mut_discipline(&expr).map_err(|errs| resolve_infer_errors(errs, &lowering_projection))?;
 
     // Enforce that every `:=` / `+=` write targets a mutable variable (a write is
     // never a shadowing rebind of an immutable). Post-inference so binder types
@@ -869,7 +877,8 @@ pub fn compile_program(
     // construction, since lowering only emits `MutWrite` for registered mutable variables;
     // it becomes load-bearing once lowering emits writes uniformly and drops the
     // registry — see src/ccl/design/mutability.md, "Mutability is the type (no lowering registry)".)
-    check_mut_write_targets(&expr).map_err(|errs| errs.into_compile_errors())?;
+    check_mut_write_targets(&expr)
+        .map_err(|errs| resolve_infer_errors(errs, &lowering_projection))?;
 
     // Inline UDFs *before* desugar: a defer-mediating UDF (`λ out → out << e`)
     // or a cross-function writer is beta-reduced to its call site before
@@ -893,9 +902,9 @@ pub fn compile_program(
     check_pre_desugar(&expr).map_err(|errs| {
         if errs
             .iter()
-            .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
+            .all(|e| matches!(e.error, InferError::UnresolvedInfer { .. }))
         {
-            errs.into_compile_errors()
+            resolve_infer_errors(errs, &lowering_projection)
         } else {
             panic!("UDF inlining created invalid expr: {errs:?}")
         }

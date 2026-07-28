@@ -453,7 +453,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 /// `simplify`'s `debug_typecheck` (one call per *fired* rewrite rule), which
 /// is compiled out of release builds; the remaining callers (`typecheck`,
 /// post-planning validation in `context.rs`) run once per pipeline stage.
-pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn check(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     let mut cloned = expr.clone();
     let mut ctx = CheckCtx::new(cloned.node_id());
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
@@ -469,13 +469,7 @@ pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
     if ctx.errors.is_empty() {
         Ok(())
     } else {
-        // Check-mode failures are compiler bugs (a pass produced an ill-typed
-        // tree), and every caller either `.expect()`s them or renders them
-        // without source context, so the blame nodes are dropped here rather
-        // than plumbed through `typecheck`/`check_pre_desugar`. They are
-        // recorded per error, so surfacing them is a signature change away when
-        // a caller wants an underlined report.
-        Err(ctx.errors.into_iter().map(|e| e.error).collect())
+        Err(ctx.errors)
     }
 }
 

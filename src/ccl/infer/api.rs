@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
+use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{Expr, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode};
 use crate::util::ScopeStack;
@@ -310,6 +311,17 @@ pub enum InferError {
     },
     /// An incompatible-bounds conflict from coalescing.
     /// The solver rejects unions/intersections of distinct concrete types.
+    ///
+    /// TODO(structured-context): this is the one error whose nature is a
+    /// collision *between* sites, so one blame node understates it — the other
+    /// contributing sites are here as `origin`/`context` display labels. Making
+    /// them locatable means moving them onto the wrapper as label-with-node pairs
+    /// (`LocatedInferError`, mirroring `ParseErrorInfo::context: Vec<(String,
+    /// Span)>`), not adding a parallel node vec here: `InferError` stays
+    /// location-free, and a span inside it would break that. Then
+    /// `is_significant_context` (`solve.rs`) can filter on node kind instead of
+    /// substring-matching a rendering, and `infer_report` can emit a secondary
+    /// label per site.
     IncompatibleBounds {
         /// `true` = positive polarity (lower-bound union); `false` = negative (upper-bound intersection).
         polarity: bool,
@@ -408,12 +420,52 @@ pub enum InferError {
 /// where they are raised. An inference error is raised holding types, not spans,
 /// so it carries a node id and resolves to a span at the `compile_program`
 /// boundary.)
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct LocatedInferError {
     /// The underlying inference error.
     pub error: InferError,
     /// The node whose typing rule raised the error.
-    pub node_id: crate::ccl::provenance::NodeId,
+    pub node_id: NodeId,
+}
+
+impl std::fmt::Debug for LocatedInferError {
+    /// Delegates to the error's own `Debug` — which is the human-readable
+    /// message — and appends the blame node. A derived impl would bury the
+    /// message inside struct syntax, and these values are what the pipeline's
+    /// `.expect("…")` walls print when a pass produces an ill-typed tree.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} [{:?}]", self.error, self.node_id)
+    }
+}
+
+/// Record `error` at `node`, unless an identical error is already recorded there.
+///
+/// The check walks recurse through *types*, and one type can mention the same
+/// unsolved variable (or hole) in several positions — `Fun{?0, Tuple[?0, ?0]}`
+/// states one fact about one node three times, each report carrying the same
+/// label because the label renders the enclosing node. Those are equal values at
+/// the same node, so exact equality is the whole key: no per-variant handling.
+///
+/// Deliberately **not** keyed on the node alone. Two *different* errors
+/// legitimately share a node — an `UnresolvedInfer` on a lambda's binder slot and
+/// a `MutNotBareVariable` on the lambda itself — and collapsing those would drop
+/// real findings. Reports of one cause at *different* nodes are likewise kept:
+/// each node's type genuinely is unresolved, and presenting them as one finding
+/// is the renderer's job, not this walk's.
+///
+/// The check family's counterpart to `Typing::raise` (emission) and
+/// `CoalesceCtx::push_error` (coalesce): one place per walk that turns an error
+/// into a located one, so a push site cannot forget the node.
+fn record_error(errors: &mut Vec<LocatedInferError>, node: NodeId, error: InferError) {
+    let located = LocatedInferError {
+        error,
+        node_id: node,
+    };
+    // Linear scan: this list is empty on the success path and single-digit on the
+    // failure path, which either aborts compilation or panics.
+    if !errors.contains(&located) {
+        errors.push(located);
+    }
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -602,12 +654,12 @@ pub enum Strictness {
 ///
 /// Runs as the first phase of [`typecheck`]; callers that want the combined
 /// hole-freeness + semantic check should call [`typecheck`] directly.
-pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     check_annotated(expr, Strictness::Strict)
 }
 
 /// [`check_fully_typed`] at the given [`Strictness`].
-fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<InferError>> {
+fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<LocatedInferError>> {
     let mut errors = Vec::new();
     let mut seen: HashSet<crate::ccl::PredicateId> = HashSet::new();
     collect_expr_errors(expr, strictness, &mut errors, &mut seen);
@@ -630,23 +682,30 @@ fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<InferE
 fn collect_expr_errors(
     expr: &Expr,
     strictness: Strictness,
-    errors: &mut Vec<InferError>,
+    errors: &mut Vec<LocatedInferError>,
     seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
     collect_type_errors(
         &expr.ty,
         &symbolic(expr),
+        expr.node_id(),
         strictness,
         errors,
         seen_refinements,
     );
     // Binder-bearing variants emit per-binding type errors before descending
     // into their children; everything else just visits its direct children.
+    //
+    // A `TypedBinding` is not an `Expr`, so it has no `NodeId` of its own: its
+    // type errors are blamed on the node that *declares* it, whose span covers
+    // the binder. The label still names the binder, so one node can carry both
+    // its own type error and its binder's — distinct errors, same blame.
     match &expr.node {
         TypedExprNode::Lambda { param, body, .. } => {
             collect_type_errors(
                 &param.ty,
                 param.name.base(),
+                expr.node_id(),
                 strictness,
                 errors,
                 seen_refinements,
@@ -657,6 +716,7 @@ fn collect_expr_errors(
             collect_type_errors(
                 &binding.ty,
                 binding.name.base(),
+                expr.node_id(),
                 strictness,
                 errors,
                 seen_refinements,
@@ -680,6 +740,7 @@ fn collect_expr_errors(
                     collect_type_errors(
                         &p.binding.ty,
                         p.binding.name.base(),
+                        expr.node_id(),
                         strictness,
                         errors,
                         seen_refinements,
@@ -693,7 +754,14 @@ fn collect_expr_errors(
         // `walk_children` never reaches — check them like a lambda param.
         TypedExprNode::LetRec { bindings, .. } => {
             for (b, _) in bindings {
-                collect_type_errors(&b.ty, b.name.base(), strictness, errors, seen_refinements);
+                collect_type_errors(
+                    &b.ty,
+                    b.name.base(),
+                    expr.node_id(),
+                    strictness,
+                    errors,
+                    seen_refinements,
+                );
             }
             expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements));
         }
@@ -703,6 +771,7 @@ fn collect_expr_errors(
             collect_type_errors(
                 &target.ty,
                 target.name.base(),
+                expr.node_id(),
                 strictness,
                 errors,
                 seen_refinements,
@@ -724,14 +793,19 @@ fn collect_expr_errors(
 fn collect_type_errors(
     ty: &Type,
     context_sym: &str,
+    node: NodeId,
     strictness: Strictness,
-    errors: &mut Vec<InferError>,
+    errors: &mut Vec<LocatedInferError>,
     seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
     match ty {
-        Type::Hole => errors.push(InferError::UnresolvedHole {
-            at: context_sym.to_string(),
-        }),
+        Type::Hole => record_error(
+            errors,
+            node,
+            InferError::UnresolvedHole {
+                at: context_sym.to_string(),
+            },
+        ),
         Type::Infer(var) => {
             // Pre-desugar, an induction accumulator's domain is still `Infer` (a
             // `Mut(V)` with no annotated domain — the unified phase resolves it
@@ -739,10 +813,14 @@ fn collect_type_errors(
             // [`Strictness`]). Feed channel domains are the rigid `ChanDom`
             // handled below, not `Infer`.
             if strictness == Strictness::Strict {
-                errors.push(InferError::UnresolvedInfer {
-                    id: var.uid,
-                    at: context_sym.to_string(),
-                });
+                record_error(
+                    errors,
+                    node,
+                    InferError::UnresolvedInfer {
+                        id: var.uid,
+                        at: context_sym.to_string(),
+                    },
+                );
             }
         }
         // a nominal channel domain is a pre-desugar artifact
@@ -750,30 +828,62 @@ fn collect_type_errors(
         // substitute it away; a survivor at the strict wall is a compiler bug.
         Type::ChanDom(name, _) => {
             if strictness == Strictness::Strict {
-                errors.push(InferError::Unsupported(format!(
-                    "channel domain chan({name}) survived channelize at `{context_sym}`"
-                )));
+                record_error(
+                    errors,
+                    node,
+                    InferError::Unsupported(format!(
+                        "channel domain chan({name}) survived channelize at `{context_sym}`"
+                    )),
+                );
             }
         }
         Type::Fun {
             domain, codomain, ..
         } => {
-            collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
-            collect_type_errors(codomain, context_sym, strictness, errors, seen_refinements);
+            collect_type_errors(
+                domain,
+                context_sym,
+                node,
+                strictness,
+                errors,
+                seen_refinements,
+            );
+            collect_type_errors(
+                codomain,
+                context_sym,
+                node,
+                strictness,
+                errors,
+                seen_refinements,
+            );
         }
         Type::Tuple(elems) => {
             for elem in elems {
-                collect_type_errors(elem, context_sym, strictness, errors, seen_refinements);
+                collect_type_errors(
+                    elem,
+                    context_sym,
+                    node,
+                    strictness,
+                    errors,
+                    seen_refinements,
+                );
             }
         }
         Type::Record(fields) => {
             for (_, ty) in fields {
-                collect_type_errors(ty, context_sym, strictness, errors, seen_refinements);
+                collect_type_errors(ty, context_sym, node, strictness, errors, seen_refinements);
             }
         }
         Type::Variant(tags) => {
             for (_, payload) in tags {
-                collect_type_errors(payload, context_sym, strictness, errors, seen_refinements);
+                collect_type_errors(
+                    payload,
+                    context_sym,
+                    node,
+                    strictness,
+                    errors,
+                    seen_refinements,
+                );
             }
         }
         Type::History {
@@ -789,12 +899,28 @@ fn collect_type_errors(
                     HistoryKind::Append => "feed handle type survived channelize",
                     HistoryKind::Overwrite => "mutable-reference type survived the unified phase",
                 };
-                errors.push(InferError::Unsupported(format!(
-                    "{what} at `{context_sym}`"
-                )));
+                record_error(
+                    errors,
+                    node,
+                    InferError::Unsupported(format!("{what} at `{context_sym}`")),
+                );
             }
-            collect_type_errors(value, context_sym, strictness, errors, seen_refinements);
-            collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
+            collect_type_errors(
+                value,
+                context_sym,
+                node,
+                strictness,
+                errors,
+                seen_refinements,
+            );
+            collect_type_errors(
+                domain,
+                context_sym,
+                node,
+                strictness,
+                errors,
+                seen_refinements,
+            );
         }
         Type::Refinement(inner, refinement) => {
             // Walk each predicate term only once: a predicate term shared by
@@ -811,7 +937,14 @@ fn collect_type_errors(
             if seen_refinements.insert(refinement.predicate_id()) {
                 collect_expr_errors(&refinement.predicate, strictness, errors, seen_refinements);
             }
-            collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
+            collect_type_errors(
+                inner,
+                context_sym,
+                node,
+                strictness,
+                errors,
+                seen_refinements,
+            );
         }
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
     }
@@ -838,7 +971,7 @@ fn collect_type_errors(
 /// precondition self-enforcing rather than an implicit caller obligation.
 /// Returns `Ok(())` if no errors are found, or all discovered errors as
 /// `Err(errs)`.
-pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn typecheck(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     check_fully_typed(expr)?;
     super::check(expr)
 }
@@ -848,7 +981,7 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// (`Feed` channels with a `ChanDom` domain, `Overwrite`s with an `Infer` domain)
 /// are permitted — the unified phase and `channelize` erase them (see
 /// [`Strictness::PreDesugar`]).
-pub fn check_pre_desugar(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn check_pre_desugar(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     // The relaxation applies only when the tree carries transient histories
     // (feed/mutable machinery). A program with none should be fully resolved
     // after inference, so a residual `Infer` there is an ambiguous program
@@ -974,7 +1107,7 @@ fn annotation_peels_to_hole(ty: &Type) -> bool {
 ///    ([`InferError::MutInCompositeType`]).
 /// 3. An *unannotated* binding may not have `Mut` type — `b = a` aliases a
 ///    mutable variable and is rejected ([`InferError::UnannotatedMutBinding`]).
-pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     let mut errors = Vec::new();
     check_mut_discipline_go(expr, &mut errors);
     if errors.is_empty() {
@@ -998,7 +1131,8 @@ fn check_no_nested_mut(
     ty: &Type,
     allow_mut: bool,
     at: &dyn Fn() -> String,
-    errors: &mut Vec<InferError>,
+    node: NodeId,
+    errors: &mut Vec<LocatedInferError>,
 ) {
     match ty {
         // Only an `Overwrite` history is a `Mut` for rule 2; a `Feed` history is a
@@ -1012,25 +1146,29 @@ fn check_no_nested_mut(
             kind: HistoryKind::Overwrite,
         } => {
             if !allow_mut {
-                errors.push(InferError::MutInCompositeType {
-                    at: at(),
-                    ty: ty.clone(),
-                });
+                record_error(
+                    errors,
+                    node,
+                    InferError::MutInCompositeType {
+                        at: at(),
+                        ty: ty.clone(),
+                    },
+                );
             }
             // Either child of a `Mut` is a nested (illegal) position.
-            check_no_nested_mut(value, false, at, errors);
-            check_no_nested_mut(domain, false, at, errors);
+            check_no_nested_mut(value, false, at, node, errors);
+            check_no_nested_mut(domain, false, at, node, errors);
         }
         Type::Fun {
             domain, codomain, ..
         } => {
-            check_no_nested_mut(domain, true, at, errors);
-            check_no_nested_mut(codomain, false, at, errors);
+            check_no_nested_mut(domain, true, at, node, errors);
+            check_no_nested_mut(codomain, false, at, node, errors);
         }
-        Type::Refinement(base, _) => check_no_nested_mut(base, allow_mut, at, errors),
+        Type::Refinement(base, _) => check_no_nested_mut(base, allow_mut, at, node, errors),
         // Tuple / Record / Variant / feed-history payloads (and inert leaves): a
         // `Mut` anywhere below here is nested, so drop `allow_mut` to `false`.
-        _ => ty.walk_children(|c| check_no_nested_mut(c, false, at, errors)),
+        _ => ty.walk_children(|c| check_no_nested_mut(c, false, at, node, errors)),
     }
 }
 
@@ -1038,7 +1176,7 @@ fn check_no_nested_mut(
 /// binder slot. `Loop`, `For`, `Case`-pattern, `LetRec`, `Lambda`, and `Let`
 /// binder types are unreachable by `walk_children`, so the caller invokes this
 /// on each explicitly.
-fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
+fn check_binder(binding: &TypedBinding, node: NodeId, errors: &mut Vec<LocatedInferError>) {
     // Rule 3: an *unspecified* binder whose resolved type is a mutable variable is an
     // alias (`b = a`) — rejected, to force disambiguation between copying the
     // value and seeding a new mutable variable. A *concrete* annotation is a deliberate
@@ -1058,9 +1196,13 @@ fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
         Some(ann) => annotation_peels_to_hole(ann),
     };
     if annotation_is_unspecified && peel_mut(&binding.ty).is_some() {
-        errors.push(InferError::UnannotatedMutBinding {
-            name: binding.name.base().to_string(),
-        });
+        record_error(
+            errors,
+            node,
+            InferError::UnannotatedMutBinding {
+                name: binding.name.base().to_string(),
+            },
+        );
     }
     // A binder slot is a top-level type position, so `Mut` itself is legal;
     // only a `Mut` *nested* in the declared type is a rule-2 violation.
@@ -1068,11 +1210,12 @@ fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
         &binding.ty,
         true,
         &|| binding.name.base().to_string(),
+        node,
         errors,
     );
 }
 
-fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
+fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<LocatedInferError>) {
     // The `symbolic(expr)` render for error labels is computed *lazily* — only
     // in the branches that actually raise an error — because this walk visits
     // every node and the no-error path is overwhelmingly common; rendering the
@@ -1096,13 +1239,17 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
     // target is a `Name`, not a child node, so it never surfaces here.
     if peel_mut(&expr.ty).is_some() && !forwards_tail && !matches!(expr.node, TypedExprNode::Var(_))
     {
-        errors.push(InferError::MutNotBareVariable { at: symbolic(expr) });
+        record_error(
+            errors,
+            expr.node_id(),
+            InferError::MutNotBareVariable { at: symbolic(expr) },
+        );
     }
 
     // Rule 2 on this node's own type. A forwarder's type is its tail's, so the
     // tail's own check already covers it — skip to avoid ancestor-chain dupes.
     if !forwards_tail {
-        check_no_nested_mut(&expr.ty, true, &|| symbolic(expr), errors);
+        check_no_nested_mut(&expr.ty, true, &|| symbolic(expr), expr.node_id(), errors);
     }
 
     // Rule 1(b): an argument passed to a `Mut` parameter must name a real mutable variable
@@ -1121,32 +1268,43 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
         if let Type::Fun { domain, .. } = fn_ty
             && peel_mut(domain).is_some()
         {
+            // Blamed on the *argument*, not the application: the argument is
+            // the node the rule complains about, and its span is what a report
+            // should underline.
             if !matches!(argument.node, TypedExprNode::Var(_)) {
-                errors.push(InferError::MutNotBareVariable {
-                    at: symbolic(argument),
-                });
+                record_error(
+                    errors,
+                    argument.node_id(),
+                    InferError::MutNotBareVariable {
+                        at: symbolic(argument),
+                    },
+                );
             } else if peel_mut(&argument.ty).is_none() {
-                errors.push(InferError::MutArgNotMutable {
-                    at: symbolic(argument),
-                });
+                record_error(
+                    errors,
+                    argument.node_id(),
+                    InferError::MutArgNotMutable {
+                        at: symbolic(argument),
+                    },
+                );
             }
         }
     }
 
     // Rules 3 + 2 on binder slots `walk_children` does not reach.
     match &expr.node {
-        TypedExprNode::Let { binding, .. } => check_binder(binding, errors),
-        TypedExprNode::Lambda { param, .. } => check_binder(param, errors),
-        TypedExprNode::For { target, .. } => check_binder(target, errors),
+        TypedExprNode::Let { binding, .. } => check_binder(binding, expr.node_id(), errors),
+        TypedExprNode::Lambda { param, .. } => check_binder(param, expr.node_id(), errors),
+        TypedExprNode::For { target, .. } => check_binder(target, expr.node_id(), errors),
         TypedExprNode::LetRec { bindings, .. } => {
             for (b, _) in bindings {
-                check_binder(b, errors);
+                check_binder(b, expr.node_id(), errors);
             }
         }
         TypedExprNode::Case { branches, .. } => {
             for b in branches {
                 if let Some(p) = &b.pattern {
-                    check_binder(&p.binding, errors);
+                    check_binder(&p.binding, expr.node_id(), errors);
                 }
             }
         }
@@ -1167,7 +1325,7 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
 /// scope stack, and shadowing is handled for free. A target whose peeled type
 /// is not `Mut` is [`InferError::MutWriteToNonMutable`]; a target absent from the
 /// map is an unbound write inference already rejected, and is skipped.
-pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     let mut muts: HashMap<Name, bool> = HashMap::new();
     collect_mut_binders(expr, &mut muts);
     let mut errors = Vec::new();
@@ -1229,14 +1387,18 @@ fn collect_mut_binders(expr: &Expr, out: &mut HashMap<Name, bool>) {
 fn check_mut_write_targets_go(
     expr: &Expr,
     muts: &HashMap<Name, bool>,
-    errors: &mut Vec<InferError>,
+    errors: &mut Vec<LocatedInferError>,
 ) {
     if let TypedExprNode::MutWrite { name, .. } = &expr.node
         && muts.get(name) == Some(&false)
     {
-        errors.push(InferError::MutWriteToNonMutable {
-            name: name.base().to_string(),
-        });
+        record_error(
+            errors,
+            expr.node_id(),
+            InferError::MutWriteToNonMutable {
+                name: name.base().to_string(),
+            },
+        );
     }
     expr.walk_children(|c| check_mut_write_targets_go(c, muts, errors));
 }
@@ -1742,7 +1904,7 @@ mod tests {
             body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
         });
         assert_eq!(
-            check_mut_write_targets(&expr),
+            check_mut_write_targets(&expr).map_err(LocatedInferError::bare),
             Err(vec![InferError::MutWriteToNonMutable {
                 name: "x".to_string(),
             }])
@@ -2584,7 +2746,7 @@ mod tests {
         // TypedExpr::new sets ty: Type::Hole — don't call with_ty.
         let expr = Expr::lit(Lit::Int(1));
         assert_eq!(
-            check_fully_typed(&expr),
+            check_fully_typed(&expr).map_err(LocatedInferError::bare),
             Err(vec![InferError::UnresolvedHole { at: "1".into() }])
         );
     }
@@ -2615,7 +2777,7 @@ mod tests {
         })
         .with_ty(Type::Base(BaseType::Int));
         assert_eq!(
-            check_fully_typed(&expr),
+            check_fully_typed(&expr).map_err(LocatedInferError::bare),
             Err(vec![
                 InferError::UnresolvedHole { at: "x".into() },
                 InferError::UnresolvedHole { at: "42".into() }
@@ -2633,9 +2795,104 @@ mod tests {
         let id = var.uid;
         let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Infer(var));
         assert_eq!(
-            check_fully_typed(&expr),
+            check_fully_typed(&expr).map_err(LocatedInferError::bare),
             Err(vec![InferError::UnresolvedInfer { id, at: "1".into() }])
         );
+    }
+
+    /// A binder slot's type error is blamed on the node that declares it.
+    ///
+    /// A `TypedBinding` is not an `Expr` and has no id of its own, so the only
+    /// truthful blame is the declaring node — whose span covers the binder. Pinned
+    /// because the alternative (leaving such errors unlocated) is what the
+    /// mandatory-node design rules out.
+    #[test]
+    fn binder_slot_errors_are_blamed_on_the_declaring_node() {
+        let var = crate::ccl::InferVar::fresh(0);
+        let expr = Expr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "x".into(),
+                ty: Type::Infer(var),
+                user_annotation: None,
+            },
+            body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
+        })
+        .with_ty(Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        });
+        let errors = check_fully_typed(&expr).expect_err("the param slot is unsolved");
+        let [located] = errors.as_slice() else {
+            panic!("expected exactly one error, got {errors:?}");
+        };
+        assert!(matches!(located.error, InferError::UnresolvedInfer { .. }));
+        assert_eq!(located.node_id, expr.node_id(), "blamed on the lambda");
+    }
+
+    /// One unsolved variable in several positions of one type is one finding per
+    /// *node*, not one per occurrence — and the per-node findings all survive.
+    ///
+    /// `λ x → (x, x)` where every slot holds the same variable: without dedup the
+    /// walk reports 8 times (three occurrences inside the lambda's own `Fun` type,
+    /// two inside the tuple's, one per binder/use), all carrying the same label
+    /// because the label renders the enclosing node. `record_error` collapses the
+    /// within-node repeats by exact equality and keeps the rest: each node's type
+    /// genuinely is unresolved, so each is a separately-locatable statement.
+    #[test]
+    fn one_variable_reports_once_per_node() {
+        let var = crate::ccl::InferVar::fresh(0);
+        let use1 = Expr::var("x").with_ty(Type::Infer(var.clone()));
+        let use2 = Expr::var("x").with_ty(Type::Infer(var.clone()));
+        let (u1, u2) = (use1.node_id(), use2.node_id());
+        let body = Expr::tuple(vec![use1, use2]).with_ty(Type::Tuple(vec![
+            Type::Infer(var.clone()),
+            Type::Infer(var.clone()),
+        ]));
+        let tuple_id = body.node_id();
+        let expr = Expr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "x".into(),
+                ty: Type::Infer(var.clone()),
+                user_annotation: None,
+            },
+            body: Box::new(body),
+        })
+        .with_ty(Type::Fun {
+            name: None,
+            domain: Box::new(Type::Infer(var.clone())),
+            codomain: Box::new(Type::Tuple(vec![
+                Type::Infer(var.clone()),
+                Type::Infer(var),
+            ])),
+        });
+
+        let errors = check_fully_typed(&expr).expect_err("nothing is solved");
+        // Five errors over four nodes. Without dedup this walk reports eight: the
+        // lambda's `Fun` type mentions the variable three times and the tuple's
+        // twice, and those repeats are equal values at one node.
+        assert_eq!(errors.len(), 5, "{errors:?}");
+        let mut blamed: Vec<_> = errors.iter().map(|e| e.node_id.as_u64()).collect();
+        blamed.sort_unstable();
+        blamed.dedup();
+        assert_eq!(blamed.len(), 4, "four nodes carry a report: {errors:?}");
+        // The lambda carries two — its own type and its binder slot's. Distinct
+        // errors (the labels differ) at one node, which is exactly why the dedup
+        // key is the (node, error) pair and not the node.
+        let lambda_errors = errors
+            .iter()
+            .filter(|e| e.node_id == expr.node_id())
+            .count();
+        assert_eq!(
+            lambda_errors, 2,
+            "lambda's own type + its binder: {errors:?}"
+        );
+        for node in [tuple_id, u1, u2] {
+            assert!(
+                errors.iter().any(|e| e.node_id == node),
+                "node {node:?} keeps its own report: {errors:?}"
+            );
+        }
     }
 
     /// A `Type::Infer` inside a lambda parameter binding is caught.
@@ -2662,7 +2919,7 @@ mod tests {
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
         assert_eq!(
-            check_fully_typed(&expr),
+            check_fully_typed(&expr).map_err(LocatedInferError::bare),
             Err(vec![InferError::UnresolvedInfer { id, at: "x".into() }])
         );
     }
@@ -2680,7 +2937,7 @@ mod tests {
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
         assert_eq!(
-            check_fully_typed(&expr),
+            check_fully_typed(&expr).map_err(LocatedInferError::bare),
             Err(vec![InferError::UnresolvedHole { at: "1".into() }])
         );
     }
@@ -2831,7 +3088,7 @@ mod tests {
             .expect_err("an empty Case must be reported, not silently accepted");
         assert!(
             errs.iter()
-                .any(|e| matches!(e, InferError::EmptyCase { .. })),
+                .any(|e| matches!(e.error, InferError::EmptyCase { .. })),
             "expected EmptyCase, got {errs:?}"
         );
     }
@@ -2854,7 +3111,7 @@ mod tests {
         let errs = result.unwrap_err();
         assert!(
             errs.iter()
-                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+                .any(|e| matches!(e.error, InferError::TypeMismatch { .. }))
         );
     }
 
@@ -2875,7 +3132,7 @@ mod tests {
         let errs = result.unwrap_err();
         assert!(
             errs.iter()
-                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+                .any(|e| matches!(e.error, InferError::TypeMismatch { .. }))
         );
     }
 
@@ -2895,7 +3152,7 @@ mod tests {
             result
                 .unwrap_err()
                 .iter()
-                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+                .any(|e| matches!(e.error, InferError::TypeMismatch { .. }))
         );
     }
 
@@ -2923,7 +3180,7 @@ mod tests {
         let errs = result.unwrap_err();
         assert!(
             errs.iter()
-                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+                .any(|e| matches!(e.error, InferError::TypeMismatch { .. }))
         );
     }
 
@@ -2960,7 +3217,7 @@ mod tests {
         let errs = result.unwrap_err();
         assert!(
             errs.iter()
-                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+                .any(|e| matches!(e.error, InferError::TypeMismatch { .. }))
         );
     }
 
