@@ -526,6 +526,18 @@ along with backfill and retroactive branch points. A branch turns out to be an
 ordinary `Case` on the sequencing domain, and the retroactive cases are cut —
 see branching.md for why.
 
+### The next analysis: divergence reachability
+
+Running two versions side by side means giving each its own copy of any state
+they could disagree about — and *only* of that state. The question is per
+register and per sink: **is any divergence upstream of it in the dataflow
+graph?** If none is, the two versions provably write it identically and it needs
+one store; if one is, it needs a store per version (or copy-on-write, where the
+values happen to agree anyway — a runtime concern, not this one).
+
+It is a reachability query over `divergences()` rather than new matching work,
+and it is what makes a second version cost the diff rather than 2×. Not built.
+
 ---
 
 ## Open threads

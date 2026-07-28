@@ -3,7 +3,12 @@
 Cambra programs evolve, and the point of the system is that the *diff between
 two versions* is something the compiler and runtime can act on rather than an
 opaque redeploy. [diffing.md](diffing.md) works out what changed. This document
-works out what to build from it.
+works out what to build from it: upgrading a running program without rewriting
+the history it already produced, and running two versions side by side.
+
+Those are not two designs. They are settings of the same three knobs, and the
+bulk of this document is one model with upgrade and fork as configurations of
+it.
 
 Nothing here is implemented. The diff analysis it consumes is.
 
@@ -31,32 +36,65 @@ builds, and it is why the feature exists at all.
 
 ---
 
-## Three features, not one
+## Three knobs, not two features
 
-"Program branching" has been used for three things with different costs and
-different prerequisites. They are worth separating before designing any of them.
+"Upgrade" and "fork" are not two designs. They are two settings of the same
+three knobs, and the other settings are useful too. A **version attachment** is:
 
-**Compute sharing.** Run two versions; evaluate what they have in common once.
-No time, no state, no cutover — an optimization, and the diff already answers it
-(`shared_roots()`).
+1. **Arms** — the versions. From the diff: one tree with selected sites, so the
+   arms share everything they have in common rather than being two programs.
+2. **A selector** — what decides which arm applies at a given position. Its
+   domain is an *existing* domain of the program: the commit clock, or a
+   property of an input element.
+3. **A state policy** — **shared** (one history, both arms write it) or
+   **partitioned** (one history per arm).
 
-**Upgrade.** *One* timeline. The logic changes at a branch point; there is one
-store, one output stream, one set of clients. This is the feature this document
-is about.
+|  | shared state | partitioned state |
+| --- | --- | --- |
+| **time selector** | **upgrade** | rollback-capable cutover |
+| **input selector** | **live experiment** — some users get v1's pricing, one inventory | **canary** |
+| **no selector** (both arms see everything) | not a version attachment: every input writes twice | **shadow** |
 
-**Fork.** *Two* timelines from a common ancestor, both live, each with its own
-state and its own readers. Genuinely different: it needs state duplication,
-reader routing, and a drain or merge policy. Deferred.
+Compute sharing is not a fourth configuration. It is what makes the others
+affordable: the arms are one tree, so the marginal cost of a second version is
+proportional to the diff rather than to the program.
 
-And one deliberately cut: **retroactive change**, a branch point in the past. It
-needs durable, replayable inputs reaching back to that point, and it is
-incoherent for anything with external effects — an HTTP response already sent
-cannot be unsent. Most of the machinery an earlier draft of this design carried
-(backfill windows, streaming catch-up, blast radius through the read-dependency
-graph, obsoletion oracles) existed only to serve it. Cutting it removes that
-machinery rather than deferring it.
+### Effect ownership is the well-formedness condition
 
----
+An external sink is a single resource — two versions cannot both answer one HTTP
+request. So at every position, **each external effect must have exactly one
+owning version**, and the selector has to determine which.
+
+That is not a fourth knob; it is a constraint the three must jointly satisfy,
+and two rows of the table fall out of it rather than being posited. The
+bottom-left cell is excluded because both arms would drive the same sink (and
+write the same register twice per input). **Shadow** is derived, not invented:
+it is "v0 owns every effect while v1's state evolves anyway" — which is also why
+shadow *must* partition state, since a v1 write into the shared store would
+corrupt production.
+
+### Why upgrade is cheap: the dimension collapses
+
+Version is always a dimension. What differs is whether it survives.
+
+Under a **time selector** the version is *functionally determined by the commit
+clock*: a register's value at 𝑡 was written by whichever arm the selector picked
+at 𝑡. The dimension collapses, and one history `Txn ⇒ 𝑉` suffices — no
+duplication, no copy, no reconciliation.
+
+Under an **input selector** the version is independent of 𝑡, so the dimension
+survives and the state carries it. That single fact is the whole difference in
+cost between upgrade and fork, and it is why they are one design rather than
+two.
+
+### What is cut: retroactive change
+
+A branch point in the *past*. It needs durable, replayable inputs reaching back
+to that point, and it is incoherent for anything with external effects — an HTTP
+response already sent cannot be unsent. Most of the machinery an earlier draft
+of this design carried (backfill windows, streaming catch-up, blast radius
+through the read-dependency graph, obsoletion oracles) existed only to serve it.
+Cutting it removes that machinery rather than deferring it.
 
 ## A branch is a guard on the sequencing domain
 
@@ -170,8 +208,9 @@ preserve.
 
 ## The branch point is deployment time
 
-**𝑡ₙ is fixed at the moment of deployment.** It is not a parameter the user
-chooses. Four reasons, in descending order of force.
+For a **time selector**, **𝑡ₙ is fixed at the moment of deployment**. It is not a
+parameter the user chooses. (An input selector has no 𝑡ₙ at all — it selects on
+a property of the input, so nothing below applies to it.) Four reasons, in descending order of force.
 
 **It is the only value with no mixture window.** Batch regions switch at
 restart, because they have no clock to hold them back. Timeline regions switch
@@ -216,12 +255,14 @@ it is the fork feature and should be priced as one.
 
 ---
 
-## State belongs to the program, not the version
+## State: shared, or partitioned
 
-There is one `inventory`, and both versions write it. State is state *of the
-program*, not of a version — which is what an operator expects (you do not fork
-your database to ship a pricing change) and what distinguishes upgrade from
-fork.
+### Shared — one history, both arms write it
+
+There is one `inventory`, and both versions write it. That is what an operator
+expects (you do not fork your database to ship a pricing change), and under a
+time selector it is not merely convenient — the version dimension has collapsed,
+so there is nothing to partition.
 
 Consequences worth accepting explicitly:
 
@@ -232,6 +273,55 @@ Consequences worth accepting explicitly:
   types for one register.
 - **Adding a register is fine** — unwritten, it reads its seed. **Removing one is
   fine if unread.**
+
+### Partitioned — one history per arm
+
+For two versions this is not a new type or a new domain: **instantiate the
+writer graph twice, share the subgraph the diff calls common, and give each its
+own store.** The "version dimension" is two copies, and sharing is ordinary
+graph sharing — the same thing compute sharing already is. `Mut` is untouched.
+
+The alternative — making `Version` a real index domain, so a register is
+`Version ⇒ Txn ⇒ 𝑉` and sharing is *constancy over that dimension* — is the
+generalization, and it only earns its keep past a handful of versions
+(per-tenant, say). Build duplication; keep the domain framing in reserve.
+
+### How much is actually shared
+
+Two answers, and only the first is a compiler question:
+
+- **Static.** The diff *proves* a register can never diverge, because no
+  divergence is upstream of it in the dataflow graph. Share unconditionally: one
+  store, one writer.
+- **Dynamic.** The values happen to agree though the code differs. Copy-on-write
+  at the key level — a runtime concern.
+
+The static half is a small new analysis, **divergence reachability**: for each
+register and sink, is any divergence upstream? It is the natural next thing to
+build on `divergences()` (see [diffing.md](diffing.md)), and it is what makes a
+fork cost the diff rather than 2×.
+
+---
+
+## Two things replay decides for us
+
+The replay model settles two questions that would otherwise be free choices, and
+in both cases the answer is not the obvious one.
+
+**A shadow forks from position 0, not from the deployment.** Seeding v1's store
+from v0's current state looks natural and is the *unnatural* move here: it copies
+state the model says is a function of inputs. The natural thing is to replay
+every input through v1 from the start — which is also the honest answer to "what
+would this change have done?". So upgrade and shadow share the replay machinery
+entirely: upgrade replays one timeline with a time-switched selector, shadow
+replays two.
+
+**The selector must be a deterministic function of inputs.** A canary routing
+10% of traffic *randomly* would route differently on replay, so the two runs
+would disagree about what happened. Either the selector is derived from
+something already in the input (a user-id hash), or the routing decision is
+itself recorded as an input. This is forced, not stylistic, and it is much
+cheaper to know before someone ships a random split.
 
 ---
 
@@ -260,30 +350,53 @@ In dependency order.
 
 ## Milestones
 
-**M1 — merge.** Two programs plus a branch point in, one CCL tree out: guards at
-the divergences, everything else shared literally. Testable with no persistence,
-because replay *is* the model — run the merged program over a full input stream
-and assert the prefix matches v0's output and the suffix v1's. Needs (1) and (2)
-above; the corpus is `http_counter` and the accumulator loops, since the
-transactional serving programs are still gap programs.
+**M1 — merge (upgrade).** Two programs plus a branch point in, one CCL tree out:
+guards at the divergences, everything else shared literally. Testable with no
+persistence, because replay *is* the model — run the merged program over a full
+input stream and assert the prefix matches v0's output and the suffix v1's.
+Needs (1) and (2) above; the corpus is `http_counter` and the accumulator loops,
+since the transactional serving programs are still gap programs.
 
-**M2 — measure the sharing.** What fraction of the merged graph is one node.
-This is the actual value proposition, and nothing currently quantifies it.
+**M2 — measure the sharing.** What fraction of the merged graph is one node,
+plus divergence reachability over the registers. This is the actual value
+proposition and nothing currently quantifies it.
 
-**M3 — fork.** Only after M1 and M2, and only if the version-as-a-domain sketch
-below survives scrutiny.
+**M3 — shadow.** Partitioned state, no selector, v0 owns every effect.
+
+Shadow before canary, and before fork generally. It is the differentiated
+capability — answering "what would this change have done to production?" without
+deploying it is hard to get anywhere else. It has no routing and no
+effect-ownership complexity, since v0 owns everything. And it is precisely where
+sharing pays: both arms process every input, so the marginal cost of shadowing
+is proportional to the diff, not to the program. That is the headline claim of
+the whole system, and shadow is where it is either true or it isn't.
+
+**M4 — canary.** An input selector, and with it routing and per-position effect
+ownership.
 
 ---
 
 ## Open questions
 
-**Is a fork a domain?** The tidiest sketch: a forked program is
-`Version ⇒ Outputs`, versions are positions of an index domain, stores become
-`Version ⇒ Txn ⇒ V`, and sharing falls out of subterms being *constant* over the
-version dimension — the same tiling machinery as everything else, rather than a
-bolted-on sharing mechanism. Unknown whether the machinery supports a
-non-causal index domain used this way, and whether the engine can exploit
-constancy over it. Attractive enough to test before designing an alternative.
+**Does each arm of a fork get its own commit clock?** Two partitioned stores
+cannot conflict, so each could. But then "the same input" lands at different
+commit times in the two timelines, and comparing them — shadow's entire purpose —
+needs a common index, which would have to be the *input position* rather than
+commit time. That is a larger claim than it looks: it would make input position,
+not the commit clock, the fundamental shared index across versions.
+
+**What does a shadow report?** "v1 would have priced 4% of orders differently"
+is the output people want, and it needs the common index above. Divergence in
+*state* and divergence in *effects* are probably different reports.
+
+**How does a fork end?** Scoping it to "pick a winner, discard the loser's
+state" keeps merging two diverged histories out of the compiler, where it does
+not belong. Worth stating rather than assuming.
+
+**Should a shared-state experiment be opt-in separately?** An input selector over
+shared state means the experiment is *real* — v1's writes affect v0's users. It
+is legitimate and occasionally exactly right, but it should not be reachable by
+adjusting a flag that reads like a routing detail.
 
 **A retry that crosses 𝑡ₙ.** Optimistic concurrency assigns a fresh commit time
 on retry, so a transaction can begin under v0's logic and commit under v1's.
