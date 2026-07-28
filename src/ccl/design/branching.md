@@ -89,12 +89,14 @@ two.
 
 ### What is cut: retroactive change
 
-A branch point in the *past*. It needs durable, replayable inputs reaching back
-to that point, and it is incoherent for anything with external effects — an HTTP
-response already sent cannot be unsent. Most of the machinery an earlier draft
-of this design carried (backfill windows, streaming catch-up, blast radius
-through the read-dependency graph, obsoletion oracles) existed only to serve it.
-Cutting it removes that machinery rather than deferring it.
+A branch point in the *past*, because it is incoherent for anything with
+external effects — an HTTP response already sent cannot be unsent. Most of the
+machinery an earlier draft of this design carried (backfill windows, streaming
+catch-up, blast radius through the read-dependency graph, obsoletion oracles)
+existed only to serve it, so cutting it removes that machinery rather than
+deferring it.
+
+The exclusion is narrower than it first looks; see "Why the past is still out".
 
 ## A branch is a guard on the sequencing domain
 
@@ -187,8 +189,10 @@ A cut is meaningful iff the domain is **both**. Orderedness alone is not enough,
 and `UIntRange` is the counterexample: it is perfectly ordered, and cutting a
 loop over `[1, 2, 3]` mid-way is still incoherent, because the loop is
 recomputed every run and the answer would depend on when someone deployed. A
-source arrival is both ordered and event-anchored; program start is neither
-(§8.5: it is a *single* event, so it imposes no relative order at all).
+source arrival is both. Program start is event-anchored — it is an event, and it
+happens once — but **not ordered**: §8.5 makes it a *single* event, so it
+imposes no relative order among the blocks it triggers, and there is no "before"
+within it to cut at.
 
 So a program partitions into **timeline regions** — ordered and event-anchored,
 where a cutover is meaningful — and **batch regions**, where it is *meaningless*
@@ -200,7 +204,20 @@ type does not carry them, so nothing can check the distinction. Putting them in
 the domain's type makes "can this divergence be versioned?" a type question,
 which is how the rest of the system already works — mutability is the type, and
 the sequencing domain is in the type. Until then the differ approximates it from
-the domain of the enclosing function, which is on the node's type already.
+the domain of the enclosing function, which is on the node's type already:
+
+| Domain | Ordered | Event-anchored | Cut-overable |
+| --- | --- | --- | --- |
+| `DataSource(_)` | yes — arrival order | yes | **yes** |
+| `Txn` | yes — a total commit order | yes | **yes** |
+| `UIntRange(_)` | yes | no — recomputed each run | no |
+| program start | no — a single event | yes | no |
+| `ChanDom(_, _)` | inherits from the feeding domain | inherits | inherits |
+
+The approximation is exactly this table, and it is an approximation because
+`DataSource` is one type covering sources that genuinely differ: a live stream
+is ordered, a table snapshot or a sharded stream is not. Splitting that is what
+prerequisite (3) below asks for.
 
 ---
 
@@ -223,32 +240,65 @@ preserve.
 
 ---
 
-## The branch point is deployment time
+## The branch point: any cut at or after the frontier, defaulting to now
 
-For a **time selector**, **𝑡ₙ is fixed at the moment of deployment**. It is not a
-parameter the user chooses. (An input selector has no 𝑡ₙ at all — it selects on
-a property of the input, so nothing below applies to it.) Four reasons, in descending order of force.
+For a **time selector**, 𝑡ₙ is a consistent cut supplied at deployment. The
+**mechanism accepts any cut at or after the current frontier**; the **default
+policy** is the frontier at install — cut over now. (An input selector has no 𝑡ₙ
+at all — it selects on a property of the input, so nothing here applies to it.)
 
-**It is the only value with no mixture window.** Batch regions switch at
-restart, because they have no clock to hold them back. Timeline regions switch
-at 𝑡ₙ. If 𝑡ₙ is later than the restart, then between the two the running program
-is *neither version* — v1's batch answers feeding v0's transaction logic. Where
-a batch region computes something the transaction logic depends on (a pricing
-table, a threshold), that mixture can violate an invariant both versions
-individually satisfy. Setting 𝑡ₙ to the deployment makes the window empty. The
-alternative — holding batch regions at v0 until 𝑡ₙ — means running both, which
-is a fork, not an upgrade.
+Defaulting to *now* and *permitting* later are different claims, and only the
+first is a simplification worth making. Three reasons the mechanism must not be
+restricted to "now":
 
-**A future 𝑡ₙ only buys scheduling.** The reason to want one is "cut over at
-midnight". That is a deployment-orchestration concern, and it is served just as
-well by deploying at midnight. It does not need to be in the language.
+**"Now" is not available in the distributed case.** Deployment is not a single
+event across replicas: each would cut at its own instant, and the merged program
+would not be the same program everywhere. Replicas have to *agree* on a cut, and
+agreement is not instantaneous — so the agreed cut is necessarily slightly in
+the future. A mechanism that only accepts the present cannot express a
+replicated deployment at all, and the concurrency section puts distribution
+explicitly in scope.
 
-**There is no way to denote a commit position anyway.** `Txn` is an anonymous
-total order whose positions exist only in the tile; there is no syntax for a
-specific one. "The next commit after deploy" is a sentinel rather than a value —
-and at deployment, that sentinel is exactly what is at hand.
+**Loading and switching are separately valuable.** Deploying the merged program
+warms it, validates it, and gets it running; choosing when its behaviour changes
+is a second decision. Collapsing them forces the risky operation to happen at
+the moment you least want to be doing operations.
 
-**A past 𝑡ₙ is already cut**, for the reasons above.
+**Nothing about a future cut is mechanically harder.** The guard is the same
+comparison either way. Restricting to "now" would not simplify the compiler; it
+would only remove a parameter.
+
+### What a future cut does *not* cost
+
+An earlier draft argued that a future cut leaves a **mixture window**: batch
+regions switch at restart because nothing can hold them back, so between the
+restart and 𝑡ₙ the program would run v1's batch answers against v0's transaction
+logic, breaking invariants that each version satisfies alone.
+
+That argument does not survive the guard-placement rule above. A batch region
+*consumed by* a timeline region is versioned at the point of consumption, so
+v0's transaction logic consumes v0's batch answer. The apparent residue — a
+batch region feeding only an output — is empty too: in a program that has a
+timeline at all, its sinks are timeline-driven, so a batch value reaching an
+output enters a timeline and is guarded there. A program with no timeline
+anywhere has nothing to be inconsistent *with*.
+
+So there is no mixture window to avoid, and the case for defaulting to "now"
+rests on it being the obvious default rather than on it being the only safe
+value.
+
+### Why the past is still out
+
+Not for lack of durable inputs — the retention window now supplies those. The
+blocker is **effects**: a response already sent cannot be unsent, so recomputing
+a past that had external consequences produces a history that disagrees with
+what the world already saw.
+
+That narrows the exclusion rather than removing it. A retroactive cut is
+incoherent for anything with external sinks; for purely internal state, inside
+the retention window, it is not. Whether that narrower case is worth supporting
+is open — it is the only remaining route to "fix the bug and recompute what it
+corrupted", which is the thing retroactivity was ever wanted for.
 
 ### 𝑡ₙ is a consistent cut, not a timestamp
 
@@ -257,6 +307,10 @@ than the model needs and more than a distributed engine can cheaply provide, so
 𝑡ₙ is a **consistent cut of the event partial order**: a frontier past which
 every event belongs to the new version and before which every event belongs to
 the old. A scalar is the degenerate case where the order happens to be total.
+
+A cut is representable — the durability section requires recording one — but
+there is no *source syntax* for a commit position, and none is needed: 𝑡ₙ is a
+deployment parameter, not something a program mentions.
 
 The alternative — a cut point per source — reintroduces the mixture window
 *across sources*: for an interval `/order` runs v1 while `/restock` runs v0, and
@@ -341,13 +395,11 @@ checkpoint or a full re-derive from inputs, which is possible only inside the
 window. That gives the type-breaking case an operational meaning rather than a
 flat rejection.
 
-### What this gives up
+### What the default gives up
 
-Scheduled cutover, and with it any story where the branch point is a first-class
-value the program can reason about. Re-introducing a future 𝑡ₙ later means
-solving the mixture window, which means holding both versions' batch regions —
-i.e. it becomes a fork. That is a coherent extension, not a contradiction, but
-it is the fork feature and should be priced as one.
+Only the *interface* for choosing a cut, not the capability. A program cannot
+reason about its own branch point, and there is no scheduling UX; both are
+additions on top of a mechanism that already accepts the value.
 
 ---
 
@@ -404,13 +456,13 @@ fork cost the diff rather than 2×.
 The replay model settles two questions that would otherwise be free choices, and
 in both cases the answer is not the obvious one.
 
-**A shadow forks from position 0, not from the deployment.** Seeding v1's store
-from v0's current state looks natural and is the *unnatural* move here: it copies
-state the model says is a function of inputs. The natural thing is to replay
-every input through v1 from the start — which is also the honest answer to "what
-would this change have done?". So upgrade and shadow share the replay machinery
-entirely: upgrade replays one timeline with a time-switched selector, shadow
-replays two.
+**A shadow forks from the start of the retention window, not from the
+deployment.** Seeding v1's store from v0's current state looks natural and is the
+*unnatural* move here: it copies state the model says is a function of inputs.
+The natural thing is to replay every retained input through v1 — which is also
+the honest answer to "what would this change have done?", bounded by how far
+back the inputs go. So upgrade and shadow share the replay machinery entirely:
+upgrade replays one timeline with a cut-switched selector, shadow replays two.
 
 **The selector must be a deterministic function of inputs.** A canary routing
 10% of traffic *randomly* would route differently on replay, so the two runs
@@ -473,9 +525,12 @@ Shadow before canary, and before fork generally. It is the differentiated
 capability — answering "what would this change have done to production?" without
 deploying it is hard to get anywhere else. It has no routing and no
 effect-ownership complexity, since v0 owns everything. And it is precisely where
-sharing pays: both arms process every input, so the marginal cost of shadowing
-is proportional to the diff, not to the program. That is the headline claim of
-the whole system, and shadow is where it is either true or it isn't.
+sharing pays: both arms process every input, so the marginal *compute* is
+proportional to the divergent part rather than to the program. Storage is the
+weaker claim and the one to state carefully — a register is duplicated when
+*any* divergence is upstream of it, so a one-token edit high in the dataflow can
+duplicate the whole store. The measure to hold M3 to is **divergence
+reachability**, not diff size.
 
 **M4 — canary.** An input selector, and with it routing and per-position effect
 ownership.
@@ -489,6 +544,27 @@ is the output people want. It aligns on **event identity** — for request 𝑅,
 said 𝑋 and v1 said 𝑌 — not on any position or timestamp, so each arm having its
 own commit clock costs nothing here. Divergence in *state* and divergence in
 *effects* are probably different reports.
+
+**Are replayed effects suppressed, and by what?** The model rests on replay, and
+every serving program has sinks — replaying last week's requests would re-send
+last week's responses. There must be a rule, and it is a *third* phase the
+document does not have: during replay no version owns effects; past the frontier
+the live one does. It also weakens M1's test, which can assert on the replayed
+prefix only because a test has no already-emitted past; production replay cannot
+observe that prefix at all. This is the largest gap here.
+
+**How does a merge over more than two versions work?** The retention window
+implies a merged program carries an arm per version deployed inside it, so N
+arms — but the diff is pairwise and the partitioned-state realization is written
+for two. An N-way guard and a merge over N trees with maximal sharing are both
+undescribed. Chaining pairwise diffs is the obvious approach and is not
+obviously the right one.
+
+**What does comparing against a cut mean at a single site?** 𝑡ₙ is a consistent
+cut, but the guard is a comparison. Presumably each site compares its own
+position against the cut's projection onto its domain — but that is not worked
+out, and neither is what the "event partial order" concretely *is* in terms of
+the domains a program actually has.
 
 **How does a fork end?** Scoping it to "pick a winner, discard the loser's
 state" keeps merging two diverged histories out of the compiler, where it does

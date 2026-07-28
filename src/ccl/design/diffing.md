@@ -514,12 +514,13 @@ Three things there bear on this document.
 guard goes; `shared_roots()` says what the two versions can compute once. That
 is why both are derived here rather than left to the consumer.
 
-*A guard needs a clock, and the type says whether there is one.* A divergence
-inside a domain that advances with real time (`Txn`, a live source) can be
-guarded; one inside a batch region — literal data, a finite loop — cannot,
-because there is no position at which its answer changes. The distinction is the
-domain of the enclosing function, already on the node's type, so the differ
-supplies it without new analysis.
+*A guard needs a clock, and the domain says whether there is one.* A divergence
+inside a domain that is both ordered and event-anchored (`Txn`, a live source)
+can be guarded; one inside a batch region — literal data, a finite loop — cannot,
+because there is no position at which its answer changes. Neither property is
+carried in the type today, so this is an approximation read off the domain of
+the enclosing function rather than something checkable; branching.md tabulates
+which of today's domains fall where.
 
 *No `Versioned` node.* An earlier draft of the branching design proposed one,
 along with backfill and retroactive branch points. A branch turns out to be an
