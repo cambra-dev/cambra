@@ -163,17 +163,27 @@ enum ReadPurpose {
     /// the baseline for the clone's two-way pin), and is *not* what the use node
     /// ends up carrying — that is the clone's own coalesced type.
     ///
-    /// Witnesses are excluded from the comparison here because of what this read
-    /// is *used for*. The pin that immediately follows it moves witnesses in both
-    /// directions — inward from the use, outward from the clone — so every read
-    /// observed to drift drifts across that pin: a witness appears
-    /// (`pick = \lo, hi -> …` at `pick(8, 0)` keys on `((Int) ⇒ Int)` and resolves
-    /// to `((8) ⇒ Int)` afterwards) or intersects away. The only consumer of the
-    /// key is [`Specialization::use_ty`]'s equality, where a witness that arrived
-    /// late can only cause a **miss** — a fresh private clone, at worst a wasted
-    /// one, never a mis-typed use. The *base skeleton* is still held fixed: a
-    /// stale skeleton could make the lookup **hit** the wrong clone, which is a
-    /// different thing entirely.
+    /// Witnesses are excluded from the comparison here, and the reason is not that
+    /// a bound arrives late — nothing does. An argument's witness reaches the
+    /// instantiation as a **lower** bound on the domain variable
+    /// (`(8, 0) <: ?dom`, from the emit-time `arg <: domain` edge), and a domain is
+    /// a *negative* position, where coalescing intersects **upper** bounds. So the
+    /// witness is in the graph before this read and simply not on the side the read
+    /// consults. The pin that immediately follows adds the clone's parameter
+    /// variable as an upper bound of `?dom` and drives the same information into
+    /// it, which is the path that makes the witness visible — so re-resolving the
+    /// snapshot at end of pass yields it (`pick = \lo, hi -> …` at `pick(8, 0)`:
+    /// `?dom` has `lower=[(8, 0)] upper=[?52]` and resolves to `(Int)`; after the
+    /// pin, `upper=[?52, (?89)]` and it resolves to `(8)`).
+    ///
+    /// That makes the drift a property of *when* the read is taken relative to the
+    /// pin, not of any bound going stale — which is why every [`Stamp`](Self::Stamp)
+    /// read is stable and only this one moves. The key's only consumer is
+    /// [`Specialization::use_ty`]'s equality, where a witness the read could not see
+    /// can only cause a **miss** — a fresh private clone, at worst a wasted one,
+    /// never a mis-typed use. The *base skeleton* is still held fixed: a stale
+    /// skeleton could make the lookup **hit** the wrong clone, which is a different
+    /// thing entirely.
     SpecializationKey,
 }
 
@@ -390,10 +400,22 @@ struct SpecializeFrame {
     /// The comparison is deliberately conservative in one direction, and it matters
     /// that it is *this* direction: an entry's key is the clone's **coalesced** type,
     /// which carries every witness the pin delivered, while a candidate's is its
-    /// instantiation resolved *before* its own pin runs. So a use whose witness has
-    /// not landed yet does not match an otherwise-identical entry and mints its own
-    /// clone — a wasted clone, never a use served by a clone pinned to someone
-    /// else's refinement.
+    /// instantiation resolved *before* its own pin runs — where a witness sitting on
+    /// the domain's *lower* bounds is invisible (see
+    /// [`ReadPurpose::SpecializationKey`]). So a use whose witness the pre-pin
+    /// resolution cannot see does not match an otherwise-identical entry, and mints
+    /// its own clone: a wasted clone, never a use served by a clone pinned to
+    /// someone else's refinement.
+    ///
+    /// The waste is per **call site**, not per distinct type, for any definition
+    /// whose clone type acquires a witness only across the pin — two calls at the
+    /// *same* literal miss each other too. Which definitions those are depends on
+    /// how the body uses the parameter: `\a, b -> a + b` applied at `(1, 2)` keys on
+    /// `((1, Int) ⇒ Int)` and shares one clone, while `\lo, hi -> sum([v for v in xs
+    /// if v >= lo])` applied at `(8, 0)` keys on `((Int) ⇒ Int)` against an entry
+    /// stored as `((8) ⇒ Int)` and does not. Both candidate fixes are the ones noted
+    /// above — key modulo refinements (needs the clone built at the stripped type),
+    /// or resolve the key *after* the pin.
     specs: Vec<Specialization>,
 }
 
