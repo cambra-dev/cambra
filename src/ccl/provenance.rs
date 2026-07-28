@@ -87,30 +87,15 @@ impl std::fmt::Debug for NodeId {
 // not as a struct. Hand-written rather than `#[serde(transparent)]` because the
 // inner field is private.
 //
-// TODO(wire-stability): shipping the raw mint-order value makes the golden
-// fixtures churn wholesale — any upstream change to mint *counts* shifts every
-// later id, rewriting every subsequent `nodeId` and `paneLinks` edge pair for a
-// semantically tiny diff.
-//
-// The fix is the canonicalization walk in the inspector fixture-hardening plan
-// (design vault): keep `NodeId` as the internal identity and canonicalize only at
-// serialization time — first-encounter dense indices from one deterministic walk
-// of the whole snapshot (the uniquify binder-index precedent), alongside a second
-// map giving synthetic `__` binder names per-prefix first-encounter ordinals,
-// since those churn for the same reason. Upstream mint-count changes then produce
-// no fixture diff at all, and a genuine reorder produces a diff proportional to
-// it.
-//
-// Two constraints that walk owes this layer, neither of which is a property of
-// the ids themselves:
-//
-// - the numbering is snapshot-**global**, not per-pane: an id preserved across
-//   panes must canonicalize to one index, or `paneLinks` edges stop connecting
-//   their endpoints — and the frontend's untagged `Set<number>` /
-//   `Map<number, …>` collections assume ids are unique across panes, not just
-//   within one.
-// - it applies to every id-bearing position on the wire, edge endpoints
-//   included, not only to the nodes of the pane trees.
+// TODO(wire-stability): the mint-order value is not stable across compiler
+// changes — anything that shifts upstream mint *counts* renumbers every later id,
+// so a semantically tiny change rewrites every subsequent `nodeId` and every
+// `paneLinks` endpoint in the golden fixtures. The fix belongs in the
+// serialization layer rather than here, leaving `NodeId` as the internal identity:
+// one deterministic walk of the snapshot assigns dense first-encounter indices
+// (the uniquify binder-index precedent), so mint-count changes produce no fixture
+// diff and a genuine reordering produces one proportional to it. Not yet
+// implemented.
 #[cfg(feature = "serde")]
 impl serde::Serialize for NodeId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -127,8 +112,7 @@ impl serde::Serialize for NodeId {
 /// provenance: `Pair`, `Mono`, `SolverArg`, …) are deliberately separate enums,
 /// neither wrapping the other — one tags `NodeId`s (expression nodes), the
 /// other tags `Uid`s (binders), and merging them would conflate the WHO axis
-/// with binder-role payloads. See the design-provenance doc's "`Pass` and
-/// `SyntheticKind` stay separate" section for the full rationale.
+/// with binder-role payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Pass {

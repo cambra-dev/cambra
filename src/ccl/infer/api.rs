@@ -385,13 +385,16 @@ pub struct LocatedInferError {
     pub node_id: Option<crate::ccl::provenance::NodeId>,
 }
 
+#[cfg(test)]
 impl LocatedInferError {
     /// The bare errors of a located list, dropping the blame nodes.
     ///
-    /// For callers that assert on error *payloads* and have no projection to
-    /// resolve ids against — the inference test suites. A diagnostic path must
-    /// not use this: pairing the id with its error is the whole point.
-    pub fn bare(located: Vec<Self>) -> Vec<InferError> {
+    /// **Test-only, and deliberately unavailable outside `cfg(test)`.** The unit
+    /// tests assert on error *payloads* and have no projection to resolve ids
+    /// against; a diagnostic path must never discard the pairing, so there is no
+    /// production affordance for doing it. Integration tests are separate crates
+    /// that cannot see this, and define their own local strip helper.
+    pub(crate) fn bare(located: Vec<Self>) -> Vec<InferError> {
         located.into_iter().map(|l| l.error).collect()
     }
 }

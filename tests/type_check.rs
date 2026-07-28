@@ -68,6 +68,16 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
     infer(&mut expr, &mut ictx).expect("inference failed")
 }
 
+/// The inference errors of a located list, dropping the blame nodes.
+///
+/// These tests assert on error payloads and have no lowering projection to
+/// resolve a blame node against. The library exposes no such helper outside its
+/// own unit tests — discarding the error/node pairing is a test-local
+/// convenience, never a production affordance.
+fn bare(located: Vec<LocatedInferError>) -> Vec<InferError> {
+    located.into_iter().map(|l| l.error).collect()
+}
+
 /// Like [`infer_program`] but expects inference to fail and returns all errors.
 fn infer_program_err(code: &str) -> Vec<InferError> {
     let mut lctx = LoweringContext::default();
@@ -77,7 +87,7 @@ fn infer_program_err(code: &str) -> Vec<InferError> {
         .into_result()
         .expect("lowering failed");
     infer(&mut expr, &mut ictx)
-        .map_err(LocatedInferError::bare)
+        .map_err(bare)
         .expect_err("expected inference error")
 }
 
@@ -110,7 +120,7 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
         .into_result()
         .expect("lowering failed");
     infer(&mut expr, &mut ictx)
-        .map_err(LocatedInferError::bare)
+        .map_err(bare)
         .expect_err("expected inference error")
 }
 

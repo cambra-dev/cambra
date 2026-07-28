@@ -1098,7 +1098,8 @@ impl TypedExpr {
 // ---------------------------------------------------------------------------
 
 impl TypedExpr {
-    /// Invoke `f` on each direct child [`TypedExpr`] of this node.
+    /// Invoke `f` on each direct child [`TypedExpr`] of this node, in child
+    /// order.
     ///
     /// "Direct child" means an Expr reachable through this node's value fields
     /// — `function`/`argument`, `left`/`right`, `Case` branch guard/body,
@@ -1113,17 +1114,20 @@ impl TypedExpr {
     /// shadowing (e.g. stopping at a [`TypedExprNode::Lambda`] whose param
     /// matches a target name) must still handle the binder variants
     /// explicitly rather than relying on this method.
-    /// Collect borrows of the direct child expressions, in the same order as
-    /// [`walk_children`](Self::walk_children).
     ///
-    /// The borrow-returning sibling of [`walk_children`](Self::walk_children):
-    /// where `walk_children` hands each child to a closure under a fresh
-    /// short-lived borrow (so a found child cannot escape the call), this returns
-    /// the children as `&Self`-lifetime borrows. Use it when a traversal needs to
-    /// *return* a child reference (e.g. find-node-by-id), which the closure form
-    /// structurally cannot express.
-    pub fn child_exprs(&self) -> Vec<&TypedExpr> {
-        let mut out = Vec::new();
+    /// This is the single immutable child-structure definition —
+    /// [`child_exprs`](Self::child_exprs), [`any_child`](Self::any_child),
+    /// [`all_children`](Self::all_children), and
+    /// [`fold_children`](Self::fold_children) all route through it, so they
+    /// cannot drift out of sync — and it allocates nothing, which is why it is
+    /// the form the compile-path walks use.
+    ///
+    /// `f` receives each child borrowed for `&self`'s full lifetime rather than a
+    /// shorter reborrow, so a child borrow may **escape** the closure into an
+    /// enclosing binding. That is what lets a value-returning recursion (a
+    /// find-by-id that yields `Option<&TypedExpr>`) go through this form instead
+    /// of needing the allocating one.
+    pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a TypedExpr)) {
         match &self.node {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -1133,88 +1137,88 @@ impl TypedExpr {
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
-                out.push(function.as_ref());
-                out.push(argument.as_ref());
+                f(function.as_ref());
+                f(argument.as_ref());
             }
-            TypedExprNode::Cast { value, .. } => out.push(value.as_ref()),
+            TypedExprNode::Cast { value, .. } => f(value.as_ref()),
             TypedExprNode::BinOp { left, right, .. } => {
-                out.push(left.as_ref());
-                out.push(right.as_ref());
+                f(left.as_ref());
+                f(right.as_ref());
             }
-            TypedExprNode::UnaryOp(_, inner) => out.push(inner.as_ref()),
-            TypedExprNode::Lambda { body, .. } => out.push(body.as_ref()),
-            TypedExprNode::Aggregate { input, .. } => out.push(input.as_ref()),
+            TypedExprNode::UnaryOp(_, inner) => f(inner.as_ref()),
+            TypedExprNode::Lambda { body, .. } => f(body.as_ref()),
+            TypedExprNode::Aggregate { input, .. } => f(input.as_ref()),
             TypedExprNode::Let {
                 bound_expr, body, ..
             } => {
-                out.push(bound_expr.as_ref());
-                out.push(body.as_ref());
+                f(bound_expr.as_ref());
+                f(body.as_ref());
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
-            | TypedExprNode::CollectionUnion(elts) => out.extend(elts.iter()),
+            | TypedExprNode::CollectionUnion(elts) => elts.iter().for_each(f),
             TypedExprNode::Case {
                 scrutinee,
                 branches,
             } => {
                 if let Some(s) = scrutinee {
-                    out.push(s.as_ref());
+                    f(s.as_ref());
                 }
                 for b in branches {
-                    out.push(&b.guard);
-                    out.push(&b.body);
+                    f(&b.guard);
+                    f(&b.body);
                 }
             }
-            TypedExprNode::VariantCtor { payload, .. } => out.push(payload.as_ref()),
-            TypedExprNode::Record(fields) => out.extend(fields.iter().map(|(_, e)| e)),
+            TypedExprNode::VariantCtor { payload, .. } => f(payload.as_ref()),
+            TypedExprNode::Record(fields) => fields.iter().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child, so the expr-walker
             // skips it (its type residue is reached via `expr.ty` walks). Child
             // order mirrors `walk_transact`: each key's init, then each writer's
             // source and body.
             TypedExprNode::Transact { keys, writers, .. } => {
                 for k in keys {
-                    out.push(&k.init);
+                    f(&k.init);
                 }
                 for w in writers {
-                    out.push(&w.source);
-                    out.push(&w.body);
+                    f(&w.source);
+                    f(&w.body);
                 }
             }
             TypedExprNode::LetRec { bindings, body } => {
                 for (_, def) in bindings {
-                    out.push(def);
+                    f(def);
                 }
-                out.push(body.as_ref());
+                f(body.as_ref());
             }
             TypedExprNode::For { iter, body, .. } => {
-                out.push(iter.as_ref());
-                out.push(body.as_ref());
+                f(iter.as_ref());
+                f(body.as_ref());
             }
             TypedExprNode::ExprStmt { expr, body } => {
-                out.push(expr.as_ref());
-                out.push(body.as_ref());
+                f(expr.as_ref());
+                f(body.as_ref());
             }
             TypedExprNode::Feed { value, .. }
             | TypedExprNode::Define { value, .. }
-            | TypedExprNode::MutWrite { value, .. } => out.push(value.as_ref()),
-            TypedExprNode::Begin { body } => out.push(body.as_ref()),
+            | TypedExprNode::MutWrite { value, .. } => f(value.as_ref()),
+            TypedExprNode::Begin { body } => f(body.as_ref()),
         }
-        out
     }
 
-    /// Invoke `f` on each direct child Expr by shared reference, in child order.
+    /// Collect borrows of the direct child expressions, in
+    /// [`walk_children`](Self::walk_children) order.
     ///
-    /// Delegates to [`child_exprs`](Self::child_exprs) — the single immutable
-    /// child-structure definition — so the two cannot drift out of sync. Leaf
-    /// nodes yield an empty `Vec` (no allocation); only internal nodes pay a
-    /// small transient `Vec`, which is immaterial for compile-time tree walks.
-    /// Does not descend through type refinement predicates or visit binder
-    /// name/type fields (see [`child_exprs`](Self::child_exprs)).
-    pub fn walk_children(&self, mut f: impl FnMut(&TypedExpr)) {
-        for child in self.child_exprs() {
-            f(child);
-        }
+    /// Derived from `walk_children`, for the callers that want the children as a
+    /// slice — to index them, enumerate them, or hand them to iterator
+    /// combinators. It heap-allocates once per internal node, so prefer
+    /// `walk_children` anywhere on the compile path; this form is for cold
+    /// consumers (the inspector's snapshot queries).
+    pub fn child_exprs(&self) -> Vec<&TypedExpr> {
+        // Most nodes have ≤ 2 children; the few n-ary variants grow from there.
+        let mut out = Vec::with_capacity(2);
+        self.walk_children(|c| out.push(c));
+        out
     }
 
     /// Return `true` if `f` returns `true` for any direct child Expr.
@@ -1275,18 +1279,25 @@ impl TypedExpr {
         acc.expect("fold_children: walk_children dropped accumulator")
     }
 
-    /// Collect mutable borrows of the direct child expressions, in the same
-    /// order as [`child_exprs`](Self::child_exprs).
+    /// Mutable analog of [`walk_children`](Self::walk_children): invoke `f` on
+    /// each direct child Expr by mutable reference, in the same child order.
     ///
-    /// The `&mut` sibling of [`child_exprs`](Self::child_exprs) and the single
-    /// mutable child-structure definition (`walk_children_mut`/`map_children`/
-    /// `try_map_children` all route through it). The immutable and mutable
-    /// primitives are necessarily distinct arms — Rust's borrow rules forbid one
-    /// `&`/`&mut`-generic body — so they are the two (and, short of a codegen
-    /// macro, irreducible) match arms over the node's children. Does not descend
-    /// through type refinement predicates or visit binder name/type fields.
-    pub fn child_exprs_mut(&mut self) -> Vec<&mut TypedExpr> {
-        let mut out: Vec<&mut TypedExpr> = Vec::new();
+    /// The single mutable child-structure definition —
+    /// [`fold_children_mut`](Self::fold_children_mut),
+    /// [`map_children`](Self::map_children), and
+    /// [`try_map_children`](Self::try_map_children) all route through it, and it
+    /// allocates nothing. The immutable and mutable walkers are necessarily
+    /// separate match arms (Rust's borrow rules forbid one `&`/`&mut`-generic
+    /// body), so these two matches are the irreducible statement of the node's
+    /// child structure, short of a codegen macro; a new child-bearing variant
+    /// must appear in both.
+    ///
+    /// Same caveats as `walk_children`: does not descend through type refinement
+    /// predicates and does not visit binder name/type fields. Pure-mutator passes
+    /// that need to mutate `Lambda.param.ty`, `Let.binding.ty`, or the refinement
+    /// predicate must handle those explicitly before (or after) calling this
+    /// method.
+    pub fn walk_children_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut TypedExpr)) {
         match &mut self.node {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -1296,87 +1307,72 @@ impl TypedExpr {
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
-                out.push(function.as_mut());
-                out.push(argument.as_mut());
+                f(function.as_mut());
+                f(argument.as_mut());
             }
             // Only `value` is an expression child; `target` is a type (its
             // refinement predicate is reached via type walks, not here).
-            TypedExprNode::Cast { value, .. } => out.push(value.as_mut()),
+            TypedExprNode::Cast { value, .. } => f(value.as_mut()),
             TypedExprNode::BinOp { left, right, .. } => {
-                out.push(left.as_mut());
-                out.push(right.as_mut());
+                f(left.as_mut());
+                f(right.as_mut());
             }
-            TypedExprNode::UnaryOp(_, inner) => out.push(inner.as_mut()),
-            TypedExprNode::Lambda { body, .. } => out.push(body.as_mut()),
-            TypedExprNode::Aggregate { input, .. } => out.push(input.as_mut()),
+            TypedExprNode::UnaryOp(_, inner) => f(inner.as_mut()),
+            TypedExprNode::Lambda { body, .. } => f(body.as_mut()),
+            TypedExprNode::Aggregate { input, .. } => f(input.as_mut()),
             TypedExprNode::Let {
                 bound_expr, body, ..
             } => {
-                out.push(bound_expr.as_mut());
-                out.push(body.as_mut());
+                f(bound_expr.as_mut());
+                f(body.as_mut());
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
-            | TypedExprNode::CollectionUnion(elts) => out.extend(elts.iter_mut()),
+            | TypedExprNode::CollectionUnion(elts) => elts.iter_mut().for_each(f),
             TypedExprNode::Case {
                 scrutinee,
                 branches,
             } => {
                 if let Some(s) = scrutinee {
-                    out.push(s.as_mut());
+                    f(s.as_mut());
                 }
                 for b in branches {
-                    out.push(&mut b.guard);
-                    out.push(&mut b.body);
+                    f(&mut b.guard);
+                    f(&mut b.body);
                 }
             }
-            TypedExprNode::VariantCtor { payload, .. } => out.push(payload.as_mut()),
-            TypedExprNode::Record(fields) => out.extend(fields.iter_mut().map(|(_, e)| e)),
-            // `domain` is a `Type`, not an `Expr` child (see `child_exprs`).
+            TypedExprNode::VariantCtor { payload, .. } => f(payload.as_mut()),
+            TypedExprNode::Record(fields) => fields.iter_mut().for_each(|(_, e)| f(e)),
+            // `domain` is a `Type`, not an `Expr` child (see `walk_children`).
             // Child order mirrors `walk_transact`.
             TypedExprNode::Transact { keys, writers, .. } => {
                 for k in keys {
-                    out.push(&mut k.init);
+                    f(&mut k.init);
                 }
                 for w in writers {
-                    out.push(&mut w.source);
-                    out.push(&mut w.body);
+                    f(&mut w.source);
+                    f(&mut w.body);
                 }
             }
             TypedExprNode::LetRec { bindings, body } => {
                 for (_, def) in bindings {
-                    out.push(def);
+                    f(def);
                 }
-                out.push(body.as_mut());
+                f(body.as_mut());
             }
             TypedExprNode::For { iter, body, .. } => {
-                out.push(iter.as_mut());
-                out.push(body.as_mut());
+                f(iter.as_mut());
+                f(body.as_mut());
             }
             TypedExprNode::ExprStmt { expr, body } => {
-                out.push(expr.as_mut());
-                out.push(body.as_mut());
+                f(expr.as_mut());
+                f(body.as_mut());
             }
             TypedExprNode::Feed { value, .. }
             | TypedExprNode::Define { value, .. }
-            | TypedExprNode::MutWrite { value, .. } => out.push(value.as_mut()),
-            TypedExprNode::Begin { body } => out.push(body.as_mut()),
-        }
-        out
-    }
-
-    /// Mutable analog of [`walk_children`](Self::walk_children).
-    ///
-    /// Delegates to [`child_exprs_mut`](Self::child_exprs_mut) so the mutable
-    /// child structure lives in exactly one place. Same caveats as
-    /// `walk_children`: does not descend through type refinement predicates and
-    /// does not visit binder name/type fields. Pure-mutator passes that need to
-    /// mutate `Lambda.param.ty`, `Let.binding.ty`, or the refinement predicate
-    /// must handle those explicitly before (or after) calling this method.
-    pub fn walk_children_mut(&mut self, mut f: impl FnMut(&mut TypedExpr)) {
-        for child in self.child_exprs_mut() {
-            f(child);
+            | TypedExprNode::MutWrite { value, .. } => f(value.as_mut()),
+            TypedExprNode::Begin { body } => f(body.as_mut()),
         }
     }
 
