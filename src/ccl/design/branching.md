@@ -90,11 +90,10 @@ two.
 ### What is cut: retroactive change
 
 A branch point in the *past*, because it is incoherent for anything with
-external effects — an HTTP response already sent cannot be unsent. Most of the
-machinery an earlier draft of this design carried (backfill windows, streaming
-catch-up, blast radius through the read-dependency graph, obsoletion oracles)
-existed only to serve it, so cutting it removes that machinery rather than
-deferring it.
+external effects — an HTTP response already sent cannot be unsent. Supporting
+it would mean backfill windows, streaming catch-up, tracking a change's blast
+radius through the read-dependency graph, and an oracle for which inputs are
+still replayable; none of that is needed for anything else here.
 
 The exclusion is narrower than it first looks; see "Why the past is still out".
 
@@ -130,10 +129,10 @@ bound by a `let` directly above it — lexically in scope at the divergence, and
 captured by an inserted guard exactly as any other free variable would be.
 Lambda elimination already threads captures.
 
-So a **`Versioned` node is the wrong shape**. It would be a runtime mechanism
-for something the substrate can already express. What *would* force one is
-branching on **who is observing** rather than **when** — that is the fork case,
-and an observer is not a position in any of the program's domains.
+What *would* need more than a guard is branching on **who is observing**
+rather than **when**: an observer is not a position in any of the program's
+domains, so there is nothing to compare against. That is the fork case, and it
+is handled by partitioning state rather than by selecting on a clock.
 
 ---
 
@@ -268,24 +267,22 @@ the moment you least want to be doing operations.
 comparison either way. Restricting to "now" would not simplify the compiler; it
 would only remove a parameter.
 
-### What a future cut does *not* cost
+### A future cut leaves no mixture window
 
-An earlier draft argued that a future cut leaves a **mixture window**: batch
-regions switch at restart because nothing can hold them back, so between the
-restart and 𝑡ₙ the program would run v1's batch answers against v0's transaction
-logic, breaking invariants that each version satisfies alone.
+Batch regions switch at restart, because nothing can hold them back; timeline
+regions switch at 𝑡ₙ. Between the two the program might be expected to run v1's
+batch answers against v0's transaction logic, which would break invariants each
+version satisfies alone.
 
-That argument does not survive the guard-placement rule above. A batch region
-*consumed by* a timeline region is versioned at the point of consumption, so
-v0's transaction logic consumes v0's batch answer. The apparent residue — a
-batch region feeding only an output — is empty too: in a program that has a
-timeline at all, its sinks are timeline-driven, so a batch value reaching an
-output enters a timeline and is guarded there. A program with no timeline
-anywhere has nothing to be inconsistent *with*.
+The guard-placement rule rules that out. A batch region *consumed by* a timeline
+region is versioned at the point of consumption, so v0's transaction logic
+consumes v0's batch answer. The apparent residue — a batch region feeding only
+an output — is empty too: in a program that has a timeline at all, its sinks are
+timeline-driven, so a batch value reaching an output enters a timeline and is
+guarded there. A program with no timeline anywhere has nothing to be
+inconsistent *with*.
 
-So there is no mixture window to avoid, and the case for defaulting to "now"
-rests on it being the obvious default rather than on it being the only safe
-value.
+So defaulting to "now" is the obvious default, not the only safe value.
 
 ### Why the past is still out
 
@@ -580,10 +577,10 @@ on retry, so a transaction can begin under v0's logic and commit under v1's.
 Defensible — a retry is a fresh attempt — but it should be a decision, not an
 accident.
 
-**Do we still want a marker?** Once a branch is a plain `Case`, "which version
-produced this output" is not recoverable from the tree. Attribution, rendering,
-and per-version diagnostics may want a marker that the runtime ignores. That is
-a different justification from the one this document rejects.
+**Does attribution want a marker?** A branch is a plain `Case`, so "which
+version produced this output" is not recoverable from the tree. Attribution,
+rendering, and per-version diagnostics may want a marker the runtime ignores —
+which is a tooling need, distinct from anything the execution model requires.
 
 **Does a global arrival order survive distribution?** Per-footprint-key
 sequencing is per-shard, so it should preserve the concurrency section's claim

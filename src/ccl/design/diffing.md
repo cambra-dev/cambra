@@ -159,17 +159,17 @@ Once a pass renders one into a `String`, the hash sees an ordinary string and
 the seam no longer applies — nothing downstream can tell a run-varying identity
 from a user-written one.
 
-Loop planning used to do exactly that. The register record a `Transact` denotes
-was typed with `Name::field_key()` labels that folded the binder uid in, so one
-compilation produced `{acc#9: ([0, 2] ⇒ Int)}` and the next `{acc#19: …}`, with
-`.acc#9` against `.acc#19` reading it. Two compilations of the *same* source
-diffed as different, which made every stage from planning down unusable.
+Loop planning is where this bites. The register record a `Transact` denotes is
+typed with `Name::field_key()` labels, and folding the binder uid into one would
+type the node `{acc#9: ([0, 2] ⇒ Int)}` in one compilation and `{acc#19: …}` in
+the next, with `.acc#9` against `.acc#19` reading it — two compilations of the
+*same* source diffing as different, and every stage from planning down unusable.
 
-The label had no need of a uid. It has to be distinct only among the keys of one
-register record — every consumer resolves it against a `keys_map` built per
+The label has no need of a uid. It must be distinct only among the keys of one
+register record: every consumer resolves it against a `keys_map` built per
 `Transact` node, so accumulators in sibling loops live in different records and
-cannot collide. `field_key` is now the plain spelling, and the per-record
-uniqueness it relies on is asserted where the record is built rather than left
+cannot collide. `field_key` is therefore the plain spelling, with the per-record
+uniqueness it relies on asserted where the record is built rather than left
 implicit in a global naming scheme.
 
 The general rule this leaves: **a name rendered into a string is an identity the
@@ -518,10 +518,9 @@ carried in the type today, so this is an approximation read off the domain of
 the enclosing function rather than something checkable; branching.md tabulates
 which of today's domains fall where.
 
-*No `Versioned` node.* An earlier draft of the branching design proposed one,
-along with backfill and retroactive branch points. A branch turns out to be an
-ordinary `Case` on the sequencing domain, and the retroactive cases are cut —
-see branching.md for why.
+*A branch needs no new node.* It is an ordinary `Case` on the sequencing
+domain, so nothing in the diff's output has to be a construct the rest of the
+pipeline does not already understand.
 
 ### The next analysis: divergence reachability
 
