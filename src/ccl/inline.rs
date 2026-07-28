@@ -1131,6 +1131,72 @@ mod tests {
         assert_eq!(result, shadowed);
     }
 
+    // Refined outer parameter — discharged by the argument's own type
+    // -----------------------------------------------------------------------
+
+    /// A literal's singleton (`5 : {Int | __elem == 5}`) reaches the outer
+    /// lambda's `param.ty` through coalesce's `refresh_lambda_param_slot`, so
+    /// the refined-parameter branch of [`inline_and_beta_reduce`] — and its hard
+    /// `assert!` — is live on an ordinary UDF call path rather than dead. The
+    /// argument's own type *is* the demanded refinement, so the precondition is
+    /// discharged and substitution proceeds.
+    ///
+    /// Shape mirrors a list-returning UDF over a scalar parameter,
+    /// `def rep(k): for x in [1, 2, 3]: yield k` called as `rep(5)`: the outer
+    /// `λ k` takes the argument's singleton as its domain, and beta-reduction
+    /// leaves the inner iteration lambda with `5` substituted for `k`.
+    #[test]
+    fn refined_outer_param_discharged_by_literal_argument() {
+        let int = Type::Base(BaseType::Int);
+        let singleton = crate::ccl::infer::lit_singleton(&Lit::Int(5));
+        let range = Type::UIntRange(3);
+        let list = fn_ty(range.clone(), int.clone());
+        let udf_ty = fn_ty(singleton.clone(), list.clone());
+
+        // λ k : {Int | __elem == 5} → λ __iter_record : [0, 2] → k
+        let inner = TypedExpr::lambda(
+            "__iter_record",
+            range.clone(),
+            TypedExpr::var("k").with_ty(int.clone()),
+        )
+        .with_ty(list.clone());
+        let outer = TypedExpr::lambda("k", singleton.clone(), inner).with_ty(udf_ty.clone());
+
+        // 5 ▷ rep, with the argument carrying its singleton.
+        let arg = TypedExpr::lit(Lit::Int(5)).with_ty(singleton);
+        let call = TypedExpr::apply(arg.clone(), TypedExpr::var("rep").with_ty(udf_ty))
+            .with_ty(list.clone());
+        let expr = TypedExpr::let_bind("rep", outer, call);
+
+        let result = inline_non_iterable_lambdas(expr);
+
+        let expected = TypedExpr::lambda("__iter_record", range, arg).with_ty(list);
+        assert_eq!(result, expected);
+    }
+
+    /// The complement: a parameter refinement the argument does *not* carry is a
+    /// precondition beta-reduction would silently drop, so the assert fires
+    /// rather than substituting. Pins the guard that keeps
+    /// [`refinement_discharged_by`] from being weakened to "any refined param is
+    /// fine" — e.g. if specialization were ever keyed modulo refinements, one
+    /// literal's singleton could reach the param slot of a call made at another.
+    #[test]
+    #[should_panic(expected = "does not entail")]
+    fn refined_outer_param_not_entailed_by_argument_asserts() {
+        let int = Type::Base(BaseType::Int);
+        let demanded = crate::ccl::infer::lit_singleton(&Lit::Int(5));
+        let supplied = crate::ccl::infer::lit_singleton(&Lit::Int(7));
+        let udf_ty = fn_ty(demanded.clone(), int.clone());
+
+        let lambda = TypedExpr::lambda("k", demanded, TypedExpr::var("k").with_ty(int.clone()))
+            .with_ty(udf_ty.clone());
+        let arg = TypedExpr::lit(Lit::Int(7)).with_ty(supplied);
+        let call = TypedExpr::apply(arg, TypedExpr::var("f").with_ty(udf_ty)).with_ty(int.clone());
+        let expr = TypedExpr::let_bind("f", lambda, call);
+
+        let _ = inline_non_iterable_lambdas(expr);
+    }
+
     // inline_non_iterable_lambdas — end-to-end pass behaviour
     // -----------------------------------------------------------------------
 

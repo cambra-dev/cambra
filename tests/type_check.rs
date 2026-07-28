@@ -15,7 +15,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
     FieldKey, HistoryKind, Lit, Type,
-    infer::{InferError, TypeInferenceContext, infer, lit_singleton},
+    infer::{InferError, TypeInferenceContext, check_pre_desugar, infer, lit_singleton},
     lower::{LoweringContext, lower_stmts},
 };
 use cambra::chl_parser::{self, ast as chl_ast};
@@ -764,6 +764,45 @@ fn test_filtered_comprehension_has_refinement_on_domain() {
     } else {
         panic!("expected Fun type, got {ty}");
     }
+}
+
+/// A `Case` whose arms are *collections* must survive the post-inference
+/// consistency wall. **Currently failing** — see the `BUG` comment on
+/// `emit_case`'s arm relation in `src/ccl/infer/emit.rs`, which carries the
+/// one-line fix.
+///
+/// `emit_case` derives the node's result type from the first arm stripped of
+/// refinements, so two arms carrying different singletons (`if c: 1 else: 2`)
+/// can share one type. But it strips the two sides of the arm relation
+/// *asymmetrically*: `prev` is stripped, the arm being related to it is not.
+/// For a scalar arm that is harmless — a singleton is a subtype of its base.
+/// For a **collection** arm it is not: a filtered comprehension is
+/// `{[0, N] | predicate} ⇒ elem`, carrying its refinement on the function's
+/// **domain**, where subtyping is contravariant. Relating a refined-domain arm
+/// to a stripped-domain `prev` therefore demands `[0, N] <: {[0, N] | p}`,
+/// which does not hold — so two arms that are *literally the same expression*
+/// are rejected. Because the rule re-runs in Check mode over concrete recorded
+/// types, that lands on `check_pre_desugar`, a wall whose failures are compiler
+/// bugs and which `compile_program` panics on.
+#[test]
+fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
+    let code = r"
+xs = [1, 2, 3]
+c = 1 > 0
+if c:
+    [x for x in xs if x > 1]
+else:
+    [x for x in xs if x > 1]
+";
+    let mut lctx = LoweringContext::default();
+    let mut ictx = TypeInferenceContext::new();
+    let stmts = parse_module(code.trim());
+    let mut expr = lower_stmts(&stmts, &mut lctx)
+        .into_result()
+        .expect("lowering failed");
+    infer(&mut expr, &mut ictx).expect("inference failed");
+    check_pre_desugar(&expr)
+        .expect("post-inference consistency wall must accept the inferred tree");
 }
 
 // ---------------------------------------------------------------------------

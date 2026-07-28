@@ -81,6 +81,22 @@ fn test_function_def_polymorphic_used_at_two_types() {
     "def add_to(xs, n):\n    for x in xs:\n        yield x + n\nadd_to([1, 2, 3], 10)",
     make_int_list(&[11, 12, 13])
 )]
+// A list-returning UDF over a *literal* argument, with a body that imposes
+// nothing on that parameter (`yield k`, not `yield x + k`). The UDF is
+// therefore generalized in `k`, so use-site monomorphization specializes its
+// domain to the type actually flowing in — a literal's singleton,
+// `{Int | __elem == 10}` — and coalesce's `refresh_lambda_param_slot` copies
+// that refinement into the outer lambda's `param.ty`. This is what makes the
+// refined-outer-parameter branch of `ccl::inline::inline_and_beta_reduce`
+// (and its hard, release-mode `assert!`) live on an ordinary call path: the
+// assert passes only because the argument's own type carries the very
+// refinement the parameter demands, so beta-reduction *discharges* the
+// precondition instead of dropping it. Contrast `add_to` above, where
+// `x + n` forces `n` to plain `Int` and the parameter is unrefined.
+#[case(
+    "def rep(k):\n    for x in [1, 2, 3]:\n        yield k\nrep(10)",
+    make_int_list(&[10, 10, 10])
+)]
 // Filter via if-guard. The generator body's filter-feed lowers to a
 // refined-source channel whose domain carries the bare element predicate
 // `__elem ▷ source ▷ (λ x → x > n)` (the same form a filtered comprehension
