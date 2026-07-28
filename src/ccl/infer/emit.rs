@@ -1104,6 +1104,38 @@ pub(super) fn emit_case<C: Typing>(
         };
         match &result_ty {
             None => result_ty = Some(strip_refinements(&body_ty)),
+            // BUG (pinned failing by
+            // `type_check::test_case_with_filtered_comprehension_arms_passes_consistency_wall`):
+            // the two sides of this relation are stripped *asymmetrically* — `prev` was
+            // stripped when it was stored, `body_ty` is not stripped here. For a scalar
+            // arm that is harmless, since a singleton is a subtype of its base
+            // (`{Int | __elem == 2} <: Int`). For an arm whose type is a **collection**
+            // it is not: a filtered comprehension is
+            // `{[0, N] | __elem ▷ p} ⇒ elem`, carrying its refinement on the `Fun`
+            // *domain*, and function subtyping is **contravariant** there — so relating
+            // a refined-domain arm to a stripped-domain `prev` demands
+            // `[0, N] <: {[0, N] | p}`, which does not hold. Two arms that are literally
+            // the same expression are rejected, and because this rule re-runs in Check
+            // mode over concrete recorded types the rejection lands on the
+            // post-inference consistency wall as an internal "compiler bug" panic
+            // (`ccl/context.rs`) rather than a user diagnostic.
+            //
+            // The fix is to strip **both** sides, making this the symmetric
+            // compare-modulo-refinements the rule intends (the same relation
+            // `check_node`'s reconcile and `channelize`'s feed-operand assert already
+            // use):
+            //
+            //     Some(prev) => ctx.require_sub(&strip_refinements(&body_ty), prev, &|| {
+            //         "Case arm".to_string()
+            //     })?,
+            //
+            // That also settles a second defect the asymmetry causes. With arms carrying
+            // *different* predicates the unstripped side deposits its witness on the
+            // shared variable and the stripped side deposits none, so the `Case` claims
+            // one arm's filter: `if c: [x for x in xs if x > 1] else: [x for x in xs if
+            // x < 3]` infers `{[0, 2] | x < 3} ⇒ Int`, an extent excluding `3` when the
+            // true branch contains it. Stripping both sides intersects the witnesses to
+            // none and yields `[0, 2] ⇒ Int` — the join, and sound.
             Some(prev) => ctx.require_sub(&body_ty, prev, &|| "Case arm".to_string())?,
         }
     }
