@@ -174,16 +174,33 @@ used when no commit precedes 𝑡. Every position where it matters is before the
 branch point, so a changed seed silently never takes effect. Not an error;
 worth a diagnostic.
 
-So a program partitions into
+### Two properties, not one
 
-- **timeline regions**, indexed by a domain that advances with real time (`Txn`,
-  live sources) — a cutover is meaningful; and
-- **batch regions**, over literal data and finite loops — a cutover is
-  *meaningless*, not merely unavailable.
+The dividing line is sharper than "advances with real time", and it is two
+independent properties of the enclosing domain:
 
-The differ classifies this for free: the region kind is the domain of the
-enclosing function, which is already on the node's type. `Divergence` plus that
-domain gives the partition with no new analysis.
+- **Ordered** — positions are comparable, so "before the cut" is expressible.
+- **Event-anchored** — positions correspond to things that *happened once*, so
+  "before the cut" is a fact about history rather than about this run.
+
+A cut is meaningful iff the domain is **both**. Orderedness alone is not enough,
+and `UIntRange` is the counterexample: it is perfectly ordered, and cutting a
+loop over `[1, 2, 3]` mid-way is still incoherent, because the loop is
+recomputed every run and the answer would depend on when someone deployed. A
+source arrival is both ordered and event-anchored; program start is neither
+(§8.5: it is a *single* event, so it imposes no relative order at all).
+
+So a program partitions into **timeline regions** — ordered and event-anchored,
+where a cutover is meaningful — and **batch regions**, where it is *meaningless*
+rather than merely unavailable.
+
+Both properties are currently implicit. The model already distinguishes them
+(§8.5 separates program start from source arrivals precisely on this), but the
+type does not carry them, so nothing can check the distinction. Putting them in
+the domain's type makes "can this divergence be versioned?" a type question,
+which is how the rest of the system already works — mutability is the type, and
+the sequencing domain is in the type. Until then the differ approximates it from
+the domain of the enclosing function, which is on the node's type already.
 
 ---
 
@@ -233,17 +250,96 @@ and at deployment, that sentinel is exactly what is at hand.
 
 **A past 𝑡ₙ is already cut**, for the reasons above.
 
+### 𝑡ₙ is a consistent cut, not a timestamp
+
+A scalar branch point presumes a global total order over events. That is more
+than the model needs and more than a distributed engine can cheaply provide, so
+𝑡ₙ is a **consistent cut of the event partial order**: a frontier past which
+every event belongs to the new version and before which every event belongs to
+the old. A scalar is the degenerate case where the order happens to be total.
+
+The alternative — a cut point per source — reintroduces the mixture window
+*across sources*: for an interval `/order` runs v1 while `/restock` runs v0, and
+if they meet at a shared register that can break an invariant both versions
+satisfy alone. The cut has to be consistent with respect to everything that
+interacts, which is exactly what a consistent cut means.
+
+The runtime already has the concept: an as-of read "waits only for the
+*frontier* (that no earlier-or-equal commit is still outstanding)" (§8.5).
+
 ### What must be durable
 
-Once 𝑡ₙ is the deployment, it is the **one fact that has to outlive the process**.
-Everything else is derived: state is a function of the inputs, and the inputs
-are replayed. 𝑡ₙ is not, because it records something about the world — when the
-operator deployed — that no input contains.
+Everything about *state* is derived — a register is a function of the inputs, and
+the inputs are replayed. Three things are not derived, and have to outlive the
+process.
 
-So a deployed program carries a small durable **deployment log**: the branch
-points of the versions merged into it, as positions in the replayed timeline.
-This is a much weaker requirement than persisting state, and it is the only
-persistence the upgrade model needs.
+**The inputs, with enough order to reproduce the conflicts.** Not a global
+arrival order: two events with disjoint footprints commute, so their relative
+order is unobservable and reproducing it is wasted work. What must be reproduced
+is the transitive closure of the *conflict* relation — which is what the commit
+operator already computes for validation. Per-key **write** order does not
+suffice: for `T₁` reading 𝐴 and writing 𝐵 against `T₂` writing 𝐴, per-key
+sequences record no relation between them, yet their order decides whether `T₁`
+saw the new 𝐴. The recorded unit is therefore a position per **footprint** key,
+over read ∪ write. That is bounded by the footprint, which the compiler knows
+completely — the same fact the concurrency section leans on for distributed
+commit, and the reason this stays shardable where a global clock would not.
+
+**The branch points**, as consistent cuts. They record something about the world
+— when an operator deployed — that no input contains.
+
+**Nothing else.** In particular, not the state itself, up to the retention
+window below.
+
+### Retention, and checkpoints beyond it
+
+Replaying from position 0 keeps state re-derivable and keeps the input log
+unbounded, which collides head-on with the store-bounding work (writer-window
+compaction, release-driven GC) whose whole purpose is to stop retaining
+everything. Both cannot hold.
+
+The resolution is a **retention window**. Inputs are kept for the window; beyond
+it a **checkpoint** stands in for them. A checkpoint is the bounded store
+contents at a consistent cut, plus the cut — and since as-of reads can reach
+backwards, "bounded store contents" means whatever is still readable, which is
+exactly what store bounding already computes. So checkpointing is mostly
+persisting what is in memory at a frontier, not new machinery.
+
+The window is a **dial, and the user sets it**, up to and including infinity.
+That is a cost decision — retaining inputs forever is what buys unlimited
+re-derivation — and not one the language should make. What matters is that one
+dial governs three things at once:
+
+- **how far back state can be re-derived**,
+- **how far back a shadow is meaningful** — "what would v1 have done all along"
+  becomes "…since the window opened", and
+- **how many arms a merged program carries** (below).
+
+### Why the window is what bounds the version chain
+
+Replaying from a checkpoint rather than from 0 means v0's arm is only needed for
+the interval between the checkpoint and 𝑡ₙ. Take a checkpoint *at* the
+deployment and that interval is empty — and the merged program is not needed at
+all. Deploying v1 against a checkpoint is what an ordinary system does.
+
+So checkpoint-at-deploy would make this whole feature evaporate. What it costs
+is the thing the feature exists for: **re-derivability**. A checkpoint that
+replaces its inputs is a source of truth, not a cache, and with it go
+auditability ("why is this balance 7?" is answerable only by replaying the logic
+that was live at the time) and shadow, which needs replay from further back than
+the last checkpoint to say anything interesting.
+
+Inside a retention window both hold at once, and the consequence is a clean
+answer to how versions stack: **a merged program needs an arm only for versions
+deployed inside the window.** Anything older folds into the checkpoint. The
+version chain is bounded by retention rather than by history, and v0 → v1 → v2
+needs no squash policy — the window does it.
+
+**One concrete failure mode.** A type-breaking store change makes an existing
+checkpoint unreadable. It then requires either a migration applied to the
+checkpoint or a full re-derive from inputs, which is possible only inside the
+window. That gives the type-breaking case an operational meaning rather than a
+flat rejection.
 
 ### What this gives up
 
@@ -342,9 +438,19 @@ In dependency order.
    *diffing* a real serving program, let alone merging one. Binding belongs at
    graph construction. Small, and on the critical path for demonstrating any of
    this.
-3. **A clock on stream elements** (`req.time`), for divergences in stream-indexed
-   regions outside a block. Without it those divergences have no guard site and
-   fall back to whole-region replacement.
+3. **Ordered, event-anchored positions on source domains**, for divergences in
+   stream-indexed regions outside a block — where a `Txn` is not in scope but a
+   position is. The spec's `req.time` is one spelling of this; the requirement is
+   the two properties, carried in the domain's type so an unordered source
+   (a sharded stream, a table snapshot) cannot be cut on by mistake. Imposing an
+   order on a source that has none would let a program depend on an ordering that
+   does not survive replay — the same class of error as rendering a run-varying
+   identity into a stable-looking string. Without this, such divergences have no
+   guard site and fall back to whole-region replacement.
+4. **A durable input log with per-footprint-key ordering**, and **checkpoints**
+   at consistent cuts beyond the retention window. Both are described above; the
+   engine already computes the footprints and the bounded store contents, so
+   this is mostly persistence rather than new analysis.
 
 ---
 
@@ -378,16 +484,11 @@ ownership.
 
 ## Open questions
 
-**Does each arm of a fork get its own commit clock?** Two partitioned stores
-cannot conflict, so each could. But then "the same input" lands at different
-commit times in the two timelines, and comparing them — shadow's entire purpose —
-needs a common index, which would have to be the *input position* rather than
-commit time. That is a larger claim than it looks: it would make input position,
-not the commit clock, the fundamental shared index across versions.
-
 **What does a shadow report?** "v1 would have priced 4% of orders differently"
-is the output people want, and it needs the common index above. Divergence in
-*state* and divergence in *effects* are probably different reports.
+is the output people want. It aligns on **event identity** — for request 𝑅, v0
+said 𝑋 and v1 said 𝑌 — not on any position or timestamp, so each arm having its
+own commit clock costs nothing here. Divergence in *state* and divergence in
+*effects* are probably different reports.
 
 **How does a fork end?** Scoping it to "pick a winner, discard the loser's
 state" keeps merging two diverged histories out of the compiler, where it does
@@ -408,10 +509,17 @@ produced this output" is not recoverable from the tree. Attribution, rendering,
 and per-version diagnostics may want a marker that the runtime ignores. That is
 a different justification from the one this document rejects.
 
-**Stacking.** v0 → v1 → v2. Squash to base-to-tip, or compose guards? Composing
-gives per-version attribution and a growing conditional; squashing keeps the
-tree flat and loses the intermediate history. Interacts with the marker
-question.
+**Does a global arrival order survive distribution?** Per-footprint-key
+sequencing is per-shard, so it should preserve the concurrency section's claim
+that a distributed commit is decided from complete local knowledge. Establishing
+a *consistent cut* across shards is a weaker requirement than a global clock but
+is not free either, and the cost has not been worked out.
+
+**What happens at the window boundary during an upgrade?** A merged program
+carries an arm per version deployed inside the retention window. When the window
+advances past a branch point, that arm becomes unreachable and should be
+collected — which is a live rewrite of a running program, or a redeploy. Neither
+is obviously right.
 
 **Diagnostics for unguardable divergences.** A changed seed is inert; a changed
 batch region silently rewrites its part of the past on replay. Both are cases
