@@ -501,61 +501,30 @@ reads underneath resolve to non-corresponding binders and report as changed. See
 
 ---
 
-## Beyond the analysis: Versioned nodes
+## Beyond the analysis: branching
 
-The analysis stops at the classification. The next milestone is a **unified CCL
-AST**: both versions compile to one tree, identical subterms shared directly and
-each divergence wrapped in a `Versioned` node carrying the two arms. The
-`Changed` correspondences are exactly the sites where such a node would sit.
+The analysis stops at the classification. What gets built from it — running two
+versions with their common work shared, and upgrading one to the next without
+rewriting the history the old one produced — is worked out in
+[branching.md](branching.md).
 
-The semantic requirements, from the original model:
+Three things there bear on this document.
 
-1. Both arms must type-check. If their types do not unify the diff is
-   *type-breaking*: the node's type is a time-indexed union — `𝑇₁` for reads
-   below `t_new`, `𝑇₂` at or above it — and storage cannot be shared at the key
-   level.
-2. Each `Versioned` node needs a stable identity across the two versions, so
-   downstream passes can map it back to user-visible source locations.
-3. Runtime evaluation is parameterized by the reader's version and the branch
-   point: a v1 reader sees v1's arm; a v2 reader sees v2's arm subject to
-   `t_new` / `t_live`.
+*The divergence frontier is the input.* `divergences()` says where a version
+guard goes; `shared_roots()` says what the two versions can compute once. That
+is why both are derived here rather than left to the consumer.
 
-"Compilable" admits three depths, each a superset of the last — *type-checks*
-(the unified AST passes the checker), *lowers* (it survives to CCL, which forces
-deciding how `Versioned` appears in lowered form), and *executes* (the runtime
-serves the correct arm, which needs a branch-selection tile operator). Which one
-is the milestone is open.
+*A guard needs a clock, and the type says whether there is one.* A divergence
+inside a domain that advances with real time (`Txn`, a live source) can be
+guarded; one inside a batch region — literal data, a finite loop — cannot,
+because there is no position at which its answer changes. The distinction is the
+domain of the enclosing function, already on the node's type, so the differ
+supplies it without new analysis.
 
-Storage sharing is **key-level**: a key written identically under both branches
-at a given logical step is one physical entry; a key that differs gets one entry
-per branch. The per-key read-set/write-set machinery the commit operator already
-maintains ([mutability.md](mutability.md)) operates at exactly this granularity.
-Sharing therefore scales with the *unchanged* surface area, not with the size of
-the diff.
-
-Compute sharing is the analogue, and it is what the content hash approximates:
-subterms that are denotationally equivalent between versions can be evaluated
-once. The approximation is deliberately minimal — α-equivalence plus lexical
-canonicalization. More aggressive normalizations (β/η reduction, constant
-folding, AC-normalization of associative-commutative operators) widen the
-equivalence class at compiler cost; the plan is to let observed missed sharing
-drive that roadmap rather than to speculate.
-
-### Deferred
-
-- **Move labelling into an edit script.** Placement is classified, but no
-  `Insert`/`Delete`/`Move`/`Update` script is emitted. The unified-tree work
-  needs the correspondence, not a script.
-- **Stacked diffs.** A v2→v3 diff on top of an already-diffed v1→v2. Squashed to
-  a single base-to-tip diff for now.
-- **Live backfill.** When `t_new` is historic and v1 is still writing, `t_live`
-  is a moving target and v2 must replay v1's commit log through its own body
-  until it catches up. Backfilling at all requires reproducible inputs over the
-  window, which bounds the legal range of `t_new` by prior release/obsoletion
-  decisions.
-- **Blast radius.** A retroactive change propagates: every commit that *read* a
-  changed key must be recomputed transitively. The blast radius is the diff's
-  transitive closure through the read-dependency graph, not the diff itself.
+*No `Versioned` node.* An earlier draft of the branching design proposed one,
+along with backfill and retroactive branch points. A branch turns out to be an
+ordinary `Case` on the sequencing domain, and the retroactive cases are cut —
+see branching.md for why.
 
 ---
 
