@@ -146,17 +146,6 @@ pub struct TypeInferenceContext {
 
     /// Types of known externally-registered data sources.
     pub(crate) source_types: HashMap<String, Type>,
-
-    /// Node ids for the inference errors returned by the last [`infer`] run,
-    /// aligned **positionally** with the returned `Vec<InferError>` (entry `i`
-    /// is the blame node for error `i`, `None` when unknown). Inference stays
-    /// ignorant of the source projection; it only surfaces these ids, and
-    /// `compile_program` drains them via
-    /// [`take_infer_error_nodes`](Self::take_infer_error_nodes) to resolve each
-    /// to a source span (against the `lowering_projection`) while it is in scope. This
-    /// is the side-channel that lets the public [`infer`] keep its
-    /// location-free `Result<Type, Vec<InferError>>` signature unchanged.
-    infer_error_nodes: Vec<Option<crate::ccl::provenance::NodeId>>,
 }
 
 /// RAII guard returned by [`TypeInferenceContext::enter_scope`].
@@ -208,15 +197,6 @@ impl TypeInferenceContext {
     /// is registered; the type is a `Fun(DataSource(name), output_type)`.
     pub fn register_source_type(&mut self, name: &str, ty: Type) {
         self.source_types.insert(name.to_string(), ty);
-    }
-
-    /// Drain the per-error blame node ids accumulated by the most recent
-    /// failing [`infer`] run. See
-    /// [`infer_error_nodes`](TypeInferenceContext::infer_error_nodes); the
-    /// returned `Vec` is aligned positionally with the `Vec<InferError>` that
-    /// `infer` returned, and `compile_program` zips the two to resolve spans.
-    pub fn take_infer_error_nodes(&mut self) -> Vec<Option<crate::ccl::provenance::NodeId>> {
-        std::mem::take(&mut self.infer_error_nodes)
     }
 
     /// Look up the CCL type for a registered source by name.
@@ -385,20 +365,35 @@ pub enum InferError {
 /// An [`InferError`] paired with the [`NodeId`](crate::ccl::provenance::NodeId)
 /// of the expression it was emitted at, when known.
 ///
-/// The location is *provenance metadata*, not part of the error's identity:
-/// `InferError` itself stays location-free (and `PartialEq`, as the inference
-/// tests require). The inner [`infer::run`](crate::ccl::infer::run)
-/// produces these so the `compile_program` boundary can resolve each id to a
-/// source [`Span`](crate::chl_parser::ast::Span) via the `lowering_projection`
-/// while it is still in scope. Only the fail-fast pass-1 emit site carries a
-/// real id; coalesce/scope-check errors use `node_id: None`, which renders as
-/// graceful plain text.
+/// The location is *provenance metadata*, not part of the error's identity, so
+/// it rides beside `InferError` rather than inside it: `InferError` stays
+/// location-free and `PartialEq`, which is what lets the inference tests compare
+/// errors by value.
+///
+/// This is what [`infer`] returns on failure, so the blame node travels *with*
+/// the error it belongs to. `compile_program` resolves each id to a source
+/// [`Span`](crate::chl_parser::ast::Span) against the `lowering_projection`
+/// while that projection is in scope. `node_id: None` means no precise node is
+/// known (a coalesce or scope-validity error), which renders as plain text with
+/// no source snippet.
+#[derive(Debug, PartialEq)]
 pub struct LocatedInferError {
     /// The underlying inference error.
     pub error: InferError,
     /// The node the error was emitted at, or `None` when no precise node is
     /// known (coalesce / scope-validity errors).
     pub node_id: Option<crate::ccl::provenance::NodeId>,
+}
+
+impl LocatedInferError {
+    /// The bare errors of a located list, dropping the blame nodes.
+    ///
+    /// For callers that assert on error *payloads* and have no projection to
+    /// resolve ids against — the inference test suites. A diagnostic path must
+    /// not use this: pairing the id with its error is the whole point.
+    pub fn bare(located: Vec<Self>) -> Vec<InferError> {
+        located.into_iter().map(|l| l.error).collect()
+    }
 }
 
 impl std::fmt::Debug for InferError {
@@ -530,7 +525,14 @@ impl std::fmt::Debug for InferError {
 /// may still carry `Type::History` (feed) types with `Type::Infer` channel domains
 /// — those are erased by `channelize`, which runs next (see
 /// [`Strictness::PreDesugar`]).
-pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Vec<InferError>> {
+///
+/// Each error carries its own blame node ([`LocatedInferError`]) so the caller
+/// can resolve it to a source span; there is no separate location channel to
+/// keep in step with the error list.
+pub fn infer(
+    expr: &mut Expr,
+    ctx: &mut TypeInferenceContext,
+) -> Result<Type, Vec<LocatedInferError>> {
     // The arena owns every inference variable minted by the passes below
     // (captured through the thread-local mint sink). Its lifetime spans both
     // Pass 1 (constraint emission) and Pass 2 (coalesce); when it drops here
@@ -538,20 +540,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
     let _arena = InferArena::new();
-    // Match on the inner result so we can split a `LocatedInferError`'s span
-    // metadata off into the side-channel, keeping this signature
-    // location-free. `_arena` drops on both arms (and any earlier `?` — there
-    // are none here), so the variable-graph teardown still happens.
-    match super::run(expr, &ctx.source_types) {
-        Ok(ty) => Ok(ty),
-        Err(located) => {
-            // Stash the blame node ids (positionally aligned with the errors)
-            // for `compile_program` to resolve to spans, then hand back the
-            // bare `Vec<InferError>` the public contract promises.
-            ctx.infer_error_nodes = located.iter().map(|le| le.node_id).collect();
-            Err(located.into_iter().map(|le| le.error).collect())
-        }
-    }
+    super::run(expr, &ctx.source_types)
 }
 
 /// How the annotation checks treat inference-transient type variants.
@@ -1267,6 +1256,43 @@ mod tests {
         TypedBinding, TypedExpr, TypedExprNode,
     };
 
+    /// [`infer`] with the blame nodes stripped, for the assertions that compare
+    /// error *payloads*.
+    ///
+    /// These trees are built by hand rather than lowered, so there is no
+    /// projection a blame node could resolve against and nothing to assert about
+    /// one. Named rather than shadowing `infer`: a test that calls `infer` is
+    /// calling the real entry point, and a test that discards locations says so
+    /// at the call site.
+    fn infer_bare(
+        expr: &mut Expr,
+        ctx: &mut TypeInferenceContext,
+    ) -> Result<Type, Vec<InferError>> {
+        infer(expr, ctx).map_err(LocatedInferError::bare)
+    }
+
+    /// The located signature's contract: an emit-time error names the node it was
+    /// raised at, so the caller can resolve a span without a side channel to keep
+    /// aligned. `x + 1` with `x` unbound fails in pass 1, whose blame node is the
+    /// innermost failing node. (Calls `infer` directly, not the location-stripping
+    /// [`infer_bare`] the payload assertions use.)
+    #[test]
+    fn infer_pairs_each_error_with_its_blame_node() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::var("x"),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::Int(1)),
+        );
+        let errors = infer(&mut expr, &mut ctx).expect_err("`x` is unbound");
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].error, InferError::UnboundVariable(_)));
+        assert!(
+            errors[0].node_id.is_some(),
+            "a pass-1 emit error must carry its blame node"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Unit tests
     // -----------------------------------------------------------------------
@@ -1359,7 +1385,7 @@ mod tests {
     #[test]
     fn test_infer_unbound_var() {
         let mut ctx = TypeInferenceContext::new();
-        let result = infer(&mut Expr::var("y"), &mut ctx);
+        let result = infer_bare(&mut Expr::var("y"), &mut ctx);
         assert_eq!(result, Err(vec![InferError::UnboundVariable("y".into())]));
     }
 
@@ -1550,7 +1576,7 @@ mod tests {
         // (42 : String)  =>  annotation conflict
         // inference surfaces annotation conflicts as AnnotationMismatch
         let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::String));
-        let errs = infer(&mut expr, &mut ctx).unwrap_err();
+        let errs = infer_bare(&mut expr, &mut ctx).unwrap_err();
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -1601,7 +1627,7 @@ mod tests {
             body: Box::new(Expr::var("x")),
         });
         assert_eq!(
-            infer(&mut expr, &mut ctx),
+            infer_bare(&mut expr, &mut ctx),
             Err(vec![InferError::AnnotationMismatch {
                 annotation: Type::Base(BaseType::String),
                 inferred: int_lit_ty(42),
@@ -1680,7 +1706,7 @@ mod tests {
         // remains visible in `ctx` after the call returns.
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("unbound_var"));
-        let result = infer(&mut expr, &mut ctx);
+        let result = infer_bare(&mut expr, &mut ctx);
         assert_eq!(
             result,
             Err(vec![InferError::UnboundVariable("unbound_var".into())])
@@ -1714,7 +1740,7 @@ mod tests {
         );
         let mut ctx = TypeInferenceContext::new();
         // inference catches the mismatch at the Apply site.
-        let errs = infer(&mut expr, &mut ctx)
+        let errs = infer_bare(&mut expr, &mut ctx)
             .expect_err("expected TypeMismatch Int/String under inference");
         assert!(
             errs.iter().any(|e| matches!(
@@ -1741,7 +1767,7 @@ mod tests {
         // correctly reject the program.
         let mut expr = double_apply_lambda(Type::Base(BaseType::Int), Type::Base(BaseType::String));
         let mut ctx = TypeInferenceContext::new();
-        let errs = infer(&mut expr, &mut ctx).expect_err("expected an Int/String conflict");
+        let errs = infer_bare(&mut expr, &mut ctx).expect_err("expected an Int/String conflict");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -1946,7 +1972,7 @@ mod tests {
             AggregateKind::Sum,
         );
         assert!(
-            infer(&mut expr, &mut ctx).is_err_and(|errs| errs
+            infer_bare(&mut expr, &mut ctx).is_err_and(|errs| errs
                 .iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. }))),
             "Sum over String should be a type error"
@@ -1963,7 +1989,8 @@ mod tests {
         let mut expr = Expr::aggregate(Expr::lit(Lit::Int(42)), AggregateKind::Sum);
         // HM produces TypeMismatch; inference's map_constrain_err detects that the
         // rhs is a Fun and lhs is not, promoting it to ExpectedFunction.
-        let errs = infer(&mut expr, &mut ctx).expect_err("expected error for non-function input");
+        let errs =
+            infer_bare(&mut expr, &mut ctx).expect_err("expected error for non-function input");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -2050,7 +2077,7 @@ mod tests {
         );
         let mut ctx = TypeInferenceContext::new();
         // Body inference constrains p, but the And of Int and Bool is a type error.
-        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| {
+        assert!(infer_bare(&mut expr, &mut ctx).is_err_and(|errs| {
             errs.iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. }))
         }));
@@ -2075,7 +2102,7 @@ mod tests {
             ),
         );
         let mut ctx = TypeInferenceContext::new();
-        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| {
+        assert!(infer_bare(&mut expr, &mut ctx).is_err_and(|errs| {
             errs.iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. }))
         }));
@@ -2149,7 +2176,7 @@ mod tests {
             },
             body: Box::new(Expr::apply(Expr::var("x"), inner)),
         });
-        let errs = infer(&mut expr, &mut ctx).expect_err("Int and String cannot meet");
+        let errs = infer_bare(&mut expr, &mut ctx).expect_err("Int and String cannot meet");
         assert!(
             errs.iter()
                 .any(|e| matches!(e, InferError::IncompatibleBounds { .. })),
@@ -2182,7 +2209,7 @@ mod tests {
         });
         // the solver: the annotation pins the param to String; the Apply then fails to
         // constrain Int ≤ String and surfaces as TypeMismatch.
-        let errs = infer(&mut expr, &mut ctx).expect_err("expected error under inference");
+        let errs = infer_bare(&mut expr, &mut ctx).expect_err("expected error under inference");
         assert!(
             errs.iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. })),
@@ -2246,7 +2273,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::new(TypedExprNode::Source("ghost".into()));
         assert_eq!(
-            infer(&mut expr, &mut ctx),
+            infer_bare(&mut expr, &mut ctx),
             Err(vec![InferError::UnboundVariable("ghost".into())])
         );
     }
@@ -2301,8 +2328,8 @@ mod tests {
         use crate::ccl::UnaryOpKind;
         // -true → TypeMismatch(Bool, Int).
         let mut expr = Expr::unary(UnaryOpKind::Neg, Expr::lit(Lit::Bool(true)));
-        let errs =
-            infer(&mut expr, &mut ctx).expect_err("expected TypeMismatch Bool/Int under inference");
+        let errs = infer_bare(&mut expr, &mut ctx)
+            .expect_err("expected TypeMismatch Bool/Int under inference");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -2414,7 +2441,7 @@ mod tests {
             branches: vec![],
         });
         assert!(matches!(
-            infer(&mut expr, &mut ctx),
+            infer_bare(&mut expr, &mut ctx),
             Err(ref errs) if errs.iter().any(|e| matches!(e, InferError::EmptyCase { .. }))
         ));
     }

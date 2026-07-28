@@ -408,7 +408,8 @@ pub(crate) mod test_helpers {
 
     pub(crate) fn run_inference(expr: &mut Expr) -> Result<Type, Vec<InferError>> {
         let mut ctx = TypeInferenceContext::new();
-        infer(expr, &mut ctx)
+        // These tests assert on error payloads, not blame nodes.
+        infer(expr, &mut ctx).map_err(LocatedInferError::bare)
     }
 
     /// `{Int | __elem > rhs}` — a refinement whose bare predicate compares

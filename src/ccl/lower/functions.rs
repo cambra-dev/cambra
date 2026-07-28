@@ -172,7 +172,8 @@ pub(super) fn uncurry_params(
         // The projection plumbing is manufactured per *occurrence*: the
         // substitution deep-freshens the template's INTERIOR into every
         // occurrence of the parameter (root-carry keeps each occurrence's own
-        // id/attribution — §2.14), so tag the template's three nodes as machinery
+        // id/attribution — see `substitute_param_in_body`), so tag the template's
+        // three nodes as machinery
         // leaves. The template itself never enters the tree; its ids compose away
         // at the lowering fold as born-copied-discarded transients (no manual
         // removal needed — the fold handles it).
@@ -243,12 +244,16 @@ pub(super) fn lower_lambda(
 /// into the comprehension's `Cast::target` predicate with `lo` free in it,
 /// and the engine rewrites it there along with the term spine.
 ///
-/// Root-carry (§2.14): the engine carries each occurrence's own id onto the
-/// replacement root (a preserve inheriting the occurrence's `Source`
-/// attribution) and deep-freshens only the compound replacement's *interior*
-/// into fresh nodes. Those interior freshens land as ambient `Copy`s in the
-/// open lowering copy-frame below, mirroring the template's machinery
-/// attribution — so every substituted node stays covered by the lowering fold.
+/// **Root-carry** — the substitution engine's identity rule for a compound
+/// replacement: it carries each *occurrence*'s own id onto the replacement root
+/// (a preserve, so the root inherits the occurrence's own `Source` attribution)
+/// and deep-freshens only the replacement's *interior* into fresh nodes. That is
+/// what buys occurrence fidelity here: every `x` in `def f(x, y)`'s body becomes
+/// its own `__arg_tuple.0` whose root still points at that `x`'s span, rather
+/// than every projection mirroring the one shared `def` span. The interior
+/// freshens land as ambient `Copy`s in the open lowering copy-frame below,
+/// mirroring the template's machinery attribution — so every substituted node
+/// stays covered by the lowering fold.
 ///
 /// Capture is structurally impossible at this (pre-uniquify, raw-name) call
 /// site: the replacement's `Var` uses the reserved `__arg_tuple_` prefix
@@ -390,13 +395,13 @@ in add"
         assert_eq!(symbolic(&ccl), expected);
     }
 
-    /// Occurrence fidelity (lineage-redesign §2.14, the root-carry win): in a
-    /// multi-param `def` whose params occur more than once, uncurry substitutes
-    /// a fresh tuple-projection template into each occurrence — and root-carry
-    /// makes each projection *root* preserve the occurrence's own id, so it
-    /// inherits the occurrence's own source span (not the shared `def` span the
-    /// pre-root-carry code mirrored onto every copy). The corpus otherwise has no
-    /// multi-param `def`, so pin the span fidelity here.
+    /// Occurrence fidelity: in a multi-param `def` whose params occur more than
+    /// once, uncurry substitutes a fresh tuple-projection template into each
+    /// occurrence — and root-carry (see [`substitute_param_in_body`]) makes each
+    /// projection *root* preserve the occurrence's own id, so it inherits that
+    /// occurrence's own source span instead of the one `def` span shared by every
+    /// copy. The corpus otherwise has no multi-param `def`, so pin the span
+    /// fidelity here.
     #[test]
     fn uncurry_projection_roots_carry_occurrence_spans() {
         use crate::ccl::TypedExprNode;

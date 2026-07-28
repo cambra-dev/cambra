@@ -1,4 +1,4 @@
-# provenance & lineage — design and implementation
+# Provenance & lineage — node identity and source attribution
 
 This doc is the as-built reference for how Cambra keeps an IR node's connection
 to the source the user wrote, through a pipeline that otherwise loses it (spans
@@ -7,17 +7,19 @@ bodies out, channelize rewriting defers, lambda-elim synthesizing combinators,
 planning fusing clauses).
 
 > The design of record — the full decision log, the collapse algorithm, the
-> recorder mechanism, and the adoption sequencing — lives in the lineage-redesign
-> design doc in the internal vault. This file summarizes
-> the shipped shape; where they disagree, that doc wins.
+> recorder mechanism, and the adoption sequencing — is the lineage-redesign doc
+> under projects/program-inspector in the internal vault. This file summarizes
+> the shipped shape; where the two disagree, that doc wins.
 
 ## The two identity primitives (`src/ccl/provenance.rs`)
 
 - **`NodeId`** — a `Copy` newtype giving each IR expression node a stable,
   never-reused identity (its own atomic counter, distinct from `Uid`). It rides
-  inline on `TypedExpr` and is **excluded from `PartialEq`/`Hash`** — provenance
-  is metadata, not part of a node's value, and the passes' structural-equality
-  memoization depends on that. `NodeId::PLACEHOLDER` is the reserved sentinel for
+  inline on `TypedExpr`, whose hand-written `PartialEq` **skips it**: provenance
+  is metadata, not part of a node's value, so two structurally-equal nodes stay
+  equal even with distinct ids — which the passes' structural-equality checks
+  depend on. (Nodes are never hashed by value: `TypedExpr` has no `Hash` impl.
+  `NodeId` itself is `Hash`/`Ord`, as a map key.) `NodeId::PLACEHOLDER` is the reserved sentinel for
   `Default`/`mem::take` throwaways (ignored by the recorder; `assert_unique_node_ids`
   backstops that it never persists into a checked tree).
 - **`Pass`** — the compiler stage that produced/rewrote a node (`Lower`,
@@ -141,25 +143,25 @@ audit (`Leak`) guarantees no node silently loses its history.
 
 ## Inspector consumers (`src/inspector_model/`)
 
-- `SpanIndex::build(ir, projection)` inverts the pane projection to span → node.
+The inspector is the only consumer of the pane folds; the release compiler reads
+the lowering projection and nothing else.
+
+- `SpanIndex::build(ir, projection)` inverts a pane's projection to span → node.
 - `build_inspect_tree` / `resolve` / `hover` read the pane projection and ship
-  the native attribution: per `ir` node the spans channel (`span` field) plus a
-  `rewritten` tag (`null | { via, nature, label }`); `/api/resolve` and
-  `/api/hover` carry the same `{ spans, rewritten }` `SourceAttribution` shape.
-  `rewritten` is `null` for a direct image — the mandatory `Nature::Source` tag
-  null-compresses at these emission sites, so the wire is byte-identical to the
-  retired `rewritten: None` encoding and no fixtures/validators/frontend moved.
-- `paneLinks` ship each pane-pair `LineageMap` **dense** — self-edges included —
-  via `stage::dense_edges`; the frontend follows edges only.
+  each attribution as it is stored: a node's spans plus its `rewritten` tag
+  (`{ via, nature, label }`). `/api/resolve` and `/api/hover` carry the same
+  `{ spans, rewritten }` shape. The tag serializes as `null` for a direct image
+  — `Nature::Source` null-compresses at the emission sites via
+  `Nature::is_source`, and both validators guard that a `"source"` nature never
+  actually ships. The wire carries no flat `Source`/`Derived`/`Synthetic` label
+  string; the frontend formats the tag itself.
+- `paneLinks` ship each pane-pair `LineageMap` **dense** — self-edges included,
+  no identity-edge filter — via `stage::dense_edges`; the frontend only follows
+  edges, never reconstructing them. Both validators check that every edge
+  endpoint is a live node id in its respective pane.
 
-## Wire (schema 3)
-
-Schema 3 is the native attribution wire shape:
-
-- `SourceAttribution` carries no flat `Source`/`Derived`/`Synthetic` label
-  string; the frontend formats the native `rewritten` tag itself.
-- `SourceAttribution`'s serde impl emits the native `{ spans, rewritten }`
-  shape.
-- there is no non-identity edge filter — `stage::dense_edges` ships the map
-  verbatim, self-edges included; validators check every edge endpoint is a live
-  node id in its respective pane.
+The snapshot payload carries its own version in `meta.schema`, owned by the
+inspector crate along with the fixture corpus pinned to it. Nothing under
+`ccl/` reads or depends on that number: this layer produces attributions and
+maps, and the serialization shape is the inspector's contract with its
+frontend.

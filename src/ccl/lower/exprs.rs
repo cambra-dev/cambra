@@ -525,9 +525,8 @@ mod tests {
     /// (the freshened copy resolves as a `Copy` mirroring its origin's image).
     #[test]
     fn chained_compare_freshens_shared_operands() {
+        use crate::ccl::context::{assert_unique_node_ids, collect_tree_ids};
         use crate::ccl::lineage::{RecorderSession, collapse_lowering};
-        use crate::ccl::provenance::NodeId;
-        use std::collections::HashSet;
 
         let expr = parse_expr("1 < x < 3");
         let mut ctx = LoweringContext::default();
@@ -535,19 +534,10 @@ mod tests {
         let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
         let log = session.into_lowering_log();
 
-        fn walk(e: &Expr, seen: &mut HashSet<NodeId>, dups: &mut Vec<NodeId>) {
-            if !seen.insert(e.node_id()) {
-                dups.push(e.node_id());
-            }
-            e.walk_children(|c| walk(c, seen, dups));
-        }
-        let mut seen = HashSet::new();
-        let mut dups = Vec::new();
-        walk(&ccl, &mut seen, &mut dups);
-        assert!(
-            dups.is_empty(),
-            "chained comparison must not share NodeIds between pairs: {dups:?}"
-        );
+        // The same tripwire the pipeline runs at every pass boundary — this test
+        // is the crafted program for the class it guards.
+        assert_unique_node_ids(&ccl, "chained-compare lowering");
+        let seen = collect_tree_ids(&ccl);
         // The lowering fold explains every tree node (the freshened
         // middle-operand copy included) with no leak — the successor to the
         // retired per-node coverage check.

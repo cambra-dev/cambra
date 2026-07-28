@@ -28,14 +28,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// # Identity-contamination rule (load-bearing)
 ///
-/// `NodeId` is embedded inline on `TypedExpr` (`crate::ccl::expr`), which
-/// **excludes it from that type's `PartialEq`/`Hash`** (hand-written, not
-/// derived). Provenance is metadata, not part of a node's value: two nodes
+/// `NodeId` is embedded inline on `TypedExpr` (`crate::ccl::expr`), whose
+/// `PartialEq` is hand-written rather than derived precisely so it can
+/// **exclude** it. Provenance is metadata, not part of a node's value: two nodes
 /// that are structurally equal as values must still compare equal even with
 /// different `NodeId`s. The structural-equality memoization the passes rely on
 /// (`uniquify`'s memo, `planning`'s predicate memo) depends on this — including
 /// `node_id` would make every node look distinct and the memo tables would
-/// never hit.
+/// never hit. (Nodes are never hashed by value — `TypedExpr` has no `Hash` impl
+/// — so there is no equality/hash pair to keep consistent here; `NodeId`'s own
+/// `Hash` is for using it as a map key.)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(u64);
 
@@ -88,14 +90,27 @@ impl std::fmt::Debug for NodeId {
 // TODO(wire-stability): shipping the raw mint-order value makes the golden
 // fixtures churn wholesale — any upstream change to mint *counts* shifts every
 // later id, rewriting every subsequent `nodeId` and `paneLinks` edge pair for a
-// semantically tiny diff. Likely fix: keep `NodeId` as the internal identity but
-// ship a canonical snapshot-local renumbering (Barendregt-style dense indices
-// assigned in one deterministic traversal of the whole snapshot — the uniquify
-// binder-index precedent), so fixture diffs stay proportional to real change.
-// The renumbering must remain globally unique across all panes of one snapshot:
-// the frontend's untagged `Set<number>`/`Map<number, …>` collections rely on
-// cross-pane uniqueness. Tracked in the lineage-redesign follow-ups ledger
-// (design vault).
+// semantically tiny diff.
+//
+// The fix is the canonicalization walk in the inspector fixture-hardening plan
+// (design vault): keep `NodeId` as the internal identity and canonicalize only at
+// serialization time — first-encounter dense indices from one deterministic walk
+// of the whole snapshot (the uniquify binder-index precedent), alongside a second
+// map giving synthetic `__` binder names per-prefix first-encounter ordinals,
+// since those churn for the same reason. Upstream mint-count changes then produce
+// no fixture diff at all, and a genuine reorder produces a diff proportional to
+// it.
+//
+// Two constraints that walk owes this layer, neither of which is a property of
+// the ids themselves:
+//
+// - the numbering is snapshot-**global**, not per-pane: an id preserved across
+//   panes must canonicalize to one index, or `paneLinks` edges stop connecting
+//   their endpoints — and the frontend's untagged `Set<number>` /
+//   `Map<number, …>` collections assume ids are unique across panes, not just
+//   within one.
+// - it applies to every id-bearing position on the wire, edge endpoints
+//   included, not only to the nodes of the pane trees.
 #[cfg(feature = "serde")]
 impl serde::Serialize for NodeId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

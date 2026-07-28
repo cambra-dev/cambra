@@ -9,7 +9,7 @@
 
 use cambra::ccl::{
     Branch, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExpr, TypedExprNode,
-    infer::{InferError, TypeInferenceContext, infer},
+    infer::{InferError, LocatedInferError, TypeInferenceContext, infer},
 };
 use cambra::interpreter::BaseType;
 
@@ -81,14 +81,15 @@ fn var(name: &str) -> TypedExpr {
 /// Run inference on an expression, returning the inferred root type.
 fn run(mut expr: TypedExpr) -> Result<Type, Vec<InferError>> {
     let mut ctx = TypeInferenceContext::new();
-    infer(&mut expr, &mut ctx)
+    // These tests assert on error payloads, not blame nodes.
+    infer(&mut expr, &mut ctx).map_err(LocatedInferError::bare)
 }
 
 /// Run inference and return the fully-inferred expression (so tests can
 /// inspect inner `expr.ty` / `binding.ty` slots, not just the root type).
 fn run_full(mut expr: TypedExpr) -> Result<TypedExpr, Vec<InferError>> {
     let mut ctx = TypeInferenceContext::new();
-    infer(&mut expr, &mut ctx)?;
+    infer(&mut expr, &mut ctx).map_err(LocatedInferError::bare)?;
     Ok(expr)
 }
 

@@ -377,14 +377,17 @@ fn attribute(
     label: RewriteLabel,
     attr: &SourceProjection,
 ) -> SourceAttribution {
-    // No *pass* step may carry `Nature::Source`: it is
-    // lowering-only. The guard sits on the attributing ARM, not on projection
-    // entries — an *inherited* Source tag on a preserved id in a later pane is
-    // legal and reaches the projection by clone, never through this fn.
+    // No *pass* step may carry `Nature::Source`: `Source` means "this node is a
+    // source construct's direct one-to-one translation", which only lowering can
+    // produce — a later pass rewriting a node changes what it is. The guard sits
+    // on the attributing ARM, not on projection entries: an *inherited* Source
+    // tag on a preserved id in a later pane is legal and reaches the projection
+    // by clone, never through this fn. See `design/provenance.md`, "The lineage
+    // model (`src/ccl/lineage.rs`)".
     debug_assert!(
         !nature.is_source(),
         "a pass step carries Nature::Source (label {label:?}, via {via:?}) — \
-         Source is lowering-only (§2.5)"
+         Source is emitted only by lowering"
     );
     let mut spans: Vec<Span> = Vec::new();
     for b in blame {
@@ -465,11 +468,12 @@ pub(crate) fn collapse(
                         continue;
                     }
                     let out_attr = if step.blame.is_empty() {
-                        // Copy-mirror re-tag: no pass step carries Source.
+                        // Copy-mirror re-tag: as in `attribute`, no pass step may
+                        // carry Source — only lowering emits it.
                         debug_assert!(
                             !step.nature.is_source(),
                             "a pass Copy step carries Nature::Source (label {:?}, via {via:?}) — \
-                             Source is lowering-only (§2.5)",
+                             Source is emitted only by lowering",
                             step.label,
                         );
                         SourceAttribution {

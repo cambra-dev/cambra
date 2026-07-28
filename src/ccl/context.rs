@@ -567,7 +567,7 @@ impl CompiledProgram {
 /// Every main-tree node id reachable in `expr` (the `walk_children` node set,
 /// refinement-predicate interiors excluded — the domain the lineage steps and
 /// the pane projections reason about).
-fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId> {
+pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId> {
     fn go(e: &Expr, acc: &mut std::collections::HashSet<NodeId>) {
         acc.insert(e.node_id());
         e.walk_children(|c| go(c, acc));
@@ -589,6 +589,76 @@ fn assert_leaks_clean(leaks: &[Leak], boundary: &str) {
     assert!(
         leaks.is_empty(),
         "lineage leak at the fully-recorded {boundary} boundary (expected none): {leaks:?}"
+    );
+}
+
+/// Every duplicated [`NodeId`] over the **main tree** — the `walk_children`
+/// node-set, refinement predicates excluded (matching inline's blind spot, so the
+/// check does not false-fire there). Returns `(id, node kind)` for each
+/// occurrence *beyond the first*.
+fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
+    fn walk(
+        e: &Expr,
+        seen: &mut std::collections::HashSet<NodeId>,
+        dups: &mut Vec<(NodeId, &'static str)>,
+    ) {
+        if !seen.insert(e.node_id()) {
+            dups.push((e.node_id(), e.node.kind_name()));
+        }
+        e.walk_children(|c| walk(c, seen, dups));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut dups = Vec::new();
+    walk(expr, &mut seen, &mut dups);
+    dups
+}
+
+/// Pipeline-wide id-uniqueness tripwire: panic if `expr` carries a duplicated
+/// [`NodeId`], naming the `boundary` and the offending id(s) + node kinds.
+///
+/// Uniqueness within a tree is what makes a `NodeId` an *identity*: the lineage
+/// map is keyed by id, so two live nodes sharing one id make their attributions
+/// and edges indistinguishable. The failure mode this catches is a clone that
+/// forgot to freshen, or a rewrite that preserved an id where it minted.
+///
+/// This asserts a *tree invariant* at a pass boundary and encodes no pass order,
+/// so it is robust to pass reordering (a moved pass carries its check with it).
+/// It catches the *class* of preserve-as-mint / clone-without-freshen bugs
+/// across the whole test suite, not just a crafted program.
+///
+/// The walk is the same main-tree `walk_children` walk as
+/// [`duplicate_node_ids`]/`collect_ids` — a predicate-inclusive walk would
+/// false-fire on inline's known predicate blind spot. Gated
+/// via `cfg!(...)` as an expression (not a `#[cfg]` item) so the same call site
+/// compiles under both `./ci.sh` clippy passes without a release-only
+/// gated-item-reference failure.
+pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
+    if !cfg!(any(debug_assertions, test)) {
+        return;
+    }
+    let dups = duplicate_node_ids(expr);
+    assert!(
+        dups.is_empty(),
+        "node-id uniqueness invariant violated at `{boundary}`: {} duplicated id(s) \
+         (id, kind): {:?}",
+        dups.len(),
+        dups
+    );
+    // The `Default`/`mem::take` sentinel (see `NodeId::PLACEHOLDER`) is a
+    // transient throwaway that must always be overwritten before it reaches a
+    // pass boundary; a persisted placeholder means a `mem::take` slot was left
+    // unfilled, which would silently corrupt provenance.
+    fn walk_placeholder(e: &Expr, found: &mut bool) {
+        if e.node_id() == NodeId::PLACEHOLDER {
+            *found = true;
+        }
+        e.walk_children(|c| walk_placeholder(c, found));
+    }
+    let mut placeholder = false;
+    walk_placeholder(expr, &mut placeholder);
+    assert!(
+        !placeholder,
+        "Default/mem::take placeholder node persisted into the tree at `{boundary}`"
     );
 }
 
@@ -678,6 +748,13 @@ pub fn compile_program(
     // explained by a leaf or a copy). The checks are debug/test
     // gated at the boundary via `assert_leaks_clean`; the fold itself is
     // always-on (its product is release-critical).
+    // Id uniqueness is the precondition for keying anything by `NodeId`, so gate
+    // it before the fold that does exactly that: a duplicate here would silently
+    // collapse two nodes' attributions into one projection entry. Lowering's own
+    // copy sites (uncurry's template discharge, the chained-comparison operand
+    // freshens) are what make this a live risk at this boundary.
+    assert_unique_node_ids(&expr, "post-lowering");
+
     let lowering_log = lowering_session.into_lowering_log();
     let lowering_projection = {
         let output_ids = collect_tree_ids(&expr);
@@ -723,21 +800,23 @@ pub fn compile_program(
     // errors are reported against the program the user wrote, not the
     // channelized rewrite.
     let infer_outcome = infer(&mut expr, ctx.inference_ctx());
-    // On failure, resolve each error's blame node to a source span *here* — the
-    // lowering projection is in scope and holds the lowered attribution (this is
-    // the always-on release read: one hop, no fold). `take_infer_error_nodes`
-    // returns ids positionally aligned with the errors; `.chain(repeat(None))`
-    // guards against length skew.
+    // On failure, resolve each error's own blame node to a source span *here* —
+    // the lowering projection is in scope and holds the lowered attribution (this
+    // is the always-on release read: one hop, no fold). A `None` node (coalesce /
+    // scope-check errors) or an id the projection doesn't cover degrades to a
+    // span-less diagnostic.
     if let Err(errors) = infer_outcome {
-        let node_ids = ctx.inference_ctx().take_infer_error_nodes();
         return Err(errors
             .into_iter()
-            .zip(node_ids.into_iter().chain(std::iter::repeat(None)))
-            .map(|(error, node_id)| {
-                let span = node_id
+            .map(|located| {
+                let span = located
+                    .node_id
                     .and_then(|id| lowering_projection.get(&id))
                     .and_then(|attr| attr.spans.first().copied());
-                CompileError::Infer { error, span }
+                CompileError::Infer {
+                    error: located.error,
+                    span,
+                }
             })
             .collect());
     }
