@@ -24,19 +24,30 @@ use super::{product, variant_type};
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
 /// their `Type`s are stored on their own nodes the same way.
 ///
-/// Thin wrapper over [`emit_node_inner`] that maintains
-/// [`InferCtx::current_node_id`](super::context::InferCtx): it
-/// records this node's id on entry and restores the previous id *only on
-/// success*. Inference is fail-fast, so on the error path the id is
-/// intentionally left pointing at the innermost node that failed — that is the
-/// node the diagnostic blames. All recursion (including the generic
-/// `Typing::subexpr` impl) routes through here, so every emitted node passes
-/// through this bookkeeping.
+/// Thin wrapper over [`emit_node_inner`] that owns two pieces of bookkeeping.
+/// All recursion (including the generic `Typing::subexpr` impl) routes through
+/// here, so every emitted node passes through both.
+///
+/// 1. [`InferCtx::current_node_id`](super::context::InferCtx) is set on entry and
+///    restored on exit — **unconditionally**, on the error path too. It is a
+///    truthful "node currently being emitted" at every point in the walk, with no
+///    state left behind for a later reader to interpret.
+/// 2. On the error path the frame *claims blame* for the failure if no inner
+///    frame already has ([`InferCtx::blame_error`]). The innermost frame that
+///    sees an error is the one that raised it, so first-claim-wins gives the
+///    precise node without any frame needing to know how deep it sits.
+///
+/// Rule (2) is what keeps the blame independent of fail-fast: it attaches the
+/// location where the error arises rather than reading a cursor after the walk
+/// unwinds, so it stays correct if emission later accumulates several errors
+/// instead of returning at the first. The identical rule locates the errors of
+/// the already-accumulating coalesce walk (`CoalesceCtx::blame_frame`).
 pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, InferError> {
     let prev = ctx.current_node_id.replace(expr.node_id());
     let result = emit_node_inner(expr, ctx);
-    if result.is_ok() {
-        ctx.current_node_id = prev;
+    ctx.current_node_id = prev;
+    if result.is_err() {
+        ctx.blame_error(expr.node_id());
     }
     result
 }

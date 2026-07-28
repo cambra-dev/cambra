@@ -97,12 +97,23 @@ pub(super) struct InferCtx {
     /// delicate elsewhere.
     lit_singletons: HashMap<Lit, Rc<TypedExpr>>,
     /// The `NodeId` of the node currently being emitted, maintained by the
-    /// [`emit_node`](super::emit::emit_node) wrapper: set on entry, *restored
-    /// only on success* so that on the fail-fast error path it is left pointing
-    /// at the innermost node that failed. This is provenance metadata for
-    /// diagnostics, surfaced to the `compile_program` boundary via the public
-    /// `infer`'s side-channel — it never influences inference itself.
+    /// [`emit_node`](super::emit::emit_node) wrapper: set on entry and restored
+    /// on exit, error path included. It always names the node under emission and
+    /// nothing else — it is not a channel for reporting anything to a later
+    /// reader. Provenance metadata for diagnostics; it never influences
+    /// inference.
     pub(super) current_node_id: Option<crate::ccl::provenance::NodeId>,
+    /// The node blamed for the emission failure, claimed by the innermost
+    /// [`emit_node`](super::emit::emit_node) frame that saw the error (see
+    /// [`blame_error`](Self::blame_error)).
+    ///
+    /// One slot because *emission* is fail-fast: it returns at the first error,
+    /// so at most one error per run exists to blame. That is a property of this
+    /// pass, not of the blame mechanism — the location is recorded when the error
+    /// arises, so an accumulating emitter would replace this slot with a blame
+    /// per error and change nothing else. The already-accumulating coalesce walk
+    /// does exactly that (`CoalesceCtx::errors` holds `LocatedInferError`s).
+    blame: Option<crate::ccl::provenance::NodeId>,
 }
 
 impl InferCtx {
@@ -116,7 +127,23 @@ impl InferCtx {
             pred_memo: Default::default(),
             lit_singletons: HashMap::new(),
             current_node_id: None,
+            blame: None,
         }
+    }
+
+    /// Claim `node` as the blame for the in-flight emission failure, unless an
+    /// inner frame already claimed one.
+    ///
+    /// First claim wins because the frames unwind innermost-first, so the first
+    /// claimant is the node that actually raised the error rather than an
+    /// ancestor that merely propagated it.
+    pub(super) fn blame_error(&mut self, node: crate::ccl::provenance::NodeId) {
+        self.blame.get_or_insert(node);
+    }
+
+    /// The blame node for this run's emission failure, if one was claimed.
+    pub(super) fn error_blame(&self) -> Option<crate::ccl::provenance::NodeId> {
+        self.blame
     }
 
     /// Normalize a user annotation / source type into a solver-ready

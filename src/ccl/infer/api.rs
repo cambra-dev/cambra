@@ -376,6 +376,17 @@ pub enum InferError {
 /// while that projection is in scope. `node_id: None` means no precise node is
 /// known (a coalesce or scope-validity error), which renders as plain text with
 /// no source snippet.
+///
+/// Deliberately concrete rather than a generic `Located<E>`: inference is the
+/// only pass whose errors carry a node today. The other unlocated pipeline
+/// errors — `LambdaElimError`, `ConversionError`, `DeferError`, whose spans
+/// `CompileError`'s docs call future work — are the prospective second, third,
+/// and fourth users; generalize when the first of them lands, not before. (Note
+/// the front-end convention differs on purpose: `LexError`/`ParseErrorInfo`/
+/// `LoweringError` hold a `Span` *inline* per variant, because a span exists
+/// where they are raised. An inference error is raised holding types, not spans,
+/// so it carries a node id and resolves to a span at the `compile_program`
+/// boundary.)
 #[derive(Debug, PartialEq)]
 pub struct LocatedInferError {
     /// The underlying inference error.
@@ -1287,12 +1298,19 @@ mod tests {
             BinOpKind::Arithmetic(ArithmeticKind::Add),
             Expr::lit(Lit::Int(1)),
         );
+        // The blame is the innermost frame that saw the error — the `Var` node,
+        // not the enclosing `BinOp` that propagated it.
+        let blamed = match &expr.node {
+            crate::ccl::TypedExprNode::BinOp { left, .. } => left.node_id(),
+            other => panic!("expected a BinOp, got {other:?}"),
+        };
         let errors = infer(&mut expr, &mut ctx).expect_err("`x` is unbound");
         assert_eq!(errors.len(), 1);
         assert!(matches!(errors[0].error, InferError::UnboundVariable(_)));
-        assert!(
-            errors[0].node_id.is_some(),
-            "a pass-1 emit error must carry its blame node"
+        assert_eq!(
+            errors[0].node_id,
+            Some(blamed),
+            "an emit error is blamed on the node that raised it"
         );
     }
 

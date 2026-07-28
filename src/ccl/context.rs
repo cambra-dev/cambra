@@ -1159,9 +1159,9 @@ Error: lowering error
     /// through `provenance.origins` to a `Some` span over the offending
     /// expression.
     ///
-    /// (Note: `1 + "a"` does *not* exercise this path — the `Int`/`String`
-    /// collision there surfaces in pass-2 coalesce as `IncompatibleBounds`,
-    /// which has no single blame node and renders as `node_id: None`.)
+    /// (`1 + "a"` reaches the same outcome by the other route: its `Int`/`String`
+    /// collision surfaces in pass-2 coalesce, which blames per error — see
+    /// `coalesce_error_carries_resolved_span`.)
     #[test]
     fn infer_error_carries_resolved_span() {
         let code = "1 and 2\n";
@@ -1182,6 +1182,36 @@ Error: lowering error
         assert!(
             pointed.contains("and"),
             "span {span:?} should cover the offending expression, points at {pointed:?}"
+        );
+    }
+
+    /// The pass-2 counterpart: a collision the emitter accepts and *coalesce*
+    /// rejects still resolves to a span.
+    ///
+    /// `1 + "a"` constrains one variable against both `Int` and `String`, which
+    /// only fails when the bounds are resolved — so this is the accumulating
+    /// walk's blame path (`CoalesceCtx::blame_frame`), not emission's. Before
+    /// coalesce errors were blamed per raising frame, every one of them rendered
+    /// without source context.
+    #[test]
+    fn coalesce_error_carries_resolved_span() {
+        let code = "1 + \"a\"\n";
+        let errs = compile_err(code);
+        let (error, span) = errs
+            .iter()
+            .find_map(|e| match e {
+                CompileError::Infer { error, span } => Some((error, *span)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
+        let span = span.unwrap_or_else(|| {
+            panic!("the coalesce error resolves to a source span, got {error:?} with no span")
+        });
+        let pointed = &code[span.start..span.end];
+        assert_eq!(
+            pointed, "1 + \"a\"",
+            "the blame is the node whose coalesce frame raised the error — here the \
+             `+` application over both operands, not the whole program or nothing"
         );
     }
 
