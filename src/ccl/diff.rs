@@ -37,32 +37,28 @@
 //! edit has changed content, and every *descendant* of an inserted subtree is
 //! new. [`Diff::divergences`] reduces it to the places the programs actually
 //! disagree, and [`Diff::shared_roots`] to the largest pieces they have in
-//! common. Those two are the actionable form, and what a `Versioned` tree would
-//! be built from.
+//! common. Those two are the actionable form: the first says where a version
+//! guard goes, the second says what the two versions can compute once.
 //!
-//! # Stage-agnostic: one core, two modes
+//! # Stage-agnostic
 //!
-//! [`diff`] is a pure function of two [`TypedExpr`] trees — it does not care
-//! which pipeline stage produced them, so the *same* implementation serves both
-//! supported modes; the caller picks the mode by choosing which trees to pass:
-//!
-//! * **Pre-uniquify** (lowered CCL, `Raw` names, most types still `Hole`) —
-//!   close to source, minimal diffs, the default target.
-//! * **Post-inference** (uniquified, fully typed) — binders carry run-varying
-//!   `uid`s and nodes carry concrete types, so the diff reflects type
-//!   differences the earlier stage cannot see.
-//!
-//! Nothing in the matcher is stage-specific: [`content_hash`] is uid-robust
-//! (free names by spelling) and type-aware, which is exactly what lets one core
-//! handle both. See the `content_hash` module.
+//! [`diff`] is a pure function of two [`TypedExpr`] trees and does not care
+//! which pipeline stage produced them, so one implementation serves every
+//! [`CompileStage`]: the caller chooses how much of the compiler's own
+//! rewriting to diff through by choosing which trees to pass. Nothing in the
+//! matcher is stage-specific — [`content_hash`] is uid-robust (free names by
+//! spelling) and type-aware, which is what lets one core cover the lot,
+//! including the `LetRec` and `Transact` shapes that exist only below the
+//! mutability phases. Which stage answers which question is
+//! `src/ccl/design/diffing.md`, "Which stage to diff".
 //!
 //! # Scope of this implementation
 //!
-//! This is the analysis, not a rewrite: it does **not** construct the unified
-//! `Versioned`-node tree (see `src/ccl/design/diffing.md`, "Beyond the
-//! analysis: Versioned nodes"). The one place it departs from full GumTree is
-//! candidate selection in step 3, which picks the best-scoring container
-//! greedily rather than solving a global assignment — GumTree does the same.
+//! This is the analysis, not a rewrite: it computes a correspondence and says
+//! nothing about what to build from it. The one place it departs from full
+//! GumTree is candidate selection in step 3, which picks the best-scoring
+//! container greedily rather than solving a global assignment — GumTree does
+//! the same.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -73,13 +69,14 @@ use super::context::{CompileError, CompileStage, compile_to};
 use super::scope::{ScopedItem, for_each_scoped_item};
 use super::{Name, TypedExpr};
 
-/// A node's bottom-up similarity must reach this fraction of its descendants
-/// for container recovery to pair it. The GumTree default.
+/// How much of the smaller of two subtrees must be common before container
+/// recovery will pair them — see the containment gate in [`bottom_up`]. The
+/// GumTree default, applied to a different measure than GumTree's.
 const SIMILARITY_THRESHOLD: f64 = 0.5;
 
 /// Subtree-size ceiling for the optimal recovery step ([`recover`]). Tree edit
 /// distance is `O(n²m²)` in the worst case, so a pair of containers larger than
-/// this keeps only the matches steps 1–2 found; their unmatched interiors are
+/// this keeps only the matches steps 1–3 found; their unmatched interiors are
 /// reported as deleted/new rather than aligned. GumTree's default, for the same
 /// reason.
 const MAX_RECOVERY_SIZE: u32 = 100;
@@ -91,7 +88,7 @@ pub enum Content {
     /// Equal content hash — identical computation, reusable wholesale.
     Same,
     /// The node corresponds but its content differs. The actual divergence is
-    /// in the children; these are the points a `Versioned` node would sit.
+    /// in the children — see [`Diff::divergences`] for the minimal set.
     Changed,
 }
 
@@ -176,8 +173,8 @@ impl<'a> Diff<'a> {
     /// The **minimal** set of places the two programs disagree, in new-program
     /// order (deletions, which have no place there, come last).
     ///
-    /// This is the actionable form of the diff, and the one a `Versioned` node
-    /// would be built from. `matched`/`deleted`/`new` are complete but not
+    /// This is the actionable form of the diff, and where a version guard would
+    /// be placed. `matched`/`deleted`/`new` are complete but not
     /// minimal: every *ancestor* of an edit has changed content too, and every
     /// *descendant* of an inserted subtree is itself new. One literal edited at
     /// the bottom of a forty-binding spine leaves forty-two changed nodes, of
@@ -280,8 +277,8 @@ impl<'a> Diff<'a> {
     }
 }
 
-/// One place the two programs disagree, at the granularity a `Versioned` node
-/// would sit. Minimal by construction: no divergence contains another.
+/// One place the two programs disagree, at the granularity a version guard is
+/// placed. Minimal by construction: no divergence contains another.
 #[derive(Debug, Clone, Copy)]
 pub enum Divergence<'a> {
     /// Both programs have a node here and its content differs, with nothing
@@ -309,14 +306,12 @@ pub fn diff<'a>(src: &'a TypedExpr, dst: &'a TypedExpr) -> Diff<'a> {
 /// Anchor the two roots to each other when phase 1 has not already.
 ///
 /// Two programs being diffed are two *versions of one program*, so their roots
-/// correspond by construction — neither has anywhere else to go. Bottom-up
-/// recovery cannot reach that conclusion on its own: its Dice test weighs a
-/// container's matched descendants against the *combined* size of both
-/// subtrees, so a root that gained one substantial statement scores below
-/// [`SIMILARITY_THRESHOLD`] and the entire program reads as
-/// deleted-and-reinserted for a one-statement edit. Anchoring the roots turns
-/// that back into an insertion, and gives phase 3 a pair to align the spine
-/// inside.
+/// correspond by construction — neither has anywhere else to go. [`bottom_up`]
+/// cannot reach that on its own because it is seeded by already-matched
+/// descendants and gives up when a node has none, which is exactly the case
+/// where two roots correspond but nothing *inside* them does: `Some(1)` against
+/// `Some(2)` would otherwise be a wholesale rebuild rather than an edited
+/// payload. Anchoring also hands step 4 a pair to align the interiors within.
 ///
 /// Requiring the same node kind keeps the anchor honest: two genuinely
 /// unrelated programs (a `BinOp` against a `Lit`) still correspond nowhere.
@@ -668,7 +663,7 @@ fn map_isomorphic(s: &Indexed, d: &Indexed, u: usize, w: usize, m: &mut Matching
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: bottom-up container recovery
+// Phase 3: bottom-up container recovery
 // ---------------------------------------------------------------------------
 
 fn bottom_up(s: &Indexed, d: &Indexed, m: &mut Matching) {
@@ -734,7 +729,11 @@ fn bottom_up(s: &Indexed, d: &Indexed, m: &mut Matching) {
     }
 }
 
-/// Optimally align the still-unmatched interiors of a freshly recovered
+// ---------------------------------------------------------------------------
+// Phase 4: optimal recovery inside a paired container
+// ---------------------------------------------------------------------------
+
+/// Optimally align the still-unmatched interiors of a freshly paired
 /// container pair `(u, w)`.
 ///
 /// Steps 1–2 match by *whole-subtree* equality and by container similarity;
@@ -1184,8 +1183,7 @@ fn head(e: &TypedExpr) -> String {
 /// program had that the new one dropped.
 ///
 /// Every node of the new program is marked with what the diff concluded about
-/// it, so the output doubles as the shape a unified `Versioned` tree would
-/// take. An inserted or deleted subtree is shown by its **root** only, with its
+/// it. An inserted or deleted subtree is shown by its **root** only, with its
 /// node count — printing every node of a pasted-in block is noise, and the root
 /// is the actionable unit.
 ///
@@ -1413,7 +1411,7 @@ mod tests {
             r.shared()
                 .any(|m| content_hash(m.src) == content_hash(&var("index")))
         );
-        // The two tuples correspond but differ → an update (a Versioned site).
+        // The two tuples correspond but differ → an update.
         assert!(
             r.updated()
                 .any(|m| matches!(m.src.node, TypedExprNode::Tuple(_)))
@@ -1680,8 +1678,7 @@ mod tests {
         compile_to(code, CompileStage::Lowered).expect("compile to lowered stage should succeed")
     }
 
-    /// Post-inference CCL (uniquified, fully typed), via the public API — the
-    /// differ's other supported mode.
+    /// Post-inference CCL (uniquified, fully typed), via the public API.
     fn lower_and_infer(code: &str) -> TypedExpr {
         compile_to(code, CompileStage::Inferred).expect("compile to inferred stage should succeed")
     }

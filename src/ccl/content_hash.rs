@@ -31,7 +31,8 @@
 //! * A variable whose binder lies *inside* the subterm being hashed contributes
 //!   its De Bruijn index — invisible to α-renaming.
 //! * A variable that is *free* in the subterm contributes an identity supplied
-//!   by [`hash_free_var`] — the one stage-specific seam (see below).
+//!   by [`hash_free_var`] — the one place the hash's meaning is a choice
+//!   rather than a consequence of the term (see below).
 //!
 //! Lexical shadowing falls out for free: [`hash_rel`] resolves a name against
 //! the *innermost* enclosing binder, so a shadowed `Raw` name resolves to the
@@ -59,16 +60,9 @@
 //!
 //! The hash is a pure function of a [`TypedExpr`] plus the binder-scoping rules
 //! of [`crate::ccl::scope`], which cover **every** [`TypedExprNode`] variant —
-//! including the ones (`LetRec`, `Transact`) that only appear at later pipeline
-//! stages. The single thing that differs between stages is how a *free*
-//! variable is identified, and that is isolated in the seam above, whose
-//! default hashes a free variable by its stable **spelling** ([`Name::base`])
-//! rather than its `uid`. This is robust across stages: lowering already uniquifies
-//! some subexpressions, so a free binder can be `Unique`/`Synthetic` with a
-//! run-varying `uid` even before the global uniquify pass — and the spelling is
-//! the identity that survives independent compilations. A finer cross-version
-//! binder correspondence (to distinguish genuinely distinct same-spelling
-//! binders) can refine this one seam without touching the rest.
+//! including the ones (`LetRec`, `Transact`) that exist only below the
+//! mutability phases. Nothing else is stage-sensitive, so one hash serves every
+//! [`CompileStage`](crate::ccl::context::CompileStage).
 //!
 //! # Complexity
 //!

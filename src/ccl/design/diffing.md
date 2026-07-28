@@ -37,16 +37,13 @@ That buys three things:
 The nearest operational analogy is blue/green deployment with shared state,
 lifted from infrastructure to program semantics.
 
-### Versions as branches
+### What the diff is for
 
-Once v2 is proposed on top of v1 the commit-timestamp space is no longer one
-total order but a tree rooted at the branch point `t_new`. Each branch has its
-own commit-time space; the total-order claim holds *within* a branch. Readers
-are version-tagged, and v2's store is defined piecewise: it agrees with v1's
-below `t_new` and is defined by v2's body at or above it. Two distinct times
-govern a version's life — `t_new`, the branch point (a property of the v2
-program, possibly historic), and `t_live`, the wall-clock time at which v2
-begins serving. The gap between them is the **backfill window**.
+Two versions of one program are two denotations over the same inputs, and the
+diff is where they part company. [branching.md](branching.md) works out what to
+build from that: a version guard placed at each divergence, everything else
+shared literally, so that redeploying does not rewrite the history the old
+version already produced.
 
 None of that is implemented. It is the destination; what follows is the first
 step.
@@ -279,8 +276,7 @@ independent: a node can keep its content and move, or stay put and change.
 
 - *Content* is just hash equality: `Same` (identical computation, reusable
   wholesale) or `Changed` (the same place in both programs with different
-  content — the divergence lives in the children, and these are where a
-  `Versioned` node would sit).
+  content — the divergence lives in the children).
 - *Placement* is the child-alignment step from Chawathe et al.'s edit-script
   derivation, which GumTree inherits. A node is `InPlace` iff it hangs off the
   corresponding parent *and* did not cross any of its matched siblings. Within
@@ -304,7 +300,7 @@ directly would have to re-derive the interesting set every time, so the differ
 derives it once.
 
 **`divergences()`** is the minimal set of places the two programs disagree, at
-the granularity a `Versioned` node would sit. No divergence contains another,
+the granularity a version guard is placed. No divergence contains another,
 so the set partitions the disagreement: everything not under one corresponds.
 Three kinds —
 
@@ -338,8 +334,8 @@ runtime, not a property of the tree.
 ### Reading a diff
 
 A [`Diff`](../diff.rs) renders itself: it prints as an annotated tree of the
-**new** program, so the output doubles as the shape a unified `Versioned` tree
-would take, followed by whatever the old program had that the new one dropped.
+**new** program, followed by whatever the old program had that the new one
+dropped.
 
 ```text
 2 shared · 1 changed · 1 moved · 0 deleted · 16 new
