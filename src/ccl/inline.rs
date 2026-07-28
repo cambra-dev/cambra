@@ -65,7 +65,7 @@
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
 use crate::ccl::{
-    Expr, Lit, Name, Type, TypedExprNode, ccl_utils::walk_refined_predicates_mut,
+    Expr, Lit, Name, Refinement, Type, TypedExprNode, ccl_utils::walk_refined_predicates_mut,
     lambda_elim::substitute,
 };
 
@@ -388,27 +388,33 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
         let function = inline_and_beta_reduce(*function, name, lambda);
         match function.node {
             TypedExprNode::Lambda { param, body } => {
-                // A domain refinement on this outer lambda would encode a
-                // precondition `P(arg)` that beta reduction must preserve.
-                // Such refinements ride the param's *type* (a
-                // `Type::Refinement` introduced by `cast`, and copied into
-                // `param.ty` by coalesce's `refresh_lambda_param_slot`);
-                // current lowering of generator/list-returning `def`s puts no
-                // refinement on the outer parameter (only the inner
-                // `__iter_record` if-guard lambda is refined, and that is
-                // never beta-reduced here). If a future lowering refines the
-                // outer param, this branch needs a principled lift (e.g. a
-                // `restrict(pred)` guard around the substituted body) before
-                // proceeding. A hard assert, not debug_assert: the condition
-                // reads a live post-inference data path, and a release build
-                // proceeding past it would silently drop the precondition —
-                // a wrong-results miscompile, not a recoverable state.
+                // A domain refinement on this outer lambda encodes a precondition
+                // `P(arg)` that beta reduction must not lose. Such refinements ride
+                // the param's *type* (a `Type::Refinement` introduced by `cast`, or
+                // the singleton a literal carries), copied into `param.ty` by
+                // coalesce's `refresh_lambda_param_slot`.
+                //
+                // Substitution **discharges** the precondition when the argument's
+                // own type already entails it: `P` then holds of the term replacing
+                // the binder, so dropping it from a type that no longer has a binder
+                // to describe loses nothing. That is the ordinary case for a literal
+                // argument — `{Int | __elem == 5}` is entailed by `5`'s own type,
+                // trivially.
+                //
+                // What is *not* safe is a precondition the argument does not
+                // establish; that needs a principled lift (a `restrict(pred)` guard
+                // around the substituted body) rather than a silent drop. A hard
+                // assert, not `debug_assert`: this reads a live post-inference data
+                // path, and a release build proceeding past it would miscompile to
+                // wrong results rather than fail.
                 assert!(
-                    !matches!(param.ty, Type::Refinement(..)),
-                    "inline_and_beta_reduce: outer lambda for `{name}` has a \
-                         refined parameter type; beta reduction would silently drop its \
-                         precondition. Extend this branch if list-UDF lowering \
-                         starts producing refined outer params."
+                    refinement_discharged_by(&argument.ty, &param.ty),
+                    "inline_and_beta_reduce: outer lambda for `{name}` has parameter \
+                     type {} which the argument type {} does not entail; beta reduction \
+                     would silently drop the precondition. This needs a `restrict` lift, \
+                     not a substitution.",
+                    param.ty,
+                    argument.ty
                 );
                 return substitute(*body, &param.name, &argument);
             }
@@ -560,6 +566,35 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
         TypedExprNode::Apply { function, .. } => is_name_in_function_position(function, name),
         _ => false,
     }
+}
+
+/// Whether every refinement the parameter demands is already carried by the
+/// argument — so substituting the argument for the binder **discharges** the
+/// precondition rather than dropping it.
+///
+/// Compared with the type-blind predicate relation
+/// ([`eq_refinement_predicate`](crate::ccl::eq_refinement_predicate), via `Refinement`'s
+/// `PartialEq`), because the two copies legitimately differ in inference metadata.
+/// This is deliberately a *syntactic* entailment, not a solver call: post-inference
+/// there is no constraint graph left, and the case that must succeed — an argument
+/// whose type carries the very refinement the parameter acquired *from* it — is an
+/// equality. Anything subtler is exactly what should trip the assert and get a real
+/// `restrict` lift.
+fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
+    fn layers(mut ty: &Type) -> Vec<&Refinement> {
+        let mut out = Vec::new();
+        while let Type::Refinement(inner, r) = ty {
+            out.push(r);
+            ty = inner;
+        }
+        out
+    }
+    let demanded = layers(param_ty);
+    if demanded.is_empty() {
+        return true;
+    }
+    let supplied = layers(arg_ty);
+    demanded.iter().all(|d| supplied.contains(d))
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,6 +1130,72 @@ mod tests {
         .with_ty(fn_ty(int.clone(), int));
         let result = inline_and_beta_reduce(shadowed.clone(), &Name::raw("f"), &replacement);
         assert_eq!(result, shadowed);
+    }
+
+    // Refined outer parameter — discharged by the argument's own type
+    // -----------------------------------------------------------------------
+
+    /// A literal's singleton (`5 : {Int | __elem == 5}`) reaches the outer
+    /// lambda's `param.ty` through coalesce's `refresh_lambda_param_slot`, so
+    /// the refined-parameter branch of [`inline_and_beta_reduce`] — and its hard
+    /// `assert!` — is live on an ordinary UDF call path rather than dead. The
+    /// argument's own type *is* the demanded refinement, so the precondition is
+    /// discharged and substitution proceeds.
+    ///
+    /// Shape mirrors a list-returning UDF over a scalar parameter,
+    /// `def rep(k): for x in [1, 2, 3]: yield k` called as `rep(5)`: the outer
+    /// `λ k` takes the argument's singleton as its domain, and beta-reduction
+    /// leaves the inner iteration lambda with `5` substituted for `k`.
+    #[test]
+    fn refined_outer_param_discharged_by_literal_argument() {
+        let int = Type::Base(BaseType::Int);
+        let singleton = crate::ccl::infer::lit_singleton(&Lit::Int(5));
+        let range = Type::UIntRange(3);
+        let list = fn_ty(range.clone(), int.clone());
+        let udf_ty = fn_ty(singleton.clone(), list.clone());
+
+        // λ k : {Int | __elem == 5} → λ __iter_record : [0, 2] → k
+        let inner = TypedExpr::lambda(
+            "__iter_record",
+            range.clone(),
+            TypedExpr::var("k").with_ty(int.clone()),
+        )
+        .with_ty(list.clone());
+        let outer = TypedExpr::lambda("k", singleton.clone(), inner).with_ty(udf_ty.clone());
+
+        // 5 ▷ rep, with the argument carrying its singleton.
+        let arg = TypedExpr::lit(Lit::Int(5)).with_ty(singleton);
+        let call = TypedExpr::apply(arg.clone(), TypedExpr::var("rep").with_ty(udf_ty))
+            .with_ty(list.clone());
+        let expr = TypedExpr::let_bind("rep", outer, call);
+
+        let result = inline_non_iterable_lambdas(expr);
+
+        let expected = TypedExpr::lambda("__iter_record", range, arg).with_ty(list);
+        assert_eq!(result, expected);
+    }
+
+    /// The complement: a parameter refinement the argument does *not* carry is a
+    /// precondition beta-reduction would silently drop, so the assert fires
+    /// rather than substituting. Pins the guard that keeps
+    /// [`refinement_discharged_by`] from being weakened to "any refined param is
+    /// fine" — e.g. if specialization were ever keyed modulo refinements, one
+    /// literal's singleton could reach the param slot of a call made at another.
+    #[test]
+    #[should_panic(expected = "does not entail")]
+    fn refined_outer_param_not_entailed_by_argument_asserts() {
+        let int = Type::Base(BaseType::Int);
+        let demanded = crate::ccl::infer::lit_singleton(&Lit::Int(5));
+        let supplied = crate::ccl::infer::lit_singleton(&Lit::Int(7));
+        let udf_ty = fn_ty(demanded.clone(), int.clone());
+
+        let lambda = TypedExpr::lambda("k", demanded, TypedExpr::var("k").with_ty(int.clone()))
+            .with_ty(udf_ty.clone());
+        let arg = TypedExpr::lit(Lit::Int(7)).with_ty(supplied);
+        let call = TypedExpr::apply(arg, TypedExpr::var("f").with_ty(udf_ty)).with_ty(int.clone());
+        let expr = TypedExpr::let_bind("f", lambda, call);
+
+        let _ = inline_non_iterable_lambdas(expr);
     }
 
     // inline_non_iterable_lambdas — end-to-end pass behaviour

@@ -2,6 +2,7 @@
 // Check pass: post-inference structural re-validation
 // ---------------------------------------------------------------------------
 
+use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fresh_var, prim};
 use crate::ccl::symbolic::symbolic;
@@ -270,7 +271,27 @@ impl Typing for CheckCtx {
 fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
     let label = symbolic(expr);
     let ty = match &mut expr.node {
-        TypedExprNode::Lit(lit) => lit_base(lit),
+        // Verify the **base**, trust the refinement. A literal's singleton predicate
+        // (`{Int | __elem == 5}`) is a resolved predicate like any other, and by the
+        // time this mode runs post-planning it has been compiled to point-free form.
+        // Reconstructing the pointful predicate here and requiring it to match would
+        // contradict this mode's own contract (see `type_annotation_predicates`):
+        // a rebuilt predicate can never equal a compiled one, though the two denote
+        // the same restriction. Every other node here trusts its recorded type or
+        // derives it from children; a literal is the one that could rebuild it, and
+        // must not.
+        TypedExprNode::Lit(lit) => {
+            // Reported through `require_sub`, which *accumulates* into `ctx.errors`
+            // and returns `Ok` — that is how a rule reports without short-circuiting
+            // the walk (`check` collects a propagated `Err` too, but only a rule with
+            // nothing to accumulate into should use one).
+            let base = lit_base(lit);
+            let recorded = strip_refinements(&expr.ty);
+            if recorded != base {
+                ctx.require_sub(&base, &recorded, &|| format!("literal {label}"))?;
+            }
+            expr.ty.clone()
+        }
 
         // Leaves whose type carries the full load and was resolved during
         // inference — trust the recorded type (matching the old typecheck,
@@ -370,6 +391,17 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
     // constructors rebuild the same product), the subtype check is reflexive
     // and trivially holds, so skip the (deeper, allocating) `constrain_subtype`.
     if ty != expr.ty {
+        // Refinements included: this is the plain strict relation, like every other
+        // check here. A rule that rebuilds a node's type from its children rebuilds
+        // its refinements too, so a recorded refinement the reconstruction lacks is a
+        // real disagreement about the node — usually a **merge point that took one
+        // input's refinement** instead of the join of all of them, which is what makes
+        // an unrefined reconstruction meet a refined recorded type (`{Int | __elem == 0}`
+        // recorded on a `__txp.0 + 1`, say). Comparing modulo refinements here would
+        // hide exactly that class of bug, and it is the one this check is best placed
+        // to catch: every merge point in the pipeline — a `Case`'s arms, a list's
+        // elements, a register's seed and writes, a channel's contributions — joins,
+        // and the wall is what holds them to it.
         ctx.require_sub(&ty, &expr.ty, &|| format!("type of {label}"))?;
     }
     Ok(ty)
@@ -389,8 +421,16 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
 pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut cloned = expr.clone();
     let mut ctx = CheckCtx::new();
-    // `check_node` accumulates errors into `ctx` and never returns `Err` here.
-    let _ = check_node(&mut cloned, &mut ctx);
+    // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
+    // going and reports everything it can. But a few propagate instead —
+    // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned
+    // `Err` is collected rather than dropped. Discarding it, as this used to, meant a
+    // rule that reported the only way it could was reporting into the void: an empty
+    // `Case` reaching here was silently accepted, and any future rule that returns
+    // instead of accumulating would join it.
+    if let Err(e) = check_node(&mut cloned, &mut ctx) {
+        ctx.errors.push(e);
+    }
     if ctx.errors.is_empty() {
         Ok(())
     } else {

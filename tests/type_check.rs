@@ -14,8 +14,8 @@
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
-    FieldKey, HistoryKind, Type,
-    infer::{InferError, TypeInferenceContext, infer},
+    FieldKey, HistoryKind, Lit, Type,
+    infer::{InferError, TypeInferenceContext, check_pre_desugar, infer, lit_singleton},
     lower::{LoweringContext, lower_stmts},
 };
 use cambra::chl_parser::{self, ast as chl_ast};
@@ -120,6 +120,24 @@ fn int() -> Type {
     Type::Base(BaseType::Int)
 }
 
+/// The type of the integer literal `n` — its **singleton**,
+/// `{Int | __elem == n}` (rendered `n`). A literal is typed by what it is, not
+/// merely by its base ([`lit_singleton`]), so a test that expects a program to
+/// evaluate to a known constant should say which one.
+fn int_lit(n: i64) -> Type {
+    lit_singleton(&Lit::Int(n))
+}
+
+/// The type of the string literal `s` — see [`int_lit`].
+fn str_lit(s: &str) -> Type {
+    lit_singleton(&Lit::String(s.to_string()))
+}
+
+/// The type of the boolean literal `b` — see [`int_lit`].
+fn bool_lit(b: bool) -> Type {
+    lit_singleton(&Lit::Bool(b))
+}
+
 /// Convenience alias for `Type::Base(BaseType::String)`.
 fn string() -> Type {
     Type::Base(BaseType::String)
@@ -134,13 +152,16 @@ fn bool_ty() -> Type {
 // Literal tests
 // ---------------------------------------------------------------------------
 
+/// A literal is typed by **which** literal it is: its base refined by the singleton
+/// `__elem == lit`. `unit` is the exception — one inhabitant, so the singleton would
+/// say nothing its base does not.
 #[rstest]
-#[case::int("2", BaseType::Int)]
-#[case::string(r#""hi""#, BaseType::String)]
-#[case::bool_lit("True", BaseType::Bool)]
-#[case::none("None", BaseType::Unit)]
-fn test_literal(#[case] code: &str, #[case] expected: BaseType) {
-    assert_eq!(infer_program(code), Type::Base(expected));
+#[case::int("2", int_lit(2))]
+#[case::string(r#""hi""#, str_lit("hi"))]
+#[case::bool_lit("True", bool_lit(true))]
+#[case::none("None", Type::Base(BaseType::Unit))]
+fn test_literal(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -160,22 +181,28 @@ fn test_binary_op(#[case] code: &str, #[case] expected: BaseType) {
 // Let binding / scoping tests
 // ---------------------------------------------------------------------------
 
+/// A binding propagates its value's type unchanged, singleton and all — `x = 2`
+/// makes `x` *the* `2`. The chain case shows the other half: `y + x` joins two
+/// singletons, and a join intersects refinements, so the sum is plain `Int`.
 #[rstest]
-#[case::simple("x = 2\nx", BaseType::Int)]
-#[case::chain("x = 2\ny = x\ny + x", BaseType::Int)]
-fn test_let(#[case] code: &str, #[case] expected: BaseType) {
-    assert_eq!(infer_program(code), Type::Base(expected));
+#[case::simple("x = 2\nx", int_lit(2))]
+#[case::chain("x = 2\ny = x\ny + x", int())]
+fn test_let(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
 }
 
 // ---------------------------------------------------------------------------
 // Unary operator tests
 // ---------------------------------------------------------------------------
 
+/// `-2` folds to the literal `-2` at lowering, so it is a literal like any other and
+/// carries its own singleton. `not True` does not fold — a unary operator computes a
+/// *new* value, and its result takes no refinement from its operand.
 #[rstest]
-#[case::neg("-2", BaseType::Int)]
-#[case::not("not True", BaseType::Bool)]
-fn test_unary_op(#[case] code: &str, #[case] expected: BaseType) {
-    assert_eq!(infer_program(code), Type::Base(expected));
+#[case::neg("-2", int_lit(-2))]
+#[case::not("not True", bool_ty())]
+fn test_unary_op(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +231,7 @@ fn test_list_literal() {
 fn test_def_param_annotation_enforced() {
     // A scalar annotation is enforced at the call site: an identity body infers
     // nothing on its own, so without the annotation any argument was accepted.
-    assert_eq!(infer_program("def g(a: Int):\n    a\ng(1)"), int());
+    assert_eq!(infer_program("def g(a: Int):\n    a\ng(1)"), int_lit(1));
     assert!(!infer_program_err("def g(a: Int):\n    a\ng(\"x\")").is_empty());
     // A `List(Int)` annotation enforces the element type through the annotation.
     assert_eq!(
@@ -213,7 +240,7 @@ fn test_def_param_annotation_enforced() {
     );
     assert!(!infer_program_err("def g(a: List(Int)):\n    sum(a)\ng([\"a\", \"b\"])").is_empty());
     // An unannotated param still infers purely from use.
-    assert_eq!(infer_program("def g(a):\n    a\ng(\"x\")"), string());
+    assert_eq!(infer_program("def g(a):\n    a\ng(\"x\")"), str_lit("x"));
 }
 
 #[test]
@@ -221,7 +248,7 @@ fn test_multiarg_def_param_annotation_enforced() {
     // Each tupled parameter's annotation is enforced independently.
     assert_eq!(
         infer_program("def g(a: Int, b: String):\n    a\ng(1, \"x\")"),
-        int()
+        int_lit(1)
     );
     // Wrong type on `a` is rejected.
     assert!(!infer_program_err("def g(a: Int, b: String):\n    a\ng(\"x\", \"y\")").is_empty());
@@ -316,50 +343,53 @@ fn test_aggregate(#[case] code: &str, #[case] expected: BaseType) {
 fn test_tuple() {
     assert_eq!(
         infer_program(r#"(1, "a")"#),
-        Type::Tuple(vec![int(), string()])
+        Type::Tuple(vec![int_lit(1), str_lit("a")])
     );
 }
 
 #[test]
 fn test_tuple_index() {
-    assert_eq!(infer_program(r#"(1, "a")[0]"#), int());
+    assert_eq!(infer_program(r#"(1, "a")[0]"#), int_lit(1));
 }
 
 // ---------------------------------------------------------------------------
 // Type annotation tests
 // ---------------------------------------------------------------------------
 
+/// An ascription is one-way: it must *admit* the value, and the value keeps whatever
+/// more precise type it already had. So annotating a literal at its base does not
+/// widen it, while an expression that computes a new value has nothing to keep.
 #[rstest]
 #[case::literal(
     r"
 x: Int = 2
 x
 ",
-    BaseType::Int
+    int_lit(2)
 )]
 #[case::expr(
     r"
 x: Int = 1 + 2
 x
 ",
-    BaseType::Int
+    int()
 )]
 #[case::wildcard(
     r"
 x: _ = 2
 x
 ",
-    BaseType::Int
+    int_lit(2)
 )]
 #[case::wildcard_str(
     r#"
 x: _ = "hi"
 x
 "#,
-    BaseType::String
+    str_lit("hi")
 )]
-fn test_ann_assign_ok(#[case] code: &str, #[case] expected: BaseType) {
-    assert_eq!(infer_program(code), Type::Base(expected));
+fn test_ann_assign_ok(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
 }
 
 #[test]
@@ -614,9 +644,14 @@ fn test_ternary(#[case] code: &str, #[case] expected: BaseType) {
     assert_eq!(infer_program(code), Type::Base(expected));
 }
 
+/// Arms of different types are rejected — as two incompatible lower-bound atoms
+/// on the arms' join variable, which `coalesce_compact` reports as
+/// `IncompatibleBounds`. A `Case`'s type is the join of its arms (they flow
+/// one-way into one variable), so a collision surfaces at coalesce rather than
+/// eagerly at the arm relation — the same place a heterogeneous list literal or
+/// `CollectionUnion` reports it (see `test_collection_union_heterogeneous_rejected`).
 #[test]
 fn test_if_else_arm_type_mismatch() {
-    // Arms return different types — inference must report a type mismatch.
     let err = infer_program_err(
         r#"
 if True:
@@ -628,8 +663,8 @@ else:
     );
     assert!(
         err.iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. })),
-        "expected TypeMismatch, got {err:?}"
+            .any(|e| matches!(e, InferError::IncompatibleBounds { .. })),
+        "expected IncompatibleBounds, got {err:?}"
     );
 }
 
@@ -697,8 +732,8 @@ fn test_generic_identity() {
 /// heterogeneous tuple, exercising the partial-tuple / projection rule.
 #[test]
 fn test_tuple_index_heterogeneous() {
-    assert_eq!(infer_program(r#"(1, "a")[0]"#), int());
-    assert_eq!(infer_program(r#"(1, "a")[1]"#), string());
+    assert_eq!(infer_program(r#"(1, "a")[0]"#), int_lit(1));
+    assert_eq!(infer_program(r#"(1, "a")[1]"#), str_lit("a"));
 }
 
 /// An unconstrained identity applied to a concrete value must resolve all
@@ -708,7 +743,7 @@ fn test_unconstrained_identity_applied_resolves() {
     // bind via Let so `f(5)` is a named call (lowering doesn't yet
     // support a lambda-literal in call position).
     let ty = infer_program("f = \\x -> x\nf(5)");
-    assert_eq!(ty, int());
+    assert_eq!(ty, int_lit(5));
 }
 
 /// A refined comprehension carries its filter predicate as a refinement on
@@ -734,6 +769,139 @@ fn test_filtered_comprehension_has_refinement_on_domain() {
     } else {
         panic!("expected Fun type, got {ty}");
     }
+}
+
+/// Infer `code` and run the post-inference consistency wall over the result,
+/// returning the program's type. The wall's failures are compiler bugs, not user
+/// errors — `compile_program` panics on them — so a rule that types a program
+/// must also survive its own re-run in Check mode.
+fn infer_and_check(code: &str) -> Type {
+    let mut lctx = LoweringContext::default();
+    let mut ictx = TypeInferenceContext::new();
+    let stmts = parse_module(code.trim());
+    let mut expr = lower_stmts(&stmts, &mut lctx)
+        .into_result()
+        .expect("lowering failed");
+    let ty = infer(&mut expr, &mut ictx).expect("inference failed");
+    check_pre_desugar(&expr)
+        .expect("post-inference consistency wall must accept the inferred tree");
+    ty
+}
+
+/// A `Case` whose arms are *collections* survives the consistency wall, and the
+/// restriction **both** arms establish survives with it: two identical filtered
+/// comprehensions join to that same filtered extent, not to the bare `[0, 2]`.
+///
+/// A collection carries its extent as a refinement on its `Fun` *domain*, where
+/// subtyping is contravariant — which is why the arms must reach the node's type
+/// by a join rather than by relating each arm to a *stripped* sibling: stripping
+/// one side of a domain edge demands `[0, N] <: {[0, N] | p}` and rejects two arms
+/// that are the same expression, and stripping both discards an extent that no
+/// branch widens.
+#[test]
+fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
+    let ty = infer_and_check(
+        r"
+xs = [1, 2, 3]
+c = 1 > 0
+if c:
+    [x for x in xs if x > 1]
+else:
+    [x for x in xs if x > 1]
+",
+    );
+    let Type::Fun {
+        domain, codomain, ..
+    } = &ty
+    else {
+        panic!("expected a collection type, got {ty}");
+    };
+    assert!(
+        matches!(&**domain, Type::Refinement(..)),
+        "the filter both arms establish must survive the join, got {ty}"
+    );
+    assert_eq!(**codomain, int(), "expected an Int codomain, got {ty}");
+}
+
+/// The same relation, one construct over: a `List`'s elements join into a shared
+/// variable exactly as a `Case`'s arms do, so a list *of* filtered comprehensions
+/// has to clear the wall too. The reconcile compares the rule-derived type to the
+/// recorded one modulo refinements, and a join variable holds its operands' real
+/// (refined) types in its bounds — where erasing the two compared types cannot
+/// reach them.
+#[test]
+fn test_list_of_filtered_comprehensions_passes_consistency_wall() {
+    let ty = infer_and_check(
+        r"
+xs = [1, 2, 3]
+[[x for x in xs if x > 1]]
+",
+    );
+    let Type::Fun {
+        domain, codomain, ..
+    } = &ty
+    else {
+        panic!("expected a collection type, got {ty}");
+    };
+    assert_eq!(
+        **domain,
+        Type::UIntRange(1),
+        "expected a 1-element list, got {ty}"
+    );
+    assert!(
+        matches!(&**codomain, Type::Fun { domain: d, .. } if matches!(&**d, Type::Refinement(..))),
+        "the element's filtered extent must survive, got {ty}"
+    );
+}
+
+/// A `Case`'s type is the **join** of its arms, so a refinement survives exactly
+/// when every arm establishes it. Two arms that are the same literal *are* that
+/// literal; two different ones are only their base.
+#[rstest]
+#[case::same_literal("c = 1 > 0\n5 if c else 5", int_lit(5))]
+#[case::different_literals("c = 1 > 0\n1 if c else 2", int())]
+#[case::inside_a_tuple("c = 1 > 0\n(1, 2) if c else (3, 4)", Type::Tuple(vec![int(), int()]))]
+#[case::at_depth(
+    "c = 1 > 0\n((1, 2), 3) if c else ((4, 5), 6)",
+    Type::Tuple(vec![Type::Tuple(vec![int(), int()]), int()])
+)]
+fn test_case_arms_join(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_and_check(code), expected);
+}
+
+/// Arms whose extents differ. A function type's join *meets* its domain, so the
+/// two filters accumulate as two witnesses on one domain — the extent both arms
+/// admit — rather than one arm's filter being picked (which would claim positions
+/// the other branch does not produce). Nothing downstream can observe the choice
+/// yet: a logical `Case` over collections is rejected by lambda elimination, so
+/// this pins the typing rule, not a compiled extent.
+#[test]
+fn test_case_arms_with_different_filters_accumulate_witnesses() {
+    let ty = infer_and_check(
+        r"
+xs = [1, 2, 3]
+c = 1 > 0
+if c:
+    [x for x in xs if x > 1]
+else:
+    [x for x in xs if x < 3]
+",
+    );
+    let Type::Fun { domain, .. } = &ty else {
+        panic!("expected a collection type, got {ty}");
+    };
+    let mut layers = 0;
+    let mut cur = &**domain;
+    while let Type::Refinement(inner, _) = cur {
+        layers += 1;
+        cur = inner;
+    }
+    assert_eq!(layers, 2, "expected both arms' witnesses, got {ty}");
+    assert_eq!(
+        *cur,
+        Type::UIntRange(3),
+        "expected the source extent, got {ty}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -909,8 +1077,10 @@ b = make("s")
     let Type::Tuple(elems) = &ty else {
         panic!("expected a pair of feed handles, got {ty}");
     };
-    assert_eq!(*feed_value(&elems[0]), int());
-    assert_eq!(*feed_value(&elems[1]), string());
+    // The contributed value's type flows into the channel whole, so each handle's
+    // element type is the literal that was fed to it.
+    assert_eq!(*feed_value(&elems[0]), int_lit(1));
+    assert_eq!(*feed_value(&elems[1]), str_lit("s"));
 }
 
 // ---------------------------------------------------------------------------

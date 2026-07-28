@@ -224,9 +224,8 @@ impl Default for OperatorSchemes {
 mod tests {
     use super::super::test_helpers::*;
     use super::OperatorSchemes;
-    use crate::ccl::{
-        AggregateKind, BaseType, Builtin, Type, TypedBinding, TypedExpr, TypedExprNode,
-    };
+    use crate::ccl::infer::int_lit_ty;
+    use crate::ccl::{AggregateKind, Builtin, Type, TypedBinding, TypedExpr, TypedExprNode};
 
     /// `GetPrevTxn`'s scheme instantiates to
     /// `((ι ⇒ {time: Txn, write: ν}), Txn, ν) ⇒ ν`: the history domain `ι` is a
@@ -323,9 +322,6 @@ mod tests {
         let mut e = TypedExpr::aggregate(lam, AggregateKind::Max);
         let ty = run_inference(&mut e).expect("inference succeeds (the bug under test)");
         // Buggy current behavior: the non-orderable tuple codomain is accepted.
-        assert_eq!(
-            ty,
-            Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)])
-        );
+        assert_eq!(ty, Type::Tuple(vec![int_lit_ty(1), int_lit_ty(2)]));
     }
 }

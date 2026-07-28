@@ -328,9 +328,14 @@ impl fmt::Display for Type {
                     write!(f, "[{}]", parts.join(" | "))
                 }
             }
-            Type::Refinement(t, r) => {
-                write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate))
-            }
+            // A **singleton** prints as the literal it pins: `{Int | __elem == 5}` is
+            // `5`. That is the whole content of the type, and spelling it out puts a
+            // predicate in front of the reader at every literal. Every other
+            // refinement prints in the general form.
+            Type::Refinement(t, r) => match singleton_value(self) {
+                Some(lit) => write!(f, "{}", symbolic::symbolic(lit)),
+                None => write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate)),
+            },
             Type::Hole => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
@@ -349,6 +354,32 @@ impl fmt::Display for Type {
             }
         }
     }
+}
+
+/// The literal a **singleton** refinement pins, if `ty` is one: a base refined by
+/// exactly `__elem == <lit>` and nothing else.
+///
+/// Presentation only. The type keeps its general [`Type::Refinement`] shape — every
+/// rule that handles refinements handles this one unchanged — and this recognizes
+/// the shape just well enough to print it as what it means.
+fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
+    let Type::Refinement(base, r) = ty else {
+        return None;
+    };
+    // Exactly one layer: a further-refined singleton is not one.
+    if matches!(base.as_ref(), Type::Refinement(..)) {
+        return None;
+    }
+    let TypedExprNode::BinOp {
+        left,
+        op: crate::ccl::BinOpKind::Compare(crate::ccl::CompareKind::Equals),
+        right,
+    } = &r.predicate.node
+    else {
+        return None;
+    };
+    let elem_lhs = matches!(&left.node, TypedExprNode::Var(n) if n.is_elem());
+    (elem_lhs && matches!(right.node, TypedExprNode::Lit(_))).then_some(right.as_ref())
 }
 
 impl Type {

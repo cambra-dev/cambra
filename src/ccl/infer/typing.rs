@@ -44,17 +44,6 @@ pub(super) trait Typing {
         at: &dyn Fn() -> String,
     ) -> Result<(), InferError>;
 
-    /// Require `a` and `b` to be equal (subtyping in both directions).
-    fn require_eq(
-        &mut self,
-        a: &Type,
-        b: &Type,
-        at: &dyn Fn() -> String,
-    ) -> Result<(), InferError> {
-        self.require_sub(a, b, at)?;
-        self.require_sub(b, a, at)
-    }
-
     /// Run `f` with `name: ty` bound *monomorphically* in the lexical scope
     /// (lambda params, pattern/loop binders), restoring the scope afterward on
     /// both the success and error paths.

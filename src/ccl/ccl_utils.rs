@@ -704,12 +704,19 @@ fn count_free_in_type_with_visited(
 ) -> usize {
     // The only variable a type can bind is the refinement element binder
     // ([`crate::ccl::REFINEMENT_BINDER`]): it occurs *only* inside refinement
-    // predicates, and each such occurrence is bound by its enclosing refinement.
-    // So it is never free in a type — counting its (bound) occurrences would
-    // falsely report the binder as free, e.g. tripping lambda-elim's
-    // "value-dependent dependent function" guard when a predicate merely carries
-    // a nested refinement over `__elem`. Every *other* name in a predicate is a
-    // free reference to the enclosing lexical scope and is counted.
+    // predicates, and each such occurrence is bound by its enclosing refinement —
+    // including under nesting, where each layer binds its own. So it is never free
+    // in a type: counting its (bound) occurrences reports a binder capture that
+    // cannot happen, and the caller that asks (lambda-elim's "value-dependent
+    // dependent function" guard) then rejects a perfectly ordinary term because
+    // some type inside it carried an `__elem` predicate. Every *other* name in a
+    // predicate is a free reference to the enclosing lexical scope and is counted.
+    //
+    // The carve-out is type-level only: the *term* walk
+    // ([`count_free_with_visited`]) deliberately keeps counting `__elem`, because a
+    // bare predicate manipulated as a term — eta-expanded by
+    // `planning::fn_of_bare_predicate`, say — genuinely has it free until that
+    // expansion binds it.
     if name.is_elem() {
         return 0;
     }

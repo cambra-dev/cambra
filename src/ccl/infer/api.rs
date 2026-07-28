@@ -885,9 +885,14 @@ fn annotation_peels_to_hole(ty: &Type) -> bool {
 /// The three rules, all of which keep a mutable value statically traceable to
 /// a single introduction (so the writer set of every mutable variable is known):
 ///
-/// 1. A `Mut`-typed *value* must be a bare variable reference — no computed or
-///    conditional expression of `Mut` type, and no non-variable argument to a
-///    `Mut` parameter ([`InferError::MutNotBareVariable`]).
+/// 1. A `Mut`-typed *value* must be a bare variable reference — no computed
+///    expression of `Mut` type, and no non-variable argument to a `Mut`
+///    parameter ([`InferError::MutNotBareVariable`]). A *conditional* over two
+///    registers is not caught by the first clause: a mutable read derefs into
+///    the arms' join exactly as it derefs into a tuple element, so the selection
+///    types as a plain value and there is no `Mut` left on the node. What the
+///    rule is protecting — a selected register reaching a position that writes
+///    through it — is the second clause, which reads the argument's *node*.
 /// 2. `Mut` may not appear inside any composite type — only at a top-level
 ///    binding/parameter/expression position or a function *domain*
 ///    ([`InferError::MutInCompositeType`]).
@@ -1190,6 +1195,7 @@ pub fn dbg_typecheck_mv(expr: Expr) -> Expr {
 mod tests {
     use super::*;
     use crate::ccl::BaseType;
+    use crate::ccl::infer::{bool_lit_ty, int_lit_ty, str_lit_ty};
     use crate::ccl::symbolic::symbolic;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, Lit, LogicKind, Type,
@@ -1205,15 +1211,15 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         assert_eq!(
             infer(&mut Expr::lit(Lit::Int(42)), &mut ctx),
-            Ok(Type::Base(BaseType::Int))
+            Ok(int_lit_ty(42))
         );
         assert_eq!(
             infer(&mut Expr::lit(Lit::String("hello".into())), &mut ctx),
-            Ok(Type::Base(BaseType::String))
+            Ok(str_lit_ty("hello"))
         );
         assert_eq!(
             infer(&mut Expr::lit(Lit::Bool(true)), &mut ctx),
-            Ok(Type::Base(BaseType::Bool))
+            Ok(bool_lit_ty(true))
         );
         assert_eq!(
             infer(&mut Expr::lit(Lit::Unit), &mut ctx),
@@ -1240,17 +1246,18 @@ mod tests {
     #[test]
     fn test_infer_apply_annotates_lambda() {
         let mut ctx = TypeInferenceContext::new();
-        // Apply(λ x → x, 42) should annotate x : Int and return Int.
+        // Apply(λ x → x, 42) should annotate x : 42 and return 42 — the identity
+        // returns its argument, so the argument's own type flows all the way out.
         let mut expr = Expr::apply(
             Expr::lit(Lit::Int(42)),
             Expr::lambda("x", Type::infer(), Expr::var("x")),
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert_eq!(ty, Type::Base(BaseType::Int));
+        assert_eq!(ty, int_lit_ty(42));
         // Verify the lambda was annotated in place.
         if let TypedExprNode::Apply { function, .. } = &expr.node {
             if let TypedExprNode::Lambda { param, .. } = &function.node {
-                assert_eq!(param.ty, Type::Base(BaseType::Int));
+                assert_eq!(param.ty, int_lit_ty(42));
             } else {
                 panic!("expected Lambda in function position");
             }
@@ -1484,20 +1491,21 @@ mod tests {
                 e,
                 InferError::AnnotationMismatch {
                     annotation: Type::Base(BaseType::String),
-                    inferred: Type::Base(BaseType::Int),
+                    ..
                 }
             )),
-            "expected AnnotationMismatch String/Int, got {errs:?}"
+            "expected AnnotationMismatch against String, got {errs:?}"
         );
     }
 
     #[test]
     fn test_infer_type_annotation_ok() {
         let mut ctx = TypeInferenceContext::new();
-        // (42 : Int)  =>  Int
+        // (42 : Int)  =>  42. The ascription is one-way, so the value keeps the more
+        // precise type it already had; the annotation only has to admit it.
         let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::Int));
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert_eq!(ty, Type::Base(BaseType::Int));
+        assert_eq!(ty, int_lit_ty(42));
     }
 
     #[test]
@@ -1531,7 +1539,7 @@ mod tests {
             infer(&mut expr, &mut ctx),
             Err(vec![InferError::AnnotationMismatch {
                 annotation: Type::Base(BaseType::String),
-                inferred: Type::Base(BaseType::Int),
+                inferred: int_lit_ty(42),
             }])
         );
     }
@@ -2053,15 +2061,20 @@ mod tests {
     /// constrains the param to `String`. Inference should return `AnnotationMismatch`.
     ///
     /// This path is not yet reachable from the pipeline (lowering always sets
-    /// `user_annotation: None`), but the error variant must be exercised
-    /// directly so it does not bitrot.
+    /// `user_annotation: None`), but the conflict must be exercised directly so the
+    /// annotation-binding rule does not bitrot.
     #[test]
     fn test_infer_annotation_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         // λ [x : annotated Int] → Apply(λ s : String → s, x)
         // x starts as Infer(id); body inference applies x as an arg to a
         // String-expecting function, constraining Infer(id) → String.
-        // Post-body check: constrain_equal(Int, String) → AnnotationMismatch.
+        //
+        // The conflict surfaces at **coalesce**, as `Int` and `String` colliding on
+        // one variable, rather than eagerly as `AnnotationMismatch`. That is the
+        // consequence of `bind_annotation` being one-way (`inferred <: ann`): the
+        // reverse edge used to detect this immediately, at the cost of also
+        // rejecting sound widenings. What matters is that the conflict is caught.
         let inner = Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s"));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
@@ -2071,12 +2084,11 @@ mod tests {
             },
             body: Box::new(Expr::apply(Expr::var("x"), inner)),
         });
-        assert_eq!(
-            infer(&mut expr, &mut ctx),
-            Err(vec![InferError::AnnotationMismatch {
-                annotation: Type::Base(BaseType::Int),
-                inferred: Type::Base(BaseType::String),
-            }])
+        let errs = infer(&mut expr, &mut ctx).expect_err("Int and String cannot meet");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::IncompatibleBounds { .. })),
+            "expected the Int/String collision, got {errs:?}"
         );
     }
 
@@ -2243,7 +2255,8 @@ mod tests {
     // Record inference tests
     // -----------------------------------------------------------------------
 
-    /// A record literal `{x: 1, y: "hi"}` infers to `Record([("x", Int), ("y", String)])`.
+    /// A record literal `{x: 1, y: "hi"}` infers field-wise, each field keeping its
+    /// value's own type — so the literals' singletons, not their bases.
     #[test]
     fn test_infer_record_literal() {
         let mut ctx = TypeInferenceContext::new();
@@ -2255,8 +2268,8 @@ mod tests {
         assert_eq!(
             ty,
             Type::Record(vec![
-                ("x".into(), Type::Base(BaseType::Int)),
-                ("y".into(), Type::Base(BaseType::String)),
+                ("x".into(), int_lit_ty(1)),
+                ("y".into(), str_lit_ty("hi"))
             ])
         );
     }
@@ -2510,14 +2523,15 @@ mod tests {
             Expr::proj_index(2),
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert_eq!(ty, Type::Base(BaseType::Bool));
+        assert_eq!(ty, bool_lit_ty(true));
     }
 
     /// `Proj(Field("x"))` applied to a record infers the field type.
     #[test]
     fn test_infer_proj_field_on_record() {
         let mut ctx = TypeInferenceContext::new();
-        // Apply({x: 42, y: "hi"}, .x)  =>  Int
+        // Apply({x: 42, y: "hi"}, .x)  =>  42 — projection selects the field's type
+        // whole, singleton included.
         let mut expr = Expr::apply(
             Expr::new(TypedExprNode::Record(vec![
                 ("x".to_string(), Expr::lit(Lit::Int(42))),
@@ -2526,7 +2540,7 @@ mod tests {
             Expr::proj_field("x"),
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert_eq!(ty, Type::Base(BaseType::Int));
+        assert_eq!(ty, int_lit_ty(42));
     }
 
     // -----------------------------------------------------------------------
@@ -2621,6 +2635,24 @@ mod tests {
     ///
     /// After inference `true and false` is correctly typed; forcibly setting one
     /// operand's type to `Int` creates a node whose types are inconsistent.
+    /// A rule that reports by **returning** `Err` rather than accumulating into the
+    /// context must still surface. `check` runs most rules through `require_sub`,
+    /// which records and keeps walking, but a few — `emit_case`'s `EmptyCase`,
+    /// `emit_node`'s `UnboundVariable` — can only propagate. Dropping that return
+    /// value, as the driver used to, made those rules report into the void.
+    #[test]
+    fn typecheck_surfaces_a_propagated_error() {
+        let empty_case =
+            Expr::match_expr(Expr::lit(Lit::Int(1)), Vec::new()).with_ty(Type::Base(BaseType::Int));
+        let errs = super::super::check(&empty_case)
+            .expect_err("an empty Case must be reported, not silently accepted");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::EmptyCase { .. })),
+            "expected EmptyCase, got {errs:?}"
+        );
+    }
+
     #[test]
     fn test_typecheck_bool_logic_wrong_operand_type() {
         let mut ctx = TypeInferenceContext::new();

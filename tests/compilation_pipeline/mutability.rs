@@ -483,13 +483,16 @@ fn rule2_function_returning_mut_is_rejected() {
     expect_mut_discipline_error("x := 0\nf = \\z -> x\nf", "inside a composite type");
 }
 
-/// Rule 1: a `Mut` value must be a bare variable reference, so a conditional
-/// selecting between two mutable variables (which mutable variable does the result alias?) is
-/// rejected.
+/// Rule 1: an argument to a `Mut` parameter must be a bare variable reference,
+/// so a *conditional* selecting between two mutable variables — which one would
+/// the callee's write target? — is rejected. The check reads the argument node,
+/// not its type: a conditional over two registers reads their *values* (a
+/// mutable read derefs into the arms' join, as it does into a tuple element), so
+/// there is no `Mut` on the selection itself to key on.
 #[test]
-fn rule1_computed_mut_is_rejected() {
+fn rule1_selected_mut_argument_is_rejected() {
     expect_mut_discipline_error(
-        "x := 0\ny := 1\nx if True else y",
+        "def bump(c: Mut(Int)):\n    c += 1\nx := 0\ny := 1\nbump(x if True else y)\nx",
         "bare variable reference",
     );
 }

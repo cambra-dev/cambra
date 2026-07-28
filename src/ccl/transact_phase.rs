@@ -472,7 +472,7 @@ fn register_value_ty(ty: &Type) -> Type {
     }
     match under_mut(ty) {
         Some(v) => register_value_ty(v),
-        None => ty.clone(),
+        None => crate::ccl::ccl_utils::strip_refinements(ty),
     }
 }
 
