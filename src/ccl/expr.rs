@@ -1202,10 +1202,10 @@ impl TypedExpr {
     }
 
     /// Invoke `f` on every [`Type`] slot this node carries **directly**: its own
-    /// `ty`, its `user_annotation`, a [`TypedExprNode::Cast`]'s `target`, and the
-    /// declared type of every binder it introduces
-    /// ([`walk_binders`](Self::walk_binders)). Does not recurse into child
-    /// expressions.
+    /// `ty`, its `user_annotation`, a [`TypedExprNode::Cast`]'s `target`, and — for
+    /// every binder it introduces ([`walk_binders`](Self::walk_binders)) — both
+    /// that binder's `ty` **and** its `user_annotation`. Does not recurse into
+    /// child expressions.
     ///
     /// This is the single source of truth for "which type slots a node carries",
     /// and it exists because those slots are **independent** values: a refinement
@@ -1219,6 +1219,22 @@ impl TypedExpr {
     /// one place instead of every such pass, and a pass cannot acquire a blind
     /// spot by omission.
     ///
+    /// **A binder's annotation is a slot, not decoration.** Lowering writes a
+    /// mutable variable's `Mut(V, D)` history *there* rather than on `b.ty`
+    /// (`x := e` lowers via `let_bind_annotated`), and `infer::api::binder_is_mut`
+    /// reads it as authoritative over `b.ty`. A walk that visits only `b.ty` will
+    /// silently skip every mutable binder in the program.
+    ///
+    /// **Coverage is exact for every variant except
+    /// [`TypedExprNode::Transact`]**, whose `domain` — the sequencing extent, or
+    /// `Txn` — is the one directly-carried `Type` this does not visit. `Transact`
+    /// is born by `planning::plan_loops`, *after* every pass that uses this walk,
+    /// so no caller can observe the omission today; covering it would newly expose
+    /// the domain to `planning::compile_refinement_predicates`, which runs later.
+    /// That is a real behavioural change in the recurrence engine and wants its
+    /// own change rather than riding along here. The exhaustiveness this claims is
+    /// checked, not asserted: `walk_type_slots_covers_every_carried_type_slot`.
+    ///
     /// Callers that also need slots reachable *through* a type (a `Fun` domain, a
     /// refinement predicate's own type slots) compose this with
     /// [`Type::walk_children`] — see
@@ -1231,7 +1247,12 @@ impl TypedExpr {
         if let TypedExprNode::Cast { target, .. } = &self.node {
             f(target);
         }
-        self.walk_binders(|b| f(&b.ty));
+        self.walk_binders(|b| {
+            f(&b.ty);
+            if let Some(annotation) = &b.user_annotation {
+                f(annotation);
+            }
+        });
     }
 
     /// Mutable analog of [`walk_type_slots`](Self::walk_type_slots), for passes
@@ -1245,7 +1266,12 @@ impl TypedExpr {
         if let TypedExprNode::Cast { target, .. } = &mut self.node {
             f(target);
         }
-        self.walk_binders_mut(|b| f(&mut b.ty));
+        self.walk_binders_mut(|b| {
+            f(&mut b.ty);
+            if let Some(annotation) = &mut b.user_annotation {
+                f(annotation);
+            }
+        });
     }
 
     /// Mutable analog of [`fold_children`](Self::fold_children).
@@ -1479,6 +1505,73 @@ mod tests {
         assert!(
             !ops.iter()
                 .any(|e| matches!(&e.node, TypedExprNode::CollectionUnion(_))),
+        );
+    }
+
+    /// Every `Type` a node carries *directly* is reached by
+    /// [`TypedExpr::walk_type_slots`] — or is a named, justified exception.
+    ///
+    /// Stamps a distinct `Type::DataSource` marker into each slot and asserts the
+    /// walk reports exactly the expected set. A marker is used rather than a real
+    /// type because the point is slot *reachability*, not type content.
+    ///
+    /// The full inventory of directly-carried `Type`s in the AST: `TypedExpr.ty`,
+    /// `TypedExpr.user_annotation`, `TypedBinding.ty`, `TypedBinding.user_annotation`,
+    /// `TypedExprNode::Cast.target`, and `TypedExprNode::Transact.domain`. The walk
+    /// covers the first five; `Transact.domain` is excluded for the reason on
+    /// `walk_type_slots`, and this pins that exclusion so it cannot become silent.
+    #[test]
+    fn walk_type_slots_covers_every_carried_type_slot() {
+        fn marker(name: &str) -> Type {
+            Type::DataSource(name.into())
+        }
+        fn reached(e: &TypedExpr) -> Vec<String> {
+            let mut seen = Vec::new();
+            e.walk_type_slots(|ty| {
+                if let Type::DataSource(n) = ty {
+                    seen.push(n.to_string());
+                }
+            });
+            seen.sort();
+            seen
+        }
+
+        // A binder-bearing node: node type + annotation, binder type + annotation.
+        let mut lam = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "x".into(),
+                ty: marker("param_ty"),
+                user_annotation: Some(marker("param_annotation")),
+            },
+            body: Box::new(TypedExpr::lit(Lit::Unit)),
+        });
+        lam.ty = marker("node_ty");
+        lam.user_annotation = Some(marker("node_annotation"));
+        assert_eq!(
+            reached(&lam),
+            vec!["node_annotation", "node_ty", "param_annotation", "param_ty"],
+            "a binder's annotation carries a mutable variable's history — see \
+             `walk_type_slots`"
+        );
+
+        // `Cast` carries a target beyond its own type.
+        let mut cast = TypedExpr::cast(TypedExpr::lit(Lit::Unit), marker("cast_target"));
+        cast.ty = marker("node_ty");
+        assert_eq!(reached(&cast), vec!["cast_target", "node_ty"]);
+
+        // `Transact.domain` is the one directly-carried `Type` deliberately not
+        // covered. Asserted so the exclusion stays a decision rather than drift:
+        // if this starts failing, the walk grew to cover it and the doc must too.
+        let mut txn = TypedExpr::new(TypedExprNode::Transact {
+            keys: Vec::new(),
+            writers: Vec::new(),
+            domain: marker("transact_domain"),
+        });
+        txn.ty = marker("node_ty");
+        assert_eq!(
+            reached(&txn),
+            vec!["node_ty"],
+            "`Transact.domain` is excluded on purpose; see `walk_type_slots`"
         );
     }
 }

@@ -309,14 +309,30 @@ Two things make this load-bearing rather than housekeeping:
   than a bare map.
 
 A pass reaches predicates through **every type slot a node carries**, not just
-`expr.ty`: the node's own type, its `user_annotation`, a `Cast`'s `target`, and
-each binder's declared type all hold independent predicate `Rc`s.
-`Expr::walk_type_slots{,_mut}` is the single source of truth for that set,
-precisely because hand-rolling it per pass is how a pass silently acquires a
-blind spot — `Cast.target`, where a comprehension filter's predicate actually
-lives, is the one that costs most. `count_free`/`is_free` are on it too, and that
-is not cosmetic: several passes *skip work* when `is_free` says no, so a slot the
-free-variable walk cannot see is a slot those passes decline to rewrite.
+`expr.ty`: the node's own type, its `user_annotation`, a `Cast`'s `target`, and —
+per binder — both the binder's declared type *and* its annotation. Each holds an
+independent predicate `Rc`. `Expr::walk_type_slots{,_mut}` is the single source of
+truth for that set, precisely because hand-rolling it per pass is how a pass
+silently acquires a blind spot — `Cast.target`, where a comprehension filter's
+predicate actually lives, is the one that costs most. `count_free`/`is_free` are on
+it too, and that is not cosmetic: several passes *skip work* when `is_free` says
+no, so a slot the free-variable walk cannot see is a slot those passes decline to
+rewrite.
+
+A binder's **annotation** is the subtle member of that set: it is where lowering
+writes a mutable variable's `Mut(V, D)` history (`x := e` lowers via
+`let_bind_annotated`), and `infer::api::binder_is_mut` reads it as authoritative
+over the binder's `ty`. A walk covering only `b.ty` skips every mutable binder in
+the program, and — because an erasure and its own post-condition would share that
+walk — the check could not report what the erasure missed.
+
+The claim is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
+stamps a distinct marker into every directly-carried `Type` in the AST and pins
+which ones the walk reaches. One is deliberately excluded — `Transact`'s `domain` —
+because that node is born by `plan_loops` after every pass on the walk, so covering
+it would newly expose the sequencing extent to planning's predicate compilation.
+That is a behavioural change in the recurrence engine, and the test pins the
+exclusion so it stays a decision rather than drift.
 
 #### The memo key is the predicate *and the conditions it was rebuilt under*
 

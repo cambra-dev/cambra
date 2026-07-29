@@ -1093,6 +1093,57 @@ mod tests {
     use super::*;
     use crate::ccl::BaseType;
 
+    /// Whether any *binder annotation* still carries a mutable history.
+    ///
+    /// Deliberately independent of [`contains_mut_type`]: the post-condition and
+    /// the erasure share one walk, so a slot that walk misses is a slot the
+    /// post-condition cannot report. A guard has to enumerate the slot itself or
+    /// it inherits the same blind spot.
+    fn binder_annotation_has_mut(expr: &Expr) -> bool {
+        fn ty_has_mut(ty: &Type) -> bool {
+            matches!(
+                ty,
+                Type::History {
+                    kind: HistoryKind::Overwrite,
+                    ..
+                }
+            ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
+        }
+        let mut found = false;
+        expr.walk_binders(|b| {
+            if let Some(ann) = &b.user_annotation {
+                found |= ty_has_mut(ann);
+            }
+        });
+        found || expr.any_child(binder_annotation_has_mut)
+    }
+
+    /// A mutable variable's history rides the binder's **annotation**, not its
+    /// `ty`: `x := e` lowers to `let_bind_annotated(.., Mut(V, _))`, and
+    /// `infer::api::binder_is_mut` reads the annotation as authoritative. So the
+    /// phase's erasure has to reach that slot.
+    #[test]
+    fn phase_erases_mut_from_a_binder_annotation() {
+        let (mut tree, _, _) = direct_mirror_sum();
+        let TypedExprNode::Let { binding, .. } = &mut tree.node else {
+            panic!("fixture is a let");
+        };
+        binding.user_annotation = Some(Type::History {
+            value: Box::new(Type::Base(BaseType::Int)),
+            domain: Box::new(Type::Hole),
+            kind: HistoryKind::Overwrite,
+        });
+        assert!(binder_annotation_has_mut(&tree), "sanity: fixture has one");
+
+        let out = run(tree);
+
+        assert!(
+            !binder_annotation_has_mut(&out),
+            "a history survived on a binder annotation: {}",
+            symbolic(&out)
+        );
+    }
+
     /// Build the typed direct-mirror tree for
     /// `x := 0; for i in [1,2,3]: x += i; x` as lowering + inference
     /// leave it: `let x = 0 in ExprStmt(For{i, [1,2,3], x := x+i}, x)`.
