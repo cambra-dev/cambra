@@ -29,6 +29,40 @@ prose describes code you can go read.
   `NodeId` itself is `Hash`/`Ord`, as a map key.) `NodeId::PLACEHOLDER` is the reserved sentinel for
   `Default`/`mem::take` throwaways (ignored by the recorder; `assert_unique_node_ids`
   backstops that it never persists into a checked tree).
+- **The id domain: the main tree, and nothing else.** A `NodeId` lives on the
+  `walk_children` node-set. A `Type` carries no identity — the only `NodeId`s
+  reachable *through* a type are the `TypedExpr`s inside a
+  `Refinement.predicate`, and those are outside the domain: duplication does not
+  freshen them, and no walk that matters enumerates them.
+  `assert_unique_node_ids` excludes predicates deliberately (a predicate-inclusive
+  walk would false-fire on inline's blind spot); the fold's leak classes and every
+  `SourceProjection` enumerate from `collect_tree_ids`; the remaining
+  predicate-interior readers key on `PredicateId` (transient pointer identity) or
+  `Name`. So predicate-interior ids are *carried*, never *checked*, and a
+  duplicated subtree's predicate interior may alias its source's ids. Freshening
+  them would be write-only, and it splits predicate `Rc` sharing — planning's
+  compile memo is `Rc`-keyed, so a split predicate is compiled once per copy.
+  The rule cuts the other way too, and usefully: because predicate-interior ids
+  are unread, a duplication path is free to *share* a predicate `Rc` with its
+  source rather than rebuild one, with no identity consequence to weigh (see
+  `design/type-inference.md`, "Sharing is an invariant").
+
+  `uniquify::collect_node_ids` is the one predicate-inclusive walk, and is not a
+  counterexample: it is a debug tripwire on uniquify itself, asserting
+  **multiset preservation** over the nodes `Uniquifier::expr` visits — uniquify
+  *rebuilds* predicate terms through a `PredMemo`, which is exactly where ids
+  could be dropped or re-minted. It checks preservation, not uniqueness, and
+  deliberately does not dedup by `PredicateId`.
+
+  The cost, accepted: an inference error blamed on a predicate-interior node
+  resolves to no span (the guard of `[x for x in xs if x > "a"]` reports without
+  a caret) because the id is not in the lowering projection. Fixing that means
+  seeding predicate-position nodes into the fold as live roots and making
+  `output_ids` predicate-inclusive — deferred; see the lineage-redesign doc's
+  decisions 16-17. Sharing ids with the main tree is *not* a fix: lowering
+  already shares a few incidentally (`pred_sources = gen_sources.clone()`), but
+  the nodes actually blamed for guard errors are minted fresh in predicate
+  position and have no main-tree twin.
 - **`Pass`** — the compiler stage that produced/rewrote a node (`Lower`,
   `Uniquify`, `Inline`, `Desugar`, `Transact`, `Letrec`, `Mono`, `LambdaElim`,
   `Planning`). It lives in the lineage *data* (each step's `via`), never in a

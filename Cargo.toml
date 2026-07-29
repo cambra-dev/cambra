@@ -31,6 +31,9 @@ deep-typecheck = []
 serde = ["dep:serde"]
 
 [dev-dependencies]
+# Self dev-dependency so the integration tests (separate crates) can see the
+# `test-helpers`-gated helpers. Cargo unifies this with the library under test.
+cambra = { path = ".", features = ["test-helpers"] }
 microbench = "0.5.0"
 rstest = { version = "0.26.1", features = ["async-timeout"] }
 rstest-log = "0.2.0"

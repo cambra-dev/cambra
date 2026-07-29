@@ -1212,22 +1212,16 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
 /// Mint a fresh [`NodeId`](crate::ccl::provenance::NodeId) for every node in a
 /// monomorphization clone.
 ///
-/// Walks the same node-set as `uniquify::collect_node_ids`: the main expression
-/// tree *and* the [`TypedExpr`]s living inside type-borne refinement predicates
-/// (reached through `expr.ty`, the user annotation, and a `Cast`'s target
-/// type). After `freshen_expr_type_slots` those predicate
-/// `Rc<TypedExpr>`s are fresh copies that still carry the *original* ids, so
-/// they must be freshened here too — otherwise predicate-embedded clone nodes
-/// would collide across specializations exactly like the main-tree nodes do.
-///
-/// A predicate term shared by `Rc` across several type slots is freshened once;
-/// a visited-set keyed by [`PredicateId`](crate::ccl::PredicateId) (pointer
-/// identity) prevents re-walking it (and re-minting its ids), so the freshen
-/// stays 1:1 per node.
+/// Walks the main expression tree — the `walk_children` domain, which is the
+/// whole `NodeId` domain. Type slots are *not* walked: a `Type` carries no
+/// identity, and the predicate `Rc<TypedExpr>`s reachable through one are outside
+/// the id domain, so a specialization's predicate-embedded ids may alias the
+/// definition's. Nothing checks or reads them (see `ccl/design/provenance.md`,
+/// "The id domain"), and freshening them would split the predicate `Rc` sharing
+/// planning's compile memo depends on.
 fn freshen_clone_node_ids(expr: &mut Expr) {
-    // The deep walk (main tree + predicate `Rc`s via `make_mut` + `Cast`
-    // targets) lives on `TypedExpr::freshen_node_ids_deep`; each re-mint fires
-    // the ambient `on_copy` hook, captured by the open Mono Copy step.
+    // The deep walk lives on `TypedExpr::freshen_node_ids_deep`; each re-mint
+    // fires the ambient `on_copy` hook, captured by the open Mono Copy step.
     expr.freshen_node_ids_deep();
 }
 
@@ -1301,10 +1295,9 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // breaking any post-inference index keyed by `NodeId`. Mint a fresh id for
     // every cloned node. This is a dedicated walk scoped to monomorphization
     // (not folded into the shared `freshen_expr_type_slots`, which also runs on
-    // refinement-predicate copies outside any mono context). It mirrors
-    // `uniquify::collect_node_ids`'s traversal so predicate-embedded clone
-    // nodes (reached only through type slots / `Cast` targets) are freshened
-    // too.
+    // refinement-predicate copies outside any mono context). It covers the
+    // `walk_children` domain only — predicate-embedded ids, reachable through
+    // type slots, are outside the id domain and stay aliased.
     freshen_clone_node_ids(&mut clone);
 
     // Pin the clone to the use's live instantiation type, two-way. Inward,

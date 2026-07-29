@@ -656,59 +656,24 @@ impl PartialEq for TypedExpr {
     }
 }
 
-/// Shared deep-freshen walk over a type's refinement-predicate node-set (the
-/// [`crate::ccl::uniquify`] `collect_node_ids` domain). Freshens each predicate
-/// `Rc` once (clone-on-write via [`Rc::make_mut`](std::rc::Rc::make_mut), guarded
-/// by a [`PredicateId`](crate::ccl::PredicateId) visited-set). Backs both
-/// [`TypedExpr::freshen_node_ids_deep`] and [`TypedExpr::freshen_interior_node_ids`].
+/// Shared deep-freshen walk over an expression's node-set: re-mints this node's
+/// id (which fires the ambient `on_copy` recorder hook) then descends into its
+/// children. Backs [`TypedExpr::freshen_node_ids_deep`]; the interior variant
+/// calls it per child, skipping the root's own re-mint.
 ///
-/// **This walk splits predicate `Rc` sharing, on purpose.** A predicate interior
-/// is made of [`TypedExpr`]s carrying [`NodeId`]s, so a freshened copy must not
-/// alias the original's ids — `make_mut` on a shared `Rc` (refcount > 1) clones,
-/// which is exactly what makes the copy's ids its own.
-///
-/// TODO(predicate-sharing): that trades against the sharing invariant
-/// `tests/predicate_sharing.rs` asserts — no two *distinct* predicate `Rc`s are
-/// structurally equal — because planning's compile memo is keyed on `Rc`
-/// identity, so a split predicate is compiled once per copy. The guard measures
-/// at post-inference and its corpus is comprehension-only, so it does not
-/// currently observe this: a UDF `def` whose body carries a filter predicate
-/// already yields two structurally-equal `Rc`s once its body is duplicated.
-/// Decide whether planning's memo should key on structure rather than `Rc`
-/// identity, or whether the sharing invariant should be stated as "preserved
-/// through inference, deliberately re-split at duplication".
-fn freshen_from_ty(t: &mut Type, seen: &mut std::collections::HashSet<crate::ccl::PredicateId>) {
-    if let Type::Refinement(_, r) = t {
-        // The same predicate `Rc` may be reachable through several type slots;
-        // guard on pointer identity so it is freshened once.
-        if seen.insert(r.predicate_id()) {
-            let pred = std::rc::Rc::make_mut(&mut r.predicate);
-            freshen_from_expr(pred, seen);
-        }
-    }
-    t.walk_children_mut(|c| freshen_from_ty(c, seen));
-}
-
-/// Shared deep-freshen walk over an expression's whole node-set: re-mints this
-/// node's id (which fires the ambient `on_copy` recorder hook) then descends
-/// into its type slots, annotation, `Cast` target, and children. Backs
-/// [`TypedExpr::freshen_node_ids_deep`]; the interior variant calls it per
-/// child, skipping the root's own re-mint.
-fn freshen_from_expr(
-    e: &mut TypedExpr,
-    seen: &mut std::collections::HashSet<crate::ccl::PredicateId>,
-) {
+/// **Type slots are not walked, and that is the rule, not an omission.** A
+/// [`Type`] carries no identity: the only [`NodeId`]s reachable through one are
+/// the [`TypedExpr`]s inside a `Refinement.predicate`, and those are outside the
+/// id domain — `assert_unique_node_ids` excludes predicates deliberately, and the
+/// lineage fold's leak classes and `SourceProjection` both enumerate from
+/// `collect_tree_ids` (the `walk_children` domain), so a predicate-interior id is
+/// carried but never checked. Freshening them was write-only work whose only
+/// observable effect was splitting predicate `Rc` sharing — planning's compile
+/// memo is keyed on `Rc` identity, so each split predicate is compiled once per
+/// copy. See `design/provenance.md`, "The id domain".
+fn freshen_from_expr(e: &mut TypedExpr) {
     e.freshen_node_id();
-    freshen_from_ty(&mut e.ty, seen);
-    if let Some(ann) = &mut e.user_annotation {
-        freshen_from_ty(ann, seen);
-    }
-    // `Cast`'s target is a type slot `walk_children_mut` skips; walk it
-    // explicitly so its refinement predicate's nodes are freshened.
-    if let TypedExprNode::Cast { target, .. } = &mut e.node {
-        freshen_from_ty(target, seen);
-    }
-    e.walk_children_mut(|c| freshen_from_expr(c, seen));
+    e.walk_children_mut(freshen_from_expr);
 }
 
 impl TypedExpr {
@@ -792,32 +757,27 @@ impl TypedExpr {
         (old, new)
     }
 
-    /// Deep-freshen every [`NodeId`] in this expression's node-set. Each
-    /// re-minted node fires the ambient `on_copy` recorder hook (via
+    /// Deep-freshen every [`NodeId`] in this expression's node-set — the
+    /// `walk_children` domain, which is the whole id domain (type slots carry no
+    /// identity; see [`freshen_from_expr`]). Each re-minted node fires the ambient
+    /// `on_copy` recorder hook (via
     /// [`freshen_node_id`](Self::freshen_node_id)), so an open lineage step
     /// captures the copies.
     ///
-    /// Walks the **same node-set as [`crate::ccl::uniquify`]'s `collect_node_ids`**:
-    /// the main expression tree *and* the [`TypedExpr`]s living inside type-borne
-    /// refinement predicates — reached through `self.ty`, the user annotation, and
-    /// a [`TypedExprNode::Cast`]'s target type. Predicate `Rc`s are split via
-    /// [`Rc::make_mut`](std::rc::Rc::make_mut) (clone-on-write) so freshening a
-    /// copy never mutates a predicate term still shared by another tree; a
-    /// [`PredicateId`](crate::ccl::PredicateId) visited-set freshens each such
-    /// term exactly once (so an `Rc` reachable through several type slots is not
-    /// re-walked or re-minted, keeping the freshen 1:1 per node).
-    ///
     /// This is the single deep-freshen walk shared by monomorphization's clone
     /// freshening and the transact/letrec phases' `subst_env` copies. Do not
-    /// hand-roll a second walk over this node-set; they must stay in lockstep.
+    /// hand-roll a second walk over this node-set.
+    ///
+    /// Not to be confused with [`crate::ccl::uniquify`]'s `collect_node_ids`,
+    /// which *is* predicate-inclusive: it is a debug tripwire asserting uniquify
+    /// preserves every id as a **multiset** across its own predicate rebuilds, a
+    /// different property over a deliberately different domain.
     pub(crate) fn freshen_node_ids_deep(&mut self) {
-        let mut seen = std::collections::HashSet::new();
-        freshen_from_expr(self, &mut seen);
+        freshen_from_expr(self);
     }
 
-    /// Deep-freshen the **interior** of this node — its type-slot refinement
-    /// predicates and every descendant — while leaving the node's *own*
-    /// [`NodeId`] untouched.
+    /// Deep-freshen the **interior** of this node — every descendant — while
+    /// leaving the node's *own* [`NodeId`] untouched.
     ///
     /// This is the root-carry primitive: the
     /// substitution engine's compound-replacement arm carries the occurrence's
@@ -827,17 +787,8 @@ impl TypedExpr {
     /// `on_copy` hook (via [`freshen_node_id`](Self::freshen_node_id)), so an
     /// open lineage step captures them.
     pub(crate) fn freshen_interior_node_ids(&mut self) {
-        let mut seen = std::collections::HashSet::new();
-        // The root's own id is preserved; only its type slots and children are
-        // freshened.
-        freshen_from_ty(&mut self.ty, &mut seen);
-        if let Some(ann) = &mut self.user_annotation {
-            freshen_from_ty(ann, &mut seen);
-        }
-        if let TypedExprNode::Cast { target, .. } = &mut self.node {
-            freshen_from_ty(target, &mut seen);
-        }
-        self.walk_children_mut(|c| freshen_from_expr(c, &mut seen));
+        // The root's own id is preserved; only its children are freshened.
+        self.walk_children_mut(freshen_from_expr);
     }
 
     /// Set the inferred type on this expression, consuming and returning it.

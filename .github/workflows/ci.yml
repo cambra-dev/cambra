@@ -112,6 +112,20 @@ jobs:
         if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh clippy_release
 
+      - name: Clippy (serde feature)
+        # The `serde` feature is default-OFF, so every pass above compiles zero
+        # serde — including the hand-written `Serialize` impls for the inspector
+        # wire types. Without this step that code is compiled by nobody.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh clippy_serde
+
+      - name: Doc
+        # Builds rustdoc with broken intra-doc links denied, which is what makes
+        # a `[`identifier`]` reference in a doc comment a checkable citation
+        # rather than prose that rots silently.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh doc
+
       - name: Test
         # Run even if earlier steps failed so we see all errors in one run.
         # (Steps default to `if: success()`, which skips on prior failure.)

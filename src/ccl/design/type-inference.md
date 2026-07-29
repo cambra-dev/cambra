@@ -308,6 +308,23 @@ Two things make this load-bearing rather than housekeeping:
   retains every origin for its own lifetime; that is why passes use it rather
   than a bare map.
 
+**One known exception, scoped and unfixed: generic instantiation.** The list above
+is the *rebuilding passes*. `freshen_above`'s `Refinement` arm does not thread a
+memo — `freshen_refinement_predicate` clones the predicate term, freshens its type
+slots, and installs an unconditional `Rc::new` — so every refinement a scheme
+instantiation touches comes out `Rc`-distinct, including several slots of one
+clone that shared an `Rc` going in. This is why the invariant holds for
+comprehension-only programs and fails as soon as a UDF body carries a predicate:
+`f = \xs -> [x for x in xs if x > 1]` leaves 4 surplus `Rc`s of 9 distinct at one
+call site, 29 of 38 at two. `tests/predicate_sharing.rs` does not observe it (its
+corpus is comprehension-only and it measures post-inference). Whether this costs
+anything in planning is **unmeasured** — the superlinearity argument above comes
+from the original split's shape, not this one — and that measurement is what
+decides between fixing the producer (memoize the rebuild, or keep the origin `Rc`
+when the freshen is vacuous) and narrowing the invariant to "preserved through
+inference, deliberately re-split at instantiation". Tracked in the
+lineage-redesign doc, §12.4(9).
+
 A pass reaches predicates through **every type slot a node carries**, not just
 `expr.ty`: the node's own type, its `user_annotation`, a `Cast`'s `target`, and —
 per binder — both the binder's declared type *and* its annotation. Each holds an

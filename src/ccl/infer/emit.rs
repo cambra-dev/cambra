@@ -1431,7 +1431,9 @@ mod review_tests {
         let mut r1 = Refinement::sharing(&shared);
         let mut r2 = Refinement::sharing(&shared);
 
-        let mut ctx = InferCtx::new(std::collections::HashMap::new());
+        // Our stack seeds the blame cursor at construction; this unit test has no
+        // enclosing tree, so the predicate term itself is the root to blame.
+        let mut ctx = InferCtx::new(std::collections::HashMap::new(), shared.node_id());
         let d1 = ctx.fresh();
         let d2 = ctx.fresh();
         emit_bare_predicate(&mut r1, &d1, &mut ctx).expect("first occurrence types");

@@ -310,7 +310,19 @@ impl Uniquifier {
 /// the main expression tree *and* the [`TypedExpr`]s living inside type-borne
 /// refinement predicates (which uniquify rebuilds in place). Sorting makes the
 /// result order-independent so the before/after comparison checks set identity
-/// with 1:1 multiplicity, not traversal order. Compiled under `debug_assertions`
+/// with 1:1 multiplicity, not traversal order.
+///
+/// This domain is deliberately **broader than the `NodeId` domain** (the
+/// `walk_children` node-set — see `design/provenance.md`, "The id domain"): the
+/// property checked here is not uniqueness but *preservation*, and predicate
+/// interiors are in scope precisely because uniquify rebuilds those terms through
+/// a [`PredMemo`], which is where a rebuild could drop or re-mint an id. Do not
+/// narrow it to match the freshen walks — they are checking different things.
+/// (Likewise no [`PredicateId`](crate::ccl::PredicateId) dedup: a term shared by
+/// `Rc` across N slots contributes its ids N times, on both sides of the
+/// comparison.)
+///
+/// Compiled under `debug_assertions`
 /// (where `run` asserts with it) or `test` (where the preservation tests call
 /// it); a release build with neither pays nothing.
 #[cfg(any(debug_assertions, test))]

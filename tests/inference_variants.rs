@@ -78,27 +78,17 @@ fn var(name: &str) -> TypedExpr {
     TypedExpr::var(name)
 }
 
-/// The inference errors of a located list, dropping the blame nodes.
-///
-/// These tests assert on error payloads and have no lowering projection to
-/// resolve a blame node against. The library exposes no such helper outside its
-/// own unit tests — discarding the error/node pairing is a test-local
-/// convenience, never a production affordance.
-fn bare(located: Vec<LocatedInferError>) -> Vec<InferError> {
-    located.into_iter().map(|l| l.error).collect()
-}
-
 /// Run inference on an expression, returning the inferred root type.
 fn run(mut expr: TypedExpr) -> Result<Type, Vec<InferError>> {
     let mut ctx = TypeInferenceContext::new();
-    infer(&mut expr, &mut ctx).map_err(bare)
+    infer(&mut expr, &mut ctx).map_err(LocatedInferError::bare)
 }
 
 /// Run inference and return the fully-inferred expression (so tests can
 /// inspect inner `expr.ty` / `binding.ty` slots, not just the root type).
 fn run_full(mut expr: TypedExpr) -> Result<TypedExpr, Vec<InferError>> {
     let mut ctx = TypeInferenceContext::new();
-    infer(&mut expr, &mut ctx).map_err(bare)?;
+    infer(&mut expr, &mut ctx).map_err(LocatedInferError::bare)?;
     Ok(expr)
 }
 

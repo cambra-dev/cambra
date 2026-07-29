@@ -604,9 +604,10 @@ impl Subst {
             if !matches!(e.node, TypedExprNode::Var(_)) {
                 // Compound replacement: `as_expr_preserving` bare-`clone()`s the
                 // whole subtree, sharing the source's NodeIds. Freshen only the
-                // INTERIOR (children + type slots) — the root keeps the carried
-                // id. Each interior re-mint fires the ambient `on_copy` lineage
-                // hook into any open step.
+                // INTERIOR (the children) — the root keeps the carried id. Each
+                // interior re-mint fires the ambient `on_copy` lineage hook into
+                // any open step. Type slots are out of the id domain, so the
+                // predicate `Rc`s the clone shares with its source stay shared.
                 //
                 // Freshening the root as well would work, but it re-mints an id
                 // the carry immediately overwrites, so the step records a `Copy`

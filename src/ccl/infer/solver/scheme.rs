@@ -259,6 +259,22 @@ pub fn freshen_above(
 /// Freshen a refinement's predicate: clone the (immutable) predicate term,
 /// freshen its type slots through `cache`, and install a fresh `Rc`. See
 /// [`freshen_above`]'s `Refinement` arm.
+///
+/// **This does not preserve predicate `Rc` sharing, and unlike the rebuilding
+/// passes it threads no [`PredMemo`](crate::ccl::ccl_utils::PredMemo).** The
+/// `Rc::new` is unconditional, so N type slots of one clone that shared an `Rc`
+/// going in come out with N distinct `Rc`s, and planning — whose compile memo is
+/// `Rc`-keyed — compiles each separately. Known and not currently fixed: the
+/// downstream cost is unmeasured, and the fix (memoize on
+/// [`PredicateId`](crate::ccl::PredicateId) with `PredMemo`'s keepalive
+/// discipline, or keep the origin `Rc` when the freshen is vacuous) is chosen
+/// only once that cost is known. See `ccl/design/type-inference.md`, "One known
+/// exception, scoped and unfixed", for the numbers and the decision.
+///
+/// Note the freshened copy's predicate interior carries the *origin's*
+/// [`NodeId`](crate::ccl::provenance::NodeId)s: predicate interiors are outside
+/// the id domain (`ccl/design/provenance.md`), so nothing reads or checks them and
+/// a sharing fix here has no identity consequence.
 fn freshen_refinement_predicate(
     lim: Level,
     r: &Refinement,
