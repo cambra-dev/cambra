@@ -627,7 +627,7 @@ fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
 /// across the whole test suite, not just a crafted program.
 ///
 /// The walk is the same main-tree `walk_children` walk as
-/// [`duplicate_node_ids`]/`collect_ids` — a predicate-inclusive walk would
+/// [`duplicate_node_ids`]/[`collect_tree_ids`] — a predicate-inclusive walk would
 /// false-fire on inline's known predicate blind spot. Gated
 /// via `cfg!(...)` as an expression (not a `#[cfg]` item) so the same call site
 /// compiles under both `./ci.sh` clippy passes without a release-only
@@ -1155,8 +1155,8 @@ Error: lowering error
     /// whose provenance resolves to a source span. `1 and 2` constrains the
     /// integer literal against `and`'s `Bool` operand during pass-1 emission,
     /// so the blame node is that pass-1 emit site and its id round-trips
-    /// through `provenance.origins` to a `Some` span over the offending
-    /// expression.
+    /// through the lowering projection (`SourceProjection`, keyed by `NodeId`)
+    /// to a `Some` span over the offending expression.
     ///
     /// (`1 + "a"` reaches the same outcome by the other route: its `Int`/`String`
     /// collision surfaces in pass-2 coalesce, which blames per error — see
@@ -1189,9 +1189,9 @@ Error: lowering error
     ///
     /// `1 + "a"` constrains one variable against both `Int` and `String`, which
     /// only fails when the bounds are resolved — so this is the accumulating
-    /// walk's blame path (`CoalesceCtx::blame_frame`), not emission's. Before
-    /// coalesce errors were blamed per raising frame, every one of them rendered
-    /// without source context.
+    /// walk's blame path (`CoalesceCtx::current_node`, stamped by `coalesce_node`),
+    /// not emission's. Coalesce blames per error, so each of several errors
+    /// renders with its own source context.
     #[test]
     fn coalesce_error_carries_resolved_span() {
         let code = "1 + \"a\"\n";

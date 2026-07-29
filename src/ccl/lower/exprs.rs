@@ -370,22 +370,9 @@ pub(super) fn lower_compare(
             // copy-frame so each re-minted node lands as a `Copy` LoweringStep
             // mirroring the original operand's (Source) image — exactly the
             // attribution wanted for the duplicated operand.
-            //
-            // This is a copy-only frame, so its `nature` is inert:
-            // `collapse_lowering` attributes `Copy` steps by mirroring the
-            // origin's folded entry, never from the frame's nature. The
-            // `Nature::Source` passed here is therefore not a second `Source`
-            // emitter — it never reaches an attribution.
-            use crate::ccl::lineage::{Nature, StepKind, step};
+            use crate::ccl::lineage::copy_frame;
             let mut copy = operands[i].clone();
-            let _frame = step(
-                "lower.compare_operand",
-                StepKind::Transform {
-                    consumed: Vec::new(),
-                },
-                Vec::new(),
-                Nature::Source,
-            );
+            let _frame = copy_frame("lower.compare_operand");
             copy.freshen_node_ids_deep();
             copy
         };
@@ -518,9 +505,9 @@ mod tests {
     }
 
     /// Regression: a chained comparison shares each middle operand between two
-    /// adjacent pairs. A bare clone used to put the same `NodeId`s in the tree
-    /// twice, tripping `assert_unique_node_ids` at the post-inline boundary. The
-    /// second use is freshened inside a lowering copy-frame; the tree must be
+    /// adjacent pairs. A bare clone would put the same `NodeId`s in the tree
+    /// twice, tripping `assert_unique_node_ids` at the `"post-lowering"`
+    /// boundary. The second use is freshened inside a lowering copy-frame; the tree must be
     /// duplicate-free, and the lowering fold must explain every node with no leak
     /// (the freshened copy resolves as a `Copy` mirroring its origin's image).
     #[test]

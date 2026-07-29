@@ -16,8 +16,7 @@ use crate::ccl::{
     Type, TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::{count_free, strip_refinements},
     letrec::check_letrec_causal,
-    mut_elim::{binding, fun_parts, let_in, tvar},
-    provenance::NodeId,
+    mut_elim::{binding, fun_parts, tvar},
     symbolic::symbolic,
 };
 
@@ -139,7 +138,7 @@ fn flatten_channel_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Exp
     }
     let mut out = body;
     for (b, def) in ordered.into_iter().rev() {
-        out = let_in(b, def, out);
+        out = Expr::let_in(b, def, out);
     }
     out
 }
@@ -479,17 +478,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         );
     }
 
-    let ty = body.ty.clone();
-    Expr {
-        node: TypedExprNode::Let {
-            binding: binding(reg, reg_ty),
-            bound_expr: Box::new(transact),
-            body: Box::new(body),
-        },
-        ty,
-        user_annotation: None,
-        node_id: NodeId::fresh(),
-    }
+    Expr::let_in(binding(reg, reg_ty), transact, body)
 }
 
 /// Rewrite every history / tap binding reference in the continuation to a
@@ -661,17 +650,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         h.name
     );
 
-    let ty = body.ty.clone();
-    Expr {
-        node: TypedExprNode::Let {
-            binding: binding(reg, reg_ty),
-            bound_expr: Box::new(transact),
-            body: Box::new(body),
-        },
-        ty,
-        user_annotation: None,
-        node_id: NodeId::fresh(),
-    }
+    Expr::let_in(binding(reg, reg_ty), transact, body)
 }
 
 /// `__reg.field = Apply(Var(__reg), Proj(Field(field)))` — a register-record

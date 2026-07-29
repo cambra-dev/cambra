@@ -1,10 +1,17 @@
 # Provenance & lineage — node identity and source attribution
 
-This doc is the as-built reference for how Cambra keeps an IR node's connection
-to the source the user wrote, through a pipeline that otherwise loses it (spans
-dropped at lowering, monomorphization cloning subtrees, inline fanning UDF
-bodies out, channelize rewriting defers, lambda-elim synthesizing combinators,
-planning fusing clauses).
+This doc is the reference for how Cambra keeps an IR node's connection to the
+source the user wrote, through a pipeline that otherwise loses it (spans dropped
+at lowering, monomorphization cloning subtrees, inline fanning UDF bodies out,
+channelize rewriting defers, lambda-elim synthesizing combinators, planning
+fusing clauses).
+
+**Status markers.** The substrate — the identity primitives, the lineage model,
+the recorder, and the always-on lowering projection — is in tree. Everything a
+**Planned** marker introduces is designed but not yet built: the passes' adoption
+of the recorder, the pane-boundary folds, and the inspector's consumption of
+them. A reader on `main` can tell the two apart by the marker alone; unmarked
+prose describes code you can go read.
 
 > The design of record — the full decision log, the collapse algorithm, the
 > recorder mechanism, and the adoption sequencing — is the lineage-redesign doc
@@ -64,17 +71,21 @@ An ambient thread-local step stack (`STEP_STACK`) + an installed log
   check on the construction hot path).
 - `RecorderSession` installs/drains the log at a pass boundary.
 
-Production step sites: `infer` (mono — the `specialize_use` clone `Copy`s and the
-`coalesce_generalized_let` wrapper `Transform`), `inline` (beta/alias discard
-`Transform`s + fan-out `Copy`s), `channelize` (cluster/feed-union/lift/drop).
-Each boundary in `compile_program` wraps the pass in a `RecorderSession` and
-retains its drained `LineageLog` on `CompiledProgram::pass_lineage`, in pipeline
-order: `[(Mono, …), (Inline, …), (Transact, …), (Letrec, …), (Desugar, …)]`.
+**Planned — the passes' adoption.** Production step sites in `infer` (mono — the
+`specialize_use` clone `Copy`s and the `coalesce_generalized_let` wrapper
+`Transform`), `inline` (beta/alias discard `Transform`s + fan-out `Copy`s), and
+`channelize` (cluster/feed-union/lift/drop). Each boundary in `compile_program`
+wraps the pass in a `RecorderSession` and retains its drained `LineageLog` on
+`CompiledProgram::pass_lineage`, in pipeline order: `[(Mono, …), (Inline, …),
+(Transact, …), (Letrec, …), (Desugar, …)]`.
+
+Today the only production step frames are lowering's two `Copy`-capture frames
+(below); every other rewrite runs unrecorded.
 
 ### The collapse
 
-At each inspector pane boundary, `collapse(logs, input_ids, output_ids,
-upstream_attr)` folds the intervening logs once, in pass order, into:
+`collapse(logs, input_ids, output_ids, upstream_attr)` folds a set of logs once,
+in pass order, into:
 
 - a `LineageMap<NodeId, NodeId>` — a dense bidirectional node↔node relation
   (self-edge for every survivor), and
@@ -88,7 +99,32 @@ upstream_attr)` folds the intervening logs once, in pass order, into:
   validators carry a debug guard that a `"source"` nature never actually ships.
 
 Transients (born + consumed within the phase) compose away. A two-sided leak
-audit (`Leak`) guarantees no node silently loses its history.
+audit (`Leak`) guarantees no node silently loses its history: an output with no
+lineage (`Unexplained`) and an input that vanished unconsumed (`Dropped`).
+
+Both checks enumerate from the **tree**. There is deliberately no third check on
+the *produced* side — "every id a step claims to produce is held by some node" —
+because it is not decidable against the node set the fold works over: lowering
+tags the nodes inside a refinement predicate, but that set is `collect_tree_ids`,
+the `walk_children` domain, which excludes predicate interiors, so every
+predicate id would read as a violation.
+
+Two legitimate shapes would read as violations too. Uncurrying `def f(x, y)`
+builds one `__arg_tuple_0.0` projection template and substitutes a freshened copy
+of it at each `x`; every copy's root carries that occurrence's own id, so the
+template's own root id is tagged and then held by no node. The read-your-writes
+values the mutability phases keep in a substitution `env` work the same way. An
+id retired like that leaves no trace — a *consumed* id shows up in the fold as
+absence from `roots`, but a replaced one looks exactly like a live node the check
+cannot see. Saying it explicitly means emitting the discard the model already
+has, `Transform { consumed: [id], produced: [] }`, which neither site does today.
+
+Construction closes the gap the check would have watched: a node is built either
+by `TypedExpr::new` (mint, recorded) or `TypedExpr::preserve` (carry an existing
+id, nothing recorded), so an id cannot be minted and then discarded.
+
+The fold is in tree; **planned** is its use at the inspector's two pane
+boundaries, which needs the pass logs above.
 
 ## The seam (`src/ccl/context.rs`)
 
@@ -127,24 +163,25 @@ audit (`Leak`) guarantees no node silently loses its history.
   the boundary via `assert_leaks_clean`. Orphaned projection keys are
   structurally impossible — the projection is *produced by* the fold, never
   mutated incrementally.
-- **Materialization (cold, inspector-only).** `CompiledProgram::materialize_panes`
+- **Planned — materialization (cold, inspector-only).** `CompiledProgram::materialize_panes`
   folds `pass_lineage` at the two pane boundaries: the Mono log bridges
   pre → post-inference; the Inline + Transact + Letrec + Desugar logs bridge
   post-inference → post-desugar. It returns the three per-pane
   `SourceProjection`s and the two pane-pair `LineageMap`s. **Both boundaries are
   fully recorded** — every pass emits its mints/consumes/copies as `RewriteStep`s
   — so there is no catch-all bridge — every node is explained by a recorded step.
-- **The leak gate (`assert_leaks_clean`).** Debug/test only. Both boundaries
-  assert **zero** leaks of every class: an `Unexplained` (uncaptured mint) or
-  `Dropped` (unconsumed vanishing node) is a recording bug, not tolerated
-  residue. With the full-coverage lowering projection, `unresolved` projection
-  entries are a hard zero at every pane too — asserted structurally by the
-  census ratchet.
+- **Planned — the pane leak gate.** `assert_leaks_clean` is in tree and gates the
+  lowering boundary today; planned is applying it at both **pane** boundaries,
+  which assert **zero** leaks of every class: an `Unexplained` (uncaptured mint)
+  or a `Dropped` (unconsumed vanishing node) is a recording bug, not tolerated
+  residue. With the
+  full-coverage lowering projection, `unresolved` projection entries are a hard
+  zero at every pane too — to be asserted structurally by the census ratchet.
 
-## Inspector consumers (`src/inspector_model/`)
+## Planned — inspector consumers (`src/inspector_model/`)
 
-The inspector is the only consumer of the pane folds; the release compiler reads
-the lowering projection and nothing else.
+None of this layer exists yet. The inspector is to be the only consumer of the
+pane folds; the release compiler reads the lowering projection and nothing else.
 
 - `SpanIndex::build(ir, projection)` inverts a pane's projection to span → node.
 - `build_inspect_tree` / `resolve` / `hover` read the pane projection and ship

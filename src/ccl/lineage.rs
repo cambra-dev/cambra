@@ -59,7 +59,6 @@ pub type RewriteLabel = &'static str;
 /// resolved independently at [`collapse`] time (see the module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 // Consumed when the passes adopt the recorder (next commit in the stack).
-#[allow(dead_code)]
 pub(crate) struct RewriteStep {
     /// The identity relation this step performs.
     pub op: Op,
@@ -77,7 +76,6 @@ pub(crate) struct RewriteStep {
 
 /// The identity relation a [`RewriteStep`] performs.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum Op {
     /// `consumed` ids vanish; `produced` ids appear. Empty `produced` = discard.
     ///
@@ -140,6 +138,9 @@ impl Nature {
     /// `"source"` must **never** actually reach the wire — a `Source`-nature tag
     /// null-compresses at the emission sites (see [`is_source`](Self::is_source));
     /// the arm exists for the validators' guard and for completeness.
+    ///
+    /// Compiled only under the `serde` feature (the `Serialize` impl below is its
+    /// sole caller), so a default build sees it as dead.
     #[allow(dead_code)]
     pub(crate) fn wire_str(self) -> &'static str {
         match self {
@@ -158,7 +159,6 @@ impl Nature {
 }
 
 /// A pass's ordered rewrite record. Passes append; the fold reads.
-#[allow(dead_code)]
 pub(crate) type LineageLog = Vec<RewriteStep>;
 
 /// Lowering's log entry: the same [`Op`]s a
@@ -260,7 +260,7 @@ pub struct SourceAttribution {
     pub rewritten: RewriteTag,
 }
 
-// Wire shape (inspector, feature `serde`): the native schema-3 attribution. The
+// Wire shape (inspector, feature `serde`): the attribution ships natively. The
 // query endpoints (`/api/resolve`, `/api/hover`) carry a `SourceAttribution` as
 // `{ spans, rewritten: null | { via, nature, label } }` — the same two-channel
 // shape the per-node `ir` tree carries (spans + rewrite tag), letting the
@@ -369,6 +369,8 @@ pub enum Leak {
 /// `roots`. A blamed id absent from `attr` contributes no spans (it has no
 /// known source), which is legal — empty blame or all-unknown blame yields
 /// `spans: []`, the "known node, no source anchor" case.
+///
+/// A private helper of [`collapse`], so it is dead exactly while `collapse` is.
 #[allow(dead_code)]
 fn attribute(
     blame: &[NodeId],
@@ -433,6 +435,11 @@ fn attribute(
 /// edges — the bipartite product for N:M steps and self-edges for untouched ids
 /// both fall out. Ids born and consumed within the phase never reach an output
 /// and compose away.
+///
+/// Exercised only by this module's tests until a pane boundary calls it, which
+/// needs the per-pass logs the passes do not yet record. `collapse_lowering` is
+/// the always-on sibling and shares the [`RootTracker`] core, so the fold logic
+/// here is not untested — only this entry point is uncalled.
 #[allow(dead_code)]
 pub(crate) fn collapse(
     logs: &[(Pass, LineageLog)],
@@ -790,32 +797,16 @@ enum ActiveLog {
     Lowering(LoweringLog),
 }
 
-/// What a step declares up front: a `Transform` names the ids it will *consume*;
-/// a `Copy` names the *origin* its minted/copied outputs mirror. The `produced`
-/// side is discovered — captured from the construction hooks — never declared.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum StepKind {
-    /// The step consumes `consumed` and produces whatever it mints.
-    Transform { consumed: Vec<NodeId> },
-    /// The step's minted/copied outputs mirror `origin`'s lineage. Reserved for
-    /// a declared-origin copy (e.g. planning's iterate `Copy`-of-predicate);
-    /// production passes today capture their fan-out copies through the
-    /// `on_copy` hook under a `Transform` frame, so this variant is exercised
-    /// only by the recorder's own tests.
-    #[allow(dead_code)]
-    Copy { origin: NodeId },
-}
-
 /// An in-flight step accumulating the ids born and copied within its dynamic
 /// extent. Finalized (flushed to a [`RewriteStep`]) by its [`StepGuard`]'s
 /// `Drop`. The `produced`/copy sides are *captured*, not declared: this is what
 /// makes recording a byproduct of construction rather than a parallel
 /// annotation.
-#[allow(dead_code)]
 struct OpenStep {
     label: RewriteLabel,
-    kind: StepKind,
+    /// The ids this step declared it would consume. The `produced` side is
+    /// discovered from the construction hooks, never declared.
+    consumed: Vec<NodeId>,
     blame: Vec<NodeId>,
     nature: Nature,
     /// Ids minted via `Expr::new` while this was the innermost open frame.
@@ -828,85 +819,47 @@ struct OpenStep {
 impl OpenStep {
     /// Finalize this frame into the active log's [`RewriteStep`]s.
     ///
-    /// A `Transform` frame emits one `Transform { consumed, produced: births }`;
-    /// a `Copy` frame emits the declared-origin `Copy` carrying the minted
-    /// births. In *both* cases the captured freshen pairs flush as per-origin
-    /// `Copy` steps (empty blame — a copy mirrors its origin, it does not
-    /// re-attribute), so a deep freshen's one-pair-per-node duplication lands as
-    /// one `Copy` step per freshened origin.
+    /// The frame emits one `Transform { consumed, produced: births }`, and its
+    /// captured freshen pairs flush as per-origin `Copy` steps (empty blame — a
+    /// copy mirrors its origin, it does not re-attribute), so a deep freshen's
+    /// one-pair-per-node duplication lands as one `Copy` step per freshened
+    /// origin. A copy's origin is always *discovered* through the `on_copy` hook,
+    /// never declared up front: every duplication path funnels through
+    /// [`TypedExpr::freshen_node_id`](crate::ccl::expr::TypedExpr::freshen_node_id),
+    /// so capture is total and a declared-origin frame kind would be redundant.
     ///
     /// A `Transform` frame whose `consumed` *and* captured `births` are both
     /// empty emits no `Transform` record: it was opened purely to capture the
     /// freshen pairs of a deep clone (its only output is those per-origin `Copy`
     /// steps), and a `Transform { consumed: [], produced: [] }` would be an
     /// unanchored no-op ([`Leak::EmptyConsumed`] were blame also empty).
-    #[allow(dead_code)]
     fn flush_into(self, log: &mut LineageLog) {
         let OpenStep {
             label,
-            kind,
+            consumed,
             blame,
             nature,
             births,
             copies,
         } = self;
-        let grouped = group_copies(&copies);
-        match kind {
-            StepKind::Transform { consumed } => {
-                if !(consumed.is_empty() && births.is_empty()) {
-                    log.push(RewriteStep {
-                        op: Op::Transform {
-                            consumed,
-                            produced: births,
-                        },
-                        blame,
-                        nature,
-                        label,
-                    });
-                }
-                for (origin, produced) in grouped {
-                    log.push(RewriteStep {
-                        op: Op::Copy { origin, produced },
-                        blame: Vec::new(),
-                        nature,
-                        label,
-                    });
-                }
-            }
-            StepKind::Copy { origin: declared } => {
-                // The declared origin owns the minted births (they mirror it);
-                // freshen pairs for other origins each get their own step. The
-                // declared-origin step carries the frame's blame; the sibling
-                // per-origin copies carry none.
-                let mut declared_produced = births;
-                let mut others: Vec<(NodeId, Vec<NodeId>)> = Vec::new();
-                for (origin, produced) in grouped {
-                    if origin == declared {
-                        declared_produced.extend(produced);
-                    } else {
-                        others.push((origin, produced));
-                    }
-                }
-                if !declared_produced.is_empty() {
-                    log.push(RewriteStep {
-                        op: Op::Copy {
-                            origin: declared,
-                            produced: declared_produced,
-                        },
-                        blame,
-                        nature,
-                        label,
-                    });
-                }
-                for (origin, produced) in others {
-                    log.push(RewriteStep {
-                        op: Op::Copy { origin, produced },
-                        blame: Vec::new(),
-                        nature,
-                        label,
-                    });
-                }
-            }
+        if !(consumed.is_empty() && births.is_empty()) {
+            log.push(RewriteStep {
+                op: Op::Transform {
+                    consumed,
+                    produced: births,
+                },
+                blame,
+                nature,
+                label,
+            });
+        }
+        for (origin, produced) in group_copies(&copies) {
+            log.push(RewriteStep {
+                op: Op::Copy { origin, produced },
+                blame: Vec::new(),
+                nature,
+                label,
+            });
         }
     }
 
@@ -964,7 +917,6 @@ pub(crate) fn lowering_leaf(id: NodeId, span: Span, nature: Nature, label: Rewri
 
 /// Group captured `(origin, fresh)` pairs into per-origin produced-lists,
 /// preserving first-seen origin order for a deterministic log.
-#[allow(dead_code)]
 fn group_copies(copies: &[(NodeId, NodeId)]) -> Vec<(NodeId, Vec<NodeId>)> {
     let mut out: Vec<(NodeId, Vec<NodeId>)> = Vec::new();
     for &(origin, fresh) in copies {
@@ -982,11 +934,15 @@ fn group_copies(copies: &[(NodeId, NodeId)]) -> Vec<(NodeId, Vec<NodeId>)> {
 /// minted (via `Expr::new`) or freshened (via the freshen helpers) on this
 /// thread is captured into it. `blame` is the separate attribution channel
 /// (blame ⊥ consumption) — the upstream ids the outputs trace to, which may
-/// differ from what a `Transform` consumes.
-#[allow(dead_code)]
+/// differ from what the step consumes.
+///
+/// `consumed` is the only thing a frame declares up front; the produced side is
+/// discovered from the construction hooks. A frame that consumes nothing and
+/// mints nothing — opened purely to capture a clone's freshen pairs — is a
+/// [`copy_frame`], which spells that out and has no inert arguments.
 pub(crate) fn step(
     label: RewriteLabel,
-    kind: StepKind,
+    consumed: Vec<NodeId>,
     blame: Vec<NodeId>,
     nature: Nature,
 ) -> StepGuard {
@@ -995,7 +951,7 @@ pub(crate) fn step(
         let depth = stack.len();
         stack.push(OpenStep {
             label,
-            kind,
+            consumed,
             blame,
             nature,
             births: Vec::new(),
@@ -1005,10 +961,27 @@ pub(crate) fn step(
     })
 }
 
+/// Open a **lowering** copy-only frame: it consumes nothing, mints nothing, and
+/// exists solely to capture the `(origin, fresh)` pairs a clone's freshen reports,
+/// which flush as per-origin [`Op::Copy`] steps.
+///
+/// The distinct constructor is what keeps the frame honest, and the reason it is
+/// lowering-specific is the two folds' `Op::Copy` arms:
+/// [`collapse_lowering`] mirrors the origin's already-folded attribution
+/// *verbatim*, so a lowering copy's `nature` and `blame` are genuinely never read
+/// — passing them would be passing unobservable values, and a wrong one (a
+/// `Nature::Source` on a copy frame) would look meaningful while being inert.
+/// [`collapse`] does **not** mirror: a pass `Op::Copy` with empty blame builds
+/// `RewriteTag { nature: step.nature, .. }`, so a pass copy-frame's nature reaches
+/// the attribution and must be chosen deliberately. Such a frame opens with
+/// [`step`] and names its nature.
+pub(crate) fn copy_frame(label: RewriteLabel) -> StepGuard {
+    step(label, Vec::new(), Vec::new(), Nature::Machinery)
+}
+
 /// RAII finalizer for an open [`step`]. Popping and flushing on `Drop` is
 /// panic-safe: an unwind through an open step still pops its frame (so the stack
 /// is never left corrupt) and flushes what was captured before the panic.
-#[allow(dead_code)]
 pub(crate) struct StepGuard {
     /// The stack index this frame occupied when opened, for the LIFO tripwire.
     depth: usize,
@@ -1059,8 +1032,15 @@ pub(crate) fn on_mint(id: NodeId) {
 
 /// A hook called from the freshen helpers for every `(origin, fresh)`
 /// duplication. Pushes the pair into the innermost open step's copies, or does
-/// nothing when no step is open.
+/// nothing when no step is open. Guards the [`PLACEHOLDER`] sentinel on both
+/// sides, as [`on_mint`] does: a placeholder origin would fold as
+/// [`Leak::CopyOfUnknown`] against an id that is never live by construction.
+///
+/// [`PLACEHOLDER`]: NodeId::PLACEHOLDER
 pub(crate) fn on_copy(origin: NodeId, fresh: NodeId) {
+    if origin == NodeId::PLACEHOLDER || fresh == NodeId::PLACEHOLDER {
+        return;
+    }
     STEP_STACK.with(|s| {
         if let Some(top) = s.borrow_mut().last_mut() {
             top.copies.push((origin, fresh));
@@ -1085,6 +1065,10 @@ impl RecorderSession {
     /// Install a fresh, empty **pass** log as the active recording target for
     /// this thread. Non-reentrant: at most one session per thread
     /// (debug-asserted).
+    ///
+    /// The pass-log counterpart to [`lowering`](Self::lowering), which is
+    /// always-on. Uncalled outside this module's tests until a pass boundary
+    /// installs a session of its own.
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::install(ActiveLog::Pass(Vec::new()))
@@ -1111,6 +1095,8 @@ impl RecorderSession {
 
     /// Drain and return the recorded **pass** log, ending the session. The
     /// subsequent `Drop` is then a no-op (the slot is already empty).
+    ///
+    /// Paired with [`new`](Self::new), so it is dead exactly while that is.
     #[allow(dead_code)]
     pub(crate) fn into_log(self) -> LineageLog {
         ACTIVE_LOG.with(|slot| match slot.borrow_mut().take() {
@@ -1700,22 +1686,13 @@ mod tests {
     use crate::ccl::Lit;
     use crate::ccl::expr::Expr;
 
-    fn transform_kind(consumed: Vec<NodeId>) -> StepKind {
-        StepKind::Transform { consumed }
-    }
-
     #[test]
     fn transform_step_captures_births_as_produced() {
         let session = RecorderSession::new();
         let consumed = NodeId::fresh();
         let (a, b);
         {
-            let _g = step(
-                "rw.build",
-                transform_kind(vec![consumed]),
-                vec![],
-                Nature::Expansion,
-            );
+            let _g = step("rw.build", vec![consumed], vec![], Nature::Expansion);
             a = Expr::lit(Lit::Int(1)).node_id();
             b = Expr::lit(Lit::Int(2)).node_id();
         }
@@ -1738,20 +1715,10 @@ mod tests {
         let (outer_c, inner_c) = (NodeId::fresh(), NodeId::fresh());
         let (outer_pre, inner_id, outer_post);
         {
-            let _outer = step(
-                "rw.outer",
-                transform_kind(vec![outer_c]),
-                vec![],
-                Nature::Expansion,
-            );
+            let _outer = step("rw.outer", vec![outer_c], vec![], Nature::Expansion);
             outer_pre = Expr::lit(Lit::Int(0)).node_id();
             {
-                let _inner = step(
-                    "rw.inner",
-                    transform_kind(vec![inner_c]),
-                    vec![],
-                    Nature::Expansion,
-                );
+                let _inner = step("rw.inner", vec![inner_c], vec![], Nature::Expansion);
                 inner_id = Expr::lit(Lit::Int(1)).node_id();
             }
             outer_post = Expr::lit(Lit::Int(2)).node_id();
@@ -1778,9 +1745,11 @@ mod tests {
     }
 
     #[test]
-    fn deep_freshen_in_a_copy_step_yields_per_origin_copies() {
+    fn deep_freshen_in_a_step_yields_per_origin_copies() {
         // Build a 3-node tree (tuple + two lits) OUTSIDE any step, clone it
-        // (Clone shares ids), then deep-freshen the clone inside a Copy step.
+        // (Clone shares ids), then deep-freshen the clone inside a copy-only
+        // frame — one that consumes nothing and mints nothing, so its whole
+        // output is the freshen pairs the `on_copy` hook captures.
         let tree = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
         let mut clone = tree.clone();
         let old_root = clone.node_id();
@@ -1792,12 +1761,7 @@ mod tests {
 
         let session = RecorderSession::new();
         {
-            let _g = step(
-                "dup",
-                StepKind::Copy { origin: old_root },
-                vec![],
-                Nature::Machinery,
-            );
+            let _g = copy_frame("dup");
             clone.freshen_node_ids_deep();
         }
         let log = session.into_log();
@@ -1831,12 +1795,7 @@ mod tests {
 
         let session = RecorderSession::new();
         {
-            let _g = step(
-                "wrap.freshen",
-                transform_kind(vec![]),
-                vec![],
-                Nature::Machinery,
-            );
+            let _g = step("wrap.freshen", vec![], vec![], Nature::Machinery);
             clone.freshen_node_ids_deep();
         }
         let log = session.into_log();
@@ -1867,12 +1826,7 @@ mod tests {
             "precondition: no session installed",
         );
         {
-            let _g = step(
-                "rw",
-                transform_kind(vec![NodeId::fresh()]),
-                vec![],
-                Nature::Expansion,
-            );
+            let _g = step("rw", vec![NodeId::fresh()], vec![], Nature::Expansion);
             let _a = Expr::lit(Lit::Int(1));
         }
         assert_eq!(
@@ -1886,12 +1840,7 @@ mod tests {
     fn panic_inside_a_step_unwinds_without_poisoning_the_stack() {
         assert_eq!(step_stack_depth(), 0, "clean precondition");
         let result = std::panic::catch_unwind(|| {
-            let _g = step(
-                "boom",
-                transform_kind(vec![NodeId::fresh()]),
-                vec![],
-                Nature::Expansion,
-            );
+            let _g = step("boom", vec![NodeId::fresh()], vec![], Nature::Expansion);
             let _a = Expr::lit(Lit::Int(1));
             panic!("deliberate panic inside an open step");
         });
@@ -1907,12 +1856,7 @@ mod tests {
         let consumed = NodeId::fresh();
         let a;
         {
-            let _g = step(
-                "rw",
-                transform_kind(vec![consumed]),
-                vec![],
-                Nature::Expansion,
-            );
+            let _g = step("rw", vec![consumed], vec![], Nature::Expansion);
             a = Expr::lit(Lit::Int(7)).node_id();
         }
         let log = session.into_log();
@@ -1934,12 +1878,7 @@ mod tests {
         // Even inside an open step, a Default throwaway must not be captured.
         let consumed = NodeId::fresh();
         {
-            let _g = step(
-                "rw",
-                transform_kind(vec![consumed]),
-                vec![],
-                Nature::Expansion,
-            );
+            let _g = step("rw", vec![consumed], vec![], Nature::Expansion);
             let _d3 = Expr::default();
         }
         let log = session.into_log();
@@ -1977,12 +1916,7 @@ mod tests {
         let session = RecorderSession::new();
         let out_id;
         {
-            let _g = step(
-                "rw.replace",
-                transform_kind(vec![a_id]),
-                vec![a_id],
-                Nature::Expansion,
-            );
+            let _g = step("rw.replace", vec![a_id], vec![a_id], Nature::Expansion);
             out_id = Expr::lit(Lit::Int(2)).node_id();
         }
         let log = session.into_log();
@@ -2022,7 +1956,7 @@ mod tests {
         {
             let _g = step(
                 "test.template",
-                transform_kind(vec![origin]),
+                vec![origin],
                 vec![origin],
                 Nature::Machinery,
             );

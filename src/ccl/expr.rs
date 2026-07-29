@@ -661,6 +661,22 @@ impl PartialEq for TypedExpr {
 /// `Rc` once (clone-on-write via [`Rc::make_mut`](std::rc::Rc::make_mut), guarded
 /// by a [`PredicateId`](crate::ccl::PredicateId) visited-set). Backs both
 /// [`TypedExpr::freshen_node_ids_deep`] and [`TypedExpr::freshen_interior_node_ids`].
+///
+/// **This walk splits predicate `Rc` sharing, on purpose.** A predicate interior
+/// is made of [`TypedExpr`]s carrying [`NodeId`]s, so a freshened copy must not
+/// alias the original's ids — `make_mut` on a shared `Rc` (refcount > 1) clones,
+/// which is exactly what makes the copy's ids its own.
+///
+/// TODO(predicate-sharing): that trades against the sharing invariant
+/// `tests/predicate_sharing.rs` asserts — no two *distinct* predicate `Rc`s are
+/// structurally equal — because planning's compile memo is keyed on `Rc`
+/// identity, so a split predicate is compiled once per copy. The guard measures
+/// at post-inference and its corpus is comprehension-only, so it does not
+/// currently observe this: a UDF `def` whose body carries a filter predicate
+/// already yields two structurally-equal `Rc`s once its body is duplicated.
+/// Decide whether planning's memo should key on structure rather than `Rc`
+/// identity, or whether the sharing invariant should be stated as "preserved
+/// through inference, deliberately re-split at duplication".
 fn freshen_from_ty(t: &mut Type, seen: &mut std::collections::HashSet<crate::ccl::PredicateId>) {
     if let Type::Refinement(_, r) = t {
         // The same predicate `Rc` may be reachable through several type slots;
@@ -711,6 +727,49 @@ impl TypedExpr {
         }
     }
 
+    /// Construct a node at an **already-minted** identity: a *preserve*, the dual
+    /// of [`new`](Self::new)'s mint.
+    ///
+    /// A pass that rebuilds a node — reparenting it, renaming a slot, moving it
+    /// along a spine — is producing the same logical node at a new position, so
+    /// its `NodeId` must carry over for its span and lineage to survive as a
+    /// self-edge. Minting and then overwriting the id cannot express that: the
+    /// mint fires [`on_mint`](crate::ccl::lineage::on_mint), so the log records a
+    /// birth for an id that ends up on no node — a claim the fold cannot check,
+    /// because its leak classes enumerate from the tree (see
+    /// `design/provenance.md`, "The collapse"). Entering the id at construction
+    /// makes that unrepresentable rather than merely detectable.
+    ///
+    /// These are the only two ways to build a node, and the recorder sees exactly
+    /// the difference: `new` mints and records a birth, `preserve` does neither.
+    ///
+    /// Some passes still hand-roll this as a `TypedExpr { … node_id: src.node_id }`
+    /// struct literal (grep `TODO(preserve)`). Those are correct — a literal mints
+    /// nothing — but they make a preserve and a mint one token apart in otherwise
+    /// identical code, which is how a raw `node_id: NodeId::fresh()` (a mint the
+    /// recorder never sees) hides among them. Folding them in needs an
+    /// `Option`-taking annotation setter, since most carry `user_annotation`
+    /// through from the source node.
+    pub fn preserve(node_id: NodeId, node: TypedExprNode) -> Self {
+        TypedExpr {
+            node,
+            ty: Type::Hole,
+            user_annotation: None,
+            node_id,
+        }
+    }
+
+    /// Construct a node that will **never enter a tree** — one built only to be
+    /// rendered, typically inside a panic message or a `debug_assert!` probe.
+    ///
+    /// It carries [`NodeId::PLACEHOLDER`], the reserved throwaway identity, so it
+    /// consumes no id and records no birth: a diagnostic must not perturb the
+    /// lineage log it may be reporting on. `assert_unique_node_ids` backstops that
+    /// a placeholder never reaches a checked tree.
+    pub fn throwaway(node: TypedExprNode) -> Self {
+        Self::preserve(NodeId::PLACEHOLDER, node)
+    }
+
     /// The stable provenance id of this node (see [`crate::ccl::provenance`]).
     pub fn node_id(&self) -> NodeId {
         self.node_id
@@ -731,20 +790,6 @@ impl TypedExpr {
         // hook reports the (old, new) pair to any open lineage step.
         crate::ccl::lineage::on_copy(old, new);
         (old, new)
-    }
-
-    /// Carry an *existing* [`NodeId`] onto this node, consuming and returning
-    /// it. Unlike [`freshen_node_id`](Self::freshen_node_id) (which mints), this
-    /// transplants an id already minted elsewhere — the legitimate use is a
-    /// merge/restructure pass carrying the surviving input node's id onto a
-    /// rebuilt node so its provenance survives by construction. There is
-    /// deliberately no arbitrary-`u64` setter; ids only ever come from `fresh`
-    /// or another node.
-    // Used by the pass-adoption layer; unused within the substrate alone.
-    #[allow(dead_code)]
-    pub(crate) fn with_node_id(mut self, id: NodeId) -> Self {
-        self.node_id = id;
-        self
     }
 
     /// Deep-freshen every [`NodeId`] in this expression's node-set. Each
@@ -845,12 +890,36 @@ impl TypedExpr {
         })
     }
 
-    /// Construct an ExprStmt expression.
+    /// Construct an ExprStmt expression — `expr; body`.
+    ///
+    /// The sequencing node's type **is** its body's, by construction: the
+    /// statement's value is whatever the continuation evaluates to. Carrying it
+    /// here holds that invariant in the module that defines the node, so a pass
+    /// rebuilding a spine does not have to re-derive it. During lowering
+    /// `body.ty` is [`Type::Hole`] and the carry is the identity; after inference
+    /// it is the real type.
     pub fn expr_stmt(expr: Self, body: Self) -> Self {
+        let ty = body.ty.clone();
         Self::new(TypedExprNode::ExprStmt {
             expr: Box::new(expr),
             body: Box::new(body),
         })
+        .with_ty(ty)
+    }
+
+    /// [`expr_stmt`](Self::expr_stmt) at a **preserved** identity: the same
+    /// logical statement rebuilt at a new spine position, carrying `node_id`
+    /// rather than minting. See [`preserve`](Self::preserve).
+    pub fn expr_stmt_preserving(node_id: NodeId, expr: Self, body: Self) -> Self {
+        let ty = body.ty.clone();
+        Self::preserve(
+            node_id,
+            TypedExprNode::ExprStmt {
+                expr: Box::new(expr),
+                body: Box::new(body),
+            },
+        )
+        .with_ty(ty)
     }
 
     /// Construct a feed expression.
@@ -924,6 +993,43 @@ impl TypedExpr {
             bound_expr: Box::new(bound_expr),
             body: Box::new(body),
         })
+    }
+
+    /// `let binding = def in body`, typed as `body` — the pre-built-binding form
+    /// of [`let_bind`](Self::let_bind), for passes that already hold a
+    /// [`TypedBinding`] (a synthesized register, a rebuilt spine slot).
+    ///
+    /// As with [`expr_stmt`](Self::expr_stmt), the node's type is its body's: a
+    /// `let` evaluates to its continuation.
+    pub fn let_in(binding: TypedBinding, def: Self, body: Self) -> Self {
+        let ty = body.ty.clone();
+        Self::new(TypedExprNode::Let {
+            binding,
+            bound_expr: Box::new(def),
+            body: Box::new(body),
+        })
+        .with_ty(ty)
+    }
+
+    /// [`let_in`](Self::let_in) at a **preserved** identity: the same logical
+    /// binding rebuilt at a new spine position, carrying `node_id` rather than
+    /// minting. See [`preserve`](Self::preserve).
+    pub fn let_in_preserving(
+        node_id: NodeId,
+        binding: TypedBinding,
+        def: Self,
+        body: Self,
+    ) -> Self {
+        let ty = body.ty.clone();
+        Self::preserve(
+            node_id,
+            TypedExprNode::Let {
+                binding,
+                bound_expr: Box::new(def),
+                body: Box::new(body),
+            },
+        )
+        .with_ty(ty)
     }
 
     /// Construct an annotated let binding expression.
@@ -1561,27 +1667,6 @@ impl TypedExpr {
             }
         });
         err
-    }
-
-    /// Transform this node's [`TypedExprNode`] while preserving its identity
-    /// envelope (`node_id`, `ty`, `user_annotation`).
-    ///
-    /// The owned-rebuild sibling of in-place mutation — completes the
-    /// `walk_children`/`map_children`/`map_node` family. Use in owned-transform
-    /// passes (e.g. `desugar_defers`) so a structural rewrite preserves
-    /// provenance by construction: the rebuilt node keeps the original's
-    /// [`NodeId`] rather than minting a fresh one via [`TypedExpr::new`].
-    ///
-    /// Currently unused in-tree: the desugar spine rewrites that used it now go
-    /// through explicit envelope reconstruction (they must also re-synthesize a
-    /// stale `ty`, which this envelope-preserving form cannot express). Retained
-    /// as the owned-transform member of the traversal family: under the lineage
-    /// model a `map_node` rewrite is an id-preserving *preserve* (see the
-    /// preserve rule on `lineage.rs`'s `Op` mapping).
-    #[allow(dead_code)]
-    pub(crate) fn map_node(mut self, f: impl FnOnce(TypedExprNode) -> TypedExprNode) -> Self {
-        self.node = f(self.node);
-        self
     }
 }
 

@@ -25,8 +25,8 @@ test-helpers = []
 # Enable when bisecting a miscompile: `cargo test --features deep-typecheck`.
 deep-typecheck = []
 
-# Optional, default-OFF. Enables `Serialize`/`Deserialize` derives on the
-# inspector wire types (added in I3 via `#[cfg_attr(feature = "serde", ...)]`).
+# Optional, default-OFF. Enables `Serialize`/`Deserialize` on the inspector wire
+# types, via `#[cfg_attr(feature = "serde", ...)]` at each site.
 # `cambra-inspector` turns this on; plain `cambra` builds compile zero serde.
 serde = ["dep:serde"]
 

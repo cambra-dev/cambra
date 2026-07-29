@@ -114,7 +114,6 @@ use crate::ccl::{
     Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
     ccl_utils::{count_free, typed_compose},
     letrec::check_letrec_causal,
-    provenance::NodeId,
 };
 
 /// `true` when `ty` carries channelization-erasable residue — a `Hole` stamped
@@ -316,6 +315,7 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
                     node,
                     ty: current.ty,
                     user_annotation: current.user_annotation,
+                    // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                     node_id: cur_id,
                 };
                 break;
@@ -356,6 +356,7 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
                 user_annotation: None,
                 // Preserve: the lifted prefix head is the same node with its
                 // feed target renamed, so carry its id onto the rebuild.
+                // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                 node_id: head.node_id,
             },
             TypedExprNode::Define { name: _, value } => TypedExpr {
@@ -365,6 +366,7 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
                     value,
                 },
                 user_annotation: None,
+                // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                 node_id: head.node_id,
             },
             _ => head,
@@ -1182,6 +1184,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                             node: other,
                             ty: current_body.ty,
                             user_annotation: current_body.user_annotation,
+                            // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                             node_id: cur_let_id,
                         };
                         break;
@@ -2141,6 +2144,7 @@ fn extract_for_defer(
                         },
                     ty: function_ty,
                     user_annotation: function_user_annotation,
+                    // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                     node_id: function_node_id,
                 } = *function
                 else {
@@ -2259,6 +2263,7 @@ fn extract_for_defer(
                     },
                     ty: function_ty,
                     user_annotation: function_user_annotation,
+                    // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                     node_id: function_node_id,
                 };
                 TypedExprNode::Apply {
@@ -2441,6 +2446,7 @@ fn extract_for_defer(
                                 },
                                 ty: elt_ty,
                                 user_annotation: elt_user_ann,
+                                // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                                 node_id: elt_node_id,
                             };
                             new_elts.push(new_lambda);
@@ -2491,6 +2497,7 @@ fn extract_for_defer(
                             },
                             ty: elt_ty,
                             user_annotation: elt_user_ann,
+                            // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                             node_id: elt_node_id,
                         });
                     }
@@ -2499,6 +2506,7 @@ fn extract_for_defer(
                             node: other,
                             ty: elt_ty,
                             user_annotation: elt_user_ann,
+                            // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                             node_id: elt_node_id,
                         };
                         new_elts.push(extract_for_defer(
@@ -2687,12 +2695,9 @@ fn extract_for_defer(
         node @ (TypedExprNode::For { .. } | TypedExprNode::MutWrite { .. }) => {
             debug_assert!(
                 {
-                    let probe = TypedExpr {
-                        node: node.clone(),
-                        ty: ty.clone(),
-                        user_annotation: user_annotation.clone(),
-                        node_id: NodeId::fresh(),
-                    };
+                    // `collect_feed_target_names` walks node structure only, so the
+                    // probe needs no type or annotation slots.
+                    let probe = Expr::throwaway(node.clone());
                     collect_feed_target_names(&probe).is_empty()
                 },
                 "feed inside a For/MutWrite marker — v1 lowering must route \
@@ -2908,15 +2913,10 @@ mod tests {
         //   `Var("__chan")` with user_annotation = Fun(Refinement(Hole, pred(outer_n)), Hole)
         let pred = var("outer_n");
         let refinement = Refinement::born(Rc::new(pred));
-        let annotated = TypedExpr {
-            node: TypedExprNode::Var(Name::raw("__chan")),
-            ty: Type::Hole,
-            user_annotation: Some(Type::fun(
-                Type::Refinement(Box::new(Type::Hole), refinement),
-                Type::Hole,
-            )),
-            node_id: NodeId::fresh(),
-        };
+        let annotated = Expr::var(Name::raw("__chan")).with_user_annotation(Type::fun(
+            Type::Refinement(Box::new(Type::Hole), refinement),
+            Type::Hole,
+        ));
 
         let mut free: HashSet<Name> = HashSet::new();
         collect_free_vars(&annotated, &mut free);
@@ -2937,16 +2937,11 @@ mod tests {
     fn collect_free_vars_descends_into_ty_refinement_predicates() {
         let pred = var("inner_k");
         let refinement = Refinement::born(Rc::new(pred));
-        let typed = TypedExpr {
-            node: TypedExprNode::Lit(Lit::Unit),
-            ty: Type::Fun {
-                name: None,
-                domain: Box::new(Type::Refinement(Box::new(Type::Hole), refinement)),
-                codomain: Box::new(Type::Hole),
-            },
-            user_annotation: None,
-            node_id: NodeId::fresh(),
-        };
+        let typed = Expr::lit(Lit::Unit).with_ty(Type::Fun {
+            name: None,
+            domain: Box::new(Type::Refinement(Box::new(Type::Hole), refinement)),
+            codomain: Box::new(Type::Hole),
+        });
         let mut free: HashSet<Name> = HashSet::new();
         collect_free_vars(&typed, &mut free);
         assert!(

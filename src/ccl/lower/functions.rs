@@ -173,10 +173,15 @@ pub(super) fn uncurry_params(
         // substitution deep-freshens the template's INTERIOR into every
         // occurrence of the parameter (root-carry keeps each occurrence's own
         // id/attribution — see `substitute_param_in_body`), so tag the template's
-        // three nodes as machinery
-        // leaves. The template itself never enters the tree; its ids compose away
-        // at the lowering fold as born-copied-discarded transients (no manual
-        // removal needed — the fold handles it).
+        // three nodes as machinery leaves.
+        //
+        // The template itself never enters the tree. Its two interior ids reach
+        // the tree as the freshened copies the frame below captures, so they are
+        // origins of live nodes; its ROOT does not — root-carry replaces it with
+        // each occurrence's own id — so that one id is tagged and then carried by
+        // nothing. Harmless in the product (the projection is filtered to the
+        // output tree, so the entry drops out), and the reason there is no
+        // produced-side leak class: see `design/provenance.md`, "The collapse".
         let var = ctx.tag_machinery(Expr::var(&tuple_name), fn_span, up);
         let idx = ctx.tag_machinery(Expr::proj_index(i), fn_span, up);
         let proj = ctx.tag_machinery(Expr::apply(var, idx), fn_span, up);
@@ -261,20 +266,13 @@ pub(super) fn lower_lambda(
 /// ([`LoweringContext::fresh_tuple_arg`]), so the engine's no-capture assert
 /// cannot fire.
 fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
-    use crate::ccl::lineage::{Nature, StepKind, step};
+    use crate::ccl::lineage::copy_frame;
     let mut expr = expr;
     // A lowering copy-frame: the discharge's interior freshens fire `on_copy`
     // into this frame, which flushes them as `Copy` LoweringSteps (mirroring the
     // template) into the always-on lowering log. A no-op when no session is
     // installed (the lower unit tests).
-    let _frame = step(
-        "lower.uncurry_proj",
-        StepKind::Transform {
-            consumed: Vec::new(),
-        },
-        Vec::new(),
-        Nature::Machinery,
-    );
+    let _frame = copy_frame("lower.uncurry_proj");
     crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
     expr
 }

@@ -305,15 +305,6 @@ impl Uniquifier {
     }
 }
 
-/// The checked Barendregt invariant at the minting boundary: right after
-/// uniquification every binding site is a [`Name::Unique`]. `Synthetic`
-/// binders don't exist yet (later passes mint them) and the element binder is
-/// never a binding site, so `Unique` is exact here — which is the whole point
-/// of keeping the variants distinct. Global binder *uniqueness* is deliberately
-/// not asserted — lowering copies pre-minted subtrees (see module docs), so a
-/// uid may occur at several binding sites; the convention is "distinct
-/// derivations get distinct uids, copies share," which is not a tree-checkable
-/// property.
 /// Collect the sorted multiset of every node's [`NodeId`] reachable from
 /// `expr`, mirroring the exact set of nodes [`Uniquifier::expr`] visits —
 /// the main expression tree *and* the [`TypedExpr`]s living inside type-borne
@@ -353,6 +344,15 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
     out
 }
 
+/// The checked Barendregt invariant at the minting boundary: right after
+/// uniquification every binding site is a [`Name::Unique`]. `Synthetic`
+/// binders don't exist yet (later passes mint them) and the element binder is
+/// never a binding site, so `Unique` is exact here — which is the whole point
+/// of keeping the variants distinct. Global binder *uniqueness* is deliberately
+/// not asserted — lowering copies pre-minted subtrees (see module docs), so a
+/// uid may occur at several binding sites; the convention is "distinct
+/// derivations get distinct uids, copies share," which is not a tree-checkable
+/// property.
 #[cfg(debug_assertions)]
 fn assert_all_binders_minted(expr: &Expr) {
     fn go(e: &Expr) {
