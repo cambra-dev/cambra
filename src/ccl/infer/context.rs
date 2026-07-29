@@ -4,11 +4,14 @@
 
 use std::collections::HashMap;
 
+use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype, fresh_var, fun, type_level,
 };
-use crate::ccl::{Expr, Level, Name, Type, TypedExprNode};
+use std::rc::Rc;
+
+use crate::ccl::{Expr, Level, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode};
 use crate::util::ScopeStack;
 
 use super::emit::emit_node;
@@ -80,6 +83,19 @@ pub(super) struct InferCtx {
     /// `in_let_rhs`) so RHS-local variables are minted deeper than the
     /// defining scope and become generalizable at the binding site.
     pub(super) level: Level,
+    pred_memo: TermMemo,
+    /// One predicate `Rc` per distinct literal *value*, for the singleton
+    /// refinements `emit_node` stamps on `Lit` nodes.
+    ///
+    /// Without this every literal *occurrence* mints its own `{Int | __elem == 5}`,
+    /// so a program's literals become a large family of structurally-equal but
+    /// `Rc`-distinct predicates — exactly the shape that defeats planning's
+    /// `Rc`-keyed compile memo and makes it compile one trivial predicate once per
+    /// occurrence. Interning at birth is the cheapest place to prevent it: the
+    /// term is ground (see [`singleton_predicate`](super::singleton_predicate)), so
+    /// sharing it carries none of the context-dependence that makes sharing
+    /// delicate elsewhere.
+    lit_singletons: HashMap<Lit, Rc<TypedExpr>>,
 }
 
 impl InferCtx {
@@ -90,6 +106,8 @@ impl InferCtx {
             cache: ConstrainCache::new(),
             schemes: OperatorSchemes::new(),
             level: 0,
+            pred_memo: Default::default(),
+            lit_singletons: HashMap::new(),
         }
     }
 
@@ -156,7 +174,28 @@ impl InferCtx {
     }
 }
 
+impl InferCtx {
+    /// `lit`'s singleton type, with its predicate shared across every occurrence
+    /// of the same literal value in this pass (see [`Self::lit_singletons`]).
+    pub(super) fn lit_singleton(&mut self, lit: &Lit) -> Type {
+        let base = super::lit_base(lit);
+        let Some(predicate) = self.lit_singletons.get(lit).cloned().or_else(|| {
+            let p = super::singleton_predicate(lit)?;
+            self.lit_singletons.insert(lit.clone(), Rc::clone(&p));
+            Some(p)
+        }) else {
+            // `unit`: a singleton adds nothing to a one-inhabitant base.
+            return base;
+        };
+        Type::Refinement(Box::new(base), Refinement::sharing(&predicate))
+    }
+}
+
 impl Typing for InferCtx {
+    fn pred_memo(&self) -> TermMemo {
+        self.pred_memo.clone()
+    }
+
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, InferError> {
         emit_node(child, self)
     }

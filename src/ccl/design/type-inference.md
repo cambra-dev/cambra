@@ -281,6 +281,127 @@ that rebuild a predicate on `expr.ty` re-sync the `target` to it
 (`ccl_utils::sync_cast_targets`) — the post-inference check reconstructs a cast
 from its `target`.
 
+#### Sharing is an invariant, not an optimization detail
+
+One structural predicate should be **one `Rc`** for the whole pipeline. Lowering
+establishes that (`Refinement::sharing` puts a single filter predicate on the
+source, the map, the cast target, and the consumer contract); every pass that
+rebuilds predicates must then *preserve* it, and "every pass" is the whole list —
+`uniquify`, constraint emission (`emit_bare_predicate`), `coalesce`, `retype`,
+`subst`'s both modes, `inline`, `simplify`, and planning's compilation. Each
+threads one **pass-scoped** `ccl_utils::PredMemo`, whose `rebuild` maps an origin
+`Rc` to a single result. A pass that has nothing to say about a predicate reports
+no change and keeps the origin `Rc` rather than reallocating an equal one, so
+sharing survives even the passes that merely walk past.
+
+Two things make this load-bearing rather than housekeeping:
+
+- **Downstream cost.** Planning's predicate-compilation memo is `Rc`-keyed, so a
+  predicate split into 𝑛 occurrences is compiled 𝑛 times. With nested
+  comprehensions 𝑛 grows with depth, which is how a split turns into superlinear
+  compile time.
+- **The keepalive.** The memo keys on the `Rc`'s *address*
+  (`PredicateId`), which is sound only while that address cannot be reused.
+  Overwriting a slot can drop the last reference to the origin and free an
+  address a later `Rc::new` in the same walk reclaims, at which point an
+  unrelated predicate collides with the entry and inherits its rebuild. `PredMemo`
+  retains every origin for its own lifetime; that is why passes use it rather
+  than a bare map.
+
+A pass reaches predicates through **every type slot a node carries**, not just
+`expr.ty`: the node's own type, its `user_annotation`, a `Cast`'s `target`, and —
+per binder — both the binder's declared type *and* its annotation. Each holds an
+independent predicate `Rc`. `Expr::walk_type_slots{,_mut}` is the single source of
+truth for that set, precisely because hand-rolling it per pass is how a pass
+silently acquires a blind spot — `Cast.target`, where a comprehension filter's
+predicate actually lives, is the one that costs most. `count_free`/`is_free` are on
+it too, and that is not cosmetic: several passes *skip work* when `is_free` says
+no, so a slot the free-variable walk cannot see is a slot those passes decline to
+rewrite.
+
+A binder's **annotation** is the subtle member of that set: it is where lowering
+writes a mutable variable's `Mut(V, D)` history (`x := e` lowers via
+`let_bind_annotated`), and `infer::api::binder_is_mut` reads it as authoritative
+over the binder's `ty`. A walk covering only `b.ty` skips every mutable binder in
+the program, and — because an erasure and its own post-condition would share that
+walk — the check could not report what the erasure missed.
+
+The claim is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
+stamps a distinct marker into every directly-carried `Type` in the AST and pins
+which ones the walk reaches. One is deliberately excluded — `Transact`'s `domain` —
+because that node is born by `plan_loops` after every pass on the walk, so covering
+it would newly expose the sequencing extent to planning's predicate compilation.
+That is a behavioural change in the recurrence engine, and the test pins the
+exclusion so it stays a decision rather than drift.
+
+#### The memo key is the predicate *and the conditions it was rebuilt under*
+
+Keying such a memo on the predicate `Rc`'s address alone is half a key: it answers
+"have I rebuilt this term?", while every pass needs "have I rebuilt this term
+**under the conditions I am rebuilding it under now**?". `PredMemo<C>` carries those
+conditions as `C`, and reuses an entry only when it was recorded under an equal
+`C`. Supplying the wrong `C` costs a sharing opportunity; it cannot produce a wrong
+answer — which is the point, because the key-only design did produce wrong answers
+(`subst` discharging a binder its inner scope owned; constraint emission skipping
+the emission that bounds an occurrence's own domain).
+
+What each pass supplies:
+
+| pass | `C` | why |
+|---|---|---|
+| `simplify` | `()` | a function of the term, full stop |
+| `uniquify` | `()` | resolves against `env`, but lowering shares an `Rc` only by copying one refinement, and pre-uniquifies a subtree before cloning it |
+| `coalesce` | `()` | resolution reads one live constraint graph, so occurrences of one term resolve identically |
+| `retype` | `()` | stamps by `Name`; uids are minted once, and a monomorphization clone rebuilds its predicates while freshening |
+| `inline` | `()` | the rewrite is fixed per sweep, and a shadowed subtree is *skipped*, never descended into |
+| `subst` | `Subst` | acting differently in different scopes is the point of a substitution |
+| planning | `Type` | compilation reads the refinement's base |
+
+The `()` rows are *claims*, and each one's justification lives at its call site —
+that is where to check it. Two are load-bearing in a way worth flagging: `inline`'s
+depends on its binder arms skipping rather than descending-with-a-guard, and
+`retype`'s on freshening giving clones distinct predicate `Rc`s.
+
+A pass that must share *allocations* without sharing *results* uses `TermMemo`
+instead. Constraint emission is the case: it binds `REFINEMENT_BINDER` to a domain
+`emit_cast` mints fresh per cast node, so no occurrence may reuse another's answer,
+yet all should still land on one term. `TermMemo` is a separate type rather than a
+flag, so which of the two a pass is entitled to is visible in its signature.
+
+#### The protocol is a closure, so a rebuild cannot be half-done
+
+`PredMemo::rebuild` and `TermMemo::rebuild_always` take the transform as a closure.
+An earlier token-based shape (`begin` handing out a token that a `finish` consumed)
+could be left open: dropping the token discarded the rebuild, left the occurrence
+on its origin `Rc`, and memoized nothing — so a pass that returned early between
+the halves rewrote every occurrence *but one*. Two such leaks existed; the closure
+form makes them unrepresentable.
+
+The closure is also what lets the memo be a cheap clonable handle
+(`Rc<RefCell<_>>`), which matters because three passes own their memo inside the
+very context their transform needs mutably — `uniquify`'s `self.expr` → `self.ty`,
+`coalesce_node` → `coalesce_type_predicates`, `subexpr` → `emit_node` →
+`emit_cast`. Reaching a handle needs only `&ctx`, and no borrow of the store is held
+across the callback, so those transforms re-enter the memo freely. Threading the
+memo as a plain parameter instead would mean changing `Typing::subexpr` and every
+emit rule.
+
+One consequence worth stating: the `changed` bit a callback returns is not the
+whole answer. A callback that re-enters the memo can have its copy mutated
+underneath it by a nested reuse, with nothing of its own to report; discarding the
+copy would throw that re-pointing away and memoize the staleness. `rebuild`
+therefore also consults the store's revision counter, and
+`walk_refined_predicates_mut` returns a `changed` bit for callers running a
+fixpoint.
+
+The invariant is guarded two ways: a debug-only tripwire around `retype` asserts
+the distinct-`Rc` count (`ccl_utils::distinct_predicate_rcs`) never *grows*
+across a rewrite-only pass, and `tests/predicate_sharing.rs` asserts end-to-end
+that no two `Rc`-distinct refinements reachable from an inferred tree are
+structurally equal — the exact shape a split leaves. The count is a necessary
+check; the equal-but-distinct assertion is the sufficient one, and it needs no
+magic number.
+
 A predicate *function* `p : 𝐷 ⇒ Bool` never lives in a refinement type — only in
 a *term* (an `Apply(p, Iterate/Restrict)` argument). In a type it is represented
 bare as `__elem ▷ p` (`ccl_utils::bare_predicate_of_fn`; its inverse
@@ -408,7 +529,7 @@ Some refinement predicates **close over an outer binder**. The motivating case i
 
 **Pi types.** `Type::Fun` carries an optional binder: `Fun { name: Option<Name>, domain, codomain }`. `name: Some(𝑥)` is the dependent type `(𝑥: domain) ⇒ codomain`, with `𝑥` bound in `codomain`; `name: None` is the ordinary arrow. `emit_lambda` always names the binder from the lambda parameter, so a predicate that closes over the parameter stays bound. The binder is **cosmetic for ordinary functions** — `coalesce_compact_go` keeps it only when the codomain's refinement predicates actually reference it (queried via `subst::type_free_vars`) and strips it otherwise, so monomorphic output is unchanged and equality/printing don't churn.
 
-**Substitutions and contexts (`ccl::subst`).** A `Subst` is a context morphism that maps *term* binders (`Var` names) to replacement `TypedExpr`s. It never relabels a type variable — that is freshening's job. Two flavours: a **rename** `[𝑘 ↦ 𝑥]` (invertible) and a **discharge** `[𝑥 ↦ arg]` (one-way). The traversal is uniform over terms and types: `apply_expr` rewrites each node's type slots via `apply_type` in the same pass, so a substituted binder occurring inside a type-borne refinement predicate is discharged where it sits (no value-only contract, no dangling residual for §6.2 to catch in release builds). It is a true no-op when no substituted binder occurs free in the term — value or type slots — so a vacuous discharge from a non-dependent application changes nothing and shares the predicate `Rc`. Capture is impossible under the Barendregt convention (binder uids are minted once at lowering; copies preserve them) and the engine *asserts* it instead of α-renaming. Predicates are immutable, so a substitution always *rebuilds* a changed predicate (a fresh `Rc`); the engine drives two modes that differ only in what else they touch: **transport** (`apply_expr`/`apply_type`, builds new terms — the constraint-edge flavour) and **in-place rewrite** (`rewrite_expr`, mutates the term tree the caller owns but still rebuilds each predicate, re-pointing occurrences that shared one term via a memo — the pass-level flavour that `lambda_elim::substitute`, `channelize::desugar_substitute`, inlining's beta step, and lowering's uncurrying all wrap). A **context** (`well_formed` / `type_free_vars`) is the dual *checking* device: a type is well-formed iff its predicates' free term-vars are in scope.
+**Substitutions and contexts (`ccl::subst`).** A `Subst` is a context morphism that maps *term* binders (`Var` names) to replacement `TypedExpr`s. It never relabels a type variable — that is freshening's job. Two flavours: a **rename** `[𝑘 ↦ 𝑥]` (invertible) and a **discharge** `[𝑥 ↦ arg]` (one-way). The traversal is uniform over terms and types: `apply_expr` rewrites each node's type slots via `apply_type` in the same pass, so a substituted binder occurring inside a type-borne refinement predicate is discharged where it sits (no value-only contract, no dangling residual for §6.2 to catch in release builds). It is a true no-op when no substituted binder occurs free in the term — value or type slots — so a vacuous discharge from a non-dependent application changes nothing and shares the predicate `Rc`. Capture is impossible under the Barendregt convention (binder uids are minted once at lowering; copies preserve them) and the engine *asserts* it instead of α-renaming. Predicates are immutable, so a substitution always *rebuilds* a changed predicate (a fresh `Rc`); the engine drives two modes that differ only in what else they touch: **transport** (`apply_expr`/`apply_type`, builds new terms — the constraint-edge flavour) and **in-place rewrite** (`rewrite_expr`, mutates the term tree the caller owns; a predicate the substitution actually touches is rebuilt, one it merely walks past keeps its `Rc` — the pass-level flavour that `lambda_elim::substitute`, `channelize::desugar_substitute`, inlining's beta step, and lowering's uncurrying all wrap). Both modes thread the same `PredMemo`, so occurrences that shared one term are re-pointed at the same result. A **context** (`well_formed` / `type_free_vars`) is the dual *checking* device: a type is well-formed iff its predicates' free term-vars are in scope.
 
 **Edges carry substitutions, stored two-sided in their native direction.** Each entry of a variable's bound lists is a `Bound { self_subst, ty, ty_subst }`: an upper entry on `𝑉` reads `𝑉‹self_subst› <: ty‹ty_subst›`, a lower entry `ty‹ty_subst› <: 𝑉‹self_subst›` (both identity for ordinary bounds). `constrain_subtype` delegates to `constrain_go(lhs, rhs, sl, sr, cache)` — each side under its own morphism. The **Fun/Fun arm derives the binder correspondence** `[𝑘 ↦ 𝑥]` onto the lhs side of the codomain edge, and the contravariant domain edge **swaps the two sides** rather than inverting anything. The var arms record edges verbatim — *nothing is inverted at record time*. A **discharge has no inverse**, so edges are recorded in their native direction rather than pre-inverted and re-inverted during closure (which would degrade a discharge to the identity, silently destroying it whenever a consumer edge is recorded before the producer's concrete codomain arrives — the opaque/higher-order application order, O3). Under identity morphisms every arm reduces exactly to the substitution-free solver, so all monomorphic inference is byte-identical.
 

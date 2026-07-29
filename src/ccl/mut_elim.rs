@@ -108,11 +108,11 @@ fn contains_marker(expr: &Expr) -> bool {
     found
 }
 
-/// Whether any reachable type slot (node type, binder slot, or user
-/// annotation) still carries a mutable `Type::History` — the
-/// post-condition [`erase_mut`] establishes. A `Feed` history is *not* the
-/// phase's concern (it is erased later by `channelize`), so only
-/// [`HistoryKind::Overwrite`] counts here.
+/// Whether any type slot still carries a mutable `Type::History` — the
+/// post-condition [`erase_mut`] establishes, checked over the *same*
+/// [`Expr::walk_type_slots`] set the erasure uses so the two cannot disagree about
+/// which slots exist. A `Feed` history is *not* the phase's concern (it is erased
+/// later by `channelize`), so only [`HistoryKind::Overwrite`] counts here.
 fn contains_mut_type(expr: &Expr) -> bool {
     fn ty_has_mut(ty: &Type) -> bool {
         matches!(
@@ -123,24 +123,9 @@ fn contains_mut_type(expr: &Expr) -> bool {
             }
         ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
     }
-    let binder_has_mut =
-        |b: &TypedBinding| ty_has_mut(&b.ty) || b.user_annotation.as_ref().is_some_and(ty_has_mut);
-    let node_binders = match &expr.node {
-        TypedExprNode::Lambda { param, .. }
-        | TypedExprNode::Let { binding: param, .. }
-        | TypedExprNode::For { target: param, .. } => binder_has_mut(param),
-        TypedExprNode::LetRec { bindings, .. } => bindings.iter().any(|(b, _)| binder_has_mut(b)),
-        TypedExprNode::Case { branches, .. } => branches.iter().any(|b| {
-            b.pattern
-                .as_ref()
-                .is_some_and(|p| binder_has_mut(&p.binding))
-        }),
-        _ => false,
-    };
-    ty_has_mut(&expr.ty)
-        || expr.user_annotation.as_ref().is_some_and(ty_has_mut)
-        || node_binders
-        || expr.any_child(contains_mut_type)
+    let mut here = false;
+    expr.walk_type_slots(|t| here |= ty_has_mut(t));
+    here || expr.any_child(contains_mut_type)
 }
 
 /// Replace every transient mutable `Type::History { value, .. }` in
@@ -163,24 +148,18 @@ fn erase_mut_in_type(ty: &mut Type) {
     ty.walk_children_mut(erase_mut_in_type);
 }
 
-/// Erase `Type::History` on a binder slot (its declared type and any annotation).
-fn erase_mut_in_binding(b: &mut TypedBinding) {
-    erase_mut_in_type(&mut b.ty);
-    if let Some(ann) = &mut b.user_annotation {
-        erase_mut_in_type(ann);
-    }
-}
-
-/// Erase every `Type::History` throughout `expr`: node types, user annotations, and
-/// the binder slots `walk_children_mut` does not reach (`walk_binders_mut`,
-/// mirroring the binder coverage of `infer::collect_expr_errors`, the
-/// strict-wall checker this keeps happy).
+/// Erase every `Type::History` throughout `expr`, over **every** type slot each
+/// node carries ([`Expr::walk_type_slots_mut`]) rather than an enumeration written
+/// out here.
+///
+/// The enumeration matters because [`contains_mut_type`] — the release-mode
+/// post-condition asserting this pass left no history behind — has to cover the
+/// same set. Writing the set twice is how an eraser and its own checker come to
+/// share a blind spot, at which point the check cannot observe what the erasure
+/// missed. Sharing one walk makes that impossible: a slot either both erase and
+/// check, or neither.
 fn erase_mut(expr: &mut Expr) {
-    erase_mut_in_type(&mut expr.ty);
-    if let Some(ann) = &mut expr.user_annotation {
-        erase_mut_in_type(ann);
-    }
-    expr.walk_binders_mut(erase_mut_in_binding);
+    expr.walk_type_slots_mut(erase_mut_in_type);
     expr.walk_children_mut(erase_mut);
 }
 
@@ -1113,6 +1092,57 @@ fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
 mod tests {
     use super::*;
     use crate::ccl::BaseType;
+
+    /// Whether any *binder annotation* still carries a mutable history.
+    ///
+    /// Deliberately independent of [`contains_mut_type`]: the post-condition and
+    /// the erasure share one walk, so a slot that walk misses is a slot the
+    /// post-condition cannot report. A guard has to enumerate the slot itself or
+    /// it inherits the same blind spot.
+    fn binder_annotation_has_mut(expr: &Expr) -> bool {
+        fn ty_has_mut(ty: &Type) -> bool {
+            matches!(
+                ty,
+                Type::History {
+                    kind: HistoryKind::Overwrite,
+                    ..
+                }
+            ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
+        }
+        let mut found = false;
+        expr.walk_binders(|b| {
+            if let Some(ann) = &b.user_annotation {
+                found |= ty_has_mut(ann);
+            }
+        });
+        found || expr.any_child(binder_annotation_has_mut)
+    }
+
+    /// A mutable variable's history rides the binder's **annotation**, not its
+    /// `ty`: `x := e` lowers to `let_bind_annotated(.., Mut(V, _))`, and
+    /// `infer::api::binder_is_mut` reads the annotation as authoritative. So the
+    /// phase's erasure has to reach that slot.
+    #[test]
+    fn phase_erases_mut_from_a_binder_annotation() {
+        let (mut tree, _, _) = direct_mirror_sum();
+        let TypedExprNode::Let { binding, .. } = &mut tree.node else {
+            panic!("fixture is a let");
+        };
+        binding.user_annotation = Some(Type::History {
+            value: Box::new(Type::Base(BaseType::Int)),
+            domain: Box::new(Type::Hole),
+            kind: HistoryKind::Overwrite,
+        });
+        assert!(binder_annotation_has_mut(&tree), "sanity: fixture has one");
+
+        let out = run(tree);
+
+        assert!(
+            !binder_annotation_has_mut(&out),
+            "a history survived on a binder annotation: {}",
+            symbolic(&out)
+        );
+    }
 
     /// Build the typed direct-mirror tree for
     /// `x := 0; for i in [1,2,3]: x += i; x` as lowering + inference

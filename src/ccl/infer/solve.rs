@@ -19,8 +19,8 @@
 // live in a single module.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
+use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, coalesce_compact, compact_type,
@@ -103,6 +103,11 @@ pub(super) struct CoalesceCtx {
     /// applies).
     scope: Vec<ScopeEntry>,
     errors: Vec<InferError>,
+    /// Pass-scoped predicate-rewrite memo: keeps every refinement occurrence
+    /// that entered the coalesce walk sharing one predicate `Rc` sharing a
+    /// single coalesced `Rc` on the way out, instead of splitting into one
+    /// independently-coalesced copy per node. See [`PredMemo`].
+    pred_memo: PredMemo,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
@@ -470,6 +475,7 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
         errors: Vec::new(),
+        pred_memo: PredMemo::new(),
         #[cfg(debug_assertions)]
         reads: Vec::new(),
     };
@@ -1013,12 +1019,42 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// is emitted in the enclosing scope), and the walk's scope travels with
 /// `ctx`, so a generalized-binding use living only inside a predicate
 /// specializes here.
+///
+/// Unlike [`retype_in_type`], this can't delegate the type-walk to
+/// [`walk_refined_predicates_mut`]: its per-predicate transform is
+/// `coalesce_node`, which needs `&mut CoalesceCtx` — and the memo lives *in*
+/// that ctx, so the combinator's `&mut PredMemo` and the transform's `&mut ctx`
+/// would alias. Pulling the memo out would force it through `coalesce_node`'s
+/// whole recursion (far more threading than the ctx field). So the sharing is
+/// preserved inline here via the same [`PredMemo::rebuild`] the combinator uses —
+/// which is possible because the memo is a handle, so reaching it needs only
+/// `&ctx` and the callback can re-enter it through `coalesce_node`'s own recursion.
+///
+/// **Why `C = ()`** (see [`PredMemo`]'s note on what `C` is). `coalesce_node` is
+/// level- and scope-dependent, so declaring no context means: for two occurrences
+/// of one shared `Rc` reached under different scopes, whichever the walk reaches
+/// first wins. That is sound here
+/// because sharing means *literally the same term with the same inference
+/// variables*: resolution reads those variables out of the one live constraint
+/// graph, so both occurrences would resolve identically and the first result is
+/// the only result. It is the converse that must not happen — two refinements
+/// that should resolve differently must not share an `Rc` — which holds because a
+/// shared `Rc` is only ever created by copying one occurrence of one refinement.
+///
+/// Contrast constraint *emission*, where the same reasoning fails: it is
+/// parameterized by a domain minted per occurrence, so it must run at each one and
+/// uses `TermMemo` instead (`emit_bare_predicate`).
 fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) {
     match ty {
         Type::Refinement(inner, r) => {
-            let mut pred = (*r.predicate).clone();
-            coalesce_node(&mut pred, level, ctx);
-            r.predicate = Rc::new(pred);
+            // A handle clone, so `ctx` stays freely borrowable for the rebuild —
+            // which re-enters this same memo through `coalesce_node` →
+            // `coalesce_type_predicates`.
+            let memo = ctx.pred_memo.clone();
+            memo.rebuild(r, &(), |pred| {
+                coalesce_node(pred, level, ctx);
+                true
+            });
             coalesce_type_predicates(inner, level, ctx);
         }
         Type::Fun {
@@ -1439,125 +1475,123 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
 /// its correct type is exactly that binder's resolved type. Look it up by name
 /// and stamp it. (O2/O7 for the monomorphic-direct case: the binders predicates
 /// close over are ordinary in-scope binders, each with a single solution.)
-pub(super) fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<Name, Type>) {
-    retype_in_type(&mut expr.ty, scope);
-    // Retype the **binder type slots** (and a `Cast`'s `target`), not just
-    // `expr.ty`. A binder's type (`param.ty`, a `let` binding's `ty`, a `Cast`
-    // `target`) is a copy of the same refinement that also rides `expr.ty`, but
-    // an independent immutable `Rc`: rebuilding the predicate on `expr.ty` above
-    // leaves that copy stale, and [`crate::ccl::infer::check_fully_typed`] walks
-    // these slots (a lambda's `param.ty`, etc.), so an unresolved predicate slot
-    // there is a hard error. (Under the retired shared predicate cells one
-    // rewrite fixed every alias at once; immutable terms must restamp each slot.)
-    // Each binder's *own* type is in the enclosing `scope` — the binder does not
-    // bind in its own type — so it is retyped before the binder enters `scope`.
+///
+/// A predicate is itself a term, so this is **one** walk, not a term walk plus a
+/// parallel predicate walk: [`retype_in_type`] hands each predicate back to this
+/// function. That is load-bearing rather than tidy — the slot a comprehension
+/// filter's predicate lives in (`Cast.target`) is reached only through the
+/// predicate side, so a hand-rolled predicate walk that omits an arm leaves a
+/// predicate un-restamped *and* splits its `Rc` sharing against the occurrence
+/// the term walk did reach.
+pub(super) fn retype_predicate_slots(
+    expr: &mut Expr,
+    scope: &HashMap<Name, Type>,
+    memo: &PredMemo,
+) {
+    // Every type slot the node carries, retyped in the *enclosing* scope — a
+    // binder does not bind in its own type. Each slot (`ty`, the annotation, a
+    // binder's declared type, a `Cast`'s `target`) is a copy of the same
+    // refinement holding an independent immutable `Rc`, so rebuilding one leaves
+    // the others stale; [`crate::ccl::infer::check_fully_typed`] walks them all,
+    // and an unresolved predicate slot there is a hard error.
+    // [`Expr::walk_type_slots_mut`] is the single source of truth for that set.
+    expr.walk_type_slots_mut(|ty| retype_in_type(ty, scope, memo));
+
+    // The stamp itself: a free `Var` whose slot coalesce left unresolved takes
+    // its type from the binder in scope. (Fires inside predicates — a dependent
+    // discharge's substituted argument copy is invisible to the per-node
+    // coalesce — and is a no-op on the term side, where coalesce resolved every
+    // slot.)
+    if let TypedExprNode::Var(n) = &expr.node
+        && matches!(expr.ty, Type::Infer(_) | Type::Hole)
+        && let Some(t) = scope.get(n)
+    {
+        expr.ty = t.clone();
+    }
+
+    // Recurse, extending `scope` over exactly the children each binder scopes.
+    // (The shape "walk children, each under the binders that scope it" recurs —
+    // `subst::rewrite_expr_go` and `infer::api`'s scope walks spell it out too;
+    // it is a candidate for a `walk_children_scoped` combinator alongside
+    // [`Expr::walk_binders`], which would make the scoping non-uniformity —
+    // `Let` binds only `body`, `LetRec` binds everything — declared once.)
     match &mut expr.node {
         TypedExprNode::Lambda { param, body, .. } => {
-            retype_in_type(&mut param.ty, scope);
             let mut s = scope.clone();
             s.insert(param.name.clone(), param.ty.clone());
-            retype_predicate_slots(body, &s);
+            retype_predicate_slots(body, &s, memo);
+        }
+        TypedExprNode::For { target, iter, body } => {
+            retype_predicate_slots(iter, scope, memo);
+            let mut s = scope.clone();
+            s.insert(target.name.clone(), target.ty.clone());
+            retype_predicate_slots(body, &s, memo);
         }
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
-            retype_in_type(&mut binding.ty, scope);
-            retype_predicate_slots(bound_expr, scope);
+            retype_predicate_slots(bound_expr, scope, memo);
             let mut s = scope.clone();
             s.insert(binding.name.clone(), binding.ty.clone());
-            retype_predicate_slots(body, &s);
+            retype_predicate_slots(body, &s, memo);
+        }
+        // Mutual recursion: every group binder scopes every definition and the
+        // body.
+        TypedExprNode::LetRec { bindings, body } => {
+            let mut s = scope.clone();
+            for (b, _) in bindings.iter() {
+                s.insert(b.name.clone(), b.ty.clone());
+            }
+            for (_, def) in bindings.iter_mut() {
+                retype_predicate_slots(def, &s, memo);
+            }
+            retype_predicate_slots(body, &s, memo);
         }
         TypedExprNode::Case {
             scrutinee,
             branches,
         } => {
             if let Some(sc) = scrutinee {
-                retype_predicate_slots(sc, scope);
+                retype_predicate_slots(sc, scope, memo);
             }
             for b in branches.iter_mut() {
                 let mut s = scope.clone();
-                if let Some(p) = &mut b.pattern {
-                    retype_in_type(&mut p.binding.ty, scope);
+                if let Some(p) = &b.pattern {
                     s.insert(p.binding.name.clone(), p.binding.ty.clone());
                 }
-                retype_predicate_slots(&mut b.guard, &s);
-                retype_predicate_slots(&mut b.body, &s);
+                retype_predicate_slots(&mut b.guard, &s, memo);
+                retype_predicate_slots(&mut b.body, &s, memo);
             }
         }
-        TypedExprNode::Cast { value, target } => {
-            retype_in_type(target, scope);
-            retype_predicate_slots(value, scope);
-        }
-        _ => expr.walk_children_mut(|c| retype_predicate_slots(c, scope)),
+        _ => expr.walk_children_mut(|c| retype_predicate_slots(c, scope, memo)),
     }
 }
 
-/// Recurse into `ty`'s refinement predicates, stamping each free `Var`'s
-/// resolved type from `scope`.
-fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>) {
-    match ty {
-        Type::Fun {
-            domain, codomain, ..
-        } => {
-            retype_in_type(domain, scope);
-            retype_in_type(codomain, scope);
-        }
-        Type::Tuple(ts) => ts.iter_mut().for_each(|t| retype_in_type(t, scope)),
-        Type::Record(fs) => fs.iter_mut().for_each(|(_, t)| retype_in_type(t, scope)),
-        Type::Variant(tags) => tags.iter_mut().for_each(|(_, t)| retype_in_type(t, scope)),
-        Type::Refinement(base, r) => {
-            retype_in_type(base, scope);
-            let mut pred = (*r.predicate).clone();
-            retype_pred_expr(&mut pred, scope);
-            r.predicate = Rc::new(pred);
-        }
-        Type::History { value, domain, .. } => {
-            retype_in_type(value, scope);
-            retype_in_type(domain, scope);
-        }
-        Type::Base(_)
-        | Type::UIntRange(_)
-        | Type::DataSource(_)
-        | Type::ChanDom(..)
-        | Type::Txn
-        | Type::Hole
-        | Type::Infer(_) => {}
-    }
-}
-
-/// Stamp free `Var` types inside a predicate expression from `scope`, tracking
-/// the predicate's own binders (so they shadow outer names rather than being
-/// rewritten). Only an unresolved (`Infer`/`Hole`) slot is overwritten — a slot
-/// coalesce already resolved is left intact.
-fn retype_pred_expr(e: &mut Expr, scope: &HashMap<Name, Type>) {
-    retype_in_type(&mut e.ty, scope);
-    match &mut e.node {
-        TypedExprNode::Var(n) => {
-            if matches!(e.ty, Type::Infer(_) | Type::Hole)
-                && let Some(t) = scope.get(n)
-            {
-                e.ty = t.clone();
-            }
-        }
-        TypedExprNode::Lambda { param, body, .. } => {
-            let mut s = scope.clone();
-            s.insert(param.name.clone(), param.ty.clone());
-            retype_pred_expr(body, &s);
-        }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            retype_pred_expr(bound_expr, scope);
-            let mut s = scope.clone();
-            s.insert(binding.name.clone(), binding.ty.clone());
-            retype_pred_expr(body, &s);
-        }
-        _ => e.walk_children_mut(|c| retype_pred_expr(c, scope)),
-    }
+/// Recurse into `ty`'s refinement predicates, retyping each as a term
+/// ([`retype_predicate_slots`]). The type recursion and the sharing-preserving
+/// predicate rebuild are both the shared [`walk_refined_predicates_mut`]
+/// combinator's job — this only supplies the per-predicate transform, so a new
+/// `Type` variant can never be silently missed and the `PredMemo` discipline is
+/// inherited rather than re-hand-rolled.
+/// **Why reusing an entry is sound here**, given that the stamp reads `scope` —
+/// context the memo key does not name (see [`PredMemo`]'s note on key-determined
+/// transforms). The stamp looks a binder up *by `Name`*, and binder names carry
+/// uids minted once at lowering, so a name denotes one binder with one resolved
+/// type. Copies preserve uids, so two copies of a subtree agree; and the one place
+/// copies get *different* types — a monomorphization clone — rebuilds its
+/// predicates as fresh `Rc`s while freshening (`freshen_refinement_predicate`), so
+/// clones never share an `Rc` to collapse. Occurrences sharing one `Rc` therefore
+/// stamp identically.
+fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>, memo: &PredMemo) {
+    walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+        // Always reported as changed: retyping rewrites *type slots* inside the
+        // predicate, and `Refinement`'s equality is type-blind — so a "did it
+        // change?" test at the refinement level cannot see this pass's work.
+        retype_predicate_slots(pred, scope, memo);
+        true
+    });
 }
 
 #[cfg(test)]

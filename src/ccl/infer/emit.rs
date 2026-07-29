@@ -3,7 +3,6 @@
 // ---------------------------------------------------------------------------
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use smol_str::SmolStr;
 
@@ -19,7 +18,7 @@ use crate::ccl::{
 
 use super::context::InferCtx;
 use super::typing::{Typing, peel_refinements_outer};
-use super::{lit_singleton, product, variant_type};
+use super::{product, variant_type};
 
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
@@ -28,7 +27,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
     let ty = match &mut expr.node {
-        TypedExprNode::Lit(lit) => lit_singleton(lit),
+        TypedExprNode::Lit(lit) => ctx.lit_singleton(lit),
 
         // Resolve a variable through its bound scheme. A monomorphic binder
         // freshens nothing and returns its type verbatim. A *polymorphic* `let`
@@ -299,18 +298,51 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), I
 /// it as a fresh `Rc` on `r`. The caller holds `&mut Refinement` so the typed
 /// predicate lands on the syntactic node; the cast/annotation result type then
 /// clones the typed refinement, carrying the same slots.
+///
+/// **Emission is therefore a predicate-rebuilding pass**, and it preserves
+/// predicate `Rc` sharing — but it shares *terms* rather than *results*, so it
+/// uses [`TermMemo::rebuild_always`](crate::ccl::ccl_utils::TermMemo) rather than
+/// [`PredMemo::rebuild`](crate::ccl::ccl_utils::PredMemo), which would reuse an
+/// earlier occurrence's answer.
+///
+/// The distinction is load-bearing here. This function's result depends on
+/// `domain`, which is **not** part of the memo key: the element binder is bound to
+/// it, so the predicate's constraints land on *that* domain. `emit_cast` mints a
+/// fresh domain variable per cast node, so two occurrences of one shared
+/// predicate `Rc` are two genuinely different typing problems. Skipping emission
+/// on a memo hit would leave the second occurrence's domain carrying none of the
+/// constraints the predicate imposes on `REFINEMENT_BINDER` — silently
+/// under-determined rather than wrong-looking.
+///
+/// So emission runs at **every** occurrence, and only the resulting *term* is
+/// unified. That keeps sharing without borrowing an answer: without it the first
+/// pass over the tree splits sharing before any later pass can preserve it — a
+/// nested comprehension's inner filter is reached twice (once on the term-level
+/// `Cast`'s `target`, once on the copy of that `Cast` inside the enclosing
+/// comprehension's own filter predicate), so it would emerge from emit as two
+/// `Rc`s. Discarding this occurrence's copy in favour of the first's is sound
+/// because refinement identity is type-blind: the occurrences denote one
+/// refinement, and each has already discharged its own typing obligation.
 fn emit_bare_predicate<C: Typing>(
     r: &mut Refinement,
     domain: &Type,
     ctx: &mut C,
 ) -> Result<(), InferError> {
-    let mut pred = (*r.predicate).clone();
-    let pred_ty = ctx.scoped(&Name::elem(), domain, |ctx| ctx.subexpr(&mut pred))?;
-    ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
-        "refinement predicate".to_string()
-    })?;
-    r.predicate = Rc::new(pred);
-    Ok(())
+    let memo = ctx.pred_memo();
+    // The closure cannot leave the rebuild half-done: there is no token to drop on
+    // an early return, so the error is captured and propagated after the term is
+    // installed rather than skipping the install.
+    let mut typed = Ok(());
+    memo.rebuild_always(r, |pred| {
+        typed = ctx
+            .scoped(&Name::elem(), domain, |ctx| ctx.subexpr(pred))
+            .and_then(|pred_ty| {
+                ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
+                    "refinement predicate".to_string()
+                })
+            });
+    });
+    typed
 }
 
 /// Apply a binary scheme: instantiate, build the expected call shape,
@@ -1328,4 +1360,53 @@ pub(super) fn emit_transact<C: Typing>(
         }
     }
     Ok(Type::Record(fields))
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::ccl::{BinOpKind, CompareKind, Lit, TypedExpr};
+    use std::rc::Rc;
+
+    /// Finding 2: [`emit_bare_predicate`]'s transform is parameterized by
+    /// `domain`, which is not part of the memo key. `emit_cast` passes a *fresh*
+    /// inference variable per cast node, so two occurrences of one shared
+    /// predicate `Rc` are typed against two different domains — and the memo
+    /// makes the second one emit nothing at all, leaving its domain with none of
+    /// the constraints the predicate imposes on `REFINEMENT_BINDER`.
+    #[test]
+    fn each_occurrence_constrains_its_own_domain() {
+        // `__elem > 0` — using the element binder is what makes the predicate
+        // constrain the domain it is typed against.
+        let shared = Rc::new(TypedExpr::binop(
+            TypedExpr::var(Name::elem()),
+            BinOpKind::Compare(CompareKind::Greater),
+            TypedExpr::lit(Lit::Int(0)),
+        ));
+        let mut r1 = Refinement::sharing(&shared);
+        let mut r2 = Refinement::sharing(&shared);
+
+        let mut ctx = InferCtx::new(std::collections::HashMap::new());
+        let d1 = ctx.fresh();
+        let d2 = ctx.fresh();
+        emit_bare_predicate(&mut r1, &d1, &mut ctx).expect("first occurrence types");
+        emit_bare_predicate(&mut r2, &d2, &mut ctx).expect("second occurrence types");
+
+        let bound_count = |t: &Type| {
+            let Type::Infer(v) = t else {
+                panic!("fresh() yields a variable");
+            };
+            let b = v.bounds.borrow();
+            b.lower.len() + b.upper.len()
+        };
+        assert!(
+            bound_count(&d1) > 0,
+            "sanity: typing `__elem > 0` at `d1` constrains `d1`",
+        );
+        assert!(
+            bound_count(&d2) > 0,
+            "the second occurrence's domain must be constrained by the predicate \
+             too — the memo hit skipped emission and left `d2` unbounded",
+        );
+    }
 }

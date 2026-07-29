@@ -7,46 +7,54 @@
 //! [`crate::ccl::ccl_utils::bare_predicate_of_fn`] that the iterate/restrict and
 //! op-conversion lowering consume.
 
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use super::*;
 
-/// Identity key for a refinement predicate — the `Rc<Expr>` address. Keyed on
-/// object identity, not [`crate::ccl::RefinementId`]: a substituted/discharged
-/// refinement keeps its id but holds an independently rebuilt predicate that
-/// must be compiled on its own (keying by id would skip it and leave it in
-/// lambda form). Maps each original predicate to a `(keepalive, compiled)`
-/// pair so every occurrence that shared one term is re-pointed at the same
-/// compiled `Rc` (and compiled exactly once).
-///
-/// The `keepalive` clone is load-bearing, not incidental: [`compile_predicates_in_type`]
-/// overwrites `refinement.predicate` with the compiled result, which drops the
-/// *original* `Rc` if this was its only strong reference. Without a clone held
-/// here, that free can hand the address straight back to an unrelated `Rc::new`
-/// later in the *same* tree walk — including one of `compile_predicates_in_type`'s
-/// own allocations — so a subsequent, unrelated predicate that happens to start
-/// life at that address collides with this entry and gets served this entry's
-/// `compiled` value instead of its own. Confirmed in practice: two structurally
-/// unrelated join predicates from different call sites landed on the same freed
-/// address and the second silently inherited the first's compiled form.
-///
-/// Like the value-rewrite memo in [`ccl_utils::walk_refined_predicates_mut`],
-/// dedup itself is a **performance / structural-sharing optimization, not a
-/// correctness requirement** — verified: the full suite passes with dedup
-/// disabled (i.e. recompiling every occurrence independently). Compilation is
-/// effectively a value function for comparison purposes: `lambda_elim` mints a
-/// fresh `__pair` `Uid` in its nested-lambda rule, but that binder is
-/// *eliminated* within the same run, so the compiled output is point-free and
-/// carries no minted binder — two independent compilations of one predicate
-/// yield structurally-equal terms. (The convention this rests on — no pass
-/// leaves a re-minted bound binder in a term that equality later compares — is
-/// what keeps by-name equality coincide with α-equivalence; `lambda_elim`
-/// upholds it by eliminating `__pair` rather than the equality having to be
-/// α-aware.) The *keying*, however — using the original `Rc`'s address as a
-/// stand-in for its identity — is only sound while that address cannot be
-/// reused, which is exactly what the keepalive guarantees.
-pub(super) type PredMemo = HashMap<*const Expr, (Rc<Expr>, Rc<Expr>)>;
+// Predicate compilation is a predicate-*rebuilding* pass like any other, so it
+// memoizes with the shared [`ccl_utils::PredMemo`] — including its keepalive
+// discipline, which is load-bearing rather than incidental here: overwriting
+// `refinement.predicate` with the compiled result drops the *original* `Rc` if
+// that was its last strong reference, and the freed address can be handed
+// straight back to an unrelated `Rc::new` later in the same walk — including one
+// of `compile_predicates_in_type`'s own allocations — so an unrelated predicate
+// starting life at that address would collide and inherit this entry's compiled
+// form. Observed in practice: two structurally unrelated join predicates from
+// different call sites landed on the same freed address and the second silently
+// inherited the first's compiled form.
+//
+// Dedup itself is a **performance / structural-sharing optimization, not a
+// correctness requirement** — verified: the full suite passes with dedup
+// disabled (i.e. recompiling every occurrence independently). Compilation is
+// effectively a value function for comparison purposes: `lambda_elim` mints a
+// fresh `__pair` `Uid` in its nested-lambda rule, but that binder is
+// *eliminated* within the same run, so the compiled output is point-free and
+// carries no minted binder — two independent compilations of one predicate yield
+// structurally-equal terms. (The convention this rests on — no pass leaves a
+// re-minted bound binder in a term that equality later compares — is what makes
+// by-name equality coincide with α-equivalence; `lambda_elim` upholds it by
+// eliminating `__pair` rather than the equality having to be α-aware.)
+//
+// Keying on the `Rc` address rather than a refinement id is deliberate: a
+// substituted/discharged refinement keeps its id but holds an independently
+// rebuilt predicate that must be compiled on its own, so keying by id would skip
+// it and leave it in lambda form.
+
+// The refinement's **base** is the memo's context (`PredMemo<Type>`), because
+// compilation reads it: `fn_of_bare_predicate` eta-expands `λ __elem : base →
+// bare`, and `bare_predicate_of_fn` stamps it on the element var. An entry is
+// therefore reused only for an occurrence over an equal base. That holds in
+// practice — a shared `Rc` is only ever created by copying one refinement — but
+// nothing enforces it, and keying on the base means a mismatch *recompiles*
+// rather than silently borrowing another occurrence's element type.
+//
+// Cost of a `Type` context: a lookup compares bases structurally, and `PartialEq`
+// for a refined `Type` descends into predicate terms. Two things keep that cheap.
+// The base is the type being *refined*, so it sits below the refinement rather
+// than containing it — comparing `{Int | p}`'s base compares `Int`, never `p` —
+// and the entry list for one key is a singleton in every shape measured, so a hit
+// is one compare of a small type. The clone per refinement node is the same
+// shallow value. Measured against the pre-context memo the difference is in the
+// noise; a base that ever became large enough to matter would be a signal about
+// the types, not about this key.
 
 /// True if a `__pair` binder ([`Name::is_synthetic_pair`]) appears anywhere in
 /// the **term** `e` — its node and child *expressions*, never its type slots.
@@ -91,41 +99,17 @@ fn term_mentions_pair_binder(e: &Expr) -> bool {
 /// recovers `p` via `fn_of_bare_predicate` and re-wraps). Each distinct predicate
 /// `Rc` is compiled once.
 ///
-/// Every type slot a node carries is compiled, not just `expr.ty`: a `Cast`'s
-/// `target` and the binder-declared types (lambda param, `let` binding, etc.)
-/// carry their own predicate `Rc`s. They are independent (immutable) terms, so
-/// each must be normalized. For the common predicate (no nested lambdas)
-/// compilation is deterministic, so a `target` and its parallel `expr.ty`
-/// normalize to structurally-equal point-free predicates and still
-/// match under refinement equality; for the nested-lambda case the per-`Rc`
-/// memo keeps shared occurrences equal despite `lambda_elim`'s `__pair` minting
-/// (see [`PredMemo`]).
-pub(crate) fn compile_refinement_predicates(expr: &mut Expr, memo: &mut PredMemo) {
-    compile_predicates_in_type(&mut expr.ty, memo);
-    if let Some(annotation) = &mut expr.user_annotation {
-        compile_predicates_in_type(annotation, memo);
-    }
-    match &mut expr.node {
-        TypedExprNode::Lambda { param, .. } => compile_predicates_in_type(&mut param.ty, memo),
-        TypedExprNode::Cast { target, .. } => compile_predicates_in_type(target, memo),
-        TypedExprNode::Let { binding, .. } => compile_predicates_in_type(&mut binding.ty, memo),
-        TypedExprNode::Case { branches, .. } => {
-            for b in branches.iter_mut() {
-                if let Some(p) = &mut b.pattern {
-                    compile_predicates_in_type(&mut p.binding.ty, memo);
-                }
-            }
-        }
-        TypedExprNode::LetRec { bindings, .. } => {
-            for (b, _) in bindings.iter_mut() {
-                compile_predicates_in_type(&mut b.ty, memo);
-            }
-        }
-        TypedExprNode::For { target, .. } => {
-            compile_predicates_in_type(&mut target.ty, memo);
-        }
-        _ => {}
-    }
+/// Every type slot a node carries is compiled, not just `expr.ty`
+/// ([`Expr::walk_type_slots_mut`]): a `Cast`'s `target` and the binder-declared
+/// types (lambda param, `let` binding, etc.) carry their own predicate `Rc`s.
+/// They are independent (immutable) terms, so each must be normalized. For the
+/// common predicate (no nested lambdas) compilation is deterministic, so a
+/// `target` and its parallel `expr.ty` normalize to structurally-equal point-free
+/// predicates and still match under refinement equality; for the nested-lambda
+/// case the per-`Rc` memo keeps shared occurrences equal despite `lambda_elim`'s
+/// `__pair` minting (see [`PredMemo`]).
+pub(crate) fn compile_refinement_predicates(expr: &mut Expr, memo: &PredMemo<Type>) {
+    expr.walk_type_slots_mut(|ty| compile_predicates_in_type(ty, memo));
     expr.walk_children_mut(|child| compile_refinement_predicates(child, memo));
 }
 
@@ -143,42 +127,32 @@ pub(crate) fn fn_of_bare_predicate(base: &Type, bare: &Expr) -> Expr {
         .expect("lambda-elim of refinement predicate")
 }
 
-fn compile_predicates_in_type(ty: &mut Type, memo: &mut PredMemo) {
+fn compile_predicates_in_type(ty: &mut Type, memo: &PredMemo<Type>) {
     if let Type::Refinement(base, refinement) = ty {
-        // Clone before computing the pointer: the clone is the keepalive that
-        // keeps this address from being freed and reused for the rest of the
-        // walk (see [`PredMemo`]). Reading the pointer off `refinement.predicate`
-        // directly would still be correct today, but pairing the clone with the
-        // pointer it backs makes the dependency obvious at the call site.
-        let original_rc = Rc::clone(&refinement.predicate);
-        let original = Rc::as_ptr(&original_rc);
-        if let Some((_, compiled)) = memo.get(&original) {
-            refinement.predicate = Rc::clone(compiled);
-        } else {
+        let base_ctx = (**base).clone();
+        memo.rebuild(refinement, &base_ctx, |bare| {
             // Normalize the bare predicate to `__elem ▷ p` with `p` point-free:
-            // recover the predicate function and re-wrap it. This keeps the
-            // stored predicate in the single bare form while pinning a
-            // point-free core, so the iterate/restrict producers (built from
-            // the same `p`) carry a structurally-identical refinement to the
-            // cast demand they satisfy.
-            let p = fn_of_bare_predicate(base, &refinement.predicate);
-            let mut compiled = ccl_utils::bare_predicate_of_fn(base, p);
+            // recover the predicate function and re-wrap it. This keeps the stored
+            // predicate in the single bare form while pinning a point-free core, so
+            // the iterate/restrict producers (built from the same `p`) carry a
+            // structurally-identical refinement to the cast demand they satisfy.
+            let p = fn_of_bare_predicate(&base_ctx, bare);
+            let mut compiled = ccl_utils::bare_predicate_of_fn(&base_ctx, p);
             // The compiled predicate's own sub-expressions can carry *nested*
             // refinements (a filter over an already-filtered source: the inner
-            // refinement rides a sub-expression's type slot inside this
-            // predicate). `Type::walk_children_mut` below does not descend into
-            // a predicate term, so compile those here, sharing the memo.
+            // refinement rides a sub-expression's type slot inside this predicate).
+            // `Type::walk_children_mut` below does not descend into a predicate term,
+            // so compile those here, sharing the memo.
             compile_refinement_predicates(&mut compiled, memo);
-            // The producer/consumer refinement match (`sum`'s domain vs. its
-            // feed, a compose adjacency) compares *distinct* predicate `Rc`s —
-            // the memo only dedups occurrences sharing one `Rc`. That match
-            // rests on compilation being a deterministic value function, which
-            // requires that lambda elimination's freshly-minted `__pair`
-            // (`Uid::fresh()`) never survive into the compared *term*. It
-            // legitimately survives as a `Fun.name` Pi binder in a type slot
-            // (which `eq_refinement_predicate` is type-blind to), so the check
-            // is term-only. Assert that load-bearing invariant rather than
-            // leaving it argued.
+            // The producer/consumer refinement match (`sum`'s domain vs. its feed, a
+            // compose adjacency) compares *distinct* predicate `Rc`s — the memo only
+            // dedups occurrences sharing one `Rc`. That match rests on compilation
+            // being a deterministic value function, which requires that lambda
+            // elimination's freshly-minted `__pair` (`Uid::fresh()`) never survive
+            // into the compared *term*. It legitimately survives as a `Fun.name` Pi
+            // binder in a type slot (which `eq_refinement_predicate` is type-blind
+            // to), so the check is term-only. Assert that load-bearing invariant
+            // rather than leaving it argued.
             debug_assert!(
                 !term_mentions_pair_binder(&compiled),
                 "a `__pair` binder survived into a compiled predicate term, \
@@ -186,10 +160,9 @@ fn compile_predicates_in_type(ty: &mut Type, memo: &mut PredMemo) {
                  producer/consumer match relies on: {}",
                 symbolic(&compiled)
             );
-            let compiled = Rc::new(compiled);
-            memo.insert(original, (original_rc, Rc::clone(&compiled)));
-            refinement.predicate = compiled;
-        }
+            *bare = compiled;
+            true
+        });
     }
     // Recurse into structural type children (refinement base, function
     // domain/codomain, tuple/record/variant elements).

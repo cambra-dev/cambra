@@ -791,9 +791,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let pred_on_source = typed_compose(vec![target_elim.clone(), pred_elem]);
             let source_domain = target_elim.ty.domain().unwrap();
             let source_codomain = target_elim.ty.codomain().unwrap();
-            let refinement = Refinement {
-                predicate: Rc::new(pred_on_source),
-            };
+            let refinement = Refinement::born(Rc::new(pred_on_source));
             let refined_domain = Type::Refinement(Box::new(source_domain), refinement);
             let refined_source = target_elim.with_ty(Type::fun(refined_domain, source_codomain));
             let body_elim = elim_lambda(ctx, &param.name, &param.ty, true_body)?;
@@ -1116,9 +1114,7 @@ mod tests {
         // predicate lives in the lambda's *domain type* `{Int | y > 0}`, not on
         // a dedicated AST field. `substitute` must descend through the type
         // (via `substitute_in_type`) into the predicate body.
-        let refinement = Refinement {
-            predicate: Rc::new(refinement_pred),
-        };
+        let refinement = Refinement::born(Rc::new(refinement_pred));
         let refined_param = Type::Refinement(Box::new(int_ty()), refinement);
         let expr = Expr::lambda("x", int_ty(), Expr::var("x").with_ty(int_ty()))
             .with_ty(fun_ty(refined_param, int_ty()));
@@ -1250,9 +1246,7 @@ mod tests {
         let bool_ty = Type::Base(BaseType::Bool);
 
         // Uncorrelated refinement (a Bool constant predicate) on the param.
-        let refinement = Refinement {
-            predicate: Rc::new(Expr::lit(Lit::Bool(true)).with_ty(bool_ty)),
-        };
+        let refinement = Refinement::born(Rc::new(Expr::lit(Lit::Bool(true)).with_ty(bool_ty)));
         let refined_y_ty = Type::Refinement(Box::new(int_ty()), refinement);
         let body = var("y").with_ty(int_ty());
 
@@ -1303,7 +1297,8 @@ mod tests {
             BinOpKind::Compare(CompareKind::Greater),
             Expr::var("x"),
         ));
-        let refinement = Refinement { predicate: pred };
+        // A predicate this call site is creating, so `born` — see `Refinement`.
+        let refinement = Refinement::born(pred);
 
         // Tuple([Int, {Int | __elem > x}]): the predicate rides only the second
         // component, so `any`-vs-`all` is observable.

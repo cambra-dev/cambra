@@ -719,8 +719,12 @@ fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 /// substitution *above* the binder injects the closed form the strict checker
 /// derives. Still derivation-free — a discharge transport, not re-inference.
 fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
-    // Erase this node's binder-declared type slots (shared coverage with
-    // `mut_elim::erase_mut` via `walk_binders_mut`). This is order-invariant
+    // Erase this node's binder-declared type slots — both the declared type and
+    // the annotation, since a handle can ride either. Deliberately *not*
+    // `walk_type_slots_mut` (which `mut_elim::erase_mut` uses): the slots here are
+    // visited in three separate phases — binders, then children, then this node's
+    // own `ty`/annotation *after* the `Let`-discharge below has updated `map` —
+    // and one combined call would collapse that ordering. This is order-invariant
     // w.r.t. the `Let`-discharge below: a binder's type resolves against `map` as
     // it stands, and a child's discharge only closes variables bound *inside*
     // that child — never in scope at this binder — so erasing binders before the
@@ -2148,9 +2152,7 @@ fn extract_for_defer(
                             let pred_lambda = Expr::lambda(&param.name, param.ty.clone(), pred);
                             let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
                                 .with_ty(Type::Base(BaseType::Bool));
-                            let refinement_struct = Refinement {
-                                predicate: Rc::new(pred_on_source),
-                            };
+                            let refinement_struct = Refinement::born(Rc::new(pred_on_source));
                             let mut refined_argument = new_argument.clone();
                             refine_source_domain(&mut refined_argument, refinement_struct, ctx);
                             // stamp the channel at
@@ -2363,9 +2365,8 @@ fn extract_for_defer(
                                         Expr::lambda(&param.name, param.ty.clone(), pred);
                                     let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
                                         .with_ty(Type::Base(BaseType::Bool));
-                                    let refinement_struct = Refinement {
-                                        predicate: Rc::new(pred_on_source),
-                                    };
+                                    let refinement_struct =
+                                        Refinement::born(Rc::new(pred_on_source));
                                     let mut refined_prefix = source_prefix.clone();
                                     refine_source_domain(
                                         &mut refined_prefix,
@@ -2857,9 +2858,7 @@ mod tests {
         // predicate referencing `outer_n`:
         //   `Var("__chan")` with user_annotation = Fun(Refinement(Hole, pred(outer_n)), Hole)
         let pred = var("outer_n");
-        let refinement = Refinement {
-            predicate: Rc::new(pred),
-        };
+        let refinement = Refinement::born(Rc::new(pred));
         let annotated = TypedExpr {
             node: TypedExprNode::Var(Name::raw("__chan")),
             ty: Type::Hole,
@@ -2887,9 +2886,7 @@ mod tests {
     #[test]
     fn collect_free_vars_descends_into_ty_refinement_predicates() {
         let pred = var("inner_k");
-        let refinement = Refinement {
-            predicate: Rc::new(pred),
-        };
+        let refinement = Refinement::born(Rc::new(pred));
         let typed = TypedExpr {
             node: TypedExprNode::Lit(Lit::Unit),
             ty: Type::Fun {

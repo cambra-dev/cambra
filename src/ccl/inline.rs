@@ -65,7 +65,8 @@
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
 use crate::ccl::{
-    Expr, Lit, Name, Refinement, Type, TypedExprNode, ccl_utils::walk_refined_predicates_mut,
+    Expr, Lit, Name, Refinement, Type, TypedExprNode,
+    ccl_utils::{PredMemo, is_free, walk_refined_predicates_mut},
     lambda_elim::substitute,
 };
 
@@ -292,7 +293,18 @@ fn inline_impl(expr: Expr) -> Expr {
                 // Let bindings (e.g. `let y = (let x = Defer in …) in …` after
                 // expanding a defer-returning UDF) are eligible for the alias
                 // and lift rewrites on the second pass.
-                return inline_impl(inline_and_beta_reduce(body, &binding.name, &bound_expr));
+                return inline_impl(inline_and_beta_reduce(
+                    body,
+                    &binding.name,
+                    &bound_expr,
+                    // One memo for the whole `[name ↦ lambda]` rewrite, so a
+                    // predicate rebuilt at one node is re-pointed at (not
+                    // re-derived for) its occurrences on every other node this
+                    // sweep touches. Scoped to *this* rewrite, not the `inline`
+                    // pass: a different binder's rewrite maps the same origin
+                    // `Rc` to a different result.
+                    &PredMemo::new(),
+                ));
             }
             TypedExprNode::Let {
                 binding,
@@ -351,7 +363,7 @@ fn inline_impl(expr: Expr) -> Expr {
 /// perturbs CCC simplify's input shape for list comprehensions, scalar UDFs,
 /// and BinOp paths in ways that need test-suite triage first.  Revisit if a
 /// case surfaces where the surviving anon-lambda blocks downstream work.
-fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
+fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMemo) -> Expr {
     // Direct occurrence: replace the variable with the Lambda value.
     if let TypedExprNode::Var(ref n) = expr.node
         && n == name
@@ -359,16 +371,18 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
         return lambda.clone();
     }
 
-    // Substitute inside refinement predicates riding this node's types. A
-    // predicate is an expression tree the children-walk below never reaches
-    // (e.g. a list-comprehension filter `f(x)` lives only in the cast-target
-    // refinement), so a UDF use inside one would survive as a dangling `Var`
-    // once the enclosing `Let` is dropped.
+    // Substitute inside refinement predicates riding **every** type slot this
+    // node carries — its `ty`, its annotation, a `Cast`'s `target`, and each
+    // binder's declared type. A predicate is an expression tree the
+    // children-walk below never reaches (e.g. a list-comprehension filter
+    // `f(x)` lives only in the cast-target refinement, which is also where
+    // `lambda_elim` and operator conversion read it from), so a UDF use inside
+    // one would survive as a dangling `Var` once the enclosing `Let` is
+    // dropped — and enumerating the slots by hand here is how one gets missed.
+    // A binder's own type is in the enclosing scope (a binder does not bind in
+    // its own type), so the shadowing checks further down do not apply to it.
     let mut expr = expr;
-    inline_in_type_predicates(&mut expr.ty, name, lambda);
-    if let Some(annotation) = &mut expr.user_annotation {
-        inline_in_type_predicates(annotation, name, lambda);
-    }
+    expr.walk_type_slots_mut(|ty| inline_in_type_predicates(ty, name, lambda, memo));
 
     // Apply chain ending in `Var(name)` — beta-reduce after recursively
     // substituting the argument and collapsing the function side.
@@ -384,8 +398,8 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
             TypedExprNode::Apply { function, argument } => (function, argument),
             _ => unreachable!(),
         };
-        let argument = inline_and_beta_reduce(*argument, name, lambda);
-        let function = inline_and_beta_reduce(*function, name, lambda);
+        let argument = inline_and_beta_reduce(*argument, name, lambda, memo);
+        let function = inline_and_beta_reduce(*function, name, lambda, memo);
         match function.node {
             TypedExprNode::Lambda { param, body } => {
                 // A domain refinement on this outer lambda encodes a precondition
@@ -451,7 +465,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
             } else {
                 TypedExprNode::Lambda {
                     param,
-                    body: Box::new(inline_and_beta_reduce(*body, name, lambda)),
+                    body: Box::new(inline_and_beta_reduce(*body, name, lambda, memo)),
                 }
             }
         }
@@ -461,11 +475,11 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
             bound_expr,
             body,
         } => {
-            let new_bound = inline_and_beta_reduce(*bound_expr, name, lambda);
+            let new_bound = inline_and_beta_reduce(*bound_expr, name, lambda, memo);
             let new_body = if &binding.name == name {
                 *body
             } else {
-                inline_and_beta_reduce(*body, name, lambda)
+                inline_and_beta_reduce(*body, name, lambda, memo)
             };
             TypedExprNode::Let {
                 binding,
@@ -484,22 +498,10 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
                 TypedExprNode::LetRec {
                     bindings: bindings
                         .into_iter()
-                        .map(|(b, def)| (b, inline_and_beta_reduce(def, name, lambda)))
+                        .map(|(b, def)| (b, inline_and_beta_reduce(def, name, lambda, memo)))
                         .collect(),
-                    body: Box::new(inline_and_beta_reduce(*body, name, lambda)),
+                    body: Box::new(inline_and_beta_reduce(*body, name, lambda, memo)),
                 }
-            }
-        }
-
-        // The cast target is where its refinement predicate is written —
-        // `lambda_elim` and operator conversion read the predicate off the
-        // target, not off `ty` — so walk it explicitly; `target` carries its
-        // own predicate `Rc`, independent of the one on `ty`.
-        TypedExprNode::Cast { value, mut target } => {
-            inline_in_type_predicates(&mut target, name, lambda);
-            TypedExprNode::Cast {
-                value: Box::new(inline_and_beta_reduce(*value, name, lambda)),
-                target,
             }
         }
 
@@ -508,11 +510,11 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
         // The loop target shadows `name` inside the body only; the source
         // still substitutes.
         TypedExprNode::For { target, iter, body } => {
-            let iter = Box::new(inline_and_beta_reduce(*iter, name, lambda));
+            let iter = Box::new(inline_and_beta_reduce(*iter, name, lambda, memo));
             let body = if &target.name == name {
                 body
             } else {
-                Box::new(inline_and_beta_reduce(*body, name, lambda))
+                Box::new(inline_and_beta_reduce(*body, name, lambda, memo))
             };
             TypedExprNode::For { target, iter, body }
         }
@@ -527,7 +529,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
                 ty,
                 user_annotation,
             };
-            expr.map_children(|child| inline_and_beta_reduce(child, name, lambda));
+            expr.map_children(|child| inline_and_beta_reduce(child, name, lambda, memo));
             return expr;
         }
     };
@@ -540,19 +542,37 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
 }
 
 /// Run [`inline_and_beta_reduce`] on every refinement predicate embedded in
-/// `ty`, rebuilding each predicate as a fresh immutable `Rc`. Every occurrence
-/// that shared one predicate term in `ty` is re-pointed at the same rebuilt
-/// term (the memo in [`walk_refined_predicates_mut`]), so the rewrite is
-/// observed uniformly across them.
+/// `ty` that mentions the inlined binder, rebuilding each as a fresh immutable
+/// `Rc`. `memo` spans the whole `[name ↦ lambda]` sweep, so every occurrence
+/// sharing one predicate term — across nodes, not just within one type — is
+/// re-pointed at the same rebuilt term and the rewrite is observed uniformly.
 ///
 /// This stays a pass-level walk rather than a `Subst` call because inlining
 /// inside a predicate must also *beta-reduce* the call sites it creates —
 /// substitution proper is the engine's job and runs inside
 /// [`inline_and_beta_reduce`] via `lambda_elim::substitute`.
-fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr) {
-    walk_refined_predicates_mut(ty, &mut std::collections::HashMap::new(), &mut |pred, _| {
+/// **Why `C = ()` is honest here** even though the rewrite is scope-sensitive (see
+/// [`PredMemo`]'s note on what `C` is). `[name ↦ lambda]` must not fire under a
+/// binder that shadows `name`, and unlike `subst` — which descends into such a
+/// scope with a *restricted* substitution, and so carries that substitution as its
+/// `C` — [`inline_and_beta_reduce`] does not descend at all: every binder arm that
+/// matches `name` returns its node with the body untouched. An occurrence inside a
+/// shadowed scope is therefore never *visited*, so there is nothing for the memo to
+/// serve it. This claim depends on that skipping: an arm rewritten to
+/// descend-with-a-guard would need the rewrite's scope in `C`, exactly as `subst`
+/// carries its `Subst`.
+fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr, memo: &PredMemo) {
+    walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+        // A predicate the inlined binder does not occur in is reported
+        // *unchanged*, so it keeps its origin `Rc` and stays pointer-shared with
+        // its occurrences on other nodes rather than being reallocated at each
+        // one the sweep walks past.
+        if !is_free(name, pred) {
+            return false;
+        }
         let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
-        *pred = inline_and_beta_reduce(old, name, lambda);
+        *pred = inline_and_beta_reduce(old, name, lambda, memo);
+        true
     });
 }
 
@@ -681,7 +701,7 @@ mod tests {
         use crate::ccl::Refinement;
         use std::rc::Rc;
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement { predicate: pred };
+        let refinement = Refinement::born(pred);
         let ty = Type::Refinement(Box::new(Type::Base(BaseType::Int)), refinement);
         assert!(!is_iterable_domain(&ty));
     }
@@ -691,7 +711,7 @@ mod tests {
         use crate::ccl::Refinement;
         use std::rc::Rc;
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement { predicate: pred };
+        let refinement = Refinement::born(pred);
         let ty = Type::Refinement(Box::new(Type::UIntRange(3)), refinement);
         assert!(is_iterable_domain(&ty));
     }
@@ -746,7 +766,7 @@ mod tests {
         use crate::ccl::Refinement;
         use std::rc::Rc;
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement { predicate: pred };
+        let refinement = Refinement::born(pred);
         let inner_fun = Type::Fun {
             name: None,
             domain: Box::new(Type::Base(BaseType::Int)),
@@ -1072,7 +1092,7 @@ mod tests {
         let lambda = TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
             .with_ty(fn_ty(int.clone(), int.clone()));
         let body = TypedExpr::var("f").with_ty(fn_ty(int.clone(), int));
-        let result = inline_and_beta_reduce(body, &Name::raw("f"), &lambda);
+        let result = inline_and_beta_reduce(body, &Name::raw("f"), &lambda, &PredMemo::new());
         assert_eq!(result, lambda);
     }
 
@@ -1085,7 +1105,7 @@ mod tests {
         let arg = TypedExpr::lit(Lit::Int(3)).with_ty(int.clone());
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("f").with_ty(lambda.ty.clone()))
             .with_ty(int);
-        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda);
+        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda, &PredMemo::new());
         assert_eq!(result, arg);
     }
 
@@ -1108,7 +1128,7 @@ mod tests {
             .with_ty(fn_ty(int.clone(), int.clone())),
         )
         .with_ty(int.clone());
-        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda);
+        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda, &PredMemo::new());
         assert_eq!(result, TypedExpr::lit(Lit::Int(1)).with_ty(int));
     }
 
@@ -1128,7 +1148,12 @@ mod tests {
             TypedExpr::lit(Lit::Int(42)).with_ty(int.clone()),
         )
         .with_ty(fn_ty(int.clone(), int));
-        let result = inline_and_beta_reduce(shadowed.clone(), &Name::raw("f"), &replacement);
+        let result = inline_and_beta_reduce(
+            shadowed.clone(),
+            &Name::raw("f"),
+            &replacement,
+            &PredMemo::new(),
+        );
         assert_eq!(result, shadowed);
     }
 

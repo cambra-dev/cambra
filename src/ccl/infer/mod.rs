@@ -91,6 +91,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use crate::ccl::FieldKey;
+use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::infer::solver::{CoalesceError, ConstrainError, prim};
 use crate::ccl::{BaseType, BinOpKind, CompareKind, Lit, Refinement, Type, TypedExpr};
 
@@ -235,23 +236,34 @@ pub(super) fn lit_base(lit: &Lit) -> Type {
 /// involved is known: both sides are the base and the comparison is `Bool`. The inner
 /// literal takes [`lit_base`] — refining *it* too would not terminate.
 pub fn lit_singleton(lit: &Lit) -> Type {
-    let base = lit_base(lit);
-    // `unit` has a single inhabitant, so a singleton adds nothing to its base.
-    if matches!(lit, Lit::Unit) {
-        return base;
+    match singleton_predicate(lit) {
+        Some(predicate) => Type::Refinement(Box::new(lit_base(lit)), Refinement::born(predicate)),
+        None => lit_base(lit),
     }
-    let predicate = TypedExpr::binop(
-        TypedExpr::var(Name::elem()).with_ty(base.clone()),
-        BinOpKind::Compare(CompareKind::Equals),
-        TypedExpr::lit(lit.clone()).with_ty(base.clone()),
-    )
-    .with_ty(prim(BaseType::Bool));
-    Type::Refinement(
-        Box::new(base),
-        Refinement {
-            predicate: Rc::new(predicate),
-        },
-    )
+}
+
+/// The bare predicate of `lit`'s singleton — `__elem == lit` — or `None` for
+/// `unit`, whose single inhabitant makes a singleton add nothing to its base.
+///
+/// Split out from [`lit_singleton`] because the term is **ground**: fully typed at
+/// construction, closed but for [`crate::ccl::REFINEMENT_BINDER`], and a pure
+/// function of `lit`. That is what lets one `Rc` serve every occurrence of a
+/// literal value (`InferCtx::lit_singleton`) — nothing about an occurrence can
+/// make its singleton resolve differently, because there is nothing left to
+/// resolve.
+pub(crate) fn singleton_predicate(lit: &Lit) -> Option<Rc<TypedExpr>> {
+    if matches!(lit, Lit::Unit) {
+        return None;
+    }
+    let base = lit_base(lit);
+    Some(Rc::new(
+        TypedExpr::binop(
+            TypedExpr::var(Name::elem()).with_ty(base.clone()),
+            BinOpKind::Compare(CompareKind::Equals),
+            TypedExpr::lit(lit.clone()).with_ty(base.clone()),
+        )
+        .with_ty(prim(BaseType::Bool)),
+    ))
 }
 
 /// Test shorthand for an integer literal's *type* — its singleton, `{Int | __elem == n}`.
@@ -312,7 +324,23 @@ pub(crate) fn run(
     }
     // Stamp the resolved binder types onto free `Var` references a discharge
     // substituted into refinement predicates (see `retype_predicate_slots`).
-    retype_predicate_slots(expr, &HashMap::new());
+    //
+    // Sharing tripwire: `retype` is a *rewrite-only* pass (it restamps existing
+    // predicates, never introduces new refinement types), so the distinct
+    // predicate-`Rc` count is non-increasing across it. A regression that
+    // restamps each occurrence independently — instead of threading its
+    // `PredMemo` — would split the sharing and grow this count, tripping here at
+    // the exact phase. (Cheap: address-set arithmetic, debug builds only. The
+    // end-to-end guard is `tests/predicate_sharing.rs`.)
+    #[cfg(debug_assertions)]
+    let pred_rcs_before_retype = crate::ccl::ccl_utils::distinct_predicate_rcs(expr);
+    retype_predicate_slots(expr, &HashMap::new(), &PredMemo::new());
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        crate::ccl::ccl_utils::distinct_predicate_rcs(expr) <= pred_rcs_before_retype,
+        "retype split refinement-predicate `Rc` sharing (a rewrite-only pass must not \
+         increase the distinct-predicate count) — see `ccl_utils::PredMemo`",
+    );
     // Scope-validity check (design §6.2): every coalesced node's type is
     // well-formed in the lexical scope at that node — every free term-variable
     // of its refinement predicates is bound by an enclosing Pi binder
@@ -373,9 +401,7 @@ pub(crate) mod test_helpers {
         );
         Type::Refinement(
             Box::new(Type::Base(BaseType::Int)),
-            Refinement {
-                predicate: Rc::new(pred),
-            },
+            Refinement::born(Rc::new(pred)),
         )
     }
 

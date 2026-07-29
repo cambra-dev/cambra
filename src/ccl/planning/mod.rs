@@ -18,7 +18,7 @@
 use log::trace;
 
 use crate::ccl::ccl_utils::{
-    self, apply_function, make_iterate, make_restrict, refine_codomain, set_codomain,
+    self, PredMemo, apply_function, make_iterate, make_restrict, refine_codomain, set_codomain,
     trivially_true_predicate, typed_compose,
 };
 // Re-exported so the `planning` submodules (`groupby`, `join`) can keep calling
@@ -107,7 +107,7 @@ pub fn run(mut expr: Expr) -> Expr {
     // post-planning typecheck's structural refinement match holds. It runs
     // after the recognizers (which already consumed the bare shapes they
     // match) and is idempotent on already-compiled predicates.
-    compile_refinement_predicates(&mut expr, &mut predicates::PredMemo::new());
+    compile_refinement_predicates(&mut expr, &PredMemo::new());
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
     // boilerplate that [`join::try_hash_join_rewrite`] emits via
     // [`replace_tuple_project_with_id`].  `simplify` is marker-aware: its
@@ -295,12 +295,7 @@ pub(crate) mod test_helpers {
     /// predicate.  The predicate must have type `base ⇒ Bool` so the
     /// refinement is well-formed.
     pub(crate) fn refined_ty(base: Type, predicate: Expr) -> Type {
-        Type::Refinement(
-            Box::new(base),
-            Refinement {
-                predicate: Rc::new(predicate),
-            },
-        )
+        Type::Refinement(Box::new(base), Refinement::born(Rc::new(predicate)))
     }
 
     /// Build an `Apply { argument, function: <builtin> }` whose function

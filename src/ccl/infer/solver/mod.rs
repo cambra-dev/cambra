@@ -148,9 +148,7 @@ pub(crate) mod test_helpers {
     /// equal markers match and distinct markers stay distinct.
     pub(crate) fn refined(base: Type, marker: i64) -> Type {
         use crate::ccl::{Lit, TypedExpr};
-        let r = Refinement {
-            predicate: Rc::new(TypedExpr::lit(Lit::Int(marker))),
-        };
+        let r = Refinement::born(Rc::new(TypedExpr::lit(Lit::Int(marker))));
         Type::Refinement(Box::new(base), r)
     }
 

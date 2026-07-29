@@ -36,15 +36,25 @@
 //!   stays intact and the common case allocates nothing).
 //! * **In-place rewrite** ([`Subst::rewrite_expr`]) mutates the *term tree* the
 //!   caller owns (lambda elimination, inlining, defer desugaring, lowering's
-//!   uncurrying), but still rebuilds each predicate as a fresh `Rc`. A `memo`
-//!   keyed on the original predicate's identity re-points every occurrence
-//!   that shared one predicate term in the tree at the *same* rebuilt term, so
-//!   one rewrite is observed uniformly across the aliases.
+//!   uncurrying). A predicate the substitution actually touches is rebuilt as a
+//!   fresh `Rc`; one it doesn't — no substituted binder free in it — keeps its
+//!   `Rc`, exactly as transport mode does.
+//!
+//! Both modes share the same discipline: a
+//! [`PredMemo`](crate::ccl::ccl_utils::PredMemo) re-points every occurrence that
+//! shared one predicate term at the *same* result, so one rewrite is observed
+//! uniformly across the aliases and occurrences that entered sharing one `Rc` leave
+//! sharing one `Rc`. Its context (`C`) is **the active substitution**: an entry is
+//! reused only for an occurrence under the same one, so a rebuild made outside a
+//! scope that rebinds a substituted variable is never served to an occurrence
+//! inside it. That is what makes threading a single memo across binder crossings
+//! correct — acting differently in different scopes is the whole job of a
+//! substitution, so scope cannot be left out of the key.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::is_free;
+use crate::ccl::ccl_utils::{PredMemo, is_free};
 use crate::ccl::{Branch, Name, PredicateId, Type, TypedExpr, TypedExprNode};
 
 /// A term binder name.
@@ -527,7 +537,7 @@ impl Subst {
         if self.is_id() {
             return;
         }
-        self.rewrite_expr_go(e, &mut BTreeMap::new());
+        self.rewrite_expr_go(e, &PredMemo::new());
     }
 
     /// Discharge `binder ↦ term` over `e` **in place**, cloning `term` only
@@ -543,7 +553,7 @@ impl Subst {
         Subst::discharge(binder.clone(), term.clone()).rewrite_expr(e);
     }
 
-    fn rewrite_expr_go(&self, e: &mut TypedExpr, memo: &mut BTreeMap<PredicateId, Rc<TypedExpr>>) {
+    fn rewrite_expr_go(&self, e: &mut TypedExpr, memo: &PredMemo<Subst>) {
         // Inert subtree (no substituted binder free in value or type slots):
         // leave it untouched — predicates in particular stay un-rebuilt,
         // mirroring the transport mode's `Rc`-sharing guarantee.
@@ -560,15 +570,18 @@ impl Subst {
             *e = repl.as_expr();
             return;
         }
-        self.rewrite_type_go(&mut e.ty, memo);
-        if let Some(ann) = &mut e.user_annotation {
-            self.rewrite_type_go(ann, memo);
-        }
+        // *Every* type slot the node carries, not just `ty` and the annotation: a
+        // `Cast`'s `target` and each binder's declared type hold their own
+        // predicate `Rc`s, so rewriting only `ty` leaves those stale against it —
+        // the same defect the retype walk had. A binder's own type is in the
+        // *enclosing* scope (a binder does not bind in its own type), so the
+        // unrestricted substitution is the right one for it, and the binder
+        // crossings below still only guard the children.
+        e.walk_type_slots_mut(|ty| self.rewrite_type_go(ty, memo));
         match &mut e.node {
             TypedExprNode::Var(_) => {}
 
-            TypedExprNode::Cast { value, target } => {
-                self.rewrite_type_go(target, memo);
+            TypedExprNode::Cast { value, .. } => {
                 self.rewrite_expr_go(value, memo);
             }
 
@@ -580,9 +593,10 @@ impl Subst {
             }
 
             TypedExprNode::Lambda { param, body } => {
-                // The param's domain refinement is reached through `e.ty`'s
-                // `Fun` domain (rewritten above, rebuilding the predicate via
-                // `memo`); only the body is under the binder here.
+                // `param.ty` was rewritten with the node's other type slots above
+                // — it is an independent `Rc` from the one on `e.ty`'s `Fun`
+                // domain, so it needs its own visit. Only the body is under the
+                // binder.
                 self.under_binder_mut(&param.name, body, memo);
             }
 
@@ -656,12 +670,7 @@ impl Subst {
 
     /// In-place analogue of [`Self::under_binder`]: shadow, assert
     /// no-capture, recurse into the binder's scope.
-    fn under_binder_mut(
-        &self,
-        binder: &Name,
-        body: &mut TypedExpr,
-        memo: &mut BTreeMap<PredicateId, Rc<TypedExpr>>,
-    ) {
+    fn under_binder_mut(&self, binder: &Name, body: &mut TypedExpr, memo: &PredMemo<Subst>) {
         let restricted = self.shadow(binder);
         if !restricted.0.keys().any(|k| is_free(k, body)) {
             return;
@@ -688,10 +697,10 @@ impl Subst {
         if self.is_id() {
             return;
         }
-        self.rewrite_type_go(ty, &mut BTreeMap::new());
+        self.rewrite_type_go(ty, &PredMemo::new());
     }
 
-    fn rewrite_type_go(&self, ty: &mut Type, memo: &mut BTreeMap<PredicateId, Rc<TypedExpr>>) {
+    fn rewrite_type_go(&self, ty: &mut Type, memo: &PredMemo<Subst>) {
         match ty {
             Type::Base(_)
             | Type::UIntRange(_)
@@ -735,18 +744,28 @@ impl Subst {
             }
 
             Type::Refinement(base, r) => {
-                let original = r.predicate_id();
-                if let Some(rebuilt) = memo.get(&original) {
-                    r.predicate = Rc::clone(rebuilt);
-                } else {
-                    // The refinement implicitly binds REFINEMENT_BINDER in
-                    // its bare predicate, so rewrite under that binder.
-                    let mut pred = (*r.predicate).clone();
-                    self.shadow(&Name::elem()).rewrite_expr_go(&mut pred, memo);
-                    let rebuilt = Rc::new(pred);
-                    memo.insert(original, Rc::clone(&rebuilt));
-                    r.predicate = rebuilt;
-                }
+                // The refinement implicitly binds REFINEMENT_BINDER in its bare
+                // predicate, so the substitution acts *under* that binder.
+                let restricted = self.shadow(&Name::elem());
+                // `restricted` is the memo's context: an entry is reused only for
+                // an occurrence under the *same* active substitution, so a rebuild
+                // made outside a scope that shadows a substituted binder is never
+                // served to an occurrence inside it (and a vacuous decision made
+                // inside is never served outside). That is what makes threading one
+                // memo across binder crossings correct — see `PredMemo`.
+                memo.rebuild(r, &restricted, |pred| {
+                    if !restricted.0.keys().any(|k| is_free(k, pred)) {
+                        // Vacuous: no substituted binder occurs free here, so report
+                        // no change and keep the origin `Rc` — a predicate this
+                        // substitution merely walks past stays shared with its other
+                        // occurrences (mirroring `force_refinement`'s transport
+                        // path). Memoizing the decision also makes this `is_free`
+                        // scan run once per distinct predicate, not per occurrence.
+                        return false;
+                    }
+                    restricted.rewrite_expr_go(pred, memo);
+                    true
+                });
                 self.rewrite_type_go(base, memo);
             }
 
@@ -830,9 +849,10 @@ impl Subst {
                 );
             }
         }
-        let mut r2 = r.clone();
-        r2.predicate = Rc::new(new_pred);
-        r2
+        // A substituted predicate is a genuinely new term (the transport mode
+        // builds rather than rewrites), so `born` is the right spelling; the
+        // vacuous case returned above kept the source's `Rc` instead.
+        crate::ccl::Refinement::born(Rc::new(new_pred))
     }
 
     /// This substitution with `binder` removed from its source domain (the
@@ -1202,9 +1222,7 @@ mod tests {
     fn type_slot_occurrence_is_discharged() {
         use std::rc::Rc;
         // y : {_ | k > 0} — `k` appears only in the type slot's predicate.
-        let slot_ref = Refinement {
-            predicate: Rc::new(gt(var("k"), int(0))),
-        };
+        let slot_ref = Refinement::born(Rc::new(gt(var("k"), int(0))));
         let e = var("y").with_ty(Type::Refinement(Box::new(Type::Hole), slot_ref.clone()));
         let dis = Subst::discharge("k", int(5));
 
@@ -1225,9 +1243,7 @@ mod tests {
 
         // force_refinement on a predicate whose *sub-expression type*
         // mentions `k` is no longer vacuous: the nested slot is rewritten.
-        let outer = Refinement {
-            predicate: Rc::new(e),
-        };
+        let outer = Refinement::born(Rc::new(e));
         let forced = dis.force_refinement(&outer);
         assert!(!Rc::ptr_eq(&forced.predicate, &outer.predicate));
         let forced_pred = &*forced.predicate;
@@ -1267,12 +1283,7 @@ mod tests {
     #[test]
     fn scenario_f_context_check() {
         let pred = TypedExpr::lambda("y", Type::Hole, gt(var("y"), var("k")));
-        let bad = Type::Refinement(
-            Box::new(Type::infer()),
-            Refinement {
-                predicate: Rc::new(pred),
-            },
-        );
+        let bad = Type::Refinement(Box::new(Type::infer()), Refinement::born(Rc::new(pred)));
         let only_x: BTreeSet<Binder> = [Name::raw("x")].into_iter().collect();
         let only_k: BTreeSet<Binder> = [Name::raw("k")].into_iter().collect();
         assert!(!well_formed(&bad, &only_x));
@@ -1297,9 +1308,7 @@ mod tests {
     // outer binder — the dependent-application shape `g(5)`.
     #[test]
     fn apply_type_discharges_refinement_predicate() {
-        let r = Refinement {
-            predicate: Rc::new(gt(var("i"), var("k"))),
-        };
+        let r = Refinement::born(Rc::new(gt(var("i"), var("k"))));
         let ty = Type::fun(Type::Refinement(Box::new(Type::infer()), r), Type::infer());
         let out = Subst::discharge("k", int(5)).apply_type(&ty);
         let Type::Fun { domain, .. } = &out else {
@@ -1315,9 +1324,7 @@ mod tests {
     // rebinds k.
     #[test]
     fn apply_type_shadows_pi_binder() {
-        let r = Refinement {
-            predicate: Rc::new(gt(var("i"), var("k"))),
-        };
+        let r = Refinement::born(Rc::new(gt(var("i"), var("k"))));
         // (k: _) ⇒ {i | i > k} ⇒ _  — the inner k is bound by the Pi.
         let inner = Type::fun(Type::Refinement(Box::new(Type::infer()), r), Type::infer());
         let ty = Type::pi("k", Type::infer(), inner);
@@ -1362,18 +1369,8 @@ mod rewrite_tests {
         let shared = Rc::new(gt(var("k"), int(0)));
         // Two refinement occurrences sharing one predicate term, both inside a
         // single type (a function's domain and codomain).
-        let dom = Type::Refinement(
-            Box::new(Type::Hole),
-            Refinement {
-                predicate: Rc::clone(&shared),
-            },
-        );
-        let cod = Type::Refinement(
-            Box::new(Type::Hole),
-            Refinement {
-                predicate: Rc::clone(&shared),
-            },
-        );
+        let dom = Type::Refinement(Box::new(Type::Hole), Refinement::sharing(&shared));
+        let cod = Type::Refinement(Box::new(Type::Hole), Refinement::sharing(&shared));
         let mut e = var("y").with_ty(Type::fun(dom, cod));
 
         Subst::discharge("k", int(5)).rewrite_expr(&mut e);
