@@ -161,21 +161,23 @@ fn simplify_once(expr: &mut Expr, memo: &PredMemo) -> (bool, bool) {
     // re-pointing a slot is another that the callback cannot observe (see
     // `walk_refined_predicates_mut`). Feeding only the callback's bit into the
     // fixpoint would let a re-pointing go unnoticed for an iteration.
-    // `expr.ty` only, and not [`Expr::walk_type_slots_mut`] like the other
-    // rewriting passes. Two structural facts make the other slots empty *here*: this
-    // runs after lambda elimination, which has removed the `Lambda` nodes whose
-    // `param.ty` would carry a domain refinement, and `lambda_elim::run` follows it
-    // with `sync_cast_targets`, which re-points every `Cast`'s `target` at the
-    // node's own (already simplified) `ty` rather than needing it simplified
-    // separately. Measured across the suite, no node reaching this walk carries a
-    // refinement in a slot `expr.ty` does not reach; widening it costs ~30% of
-    // compile time on a nested comprehension and finds nothing.
-    changed |= walk_refined_predicates_mut(&mut expr.ty, memo, &(), &mut |pred, memo| {
-        // Reporting "unchanged" keeps the origin `Rc` in the slot, so a predicate
-        // simplify has nothing to say about stays pointer-shared with every other
-        // occurrence — including ones in nodes this walk never reaches.
-        simplify_once(pred, memo).0
+    // Every type slot the node carries, like the other rewriting passes. `expr.ty`
+    // alone is not enough: a `Let` binding's declared type routinely carries a
+    // literal singleton (`x := 0` gives `let x : 0 = 0`), and an unvisited
+    // occurrence keeps its origin `Rc` while a visited sibling moves to the
+    // rebuild — a split, in the pass whose output the post-pass `typecheck`
+    // compares by structural refinement equality.
+    let mut slot_changed = false;
+    expr.walk_type_slots_mut(|ty| {
+        slot_changed |= walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+            // Reporting "unchanged" keeps the origin `Rc` in the slot, so a
+            // predicate simplify has nothing to say about stays pointer-shared with
+            // every other occurrence — including ones in nodes this walk never
+            // reaches.
+            simplify_once(pred, memo).0
+        });
     });
+    changed |= slot_changed;
     let (children_changed, children_have_iteration) = recurse_simplify(expr, memo);
     changed |= children_changed;
     let contains_iteration = children_have_iteration || is_iteration(expr);
