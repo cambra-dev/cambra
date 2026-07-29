@@ -1,8 +1,10 @@
 //! The CCL [`Type`] lattice, its [`Refinement`] subset-type carrier, and the
 //! type-blind structural equality / hashing on refinement predicate terms.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use smol_str::SmolStr;
 
@@ -65,6 +67,194 @@ impl fmt::Display for FieldKey {
     }
 }
 
+/// Whether a [`Type::Fun`]'s domain is a **capability** or a **collection** — the
+/// compute-function vs data-function distinction.
+///
+/// - [`FunKind::Compute`] — `α ⇒ β`: the domain is a *capability*, the inputs
+///   the function accepts. No data sits behind it, so shrinking the domain only
+///   under-promises; the contravariant meet at a control-flow join is a sound,
+///   lossy simplification.
+/// - [`FunKind::Data`] — `α ⤇ β`: the domain is a *collection*'s index set. The
+///   domain *is* the data map, so a lossy domain is lost data. A join of two data
+///   functions therefore may not take the contravariant meet: where their domains
+///   differ it is rejected (`CoalesceError::DomainJoinConflict`) rather than
+///   silently dropping rows. The lossless join — a dependent sum over the candidate
+///   domains — is the collections work; the kind distinction is what makes its
+///   absence an error instead of a wrong answer.
+///
+/// Set at introduction (list literals, comprehensions, `++`, registered
+/// sources, and every `History` erasure are `Data`; `lambda`/`def` are
+/// `Compute`). The audit rule for a rebuilt or erased arrow: it is `Data` iff
+/// `extent_of` will drive iteration off its domain. See
+/// `design/type-inference.md`, "4.6 Data vs compute functions".
+///
+/// FunKind is **inferred** (see `design/type-inference.md`, "4.6 Data vs compute
+/// functions"):
+/// where the structure fixes it (a list literal is `Data`, a scalar op is
+/// `Compute`) a concrete kind is stamped; where it depends on use or on an
+/// unresolved source (a map/comprehension) a [`FunKind::Var`] is minted and the
+/// solver resolves it, like a type variable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FunKind {
+    /// A compute function / capability (`⇒`): lossy meet at a join is fine.
+    Compute,
+    /// A data function / collection (`⤇`): the domain *is* the data; joins must
+    /// be lossless.
+    Data,
+    /// An unresolved kind, pinned down by the solver at coalesce. Identity is by
+    /// the variable's `uid`, so `FunKind` (and `Type`) keep deriving
+    /// `PartialEq`/`Eq`/`Hash` — the [`FunKindVar`] impls compare by `uid` only.
+    Var(Rc<FunKindVar>),
+}
+
+impl FunKind {
+    /// The display arrow for this kind: `⇒` for compute, `⤇` for data. An
+    /// unresolved variable renders `⇒` (its resolved kind is written back before
+    /// display matters downstream).
+    pub fn arrow(&self) -> &'static str {
+        match self {
+            FunKind::Compute | FunKind::Var(_) => "⇒",
+            FunKind::Data => "⤇",
+        }
+    }
+
+    /// A fresh inferred kind (a new [`FunKindVar`] with empty bounds).
+    pub fn fresh_var() -> FunKind {
+        FunKind::Var(FunKindVar::fresh())
+    }
+}
+
+/// Stable identity of a [`FunKindVar`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FunKindVarId(pub(crate) u32);
+
+static FUN_KIND_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Bounds on a [`FunKindVar`], over the two-point kind lattice `Data ⊑ Compute`.
+///
+/// The lattice has only two points, so "bounds" collapse to two flags rather
+/// than the polar bound *lists* an [`crate::ccl::InferVar`] carries — and no
+/// [`Type`] sits inside, so a `FunKindVar` never forms a cycle. Resolution is a
+/// flag read: `forced_compute ∧ forced_data` is the conflict (`Compute ⊑ κ ⊑
+/// Data`, impossible — the `Compute <: Data` rejection); `forced_compute` alone
+/// → `Compute`; `forced_data` alone → `Data`; neither → the caller's
+/// domain-derived default.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FunKindBounds {
+    /// A `Compute` value flows *into* this kind (`κ ⊒ Compute ⟹ κ = Compute`).
+    pub forced_compute: bool,
+    /// This kind is *demanded* as `Data` (`κ ⊑ Data ⟹ κ = Data`).
+    pub forced_data: bool,
+}
+
+/// A kind-inference variable — an unknown [`FunKind`] the solver pins down by
+/// accumulating [`FunKindBounds`]. Identity (`uid`) is immutable and lives outside
+/// the `RefCell`, so equality/hashing is borrow-free and never inspects the
+/// bounds (mirroring [`crate::ccl::InferVar`]).
+pub struct FunKindVar {
+    /// Stable, globally-unique identity.
+    pub uid: FunKindVarId,
+    /// Mutable kind bounds.
+    pub bounds: RefCell<FunKindBounds>,
+    /// Vars `u` such that `self <: u` (this kind is below them). A `Compute`
+    /// force propagates *up* to them (`self = Compute ⟹ u = Compute`).
+    uppers: RefCell<Vec<Rc<FunKindVar>>>,
+    /// Vars `l` such that `l <: self` (this kind is above them). A `Data` force
+    /// propagates *down* to them (`self = Data ⟹ l = Data`).
+    lowers: RefCell<Vec<Rc<FunKindVar>>>,
+}
+
+impl FunKindVar {
+    /// Allocate a fresh kind variable with empty bounds and no links.
+    pub fn fresh() -> Rc<FunKindVar> {
+        Rc::new(FunKindVar {
+            uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            bounds: RefCell::new(FunKindBounds::default()),
+            uppers: RefCell::new(Vec::new()),
+            lowers: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// Force this kind to `Compute` and propagate transitively up the `<:` links.
+    ///
+    /// Propagation keeps the flags at a fixpoint *incrementally*, so — unlike a
+    /// one-shot copy of the flags present when a link is first drawn — a force
+    /// that arrives strictly after its link still reaches every var it must. The
+    /// monotone flag (false → true) both terminates the walk and makes it
+    /// cycle-safe: a var already `Compute` short-circuits before recursing.
+    pub fn force_compute(self: &Rc<Self>) {
+        if self.bounds.borrow().forced_compute {
+            return;
+        }
+        self.bounds.borrow_mut().forced_compute = true;
+        for u in self.uppers.borrow().iter() {
+            u.force_compute();
+        }
+    }
+
+    /// Force this kind to `Data` and propagate transitively down the `<:` links.
+    /// The dual of [`FunKindVar::force_compute`]; same fixpoint/termination argument.
+    pub fn force_data(self: &Rc<Self>) {
+        if self.bounds.borrow().forced_data {
+            return;
+        }
+        self.bounds.borrow_mut().forced_data = true;
+        for l in self.lowers.borrow().iter() {
+            l.force_data();
+        }
+    }
+
+    /// A snapshot `(uppers, lowers)` of this var's `<:` links. Freshening uses
+    /// it to mirror def-site links onto the per-instantiation copies — the flags
+    /// alone are not enough, since a force arriving *after* instantiation must
+    /// still traverse the link to the sibling instantiation.
+    pub fn links(&self) -> (Vec<Rc<FunKindVar>>, Vec<Rc<FunKindVar>>) {
+        (self.uppers.borrow().clone(), self.lowers.borrow().clone())
+    }
+
+    /// Record the edge `lower <: upper` and reconcile the flags already present
+    /// on either end. Later forces on either var propagate through the stored
+    /// link via [`FunKindVar::force_compute`]/[`FunKindVar::force_data`].
+    pub fn link(lower: &Rc<FunKindVar>, upper: &Rc<FunKindVar>) {
+        if Rc::ptr_eq(lower, upper) {
+            return;
+        }
+        lower.uppers.borrow_mut().push(Rc::clone(upper));
+        upper.lowers.borrow_mut().push(Rc::clone(lower));
+        if lower.bounds.borrow().forced_compute {
+            upper.force_compute();
+        }
+        if upper.bounds.borrow().forced_data {
+            lower.force_data();
+        }
+    }
+}
+
+// Identity-based (by `uid`), mirroring `InferVar`: borrow-free, never touches
+// `bounds`, so it is safe even while a variable's bounds are borrowed.
+impl PartialEq for FunKindVar {
+    fn eq(&self, other: &Self) -> bool {
+        self.uid == other.uid
+    }
+}
+impl Eq for FunKindVar {}
+impl std::hash::Hash for FunKindVar {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.uid.hash(state);
+    }
+}
+impl fmt::Debug for FunKindVar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "κ{}", self.uid.0)
+    }
+}
+
+/// Reset the kind-variable counter to zero (test-only, for predictable output).
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_kind_var_counter() {
+    FUN_KIND_VAR_COUNTER.store(0, Ordering::Relaxed);
+}
+
 /// A CCL type annotation.
 ///
 /// Appears on [`TypedExpr`] nodes and as the output of type inference.
@@ -77,7 +267,7 @@ impl fmt::Display for FieldKey {
 /// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); an induction accumulator's *domain* is necessarily `Infer` until the unified phase resolves it (see `Strictness::PreDesugar`) |
 /// | `History` (`kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
 /// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
-/// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its extent resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
+/// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its domain resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
@@ -109,6 +299,11 @@ pub enum Type {
         /// renaming their Pi binder reconcile there (see the substitution
         /// machinery).
         name: Option<crate::ccl::Name>,
+        /// Whether this function is a capability (`Compute`) or a data
+        /// collection (`Data`). See [`FunKind`]. The derived [`PartialEq`] compares it: a
+        /// data function and a compute function over the same domain/codomain
+        /// are genuinely different types (one carries data, one a capability).
+        kind: FunKind,
         /// The parameter (argument) type. Contravariant position.
         domain: Box<Type>,
         /// The result type. Covariant position; may reference `name`.
@@ -174,7 +369,7 @@ pub enum Type {
     /// channel-domain residue forms. `channelize` erases it with a whole-tree
     /// substitution `ChanDom(d) ↦ <concrete channel domain>` once the channel
     /// is assembled. Like [`Type::DataSource`], it is a nominal leaf whose
-    /// extent resolves later; unlike it, it is *transient* — no pass after
+    /// domain resolves later; unlike it, it is *transient* — no pass after
     /// `channelize` may observe one.
     ///
     /// The second field is the domain's **introduction level** (the inference
@@ -190,7 +385,7 @@ pub enum Type {
     /// issued by the runtime (the prototype's `CommitTime`). It is the domain of
     /// transactional histories (`Txn ⇒ V`), the codomain of the per-site
     /// `begin_<site>` oracles, and the type of a transaction handle. Like
-    /// `DataSource`, it has no enumerable static extent — its positions exist only
+    /// `DataSource`, it has no enumerable static domain — its positions exist only
     /// in the tile. See src/ccl/design/mutability.md.
     Txn,
     /// The type of a **history** handle: a function `domain ⇒ value` that a
@@ -232,7 +427,6 @@ pub enum Type {
     },
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
-    // Refinement { base: Box<Type>, predicate: Box<Expr> }
 }
 
 /// Which flavour of [`Type::History`] a handle is — a mutable variable (`:=`) or a
@@ -296,16 +490,23 @@ impl fmt::Display for Type {
             // it as `∅` instead of computing `n - 1` and underflowing.
             Type::UIntRange(0) => write!(f, "∅"),
             Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
+            // The arrow reflects the resolved `kind`: `⇒` for a compute
+            // capability (and an unresolved kind var), `⤇` for a data domain
+            // (see `FunKind::arrow`). Once kind inference resolves every arrow
+            // once resolved, a data collection renders `⤇`, making the domain/capability
+            // distinction legible in every type string.
             Type::Fun {
                 name: Some(x),
+                kind,
                 domain,
                 codomain,
-            } => write!(f, "(({x}: {domain}) ⇒ {codomain})"),
+            } => write!(f, "(({x}: {domain}) {} {codomain})", kind.arrow()),
             Type::Fun {
                 name: None,
+                kind,
                 domain,
                 codomain,
-            } => write!(f, "({domain} ⇒ {codomain})"),
+            } => write!(f, "({domain} {} {codomain})", kind.arrow()),
             Type::Tuple(ts) => {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
@@ -394,21 +595,53 @@ fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
 }
 
 impl Type {
-    /// Helper for creating a non-dependent function type (`name: None`).
+    /// Helper for creating a non-dependent **compute** function type
+    /// (`name: None`, `kind: Compute`).
     pub fn fun(domain: Self, codomain: Self) -> Self {
         Type::Fun {
             name: None,
+            kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
     }
 
-    /// Helper for creating a dependent (Pi) function type `(name: domain) ⇒ codomain`.
+    /// Helper for creating a dependent (Pi) **compute** function type
+    /// `(name: domain) ⇒ codomain`.
     pub fn pi(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
         Type::Fun {
             name: Some(name.into()),
+            kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+        }
+    }
+
+    /// Helper for creating a non-dependent **data** function type
+    /// (`name: None`, `kind: Data`) — a collection `domain ⤇ codomain`.
+    pub fn data_fun(domain: Self, codomain: Self) -> Self {
+        Type::Fun {
+            name: None,
+            kind: FunKind::Data,
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
+    }
+
+    /// Rebuild a function type copying `name` and `kind` from an `exemplar`
+    /// `Fun`, so a downstream rebuild (lambda elimination, inlining, planning)
+    /// can never silently flip a data arrow to compute or drop its Pi binder. A
+    /// non-`Fun` exemplar yields a plain `Compute` arrow with no binder — the
+    /// safe default at a site with no arrow to copy from.
+    pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
+        match exemplar {
+            Type::Fun { name, kind, .. } => Type::Fun {
+                name: name.clone(),
+                kind: kind.clone(),
+                domain: Box::new(domain),
+                codomain: Box::new(codomain),
+            },
+            _ => Type::fun(domain, codomain),
         }
     }
 
@@ -430,13 +663,24 @@ impl Type {
         }
     }
 
-    /// A structural copy with every Pi binder name erased (`Fun.name → None`).
+    /// A structural copy with every Pi binder name erased (`Fun.name → None`)
+    /// and every function **kind** canonicalized to `Compute`.
     ///
     /// The binder is load-bearing only inside the type solver (it carries
     /// dependent-refinement correspondences); downstream passes treat function
     /// types structurally and a `Some`/`None` binder is the same arrow to them.
     /// Use this when comparing types for structural equality across a pass that
     /// does not preserve the cosmetic binder.
+    ///
+    /// FunKind is normalized for the same reason: **lambda elimination preserves a
+    /// function's denotation but not its kind representation** — a data
+    /// collection (`⤇`) becomes a point-free form built from compute combinators
+    /// (`zip`, `apply`, `const`), so the reconstructed arrow reads `Compute`
+    /// though it denotes the same collection. The kind did its work at inference
+    /// (lossless conditional-collection joins at coalesce); post-elimination it is not preserved, so
+    /// the structural-equality asserts (and the feed-operand agreement check)
+    /// compare modulo it. (FunKind-aware subtyping therefore acts in
+    /// *Emit*-mode inference, not the post-elimination Check-mode pass.)
     ///
     /// Under the Barendregt convention the blindness needed at the remaining
     /// call sites (lambda elimination's type-preservation asserts) is exactly
@@ -452,6 +696,10 @@ impl Type {
                 domain, codomain, ..
             } => Type::Fun {
                 name: None,
+                // Canonicalize kind — elimination does not preserve it (see the
+                // doc above); comparing modulo it is what these structural asserts
+                // want.
+                kind: FunKind::Compute,
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),
             },
@@ -1011,7 +1259,7 @@ mod tests {
         let cast_pred = |op: CompareKind| {
             TypedExpr::cast(
                 TypedExpr::var("xs"),
-                ccl_utils::refined_fn_type(Type::Hole, filter(op), Type::Hole),
+                ccl_utils::refined_data_fun(Type::Hole, filter(op), Type::Hole),
             )
         };
         let refinement = |pred: TypedExpr| Refinement::born(Rc::new(pred));

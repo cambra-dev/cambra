@@ -719,6 +719,8 @@ fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
         let value = std::mem::replace(value.as_mut(), Type::Hole);
         *ty = Type::Fun {
             name: None,
+            // A feed channel is a collection stream: erase History → a data function.
+            kind: crate::ccl::ty::FunKind::Data,
             domain: Box::new(domain),
             codomain: Box::new(value),
         };
@@ -858,16 +860,12 @@ fn assert_no_type_residue(expr: &Expr) {
 fn refine_source_domain(source: &mut Expr, refinement: Refinement, ctx: &DesugarCtx) {
     if ctx.input_typed
         && let Type::Fun {
-            name,
-            domain,
-            codomain,
+            domain, codomain, ..
         } = &source.ty
     {
-        source.ty = Type::Fun {
-            name: name.clone(),
-            domain: Box::new(Type::Refinement(domain.clone(), refinement)),
-            codomain: codomain.clone(),
-        };
+        let refined_domain = Type::Refinement(domain.clone(), refinement);
+        let codomain = (**codomain).clone();
+        source.ty = Type::fun_like(&source.ty, refined_domain, codomain);
         return;
     }
     // A typed-order channel source is always a concrete function type, stamped
@@ -2991,6 +2989,7 @@ mod tests {
         let refinement = Refinement::born(Rc::new(pred));
         let typed = Expr::lit(Lit::Unit).with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Refinement(Box::new(Type::Hole), refinement)),
             codomain: Box::new(Type::Hole),
         });

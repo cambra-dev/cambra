@@ -13,6 +13,103 @@ pub(crate) fn is_builtin(expr: &Expr, b: Builtin) -> bool {
     matches!(&expr.node, TypedExprNode::Builtin(x) if *x == b)
 }
 
+/// Whether `e` is a chain-head **iteration-source marker** `iterate(pred)` —
+/// `Apply(pred, Builtin::Iterate)`. Planning inserts these into the *term tree*
+/// ([`crate::ccl::planning::insert_iterate_markers`]) to mark an extent as an
+/// iteration site; `iterate ≫ src` denotes exactly `src` (the marker is
+/// denotation-neutral).
+pub(crate) fn is_iterate_marker(e: &Expr) -> bool {
+    matches!(&e.node, TypedExprNode::Apply { function, .. } if is_builtin(function, Builtin::Iterate))
+}
+
+/// Strip chain-head `iterate` source markers from a term, flattening the
+/// `Compose` chains they head (`iterate ≫ src` ⟹ `src`).
+///
+/// Used when a term value is substituted **into a type** (a refinement
+/// predicate — e.g. the §6.2 move-site discharge of a `let`-bound collection
+/// into a refined domain like a join predicate `{d | __elem ▷ (.0 ≫ a) …}`). A
+/// refinement predicate is a *denotational* term; the `iterate` marker is a
+/// term-tree planning artifact with no meaning there, and leaving it in makes
+/// the predicate churn under `simplify` (nested-`Compose` vs `flatten_compose`)
+/// and diverge from inference's (pre-marker) copy at the post-planning
+/// typecheck. Since `iterate` is denotation-neutral, dropping it recovers the
+/// collection's value unchanged.
+///
+/// A `restrict`/`filter_values` marker is deliberately **not** stripped — it is
+/// a real filter and part of the denotation; a filtered source reaching a
+/// predicate is an unsupported case caught loudly by
+/// [`debug_assert_no_iteration_markers_in_type`] rather than silently mis-stripped.
+pub(crate) fn strip_iterate_markers(e: &Expr) -> Expr {
+    let mut out = e.clone();
+    out.map_children(|c| strip_iterate_markers(&c));
+    if let TypedExprNode::Compose(elts) = &out.node {
+        let mut flat: Vec<Expr> = Vec::new();
+        for elt in elts {
+            if is_iterate_marker(elt) {
+                continue; // drop the neutral source marker
+            }
+            match &elt.node {
+                // Splice a nested compose the substitution created (e.g.
+                // `(a ≫ f)[a ↦ iterate ≫ xs]` = `(iterate ≫ xs) ≫ f`).
+                TypedExprNode::Compose(inner) => flat.extend(inner.iter().cloned()),
+                _ => flat.push(elt.clone()),
+            }
+        }
+        let ty = out.ty.clone();
+        return match flat.len() {
+            0 => out,
+            1 => flat.into_iter().next().expect("len == 1"),
+            _ => Expr::compose(flat).with_ty(ty),
+        };
+    }
+    out
+}
+
+/// Debug-only invariant: no refinement predicate embedded in `ty` contains an
+/// `iterate` or `restrict` planning marker. Predicates are denotational; markers
+/// are term-tree artifacts. Upheld by [`strip_iterate_markers`] at the term→type
+/// substitution boundary. A `restrict` here means a *filtered* source reached a
+/// predicate (e.g. `x in [y for y in ys if p]`) — a real but unsupported case
+/// that should surface loudly, not miscompile.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_no_iteration_markers_in_type(ty: &Type) {
+    fn expr_has_marker(e: &Expr) -> bool {
+        is_iterate_marker(e)
+            || is_builtin_applied(e, Builtin::Restrict)
+            || e.fold_children(false, |acc, c| acc || expr_has_marker(c))
+    }
+    fn go(ty: &Type) {
+        if let Type::Refinement(_, r) = ty {
+            debug_assert!(
+                !expr_has_marker(&r.predicate),
+                "iteration/restrict marker leaked into a refinement predicate: {}",
+                crate::ccl::symbolic::symbolic(&r.predicate)
+            );
+        }
+        ty.walk_children(go);
+    }
+    go(ty);
+}
+
+/// Whether `e` applies `b` as its function (`Apply { function: Builtin(b) }`).
+#[cfg(debug_assertions)]
+fn is_builtin_applied(e: &Expr, b: Builtin) -> bool {
+    matches!(&e.node, TypedExprNode::Apply { function, .. } if is_builtin(function, b))
+}
+
+/// Debug-only invariant walk over a whole expression tree: every node's type
+/// (and a `Cast`'s target) is checked marker-free by
+/// [`debug_assert_no_iteration_markers_in_type`]. Called at the planning→
+/// op-conversion boundary to catch a marker that leaked into a predicate.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_no_iteration_markers(expr: &Expr) {
+    debug_assert_no_iteration_markers_in_type(&expr.ty);
+    if let TypedExprNode::Cast { target, .. } = &expr.node {
+        debug_assert_no_iteration_markers_in_type(target);
+    }
+    expr.walk_children(debug_assert_no_iteration_markers);
+}
+
 /// Builds an application of a primitive combinator, setting the types based on
 /// the input expression's type and the provided output type.
 pub fn apply_primitive(expr: Expr, primitive: Builtin, output_ty: Type) -> Expr {
@@ -297,8 +394,8 @@ pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
 ///
 /// `base_domain` and `codomain` are typically `Type::Hole` at lowering time;
 /// inference fills them in by unifying against the value being cast.
-pub fn refined_fn_type(base_domain: Type, predicate: Expr, codomain: Type) -> Type {
-    Type::fun(
+pub fn refined_data_fun(base_domain: Type, predicate: Expr, codomain: Type) -> Type {
+    Type::data_fun(
         Type::Refinement(Box::new(base_domain), Refinement::born(Rc::new(predicate))),
         codomain,
     )
@@ -314,14 +411,8 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
     match ty {
         Type::Refinement(base, _) => strip_refinements(base),
         Type::Fun {
-            name,
-            domain,
-            codomain,
-        } => Type::Fun {
-            name: name.clone(),
-            domain: Box::new(strip_refinements(domain)),
-            codomain: Box::new(strip_refinements(codomain)),
-        },
+            domain, codomain, ..
+        } => Type::fun_like(ty, strip_refinements(domain), strip_refinements(codomain)),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(strip_refinements).collect()),
         Type::Record(fs) => Type::Record(
             fs.iter()

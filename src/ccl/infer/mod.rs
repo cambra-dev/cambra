@@ -156,25 +156,34 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             } else {
                 InferError::TypeMismatch {
                     ctx: ctx_label.to_string(),
-                    type_a: lhs_ty,
-                    type_b: rhs_ty,
+                    type_a: Box::new(lhs_ty),
+                    type_b: Box::new(rhs_ty),
                 }
             }
         }
         ConstrainError::MissingField { key, in_type } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (missing field {key:?})"),
-            type_a: coalesce_for_error(&in_type),
-            type_b: Type::Hole,
+            type_a: Box::new(coalesce_for_error(&in_type)),
+            type_b: Box::new(Type::Hole),
         },
         ConstrainError::ExtraTag { tag, in_type } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (variant tag .{tag} not accepted)"),
-            type_a: coalesce_for_error(&in_type),
-            type_b: Type::Hole,
+            type_a: Box::new(coalesce_for_error(&in_type)),
+            type_b: Box::new(Type::Hole),
         },
         ConstrainError::NotAFeed { found, required } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (a feed handle is required here, but the value is not one)"),
-            type_a: coalesce_for_error(&found),
-            type_b: coalesce_for_error(&required),
+            type_a: Box::new(coalesce_for_error(&found)),
+            type_b: Box::new(coalesce_for_error(&required)),
+        },
+        ConstrainError::ComputeWhereDataRequired { lhs, rhs } => InferError::TypeMismatch {
+            ctx: format!(
+                "{ctx_label} (a compute function ⇒ was supplied where a data \
+                 collection ⤇ is required — using a capability as a collection \
+                 would iterate a declared domain the value does not cover)"
+            ),
+            type_a: Box::new(coalesce_for_error(&lhs)),
+            type_b: Box::new(coalesce_for_error(&rhs)),
         },
     }
 }
@@ -199,6 +208,17 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
         },
         CoalesceError::RecursiveType { details } => InferError::Unsupported(format!(
             "recursive type at {}: {} (residual μ-types are forbidden)",
+            ctx_label, details
+        )),
+        CoalesceError::DomainJoinConflict { details } => InferError::Unsupported(format!(
+            "collection domain conflict at {}: {} \
+             (a collection's domain is its data, so a join may not narrow it)",
+            ctx_label, details
+        )),
+        CoalesceError::ComputeWhereDataRequired { details } => InferError::Unsupported(format!(
+            "a compute function ⇒ was supplied where a data collection ⤇ is required at {}: {} \
+             (using a capability as a collection would iterate a declared domain the value \
+             does not cover)",
             ctx_label, details
         )),
     }

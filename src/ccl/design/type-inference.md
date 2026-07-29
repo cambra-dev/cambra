@@ -488,12 +488,12 @@ A refinement is **required**, so `constrain_subtype` is strict for *concrete* ba
 
 **Refinements in the post-inference check.** The post-inference structural check (`infer::check`, reimplemented on the same structural rules as emission via the `Typing` trait — see §2, *The post-inference check*) is **strict and refinement-aware throughout** — it does not strip refinements before its width-subtyping checks. It runs `constrain_subtype` in two places, both fully refinement-aware:
 
-* **Adjacency rules** (a `Compose` link's `prev_cod <: next_dom`, an `Apply`'s argument-vs-domain) check *refinement flow*: feeding an unrefined producer into a refinement consumer is rejected (`T ⊀ {T | p}`), exactly as the solver is. There is **no cast escape** — a producer must already carry the refinement its consumer demands. A `… ≫ (id ≫ cast({D | r} ⇒ V))` chain composes because join planning surfaces the iterated / join-satisfying extent on the *producing* morphism's codomain, so the upstream genuinely supplies `{D | r}` (see the reconstructability bullets below). The producer's witness and the cast's contract are typically re-minted as distinct predicate terms, so the adjacency relies on the structural-predicate match above.
+* **Adjacency rules** (a `Compose` link's `prev_cod <: next_dom`, an `Apply`'s argument-vs-domain) check *refinement flow*: feeding an unrefined producer into a refinement consumer is rejected (`T ⊀ {T | p}`), exactly as the solver is. There is **no cast escape** — a producer must already carry the refinement its consumer demands. A `… ≫ (id ≫ cast({D | r} ⇒ V))` chain composes because join planning surfaces the iterated / join-satisfying domain on the *producing* morphism's codomain, so the upstream genuinely supplies `{D | r}` (see the reconstructability bullets below). The producer's witness and the cast's contract are typically re-minted as distinct predicate terms, so the adjacency relies on the structural-predicate match above.
 * **The reconcile** (a node's rule-reconstructed type vs the type inference recorded on it) is the plain strict `rule <: recorded` subtype check, refinements included (the recorded type may be a width-wider supertype — e.g. an annotation). A rule that rebuilds a node's type from its children rebuilds its refinements too, so a recorded refinement the reconstruction lacks is a real disagreement about the node — and in practice it is one specific bug: a **merge point that took one input's refinement** instead of the join of all of them (see the merge law above). Comparing modulo refinements here — stripping both sides, or a refinement-blind relation — is the *only* thing that hides that class, and this is the check best placed to catch it. Keeping it strict is what forced each merge point to join.
 
 For the reconcile to hold, the passes that *introduce* refined types post-inference (lambda-elim, join-planning) must leave each node's recorded type **reconstructable** — consistent with what the bottom-up rules rebuild from its children. These sites were emitting internally-inconsistent or under-refined nodes and are now fixed at the source rather than papered over by relaxing the check:
 
-* **Iterated / join-satisfying extents on producer codomains** (`planning`'s `set_codomain` / `refine_codomain`). An iteration source produces the refined extent it iterates, so its codomain is the site's refined domain `{D | p} ⇒ {D | p}` (mirroring `make_iterate`'s symmetry); a hash join folds its equi-conditions into the key structure with no residual `Restrict`, so the extent it yields would otherwise reach the body's `cast` *bare*. Surfacing `{D | p}` on the codomain — threaded down the combinator's whole function spine so the leaf builtin the Check pass rebuilds from agrees — keeps the `producer ≫ cast` adjacency refined-to-refined. Reconstructable because a combinator node carries its own function type and `emit_apply` returns *that* codomain verbatim. This is the post-inference counterpart of the inference-time `make_iterate`/`make_restrict`/`refine_with` refinements; trivially-true layers (`if True`) are dropped by the latter but reintroduced from the site domain so the body's `{D | true}` cast still matches.
+* **Iterated / join-satisfying domains on producer codomains** (`planning`'s `set_codomain` / `refine_codomain`). An iteration source produces the refined domain it iterates, so its codomain is the site's refined domain `{D | p} ⇒ {D | p}` (mirroring `make_iterate`'s symmetry); a hash join folds its equi-conditions into the key structure with no residual `Restrict`, so the domain it yields would otherwise reach the body's `cast` *bare*. Surfacing `{D | p}` on the codomain — threaded down the combinator's whole function spine so the leaf builtin the Check pass rebuilds from agrees — keeps the `producer ≫ cast` adjacency refined-to-refined. Reconstructable because a combinator node carries its own function type and `emit_apply` returns *that* codomain verbatim. This is the post-inference counterpart of the inference-time `make_iterate`/`make_restrict`/`refine_with` refinements; trivially-true layers (`if True`) are dropped by the latter but reintroduced from the site domain so the body's `{D | true}` cast still matches.
 
 * **Dependent groupby refinement** (`lambda_elim`'s cast-wrapped-lambda arm). `groupby` lowers to `λ k → cast({I | key(i) == k} ⇒ A, λ i → c(i))`. Because the key binder `k` is now a genuine **Pi binder** (the refinement closes over it but the *value* does not mention it), lambda-elim emits the Pi-const form `const(cast(c)) : (k) ⇒ ({I | i ▷ c ▷ key == k} ⇒ A)` — the `k`-dependence rides the refinement and is materialized as a `Restrict` at the iteration boundary (the dependent-application model, §4.5). Planning's pointful recogniser (`recognize_groupby_sites` / `convert_groupby_pointful`) matches that Pi-const source directly — identifying the key binder structurally as the free variable on one side of the predicate's equality — and emits the bucketize chain `converse(c ≫ key) ≫ map(c)`.
 * **`permute_domain` over a refined morphism** (`join_plan::convert_loop_join`). The combinator is polymorphic in the morphism it rearranges; its declared input type is the morphism's *actual* type (which may carry the join-condition refinement), not a bare `actual ⇒ actual`. Otherwise `apply_function` re-stamps the partially-applied combinator's recorded type to `fun(expr.ty, …)` (carrying the refinement) while its inner `PermuteDomain` builtin keeps the bare declaration — an inconsistent node the reconstruction can't rebuild, because the refinement rides the morphism's *invariant* domain⇒codomain position (where subtyping would demand `T <: {T|p}` *and* `{T|p} <: T` at once).
@@ -553,13 +553,13 @@ Some refinement predicates **close over an outer binder**. The motivating case i
 
 **Edges carry substitutions, stored two-sided in their native direction.** Each entry of a variable's bound lists is a `Bound { self_subst, ty, ty_subst }`: an upper entry on `𝑉` reads `𝑉‹self_subst› <: ty‹ty_subst›`, a lower entry `ty‹ty_subst› <: 𝑉‹self_subst›` (both identity for ordinary bounds). `constrain_subtype` delegates to `constrain_go(lhs, rhs, sl, sr, cache)` — each side under its own morphism. The **Fun/Fun arm derives the binder correspondence** `[𝑘 ↦ 𝑥]` onto the lhs side of the codomain edge, and the contravariant domain edge **swaps the two sides** rather than inverting anything. The var arms record edges verbatim — *nothing is inverted at record time*. A **discharge has no inverse**, so edges are recorded in their native direction rather than pre-inverted and re-inverted during closure (which would degrade a discharge to the identity, silently destroying it whenever a consumer edge is recorded before the producer's concrete codomain arrives — the opaque/higher-order application order, O3). Under identity morphisms every arm reduces exactly to the substitution-free solver, so all monomorphic inference is byte-identical.
 
-**Closure chains by bridging holder views, composing forward only.** When a new edge meets a variable's existing opposite edges, the two entries hold `𝑉` under possibly different morphisms (`lo`, `hi`); `bridge_holder_gap` reconciles them by moving whichever side is movable (substitution application is monotone w.r.t. subtyping): equal morphisms need no bridge; an invertible side bridges by `hi ∘ lo⁻¹` (renames only — lossless); two non-invertible composites that share their discharge part and differ only in correspondence renames are factored (`Subst::split_renames`) and bridged on the rename part. Two *distinct* discharges meeting at one variable is the extent-join corner (O1/O4), guarded by `invert_rename`'s panic — the loud tripwire, never a silent drop. The **constraint cache is σ-aware**: it keys each `(lhs, rhs)` pair on the *set of side-morphism pairs* seen, so `g(0)` and `g(1)` flowing into one position record two distinct edges instead of the second being conflated away; termination holds because cyclic (var⇄var) edges carry renames over the episode's finite binder set, whose composites saturate, while discharges ride acyclic content edges.
+**Closure chains by bridging holder views, composing forward only.** When a new edge meets a variable's existing opposite edges, the two entries hold `𝑉` under possibly different morphisms (`lo`, `hi`); `bridge_holder_gap` reconciles them by moving whichever side is movable (substitution application is monotone w.r.t. subtyping): equal morphisms need no bridge; an invertible side bridges by `hi ∘ lo⁻¹` (renames only — lossless); two non-invertible composites that share their discharge part and differ only in correspondence renames are factored (`Subst::split_renames`) and bridged on the rename part. Two *distinct* discharges meeting at one variable is the domain-join corner (O1/O4), guarded by `invert_rename`'s panic — the loud tripwire, never a silent drop. The **constraint cache is σ-aware**: it keys each `(lhs, rhs)` pair on the *set of side-morphism pairs* seen, so `g(0)` and `g(1)` flowing into one position record two distinct edges instead of the second being conflated away; termination holds because cyclic (var⇄var) edges carry renames over the episode's finite binder set, whose composites saturate, while discharges ride acyclic content edges.
 
 **Coalesce forces suspended substitutions.** `compact_go` threads a substitution accumulator: descending a bound edge composes the edge's *rendering morphism* (`edge_render_subst`: `ty_subst`, transported across `self_subst` by rename-inversion, or by the identity for a discharge — exact because the content lives in the post-discharge context and cannot mention the discharged binder, debug-asserted) and the composite is applied — *forced* — at each refinement-predicate leaf. A bound reached transitively through `𝑣 → 𝑤 → …` thus arrives with every edge's morphism composed (the deferred transitive closure recovered by the walk). Identity accumulator ⇒ no-op.
 
 **Dependent application.** `Typing::apply` types `f(arg)`. Emit constrains `fn_ty <: (𝑥: 𝑑) ⇒ result` against an expected Pi (the one-way Apply shape edge of §2) and returns `result` under a suspended discharge `[𝑥 ↦ arg]` on a fresh variable's lower edge, fired on the partition predicate at coalesce. So `groupby(xs, key)(𝑘₀)` types as `{𝑖 | 𝑖 ▷ xs ▷ key == 𝑘₀} ⇒ 𝑉`. The **post-inference check** (`CheckCtx::apply`) re-runs the discharge on the resolved codomain so its reconstruction matches; `force_refinement` rewrites the predicate to the same term in both places, so the two refinements compare equal under structural witness equality (§4).
 
-The expected binder is **always globally fresh** (proposal §5.2 verbatim; the §3.6 freshness discipline). The two-sided edge storage is what makes this sound at every polarity and in every constraint order: the correspondence `[𝑘 ↦ 𝑥]` and the discharge `[𝑥 ↦ arg]` compose forward along the closure regardless of whether `fn_ty` was concrete at the apply site or resolved only later (the opaque/higher-order case — a dependent function received as a *parameter* — now discharges correctly, unblocking O3 at the graph level). A contravariant position is reached by side-*swapping*, not inversion, so the discharge arrives at a `map`/aggregate's parameter domain intact. The remaining deferral is the extent-join corner — two *distinct* discharges meeting at one coalescing position (O1/O4) — guarded loudly by the closure bridge's tripwire.
+The expected binder is **always globally fresh** (proposal §5.2 verbatim; the §3.6 freshness discipline). The two-sided edge storage is what makes this sound at every polarity and in every constraint order: the correspondence `[𝑘 ↦ 𝑥]` and the discharge `[𝑥 ↦ arg]` compose forward along the closure regardless of whether `fn_ty` was concrete at the apply site or resolved only later (the opaque/higher-order case — a dependent function received as a *parameter* — now discharges correctly, unblocking O3 at the graph level). A contravariant position is reached by side-*swapping*, not inversion, so the discharge arrives at a `map`/aggregate's parameter domain intact. The remaining deferral is the domain-join corner — two *distinct* discharges meeting at one coalescing position (O1/O4) — guarded loudly by the closure bridge's tripwire.
 
 **Discharged-argument slot resolution.** A predicate's interior is typed **by construction**, and the invariant that makes that hold is that *substitution never discards a type*. A `Discharge` carries a typed argument term and clones it; a `Rename` materializes as a fresh `Var` node and takes the type of the occurrence it replaces, because α-renaming cannot change a term's type — the type belongs to the position, not to the name. Nothing re-derives a predicate's types afterwards, and nothing may: a predicate's interior is outside the walk that resolves node types (its terms ride a *type*), so a slot left untyped here would survive to the post-inference wall as an unresolved variable with no way to recover it except lexical scope — which is a *name* lookup standing in for a type that was thrown away. (`freshen_above` separately copy-and-freshens a specialization clone's predicate type slots.)
 
@@ -569,9 +569,247 @@ The expected binder is **always globally fresh** (proposal §5.2 verbatim; the �
 
 **Deferred (flagged in code).**
 * **O2 (polymorphic case)** — `freshen_above` copy-and-freshens a refined value's predicate type slots through the shared cache (its `Refinement` arm), so a specialization's predicate is a proper freshen instance rather than a shared `Rc`. Immutable predicate terms are acyclic, so no refinement-cycle guard is needed.
-* **O4** — two *different* discharges of one refinement (`g(0)` vs `g(1)`) are distinguished once forced — `force_refinement` rewrites the predicate term and witness equality is structural (§4) — and the constraint cache is σ-aware, so the two discharges record distinct edges rather than conflating. The residual extent-join corner is two *distinct non-invertible* morphisms meeting at one variable (O1/O4), guarded loudly by `bridge_holder_gap`'s panic tripwire rather than silently dropped.
+* **O4** — two *different* discharges of one refinement (`g(0)` vs `g(1)`) are distinguished once forced — `force_refinement` rewrites the predicate term and witness equality is structural (§4) — and the constraint cache is σ-aware, so the two discharges record distinct edges rather than conflating. The residual domain-join corner is two *distinct non-invertible* morphisms meeting at one variable (O1/O4), guarded loudly by `bridge_holder_gap`'s panic tripwire rather than silently dropped.
 
 The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) and the nested filtered-source group-by both run end-to-end with correct values.
+
+## 4.6 Data vs compute functions
+
+> **Status: implemented.** The `FunKind` marker, kind inference, and kind-aware
+> subtyping (the `Compute <: Data` rejection) are all live, as is the rejection of
+> a data join that would narrow a domain. One guard is deferred with rationale
+> (data-domain invariance — see the callout below).
+
+The unresolved domain-join corner of §4.5 (O1/O4 — two collections meeting at one
+join point) is resolved by making a missing distinction explicit. The distinction
+does not by itself make every such join *typeable*; what it does is make the
+untypeable ones an **error** rather than a silently short collection. See
+[The domain-join rejection](#the-domain-join-rejection).
+
+**The distinction.** A function's domain can mean two things. A **compute
+function** `α ⇒ β` treats it as a *capability* — the inputs accepted; no data
+behind it; shrinking under-promises, so the lossy contravariant meet at a
+join is fine. A **data function** `α ⤇ β` treats it as a *collection* — the
+domain *is* the data map, so a lossy domain is lost data. `Type::Fun` carries
+a `kind: FunKind` (`Compute | Data | Var`). **FunKind is a *provenance* property,
+not a function of the domain** — the *same* domain can back a data collection or
+a capability (`Map(Color, V)` vs `Color ⇒ V`), so it is decided by *what the
+value is*, stamped concretely at introduction. `Data`: list literals, `++`,
+registered sources, comprehensions and `groupby` (a comprehension over a
+collection, a keyed collection — stamped via the `data_fun` provenance annotation
+that `emit_node` reads as a concrete-kind stamp; a *filtered* comprehension's
+`refined_data_fun` cast target carries the same `Data`), induction recurrence
+carriers (a `letrec` binder declared `Data` — an accumulator indexed by the
+iteration domain — whose declared type stamps the accumulator lambda's kind,
+same `stamp_kind_from` mechanism), aggregate consumers, and every `History`
+erasure. `Compute`: scalar/combinator builtins and ordinary user lambdas
+(capabilities) — a bare `λ` is built **concrete `Compute`** (`emit_lambda`),
+because a lambda that denotes a collection is not born bare, it is one of the
+stamped `Data` forms above. A `FunKind::Var` is minted only where the kind is
+genuinely *inferred* — a function parameter or a freshened polymorphic scheme —
+resolved by uses (below); an **unconstrained var defaults to `Compute`** (the
+capability default). No arm inspects the domain shape. The audit rule for the
+*concrete* stamps: *an arrow is data iff it denotes a collection*, which the
+construction site knows.
+Constructor `data_fun` mints a data arrow directly; `fun_like(exemplar, d, c)`
+rebuilds an arrow copying the exemplar's `name` and `kind`, so a domain/codomain-
+only rewrite (`subst`, `strip_refinements`, source-domain refinement) can never
+silently flip a data arrow to compute or drop its Pi binder. A rebuild that
+*intends* a new binder or mixes two arrows' kinds (the compose-chain rebuild in
+`coalesce_node`, the Pi-adding rebuild in `lambda_elim`) constructs directly and
+sets `kind` explicitly.
+
+> **FunKind-aware subtyping (landed).** Concrete kinds (the common case — data
+> collections and capabilities are stamped at construction, above) pass through;
+> only a kind-*polymorphic* function carries a `FunKind::Var`, resolved from its
+> bounds, defaulting to `Compute` when unconstrained (no domain-shape guess). The
+> Fun-vs-Fun arm adds a kind edge over `Data ⊑ Compute`: `data <: compute`
+> upcasts, a concrete `compute <: data` is rejected
+> (`ConstrainError::ComputeWhereDataRequired`), and a var picks up
+> `forced_compute`/`forced_data` flags. A **capability demanded as data** —
+> e.g. `sum(λ x → x + 1)`, summing a plain `Int ⇒ Int` lambda — is caught right
+> here at the edge: the lambda is *concrete* `Compute`, so `sum`'s `Data` demand
+> is the concrete `compute <: data` reject, no domain inspection needed. (This is
+> why the domain-shape guess is gone: a capability is `Compute` by construction,
+> a collection `Data` by construction, so a scalar/keyed domain never decides a
+> kind.) For a genuinely *var*-kinded function (a parameter, a freshened scheme)
+> the violation is invisible at the edge — the flags are merely recorded — so a
+> var that ends with `forced_compute ∧ forced_data` is the same `Compute <: Data`
+> error, surfaced at coalesce as `CoalesceError::ComputeWhereDataRequired`; a var
+> with only `forced_data` resolves to `Data` (a parameter used only as a collection).
+> The rejection is **emission-only**: the
+> post-inference check runs a *kind-blind* `ConstrainCache` (`new_kind_blind`),
+> because elimination canonicalizes a map's reconstructed kind to `Compute`
+> (`without_pi_names`) — denotation is preserved, kind representation is not, so
+> a kind-aware re-check would false-reject. `sum([x for x in xs])`,
+> comprehensions, and `groupby` type fine because they are stamped concrete
+> `Data` at construction (the provenance annotation / `refined_data_fun` cast
+> target). One guard is deferred — see
+> [Deferred: data-domain invariance](#deferred-data-domain-invariance) below.
+
+### The domain-join rejection
+
+A join of two data functions is **not** the contravariant meet of their domains. The
+domain of a collection *is* its data, so meeting `[0,1] ⤇ Int` with `[0,2] ⤇ Int`
+down to `[0,1] ⤇ Int` silently discards the third row — a wrong answer with nothing
+in the type recording that it happened. The join is therefore defined only where
+narrowing is a no-op: where the two arms turn out to hold the **same** domain, the
+join is that collection (`[1,2] if c else [3,4]` is `[0,1] ⤇ Int`, and so is
+`xs if c else xs`). Where the domains differ, the join is **rejected**
+(`CoalesceError::DomainJoinConflict`).
+
+This is the whole payoff of tracking the kind. Without it, both arrows are just
+functions and the compute lattice's meet applies — which is correct for
+capabilities and destroys rows for collections. With it, the two cases are distinct
+and the collection case can refuse.
+
+The lossless answer exists and is not this: it is the dependent sum
+`Σ (𝑤 ∈ {𝐷ᵢ}). 𝑤 ⤇ V` over the arms' candidate domains, whose witness `𝑤` is the
+runtime branch discriminant, eliminated by distributing the consumer over it. That
+is the collections work — a type-level construct with formation, subtyping and
+elimination rules of its own, plus the value-`Case` fan-out that compiles the
+elimination. Until it lands the rejection is the contract, and the reason a
+rejection is an acceptable interim state (rather than a gap that has to be closed
+first) is that it is *loud*: the alternative to a Σ is a diagnosed error, not a
+silent miscompile. Pinned end-to-end by `conditional_collection_rejected_cleanly`.
+
+**Mechanics.** The decision is split across two phases, and the split is forced. At
+the compact merge, a positive `Data ⊔ Data` accumulates its domain **alternatives**
+(`CompactFun::domains`, unioned and deduplicated by `union_domains` — never met).
+It cannot decide there whether the alternatives are really two domains: a compact
+domain still carries inference-variable identity that `simplify_type` may merge
+afterwards, so two structurally identical domains can arrive as two alternatives.
+Coalesce materializes each alternative to a `Type` and deduplicates *again*, and
+that second comparison is the one that decides — one survivor is a plain data
+function, two or more is the rejection. A `Data ⊔ Compute` collision is a third
+outcome, `KindMerge::Conflict`, reported as `DomainJoinConflict` when it would drop
+≥ 2 alternatives and as `ComputeWhereDataRequired` when a single slot is a
+capability demanded as a collection.
+
+Refinements ride *inside* each alternative domain, so differently-filtered arms of
+one source (`[x for x in xs if x > 1]` vs `[x for x in xs if x < 3]`) are two
+distinct domains and reject like any other pair — refinement is not a special case
+here. Meeting them would claim one domain satisfying both filters; picking either
+would claim positions the other branch does not produce.
+
+**`Case` arms join by the lattice.** `emit_case` constrains *every* arm into a
+fresh result variable (`require_sub`) instead of requiring equality. Homogeneous
+arms recover the old behavior; data-collection arms with distinct domains are the
+rejection above. There is no `Mut`/`History` exception: a mutable read derefs into
+the join like any other, so a `Case` over two registers types as their *value*, and
+the second-class discipline still rejects a selected register reaching a write
+position because rule 1 reads the argument *node* rather than its type (see the
+merge-law bullets under
+[Refinements as witness sets](#refinements-as-witness-sets)).
+
+> **Deferred — heterogeneous-scalar union (follow-up).** The design goal is for
+> heterogeneous scalar arms (`1 if c else "x"`) to coalesce to a union.
+> A global positive-atom union at coalesce is **unsound** — it is
+> indistinguishable there from a binop-operand join (`1 + true`), which must
+> stay a hard error. So heterogeneous scalar arms currently remain an
+> `IncompatibleBounds` error; the sound union needs strict scalar consumers
+> (binops, …) to impose concrete bounds, tracked as a follow-up.
+
+**The codomain is joined, not preserved — and that asymmetry is principled.** Where
+two data arms *do* join (a shared domain), the codomain is the ordinary covariant
+lattice join `τ₀ ⊔ τ₁` (`CompactFun::merge` merges the codomain at `pol`, the
+domains at `!pol`), forgetting which arm contributed which element type. Loss is
+forbidden exactly where it is *silent and destroys data* — the domain, where
+dropping an index drops a row with no trace. It is permitted exactly where it is
+*visible and only coarsens type* — the codomain: `Int | String` sits in the type,
+and a consumer that needs `Int` (say `sum`) fails at *its own* constraint site.
+Where the LUB is representable this is a structured coarsening that does not error
+(record codomains intersect to their common fields, refinements drop to the shared
+base); where it is a **scalar** union it is the deferred piece above and errors at
+coalesce, the same `IncompatibleBounds` rejection as `1 + true`.
+
+Two further consequences of joining the codomain, on the record. The correlation is
+**recoverable by construction**: the correlated form is a tagged variant with each
+arm's own codomain, and a program that needs a branch-aware consumer introduces the
+choice *explicitly* (`.Ints(xs) if flag else .Strs(ys)`) and `match`es it — the
+case-split tax is paid by the code that benefits from it. And the default keeps
+consumer complexity **linear**: if the implicit join preserved correlation, every
+conditional would default to a variant every downstream consumer must destructure,
+and nested conditionals would multiply the arms through the whole consumer graph.
+This direction *depends on* tagged-variant **surface syntax** (`.Foo(x)`
+constructors + `match`, the open part of [[type-checker-tagged-variants]]): until
+that ships the codomain join is a *forced* loss with no recovery path, not a chosen
+one. We are also deliberately declining **flow-sensitive typing** — an
+occurrence-typing language could keep the arms correlated through the path
+condition `flag` itself, with no tag; Cambra does not narrow on opaque `Bool`s, and
+the tagged variant is the substitute.
+
+### Deferred: data-domain invariance
+
+The `Fun`/`Fun` domain edge is contravariant for **both** kinds. For a *compute*
+function that is right — the domain is a parameter. For a *data* function it is not:
+the domain **is** the data, so a `[0,10] ⤇ 𝑉` standing where a `[0,5] ⤇ 𝑉` is declared
+is silent row addition, and the reverse is silent row loss. Neither should typecheck.
+
+The guard is nonetheless **not** enabled. The **base** half of it is settled — strip
+refinements, require the *base* domains equal — and is already in force in practice,
+because [`Type::UIntRange`] relates only by equality. What the **refinement** half should
+be is open, and stating it needs the two candidate edges named.
+
+**What the arm does today, precisely.** For two data functions over one base differing
+only in a domain refinement, exactly one of the two edges holds
+(`a_refined_data_domain_relates_only_by_acquisition_today`):
+
+| edge | holds today | what it means when the domain *is* the data |
+| --- | --- | --- |
+| `𝐷 ⤇ 𝑉 <: {𝐷 \| 𝑝} ⤇ 𝑉` — *acquire* | **yes** | row **addition**: an unfiltered collection standing where a filtered one is declared |
+| `{𝐷 \| 𝑝} ⤇ 𝑉 <: 𝐷 ⤇ 𝑉` — *drop* | no | row **loss** |
+
+The direction is the opposite of the one a reader expects, and the reason is that the
+domain is **contravariant**. At a bare domain position the ordinary lattice is drop-only
+(`{𝐷 | 𝑝} <: 𝐷`); behind the arrow that inverts, so the relation that survives is the one
+whose *supertype* is the more refined.
+
+So the edge that is live is the row-addition one, and a *drop* pattern is not something a
+strict guard would break, because it does not hold in the first place.
+
+**The open question is which of those two edges to keep.** Under the "domain is the data"
+reading the answer looks like *neither* — both change the row set — which is full
+invariance: `strip`-equal bases **and** equal refinements. The cost is not a
+filtered-flows-where-unfiltered pattern (there isn't one) but whatever relies on
+acquisition. Establishing what that is, and what replaces it, is the work.
+
+It is deferred rather than wrong-by-omission because of what the domains actually are
+today: ranges, which are already invariant, and fresh join variables, which carry no
+refinement to acquire. The acquisition edge becomes reachable — and the omission
+load-bearing — as soon as *refined* domains are pervasive.
+
+### Deliberately incomplete here
+
+Recorded so a reader can tell a deliberate boundary from an oversight.
+
+- **The rejection is a placeholder for the lossless join, not the intended end
+  state.** Every program whose branches produce collections of different sizes is
+  rejected — including ones with an obvious meaning
+  (`sum([1,2] if c else [1,2,3])` is unambiguously `3` or `6`). What makes this an
+  acceptable interim state is only that it is diagnosed rather than miscompiled; it
+  is not a semantic position. The dependent sum described in
+  [The domain-join rejection](#the-domain-join-rejection) is the answer, and it
+  arrives with the collections work.
+
+- **`KindMerge::Conflict` is covered only by hand-constructed compact graphs.** Both
+  of its coalesce outcomes are exercised (`coalesce_domain_join_conflict_errs`,
+  `coalesce_single_domain_conflict_is_compute_where_data_required`), but no *source
+  program* in the suite reaches either. The `Data ⊔ Compute` collision needs a slot
+  that is simultaneously fed a capability and demanded as a collection, and the
+  single-slot case needs a `FunKind::Var` ending with both `forced_compute` and
+  `forced_data` — a kind-polymorphic function whose two uses disagree. The
+  constraint-level face of the same rejection *is* reachable from source
+  (`ConstrainError::ComputeWhereDataRequired`, e.g. `sum(λ x → x + 1)`), which is
+  why the coalesce-time face is a backstop rather than the primary check. If a
+  source-level route is found, it belongs in the suite; if one provably does not
+  exist, the branch should collapse into the constraint-level check.
+
+- **Data-domain invariance is not enforced**, so the contravariant `Fun`/`Fun`
+  domain edge still admits a data function standing where a differently-domained one
+  is declared. See
+  [Deferred: data-domain invariance](#deferred-data-domain-invariance) above for why
+  the obvious formulation is wrong and what the correct rule is.
 
 ---
 
@@ -604,6 +842,8 @@ The pipeline passes downstream of inference treat function types structurally an
 ### `Case` inference
 
 For each `Branch { guard, body }`: the guard flows one-way into `Type::Base(BaseType::Bool)` (a refined boolean is still a boolean); every body flows one-way into one shared variable. The overall `Case` type is that variable — the arms' **join**. Two arms of incompatible base types therefore collide as `IncompatibleBounds` at coalesce, where a heterogeneous list literal or `CollectionUnion` reports it, rather than as an eager mismatch here. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
+
+The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [Data vs compute functions](#46-data-vs-compute-functions); the strict-equality behavior above is current until that lands.
 
 ### Record literals and field access
 

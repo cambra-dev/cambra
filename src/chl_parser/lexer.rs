@@ -101,7 +101,9 @@ pub enum Token {
     PlusEq,
     #[token("-=")]
     MinusEq,
-    /// Lambda body arrow `->` (also the planned pair / map-entry arrow, §2.4).
+    /// Lambda body arrow `->`. Also the planned pair / map-entry arrow — `a -> b`
+    /// for a two-tuple, `[k -> v, …]` for a map literal (`docs/chl-spec.md`,
+    /// "2.4 Atoms").
     /// Two chars, so maximal munch takes it over `-` then `>`.
     #[token("->")]
     Arrow,

@@ -54,7 +54,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{PredMemo, is_free};
+use crate::ccl::ccl_utils::{PredMemo, is_free, strip_iterate_markers};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{Branch, Name, PredicateId, Type, TypedExpr, TypedExprNode};
 
@@ -240,7 +240,7 @@ impl Subst {
     /// would also compare equal here; predicates resolve names lexically at
     /// their introduction site, so this requires two distinct dependent
     /// functions with colliding argument spellings meeting at one position —
-    /// the extent-join territory that O1/O4 owns anyway.)
+    /// the domain-join territory that O1/O4 owns anyway.)
     pub fn eq_modulo_ty_slots(&self, other: &Subst) -> bool {
         self.0.len() == other.0.len()
             && self
@@ -813,6 +813,7 @@ impl Subst {
                 name: None,
                 domain,
                 codomain,
+                ..
             } => {
                 self.rewrite_type_go(domain, memo);
                 self.rewrite_type_go(codomain, memo);
@@ -822,6 +823,7 @@ impl Subst {
                 name: Some(b),
                 domain,
                 codomain,
+                ..
             } => {
                 self.rewrite_type_go(domain, memo);
                 let restricted = self.shadow(b);
@@ -850,6 +852,13 @@ impl Subst {
                         return false;
                     }
                     restricted.rewrite_expr_go(pred, memo);
+                    // Keep the predicate marker-free: a substituted collection may
+                    // carry a term-tree `iterate` marker that must not leak into a
+                    // type (see `strip_iterate_markers` and the `force_refinement`
+                    // twin). Only the rewritten path needs it — a marker arrives
+                    // *through* the substitution, so the vacuous path above, which
+                    // rewrites nothing and keeps the origin `Rc`, has none to strip.
+                    *pred = strip_iterate_markers(pred);
                     true
                 });
                 self.rewrite_type_go(base, memo);
@@ -917,7 +926,13 @@ impl Subst {
         if !restricted.0.keys().any(|k| is_free(k, &r.predicate)) {
             return r.clone();
         }
-        let new_pred = restricted.apply_expr(&r.predicate);
+        // A refinement predicate is a *denotational* term, so a substituted
+        // value must not drag a term-tree `iterate` planning marker into it
+        // (the §6.2 move-site discharge of a `let`-bound, iterate-marked
+        // collection into a refined domain). Strip the neutral marker so the
+        // predicate stays marker-free — otherwise it churns under `simplify`
+        // and diverges from inference's pre-marker copy.
+        let new_pred = strip_iterate_markers(&restricted.apply_expr(&r.predicate));
         // Scope-validity (design §6.2): a discharged binder must not survive
         // in the rewritten predicate — once `[x ↦ arg]` fires, no free `x`
         // may remain, or a downstream pass would observe a dangling
@@ -981,14 +996,12 @@ impl Subst {
                 name: None,
                 domain,
                 codomain,
-            } => Type::Fun {
-                name: None,
-                domain: Box::new(self.apply_type(domain)),
-                codomain: Box::new(self.apply_type(codomain)),
-            },
+                ..
+            } => Type::fun_like(ty, self.apply_type(domain), self.apply_type(codomain)),
 
             Type::Fun {
                 name: Some(b),
+                kind,
                 domain,
                 codomain,
             } => {
@@ -996,6 +1009,7 @@ impl Subst {
                 let (b2, inner) = self.under_binder_ty(b, codomain);
                 Type::Fun {
                     name: Some(b2),
+                    kind: kind.clone(),
                     domain,
                     codomain: Box::new(inner),
                 }
@@ -1069,6 +1083,34 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
     out
 }
 
+/// Whether `ty`'s structural skeleton contains an unresolved [`Type::Infer`]
+/// leaf. This is the per-type dual of `check_fully_typed`'s whole-program scan:
+/// a cheap "is this type ground" predicate for invariant assertions at pass
+/// boundaries. It walks the type skeleton only — a `Refinement`'s predicate is
+/// a term, not a type, and is not descended into (an `Infer` embedded in a
+/// predicate cast is out of scope and would need a term walk).
+pub fn type_contains_infer(ty: &Type) -> bool {
+    match ty {
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn
+        | Type::Hole => false,
+        Type::Infer(_) => true,
+        Type::Fun {
+            domain, codomain, ..
+        } => type_contains_infer(domain) || type_contains_infer(codomain),
+        Type::History { value, domain, .. } => {
+            type_contains_infer(value) || type_contains_infer(domain)
+        }
+        Type::Tuple(ts) => ts.iter().any(type_contains_infer),
+        Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
+        Type::Variant(tags) => tags.iter().any(|(_, t)| type_contains_infer(t)),
+        Type::Refinement(base, _) => type_contains_infer(base),
+    }
+}
+
 /// Insert each of `names` into `bound` for the duration of `f`, restoring the
 /// set afterward. Only names that were *newly* inserted are removed, so a
 /// binder that shadows an already-in-scope name of the same spelling does not
@@ -1107,6 +1149,7 @@ fn collect_type_fv(
             name,
             domain,
             codomain,
+            ..
         } => {
             collect_type_fv(domain, bound, visited, out);
             // A `Some` name is the Pi binder, bound in the codomain.

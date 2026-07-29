@@ -191,11 +191,33 @@ impl TypeInferenceContext {
         TypeInferenceContextGuard { ctx: self }
     }
 
-    /// Register the CCL type for an externally-managed data source.
+    /// Register an externally-managed data source by its **element type**.
     ///
-    /// Typically called by [`crate::ccl::context::GlobalContext`] when a source
-    /// is registered; the type is a `Fun(DataSource(name), output_type)`.
-    pub fn register_source_type(&mut self, name: &str, ty: Type) {
+    /// The source's CCL type is constructed here — a data function
+    /// `DataSource(name) ⤇ elem_ty` — rather than accepted from the caller. A
+    /// registered source is *definitionally* a data collection, so its
+    /// [`FunKind::Data`](crate::ccl::ty::FunKind) is intrinsic provenance
+    /// (`DataSource` is minted only for sources), not free information a caller
+    /// could stamp wrong: taking only the element type makes a miscategorized
+    /// source unrepresentable. Typically called by
+    /// [`crate::ccl::context::GlobalContext`] when a source is registered.
+    pub fn register_source_type(&mut self, name: &str, elem_ty: Type) {
+        // `elem_ty` is the source's *element* type, not the whole source arrow.
+        // A `Fun` over a `DataSource` domain is the source type itself, so seeing
+        // one here means a caller passed the constructed source type by mistake
+        // (the pre-Option-A signature took the full `Type::Fun`); catch that
+        // regression rather than silently nesting `DataSource ⤇ (DataSource ⤇ …)`.
+        debug_assert!(
+            !matches!(&elem_ty, Type::Fun { domain, .. } if matches!(**domain, Type::DataSource(_))),
+            "register_source_type: elem_ty is itself a source data function \
+             (`{elem_ty}`) — pass the element type, not the whole source arrow"
+        );
+        let ty = Type::Fun {
+            name: None,
+            kind: crate::ccl::ty::FunKind::Data,
+            domain: Box::new(Type::DataSource(name.to_string())),
+            codomain: Box::new(elem_ty),
+        };
         self.source_types.insert(name.to_string(), ty);
     }
 
@@ -242,9 +264,15 @@ pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
     UnboundVariable(String),
     /// A type mismatch was detected between two solved types.
+    ///
+    /// The two `Type`s are boxed to keep `InferError` under the
+    /// `result_large_err` budget: this is the widest variant (two `Type`s plus
+    /// a `ctx` string), and `Type` grew when [`crate::ccl::ty::FunKind`] gained
+    /// an inference variable. Boxing here keeps every
+    /// `Result<_, InferError>` cheap on the common `Ok` path.
     TypeMismatch {
-        type_a: Type,
-        type_b: Type,
+        type_a: Box<Type>,
+        type_b: Box<Type>,
         ctx: String,
     },
     /// A [`Type::Fun`] was required — e.g. in a function-application or
@@ -756,8 +784,19 @@ fn collect_type_errors(
             }
         }
         Type::Fun {
-            domain, codomain, ..
+            domain,
+            codomain,
+            kind,
+            ..
         } => {
+            // Coalesce resolves every kind var to a concrete `Data`/`Compute`
+            // (`KindMerge::of`); a surviving `FunKind::Var` is a missed resolution
+            // that would silently display `⇒` and behave as `Compute`. Catch it
+            // loudly rather than letting the wrong default ride downstream.
+            debug_assert!(
+                !matches!(kind, crate::ccl::ty::FunKind::Var(_)),
+                "unresolved FunKind::Var survived coalesce at `{context_sym}`"
+            );
             collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
             collect_type_errors(codomain, context_sym, strictness, errors, seen_refinements);
         }
@@ -1419,6 +1458,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int))
             }
@@ -1452,13 +1492,10 @@ mod tests {
         // [10, 20]  =>  Fun(UIntRange(2), Int)
         let mut expr = Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]);
         let ty = infer(&mut expr, &mut ctx).unwrap();
+        // A list literal is a **data** function (domain).
         assert_eq!(
             ty,
-            Type::Fun {
-                name: None,
-                domain: Box::new(Type::UIntRange(2)),
-                codomain: Box::new(Type::Base(BaseType::Int))
-            }
+            Type::data_fun(Type::UIntRange(2), Type::Base(BaseType::Int))
         );
     }
 
@@ -1469,7 +1506,7 @@ mod tests {
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
-            Type::fun(Type::UIntRange(0), Type::Base(BaseType::Unit))
+            Type::data_fun(Type::UIntRange(0), Type::Base(BaseType::Unit))
         );
     }
 
@@ -1649,6 +1686,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int))
             }
@@ -1836,11 +1874,11 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::TypeMismatch {
-                    type_a: Type::Base(BaseType::Int),
-                    type_b: Type::Base(BaseType::String),
-                    ..
-                }
+                InferError::TypeMismatch { type_a, type_b, .. }
+                    if matches!(
+                        (type_a.as_ref(), type_b.as_ref()),
+                        (Type::Base(BaseType::Int), Type::Base(BaseType::String))
+                    )
             )),
             "expected TypeMismatch Int/String, got {errs:?}"
         );
@@ -1976,7 +2014,7 @@ mod tests {
         let value = Expr::lambda("x", int(), Expr::var("x").with_ty(int()))
             .with_ty(Type::fun(int(), int()));
         let predicate = Expr::lit(Lit::Bool(true));
-        let target = crate::ccl::ccl_utils::refined_fn_type(int(), predicate, int());
+        let target = crate::ccl::ccl_utils::refined_data_fun(int(), predicate, int());
         let mut expr = crate::ccl::ccl_utils::make_cast(value, target);
         let ty = infer(&mut expr, &mut ctx).unwrap();
         match ty {
@@ -2093,8 +2131,10 @@ mod tests {
 
     /// `Sum` wrapping a list-comprehension lambda: `sum([x for x in [1, 2]])`.
     ///
-    /// The unannotated lambda is fully annotated by inference; its type is
-    /// `Fun(UIntRange(2), Int)` and the aggregate returns `Int`.
+    /// The unannotated lambda's domain/codomain are inferred; its kind is stamped
+    /// `Data` by the `data_fun` provenance annotation lowering puts on every
+    /// comprehension (a comprehension *is* a data collection). Its type is then
+    /// `[0, 1] ⤇ Int`, which `Sum` accepts, returning `Int`.
     #[test]
     fn test_infer_aggregate_sum_over_list_comp() {
         let mut ctx = TypeInferenceContext::new();
@@ -2103,7 +2143,8 @@ mod tests {
             Expr::list(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
             "x",
             Expr::var("x"),
-        );
+        )
+        .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole));
         let mut expr = Expr::aggregate(comp, AggregateKind::Sum);
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
     }
@@ -2331,6 +2372,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Unit))
             }
@@ -2348,12 +2390,14 @@ mod tests {
     #[test]
     fn test_infer_source_returns_registered_type() {
         let mut ctx = TypeInferenceContext::new();
+        ctx.register_source_type("mystream", Type::Base(BaseType::String));
+        // Registration constructs the source's data function from the element type.
         let source_ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Data,
             domain: Box::new(Type::DataSource("mystream".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
         };
-        ctx.register_source_type("mystream", source_ty.clone());
         let mut expr = Expr::new(TypedExprNode::Source("mystream".into()));
         assert_eq!(infer(&mut expr, &mut ctx), Ok(source_ty));
     }
@@ -2374,18 +2418,20 @@ mod tests {
     #[test]
     fn test_infer_multiple_sources_resolve_independently() {
         let mut ctx = TypeInferenceContext::new();
+        ctx.register_source_type("ints", Type::Base(BaseType::Int));
+        ctx.register_source_type("strs", Type::Base(BaseType::String));
         let int_ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Data,
             domain: Box::new(Type::DataSource("ints".into())),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
         let str_ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Data,
             domain: Box::new(Type::DataSource("strs".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
         };
-        ctx.register_source_type("ints", int_ty.clone());
-        ctx.register_source_type("strs", str_ty.clone());
 
         let mut e1 = Expr::new(TypedExprNode::Source("ints".into()));
         let mut e2 = Expr::new(TypedExprNode::Source("strs".into()));
@@ -2424,11 +2470,11 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::TypeMismatch {
-                    type_a: Type::Base(BaseType::Bool),
-                    type_b: Type::Base(BaseType::Int),
-                    ..
-                }
+                InferError::TypeMismatch { type_a, type_b, .. }
+                    if matches!(
+                        (type_a.as_ref(), type_b.as_ref()),
+                        (Type::Base(BaseType::Bool), Type::Base(BaseType::Int))
+                    )
             )),
             "expected TypeMismatch Bool/Int, got {errs:?}"
         );
@@ -2564,6 +2610,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -2606,6 +2653,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -2658,6 +2706,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -2676,6 +2725,7 @@ mod tests {
         // The node type is Fun(Hole, Int) — the Hole is inside the compound type.
         let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Hole),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -2911,6 +2961,7 @@ mod tests {
         let str_elem = Expr::lit(Lit::String("hello".into())).with_ty(Type::Base(BaseType::String));
         let list_ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -2944,6 +2995,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::String)),
             codomain: Box::new(Type::Base(BaseType::String)),
         });
