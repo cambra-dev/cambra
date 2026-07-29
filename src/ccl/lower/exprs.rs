@@ -135,7 +135,7 @@ pub(super) fn lower_call(
                 // the intermediate curried `Apply`s are manufactured (the
                 // outermost `Apply` is the call's image, tagged by `lower_expr`,
                 // whose entry overwrites the interim machinery tag).
-                let mut acc = ctx.tag_source(Expr::var(name.to_string()), func.span);
+                let mut acc = ctx.tag_image(Expr::var(name.to_string()), func.span);
                 for arg in args {
                     let applied = Expr::apply(lower_call_arg(arg, ctx)?, acc);
                     acc = ctx.tag_machinery(applied, func.span, "lower.curried_call");
@@ -149,7 +149,7 @@ pub(super) fn lower_call(
             // bypasses the gate.)
             if args.len() == 1 {
                 let arg = lower_expr(&args[0], ctx)?;
-                let callee = ctx.tag_source(Expr::var(name.to_string()), func.span);
+                let callee = ctx.tag_image(Expr::var(name.to_string()), func.span);
                 return Ok(Expr::apply(arg, callee));
             }
             // Multi-arg call: tuple the arguments and apply once,
@@ -163,7 +163,7 @@ pub(super) fn lower_call(
             // source call); the callee `Var` images the function name.
             let args_span = args[0].span.join(args[args.len() - 1].span);
             let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
-            let callee = ctx.tag_source(Expr::var(name.to_string()), func.span);
+            let callee = ctx.tag_image(Expr::var(name.to_string()), func.span);
             Ok(Expr::apply(arg_tuple, callee))
         }
     }
@@ -184,7 +184,7 @@ fn lower_call_arg(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if let ChlExpr::Name(id) = &arg.node {
-        Ok(ctx.tag_source(Expr::var(id.as_str().to_string()), arg.span))
+        Ok(ctx.tag_image(Expr::var(id.as_str().to_string()), arg.span))
     } else {
         lower_expr(arg, ctx)
     }
@@ -380,8 +380,7 @@ pub(super) fn lower_compare(
         // Each pair comparison is a `Nature::Source` direct image of its `<op>`
         // in the chain, spanning its two operands.
         let pair_span = operand_spans[i].join(operand_spans[i + 1]);
-        comparisons
-            .push(ctx.tag_source(Expr::binop(lhs, BinOpKind::Compare(kind), rhs), pair_span));
+        comparisons.push(ctx.tag_image(Expr::binop(lhs, BinOpKind::Compare(kind), rhs), pair_span));
     }
 
     // Single comparison: return it directly.
@@ -430,7 +429,7 @@ pub(super) fn lower_boolop(
     let mut acc = lower_expr(&operands[0], ctx)?;
     for value in &operands[1..] {
         let rhs = lower_expr(value, ctx)?;
-        acc = ctx.tag_source(Expr::binop(acc, kind, rhs), bool_span);
+        acc = ctx.tag_image(Expr::binop(acc, kind, rhs), bool_span);
     }
     Ok(acc)
 }

@@ -330,7 +330,7 @@ pub(super) fn lower_final_stmt(
             let name = extract_name_target(target, "augmented assignment")?;
             check_mut_write_context(&name, last.span, ctx)?;
             let val = lower_aug_binop(&name, *op, value, last.span, ctx)?;
-            Ok(ctx.tag_source(Expr::mut_write(name, val), last.span))
+            Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
         // A bare `x := e` as the final statement is a mutable-variable *write* when `x` is
         // already in scope (a mutation-loop body's terminal write, an inlined
@@ -351,7 +351,7 @@ pub(super) fn lower_final_stmt(
             let name = extract_name_target(target, "mutable assignment")?;
             check_mut_write_context(&name, last.span, ctx)?;
             let val = lower_expr(value, ctx)?;
-            Ok(ctx.tag_source(Expr::mut_write(name, val), last.span))
+            Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
         // A standalone `with begin():` as the program's final statement: one
         // transaction whose value is `Unit` (a trailing transaction produces no
@@ -467,7 +467,7 @@ pub(super) fn lower_middle_stmt(
                 "lower.http_serve",
             );
             let let_expr = Expr::let_bind(req_name, requests_expr, inner_let);
-            Ok(ctx.tag_source(let_expr, stmt.span))
+            Ok(ctx.tag_image(let_expr, stmt.span))
         }
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
         // mutable write (the mutation operators are `:=` and `+=`), so even a
@@ -475,7 +475,7 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::Assign { target, value } => {
             let name = extract_name_target(target, "assignment")?;
             let val = lower_expr(value, ctx)?;
-            Ok(ctx.tag_source(Expr::let_bind(name, val, body), stmt.span))
+            Ok(ctx.tag_image(Expr::let_bind(name, val, body), stmt.span))
         }
         ChlStmt::AnnAssign {
             target,
@@ -503,7 +503,7 @@ pub(super) fn lower_middle_stmt(
             }
             let annotation_ty = lower_type_annotation(annotation)?;
             let val = lower_expr(value, ctx)?;
-            Ok(ctx.tag_source(
+            Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),
                 stmt.span,
             ))
@@ -545,8 +545,8 @@ pub(super) fn lower_middle_stmt(
                 let mut scope = outer_bindings.clone();
                 collect_stmt_names(preceding, &mut scope);
                 if scope.contains(&name) {
-                    let write = ctx.tag_source(Expr::mut_write(name, val), stmt.span);
-                    return Ok(ctx.tag_source(Expr::expr_stmt(write, body), stmt.span));
+                    let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+                    return Ok(ctx.tag_image(Expr::expr_stmt(write, body), stmt.span));
                 }
             }
             // Otherwise this is an *introduction*. Resolve the optional
@@ -581,7 +581,7 @@ pub(super) fn lower_middle_stmt(
                 domain: Box::new(domain),
                 kind: crate::ccl::HistoryKind::Overwrite,
             };
-            Ok(ctx.tag_source(Expr::let_bind_annotated(name, val, body, mut_ty), stmt.span))
+            Ok(ctx.tag_image(Expr::let_bind_annotated(name, val, body, mut_ty), stmt.span))
         }
         // Desugar `x op= e` → `MutWrite(x, x op e)`. `+=` is a mutable write: the
         // check requires `x` to be a mutable variable (never a shadowing rebind of
@@ -596,14 +596,14 @@ pub(super) fn lower_middle_stmt(
             // runs post-inference.
             check_mut_write_context(&name, stmt.span, ctx)?;
             let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
-            let write = ctx.tag_source(Expr::mut_write(name, val), stmt.span);
-            Ok(ctx.tag_source(Expr::expr_stmt(write, body), stmt.span))
+            let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+            Ok(ctx.tag_image(Expr::expr_stmt(write, body), stmt.span))
         }
         // `x <<= e` — defer-define statement, distinct from AugAssign.
         ChlStmt::Define { target, value } => {
             let lowered = lower_define(target, value, ctx)?;
-            let define = ctx.tag_source(lowered, stmt.span);
-            Ok(ctx.tag_source(Expr::expr_stmt(define, body), stmt.span))
+            let define = ctx.tag_image(lowered, stmt.span);
+            Ok(ctx.tag_image(Expr::expr_stmt(define, body), stmt.span))
         }
         // Function definition → Let binding with curried lambda body.
         ChlStmt::FunctionDef {
@@ -612,7 +612,7 @@ pub(super) fn lower_middle_stmt(
             body: fn_body,
         } => {
             let func_expr = lower_function_body(stmt.span, params, fn_body, ctx)?;
-            Ok(ctx.tag_source(
+            Ok(ctx.tag_image(
                 Expr::let_bind(name.as_str().to_string(), func_expr, body),
                 stmt.span,
             ))
@@ -1089,7 +1089,7 @@ pub(super) fn lower_if(
         guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), if_span, "lower.if_else"),
         body: else_expr,
     });
-    Ok(ctx.tag_source(
+    Ok(ctx.tag_image(
         Expr::new(TypedExprNode::Case {
             scrutinee: None,
             branches: out_branches,
@@ -1411,10 +1411,16 @@ x";
     // Provenance side-table population (S2b)
     // -----------------------------------------------------------------------
 
-    /// Lowering records a leaf `LoweringStep` per node so that, after the
-    /// lowering fold, the root `Let` (a statement-level construct) and a nested
-    /// expression node both resolve back to their exact source spans as direct
-    /// images (`Nature::Source`).
+    /// Lowering records a leaf `LoweringStep` per node, so after the fold every
+    /// node resolves back to its exact source span — and the `Nature` each node
+    /// carries follows the structural rule on `LoweringContext::tag_source`:
+    /// `Source` ⟺ the node is the root of a lowered `Spanned<ChlExpr>`.
+    ///
+    /// This pins both sides of that rule on one program. The root `Let` images
+    /// the assignment *statement* `x = 1` — a statement is not a
+    /// `Spanned<ChlExpr>`, so it resolves to its span with the `"lower.image"`
+    /// label but **not** `Nature::Source`. The final `x + 2` *is* an expression
+    /// root, so it is `Source`.
     #[test]
     fn lowering_tags_nodes_with_source_spans() {
         use crate::ccl::TypedExprNode;
@@ -1462,8 +1468,12 @@ x";
             .expect("root Let node has a projection entry");
         assert_eq!(
             root_attr.rewritten.nature,
-            Nature::Source,
-            "directly lowered = Source"
+            Nature::Machinery,
+            "a statement image is not an expression root, so not Source"
+        );
+        assert_eq!(
+            root_attr.rewritten.label, "lower.image",
+            "it is still an image of source text, not manufactured plumbing"
         );
         assert_eq!(root_attr.spans, vec![Span::new(0, 5)]);
 
@@ -1474,15 +1484,16 @@ x";
             "bound `1` traces to its literal span"
         );
 
-        // A nested node resolves: the final `x + 2` BinOp carries the
-        // expression statement's span.
+        // The other side of the rule: the final `x + 2` BinOp is the root of a
+        // lowered `Spanned<ChlExpr>`, so it carries that expression's span *and*
+        // `Nature::Source`.
         let nested_attr = seed
             .get(&body.node_id())
             .expect("nested `x + 2` node has a projection entry");
         assert_eq!(
             nested_attr.rewritten.nature,
             Nature::Source,
-            "directly lowered = Source"
+            "an expression root is Source"
         );
         assert_eq!(nested_attr.spans, vec![final_expr_span]);
     }

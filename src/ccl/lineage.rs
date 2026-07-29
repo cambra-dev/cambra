@@ -106,22 +106,36 @@ pub(crate) enum Op {
 /// The fidelity of a node to its blamed source — the one fact the collapsed
 /// graph cannot recover. A trinary axis.
 ///
+/// **Work in progress.** This axis exists to carry display metadata to the
+/// inspector frontend, and neither the vocabulary nor the tagging is settled: the
+/// three variants are a first cut, the rule assigning them is deliberately
+/// structural for now (below), and `Expansion` has no production producer yet.
+/// Treat a node's nature as a hint the frontend may present, not as a fact any
+/// compiler decision should turn on — nothing in `ccl/` branches on it today, and
+/// the per-site `label` is the durable datum. Retagging is cheap precisely
+/// because of that: a label-keyed remap can recompute a different taxonomy
+/// without touching how any pass records.
+///
 /// Public because it rides in the public [`RewriteTag`] (and thus
 /// [`SourceAttribution`]); the recorder-facing [`RewriteStep`] carries it too.
 ///
-/// [`Source`](Nature::Source) is listed first because it is the base case: a
-/// node that *is* a source construct's direct one-to-one image. It is emitted
-/// **only by lowering** — the fold's attributing arms and both wire validators
-/// carry debug guards that no *pass* step ever carries it (if a non-lowering
-/// producer ever becomes legitimate, rename the variant to `Image` at that
-/// moment). On the wire a `Source`-nature tag null-compresses (serializes as
+/// [`Source`](Nature::Source) is listed first because it is the base case: the
+/// root of a lowered source expression. The rule for who gets it is *structural*
+/// and stated in one place — see `LoweringContext::tag_source` in
+/// `src/ccl/lower/mod.rs`, and `design/provenance.md`, "The seam
+/// (`src/ccl/context.rs`)". It is emitted **only by lowering** — the fold's
+/// attributing arms and both wire validators carry debug guards that no *pass*
+/// step ever carries it. On the wire a `Source`-nature tag null-compresses
+/// (serializes as
 /// `rewritten: null` via [`is_source`](Nature::is_source)) so the wire stays
 /// byte-identical to the retired `rewritten: None` encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Nature {
-    /// The node is a source construct's direct image (a one-to-one translation
-    /// of something the user wrote). Lowering-only; guarded off the pass logs
-    /// and off the wire.
+    /// The node is the root of a lowered source expression. Lowering-only;
+    /// guarded off the pass logs and off the wire. Note this is a *positional*
+    /// fact, not "images something the user wrote" — an interior image (a call's
+    /// callee, a chained comparison's operands) carries `Machinery` with the
+    /// `"lower.image"` label instead.
     Source,
     /// Faithful expansion of a source construct (a comparison chain, a
     /// comprehension, a lambda-elim combinator).
@@ -312,9 +326,13 @@ pub struct RewriteTag {
 }
 
 impl RewriteTag {
-    /// The tag for a source construct's **direct image**: `{via: Lower, nature:
-    /// Source, label: "lower.image"}`. A direct image is `Nature::Source` under
-    /// `Pass::Lower`, not an absence.
+    /// The tag a **lowered expression root** carries: `{via: Lower, nature:
+    /// Source, label: "lower.image"}` — a tag, never an absence.
+    ///
+    /// An interior image shares the `"lower.image"` label but carries
+    /// `Nature::Machinery`, per the structural rule on
+    /// `LoweringContext::tag_source`, so this constructor is specifically the
+    /// root case.
     pub fn direct_image() -> Self {
         RewriteTag {
             via: Pass::Lower,

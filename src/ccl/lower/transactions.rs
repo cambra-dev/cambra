@@ -105,7 +105,7 @@ pub(super) fn lower_standalone_transaction(
     let span = with_stmt.span;
     let unit_item = ctx.tag_machinery(Expr::lit(Lit::Unit), span, ts);
     let source = ctx.tag_machinery(Expr::list(vec![unit_item]), span, ts);
-    let begin = ctx.tag_source(Expr::begin(block), span);
+    let begin = ctx.tag_image(Expr::begin(block), span);
     let body_unit = ctx.tag_machinery(Expr::lit(Lit::Unit), span, ts);
     let body = ctx.tag_machinery(Expr::expr_stmt(begin, body_unit), span, ts);
     let for_node = ctx.tag_machinery(for_over(iter_var, source, body), span, ts);
@@ -248,7 +248,7 @@ fn lower_tx_block_inner(
                     ));
                 }
                 let val = lower_expr(value, ctx)?;
-                ctx.tag_source(Expr::let_bind(name, val, chain), stmt.span)
+                ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
             }
             // `if cond: <writes>` — a conditional (deny) write. The no-else
             // branch is the deny: `commit = false` for the whole transaction.
@@ -304,10 +304,10 @@ fn write_or_let(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if ctx.is_shadowed(&name) {
-        return Ok(ctx.tag_source(Expr::let_bind(name, val, chain), stmt_span));
+        return Ok(ctx.tag_image(Expr::let_bind(name, val, chain), stmt_span));
     }
-    let write = ctx.tag_source(Expr::mut_write(name, val), stmt_span);
-    Ok(ctx.tag_source(Expr::expr_stmt(write, chain), stmt_span))
+    let write = ctx.tag_image(Expr::mut_write(name, val), stmt_span);
+    Ok(ctx.tag_image(Expr::expr_stmt(write, chain), stmt_span))
 }
 
 /// Lower an `if`/`elif`/`else` guard inside a transaction to a `Case`. A bare
@@ -362,7 +362,7 @@ fn lower_tx_if(
         guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), guard_span, "lower.txn_deny"),
         body: else_expr,
     });
-    Ok(ctx.tag_source(
+    Ok(ctx.tag_image(
         Expr::new(TypedExprNode::Case {
             scrutinee: None,
             branches: out_branches,

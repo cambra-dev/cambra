@@ -48,7 +48,7 @@ Each step *separately* carries a `blame` set (the upstream ids the outputs
 attribute to — **not** the same as `consumed`), a `nature` (the trinary fidelity
 axis `Source` / `Expansion` / `Machinery`), and a stable `label`. `consumed`
 drives fate/leak accounting; `blame` drives span resolution; the two are never
-mixed. `Nature::Source` — a source construct's *direct image* — is emitted
+mixed. `Nature::Source` — the root of a lowered source expression — is emitted
 **only by lowering**; the fold's attributing arms carry a debug guard that no
 pass step ever carries it.
 
@@ -131,15 +131,33 @@ boundaries, which needs the pass logs above.
 - **The lowering log + fold.** Lowering records a `LoweringLog` under an
   always-on `RecorderSession::lowering()` (installed in every build across
   `lower_stmts`, drained before the first pass session). It records at **leaf
-  grain**: `tag_source`/`tag_machinery` are thin shims appending a single-node
-  leaf `LoweringStep` (`Transform { consumed: [], produced: [id] }`, anchored at
-  the nearest real span) — `tag_source` with `Nature::Source` + `"lower.image"`
-  (a source construct's *direct image*), `tag_machinery` with `Nature::Machinery`
-  + `"lower.<rule>"` (one label per rule; nature is uniform and refinable later
-  by a label-keyed remap). Ordinary mints open **no** frame, so `on_mint` stays a
-  no-op on the hot path; frames open only where ambient `Copy` capture is needed
-  — uncurry's template discharge and the chained-comparison operand freshens,
-  whose interior re-mints land as `Copy` LoweringSteps mirroring their origins.
+  grain**: `tag_source` / `tag_image` / `tag_machinery` are thin shims appending
+  a single-node leaf `LoweringStep` (`Transform { consumed: [], produced: [id] }`,
+  anchored at the nearest real span). Ordinary mints open **no** frame, so
+  `on_mint` stays a no-op on the hot path; frames open only where ambient `Copy`
+  capture is needed — uncurry's template discharge and the chained-comparison
+  operand freshens, whose interior re-mints land as `Copy` LoweringSteps
+  mirroring their origins (`copy_frame`, which declares that shape and so has no
+  inert blame/nature arguments).
+
+  **The rule for `Nature::Source` is structural: `Source` ⟺ the node is the root
+  of a lowered `Spanned<ChlExpr>`.** It is decided in exactly one place — the
+  `lower_expr` wrapper re-tags every lowered expression's root, last tag wins via
+  the fold's re-image path — so no lowering arm makes a judgment call. An arm
+  records its own nodes with `tag_image` (`"lower.image"`, an image of source
+  text) or `tag_machinery` (`"lower.<rule>"`, manufactured plumbing), both at
+  `Nature::Machinery`.
+
+  The cost is deliberate and worth stating: a node can be a one-to-one image of
+  something the user wrote and still not be `Source`, because it is not an
+  expression *root* — a call's callee `Var`, each comparison of `a < b < c`, the
+  projection of `x[i]`, and every statement-level image (statements are not
+  `Spanned<ChlExpr>`s, so a statement has no `Source` node at all). The converse
+  holds too: a comprehension lowers to a `Cast` wrapper the user never wrote, and
+  as the expression's root that `Cast` *is* `Source`. What is lost from `nature`
+  is preserved in the `label` — `"lower.image"` marks an image either way — and
+  the per-site label is the datum consumers read, with nature a coarse projection
+  a label-keyed remap can refine when a consumer earns it.
 
   At the lowering→pipeline handoff (before uniquify/inference, so the release
   `InferError` read timing is unchanged) `collapse_lowering` folds the log

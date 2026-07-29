@@ -155,7 +155,7 @@ pub(super) fn uncurry_params(
             }
             // Each curried lambda images one written parameter; the outermost
             // is re-tagged identically by the `def`/lambda caller.
-            ctx.tag_source(lam, fn_span)
+            ctx.tag_image(lam, fn_span)
         }));
     }
 
@@ -350,7 +350,7 @@ pub(super) fn lower_function_body(
     // tuple-arg lambda for the multi-param case is the user's function node,
     // so the def span is the right blame here.)
     let func = uncurry_params(params, body_result?, fn_span, ctx)?;
-    Ok(ctx.tag_source(func, fn_span))
+    Ok(ctx.tag_image(func, fn_span))
 }
 
 #[cfg(test)]

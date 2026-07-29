@@ -201,8 +201,8 @@ fn tagged_for_loop(
     for_span: Span,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    let lambda = ctx.tag_source(Expr::lambda(iter_var, Type::Hole, body), for_span);
-    ctx.tag_source(Expr::compose(vec![source, lambda]), for_span)
+    let lambda = ctx.tag_image(Expr::lambda(iter_var, Type::Hole, body), for_span);
+    ctx.tag_image(Expr::compose(vec![source, lambda]), for_span)
 }
 
 /// Wrap a generator's lowered loop in its synthesized defer binding,
@@ -382,7 +382,7 @@ fn lower_for_body_stmts(
                 Some(a) => Expr::let_bind_annotated(name, val, body, a),
                 None => Expr::let_bind(name, val, body),
             };
-            ctx.tag_source(let_expr, span)
+            ctx.tag_image(let_expr, span)
         }))
 }
 
@@ -413,7 +413,7 @@ fn lower_for_body_terminal(
                     )
                 })?;
                 let feed = Expr::feed(name.to_string(), lower_expr(y, ctx)?);
-                Ok(ctx.tag_source(feed, stmt.span))
+                Ok(ctx.tag_image(feed, stmt.span))
             }
             // `r << e` — direct feed into a named defer handle.
             // Note: when inside a yield-bearing generator (defer_name is Some),
@@ -422,7 +422,7 @@ fn lower_for_body_terminal(
             // A future improvement could add a lowering-time error here.
             ChlExpr::Feed { target, value: v } => {
                 let feed = lower_feed(target, v, ctx)?;
-                Ok(ctx.tag_source(feed, value.span))
+                Ok(ctx.tag_image(feed, value.span))
             }
             _ => Err(LoweringError::unsupported(
                 value.span,
@@ -476,7 +476,7 @@ fn lower_for_body_terminal(
                 ),
                 body: ctx.tag_machinery(Expr::lit(Lit::Unit), stmt.span, "lower.guard_fallthrough"),
             });
-            Ok(ctx.tag_source(
+            Ok(ctx.tag_image(
                 Expr::new(TypedExprNode::Case {
                     scrutinee: None,
                     branches: out_branches,
@@ -690,17 +690,17 @@ pub(super) fn lower_direct_mirror_loop(
                     let name = extract_name_target(target, "assignment")?;
                     check_mut_write_context(&name, stmt.span, ctx)?;
                     let val = lower_expr(value, ctx)?;
-                    ctx.tag_source(Expr::let_bind(name, val, chain), stmt.span)
+                    ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
                 }
                 ChlStmt::AugAssign { target, op, value } => {
                     let name = extract_name_target(target, "augmented assignment")?;
                     check_mut_write_context(&name, stmt.span, ctx)?;
                     let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
                     if acc_names.contains(&name) {
-                        let write = ctx.tag_source(Expr::mut_write(name, val), stmt.span);
-                        ctx.tag_source(Expr::expr_stmt(write, chain), stmt.span)
+                        let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+                        ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
                     } else {
-                        ctx.tag_source(Expr::let_bind(name, val, chain), stmt.span)
+                        ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
                     }
                 }
                 // `x := value` — a mutable write inside the loop body. A write to
@@ -725,10 +725,10 @@ pub(super) fn lower_direct_mirror_loop(
                     check_mut_write_context(&name, stmt.span, ctx)?;
                     let val = lower_expr(value, ctx)?;
                     if acc_names.contains(&name) {
-                        let write = ctx.tag_source(Expr::mut_write(name, val), stmt.span);
-                        ctx.tag_source(Expr::expr_stmt(write, chain), stmt.span)
+                        let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+                        ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
                     } else {
-                        ctx.tag_source(Expr::let_bind(name, val, chain), stmt.span)
+                        ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
                     }
                 }
                 // `y: T = value` — an ordinary annotated per-iteration local, the
@@ -751,7 +751,7 @@ pub(super) fn lower_direct_mirror_loop(
                     }
                     let ann = lower_type_annotation(annotation)?;
                     let val = lower_expr(value, ctx)?;
-                    ctx.tag_source(Expr::let_bind_annotated(name, val, chain, ann), stmt.span)
+                    ctx.tag_image(Expr::let_bind_annotated(name, val, chain, ann), stmt.span)
                 }
                 // `o << value` — an in-loop feed. Emitted as a raw `Feed` marker
                 // (reads stay bare); the phase resolves its value in the
@@ -772,7 +772,7 @@ pub(super) fn lower_direct_mirror_loop(
                         }
                     };
                     let lowered = lower_expr(feed_value, ctx)?;
-                    let feed = ctx.tag_source(Expr::feed(defer_name, lowered), value.span);
+                    let feed = ctx.tag_image(Expr::feed(defer_name, lowered), value.span);
                     ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
                 }
                 // `yield value` — a feed into the surrounding generator's defer.
@@ -785,7 +785,7 @@ pub(super) fn lower_direct_mirror_loop(
                     })?;
                     let lowered = lower_expr(y, ctx)?;
                     let feed =
-                        ctx.tag_source(Expr::feed(defer_name.to_string(), lowered), value.span);
+                        ctx.tag_image(Expr::feed(defer_name.to_string(), lowered), value.span);
                     ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
                 }
                 // A bare expression statement — the `Feed`/`Yield` guards above
@@ -807,7 +807,7 @@ pub(super) fn lower_direct_mirror_loop(
                 // recurrence — which is what lets one loop mix both.
                 ChlStmt::With { .. } => {
                     let block = lower_with_block(stmt, ctx)?;
-                    let begin = ctx.tag_source(Expr::begin(block), stmt.span);
+                    let begin = ctx.tag_image(Expr::begin(block), stmt.span);
                     ctx.tag_machinery(Expr::expr_stmt(begin, chain), stmt.span, "lower.stmt_seq")
                 }
                 _ => {
@@ -825,7 +825,7 @@ pub(super) fn lower_direct_mirror_loop(
 
     // The direct-mirror `For` images the for statement; the sequencing
     // `ExprStmt` splicing it before the continuation is manufactured.
-    let for_node = ctx.tag_source(
+    let for_node = ctx.tag_image(
         Expr::new(TypedExprNode::For {
             target: TypedBinding {
                 name: iter_var.into(),
