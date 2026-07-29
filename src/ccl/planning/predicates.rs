@@ -45,6 +45,16 @@ use super::*;
 // practice — a shared `Rc` is only ever created by copying one refinement — but
 // nothing enforces it, and keying on the base means a mismatch *recompiles*
 // rather than silently borrowing another occurrence's element type.
+//
+// Cost of a `Type` context: a lookup compares bases structurally, and `PartialEq`
+// for a refined `Type` descends into predicate terms. Two things keep that cheap.
+// The base is the type being *refined*, so it sits below the refinement rather
+// than containing it — comparing `{Int | p}`'s base compares `Int`, never `p` —
+// and the entry list for one key is a singleton in every shape measured, so a hit
+// is one compare of a small type. The clone per refinement node is the same
+// shallow value. Measured against the pre-context memo the difference is in the
+// noise; a base that ever became large enough to matter would be a signal about
+// the types, not about this key.
 
 /// True if a `__pair` binder ([`Name::is_synthetic_pair`]) appears anywhere in
 /// the **term** `e` — its node and child *expressions*, never its type slots.

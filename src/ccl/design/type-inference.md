@@ -289,10 +289,10 @@ source, the map, the cast target, and the consumer contract); every pass that
 rebuilds predicates must then *preserve* it, and "every pass" is the whole list —
 `uniquify`, constraint emission (`emit_bare_predicate`), `coalesce`, `retype`,
 `subst`'s both modes, `inline`, `simplify`, and planning's compilation. Each
-threads one **pass-scoped** `ccl_utils::PredMemo`, whose `begin`/`finish`
-protocol maps an origin `Rc` to a single rebuild; `finish_unchanged` is the
-stronger case, where a pass that has nothing to say about a predicate keeps the
-origin `Rc` rather than reallocating an equal one.
+threads one **pass-scoped** `ccl_utils::PredMemo`, whose `rebuild` maps an origin
+`Rc` to a single result. A pass that has nothing to say about a predicate reports
+no change and keeps the origin `Rc` rather than reallocating an equal one, so
+sharing survives even the passes that merely walk past.
 
 Two things make this load-bearing rather than housekeeping:
 

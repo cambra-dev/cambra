@@ -1047,11 +1047,6 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) {
     match ty {
         Type::Refinement(inner, r) => {
-            // Preserve sharing: an occurrence of this predicate `Rc` already
-            // coalesced in this pass re-points at that rebuild rather than
-            // coalescing an independent copy (which would split the sharing — see
-            // [`PredMemo`]). `begin` hands back an owned copy and drops its
-            // borrow, so `coalesce_node` can take `&mut ctx` below.
             // A handle clone, so `ctx` stays freely borrowable for the rebuild —
             // which re-enters this same memo through `coalesce_node` →
             // `coalesce_type_predicates`.

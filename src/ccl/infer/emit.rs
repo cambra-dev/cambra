@@ -300,9 +300,10 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), I
 /// clones the typed refinement, carrying the same slots.
 ///
 /// **Emission is therefore a predicate-rebuilding pass**, and it preserves
-/// predicate `Rc` sharing — but as a *context-determined* one, so it uses
-/// [`PredMemo`](crate::ccl::ccl_utils::PredMemo)'s `begin_always` /
-/// `finish_shared` protocol rather than the skipping one.
+/// predicate `Rc` sharing — but it shares *terms* rather than *results*, so it
+/// uses [`TermMemo::rebuild_always`](crate::ccl::ccl_utils::TermMemo) rather than
+/// [`PredMemo::rebuild`](crate::ccl::ccl_utils::PredMemo), which would reuse an
+/// earlier occurrence's answer.
 ///
 /// The distinction is load-bearing here. This function's result depends on
 /// `domain`, which is **not** part of the memo key: the element binder is bound to

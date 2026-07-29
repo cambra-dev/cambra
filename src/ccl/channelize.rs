@@ -719,8 +719,12 @@ fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 /// substitution *above* the binder injects the closed form the strict checker
 /// derives. Still derivation-free — a discharge transport, not re-inference.
 fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
-    // Erase this node's binder-declared type slots (shared coverage with
-    // `mut_elim::erase_mut` via `walk_binders_mut`). This is order-invariant
+    // Erase this node's binder-declared type slots — both the declared type and
+    // the annotation, since a handle can ride either. Deliberately *not*
+    // `walk_type_slots_mut` (which `mut_elim::erase_mut` uses): the slots here are
+    // visited in three separate phases — binders, then children, then this node's
+    // own `ty`/annotation *after* the `Let`-discharge below has updated `map` —
+    // and one combined call would collapse that ordering. This is order-invariant
     // w.r.t. the `Let`-discharge below: a binder's type resolves against `map` as
     // it stands, and a child's discharge only closes variables bound *inside*
     // that child — never in scope at this binder — so erasing binders before the

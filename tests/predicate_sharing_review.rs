@@ -179,7 +179,7 @@ fn is_free_sees_a_predicate_on_a_let_binding_slot() {
 
 // ---------------------------------------------------------------------------
 // Finding 5 — the `changed` bit a callback returns cannot see the re-pointings
-// a nested memo *hit* performs, so `finish_unchanged` discards them.
+// a nested memo *reuse* performs, so reporting "unchanged" discards them.
 // ---------------------------------------------------------------------------
 
 /// A callback that recurses through the memo (which is why the combinator hands
