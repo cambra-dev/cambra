@@ -83,18 +83,27 @@ pub(super) fn lower_stmts_recovering(
     }
 
     // Build a Record whose fields are the sink-bound names in sorted order
-    // (sort for determinism — HashMap iteration is unordered).
+    // (sort for determinism — HashMap iteration is unordered). The record, its
+    // field `Var`s, and the tail `ExprStmt` are program-owned plumbing with no
+    // owning statement; they carry the whole-program span.
+    let program_span = stmts[0].span.join(stmts[stmts.len() - 1].span);
     let mut sink_names: Vec<String> = ctx.sink_bindings.keys().cloned().collect();
     sink_names.sort();
-    let record = Expr::new(TypedExprNode::Record(
-        sink_names
-            .iter()
-            .map(|n| (n.clone(), Expr::var(n)))
-            .collect(),
-    ));
+    let fields = sink_names
+        .iter()
+        .map(|n| {
+            let var = ctx.tag_machinery(Expr::var(n), program_span, "lower.sink_record");
+            (n.clone(), var)
+        })
+        .collect();
+    let record = ctx.tag_machinery(
+        Expr::new(TypedExprNode::Record(fields)),
+        program_span,
+        "lower.sink_record",
+    );
     // Place ExprStmt(body, record) at the innermost position of the Let* chain
     // so the Record has the sink Var references in scope.
-    Some(append_record_at_tail(body, record))
+    Some(append_record_at_tail(body, record, program_span, ctx))
 }
 
 /// Walk to the innermost non-`Let`/`ExprStmt` continuation and wrap it with
@@ -109,14 +118,19 @@ pub(super) fn lower_stmts_recovering(
 /// The `ExprStmt` node "drives the feed": `simplify` drops it once
 /// [`crate::ccl::channelize`] has extracted all `Feed` nodes from the body,
 /// leaving a clean `Let* Record{…}` shape that `compile_program` can pattern-match on.
-fn append_record_at_tail(expr: Expr, record: Expr) -> Expr {
+fn append_record_at_tail(
+    expr: Expr,
+    record: Expr,
+    program_span: Span,
+    ctx: &mut LoweringContext,
+) -> Expr {
     match expr.node {
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
-            let new_body = append_record_at_tail(*body, record);
+            let new_body = append_record_at_tail(*body, record, program_span, ctx);
             Expr {
                 node: TypedExprNode::Let {
                     binding,
@@ -127,7 +141,7 @@ fn append_record_at_tail(expr: Expr, record: Expr) -> Expr {
             }
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
-            let new_body = append_record_at_tail(*body, record);
+            let new_body = append_record_at_tail(*body, record, program_span, ctx);
             Expr {
                 node: TypedExprNode::ExprStmt {
                     expr: effect,
@@ -137,7 +151,11 @@ fn append_record_at_tail(expr: Expr, record: Expr) -> Expr {
             }
         }
         // Terminal continuation: wrap with ExprStmt so simplify can drop it.
-        _ => Expr::expr_stmt(expr, record),
+        _ => ctx.tag_machinery(
+            Expr::expr_stmt(expr, record),
+            program_span,
+            "lower.sink_record",
+        ),
     }
 }
 
@@ -240,13 +258,10 @@ pub(super) fn lower_final_stmt(
                 // caught separately by the generator path below.
                 let acc_names = find_mutation_loop_vars(for_body, &scope);
                 if !acc_names.is_empty() || for_body_has_with(for_body) {
+                    let unit =
+                        ctx.tag_machinery(Expr::lit(Lit::Unit), last.span, "lower.loop_unit");
                     return lower_generator_or_mutation_loop(
-                        target,
-                        iter,
-                        for_body,
-                        &acc_names,
-                        Expr::lit(Lit::Unit),
-                        ctx,
+                        target, iter, for_body, &acc_names, unit, last.span, ctx,
                     );
                 }
                 // Mirror `lower_middle_stmt`'s remaining mutation guards before
@@ -288,18 +303,21 @@ pub(super) fn lower_final_stmt(
                 // effect, so it stays rejected by the generator path below — it is
                 // a likely-mistaken no-op, not a hidden writer.
                 if !for_body_has_feed(for_body) && for_body_terminal_is_bare_effect(for_body) {
+                    let unit =
+                        ctx.tag_machinery(Expr::lit(Lit::Unit), last.span, "lower.loop_unit");
                     return lower_direct_mirror_loop(
                         target,
                         iter,
                         for_body,
                         &[],
-                        Expr::lit(Lit::Unit),
+                        unit,
                         None,
+                        last.span,
                         ctx,
                     );
                 }
             }
-            lower_generator_for(target, iter, for_body, &scope, ctx)
+            lower_generator_for(target, iter, for_body, &scope, last.span, ctx)
         }
         // A `+=` as the final statement is a mutable write — a pass-by-reference
         // writer body (`def bump(c): c += 1`) or a program ending in a mutable-variable
@@ -311,8 +329,8 @@ pub(super) fn lower_final_stmt(
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
             check_mut_write_context(&name, last.span, ctx)?;
-            let val = lower_aug_binop(&name, *op, value, ctx)?;
-            Ok(Expr::mut_write(name, val))
+            let val = lower_aug_binop(&name, *op, value, last.span, ctx)?;
+            Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
         // A bare `x := e` as the final statement is a mutable-variable *write* when `x` is
         // already in scope (a mutation-loop body's terminal write, an inlined
@@ -333,13 +351,16 @@ pub(super) fn lower_final_stmt(
             let name = extract_name_target(target, "mutable assignment")?;
             check_mut_write_context(&name, last.span, ctx)?;
             let val = lower_expr(value, ctx)?;
-            Ok(Expr::mut_write(name, val))
+            Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
         // A standalone `with begin():` as the program's final statement: one
         // transaction whose value is `Unit` (a trailing transaction produces no
         // value — its replies ride the feed, and a program that wants a committed
         // value reads it inside a `with begin():` block that feeds it out).
-        ChlStmt::With { .. } => lower_standalone_transaction(last, Expr::lit(Lit::Unit), ctx),
+        ChlStmt::With { .. } => {
+            let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), last.span, "lower.txn_unit");
+            lower_standalone_transaction(last, unit, ctx)
+        }
         // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(Expr::error()),
         _ => Err(LoweringError::unsupported(
@@ -423,16 +444,30 @@ pub(super) fn lower_middle_stmt(
             )));
             let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
             ctx.sources.insert(source_name.clone(), source_obj);
-            let requests_expr = Expr::new(TypedExprNode::Source(source_name.clone()));
+            let requests_expr = ctx.tag_machinery(
+                Expr::new(TypedExprNode::Source(source_name.clone())),
+                stmt.span,
+                "lower.http_serve",
+            );
             // The responses binding is a plain Defer; the sink is registered by
             // binding name so the scheduler can subscribe it independently.
-            let responses_expr = Expr::new(TypedExprNode::Defer);
+            let responses_expr = ctx.tag_machinery(
+                Expr::new(TypedExprNode::Defer),
+                stmt.span,
+                "lower.http_serve",
+            );
             ctx.register_sink_binding(resp_name.clone(), sink);
-            Ok(Expr::let_bind(
-                req_name,
-                requests_expr,
+            // The outer `requests` binding images the assignment statement (the
+            // real source construct); the inner `responses` Defer let, the
+            // Source node, and the Defer are manufactured plumbing of the
+            // http_serve expansion.
+            let inner_let = ctx.tag_machinery(
                 Expr::let_bind(resp_name, responses_expr, body),
-            ))
+                stmt.span,
+                "lower.http_serve",
+            );
+            let let_expr = Expr::let_bind(req_name, requests_expr, inner_let);
+            Ok(ctx.tag_image(let_expr, stmt.span))
         }
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
         // mutable write (the mutation operators are `:=` and `+=`), so even a
@@ -440,7 +475,7 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::Assign { target, value } => {
             let name = extract_name_target(target, "assignment")?;
             let val = lower_expr(value, ctx)?;
-            Ok(Expr::let_bind(name, val, body))
+            Ok(ctx.tag_image(Expr::let_bind(name, val, body), stmt.span))
         }
         ChlStmt::AnnAssign {
             target,
@@ -468,7 +503,10 @@ pub(super) fn lower_middle_stmt(
             }
             let annotation_ty = lower_type_annotation(annotation)?;
             let val = lower_expr(value, ctx)?;
-            Ok(Expr::let_bind_annotated(name, val, body, annotation_ty))
+            Ok(ctx.tag_image(
+                Expr::let_bind_annotated(name, val, body, annotation_ty),
+                stmt.span,
+            ))
         }
         // `x := e` — a mutable **introduction** or **write**, split by scope:
         //  - a bare `x := e` where `x` is already in scope is a *write* — a
@@ -507,7 +545,17 @@ pub(super) fn lower_middle_stmt(
                 let mut scope = outer_bindings.clone();
                 collect_stmt_names(preceding, &mut scope);
                 if scope.contains(&name) {
-                    return Ok(Expr::expr_stmt(Expr::mut_write(name, val), body));
+                    // The `MutWrite` is the image of `x := e`; the `ExprStmt`
+                    // that sequences it onto the rest of the block is
+                    // manufactured — the user wrote no sequencing operator. Two
+                    // `"lower.image"` tags at one `stmt.span` would have two
+                    // nodes each claiming to be the image of one statement.
+                    let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+                    return Ok(ctx.tag_machinery(
+                        Expr::expr_stmt(write, body),
+                        stmt.span,
+                        "lower.stmt_seq",
+                    ));
                 }
             }
             // Otherwise this is an *introduction*. Resolve the optional
@@ -542,7 +590,7 @@ pub(super) fn lower_middle_stmt(
                 domain: Box::new(domain),
                 kind: crate::ccl::HistoryKind::Overwrite,
             };
-            Ok(Expr::let_bind_annotated(name, val, body, mut_ty))
+            Ok(ctx.tag_image(Expr::let_bind_annotated(name, val, body, mut_ty), stmt.span))
         }
         // Desugar `x op= e` → `MutWrite(x, x op e)`. `+=` is a mutable write: the
         // check requires `x` to be a mutable variable (never a shadowing rebind of
@@ -556,12 +604,15 @@ pub(super) fn lower_middle_stmt(
             // otherwise it is a bare mutable write whose target-is-a-mutable check
             // runs post-inference.
             check_mut_write_context(&name, stmt.span, ctx)?;
-            let val = lower_aug_binop(&name, *op, value, ctx)?;
-            Ok(Expr::expr_stmt(Expr::mut_write(name, val), body))
+            let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
+            let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+            Ok(ctx.tag_image(Expr::expr_stmt(write, body), stmt.span))
         }
         // `x <<= e` — defer-define statement, distinct from AugAssign.
         ChlStmt::Define { target, value } => {
-            Ok(Expr::expr_stmt(lower_define(target, value, ctx)?, body))
+            let lowered = lower_define(target, value, ctx)?;
+            let define = ctx.tag_image(lowered, stmt.span);
+            Ok(ctx.tag_image(Expr::expr_stmt(define, body), stmt.span))
         }
         // Function definition → Let binding with curried lambda body.
         ChlStmt::FunctionDef {
@@ -570,7 +621,10 @@ pub(super) fn lower_middle_stmt(
             body: fn_body,
         } => {
             let func_expr = lower_function_body(stmt.span, params, fn_body, ctx)?;
-            Ok(Expr::let_bind(name.as_str().to_string(), func_expr, body))
+            Ok(ctx.tag_image(
+                Expr::let_bind(name.as_str().to_string(), func_expr, body),
+                stmt.span,
+            ))
         }
         // For a for-loop in the middle of a block, check whether it is a mutation
         // accumulation loop (lowered to `Loop`) or a side-effecting streaming
@@ -600,7 +654,7 @@ pub(super) fn lower_middle_stmt(
                 // phases (src/ccl/design/mutability.md) build the recurrence,
                 // strip each `Begin` into a commit site, and hoist feeds.
                 return lower_generator_or_mutation_loop(
-                    target, iter, for_body, &acc_names, body, ctx,
+                    target, iter, for_body, &acc_names, body, stmt.span, ctx,
                 );
             }
             // Top-level scan found nothing, but a *nested* `if` or
@@ -645,20 +699,27 @@ pub(super) fn lower_middle_stmt(
             // *`Compose`*, a stateless map that cannot thread the accumulator,
             // so a hidden writer must take the `For` path, not that one.)
             if !for_body_has_yield(for_body) && !for_body_has_feed(for_body) {
-                return lower_direct_mirror_loop(target, iter, for_body, &[], body, None, ctx);
+                return lower_direct_mirror_loop(
+                    target,
+                    iter,
+                    for_body,
+                    &[],
+                    body,
+                    None,
+                    stmt.span,
+                    ctx,
+                );
             }
 
             // A feed/yield loop with no accumulator is a side-effecting
             // `Compose` (desugar routes its feeds).
-            Ok(Expr::expr_stmt(
-                lower_generator_for(target, iter, for_body, &scope, ctx)?,
-                body,
-            ))
+            let for_expr = lower_generator_for(target, iter, for_body, &scope, stmt.span, ctx)?;
+            Ok(ctx.tag_machinery(Expr::expr_stmt(for_expr, body), stmt.span, "lower.stmt_seq"))
         }
-        ChlStmt::Expr { .. } | ChlStmt::If { .. } => Ok(Expr::expr_stmt(
-            lower_final_stmt(stmt, preceding, outer_bindings, ctx)?,
-            body,
-        )),
+        ChlStmt::Expr { .. } | ChlStmt::If { .. } => {
+            let effect = lower_final_stmt(stmt, preceding, outer_bindings, ctx)?;
+            Ok(ctx.tag_machinery(Expr::expr_stmt(effect, body), stmt.span, "lower.stmt_seq"))
+        }
         // A standalone `with begin():` transaction — one commit over a
         // synthesized singleton source, `transact_phase` folds it into the
         // shared commit store (see src/ccl/design/mutability.md).
@@ -1030,15 +1091,20 @@ pub(super) fn lower_if(
         });
     }
     let else_expr = lower_stmts_inner(else_body, outer_bindings, ctx, false)?;
+    // The `else` arm's always-true guard is manufactured encoding; the `Case`
+    // itself images the if/else statement.
     out_branches.push(Branch {
         pattern: None,
-        guard: Expr::lit(Lit::Bool(true)),
+        guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), if_span, "lower.if_else"),
         body: else_expr,
     });
-    Ok(Expr::new(TypedExprNode::Case {
-        scrutinee: None,
-        branches: out_branches,
-    }))
+    Ok(ctx.tag_image(
+        Expr::new(TypedExprNode::Case {
+            scrutinee: None,
+            branches: out_branches,
+        }),
+        if_span,
+    ))
 }
 
 #[cfg(test)]
@@ -1348,5 +1414,96 @@ x";
             message.contains("(name=value)"),
             "expected a paren-record hint, got: {message}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Provenance side-table population (S2b)
+    // -----------------------------------------------------------------------
+
+    /// Lowering records a leaf `LoweringStep` per node, so after the fold every
+    /// node resolves back to its exact source span — and the `Nature` each node
+    /// carries follows the structural rule on `LoweringContext::tag_source`:
+    /// `Source` ⟺ the node is the root of a lowered `Spanned<ChlExpr>`.
+    ///
+    /// This pins both sides of that rule on one program. The root `Let` images
+    /// the assignment *statement* `x = 1` — a statement is not a
+    /// `Spanned<ChlExpr>`, so it resolves to its span with the `"lower.image"`
+    /// label but **not** `Nature::Source`. The final `x + 2` *is* an expression
+    /// root, so it is `Source`.
+    #[test]
+    fn lowering_tags_nodes_with_source_spans() {
+        use crate::ccl::TypedExprNode;
+        use crate::ccl::lineage::{Nature, RecorderSession, collapse_lowering};
+        use crate::ccl::provenance::NodeId;
+        use crate::chl_parser::ast::Span;
+        use std::collections::HashSet;
+
+        // `x = 1` is the first statement (spans bytes 0..5); `x + 2` is the
+        // final bare expression (spans bytes 6..11). The source-byte offsets are
+        // load-bearing: the test asserts the exact origin span of each node.
+        let src = "x = 1\nx + 2\n";
+        let stmts = parse_module(src);
+        assert_eq!(stmts[0].span, Span::new(0, 5), "stmt `x = 1` span");
+        let final_expr_span = stmts[1].span;
+        assert_eq!(final_expr_span, Span::new(6, 11), "expr `x + 2` span");
+
+        // Install the always-on lowering session, lower, then fold the log into
+        // the lowering projection — the same handoff `compile_program` runs.
+        let mut ctx = LoweringContext::default();
+        let session = RecorderSession::lowering();
+        let lowered = lower_stmts(&stmts, &mut ctx)
+            .into_result()
+            .expect("lowering succeeds");
+        let log = session.into_lowering_log();
+        let mut output_ids: HashSet<NodeId> = HashSet::new();
+        fn ids(e: &Expr, acc: &mut HashSet<NodeId>) {
+            acc.insert(e.node_id());
+            e.walk_children(|c| ids(c, acc));
+        }
+        ids(&lowered, &mut output_ids);
+        let (seed, leaks) = collapse_lowering(&log, &output_ids);
+        assert!(leaks.is_empty(), "lowering fold is leak-free: {leaks:?}");
+
+        // Root node is the `let x = 1 in (x + 2)` binding, tagged with the
+        // assignment statement's span.
+        let TypedExprNode::Let {
+            bound_expr, body, ..
+        } = &lowered.node
+        else {
+            panic!("expected a Let at the root, got {:?}", lowered.node);
+        };
+        let root_attr = seed
+            .get(&lowered.node_id())
+            .expect("root Let node has a projection entry");
+        assert_eq!(
+            root_attr.rewritten.nature,
+            Nature::Machinery,
+            "a statement image is not an expression root, so not Source"
+        );
+        assert_eq!(
+            root_attr.rewritten.label, "lower.image",
+            "it is still an image of source text, not manufactured plumbing"
+        );
+        assert_eq!(root_attr.spans, vec![Span::new(0, 5)]);
+
+        // The bound expression `1` is tagged with the RHS literal's span.
+        assert_eq!(
+            seed.get(&bound_expr.node_id()).map(|a| a.spans.as_slice()),
+            Some(&[Span::new(4, 5)][..]),
+            "bound `1` traces to its literal span"
+        );
+
+        // The other side of the rule: the final `x + 2` BinOp is the root of a
+        // lowered `Spanned<ChlExpr>`, so it carries that expression's span *and*
+        // `Nature::Source`.
+        let nested_attr = seed
+            .get(&body.node_id())
+            .expect("nested `x + 2` node has a projection entry");
+        assert_eq!(
+            nested_attr.rewritten.nature,
+            Nature::Source,
+            "an expression root is Source"
+        );
+        assert_eq!(nested_attr.spans, vec![final_expr_span]);
     }
 }

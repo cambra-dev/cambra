@@ -244,10 +244,14 @@ fn is_mut_written(name: &Name, expr: &Expr) -> bool {
 /// which renames a fed-to handle when a defer-mediating UDF is inlined. The
 /// defer-returning lift itself lives in `channelize::try_lift_defer`.
 fn inline_impl(expr: Expr) -> Expr {
+    // Carry `node_id` through every rebuild: reconstructing a node with
+    // inlined children is a Preserve (the same node, same identity), so the
+    // input id must flow onto the rebuilt `Expr` rather than being re-minted.
     let Expr {
         node,
         ty,
         user_annotation,
+        node_id,
     } = expr;
 
     let new_node = match node {
@@ -326,10 +330,11 @@ fn inline_impl(expr: Expr) -> Expr {
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
 
-        // All remaining variants: pure structural recursion.  Atoms have
-        // no children, so this is a no-op for them.
+        // All remaining variants: pure structural recursion, carrying the input
+        // id (a Preserve).  Atoms have no children, so this is a no-op for them.
         node => {
             let mut expr = Expr {
+                node_id,
                 node,
                 ty,
                 user_annotation,
@@ -340,6 +345,7 @@ fn inline_impl(expr: Expr) -> Expr {
     };
 
     Expr {
+        node_id,
         node: new_node,
         ty,
         user_annotation,
@@ -364,7 +370,9 @@ fn inline_impl(expr: Expr) -> Expr {
 /// and BinOp paths in ways that need test-suite triage first.  Revisit if a
 /// case surfaces where the surviving anon-lambda blocks downstream work.
 fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMemo) -> Expr {
-    // Direct occurrence: replace the variable with the Lambda value.
+    // Direct occurrence: replace the variable with the Lambda value — a UDF used
+    // as an unapplied value, or the function side of a call about to
+    // beta-reduce.
     if let TypedExprNode::Var(ref n) = expr.node
         && n == name
     {
@@ -393,6 +401,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
             node,
             ty,
             user_annotation,
+            node_id,
         } = expr;
         let (function, argument) = match node {
             TypedExprNode::Apply { function, argument } => (function, argument),
@@ -434,9 +443,11 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather
             // than a literal lambda) — skip beta-reduction and reconstruct
-            // the Apply with the substituted subexpressions.
+            // the Apply (a Preserve: same node, substituted children) with its
+            // input id carried through.
             _ => {
                 return Expr {
+                    node_id,
                     node: TypedExprNode::Apply {
                         function: Box::new(function),
                         argument: Box::new(argument),
@@ -451,11 +462,13 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
     // Not a call site of `name`: recurse into sub-expressions. Each recursion
     // carries the same (name, lambda) so that deeper call sites still
     // beta-reduce. This mirrors [`crate::ccl::lambda_elim::substitute`] but
-    // preserves the specialised Apply-chain detection above.
+    // preserves the specialised Apply-chain detection above. Rebuilding a node
+    // with substituted children is a Preserve, so its input id is carried.
     let Expr {
         node,
         ty,
         user_annotation,
+        node_id,
     } = expr;
     let new_node = match node {
         TypedExprNode::Lambda { param, body } => {
@@ -525,6 +538,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
         // `let`, so only its `value` child needs the walk.)
         node => {
             let mut expr = Expr {
+                node_id,
                 node,
                 ty,
                 user_annotation,
@@ -535,6 +549,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
     };
 
     Expr {
+        node_id,
         node: new_node,
         ty,
         user_annotation,

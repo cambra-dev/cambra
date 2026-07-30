@@ -18,6 +18,23 @@ ci_clippy() { cargo clippy --all-targets -- -D warnings; }
 # (e.g. a test calling a debug-only fn) only breaks here. `-- -D warnings` is
 # scoped to our crate, not deps.
 ci_clippy_release() { cargo clippy --release --all-targets -- -D warnings; }
+# The `serde` feature is default-OFF, so the default passes above compile none of
+# the serde-gated wire code — the hand-written `Serialize` impls and everything
+# only they reach. Nothing else in the gate turns the feature on, so without this
+# pass that code is compiled by nobody and its warnings (a dead `wire_str`, say)
+# never surface.
+ci_clippy_serde() { cargo clippy --features serde --all-targets -- -D warnings; }
+# The library alone, with no features unified in. Every pass above uses
+# `--all-targets`, which pulls in the dev-dependencies — including the *self*
+# dev-dependency that enables `test-helpers`. Cargo unifies that feature into the
+# lib under test, so those passes only ever compile the library with
+# `test-helpers` ON, and the feature-off configuration a consumer actually builds
+# is compiled by nothing. Edition 2024 / resolver 3 keeps the feature out of a
+# plain `cargo build --lib`, which is what makes the gap silent rather than loud:
+# ungated library code calling a `test-helpers`-gated item passes the whole gate
+# and fails `cargo build --lib`. Same argument as `ci_clippy_serde` — a
+# configuration nothing compiles is a configuration that rots.
+ci_clippy_lib() { cargo clippy --lib -- -D warnings; }
 # `DEEP_TYPECHECK=1` turns on the opt-in per-operation typecheck (see the
 # `deep-typecheck` feature). The GitHub workflow sets it so automated runs keep
 # exercising that check; it stays off for a bare local `./ci.sh` because it is
@@ -76,6 +93,12 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_clippy_release || failed=1
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_clippy_serde || failed=1
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_clippy_lib || failed=1
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_doc || failed=1

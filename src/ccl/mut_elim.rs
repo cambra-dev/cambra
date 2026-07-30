@@ -170,20 +170,6 @@ fn unit_expr() -> Expr {
     u
 }
 
-/// `ExprStmt(effect, body)`, typed as `body` (a statement sequences before
-/// the value it precedes).
-fn expr_stmt_typed(effect: Expr, body: Expr) -> Expr {
-    let ty = body.ty.clone();
-    Expr {
-        node: TypedExprNode::ExprStmt {
-            expr: Box::new(effect),
-            body: Box::new(body),
-        },
-        ty,
-        user_annotation: None,
-    }
-}
-
 /// Whether `e` is a bare mutable write.
 fn is_mut_write(e: &Expr) -> bool {
     matches!(e.node, TypedExprNode::MutWrite { .. })
@@ -220,23 +206,40 @@ fn spine_writes_mut(e: &Expr) -> bool {
 /// order and scope.
 fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Expr {
     match writer_body.node {
+        // 1:1 reparents — carry the input node's id (a preserve, not a mint): the
+        // statement/binding survives at a new spine position, so its source span
+        // and lineage carry over as a self-edge rather than a fresh untracked node.
         TypedExprNode::ExprStmt {
             expr: effect,
             body: cont,
-        } => expr_stmt_typed(*effect, hoist_writer_body(binding, *cont, body)),
+        } => Expr::expr_stmt_preserving(
+            writer_body.node_id,
+            *effect,
+            hoist_writer_body(binding, *cont, body),
+        ),
         TypedExprNode::Let {
             binding: inner,
             bound_expr: def,
             body: cont,
-        } => let_in(inner, *def, hoist_writer_body(binding, *cont, body)),
-        // A bare writer terminal: its value is `unit`.
+        } => Expr::let_in_preserving(
+            writer_body.node_id,
+            inner,
+            *def,
+            hoist_writer_body(binding, *cont, body),
+        ),
+        // A bare writer terminal: its value is `unit`. This rebuilds the *same
+        // logical write* at a new spine position, so carry the input node's id
+        // (a preserve, not a mint) — freshening would sever the write's source
+        // span and duplicate the id if the original ever also survived.
         TypedExprNode::MutWrite { name, value } => {
             let write = Expr {
                 node: TypedExprNode::MutWrite { name, value },
                 ty: writer_body.ty,
                 user_annotation: writer_body.user_annotation,
+                // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
+                node_id: writer_body.node_id,
             };
-            expr_stmt_typed(write, let_in(binding, unit_expr(), body))
+            Expr::expr_stmt(write, Expr::let_in(binding, unit_expr(), body))
         }
         // A pure terminal value: bind it directly.
         node => {
@@ -244,8 +247,10 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
                 node,
                 ty: writer_body.ty,
                 user_annotation: writer_body.user_annotation,
+                // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
+                node_id: writer_body.node_id,
             };
-            let_in(binding, terminal, body)
+            Expr::let_in(binding, terminal, body)
         }
     }
 }
@@ -293,14 +298,18 @@ fn flatten_spine(mut e: Expr) -> Expr {
         && let TypedExprNode::ExprStmt { expr: a, .. } = &effect.node
         && is_mut_write(a)
     {
+        // Re-association is a 1:1 reparent (two `ExprStmt` wrappers in, two out):
+        // carry both ids so the statements survive as self-edges, not fresh mints.
+        let outer_id = e.node_id();
         let TypedExprNode::ExprStmt { expr: effect, body } = e.node else {
             unreachable!()
         };
+        let inner_id = effect.node_id();
         let TypedExprNode::ExprStmt { expr: a, body: b } = effect.node else {
             unreachable!()
         };
-        let inner = expr_stmt_typed(*b, *body);
-        return flatten_spine(expr_stmt_typed(*a, inner));
+        let inner = Expr::expr_stmt_preserving(inner_id, *b, *body);
+        return flatten_spine(Expr::expr_stmt_preserving(outer_id, *a, inner));
     }
     // Lift a writer body's leading binding out of *effect* position. A
     // pass-by-reference writer called as a bare statement (`f(cnt)`) whose body
@@ -314,6 +323,9 @@ fn flatten_spine(mut e: Expr) -> Expr {
         && matches!(effect.node, TypedExprNode::Let { .. })
         && spine_writes_mut(effect)
     {
+        // A 1:1 reparent: the `Let` and the outer `ExprStmt` both survive at new
+        // spine positions — carry their ids (preserve, not mint).
+        let outer_id = e.node_id();
         let TypedExprNode::ExprStmt {
             expr: effect,
             body: cont,
@@ -321,6 +333,7 @@ fn flatten_spine(mut e: Expr) -> Expr {
         else {
             unreachable!()
         };
+        let let_id = effect.node_id();
         let TypedExprNode::Let {
             binding,
             bound_expr,
@@ -329,8 +342,8 @@ fn flatten_spine(mut e: Expr) -> Expr {
         else {
             unreachable!()
         };
-        let inner = expr_stmt_typed(*rest, *cont);
-        return flatten_spine(let_in(binding, *bound_expr, inner));
+        let inner = Expr::expr_stmt_preserving(outer_id, *rest, *cont);
+        return flatten_spine(Expr::let_in_preserving(let_id, binding, *bound_expr, inner));
     }
     // Hoist mutable writes out of a value-position writer body bound by a `Let`
     // (`y = f(c)`). `spine_writes_mut` fires for a genuine writer body only —
@@ -352,7 +365,7 @@ fn flatten_spine(mut e: Expr) -> Expr {
     // A bare write reached in value/terminal position: it is a `Unit`-valued
     // statement, not a value to bind.
     if is_mut_write(&e) {
-        return flatten_spine(expr_stmt_typed(e, unit_expr()));
+        return flatten_spine(Expr::expr_stmt(e, unit_expr()));
     }
     // Pass-through — recurse in place so this node's own `ty`/annotation are
     // preserved (rebuilding would drop them, corrupting e.g. join subplans).
@@ -419,7 +432,7 @@ fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
     let mut cont = cont;
     rename_uses(&mut cont, &name, &fresh);
     let cont = rewrite(cont);
-    let_in(binding(fresh, vty), value, cont)
+    Expr::let_in(binding(fresh, vty), value, cont)
 }
 
 /// A `Var` reference stamped with its concrete type.
@@ -512,20 +525,6 @@ pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
     }
 }
 
-/// `let name = def in body`, typed as `body`.
-pub(crate) fn let_in(name: TypedBinding, def: Expr, body: Expr) -> Expr {
-    let ty = body.ty.clone();
-    Expr {
-        node: TypedExprNode::Let {
-            binding: name,
-            bound_expr: Box::new(def),
-            body: Box::new(body),
-        },
-        ty,
-        user_annotation: None,
-    }
-}
-
 /// `__hist ▷ .field : domain ⇒ field_ty` — a projected view of the history's
 /// `{step, to_<feed>*}` record codomain.
 fn hist_field_view(
@@ -560,9 +559,9 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
     for (defer, view) in feeds.into_iter().rev() {
         let mut feed = Expr::feed(defer, view);
         feed.ty = Type::Base(BaseType::Unit);
-        let body_ty = body.ty.clone();
+        // `expr_stmt` carries the body's type itself — an `ExprStmt`'s type *is*
+        // its body's.
         body = Expr::expr_stmt(feed, body);
-        body.ty = body_ty;
     }
     body
 }
@@ -621,7 +620,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     }
     let mut body_out = rewrite(cont);
     for (b, def) in fold.reads.into_iter().rev() {
-        body_out = let_in(b, def, body_out);
+        body_out = Expr::let_in(b, def, body_out);
     }
     body_out = hoist_feeds(body_out, fold.feed_views);
     let bindings = vec![fold.binding];
@@ -630,14 +629,11 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
         "letrec phase emitted a non-causal group"
     );
     let ty = body_out.ty.clone();
-    Expr {
-        node: TypedExprNode::LetRec {
-            bindings,
-            body: Box::new(body_out),
-        },
-        ty,
-        user_annotation: None,
-    }
+    Expr::new(TypedExprNode::LetRec {
+        bindings,
+        body: Box::new(body_out),
+    })
+    .with_ty(ty)
 }
 
 /// An induction loop folded into a single decision-factored history binding,
@@ -784,7 +780,7 @@ pub(crate) fn fold_induction_loop(
     snap.ty = p_ty.clone();
     let mut decision = Expr::apply(snap, body_lam);
     decision.ty = decision_ty.clone();
-    let lambda_body = let_in(binding(prev, writes_ty.clone()), guard, decision);
+    let lambda_body = Expr::let_in(binding(prev, writes_ty.clone()), guard, decision);
     let mut lambda = Expr::lambda(r.clone(), domain_ty.clone(), lambda_body);
     lambda.ty = hist_ty.clone();
 
@@ -876,9 +872,8 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
         map.ty = Type::fun(domain_ty.clone(), value_ty);
         let mut feed = Expr::feed(defer, map);
         feed.ty = Type::Base(BaseType::Unit);
-        let cont_ty = body_out.ty.clone();
+        // As above: `expr_stmt` carries the continuation's type itself.
         body_out = Expr::expr_stmt(feed, body_out);
-        body_out.ty = cont_ty;
     }
     body_out
 }
@@ -905,11 +900,7 @@ fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<
                 }
                 other => panic!(
                     "letrec phase: unexpected statement in read-only `with begin():` block: {}",
-                    symbolic(&Expr {
-                        node: other,
-                        ty: Type::Hole,
-                        user_annotation: None
-                    })
+                    symbolic(&Expr::throwaway(other))
                 ),
             }
             collect_feed_only(*body, env, feeds);
@@ -917,11 +908,7 @@ fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<
         TypedExprNode::Lit(Lit::Unit) => {}
         other => panic!(
             "letrec phase: unexpected node in read-only `with begin():` block: {}",
-            symbolic(&Expr {
-                node: other,
-                ty: expr.ty,
-                user_annotation: expr.user_annotation
-            })
+            symbolic(&Expr::throwaway(other).with_ty(expr.ty))
         ),
     }
 }
@@ -963,7 +950,7 @@ fn transform_chain(
         } => {
             let bound = subst_env(*bound_expr, env);
             let rest = transform_chain(*body, env, accs, writes_ty, feeds);
-            let_in(b, bound, rest)
+            Expr::let_in(b, bound, rest)
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
             match effect.node {
@@ -974,7 +961,7 @@ fn transform_chain(
                     let fresh = Name::fresh(name.base());
                     env.insert(name.clone(), tvar(&fresh, vty.clone()));
                     let rest = transform_chain(*body, env, accs, writes_ty, feeds);
-                    let_in(binding(fresh, vty), val, rest)
+                    Expr::let_in(binding(fresh, vty), val, rest)
                 }
                 // A feed is captured (value resolved in the current env) and
                 // dropped from the chain; it becomes a `to_<feed>` field on
@@ -1008,16 +995,12 @@ fn transform_chain(
                     expr: inner_e,
                     body: inner_b,
                 } => {
-                    let spliced = expr_stmt_typed(*inner_e, expr_stmt_typed(*inner_b, *body));
+                    let spliced = Expr::expr_stmt(*inner_e, Expr::expr_stmt(*inner_b, *body));
                     transform_chain(spliced, env, accs, writes_ty, feeds)
                 }
                 other => panic!(
                     "letrec phase: unexpected statement in loop body: {}",
-                    symbolic(&Expr {
-                        node: other,
-                        ty: Type::Hole,
-                        user_annotation: None
-                    })
+                    symbolic(&Expr::throwaway(other))
                 ),
             }
         }
@@ -1053,11 +1036,7 @@ fn transform_chain(
         }
         other => panic!(
             "letrec phase: unexpected node in loop-body chain: {}",
-            symbolic(&Expr {
-                node: other,
-                ty: expr.ty,
-                user_annotation: expr.user_annotation
-            })
+            symbolic(&Expr::throwaway(other).with_ty(expr.ty))
         ),
     }
 }
@@ -1092,6 +1071,7 @@ fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
 mod tests {
     use super::*;
     use crate::ccl::BaseType;
+    use crate::ccl::provenance::NodeId;
 
     /// Whether any *binder annotation* still carries a mutable history.
     ///
@@ -1244,5 +1224,52 @@ mod tests {
             s.contains("__reg.") && s.contains("final_or_default"),
             "trailing read must project the register record and reduce it: {s}"
         );
+    }
+
+    /// RT-4b: the `flatten_spine` bare-writer arm — `Let(x, MutWrite(..), k)` (a
+    /// value-position writer whose body is a bare write, e.g. an inlined
+    /// `y = bump(c)`) — carries the input write's NodeId onto the repositioned
+    /// write rather than minting a fresh one. This is the preserve-id fix: a mint
+    /// would sever the write's source span and could duplicate the id.
+    ///
+    /// Unit-test form at the letrec boundary (the plan's RT-4b fallback): the
+    /// bare-writer `MutWrite` is consumed by the loop rewrite and does not survive
+    /// into `post_desugar_ir` as a span-indexable `MutWrite`, so id preservation
+    /// through the phase is asserted directly here.
+    #[test]
+    fn flatten_spine_bare_writer_preserves_id() {
+        let int = Type::Base(BaseType::Int);
+        let c = Name::fresh("c");
+        let x = Name::fresh("x");
+
+        // The bare write `c := 1`.
+        let mut one = Expr::new(TypedExprNode::Lit(Lit::Int(1)));
+        one.ty = int.clone();
+        let mut write = Expr::mut_write(c, one);
+        write.ty = Type::Base(BaseType::Unit);
+        let write_id = write.node_id();
+
+        // `let x = (c := 1) in x` — the value-position bare-writer shape.
+        let tree = Expr::let_bind(x.clone(), write, tvar(&x, Type::Base(BaseType::Unit)));
+
+        let out = flatten_spine(tree);
+
+        // Find the (single) MutWrite in the output and assert its id is preserved.
+        fn find_mut_write(e: &Expr) -> Option<NodeId> {
+            if matches!(e.node, TypedExprNode::MutWrite { .. }) {
+                return Some(e.node_id());
+            }
+            let mut found = None;
+            e.walk_children(|c| found = found.or_else(|| find_mut_write(c)));
+            found
+        }
+        let out_id = find_mut_write(&out).expect("the write survives flatten_spine");
+        assert_eq!(
+            out_id, write_id,
+            "flatten_spine must carry the bare writer's NodeId (preserve, not mint)"
+        );
+        // Assert through the real checker rather than a local copy of its walk:
+        // uniqueness within a tree is one invariant with one implementation.
+        crate::ccl::context::assert_unique_node_ids(&out, "flatten_spine");
     }
 }

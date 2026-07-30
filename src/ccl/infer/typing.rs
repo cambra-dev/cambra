@@ -3,8 +3,9 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::TermMemo;
-use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::PolyScheme;
+use crate::ccl::infer::{InferError, LocatedInferError};
+use crate::ccl::provenance::NodeId;
 use crate::ccl::{Expr, Name, Type};
 
 /// The operations a typing rule needs from its surrounding pass.
@@ -20,10 +21,31 @@ use crate::ccl::{Expr, Name, Type};
 /// Implemented by [`InferCtx`](super::context::InferCtx) (Emit)
 /// and [`CheckCtx`](super::check::CheckCtx) (Check).
 pub(super) trait Typing {
+    /// The node whose typing rule is currently running — the blame for any error
+    /// raised under it. Emit maintains it in
+    /// [`emit_node`](super::emit::emit_node), Check in `check_node`; both set it
+    /// on entry to a node's rule and restore it on exit, error path included.
+    fn current_node(&self) -> NodeId;
+
+    /// Raise `error`, blamed on the node whose rule is running.
+    ///
+    /// The **only** way to build a [`LocatedInferError`], which is why that type
+    /// has no unlocated state to represent: an inference error cannot be
+    /// constructed without the node it belongs to. Attribution happens at the
+    /// raise site rather than on the unwind, so it does not depend on a pass
+    /// being fail-fast — an accumulating pass gets the same per-error blame for
+    /// free (this is how the coalesce walk and Check mode both get theirs).
+    fn raise(&self, error: InferError) -> LocatedInferError {
+        LocatedInferError {
+            error,
+            node_id: self.current_node(),
+        }
+    }
+
     /// Obtain the type of a child sub-expression. In Emit mode this recurses
     /// via [`emit_node`](super::emit::emit_node), emitting the child's
     /// constraints and writing its inferred type onto the child node.
-    fn subexpr(&mut self, child: &mut Expr) -> Result<Type, InferError>;
+    fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError>;
 
     /// A fresh existential type variable at the current level.
     fn fresh(&mut self) -> Type;
@@ -49,7 +71,7 @@ pub(super) trait Typing {
         sub: &Type,
         sup: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(), InferError>;
+    ) -> Result<(), LocatedInferError>;
 
     /// Run `f` with `name: ty` bound *monomorphically* in the lexical scope
     /// (lambda params, pattern/loop binders), restoring the scope afterward on
@@ -105,7 +127,7 @@ pub(super) trait Typing {
     /// mode this two-way-constrains the two (eagerly surfacing
     /// [`InferError::AnnotationMismatch`]); the annotation is the canonical
     /// type, so both directions are recorded.
-    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), InferError>;
+    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), LocatedInferError>;
 
     /// Obtain the type for a binder slot that lives on a
     /// [`TypedBinding`](crate::ccl::TypedBinding) rather than an [`Expr`] (a
@@ -130,7 +152,7 @@ pub(super) trait Typing {
         &mut self,
         t: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(Type, Type), InferError>;
+    ) -> Result<(Type, Type), LocatedInferError>;
 
     /// Dual of [`Typing::as_function`], for a node that *provides* a function
     /// shape rather than being consumed at one. Emit records the one-way
@@ -143,7 +165,7 @@ pub(super) trait Typing {
         &mut self,
         t: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(Type, Type), InferError>;
+    ) -> Result<(Type, Type), LocatedInferError>;
 
     /// Relate an applied argument to the function's parameter domain.
     ///
@@ -183,7 +205,7 @@ pub(super) trait Typing {
         arg: &Type,
         domain: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(), InferError>;
+    ) -> Result<(), LocatedInferError>;
 
     /// Type an application `function(argument)`.
     ///
@@ -204,7 +226,7 @@ pub(super) trait Typing {
         arg_ty: &Type,
         argument: &Expr,
         at: &dyn Fn() -> String,
-    ) -> Result<Type, InferError>;
+    ) -> Result<Type, LocatedInferError>;
 }
 
 /// Peel every outer [`Type::Refinement`] layer off `t`, returning the bare

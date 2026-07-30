@@ -72,6 +72,9 @@ pub(super) fn lower_call(
             let collection = lower_expr(&args[0], ctx)?;
             let key_fn = lower_expr(&args[1], ctx)?;
 
+            // `bare_pred` (and the `collection` clone inside it) lives in the
+            // cast target's refinement predicate — a type slot outside the
+            // `walk_children` domain — so its nodes are deliberately untagged.
             let bare_pred = Expr::binop(
                 Expr::apply(
                     Expr::apply(Expr::var(Name::elem()), collection.clone()),
@@ -80,14 +83,19 @@ pub(super) fn lower_call(
                 BinOpKind::Compare(CompareKind::Equals),
                 Expr::var("__gb_k"),
             );
-            let inner_body = Expr::apply(Expr::var("__gb_i"), collection);
-            let unrefined_inner = Expr::lambda("__gb_i", Type::Hole, inner_body);
+            // Main-tree encoding plumbing of the groupby rule (the returned
+            // outer lambda is the call's image, tagged by `lower_expr`).
+            let gb = "lower.groupby";
+            let inner_var = ctx.tag_machinery(Expr::var("__gb_i"), func.span, gb);
+            let inner_body = ctx.tag_machinery(Expr::apply(inner_var, collection), func.span, gb);
+            let unrefined_inner = ctx.tag_machinery(
+                Expr::lambda("__gb_i", Type::Hole, inner_body),
+                func.span,
+                gb,
+            );
             let target_ty = refined_fn_type(Type::Hole, bare_pred, Type::Hole);
-            Ok(Expr::lambda(
-                "__gb_k",
-                Type::Hole,
-                make_cast(unrefined_inner, target_ty),
-            ))
+            let cast = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
+            Ok(Expr::lambda("__gb_k", Type::Hole, cast))
         }
         "sum" | "max" => {
             if args.len() != 1 {
@@ -123,9 +131,14 @@ pub(super) fn lower_call(
             // argument variable into the named parameter — the route by which a
             // `MutWrite` to a `Mut` parameter lands on the caller's mutable variable.
             if ctx.is_mut_param_fn(name) {
-                let mut acc = Expr::var(name.to_string());
+                // The callee `Var` images the function name the user wrote;
+                // the intermediate curried `Apply`s are manufactured (the
+                // outermost `Apply` is the call's image, tagged by `lower_expr`,
+                // whose entry overwrites the interim machinery tag).
+                let mut acc = ctx.tag_image(Expr::var(name.to_string()), func.span);
                 for arg in args {
-                    acc = Expr::apply(lower_call_arg(arg, ctx)?, acc);
+                    let applied = Expr::apply(lower_call_arg(arg, ctx)?, acc);
+                    acc = ctx.tag_machinery(applied, func.span, "lower.curried_call");
                 }
                 return Ok(acc);
             }
@@ -136,7 +149,8 @@ pub(super) fn lower_call(
             // bypasses the gate.)
             if args.len() == 1 {
                 let arg = lower_expr(&args[0], ctx)?;
-                return Ok(Expr::apply(arg, Expr::var(name.to_string())));
+                let callee = ctx.tag_image(Expr::var(name.to_string()), func.span);
+                return Ok(Expr::apply(arg, callee));
             }
             // Multi-arg call: tuple the arguments and apply once,
             // `f(a, b, ...)` → `Apply(Tuple([a, b, ...]), f)`. This pairs with
@@ -145,8 +159,12 @@ pub(super) fn lower_call(
             // combinator appearing in the tree. Arguments lower through the gated
             // `lower_expr` for the same reason as the single-arg case.
             let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
-            let arg_tuple = Expr::tuple(tupled?);
-            Ok(Expr::apply(arg_tuple, Expr::var(name.to_string())))
+            // The tuple is manufactured packing (there is no tuple in the
+            // source call); the callee `Var` images the function name.
+            let args_span = args[0].span.join(args[args.len() - 1].span);
+            let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
+            let callee = ctx.tag_image(Expr::var(name.to_string()), func.span);
+            Ok(Expr::apply(arg_tuple, callee))
         }
     }
 }
@@ -166,7 +184,7 @@ fn lower_call_arg(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if let ChlExpr::Name(id) = &arg.node {
-        Ok(Expr::var(id.as_str().to_string()))
+        Ok(ctx.tag_image(Expr::var(id.as_str().to_string()), arg.span))
     } else {
         lower_expr(arg, ctx)
     }
@@ -217,14 +235,22 @@ fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
 
 /// Lower an augmented assignment `name op= value` to the equivalent
 /// `name op value` binary operation. The caller has already extracted the
-/// target name via [`extract_name_target`].
+/// target name via [`extract_name_target`] and passes the statement's span as
+/// `stmt_span` — the manufactured read (`Var(name)`) and arithmetic (`BinOp`)
+/// implied by `op=` have no expression of their own in the source, so they
+/// carry the statement span as machinery.
 pub(super) fn lower_aug_binop(
     target_name: &str,
     op: AugOp,
     value: &Spanned<ChlExpr>,
+    stmt_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let left_expr = Expr::var(target_name.to_string());
+    let left_expr = ctx.tag_machinery(
+        Expr::var(target_name.to_string()),
+        stmt_span,
+        "lower.aug_binop",
+    );
     let right_expr = lower_expr(value, ctx)?;
     let kind = match op {
         AugOp::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -232,7 +258,11 @@ pub(super) fn lower_aug_binop(
         AugOp::Mul => BinOpKind::Arithmetic(ArithmeticKind::Mul),
         AugOp::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
     };
-    Ok(Expr::binop(left_expr, kind, right_expr))
+    Ok(ctx.tag_machinery(
+        Expr::binop(left_expr, kind, right_expr),
+        stmt_span,
+        "lower.aug_binop",
+    ))
 }
 
 pub(super) fn lower_feed(
@@ -307,12 +337,20 @@ pub(super) fn lower_compare(
     // Lower all operands up-front. For a chain of n ops there are n+1 operands:
     // left, comparators[0], comparators[1], …
     let mut operands: Vec<Expr> = Vec::with_capacity(comparators.len() + 1);
+    let mut operand_spans: Vec<Span> = Vec::with_capacity(comparators.len() + 1);
     operands.push(lower_expr(left, ctx)?);
+    operand_spans.push(left.span);
     for comp in comparators {
         operands.push(lower_expr(comp, ctx)?);
+        operand_spans.push(comp.span);
     }
 
-    // Build one BinOp per (op, adjacent-operand-pair).
+    // Build one BinOp per (op, adjacent-operand-pair). Each middle operand is
+    // shared by two pairs; a bare clone would put the same NodeIds in the tree
+    // twice. Keep-first: an operand's first tree use keeps its original ids
+    // (operand i+1 first appears as pair i's RIGHT side), and its second use
+    // (as pair i+1's LEFT side) is a deep-freshened copy whose folded
+    // attributions mirror the original's.
     let mut comparisons: Vec<Expr> = Vec::with_capacity(ops.len());
     for (i, op) in ops.iter().enumerate() {
         let kind = match op {
@@ -323,20 +361,46 @@ pub(super) fn lower_compare(
             CmpOp::Gt => CompareKind::Greater,
             CmpOp::GtE => CompareKind::GreaterOrEq,
         };
-        // Clone the shared middle operand so both adjacent pairs can own it.
-        comparisons.push(Expr::binop(
-            operands[i].clone(),
-            BinOpKind::Compare(kind),
-            operands[i + 1].clone(),
-        ));
+        let lhs = if i == 0 {
+            // Operand 0's only use.
+            operands[0].clone()
+        } else {
+            // Operand i's second use (its first was pair i-1's right side). A
+            // bare clone would share NodeIds; freshen a copy inside a lowering
+            // copy-frame so each re-minted node lands as a `Copy` LoweringStep
+            // mirroring the original operand's (Source) image — exactly the
+            // attribution wanted for the duplicated operand.
+            use crate::ccl::lineage::copy_frame;
+            let mut copy = operands[i].clone();
+            let _frame = copy_frame("lower.compare_operand");
+            copy.freshen_node_ids_deep();
+            copy
+        };
+        let rhs = operands[i + 1].clone();
+        // Each pair comparison images its `<op>` in the chain, spanning its two
+        // operands. It is *not* `Nature::Source` — a chained comparison is one of
+        // the cost cases of the structural rule (see `tag_source`): only the
+        // whole chain's root is an expression root, so the pair comparisons carry
+        // the `"lower.image"` label at `Nature::Machinery`.
+        let pair_span = operand_spans[i].join(operand_spans[i + 1]);
+        comparisons.push(ctx.tag_image(Expr::binop(lhs, BinOpKind::Compare(kind), rhs), pair_span));
     }
 
     // Single comparison: return it directly.
     // Chained comparisons: fold with logical AND. CHL's chained-comparison
-    // semantics match Python's (`a < b < c` ≡ `a < b and b < c`).
+    // semantics match Python's (`a < b < c` ≡ `a < b and b < c`). The AND glue
+    // is manufactured — the user wrote no `and` (the outermost glue node is
+    // the whole compare expression's image, re-tagged by `lower_expr`).
+    let chain_span = operand_spans[0].join(operand_spans[operand_spans.len() - 1]);
     Ok(comparisons
         .into_iter()
-        .reduce(|acc, cmp| Expr::binop(acc, BinOpKind::BoolLogic(LogicKind::And), cmp))
+        .reduce(|acc, cmp| {
+            ctx.tag_machinery(
+                Expr::binop(acc, BinOpKind::BoolLogic(LogicKind::And), cmp),
+                chain_span,
+                "lower.compare_chain",
+            )
+        })
         .expect("ops is non-empty"))
 }
 
@@ -361,10 +425,14 @@ pub(super) fn lower_boolop(
         BoolOp::And => BinOpKind::BoolLogic(LogicKind::And),
         BoolOp::Or => BinOpKind::BoolLogic(LogicKind::Or),
     };
-    // Fold left-to-right: `a and b and c` → `(a and b) and c`.
+    // Fold left-to-right: `a and b and c` → `(a and b) and c`. Each folded
+    // BinOp images (a prefix of) the operator chain the user wrote, so the
+    // intermediates are direct images at the whole expression's span (the
+    // outermost is re-tagged identically by `lower_expr`).
     let mut acc = lower_expr(&operands[0], ctx)?;
     for value in &operands[1..] {
-        acc = Expr::binop(acc, kind, lower_expr(value, ctx)?);
+        let rhs = lower_expr(value, ctx)?;
+        acc = ctx.tag_image(Expr::binop(acc, kind, rhs), bool_span);
     }
     Ok(acc)
 }
@@ -436,6 +504,40 @@ mod tests {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
+    }
+
+    /// Regression: a chained comparison shares each middle operand between two
+    /// adjacent pairs. A bare clone would put the same `NodeId`s in the tree
+    /// twice, tripping `assert_unique_node_ids` at the `"post-lowering"`
+    /// boundary. The second use is freshened inside a lowering copy-frame; the tree must be
+    /// duplicate-free, and the lowering fold must explain every node with no leak
+    /// (the freshened copy resolves as a `Copy` mirroring its origin's image).
+    #[test]
+    fn chained_compare_freshens_shared_operands() {
+        use crate::ccl::context::{assert_unique_node_ids, collect_tree_ids};
+        use crate::ccl::lineage::{RecorderSession, collapse_lowering};
+
+        let expr = parse_expr("1 < x < 3");
+        let mut ctx = LoweringContext::default();
+        let session = RecorderSession::lowering();
+        let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
+        let log = session.into_lowering_log();
+
+        // The same tripwire the pipeline runs at every pass boundary — this test
+        // is the crafted program for the class it guards.
+        assert_unique_node_ids(&ccl, "chained-compare lowering");
+        let seen = collect_tree_ids(&ccl);
+        // The lowering fold explains every tree node (the freshened
+        // middle-operand copy included) with no leak — the successor to the
+        // retired per-node coverage check.
+        let (projection, leaks) = collapse_lowering(&log, &seen);
+        assert!(leaks.is_empty(), "lowering fold is leak-free: {leaks:?}");
+        for id in &seen {
+            assert!(
+                projection.contains_key(id),
+                "tree node {id:?} missing from the folded lowering projection"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

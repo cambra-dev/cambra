@@ -455,6 +455,7 @@ fn try_pairwise_in_compose(
         node: TypedExprNode::Compose(mut elts),
         ty,
         user_annotation,
+        ..
     } = take(expr)
     else {
         unreachable!()
@@ -990,6 +991,7 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
         node: TypedExprNode::Compose(elts),
         ty,
         user_annotation,
+        ..
     } = take(expr)
     else {
         unreachable!()

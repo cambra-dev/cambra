@@ -78,7 +78,10 @@ use std::{
 };
 
 use crate::{
-    ccl::{Branch, Expr, Lit, TypedExprNode},
+    ccl::{
+        Branch, Expr, Lit, TypedExprNode,
+        lineage::{Nature, RewriteLabel},
+    },
     chl_parser::ast::{
         Expr as ChlExpr, Lit as ChlLit, RecordField, Span, Spanned, Stmt as ChlStmt,
     },
@@ -367,6 +370,108 @@ impl LoweringContext {
         std::mem::take(&mut self.sink_bindings)
     }
 
+    /// Record `expr` as a source construct's image — a single-node leaf
+    /// [`LoweringStep`](crate::ccl::lineage::LoweringStep) (`"lower.image"`,
+    /// anchored at `span`) appended to the always-on lowering log — and return it,
+    /// for chaining at construction sites.
+    ///
+    /// # The rule for `Nature::Source`
+    ///
+    /// **`Source` ⟺ the node is the root of a lowered [`Spanned<ChlExpr>`].**
+    ///
+    /// It is a *positional* fact, so it is decided in exactly one place — the
+    /// [`lower_expr`] wrapper, which re-tags every lowered expression's root
+    /// (last tag wins, via the fold's re-image path). No arm calls this; an arm
+    /// records its own nodes with [`tag_image`](Self::tag_image) for a node that
+    /// images source text and [`tag_machinery`](Self::tag_machinery) for
+    /// manufactured plumbing, and whichever of them ends up at the root is
+    /// re-tagged here.
+    ///
+    /// The rule is deliberately structural rather than semantic, and the cost is
+    /// real: nodes that *are* one-to-one images of something the user wrote but
+    /// are not an expression root do not get `Source`. That includes a call's
+    /// callee `Var`, each comparison of a chained `a < b < c`, the projection node
+    /// of `x[i]` / `x.attr`, and every statement-level image (a `Let` for an
+    /// assignment, a `MutWrite` for `x := e`) — statements are not
+    /// `Spanned<ChlExpr>`s, so a statement has no `Source` node at all. The
+    /// converse also holds: a comprehension's root is a `Cast` wrapper the user
+    /// never wrote, and under this rule it *is* `Source`.
+    ///
+    /// That information is not lost, only moved: every such node carries the
+    /// `"lower.image"` label, which is the datum consumers read (see
+    /// [`tag_machinery`](Self::tag_machinery) on nature being a coarse
+    /// projection). A label-keyed remap can recover a finer taxonomy if one earns
+    /// a consumer; the structural rule is what makes "is this `Source`?" answerable
+    /// without reading the fold.
+    ///
+    /// A no-op when no lowering session is installed (the `lower` submodules' unit
+    /// tests, which only inspect the tree shape).
+    pub(super) fn tag_source(&mut self, expr: Expr, span: Span) -> Expr {
+        crate::ccl::lineage::lowering_leaf(expr.node_id(), span, Nature::Source, "lower.image");
+        expr
+    }
+
+    /// Record `expr` as an **image of source text** at `span` — a node that is a
+    /// one-to-one translation of something the user wrote, but is not the root of
+    /// a lowered expression and so is not `Nature::Source` under the rule on
+    /// [`tag_source`](Self::tag_source).
+    ///
+    /// It carries the same `"lower.image"` label as a root image, so the two are
+    /// distinguishable from plumbing ([`tag_machinery`](Self::tag_machinery)'s
+    /// per-rule labels) even though both are `Nature::Machinery`.
+    ///
+    /// # `label` is per-rule judgment, and carries no cross-site guarantee
+    ///
+    /// Unlike `Nature::Source`, which is structural and decidable (see
+    /// [`tag_source`](Self::tag_source)), the choice between this and
+    /// `tag_machinery` is **the lowering author's judgment about their own rule**.
+    /// There is no rule to apply, and the codebase does not agree with itself: the
+    /// same node kind at the same span role is tagged both ways — an `ExprStmt` at
+    /// a statement's span is `"lower.image"` at five sites and
+    /// `"lower.stmt_seq"` at nine.
+    ///
+    /// So the guarantee is deliberately weak, and stating it is the point:
+    /// **`"lower.image"` means "the rule that minted this node considered it an
+    /// image", nothing more.** No consumer may treat it as a cross-site
+    /// classification — not "every image has a 1:1 source construct", not "a
+    /// non-image is machinery". A consumer that needs one of those needs a datum
+    /// that guarantees it, and none exists yet.
+    ///
+    /// The whole nature/label taxonomy is **provisional**. It has no consumer that
+    /// branches on it today, which is exactly why it has drifted; expect it to
+    /// move — most likely to collapse or be recomputed by a label-keyed remap —
+    /// once real consumption tells us what distinction is actually load-bearing.
+    /// Do not build on the current shape.
+    pub(super) fn tag_image(&mut self, expr: Expr, span: Span) -> Expr {
+        crate::ccl::lineage::lowering_leaf(expr.node_id(), span, Nature::Machinery, "lower.image");
+        expr
+    }
+
+    /// Record `expr` as **manufactured by lowering** — a single-node leaf
+    /// [`LoweringStep`](crate::ccl::lineage::LoweringStep) (`Nature::Machinery`,
+    /// `label`, anchored at `span`) appended to the always-on lowering log — and
+    /// return it, for chaining at construction sites. The dual of
+    /// [`tag_image`](Self::tag_image): a node lowering *manufactured* — encoding
+    /// plumbing and faithful expansions alike — rather than one that translates
+    /// something the user wrote. `span` is the nearest real source span (the
+    /// enclosing statement for statement-level mints, the expression otherwise),
+    /// never a fabricated empty one.
+    ///
+    /// All manufactured nodes get the uniform `Nature::Machinery`: no consumer
+    /// behaves differently on the expansion-vs-plumbing bit today, and the
+    /// per-site `label` (one label per lowering rule, `lower.<rule>`) is the
+    /// primary datum — nature is a coarse projection that a label-keyed remap
+    /// can recompute later if a finer taxonomy ever earns a consumer.
+    ///
+    /// Nature alone therefore does **not** separate manufactured from imaged: an
+    /// image that is not an expression root is `Machinery` too (see
+    /// [`tag_source`](Self::tag_source) for the rule). The `label` is what
+    /// distinguishes them — `"lower.image"` versus a `lower.<rule>` name.
+    pub(super) fn tag_machinery(&mut self, expr: Expr, span: Span, label: RewriteLabel) -> Expr {
+        crate::ccl::lineage::lowering_leaf(expr.node_id(), span, Nature::Machinery, label);
+        expr
+    }
+
     /// Mint a fresh `{prefix}_{id}` name from the monotonic synthetic-id
     /// counter, bumping it so every minted name is distinct within a lowering.
     /// The `fresh_*` methods below wrap this, each fixing its own `prefix`.
@@ -513,8 +618,33 @@ pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Lower a single CHL expression to a CCL expression.
+/// Lower a single CHL expression to a CCL expression, tagging the root of the
+/// lowered subtree with the source span it came from.
+///
+/// The recursion proper lives in [`lower_expr_inner`]; this thin wrapper is the
+/// **sole** emitter of `Nature::Source`, and so the one place the rule is applied:
+/// `Source` ⟺ the node is the root of a lowered `Spanned<ChlExpr>`. It re-tags the
+/// returned node via [`LoweringContext::tag_source`], overwriting any interim tag
+/// an arm put on its own root (last tag wins, through the fold's re-image path).
+/// The rule is positional, so no lowering arm ever decides it — see
+/// [`LoweringContext::tag_source`] for the rule and its costs.
+///
+/// Interior nodes an arm builds are each tagged at their mint site with
+/// [`LoweringContext::tag_image`] for a node that images source text or
+/// [`LoweringContext::tag_machinery`] for manufactured plumbing. **That choice is
+/// per-rule judgment, not a rule** — `tag_image`'s docs state what it does and
+/// does not guarantee. Whichever of them lands at the root is re-tagged here.
+/// [`collapse_lowering`](crate::ccl::lineage::collapse_lowering)'s leak taxonomy
+/// enforces full coverage of the lowered tree either way.
 pub fn lower_expr(
+    expr: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let lowered = lower_expr_inner(expr, ctx)?;
+    Ok(ctx.tag_source(lowered, expr.span))
+}
+
+fn lower_expr_inner(
     expr: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
@@ -563,7 +693,10 @@ pub fn lower_expr(
                 let idx: usize = (*n).try_into().map_err(|_| {
                     LoweringError::unsupported(index.span, "tuple index must be non-negative")
                 })?;
-                Ok(Expr::apply(lower_expr(target, ctx)?, Expr::proj_index(idx)))
+                // The `Proj` images the index token the user wrote.
+                let target_expr = lower_expr(target, ctx)?;
+                let proj = ctx.tag_image(Expr::proj_index(idx), index.span);
+                Ok(Expr::apply(target_expr, proj))
             }
             _ => Err(LoweringError::unsupported(
                 index.span,
@@ -607,11 +740,13 @@ pub fn lower_expr(
             "`{…}` is type syntax (a record type `{name: T}`); \
              a record value is written `(name=value)`",
         )),
-        // Attribute access `r.field` → `Apply(r, Proj(Field("field")))`.
-        ChlExpr::Attribute { target, attr, .. } => Ok(Expr::apply(
-            lower_expr(target, ctx)?,
-            Expr::proj_field(attr.as_str()),
-        )),
+        // Attribute access `r.field` → `Apply(r, Proj(Field("field")))`. The
+        // `Proj` images the `.field` access the user wrote.
+        ChlExpr::Attribute { target, attr, .. } => {
+            let target_expr = lower_expr(target, ctx)?;
+            let proj = ctx.tag_image(Expr::proj_field(attr.as_str()), expr.span);
+            Ok(Expr::apply(target_expr, proj))
+        }
         ChlExpr::Lambda { params, body } => lower_lambda(expr.span, params, body, ctx),
         ChlExpr::UnaryOp { op, operand } => lower_unaryop(*op, operand, ctx),
         // Ternary `then_expr if cond else else_expr` → Case { [guard → value, true → orelse] }
@@ -623,6 +758,10 @@ pub fn lower_expr(
             let guard = lower_expr(cond, ctx)?;
             let true_arm = lower_expr(then_expr, ctx)?;
             let false_arm = lower_expr(else_expr, ctx)?;
+            // The ternary has no written else-guard; its always-true guard is
+            // manufactured encoding.
+            let else_guard =
+                ctx.tag_machinery(Expr::lit(Lit::Bool(true)), expr.span, "lower.ternary_else");
             Ok(Expr::new(TypedExprNode::Case {
                 scrutinee: None,
                 branches: vec![
@@ -633,7 +772,7 @@ pub fn lower_expr(
                     },
                     Branch {
                         pattern: None,
-                        guard: Expr::lit(Lit::Bool(true)),
+                        guard: else_guard,
                         body: false_arm,
                     },
                 ],

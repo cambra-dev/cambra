@@ -831,6 +831,7 @@ fn strip(
             node,
             ty,
             user_annotation,
+            node_id,
         } = expr;
         let TypedExprNode::For { target, iter, body } = node else {
             unreachable!("guarded above")
@@ -856,6 +857,7 @@ fn strip(
             },
             ty,
             user_annotation,
+            node_id,
         };
     }
     let mut expr = expr;
@@ -871,6 +873,7 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
     match block.node {
         TypedExprNode::Lit(Lit::Unit) => rest,
         TypedExprNode::ExprStmt { expr, body } => {
+            let node_id = block.node_id;
             let body = splice_block(*body, rest);
             let ty = body.ty.clone();
             Expr {
@@ -880,6 +883,7 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
                 },
                 ty,
                 user_annotation: None,
+                node_id,
             }
         }
         TypedExprNode::Let {
@@ -887,6 +891,7 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
             bound_expr,
             body,
         } => {
+            let node_id = block.node_id;
             let body = splice_block(*body, rest);
             let ty = body.ty.clone();
             Expr {
@@ -897,24 +902,26 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
                 },
                 ty,
                 user_annotation: None,
+                node_id,
             }
         }
         // A read-only block is a `Let`/`ExprStmt`(feed) chain ending in `Unit`;
         // any other terminal is unexpected — sequence it defensively before rest.
         other => {
             let ty = rest.ty.clone();
-            Expr {
-                node: TypedExprNode::ExprStmt {
-                    expr: Box::new(Expr {
-                        node: other,
-                        ty: block.ty,
-                        user_annotation: block.user_annotation,
-                    }),
-                    body: Box::new(rest),
-                },
-                ty,
-                user_annotation: None,
-            }
+            // A freshly-synthesized defensive sequencing wrapper.
+            Expr::new(TypedExprNode::ExprStmt {
+                expr: Box::new(Expr {
+                    node: other,
+                    ty: block.ty,
+                    user_annotation: block.user_annotation,
+                    // TODO(preserve): hand-rolled preserve — fold into
+                    // `Expr::preserve`.
+                    node_id: block.node_id,
+                }),
+                body: Box::new(rest),
+            })
+            .with_ty(ty)
         }
     }
 }
@@ -940,6 +947,7 @@ fn partition_spine(expr: Expr, txn_registers: &HashSet<Name>, lifted: &mut Vec<E
         node,
         ty,
         user_annotation,
+        node_id,
     } = expr;
     match node {
         TypedExprNode::ExprStmt { expr: effect, body } if matches!(&effect.node, TypedExprNode::MutWrite { name, .. } if !txn_registers.contains(name)) =>
@@ -956,6 +964,7 @@ fn partition_spine(expr: Expr, txn_registers: &HashSet<Name>, lifted: &mut Vec<E
                 },
                 ty,
                 user_annotation,
+                node_id,
             }
         }
         TypedExprNode::Let {
@@ -972,12 +981,14 @@ fn partition_spine(expr: Expr, txn_registers: &HashSet<Name>, lifted: &mut Vec<E
                 },
                 ty,
                 user_annotation,
+                node_id,
             }
         }
         node => Expr {
             node,
             ty,
             user_annotation,
+            node_id,
         },
     }
 }
@@ -987,14 +998,11 @@ fn partition_spine(expr: Expr, txn_registers: &HashSet<Name>, lifted: &mut Vec<E
 fn prepend_effects(effects: Vec<Expr>, rest: Expr) -> Expr {
     effects.into_iter().rev().fold(rest, |rest, effect| {
         let ty = rest.ty.clone();
-        Expr {
-            node: TypedExprNode::ExprStmt {
-                expr: Box::new(effect),
-                body: Box::new(rest),
-            },
-            ty,
-            user_annotation: None,
-        }
+        Expr::new(TypedExprNode::ExprStmt {
+            expr: Box::new(effect),
+            body: Box::new(rest),
+        })
+        .with_ty(ty)
     })
 }
 
@@ -1618,15 +1626,12 @@ fn binding(name: Name, ty: Type) -> TypedBinding {
 /// `let name : name_ty = def in body`, typed as `body`.
 fn let_typed(name: Name, name_ty: Type, def: Expr, body: Expr) -> Expr {
     let ty = body.ty.clone();
-    Expr {
-        node: TypedExprNode::Let {
-            binding: binding(name, name_ty),
-            bound_expr: Box::new(def),
-            body: Box::new(body),
-        },
-        ty,
-        user_annotation: None,
-    }
+    Expr::new(TypedExprNode::Let {
+        binding: binding(name, name_ty),
+        bound_expr: Box::new(def),
+        body: Box::new(body),
+    })
+    .with_ty(ty)
 }
 
 /// `arg ▷ func : ty`.
@@ -2079,6 +2084,7 @@ fn rebind_letrec(
         node,
         ty,
         user_annotation,
+        node_id,
     } = expr;
     match node {
         TypedExprNode::Let {
@@ -2106,6 +2112,7 @@ fn rebind_letrec(
                     },
                     ty,
                     user_annotation,
+                    node_id,
                 }
             }
         }
@@ -2115,6 +2122,7 @@ fn rebind_letrec(
                 node: other,
                 ty,
                 user_annotation,
+                node_id,
             },
             key_names,
             hist,
@@ -2169,14 +2177,11 @@ fn splice_letrec(
         .collect();
     let body = hoist_feeds(inner, feed_views);
     let ty = body.ty.clone();
-    let txn_letrec = Expr {
-        node: TypedExprNode::LetRec {
-            bindings,
-            body: Box::new(body),
-        },
-        ty,
-        user_annotation: None,
-    };
+    let txn_letrec = Expr::new(TypedExprNode::LetRec {
+        bindings,
+        body: Box::new(body),
+    })
+    .with_ty(ty);
     wrap_cross_domain(txn_letrec, cross)
 }
 
@@ -2195,14 +2200,11 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
     inner = hoist_feeds(inner, cross.feeds);
     for (b, def) in cross.bindings.into_iter().rev() {
         let ty = inner.ty.clone();
-        inner = Expr {
-            node: TypedExprNode::LetRec {
-                bindings: vec![(b, def)],
-                body: Box::new(inner),
-            },
-            ty,
-            user_annotation: None,
-        };
+        inner = Expr::new(TypedExprNode::LetRec {
+            bindings: vec![(b, def)],
+            body: Box::new(inner),
+        })
+        .with_ty(ty);
     }
     inner
 }

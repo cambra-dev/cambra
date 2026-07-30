@@ -99,10 +99,17 @@ pub(super) fn lower_standalone_transaction(
     // item is never read (the block reads only stores). The `Begin` sits as an
     // `ExprStmt` effect on the (singleton) loop body — the same shape a
     // per-iteration transaction has, so `transact_phase::strip` handles both.
-    let source = Expr::list(vec![Expr::lit(Lit::Unit)]);
-    let body = Expr::expr_stmt(Expr::begin(block), Expr::lit(Lit::Unit));
-    let for_node = for_over(iter_var, source, body);
-    Ok(Expr::expr_stmt(for_node, continuation))
+    // The whole singleton-loop scaffolding is manufactured encoding; only the
+    // `Begin` images the `with begin():` the user wrote.
+    let ts = "lower.txn_singleton";
+    let span = with_stmt.span;
+    let unit_item = ctx.tag_machinery(Expr::lit(Lit::Unit), span, ts);
+    let source = ctx.tag_machinery(Expr::list(vec![unit_item]), span, ts);
+    let begin = ctx.tag_image(Expr::begin(block), span);
+    let body_unit = ctx.tag_machinery(Expr::lit(Lit::Unit), span, ts);
+    let body = ctx.tag_machinery(Expr::expr_stmt(begin, body_unit), span, ts);
+    let for_node = ctx.tag_machinery(for_over(iter_var, source, body), span, ts);
+    Ok(ctx.tag_machinery(Expr::expr_stmt(for_node, continuation), span, ts))
 }
 
 /// `For { target: <iter_var> (untyped), iter: <source>, body: <block> }`.
@@ -133,7 +140,7 @@ fn lower_tx_block(
         ));
     }
     ctx.in_tx_body = true;
-    let result = lower_tx_block_inner(stmts, ctx);
+    let result = lower_tx_block_inner(stmts, span, ctx);
     ctx.in_tx_body = false;
     let block = result?;
     // A transaction must *do* something observable: either write a transactional
@@ -169,8 +176,12 @@ fn contains_feed(e: &Expr) -> bool {
 /// transactional registers become `MutWrite` markers (reads stay bare `Var`
 /// snapshots); `if cond:` guards become `Case` (the no-else deny branch); other
 /// assignments are per-iteration `Let`s.
+///
+/// `fallback_span` anchors the manufactured chain terminal when the statement
+/// list is empty (the block's own statement spans win when present).
 fn lower_tx_block_inner(
     stmts: &[Spanned<ChlStmt>],
+    fallback_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // A bare `if cond:` is a *deny guard for the whole transaction*: its
@@ -198,7 +209,13 @@ fn lower_tx_block_inner(
              transactions",
         ));
     }
-    let mut chain = Expr::lit(Lit::Unit);
+    // The chain terminal is manufactured sequencing (spanned to the block's
+    // statements — the `with` construct when the block is empty).
+    let block_span = match (stmts.first(), stmts.last()) {
+        (Some(first), Some(last)) => first.span.join(last.span),
+        _ => fallback_span,
+    };
+    let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), block_span, "lower.txn_unit");
     for stmt in stmts.iter().rev() {
         chain = match &stmt.node {
             // `balance := value` — the transactional register write. `:=` is the
@@ -207,13 +224,13 @@ fn lower_tx_block_inner(
             ChlStmt::MutAssign { target, value, .. } => {
                 let name = extract_name_target(target, "mutable assignment")?;
                 let val = lower_expr(value, ctx)?;
-                write_or_let(name, val, chain, ctx)?
+                write_or_let(name, val, chain, stmt.span, ctx)?
             }
             // `balance += value` — the compound-write shorthand, likewise a write.
             ChlStmt::AugAssign { target, op, value } => {
                 let name = extract_name_target(target, "augmented assignment")?;
-                let val = lower_aug_binop(&name, *op, value, ctx)?;
-                write_or_let(name, val, chain, ctx)?
+                let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
+                write_or_let(name, val, chain, stmt.span, ctx)?
             }
             // `x = value` — a plain immutable binding: a per-transaction local
             // `let`. `=` never writes a register; a plain `=` to a register would be
@@ -231,7 +248,7 @@ fn lower_tx_block_inner(
                     ));
                 }
                 let val = lower_expr(value, ctx)?;
-                Expr::let_bind(name, val, chain)
+                ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
             }
             // `if cond: <writes>` — a conditional (deny) write. The no-else
             // branch is the deny: `commit = false` for the whole transaction.
@@ -240,7 +257,7 @@ fn lower_tx_block_inner(
                 else_body,
             } => {
                 let case = lower_tx_if(branches, else_body.as_deref(), ctx)?;
-                Expr::expr_stmt(case, chain)
+                ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
             // `out << e` inside the block — a per-commit feed. Its value reads
             // the read-your-writes snapshot at this point (a bare register read
@@ -251,7 +268,7 @@ fn lower_tx_block_inner(
             // phase's in-loop feeds (see `src/ccl/mut_elim.rs`).
             ChlStmt::Expr(value) if matches!(&value.node, ChlExpr::Feed { .. }) => {
                 let feed = lower_expr(value, ctx)?;
-                Expr::expr_stmt(feed, chain)
+                ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
             }
             ChlStmt::With { .. } => {
                 return Err(LoweringError::unsupported(
@@ -283,12 +300,14 @@ fn write_or_let(
     name: String,
     val: Expr,
     chain: Expr,
-    ctx: &LoweringContext,
+    stmt_span: Span,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if ctx.is_shadowed(&name) {
-        return Ok(Expr::let_bind(name, val, chain));
+        return Ok(ctx.tag_image(Expr::let_bind(name, val, chain), stmt_span));
     }
-    Ok(Expr::expr_stmt(Expr::mut_write(name, val), chain))
+    let write = ctx.tag_image(Expr::mut_write(name, val), stmt_span);
+    Ok(ctx.tag_image(Expr::expr_stmt(write, chain), stmt_span))
 }
 
 /// Lower an `if`/`elif`/`else` guard inside a transaction to a `Case`. A bare
@@ -323,24 +342,31 @@ fn lower_tx_if(
     let mut out_branches = Vec::with_capacity(branches.len() + 1);
     for branch in branches {
         let guard = lower_expr(&branch.cond, ctx)?;
-        let body = lower_tx_block_inner(&branch.body, ctx)?;
+        let body = lower_tx_block_inner(&branch.body, branch.cond.span, ctx)?;
         out_branches.push(Branch {
             pattern: None,
             guard,
             body,
         });
     }
+    // The implicit deny arm (`true → Unit`, "do not commit") is manufactured
+    // encoding of the bare `if cond:` deny idiom; the `Case` itself images
+    // the guard statement.
+    let guard_span = branches[0].cond.span;
     let else_expr = match else_body {
-        Some(stmts) => lower_tx_block_inner(stmts, ctx)?,
-        None => Expr::lit(Lit::Unit),
+        Some(stmts) => lower_tx_block_inner(stmts, guard_span, ctx)?,
+        None => ctx.tag_machinery(Expr::lit(Lit::Unit), guard_span, "lower.txn_deny"),
     };
     out_branches.push(Branch {
         pattern: None,
-        guard: Expr::lit(Lit::Bool(true)),
+        guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), guard_span, "lower.txn_deny"),
         body: else_expr,
     });
-    Ok(Expr::new(TypedExprNode::Case {
-        scrutinee: None,
-        branches: out_branches,
-    }))
+    Ok(ctx.tag_image(
+        Expr::new(TypedExprNode::Case {
+            scrutinee: None,
+            branches: out_branches,
+        }),
+        guard_span,
+    ))
 }

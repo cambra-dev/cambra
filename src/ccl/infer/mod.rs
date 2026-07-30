@@ -294,18 +294,23 @@ pub(crate) fn bool_lit_ty(b: bool) -> Type {
 pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
-) -> Result<Type, Vec<InferError>> {
+) -> Result<Type, Vec<LocatedInferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
-        let pre = InferCtx::new(HashMap::new());
+        let pre = InferCtx::new(HashMap::new(), expr.node_id());
         let translated: HashMap<String, Type> = sources
             .iter()
             .map(|(k, v)| (k.clone(), pre.normalize_annotation(v)))
             .collect();
-        InferCtx::new(translated)
+        // Seed the blame cursor with the root: every error is stamped with the
+        // node whose rule raised it, and the root is the outermost such node.
+        InferCtx::new(translated, expr.node_id())
     };
 
-    // Pass 1: emit constraints.
+    // Pass 1: emit constraints. The high-value variants
+    // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.
+    // Emission is fail-fast, so there is at most one error; it already carries
+    // the node whose rule raised it (`Typing::raise`).
     emit_node(expr, &mut sub_ctx).map_err(|e| vec![e])?;
 
     // Pass 2: resolve each node's inference variables in place into expr.ty,
@@ -318,6 +323,8 @@ pub(crate) fn run(
     // instances and a use-site coalesce *rebuilds* a predicate rather than
     // mutating one shared with the definition — occurrences share no mutable
     // state, so nothing needs to be kept in sync across them.
+    // Each coalesce error arrives blamed on the node whose frame raised it, so
+    // this pass's (potentially several) errors need no post-hoc attribution.
     let errors = coalesce_pass(expr);
     if !errors.is_empty() {
         return Err(errors);
@@ -384,7 +391,8 @@ pub(crate) mod test_helpers {
 
     pub(crate) fn run_inference(expr: &mut Expr) -> Result<Type, Vec<InferError>> {
         let mut ctx = TypeInferenceContext::new();
-        infer(expr, &mut ctx)
+        // These tests assert on error payloads, not blame nodes.
+        infer(expr, &mut ctx).map_err(LocatedInferError::bare)
     }
 
     /// `{Int | __elem > rhs}` — a refinement whose bare predicate compares

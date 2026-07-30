@@ -3,6 +3,7 @@
 //! the [`Branch`] / [`Pattern`] / [`TransactKey`] / [`WriterSite`] support
 //! types.
 
+use crate::ccl::provenance::NodeId;
 use crate::ccl::{AggregateKind, BinOpKind, Builtin, Lit, Name, ProjKey, Type, UnaryOpKind};
 
 /// The `commit` field of a [`WriterSite`] decision record — the boolean
@@ -552,6 +553,48 @@ pub enum TypedExprNode {
     Error,
 }
 
+impl TypedExprNode {
+    /// The variant's name as a stable, allocation-free string — for provenance /
+    /// invariant diagnostics (e.g. the node-id uniqueness tripwire) that name a
+    /// node by kind without dumping its contents. Exhaustive on purpose so a new
+    /// variant forces an entry here.
+    // Consumed by the id-uniqueness tripwires that land with pass adoption.
+    #[allow(dead_code)]
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match self {
+            TypedExprNode::Lit(_) => "Lit",
+            TypedExprNode::Var(_) => "Var",
+            TypedExprNode::Builtin(_) => "Builtin",
+            TypedExprNode::Apply { .. } => "Apply",
+            TypedExprNode::Cast { .. } => "Cast",
+            TypedExprNode::BinOp { .. } => "BinOp",
+            TypedExprNode::UnaryOp { .. } => "UnaryOp",
+            TypedExprNode::Lambda { .. } => "Lambda",
+            TypedExprNode::Aggregate { .. } => "Aggregate",
+            TypedExprNode::Let { .. } => "Let",
+            TypedExprNode::List(_) => "List",
+            TypedExprNode::Case { .. } => "Case",
+            TypedExprNode::VariantCtor { .. } => "VariantCtor",
+            TypedExprNode::Transact { .. } => "Transact",
+            TypedExprNode::LetRec { .. } => "LetRec",
+            TypedExprNode::For { .. } => "For",
+            TypedExprNode::MutWrite { .. } => "MutWrite",
+            TypedExprNode::Tuple(_) => "Tuple",
+            TypedExprNode::Proj(_) => "Proj",
+            TypedExprNode::Record(_) => "Record",
+            TypedExprNode::Source(_) => "Source",
+            TypedExprNode::Compose(_) => "Compose",
+            TypedExprNode::CollectionUnion { .. } => "CollectionUnion",
+            TypedExprNode::ExprStmt { .. } => "ExprStmt",
+            TypedExprNode::Feed { .. } => "Feed",
+            TypedExprNode::Define { .. } => "Define",
+            TypedExprNode::Begin { .. } => "Begin",
+            TypedExprNode::Defer => "Defer",
+            TypedExprNode::Error => "Error",
+        }
+    }
+}
+
 /// A CCL expression with a type slot on every node.
 ///
 /// Every node starts with `ty: Type::Hole`; the inference pass
@@ -561,7 +604,11 @@ pub enum TypedExprNode {
 /// `user_annotation` carries an explicit type annotation written by the user
 /// (e.g. from a Python `cast(T, expr)` or an annotated binding site). The
 /// inference pass checks that the inferred type is compatible with it.
-#[derive(Debug, Clone, PartialEq)]
+/// `PartialEq` is hand-written (see the `impl` below) rather than derived: it
+/// deliberately ignores `node_id`. Provenance is metadata, not part of a node's
+/// value, so two structurally-equal nodes must compare equal even with distinct
+/// ids.
+#[derive(Debug, Clone)]
 pub struct TypedExpr {
     /// The inferred type of this expression.
     ///
@@ -575,10 +622,73 @@ pub struct TypedExpr {
     /// Checked against the inferred type by [`crate::ccl::infer::infer`]; `None` for all
     /// nodes produced by the current lowering pass.
     pub user_annotation: Option<Type>,
+    /// Stable provenance identity for this node, minted fresh at construction
+    /// (see [`crate::ccl::provenance`]). Excluded from [`PartialEq`] because
+    /// provenance is metadata, not part of the node's value.
+    ///
+    /// `Clone` copies `node_id`, so a cloned node *shares* its source's id;
+    /// freshening a clone's id is a deliberate later step, done where it
+    /// matters (monomorphization calls [`freshen_node_id`](Self::freshen_node_id)
+    /// or [`freshen_node_ids_deep`](Self::freshen_node_ids_deep) explicitly).
+    ///
+    /// # What is forbidden is a mint, not a write
+    ///
+    /// `pub(super)` (visible within `crate::ccl`) so a pass can carry the id
+    /// through a field-wise rebuild — see [`preserve`](Self::preserve) on why such
+    /// a rebuild stays a struct literal. That is safe by construction: **a literal
+    /// mints nothing**, so it cannot record a birth for an id no node carries.
+    ///
+    /// The hazard the constructors close is the *phantom birth* — minting an id
+    /// and then overwriting it, so `on_mint` fires for an id that ends up on no
+    /// node. That is now unrepresentable: `with_node_id` is deleted,
+    /// [`freshen_node_id`](Self::freshen_node_id) is fresh-only, and there is no
+    /// `set_node_id(arbitrary)`.
+    ///
+    /// So the thing to grep for is not a write to this field but
+    /// `node_id: NodeId::fresh()` inside a literal — a *mint* that bypasses
+    /// [`new`](Self::new) and therefore `on_mint`, giving a node an identity with
+    /// no recorded birth. That is the exact dual of the phantom, and it is what
+    /// makes the id-preserving literals worth reading carefully.
+    pub(super) node_id: NodeId,
 }
 
 /// Type alias for backward compatibility. `Expr` is now [`TypedExpr`].
 pub type Expr = TypedExpr;
+
+/// Hand-written to **exclude `node_id`** from equality.
+///
+/// `node_id` is provenance metadata, not part of a node's value: two nodes that
+/// are structurally equal as values must compare equal even when they carry
+/// different ids. A derived `PartialEq` would instead make every freshly-minted
+/// node compare unequal, breaking value-comparison in tests and pass logic.
+/// Only `ty`, `node`, and `user_annotation` participate.
+impl PartialEq for TypedExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty
+            && self.node == other.node
+            && self.user_annotation == other.user_annotation
+    }
+}
+
+/// Shared deep-freshen walk over an expression's node-set: re-mints this node's
+/// id (which fires the ambient `on_copy` recorder hook) then descends into its
+/// children. Backs [`TypedExpr::freshen_node_ids_deep`]; the interior variant
+/// calls it per child, skipping the root's own re-mint.
+///
+/// **Type slots are not walked, and that is the rule, not an omission.** A
+/// [`Type`] carries no identity: the only [`NodeId`]s reachable through one are
+/// the [`TypedExpr`]s inside a `Refinement.predicate`, and those are outside the
+/// id domain — `assert_unique_node_ids` excludes predicates deliberately, and the
+/// lineage fold's leak classes and `SourceProjection` both enumerate from
+/// `collect_tree_ids` (the `walk_children` domain), so a predicate-interior id is
+/// carried but never checked. Freshening them was write-only work whose only
+/// observable effect was splitting predicate `Rc` sharing — planning's compile
+/// memo is keyed on `Rc` identity, so each split predicate is compiled once per
+/// copy. See `design/provenance.md`, "The id domain".
+fn freshen_from_expr(e: &mut TypedExpr) {
+    e.freshen_node_id();
+    e.walk_children_mut(freshen_from_expr);
+}
 
 impl TypedExpr {
     /// Construct a new [`TypedExpr`] with a [`Type::Hole`] placeholder and no user annotation.
@@ -586,11 +696,142 @@ impl TypedExpr {
     /// `Hole` is the lowering-phase placeholder. The inference pass converts it to a
     /// registered [`Type::Infer`] variable before type-checking begins.
     pub fn new(node: TypedExprNode) -> Self {
+        let node_id = NodeId::fresh();
+        crate::ccl::lineage::on_mint(node_id);
         TypedExpr {
             node,
             ty: Type::Hole,
             user_annotation: None,
+            node_id,
         }
+    }
+
+    /// Construct a node at an **already-minted** identity: a *preserve*, the dual
+    /// of [`new`](Self::new)'s mint.
+    ///
+    /// A pass that rebuilds a node — reparenting it, renaming a slot, moving it
+    /// along a spine — is producing the same logical node at a new position, so
+    /// its `NodeId` must carry over for its span and lineage to survive as a
+    /// self-edge. Minting and then overwriting the id cannot express that: the
+    /// mint fires [`on_mint`](crate::ccl::lineage::on_mint), so the log records a
+    /// birth for an id that ends up on no node — a claim the fold cannot check,
+    /// because its leak classes enumerate from the tree (see
+    /// `design/provenance.md`, "The collapse"). Entering the id at construction
+    /// makes that unrepresentable rather than merely detectable.
+    ///
+    /// These are the only two ways to build a node, and the recorder sees exactly
+    /// the difference: `new` mints and records a birth, `preserve` does neither.
+    ///
+    /// # Two shapes build a node at an existing id; only one of them is this
+    ///
+    /// **Reaching into another node for its id** — `node_id: src.node_id`, where
+    /// `src` is some *other* node — is this constructor's shape, and the one where
+    /// a stray `node_id: NodeId::fresh()` hides: a preserve and a mint differ by
+    /// one token in otherwise identical five-line literals. Those sites are marked
+    /// `TODO(preserve)` and are greppable; five remain, in `channelize`,
+    /// `mut_elim`, and `transact_phase`.
+    ///
+    /// **A field-wise rebuild** — `let TypedExpr { node, ty, user_annotation,
+    /// node_id } = expr;` then rebuilding with one child swapped — is *not* this
+    /// shape and deliberately stays a struct literal. Nothing is reached for; the
+    /// literal says "the same node, new child" in one expression, and its
+    /// exhaustive field check is load-bearing: omit a field and it fails to
+    /// compile, where `preserve(id, node).with_ty(…)` would silently default `ty`
+    /// to [`Type::Hole`] — a type residue that surfaces, if at all, as a runtime
+    /// assertion far away. Roughly three dozen such rebuilds live in
+    /// `transact_phase`, `inline`, and `channelize`; converting them would trade a
+    /// compile-time guarantee for a runtime one, once per site.
+    pub(crate) fn preserve(node_id: NodeId, node: TypedExprNode) -> Self {
+        TypedExpr {
+            node,
+            ty: Type::Hole,
+            user_annotation: None,
+            node_id,
+        }
+    }
+
+    /// Construct a node that will **never enter a tree** — one built only to be
+    /// rendered, typically inside a panic message or a `debug_assert!` probe.
+    ///
+    /// It carries [`NodeId::PLACEHOLDER`], the reserved throwaway identity, so it
+    /// consumes no id and records no birth: a diagnostic must not perturb the
+    /// lineage log it may be reporting on. `assert_unique_node_ids` backstops that
+    /// a placeholder never reaches a checked tree.
+    pub(crate) fn throwaway(node: TypedExprNode) -> Self {
+        Self::preserve(NodeId::PLACEHOLDER, node)
+    }
+
+    /// The stable provenance id of this node (see [`crate::ccl::provenance`]).
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Move an **already-cloned** node onto `node_id`, consuming and returning it
+    /// — the root-carry step of a compound substitution.
+    ///
+    /// This is the one legitimate write to `node_id` outside a constructor, and it
+    /// is named so it reads as deliberate rather than as a stray assignment. It is
+    /// sound for the same reason a preserving struct literal is: a clone mints
+    /// nothing, so overwriting its root id records no birth and strands none. The
+    /// id it drops is the clone's copied one, which no recorded step ever claimed.
+    ///
+    /// Not a way to *set* an arbitrary id on a freshly-minted node — that is the
+    /// phantom [`preserve`](Self::preserve) exists to prevent. The caller must
+    /// already hold a clone, and `node_id` must be an id some occurrence carries.
+    pub(crate) fn re_root(mut self, node_id: NodeId) -> Self {
+        self.node_id = node_id;
+        self
+    }
+
+    /// Re-mint this node's [`NodeId`], returning `(old, new)`. A cloned subtree
+    /// shares the original's ids; freshening makes them unique again.
+    ///
+    /// Deliberately fresh-only — there is no `set_node_id(arbitrary)`. Ids are
+    /// minted at construction; the one legitimate later mutation is re-minting
+    /// a clone's copied id.
+    pub(crate) fn freshen_node_id(&mut self) -> (NodeId, NodeId) {
+        let old = self.node_id;
+        let new = NodeId::fresh();
+        self.node_id = new;
+        // Every duplication path funnels through here — the direct callers and
+        // `freshen_node_ids_deep`'s per-node walk alike — so a single `on_copy`
+        // hook reports the (old, new) pair to any open lineage step.
+        crate::ccl::lineage::on_copy(old, new);
+        (old, new)
+    }
+
+    /// Deep-freshen every [`NodeId`] in this expression's node-set — the
+    /// `walk_children` domain, which is the whole id domain (type slots carry no
+    /// identity; see [`freshen_from_expr`]). Each re-minted node fires the ambient
+    /// `on_copy` recorder hook (via
+    /// [`freshen_node_id`](Self::freshen_node_id)), so an open lineage step
+    /// captures the copies.
+    ///
+    /// This is the single deep-freshen walk shared by monomorphization's clone
+    /// freshening and the transact/letrec phases' `subst_env` copies. Do not
+    /// hand-roll a second walk over this node-set.
+    ///
+    /// Not to be confused with [`crate::ccl::uniquify`]'s `collect_node_ids`,
+    /// which *is* predicate-inclusive: it is a debug tripwire asserting uniquify
+    /// preserves every id as a **multiset** across its own predicate rebuilds, a
+    /// different property over a deliberately different domain.
+    pub(crate) fn freshen_node_ids_deep(&mut self) {
+        freshen_from_expr(self);
+    }
+
+    /// Deep-freshen the **interior** of this node — every descendant — while
+    /// leaving the node's *own* [`NodeId`] untouched.
+    ///
+    /// This is the root-carry primitive: the
+    /// substitution engine's compound-replacement arm carries the occurrence's
+    /// id onto the replacement *root* (a preserve inheriting the occurrence's
+    /// span/attribution) and freshens only the interior, which lands as ambient
+    /// `Copy`s mirroring the template. Every re-minted interior node fires the
+    /// `on_copy` hook (via [`freshen_node_id`](Self::freshen_node_id)), so an
+    /// open lineage step captures them.
+    pub(crate) fn freshen_interior_node_ids(&mut self) {
+        // The root's own id is preserved; only its children are freshened.
+        self.walk_children_mut(freshen_from_expr);
     }
 
     /// Set the inferred type on this expression, consuming and returning it.
@@ -643,12 +884,36 @@ impl TypedExpr {
         })
     }
 
-    /// Construct an ExprStmt expression.
+    /// Construct an ExprStmt expression — `expr; body`.
+    ///
+    /// The sequencing node's type **is** its body's, by construction: the
+    /// statement's value is whatever the continuation evaluates to. Carrying it
+    /// here holds that invariant in the module that defines the node, so a pass
+    /// rebuilding a spine does not have to re-derive it. During lowering
+    /// `body.ty` is [`Type::Hole`] and the carry is the identity; after inference
+    /// it is the real type.
     pub fn expr_stmt(expr: Self, body: Self) -> Self {
+        let ty = body.ty.clone();
         Self::new(TypedExprNode::ExprStmt {
             expr: Box::new(expr),
             body: Box::new(body),
         })
+        .with_ty(ty)
+    }
+
+    /// [`expr_stmt`](Self::expr_stmt) at a **preserved** identity: the same
+    /// logical statement rebuilt at a new spine position, carrying `node_id`
+    /// rather than minting. See [`preserve`](Self::preserve).
+    pub(crate) fn expr_stmt_preserving(node_id: NodeId, expr: Self, body: Self) -> Self {
+        let ty = body.ty.clone();
+        Self::preserve(
+            node_id,
+            TypedExprNode::ExprStmt {
+                expr: Box::new(expr),
+                body: Box::new(body),
+            },
+        )
+        .with_ty(ty)
     }
 
     /// Construct a feed expression.
@@ -722,6 +987,43 @@ impl TypedExpr {
             bound_expr: Box::new(bound_expr),
             body: Box::new(body),
         })
+    }
+
+    /// `let binding = def in body`, typed as `body` — the pre-built-binding form
+    /// of [`let_bind`](Self::let_bind), for passes that already hold a
+    /// [`TypedBinding`] (a synthesized register, a rebuilt spine slot).
+    ///
+    /// As with [`expr_stmt`](Self::expr_stmt), the node's type is its body's: a
+    /// `let` evaluates to its continuation.
+    pub fn let_in(binding: TypedBinding, def: Self, body: Self) -> Self {
+        let ty = body.ty.clone();
+        Self::new(TypedExprNode::Let {
+            binding,
+            bound_expr: Box::new(def),
+            body: Box::new(body),
+        })
+        .with_ty(ty)
+    }
+
+    /// [`let_in`](Self::let_in) at a **preserved** identity: the same logical
+    /// binding rebuilt at a new spine position, carrying `node_id` rather than
+    /// minting. See [`preserve`](Self::preserve).
+    pub fn let_in_preserving(
+        node_id: NodeId,
+        binding: TypedBinding,
+        def: Self,
+        body: Self,
+    ) -> Self {
+        let ty = body.ty.clone();
+        Self::preserve(
+            node_id,
+            TypedExprNode::Let {
+                binding,
+                bound_expr: Box::new(def),
+                body: Box::new(body),
+            },
+        )
+        .with_ty(ty)
     }
 
     /// Construct an annotated let binding expression.
@@ -896,7 +1198,8 @@ impl TypedExpr {
 // ---------------------------------------------------------------------------
 
 impl TypedExpr {
-    /// Invoke `f` on each direct child [`TypedExpr`] of this node.
+    /// Invoke `f` on each direct child [`TypedExpr`] of this node, in child
+    /// order.
     ///
     /// "Direct child" means an Expr reachable through this node's value fields
     /// — `function`/`argument`, `left`/`right`, `Case` branch guard/body,
@@ -911,7 +1214,20 @@ impl TypedExpr {
     /// shadowing (e.g. stopping at a [`TypedExprNode::Lambda`] whose param
     /// matches a target name) must still handle the binder variants
     /// explicitly rather than relying on this method.
-    pub fn walk_children(&self, mut f: impl FnMut(&TypedExpr)) {
+    ///
+    /// This is the single immutable child-structure definition —
+    /// [`child_exprs`](Self::child_exprs), [`any_child`](Self::any_child),
+    /// [`all_children`](Self::all_children), and
+    /// [`fold_children`](Self::fold_children) all route through it, so they
+    /// cannot drift out of sync — and it allocates nothing, which is why it is
+    /// the form the compile-path walks use.
+    ///
+    /// `f` receives each child borrowed for `&self`'s full lifetime rather than a
+    /// shorter reborrow, so a child borrow may **escape** the closure into an
+    /// enclosing binding. That is what lets a value-returning recursion (a
+    /// find-by-id that yields `Option<&TypedExpr>`) go through this form instead
+    /// of needing the allocating one.
+    pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a TypedExpr)) {
         match &self.node {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -921,53 +1237,45 @@ impl TypedExpr {
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
-                f(function);
-                f(argument);
+                f(function.as_ref());
+                f(argument.as_ref());
             }
-            // Only `value` is an expression child; `target` is a type (its
-            // refinement predicate is reached via type walks, not here).
-            TypedExprNode::Cast { value, .. } => f(value),
+            TypedExprNode::Cast { value, .. } => f(value.as_ref()),
             TypedExprNode::BinOp { left, right, .. } => {
-                f(left);
-                f(right);
+                f(left.as_ref());
+                f(right.as_ref());
             }
-            TypedExprNode::UnaryOp(_, inner) => f(inner),
-            TypedExprNode::Lambda { body, .. } => f(body),
-            TypedExprNode::Aggregate { input, .. } => f(input),
+            TypedExprNode::UnaryOp(_, inner) => f(inner.as_ref()),
+            TypedExprNode::Lambda { body, .. } => f(body.as_ref()),
+            TypedExprNode::Aggregate { input, .. } => f(input.as_ref()),
             TypedExprNode::Let {
                 bound_expr, body, ..
             } => {
-                f(bound_expr);
-                f(body);
+                f(bound_expr.as_ref());
+                f(body.as_ref());
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
-            | TypedExprNode::CollectionUnion(elts) => {
-                for e in elts {
-                    f(e);
-                }
-            }
+            | TypedExprNode::CollectionUnion(elts) => elts.iter().for_each(f),
             TypedExprNode::Case {
                 scrutinee,
                 branches,
             } => {
                 if let Some(s) = scrutinee {
-                    f(s);
+                    f(s.as_ref());
                 }
                 for b in branches {
                     f(&b.guard);
                     f(&b.body);
                 }
             }
-            TypedExprNode::VariantCtor { payload, .. } => f(payload),
-            TypedExprNode::Record(fields) => {
-                for (_, e) in fields {
-                    f(e);
-                }
-            }
+            TypedExprNode::VariantCtor { payload, .. } => f(payload.as_ref()),
+            TypedExprNode::Record(fields) => fields.iter().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child, so the expr-walker
-            // skips it (its type residue is reached via `expr.ty` walks).
+            // skips it (its type residue is reached via `expr.ty` walks). Child
+            // order mirrors `walk_transact`: each key's init, then each writer's
+            // source and body.
             TypedExprNode::Transact { keys, writers, .. } => {
                 for k in keys {
                     f(&k.init);
@@ -981,21 +1289,36 @@ impl TypedExpr {
                 for (_, def) in bindings {
                     f(def);
                 }
-                f(body);
+                f(body.as_ref());
             }
             TypedExprNode::For { iter, body, .. } => {
-                f(iter);
-                f(body);
+                f(iter.as_ref());
+                f(body.as_ref());
             }
             TypedExprNode::ExprStmt { expr, body } => {
-                f(expr);
-                f(body);
+                f(expr.as_ref());
+                f(body.as_ref());
             }
             TypedExprNode::Feed { value, .. }
             | TypedExprNode::Define { value, .. }
-            | TypedExprNode::MutWrite { value, .. } => f(value),
-            TypedExprNode::Begin { body } => f(body),
+            | TypedExprNode::MutWrite { value, .. } => f(value.as_ref()),
+            TypedExprNode::Begin { body } => f(body.as_ref()),
         }
+    }
+
+    /// Collect borrows of the direct child expressions, in
+    /// [`walk_children`](Self::walk_children) order.
+    ///
+    /// Derived from `walk_children`, for the callers that want the children as a
+    /// slice — to index them, enumerate them, or hand them to iterator
+    /// combinators. It heap-allocates once per internal node, so prefer
+    /// `walk_children` anywhere on the compile path; this form is for cold
+    /// consumers (the inspector's snapshot queries).
+    pub fn child_exprs(&self) -> Vec<&TypedExpr> {
+        // Most nodes have ≤ 2 children; the few n-ary variants grow from there.
+        let mut out = Vec::with_capacity(2);
+        self.walk_children(|c| out.push(c));
+        out
     }
 
     /// Return `true` if `f` returns `true` for any direct child Expr.
@@ -1056,15 +1379,25 @@ impl TypedExpr {
         acc.expect("fold_children: walk_children dropped accumulator")
     }
 
-    /// Mutable analog of [`walk_children`](Self::walk_children).
+    /// Mutable analog of [`walk_children`](Self::walk_children): invoke `f` on
+    /// each direct child Expr by mutable reference, in the same child order.
     ///
-    /// Invokes `f` on each direct child Expr by mutable reference, in the same
-    /// order as `walk_children`.  Same caveats apply: does not descend through
-    /// type refinement predicates and does not visit binder name/type fields.
-    /// Pure-mutator passes that need to mutate `Lambda.param.ty`,
-    /// `Let.binding.ty`, or the refinement predicate must handle those
-    /// explicitly before (or after) calling this method.
-    pub fn walk_children_mut(&mut self, mut f: impl FnMut(&mut TypedExpr)) {
+    /// The single mutable child-structure definition —
+    /// [`fold_children_mut`](Self::fold_children_mut),
+    /// [`map_children`](Self::map_children), and
+    /// [`try_map_children`](Self::try_map_children) all route through it, and it
+    /// allocates nothing. The immutable and mutable walkers are necessarily
+    /// separate match arms (Rust's borrow rules forbid one `&`/`&mut`-generic
+    /// body), so these two matches are the irreducible statement of the node's
+    /// child structure, short of a codegen macro; a new child-bearing variant
+    /// must appear in both.
+    ///
+    /// Same caveats as `walk_children`: does not descend through type refinement
+    /// predicates and does not visit binder name/type fields. Pure-mutator passes
+    /// that need to mutate `Lambda.param.ty`, `Let.binding.ty`, or the refinement
+    /// predicate must handle those explicitly before (or after) calling this
+    /// method.
+    pub fn walk_children_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut TypedExpr)) {
         match &mut self.node {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -1074,51 +1407,45 @@ impl TypedExpr {
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
-                f(function);
-                f(argument);
+                f(function.as_mut());
+                f(argument.as_mut());
             }
             // Only `value` is an expression child; `target` is a type (its
             // refinement predicate is reached via type walks, not here).
-            TypedExprNode::Cast { value, .. } => f(value),
+            TypedExprNode::Cast { value, .. } => f(value.as_mut()),
             TypedExprNode::BinOp { left, right, .. } => {
-                f(left);
-                f(right);
+                f(left.as_mut());
+                f(right.as_mut());
             }
-            TypedExprNode::UnaryOp(_, inner) => f(inner),
-            TypedExprNode::Lambda { body, .. } => f(body),
-            TypedExprNode::Aggregate { input, .. } => f(input),
+            TypedExprNode::UnaryOp(_, inner) => f(inner.as_mut()),
+            TypedExprNode::Lambda { body, .. } => f(body.as_mut()),
+            TypedExprNode::Aggregate { input, .. } => f(input.as_mut()),
             TypedExprNode::Let {
                 bound_expr, body, ..
             } => {
-                f(bound_expr);
-                f(body);
+                f(bound_expr.as_mut());
+                f(body.as_mut());
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
-            | TypedExprNode::CollectionUnion(elts) => {
-                for e in elts {
-                    f(e);
-                }
-            }
+            | TypedExprNode::CollectionUnion(elts) => elts.iter_mut().for_each(f),
             TypedExprNode::Case {
                 scrutinee,
                 branches,
             } => {
                 if let Some(s) = scrutinee {
-                    f(s);
+                    f(s.as_mut());
                 }
                 for b in branches {
                     f(&mut b.guard);
                     f(&mut b.body);
                 }
             }
-            TypedExprNode::VariantCtor { payload, .. } => f(payload),
-            TypedExprNode::Record(fields) => {
-                for (_, e) in fields {
-                    f(e);
-                }
-            }
+            TypedExprNode::VariantCtor { payload, .. } => f(payload.as_mut()),
+            TypedExprNode::Record(fields) => fields.iter_mut().for_each(|(_, e)| f(e)),
+            // `domain` is a `Type`, not an `Expr` child (see `walk_children`).
+            // Child order mirrors `walk_transact`.
             TypedExprNode::Transact { keys, writers, .. } => {
                 for k in keys {
                     f(&mut k.init);
@@ -1132,20 +1459,20 @@ impl TypedExpr {
                 for (_, def) in bindings {
                     f(def);
                 }
-                f(body);
+                f(body.as_mut());
             }
             TypedExprNode::For { iter, body, .. } => {
-                f(iter);
-                f(body);
+                f(iter.as_mut());
+                f(body.as_mut());
             }
             TypedExprNode::ExprStmt { expr, body } => {
-                f(expr);
-                f(body);
+                f(expr.as_mut());
+                f(body.as_mut());
             }
             TypedExprNode::Feed { value, .. }
             | TypedExprNode::Define { value, .. }
-            | TypedExprNode::MutWrite { value, .. } => f(value),
-            TypedExprNode::Begin { body } => f(body),
+            | TypedExprNode::MutWrite { value, .. } => f(value.as_mut()),
+            TypedExprNode::Begin { body } => f(body.as_mut()),
         }
     }
 
@@ -1340,7 +1667,18 @@ impl TypedExpr {
 // Implement Default so that we can use std::mem::take out of Exprs.
 impl Default for TypedExpr {
     fn default() -> Self {
-        Self::new(TypedExprNode::Lit(Lit::Int(0)))
+        // Built *literally*, not via `Self::new`: a `mem::take` throwaway must
+        // not fire `on_mint` and pollute an open lineage step. It carries the
+        // reserved `PLACEHOLDER` id (never minted, ignored by `on_mint`) and is
+        // always immediately overwritten, so it never reaches a checked tree.
+        // Every default node shares this id, so two defaults compare equal (as
+        // they already did — `node_id` is excluded from `PartialEq`).
+        TypedExpr {
+            node: TypedExprNode::Lit(Lit::Int(0)),
+            ty: Type::Hole,
+            user_annotation: None,
+            node_id: NodeId::PLACEHOLDER,
+        }
     }
 }
 

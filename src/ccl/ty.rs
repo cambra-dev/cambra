@@ -277,6 +277,17 @@ fn synthetic_payloads(tags: &[(FieldKey, Type)]) -> Option<Vec<Type>> {
     Some(out)
 }
 
+// Wire shape (inspector, feature `serde`): a `Type` serializes as its rendered
+// `Display` string (`"Int"`, `"Int -> Int"`), not structurally — the inspector
+// schema wants the human type rendering, and structural serialization of the
+// type AST would leak internals (`Infer` ids, holes) the client never wants.
+#[cfg(feature = "serde")]
+impl serde::Serialize for Type {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -112,6 +112,31 @@ jobs:
         if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh clippy_release
 
+      - name: Clippy (serde feature)
+        # The `serde` feature is default-OFF, so every pass above compiles zero
+        # serde — including the hand-written `Serialize` impls for the inspector
+        # wire types. Without this step that code is compiled by nobody.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh clippy_serde
+
+      - name: Clippy (lib only)
+        # Every pass above uses `--all-targets`, which unifies the *self*
+        # dev-dependency's `test-helpers` feature into the lib under test — so
+        # they only ever compile the library with that feature ON, and the
+        # feature-off configuration a consumer builds is compiled by nothing.
+        # Resolver 3 keeps the feature out of a plain lib build, so the gap is
+        # silent: ungated code calling a gated item passes everything above and
+        # fails `cargo build --lib`.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh clippy_lib
+
+      - name: Doc
+        # Builds rustdoc with broken intra-doc links denied, which is what makes
+        # a `[`identifier`]` reference in a doc comment a checkable citation
+        # rather than prose that rots silently.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh doc
+
       - name: Test
         # Run even if earlier steps failed so we see all errors in one run.
         # (Steps default to `if: success()`, which skips on prior failure.)

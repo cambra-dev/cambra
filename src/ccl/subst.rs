@@ -55,6 +55,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, is_free};
+use crate::ccl::provenance::NodeId;
 use crate::ccl::{Branch, Name, PredicateId, Type, TypedExpr, TypedExprNode};
 
 /// A term binder name.
@@ -79,11 +80,29 @@ pub enum Mapping {
 
 impl Mapping {
     /// The mapping's replacement as a term (a `Rename` materializes as a bare
-    /// variable reference).
+    /// variable reference). The replacement carries a **new** identity: a fresh
+    /// mint for a `Rename`, the discharged term's own ids for a `Discharge`.
     fn as_expr(&self) -> TypedExpr {
         match self {
             Mapping::Rename(to) => TypedExpr::var(to.clone()),
             Mapping::Discharge(t) => (**t).clone(),
+        }
+    }
+
+    /// [`as_expr`](Self::as_expr) at a **preserved** root identity: the
+    /// replacement root takes `node_id` — the occurrence's own id — so it
+    /// inherits the use-site's span and attribution.
+    ///
+    /// A `Rename` is built directly at `node_id` rather than minted and then
+    /// overwritten: a mint fires `on_mint`, and an id no node ends up carrying is
+    /// a phantom birth in the lineage log. A `Discharge` clones (which mints
+    /// nothing) and re-roots that clone
+    /// ([`re_root`](TypedExpr::re_root)) — the two shapes reach a preserved
+    /// identity by different routes, and neither mints.
+    fn as_expr_preserving(&self, node_id: NodeId) -> TypedExpr {
+        match self {
+            Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone())),
+            Mapping::Discharge(t) => (**t).clone().re_root(node_id),
         }
     }
 }
@@ -497,11 +516,19 @@ impl Subst {
                 return child;
             }
         };
-        TypedExpr {
-            node,
-            ty: self.apply_type(&e.ty),
-            user_annotation: e.user_annotation.as_ref().map(|t| self.apply_type(t)),
-        }
+        // Through `Expr::new`, so the mint is visible to the recorder — a raw
+        // `node_id: NodeId::fresh()` would give the node an identity with no
+        // recorded birth, which reads downstream as a node no step produced.
+        //
+        // TODO(preserve): this mints where the non-binder arm above *clones*
+        // (keeping `e`'s id), so transport-mode substitution changes a
+        // binder-introducing node's identity but not its children's. If the
+        // rebuild should be a preserve, this is `Expr::preserve(e.node_id, node)`
+        // — but that changes id semantics for every dependent-refinement
+        // transport, so it wants its own change.
+        let mut out = TypedExpr::new(node).with_ty(self.apply_type(&e.ty));
+        out.user_annotation = e.user_annotation.as_ref().map(|t| self.apply_type(t));
+        out
     }
 
     /// Rewrite a `Feed`/`Define` handle use (see the `Feed` arm above for
@@ -567,7 +594,27 @@ impl Subst {
         if let TypedExprNode::Var(n) = &e.node
             && let Some(repl) = self.0.get(n)
         {
-            *e = repl.as_expr();
+            // Root-carry: the replacement ROOT is built at the occurrence's own
+            // id — a *preserve*, so the root inherits the occurrence's
+            // span/attribution (the use-site), unique per occurrence by
+            // construction.
+            *e = repl.as_expr_preserving(e.node_id);
+            if !matches!(e.node, TypedExprNode::Var(_)) {
+                // Compound replacement: `as_expr_preserving` bare-`clone()`s the
+                // whole subtree, sharing the source's NodeIds. Freshen only the
+                // INTERIOR (the children) — the root keeps the carried id. Each
+                // interior re-mint fires the ambient `on_copy` lineage hook into
+                // any open step. Type slots are out of the id domain, so the
+                // predicate `Rc`s the clone shares with its source stay shared.
+                //
+                // Freshening the root as well would work, but it re-mints an id
+                // the carry immediately overwrites, so the step records a `Copy`
+                // whose produced id no node ends up holding. The node survives
+                // either way — only its recorded identity would be one the tree
+                // never keeps — so this is about not logging an operation that is
+                // undone a line later, and about spending one fewer id.
+                e.freshen_interior_node_ids();
+            }
             return;
         }
         // *Every* type slot the node carries, not just `ty` and the annotation: a

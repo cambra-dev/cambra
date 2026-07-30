@@ -458,14 +458,11 @@ fn elim_lambda_impl(
                 symbolic(&value)
             );
             let inner_pf = elim_lambdas(ctx, *value)?;
-            let cast_val = TypedExpr {
-                node: TypedExprNode::Cast {
-                    value: Box::new(inner_pf),
-                    target,
-                },
-                ty: body_ty.clone(),
-                user_annotation: None,
-            };
+            let cast_val = Expr::new(TypedExprNode::Cast {
+                value: Box::new(inner_pf),
+                target,
+            })
+            .with_ty(body_ty.clone());
             let result_pi = Type::pi(param, param_ty.clone(), body_ty.clone());
             let const_fn = Expr::builtin(Builtin::Const)
                 .with_ty(Type::fun(body_ty.clone(), result_pi.clone()));
@@ -723,6 +720,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         node,
         ty,
         user_annotation,
+        ..
     } = expr;
     // Only the debug-build invariant asserts below read `original_ty`.
     #[cfg(debug_assertions)]
@@ -865,11 +863,13 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         // Pure structural recursion: Apply, plain Compose, Let, Tuple, Record,
         // List, ExprStmt, Feed, Define, and the atoms (no children to walk).
         node => {
-            let mut expr = TypedExpr {
-                node,
-                ty,
-                user_annotation,
-            };
+            // TODO(preserve): a pure structural recursion rebuilds the same
+            // logical node, so this is arguably `Expr::preserve(node_id, node)`
+            // carrying the input's id rather than a mint. Minting here is at
+            // least *recorded* (via `Expr::new`); settling mint-vs-preserve for
+            // the catch-all arm wants its own change.
+            let mut expr = Expr::new(node).with_ty(ty);
+            expr.user_annotation = user_annotation;
             expr.try_map_children(|child| elim_lambdas(ctx, child))?;
             Ok(dbg_typecheck_mv(expr))
         }

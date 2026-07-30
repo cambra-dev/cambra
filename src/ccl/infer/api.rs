@@ -223,6 +223,20 @@ impl DerefMut for TypeInferenceContext {
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during limited type inference.
+///
+/// # The `at` / `ctx` / `origin` label fields are for *display*, not location
+///
+/// Several variants carry a rendered symbolic label (`at`, `ctx`, `origin`,
+/// `context`) naming the offending expression. Those are message text — they end
+/// up verbatim in this type's hand-written `Debug`, which is the human-facing
+/// message — and they predate the compiler having any way to point at a node.
+/// They are **not** the authoritative location: that is
+/// [`LocatedInferError::node_id`], which every error raised by inference now
+/// carries, and which `compile_program` resolves to a source span. A consumer
+/// that wants to *locate* an error reads the node; a consumer that wants to
+/// *print* it reads these. The labels are consequently redundant with the node
+/// for anything but rendering, and are kept only because the message text is
+/// built from them.
 #[derive(Clone, PartialEq)]
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
@@ -238,7 +252,7 @@ pub enum InferError {
     ExpectedFunction {
         /// The actual type of the non-function expression.
         found: Type,
-        /// Symbolic label of the expression where the error occurred.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A user-written annotation on a binding site conflicts with the inferred type.
@@ -258,26 +272,26 @@ pub enum InferError {
     /// Lowering never produces a 0-branch `Case`; this indicates a malformed
     /// AST constructed outside the normal lowering path.
     EmptyCase {
-        /// Symbolic label of the case expression.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A [`Type::Hole`] placeholder survived past inference.
     UnresolvedHole {
-        /// Symbolic label of the expression whose type contains the hole.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// An unresolved [`Type::Infer`] variable survived past inference.
     UnresolvedInfer {
         /// The unresolved variable's id.
         id: InferVarId,
-        /// Symbolic label of the expression whose type contains the variable.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A partial tuple or partial record was not resolved to a concrete type.
     UnresolvedPartial {
         /// Display string of the partial type.
         kind: String,
-        /// Symbolic label of the expression whose type is partial.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A node's coalesced type references a term binder that is not in scope
@@ -286,7 +300,7 @@ pub enum InferError {
     /// (a substitution that failed to discharge a binder), not a user-facing
     /// error: user scoping mistakes are rejected earlier with source context.
     ScopeViolation {
-        /// Symbolic label of the expression whose type is ill-scoped.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
         /// The ill-scoped type.
         ty: Type,
@@ -315,7 +329,7 @@ pub enum InferError {
     /// expression of `Mut` type (or a non-variable argument to a `Mut`
     /// parameter) is rejected. Reported by [`check_mut_discipline`].
     MutNotBareVariable {
-        /// Symbolic label of the offending expression.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A [`Type::History`] appears nested inside a composite type — the
@@ -326,7 +340,7 @@ pub enum InferError {
     /// child of another `Mut` breaks the "writer set is statically known"
     /// guarantee. Reported by [`check_mut_discipline`].
     MutInCompositeType {
-        /// Symbolic label of the expression or binding whose type is offending.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
         /// The composite type that illegally contains a `Mut`.
         ty: Type,
@@ -348,7 +362,7 @@ pub enum InferError {
     /// D]`) and be silently mutated in name only. Reported by
     /// [`check_mut_discipline`].
     MutArgNotMutable {
-        /// Symbolic label of the offending argument.
+        /// Display label for the message (see the type docs — not the location).
         at: String,
     },
     /// A `MutWrite` (`:=` / `+=`) targets a binding whose resolved type is not
@@ -360,6 +374,61 @@ pub enum InferError {
         /// The base name of the write target.
         name: String,
     },
+}
+
+/// An [`InferError`] paired with the [`NodeId`](crate::ccl::provenance::NodeId)
+/// of the expression it was raised at.
+///
+/// The location is *provenance metadata*, not part of the error's identity, so
+/// it rides beside `InferError` rather than inside it: `InferError` stays
+/// location-free and `PartialEq`, which is what lets the inference tests compare
+/// errors by value.
+///
+/// This is what [`infer`] returns on failure, so the blame node travels *with*
+/// the error it belongs to. `compile_program` resolves each id to a source
+/// [`Span`](crate::chl_parser::ast::Span) against the `lowering_projection`
+/// while that projection is in scope (that resolution may fail, which is why
+/// `CompileError::Infer`'s span is optional — the *node* never is).
+///
+/// The node is **not** optional, and the only way to build one of these is
+/// through the inference contexts' `raise` (the `Typing` trait's one error
+/// affordance) or the equivalent stamp in the coalesce walk, both of which
+/// supply the node whose rule is running.
+/// So there is no unlocated state to represent and no partially-constructed
+/// intermediate: an inference error that has lost track of its node is
+/// unrepresentable rather than merely discouraged.
+///
+/// Deliberately concrete rather than a generic `Located<E>`: inference is the
+/// only pass whose errors carry a node today. The other unlocated pipeline
+/// errors — `LambdaElimError`, `ConversionError`, `DeferError`, whose spans
+/// `CompileError`'s docs call future work — are the prospective second, third,
+/// and fourth users; generalize when the first of them lands, not before. (Note
+/// the front-end convention differs on purpose: `LexError`/`ParseErrorInfo`/
+/// `LoweringError` hold a `Span` *inline* per variant, because a span exists
+/// where they are raised. An inference error is raised holding types, not spans,
+/// so it carries a node id and resolves to a span at the `compile_program`
+/// boundary.)
+#[derive(Debug, PartialEq)]
+pub struct LocatedInferError {
+    /// The underlying inference error.
+    pub error: InferError,
+    /// The node whose typing rule raised the error.
+    pub node_id: crate::ccl::provenance::NodeId,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl LocatedInferError {
+    /// The bare errors of a located list, dropping the blame nodes.
+    ///
+    /// **Test-only.** Tests assert on error *payloads* and have no projection to
+    /// resolve ids against; a diagnostic path must never discard the pairing, so
+    /// there is no production affordance for doing it. Gated on `test` for this
+    /// crate's own tests and on the default-off `test-helpers` feature for
+    /// integration tests, which are separate crates — that feature is what keeps
+    /// one implementation instead of a local copy per test file.
+    pub fn bare(located: Vec<Self>) -> Vec<InferError> {
+        located.into_iter().map(|l| l.error).collect()
+    }
 }
 
 impl std::fmt::Debug for InferError {
@@ -491,7 +560,14 @@ impl std::fmt::Debug for InferError {
 /// may still carry `Type::History` (feed) types with `Type::Infer` channel domains
 /// — those are erased by `channelize`, which runs next (see
 /// [`Strictness::PreDesugar`]).
-pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Vec<InferError>> {
+///
+/// Each error carries its own blame node ([`LocatedInferError`]) so the caller
+/// can resolve it to a source span; there is no separate location channel to
+/// keep in step with the error list.
+pub fn infer(
+    expr: &mut Expr,
+    ctx: &mut TypeInferenceContext,
+) -> Result<Type, Vec<LocatedInferError>> {
     // The arena owns every inference variable minted by the passes below
     // (captured through the thread-local mint sink). Its lifetime spans both
     // Pass 1 (constraint emission) and Pass 2 (coalesce); when it drops here
@@ -1215,6 +1291,99 @@ mod tests {
         TypedBinding, TypedExpr, TypedExprNode,
     };
 
+    /// [`infer`] with the blame nodes stripped, for the assertions that compare
+    /// error *payloads*.
+    ///
+    /// These trees are built by hand rather than lowered, so there is no
+    /// projection a blame node could resolve against and nothing to assert about
+    /// one. Named rather than shadowing `infer`: a test that calls `infer` is
+    /// calling the real entry point, and a test that discards locations says so
+    /// at the call site.
+    fn infer_bare(
+        expr: &mut Expr,
+        ctx: &mut TypeInferenceContext,
+    ) -> Result<Type, Vec<InferError>> {
+        infer(expr, ctx).map_err(LocatedInferError::bare)
+    }
+
+    /// The located signature's contract: an emit-time error names the node it was
+    /// raised at, so the caller can resolve a span without a side channel to keep
+    /// aligned. `x + 1` with `x` unbound fails in pass 1, whose blame node is the
+    /// innermost failing node. (Calls `infer` directly, not the location-stripping
+    /// [`infer_bare`] the payload assertions use.)
+    #[test]
+    fn infer_pairs_each_error_with_its_blame_node() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::var("x"),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::Int(1)),
+        );
+        // The blame is the innermost frame that saw the error — the `Var` node,
+        // not the enclosing `BinOp` that propagated it.
+        let blamed = match &expr.node {
+            crate::ccl::TypedExprNode::BinOp { left, .. } => left.node_id(),
+            other => panic!("expected a BinOp, got {other:?}"),
+        };
+        let errors = infer(&mut expr, &mut ctx).expect_err("`x` is unbound");
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].error, InferError::UnboundVariable(_)));
+        assert_eq!(
+            errors[0].node_id, blamed,
+            "an emit error is blamed on the node that raised it"
+        );
+    }
+
+    /// Every emit-path error kind is blamed on the node that raised it, not on an
+    /// ancestor and not on nothing.
+    ///
+    /// `LocatedInferError`'s node is mandatory, so "is it located" is not the
+    /// question — *which* node is. Each case names the node whose rule should own
+    /// the failure; the assertion is that the innermost rule to see the error is
+    /// the one that stamps it.
+    #[test]
+    fn emit_errors_are_blamed_on_the_raising_node() {
+        // An unbound `Var` under two layers of structure: the `Var`'s own rule
+        // raises, so neither the `Tuple` nor the `Lit` sibling may take the blame.
+        let mut expr = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::var("nope")]);
+        let var_id = match &expr.node {
+            TypedExprNode::Tuple(elts) => elts[1].node_id(),
+            other => panic!("expected a Tuple, got {other:?}"),
+        };
+        let errors =
+            infer(&mut expr, &mut TypeInferenceContext::new()).expect_err("`nope` is unbound");
+        assert_eq!(errors[0].node_id, var_id);
+        assert!(matches!(errors[0].error, InferError::UnboundVariable(_)));
+
+        // An annotation conflict: `bind_annotation` raises while the annotated
+        // `let`'s rule is running, so the `let` node owns it.
+        let mut expr = Expr::new(TypedExprNode::Let {
+            binding: TypedBinding::new_annotated("x", Type::Base(BaseType::String)),
+            bound_expr: Box::new(Expr::lit(Lit::Int(1))),
+            body: Box::new(Expr::var("x")),
+        });
+        let let_id = expr.node_id();
+        let errors = infer(&mut expr, &mut TypeInferenceContext::new())
+            .expect_err("Int bound to a String annotation");
+        assert_eq!(errors[0].node_id, let_id);
+        assert!(matches!(
+            errors[0].error,
+            InferError::AnnotationMismatch { .. }
+        ));
+
+        // A constraint failure inside a `BinOp`: `require_sub` raises under the
+        // `BinOp`'s rule, so the operator node owns it rather than either operand.
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::BoolLogic(LogicKind::And),
+            Expr::lit(Lit::Int(2)),
+        );
+        let binop_id = expr.node_id();
+        let errors = infer(&mut expr, &mut TypeInferenceContext::new())
+            .expect_err("`and` over Int operands");
+        assert_eq!(errors[0].node_id, binop_id);
+    }
+
     // -----------------------------------------------------------------------
     // Unit tests
     // -----------------------------------------------------------------------
@@ -1307,7 +1476,7 @@ mod tests {
     #[test]
     fn test_infer_unbound_var() {
         let mut ctx = TypeInferenceContext::new();
-        let result = infer(&mut Expr::var("y"), &mut ctx);
+        let result = infer_bare(&mut Expr::var("y"), &mut ctx);
         assert_eq!(result, Err(vec![InferError::UnboundVariable("y".into())]));
     }
 
@@ -1498,7 +1667,7 @@ mod tests {
         // (42 : String)  =>  annotation conflict
         // inference surfaces annotation conflicts as AnnotationMismatch
         let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::String));
-        let errs = infer(&mut expr, &mut ctx).unwrap_err();
+        let errs = infer_bare(&mut expr, &mut ctx).unwrap_err();
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -1549,7 +1718,7 @@ mod tests {
             body: Box::new(Expr::var("x")),
         });
         assert_eq!(
-            infer(&mut expr, &mut ctx),
+            infer_bare(&mut expr, &mut ctx),
             Err(vec![InferError::AnnotationMismatch {
                 annotation: Type::Base(BaseType::String),
                 inferred: int_lit_ty(42),
@@ -1628,7 +1797,7 @@ mod tests {
         // remains visible in `ctx` after the call returns.
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("unbound_var"));
-        let result = infer(&mut expr, &mut ctx);
+        let result = infer_bare(&mut expr, &mut ctx);
         assert_eq!(
             result,
             Err(vec![InferError::UnboundVariable("unbound_var".into())])
@@ -1662,7 +1831,7 @@ mod tests {
         );
         let mut ctx = TypeInferenceContext::new();
         // inference catches the mismatch at the Apply site.
-        let errs = infer(&mut expr, &mut ctx)
+        let errs = infer_bare(&mut expr, &mut ctx)
             .expect_err("expected TypeMismatch Int/String under inference");
         assert!(
             errs.iter().any(|e| matches!(
@@ -1689,7 +1858,7 @@ mod tests {
         // correctly reject the program.
         let mut expr = double_apply_lambda(Type::Base(BaseType::Int), Type::Base(BaseType::String));
         let mut ctx = TypeInferenceContext::new();
-        let errs = infer(&mut expr, &mut ctx).expect_err("expected an Int/String conflict");
+        let errs = infer_bare(&mut expr, &mut ctx).expect_err("expected an Int/String conflict");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -1894,7 +2063,7 @@ mod tests {
             AggregateKind::Sum,
         );
         assert!(
-            infer(&mut expr, &mut ctx).is_err_and(|errs| errs
+            infer_bare(&mut expr, &mut ctx).is_err_and(|errs| errs
                 .iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. }))),
             "Sum over String should be a type error"
@@ -1911,7 +2080,8 @@ mod tests {
         let mut expr = Expr::aggregate(Expr::lit(Lit::Int(42)), AggregateKind::Sum);
         // HM produces TypeMismatch; inference's map_constrain_err detects that the
         // rhs is a Fun and lhs is not, promoting it to ExpectedFunction.
-        let errs = infer(&mut expr, &mut ctx).expect_err("expected error for non-function input");
+        let errs =
+            infer_bare(&mut expr, &mut ctx).expect_err("expected error for non-function input");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -1998,7 +2168,7 @@ mod tests {
         );
         let mut ctx = TypeInferenceContext::new();
         // Body inference constrains p, but the And of Int and Bool is a type error.
-        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| {
+        assert!(infer_bare(&mut expr, &mut ctx).is_err_and(|errs| {
             errs.iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. }))
         }));
@@ -2023,7 +2193,7 @@ mod tests {
             ),
         );
         let mut ctx = TypeInferenceContext::new();
-        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| {
+        assert!(infer_bare(&mut expr, &mut ctx).is_err_and(|errs| {
             errs.iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. }))
         }));
@@ -2097,7 +2267,7 @@ mod tests {
             },
             body: Box::new(Expr::apply(Expr::var("x"), inner)),
         });
-        let errs = infer(&mut expr, &mut ctx).expect_err("Int and String cannot meet");
+        let errs = infer_bare(&mut expr, &mut ctx).expect_err("Int and String cannot meet");
         assert!(
             errs.iter()
                 .any(|e| matches!(e, InferError::IncompatibleBounds { .. })),
@@ -2130,7 +2300,7 @@ mod tests {
         });
         // the solver: the annotation pins the param to String; the Apply then fails to
         // constrain Int ≤ String and surfaces as TypeMismatch.
-        let errs = infer(&mut expr, &mut ctx).expect_err("expected error under inference");
+        let errs = infer_bare(&mut expr, &mut ctx).expect_err("expected error under inference");
         assert!(
             errs.iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. })),
@@ -2194,7 +2364,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::new(TypedExprNode::Source("ghost".into()));
         assert_eq!(
-            infer(&mut expr, &mut ctx),
+            infer_bare(&mut expr, &mut ctx),
             Err(vec![InferError::UnboundVariable("ghost".into())])
         );
     }
@@ -2249,8 +2419,8 @@ mod tests {
         use crate::ccl::UnaryOpKind;
         // -true → TypeMismatch(Bool, Int).
         let mut expr = Expr::unary(UnaryOpKind::Neg, Expr::lit(Lit::Bool(true)));
-        let errs =
-            infer(&mut expr, &mut ctx).expect_err("expected TypeMismatch Bool/Int under inference");
+        let errs = infer_bare(&mut expr, &mut ctx)
+            .expect_err("expected TypeMismatch Bool/Int under inference");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -2362,7 +2532,7 @@ mod tests {
             branches: vec![],
         });
         assert!(matches!(
-            infer(&mut expr, &mut ctx),
+            infer_bare(&mut expr, &mut ctx),
             Err(ref errs) if errs.iter().any(|e| matches!(e, InferError::EmptyCase { .. }))
         ));
     }

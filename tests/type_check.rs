@@ -15,7 +15,10 @@ use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
     FieldKey, HistoryKind, Lit, Type,
-    infer::{InferError, TypeInferenceContext, check_pre_desugar, infer, lit_singleton},
+    infer::{
+        InferError, LocatedInferError, TypeInferenceContext, check_pre_desugar, infer,
+        lit_singleton,
+    },
     lower::{LoweringContext, lower_stmts},
 };
 use cambra::chl_parser::{self, ast as chl_ast};
@@ -73,7 +76,9 @@ fn infer_program_err(code: &str) -> Vec<InferError> {
     let mut expr = lower_stmts(&stmts, &mut lctx)
         .into_result()
         .expect("lowering failed");
-    infer(&mut expr, &mut ictx).expect_err("expected inference error")
+    infer(&mut expr, &mut ictx)
+        .map_err(LocatedInferError::bare)
+        .expect_err("expected inference error")
 }
 
 /// Like [`infer_program_with_sources`] but expects inference to fail.
@@ -104,7 +109,9 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
     let mut expr = lower_stmts(&stmts, &mut lctx)
         .into_result()
         .expect("lowering failed");
-    infer(&mut expr, &mut ictx).expect_err("expected inference error")
+    infer(&mut expr, &mut ictx)
+        .map_err(LocatedInferError::bare)
+        .expect_err("expected inference error")
 }
 
 /// Parse a CHL module string into its statement list.

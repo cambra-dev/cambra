@@ -26,22 +26,35 @@ use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, coalesce_compact, compact_type,
     constrain_subtype, freshen_expr_type_slots, seed_chan_dom_pairings, simplify_type,
 };
+use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{Expr, Level, Name, Type, TypedBinding, TypedExprNode};
 
 use super::context::should_generalize;
 use super::typing::peel_refinements_outer;
-use super::{map_coalesce_err, map_constrain_err};
+use super::{LocatedInferError, map_coalesce_err, map_constrain_err};
 
 /// Returns `true` for expression labels that are structurally significant
 /// (let bindings, lambdas, comprehensions) and worth showing as error context.
 /// Filters out bare variable names and simple expressions that add noise.
 ///
-/// TODO: revisit after the ariadne error-reporting changes land. Coalesce
-/// error context is currently stringly-typed (we stringify the expression
-/// via `symbolic` and then pattern-match on the string here); once errors
-/// carry `Span`s and structured locations, contexts should be `&Expr`
-/// (or a richer node-ref type) and this string-shaped filter goes away.
+/// TODO(structured-context): this filter decides "worth showing" by
+/// substring-matching pretty-printed CCL, because when it was written an error
+/// had no way to point at a node. Half of that is now fixed — a
+/// `LocatedInferError` carries the node its rule raised it at — but the
+/// *contributing sites* of a merged `IncompatibleBounds` are still labels:
+/// `origin: String` plus `context: Vec<String>` on the variant.
+///
+/// The remaining work, and why it is worth doing for this error kind
+/// specifically: a bounds conflict has no single blame site by nature (the same
+/// variable was constrained in several places, and the error *is* the
+/// collision), so one underline understates it. Threading a `NodeId` into the
+/// merge path — `context: Vec<NodeId>` instead of `Vec<String>` — lets the
+/// renderer emit a primary label at the origin plus a secondary label per
+/// contributing site, which is exactly the shape `ParseErrorInfo` already ships
+/// (`context: Vec<(String, Span)>`, rendered by `ParseError::to_report`). This
+/// filter then matches on node *kind* (`Let`/`Lambda`/`For`) rather than on
+/// whether a rendering contains `"let "`.
 fn is_significant_context(label: &str) -> bool {
     label.contains("let ") || label.contains("λ ") || label.contains('\n')
 }
@@ -51,7 +64,20 @@ fn is_significant_context(label: &str) -> bool {
 /// If an existing error has the same `(polarity, conflicting)` key, `label` is
 /// appended to its context vec (when it passes [`is_significant_context`])
 /// instead of pushing a duplicate.  All other error kinds are pushed as-is.
-fn push_coalesce_err(errors: &mut Vec<InferError>, new_err: InferError, label: String) {
+///
+/// `blame` is the node whose rule raised `new_err`. A merged
+/// `IncompatibleBounds` keeps the *first* contributing node: a bounds conflict
+/// has no single site by nature — the same variable was constrained in several
+/// places — so the blame is the site where the conflict was first detected and
+/// the later sites land in `context`. (Turning that context into node ids, so a
+/// report can underline every contributing site, is the follow-up the
+/// `is_significant_context` note above describes.)
+fn push_coalesce_err(
+    errors: &mut Vec<LocatedInferError>,
+    new_err: InferError,
+    label: String,
+    blame: NodeId,
+) {
     if let InferError::IncompatibleBounds {
         polarity: p,
         conflicting: ref c,
@@ -65,7 +91,7 @@ fn push_coalesce_err(errors: &mut Vec<InferError>, new_err: InferError, label: S
                 conflicting,
                 context,
                 ..
-            } = e
+            } = &mut e.error
                 && *polarity == key.0
                 && conflicting == &key.1
             {
@@ -78,10 +104,16 @@ fn push_coalesce_err(errors: &mut Vec<InferError>, new_err: InferError, label: S
                 ctx_vec.push(label);
             }
         } else {
-            errors.push(new_err);
+            errors.push(LocatedInferError {
+                error: new_err,
+                node_id: blame,
+            });
         }
     } else {
-        errors.push(new_err);
+        errors.push(LocatedInferError {
+            error: new_err,
+            node_id: blame,
+        });
     }
 }
 
@@ -102,12 +134,20 @@ pub(super) struct CoalesceCtx {
     /// the same name (the same shadowing discipline emission's `ScopeStack`
     /// applies).
     scope: Vec<ScopeEntry>,
-    errors: Vec<InferError>,
+    /// Errors raised by the walk, each paired with the node whose rule raised it.
+    /// Coalesce accumulates — it visits every node and collects what it finds —
+    /// so the blame is per error, stamped at the raise site from
+    /// [`current_node`](Self::current_node).
+    errors: Vec<LocatedInferError>,
     /// Pass-scoped predicate-rewrite memo: keeps every refinement occurrence
     /// that entered the coalesce walk sharing one predicate `Rc` sharing a
     /// single coalesced `Rc` on the way out, instead of splitting into one
     /// independently-coalesced copy per node. See [`PredMemo`].
     pred_memo: PredMemo,
+    /// The node whose coalesce rule is running, maintained by
+    /// [`coalesce_node`] on both exit paths. The same discipline `emit_node` and
+    /// `check_node` use; seeded with the tree's root at construction.
+    current_node: NodeId,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
@@ -115,6 +155,12 @@ pub(super) struct CoalesceCtx {
 }
 
 impl CoalesceCtx {
+    /// Record `error`, blamed on the node whose rule is running — the coalesce
+    /// counterpart of [`Typing::raise`](super::typing::Typing::raise).
+    fn push_error(&mut self, error: InferError, label: String) {
+        push_coalesce_err(&mut self.errors, error, label, self.current_node);
+    }
+
     /// Log one read for [`assert_reads_stable`] (debug builds; free in
     /// release). `unresolved` must be the var-laden type *as resolved* —
     /// its shared `Rc<InferVar>`s are what let the end-of-pass check
@@ -471,9 +517,10 @@ fn with_shadows<R>(
     r
 }
 
-pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
+pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
+        current_node: expr.node_id(),
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
         #[cfg(debug_assertions)]
@@ -511,19 +558,25 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
 /// context (§3.4). The uniform substitution rewrites type slots in the same
 /// pass as terms, so the dangling-binder class this walk guards is
 /// structurally unrepresentable; it runs as a debug-build regression net,
-/// reporting each ill-scoped node as an [`InferError::ScopeViolation`].
+/// reporting each ill-scoped node as an [`InferError::ScopeViolation`] blamed on
+/// that node. This walk accumulates — one error per ill-scoped node — so, like
+/// coalesce, it blames per error rather than through a shared cursor; here the
+/// node is in hand at the raise site, so it needs no frame bookkeeping.
 #[cfg(debug_assertions)]
 pub(super) fn check_scope_valid(
     expr: &Expr,
     scope: &std::collections::BTreeSet<Name>,
-    errors: &mut Vec<InferError>,
+    errors: &mut Vec<LocatedInferError>,
 ) {
     let free = crate::ccl::subst::type_free_vars(&expr.ty);
     if !free.is_subset(scope) {
-        errors.push(InferError::ScopeViolation {
-            at: symbolic(expr),
-            ty: expr.ty.clone(),
-            unbound: free.difference(scope).map(|n| n.to_string()).collect(),
+        errors.push(LocatedInferError {
+            error: InferError::ScopeViolation {
+                at: symbolic(expr),
+                ty: expr.ty.clone(),
+                unbound: free.difference(scope).map(|n| n.to_string()).collect(),
+            },
+            node_id: expr.node_id(),
         });
     }
     match &expr.node {
@@ -617,6 +670,18 @@ pub(super) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
 /// predicate's expression is coalesced (`coalesce_type_predicates` runs this
 /// walk over it).
 fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+    // Mark this node as the one whose rule is running, so `push_error` stamps
+    // its errors with it; restored on exit. An inner rule overwrites the mark
+    // for its own extent, so an error is blamed on the node that raised it
+    // rather than on an ancestor. Mirrors `emit_node` / `check_node`.
+    let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
+    coalesce_node_inner(expr, level, ctx);
+    ctx.current_node = prev;
+}
+
+/// The body of [`coalesce_node`]; see the wrapper for the per-error blame
+/// bookkeeping it is wrapped in.
+fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // Use of a generalized binding (innermost-out lookup; shadow markers keep
     // inner same-name binders opaque): resolve the use's instantiation off
     // the live graph, specialize the definition to it (memoized per distinct
@@ -838,11 +903,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                         Ok(ty) => p.binding.ty = ty,
                         Err(err) => {
                             let label = format!("Case pattern `.{}` payload", p.tag);
-                            push_coalesce_err(
-                                &mut ctx.errors,
-                                map_coalesce_err(err, &label),
-                                label,
-                            );
+                            ctx.push_error(map_coalesce_err(err, &label), label);
                         }
                     }
                 }
@@ -879,7 +940,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 Ok(ty) => target.ty = ty,
                 Err(err) => {
                     let label = "For target".to_string();
-                    push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+                    ctx.push_error(map_coalesce_err(err, &label), label);
                 }
             }
         }
@@ -909,7 +970,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                     Ok(ty) => binding.ty = ty,
                     Err(err) => {
                         let label = format!("LetRec binding `{}`", binding.name);
-                        push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+                        ctx.push_error(map_coalesce_err(err, &label), label);
                     }
                 }
             }
@@ -939,7 +1000,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             ctx.record_read(&expr.ty, &ty, || label.clone());
             expr.ty = ty;
         }
-        Err(err) => push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label),
+        Err(err) => ctx.push_error(map_coalesce_err(err, &label), label),
     }
 
     // Codomain extraction (design §6.2 move site): a `let x = v in body` node's
@@ -1148,6 +1209,22 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
 // `ConstrainCache` keys on `Type`, whose `Refinement` predicates carry interior
 // mutability; the solver relies on identity-by-`uid`, not the mutable payload
 // (matching the solver's module-level allow).
+/// Mint a fresh [`NodeId`](crate::ccl::provenance::NodeId) for every node in a
+/// monomorphization clone.
+///
+/// Walks the main expression tree — the `walk_children` domain, which is the
+/// whole `NodeId` domain. Type slots are *not* walked: a `Type` carries no
+/// identity, and the predicate `Rc<TypedExpr>`s reachable through one are outside
+/// the id domain, so a specialization's predicate-embedded ids may alias the
+/// definition's. Nothing checks or reads them (see `ccl/design/provenance.md`,
+/// "The id domain"), and freshening them would split the predicate `Rc` sharing
+/// planning's compile memo depends on.
+fn freshen_clone_node_ids(expr: &mut Expr) {
+    // The deep walk lives on `TypedExpr::freshen_node_ids_deep`; each re-mint
+    // fires the ambient `on_copy` hook, captured by the open Mono Copy step.
+    expr.freshen_node_ids_deep();
+}
+
 #[allow(clippy::mutable_key_type)]
 pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) {
     // The use's instantiation type, resolved off the live graph. The graph is
@@ -1158,7 +1235,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         Ok(t) => t,
         Err(err) => {
             let label = symbolic(use_expr);
-            push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+            ctx.push_error(map_coalesce_err(err, &label), label);
             return;
         }
     };
@@ -1213,6 +1290,16 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     seed_chan_dom_pairings(&resolved, &clone.ty, cutoff, &mut fresh.chan_doms);
     freshen_expr_type_slots(&mut clone, cutoff, FreshenLevel::Preserve, &mut fresh);
 
+    // `Clone` copies `node_id`, so every node in this clone currently shares
+    // the original definition's id — N specializations would collide on one id,
+    // breaking any post-inference index keyed by `NodeId`. Mint a fresh id for
+    // every cloned node. This is a dedicated walk scoped to monomorphization
+    // (not folded into the shared `freshen_expr_type_slots`, which also runs on
+    // refinement-predicate copies outside any mono context). It covers the
+    // `walk_children` domain only — predicate-embedded ids, reachable through
+    // type slots, are outside the id domain and stay aliased.
+    freshen_clone_node_ids(&mut clone);
+
     // Pin the clone to the use's live instantiation type, two-way. Inward,
     // this drives the use site's accumulated bounds into the clone's
     // freshened variables (what makes the clone *this* use's specialization);
@@ -1225,8 +1312,12 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     let pinned = constrain_subtype(&clone.ty, &use_expr.ty, &mut cache)
         .and_then(|()| constrain_subtype(&use_expr.ty, &clone.ty, &mut cache));
     if let Err(e) = pinned {
-        ctx.errors
-            .push(map_constrain_err(e, "monomorphization specialization"));
+        // Blamed on the use site, which is the node whose demanded type the pin
+        // failed to satisfy (and the node whose frame would claim it anyway).
+        ctx.errors.push(LocatedInferError {
+            error: map_constrain_err(e, "monomorphization specialization"),
+            node_id: use_expr.node_id(),
+        });
     }
 
     // Coalesce the clone re-entrantly, in the definition site's scope: every
@@ -1648,10 +1739,18 @@ mod tests {
         e.ty = refined_int(TypedExpr::var("x"));
         let mut errors = Vec::new();
         check_scope_valid(&e, &std::collections::BTreeSet::new(), &mut errors);
-        let [InferError::ScopeViolation { unbound, .. }] = errors.as_slice() else {
+        let [located] = errors.as_slice() else {
             panic!("expected a single ScopeViolation, got {errors:?}");
         };
+        let InferError::ScopeViolation { unbound, .. } = &located.error else {
+            panic!("expected a ScopeViolation, got {:?}", located.error);
+        };
         assert_eq!(unbound, &["x".to_string()]);
+        assert_eq!(
+            located.node_id,
+            e.node_id(),
+            "the violation is blamed on the ill-scoped node itself"
+        );
     }
 
     // Appendix case K: the same refinement is accepted when the referenced

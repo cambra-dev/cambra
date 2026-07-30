@@ -24,6 +24,16 @@
 //! We measure at **post-inference** (cheap — milliseconds), which is where the
 //! sharing is established and preserved; the downstream slowdown a regression
 //! causes is in planning, but the *cause* is visible here as duplicated terms.
+//!
+//! **Known scope limit — this corpus is comprehension-only, and the invariant it
+//! asserts is not true program-wide.** Generic instantiation
+//! (`solver::scheme::freshen_refinement_predicate`) rebuilds predicates with an
+//! unconditional `Rc::new` and no `PredMemo`, so any program whose UDF body
+//! carries a predicate leaves structurally-equal `Rc`s behind:
+//! `f = \xs -> [x for x in xs if x > 1]` measures 4 surplus of 9 distinct at one
+//! call site, 29 of 38 at two. Adding such a program here **fails today** — do it
+//! as the regression test when the split is fixed, not before. Tracked in the
+//! lineage-redesign doc, §12.4(9); rationale in `ccl/design/type-inference.md`.
 
 use cambra::ccl::ccl_utils::{distinct_predicate_rcs, reachable_refinements};
 use cambra::ccl::infer::{TypeInferenceContext, infer};

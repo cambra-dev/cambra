@@ -8,8 +8,8 @@ use smol_str::SmolStr;
 
 use crate::ccl::FieldKey;
 use crate::ccl::ccl_utils::{cast_target_refinement, strip_refinements};
-use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
+use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, Type, TypedBinding,
@@ -23,7 +23,36 @@ use super::{product, variant_type};
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
 /// their `Type`s are stored on their own nodes the same way.
-pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, InferError> {
+///
+/// Thin wrapper over [`emit_node_inner`] that marks this node as the one whose
+/// rule is running, so any error raised beneath it is blamed on it
+/// ([`Typing::raise`]). Set on entry, restored on exit — the error path included.
+/// All recursion (including the generic `Typing::subexpr` impl) routes through
+/// here, so the mark is maintained for every emitted node.
+///
+/// The innermost frame wins for free: a nested rule overwrites the mark for its
+/// own extent, so an error is stamped with the node that raised it, not with an
+/// ancestor that propagated it. Nothing is read after the walk unwinds.
+///
+/// TODO(multi-error): emission is fail-fast — it returns at the first error,
+/// while the same rules in Check mode accumulate every one (`CheckCtx`). Making
+/// emission accumulate needs three decisions this wrapper does not prejudge: a
+/// poison value to carry on with when a constraint fails (a fresh unconstrained
+/// var, or a `Type::Error`), cascade suppression so one bad subtree does not
+/// report at every ancestor, and what to do with the run-wide `ConstrainCache`
+/// after a failed constraint has written into it. The blame mechanism is already
+/// accumulation-ready: each error is stamped where it is raised, so N errors
+/// carry N nodes with no further change here.
+pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
+    let prev = ctx.enter_node(expr.node_id());
+    let result = emit_node_inner(expr, ctx);
+    ctx.leave_node(prev);
+    result
+}
+
+/// The body of [`emit_node`]: the actual per-node constraint emission. See the
+/// wrapper for the `current_node_id` bookkeeping.
+fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
     let ty = match &mut expr.node {
@@ -38,7 +67,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
         // and rewrites the use to a per-type specialization
         // (`specialize_use`).
         TypedExprNode::Var(name) => match ctx.scopes.lookup(name) {
-            None => return Err(InferError::UnboundVariable(name.to_string())),
+            None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
             Some(binding) => binding.scheme.instantiate(ctx.level),
         },
 
@@ -112,7 +141,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
 
         TypedExprNode::Source(name) => match ctx.sources.get(name) {
             Some(t) => t.clone(),
-            None => return Err(InferError::UnboundVariable(name.to_string())),
+            None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
         },
 
         TypedExprNode::Compose(elts) => emit_compose(elts, ctx)?,
@@ -130,7 +159,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
         // returns the param type verbatim.
         TypedExprNode::Feed { name, value } => {
             let target_ty = match ctx.scopes.lookup(name) {
-                None => return Err(InferError::UnboundVariable(name.to_string())),
+                None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(binding) => binding.scheme.instantiate(ctx.level),
             };
             emit_feed(&target_ty, value, &label, ctx)?
@@ -138,7 +167,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
 
         TypedExprNode::Define { name, value } => {
             let target_ty = match ctx.scopes.lookup(name) {
-                None => return Err(InferError::UnboundVariable(name.to_string())),
+                None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(binding) => binding.scheme.instantiate(ctx.level),
             };
             emit_define(&target_ty, value, &label, ctx)?
@@ -166,7 +195,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
         // write and surface as `UnresolvedInfer`).
         TypedExprNode::MutWrite { name, value } => {
             let var_ty = match ctx.scopes.lookup(name) {
-                None => return Err(InferError::UnboundVariable(name.to_string())),
+                None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(binding) => binding.scheme.instantiate(ctx.level),
             };
             // The written value flows into the mutable variable's *value* type, not the
@@ -238,7 +267,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
 /// enclosing scope; this must run while those bindings are live (i.e.
 /// during `emit_node` of the annotated node). Each predicate is rebuilt in
 /// place ([`emit_bare_predicate`]) so the typed term lands on the annotation.
-fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), InferError> {
+fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
     match ty {
         Type::Refinement(inner, r) => {
             // The annotation's refinement is bare over REFINEMENT_BINDER, just
@@ -327,7 +356,7 @@ fn emit_bare_predicate<C: Typing>(
     r: &mut Refinement,
     domain: &Type,
     ctx: &mut C,
-) -> Result<(), InferError> {
+) -> Result<(), LocatedInferError> {
     let memo = ctx.pred_memo();
     // The closure cannot leave the rebuild half-done: there is no token to drop on
     // an early return, so the error is captured and propagated after the term is
@@ -367,7 +396,7 @@ fn apply_binary_scheme<C: Typing>(
     left: &Type,
     right: &Type,
     at: &dyn Fn() -> String,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let body = ctx.instantiate(scheme);
     let result = ctx.fresh();
     let expected = fun(
@@ -392,7 +421,7 @@ fn apply_unary_scheme<C: Typing>(
     scheme: &PolyScheme,
     operand: &Type,
     at: &dyn Fn() -> String,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let body = ctx.instantiate(scheme);
     let result = ctx.fresh();
     let expected = fun(operand.clone(), result.clone());
@@ -404,7 +433,7 @@ pub(super) fn emit_lambda<C: Typing>(
     param: &mut TypedBinding,
     body: &mut Expr,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     // Param type: convert any explicit annotation/Hole/Infer into a
     // the solver. A Hole turns into a fresh Var that will accumulate
     // bounds from body usage and call sites. Link `param.ty` to that
@@ -464,7 +493,7 @@ pub(super) fn emit_cast<C: Typing>(
     value: &mut Expr,
     target: &mut Type,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let value_ty = ctx.subexpr(value)?;
     // Re-view `value : D ⇒ V` as `{D | r} ⇒ V` (the refinement on the domain).
     let (d, v) = ctx.as_function(&value_ty, &|| "cast value".to_string())?;
@@ -497,7 +526,7 @@ pub(super) fn emit_apply<C: Typing>(
     function: &mut Expr,
     argument: &mut Expr,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let arg_ty = ctx.subexpr(argument)?;
     let fn_ty = ctx.subexpr(function)?;
     // The application's type is the function's codomain with its Pi binder
@@ -516,7 +545,7 @@ pub(super) fn emit_binop<C: Typing>(
     right: &mut Expr,
     scheme: &PolyScheme,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let left_ty = ctx.subexpr(left)?;
     let right_ty = ctx.subexpr(right)?;
     apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &|| "BinOp".to_string())
@@ -526,13 +555,16 @@ pub(super) fn emit_unary<C: Typing>(
     inner: &mut Expr,
     scheme: &PolyScheme,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let inner_ty = ctx.subexpr(inner)?;
     apply_unary_scheme(ctx, scheme, &inner_ty, &|| "UnaryOp".to_string())
 }
 
 /// Tuple literal: each element type becomes a positional product field.
-pub(super) fn emit_tuple<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Type, InferError> {
+pub(super) fn emit_tuple<C: Typing>(
+    elts: &mut [Expr],
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
     let mut fields = BTreeMap::new();
     for (i, e) in elts.iter_mut().enumerate() {
         // A bare mutable read in a tuple denotes its *value* (reads deref, design
@@ -550,7 +582,7 @@ pub(super) fn emit_tuple<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Ty
 pub(super) fn emit_record<C: Typing>(
     fs: &mut [(String, Expr)],
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let mut fields = BTreeMap::new();
     for (n, e) in fs.iter_mut() {
         // Deref a bare mutable read to its value, as in `emit_tuple`: the field
@@ -569,7 +601,7 @@ pub(super) fn emit_expr_stmt<C: Typing>(
     e: &mut Expr,
     body: &mut Expr,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     ctx.subexpr(e)?;
     ctx.subexpr(body)
 }
@@ -629,7 +661,7 @@ pub(super) fn emit_feed<C: Typing>(
     value: &mut Expr,
     label: &str,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     // A feed payload is a *value* (`Mut` never appears in a feed payload — the
     // discipline forbids it), so deref a bare mutable reference to its value
     // type here. This wrapping into a `Fun` codomain buries the type where the
@@ -650,7 +682,7 @@ pub(super) fn emit_define<C: Typing>(
     value: &mut Expr,
     label: &str,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let value_ty = ctx.subexpr(value)?;
     constrain_into_feed(target_ty, &value_ty, label, ctx)
 }
@@ -672,7 +704,7 @@ fn constrain_into_feed<C: Typing>(
     payload_sub: &Type,
     label: &str,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     match peel_refinements_outer(target_ty) {
         Type::History {
             value,
@@ -711,7 +743,7 @@ fn constrain_into_feed<C: Typing>(
 pub(super) fn emit_collection_union<C: Typing>(
     exprs: &mut [Expr],
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     // CollectionUnion: the result is a collection (a function from index
     // to element) whose *domain* is tagged and whose *codomain* is the
     // join of branch codomains.
@@ -762,7 +794,7 @@ pub(super) fn emit_aggregate<C: Typing>(
     input: &mut Expr,
     scheme: &PolyScheme,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let input_ty = ctx.subexpr(input)?;
     apply_unary_scheme(ctx, scheme, &input_ty, &|| "Aggregate".to_string())
 }
@@ -781,7 +813,7 @@ pub(super) fn emit_let<C: Typing>(
     bound_expr: &mut Expr,
     body: &mut Expr,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     // Emit the RHS at a deeper level so its locally-minted variables can be
     // generalized at the binding site (`scoped_let`).
     let bound_ty = ctx.in_let_rhs(|ctx| ctx.subexpr(bound_expr))?;
@@ -910,8 +942,8 @@ pub(super) fn emit_let<C: Typing>(
 fn scoped_group<C: Typing, R>(
     ctx: &mut C,
     binders: &[(Name, Type)],
-    f: &mut dyn FnMut(&mut C) -> Result<R, InferError>,
-) -> Result<R, InferError> {
+    f: &mut dyn FnMut(&mut C) -> Result<R, LocatedInferError>,
+) -> Result<R, LocatedInferError> {
     match binders.split_first() {
         None => f(ctx),
         Some(((name, ty), rest)) => ctx.scoped(name, ty, |ctx| scoped_group(ctx, rest, f)),
@@ -935,7 +967,7 @@ pub(super) fn emit_letrec<C: Typing>(
     bindings: &mut [(TypedBinding, Expr)],
     body: &mut Expr,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     // Normalize every declared type first and write it back onto the binder
     // slot, so references and coalesce share the same (possibly fresh)
     // variables — mirroring `emit_lambda`'s param handling.
@@ -975,7 +1007,7 @@ pub(super) fn emit_for<C: Typing>(
     iter: &mut Expr,
     body: &mut Expr,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let iter_ty = ctx.subexpr(iter)?;
     let iter_label = symbolic(iter);
     let (_domain, item_ty) =
@@ -1002,7 +1034,10 @@ pub(super) fn emit_for<C: Typing>(
 /// binder or scope — in-block register reads/writes/feeds are typed by their own
 /// `Var`/`MutWrite`/`Feed` rules. Shared by Emit and Check via [`Typing`], like
 /// [`emit_for`].
-pub(super) fn emit_begin<C: Typing>(body: &mut Expr, ctx: &mut C) -> Result<Type, InferError> {
+pub(super) fn emit_begin<C: Typing>(
+    body: &mut Expr,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
     ctx.subexpr(body)?;
     Ok(Type::Base(BaseType::Unit))
 }
@@ -1039,14 +1074,17 @@ pub(super) fn emit_proj<C: Typing>(
     key: &ProjKey,
     node_ty: &Type,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let (domain, codomain) = ctx.provide_function(node_ty, &|| "Proj".to_string())?;
     let requirement = proj_requirement(key, codomain, ctx);
     ctx.require_sub(&domain, &requirement, &|| "Proj".to_string())?;
     Ok(node_ty.clone())
 }
 
-pub(super) fn emit_list<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Type, InferError> {
+pub(super) fn emit_list<C: Typing>(
+    elts: &mut [Expr],
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
     if elts.is_empty() {
         return Ok(fun(Type::UIntRange(0), prim(BaseType::Unit)));
     }
@@ -1087,11 +1125,11 @@ pub(super) fn emit_case<C: Typing>(
     branches: &mut [Branch],
     label: &str,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     if branches.is_empty() {
-        return Err(InferError::EmptyCase {
+        return Err(ctx.raise(InferError::EmptyCase {
             at: label.to_string(),
-        });
+        }));
     }
 
     // Structural dispatch: constrain the scrutinee to the Variant of the
@@ -1139,7 +1177,7 @@ pub(super) fn emit_case<C: Typing>(
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the
 /// body's type. The pattern binding (if any) is already in scope.
-fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, InferError> {
+fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, LocatedInferError> {
     let guard_ty = ctx.subexpr(&mut b.guard)?;
     // One-way: a guard must *be* a `Bool`, not be exactly `Bool`. A refined boolean
     // is still a boolean, and a refinement drops on the way up.
@@ -1153,14 +1191,17 @@ pub(super) fn emit_variant_ctor<C: Typing>(
     tag: &str,
     payload: &mut Expr,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     let payload_ty = ctx.subexpr(payload)?;
     let mut tags = BTreeMap::new();
     tags.insert(FieldKey::Name(SmolStr::from(tag)), payload_ty);
     Ok(variant_type(tags))
 }
 
-pub(super) fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Type, InferError> {
+pub(super) fn emit_compose<C: Typing>(
+    elts: &mut [Expr],
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
     assert!(elts.len() >= 2, "Compose requires at least two elements");
     let mut tys = Vec::with_capacity(elts.len());
     for e in elts.iter_mut() {
@@ -1254,14 +1295,16 @@ fn emit_transact_writer<C: Typing>(
     writer: &mut WriterSite,
     key_types: &std::collections::HashMap<Name, Type>,
     ctx: &mut C,
-) -> Result<(), InferError> {
+) -> Result<(), LocatedInferError> {
     let s_ty = ctx.subexpr(&mut writer.source)?;
     let (_d, item) = ctx.as_function(&s_ty, &|| "transaction source".to_string())?;
 
     let mut snaps: Vec<Type> = Vec::with_capacity(writer.read_keys.len());
     for rk in &writer.read_keys {
         let snap = key_types.get(rk).cloned().ok_or_else(|| {
-            InferError::Unsupported(format!("read key {rk} is not a register key"))
+            ctx.raise(InferError::Unsupported(format!(
+                "read key {rk} is not a register key"
+            )))
         })?;
         snaps.push(snap);
     }
@@ -1276,7 +1319,9 @@ fn emit_transact_writer<C: Typing>(
     for wk in &writer.write_keys {
         let new = ctx.fresh();
         let bound = key_types.get(wk).cloned().ok_or_else(|| {
-            InferError::Unsupported(format!("write key {wk} is not a register key"))
+            ctx.raise(InferError::Unsupported(format!(
+                "write key {wk} is not a register key"
+            )))
         })?;
         new_tys.push(new.clone());
         news.push((new, bound));
@@ -1320,7 +1365,7 @@ pub(super) fn emit_transact<C: Typing>(
     writers: &mut [WriterSite],
     domain: &Type,
     ctx: &mut C,
-) -> Result<Type, InferError> {
+) -> Result<Type, LocatedInferError> {
     use std::collections::HashMap;
     let mut fields: Vec<(String, Type)> = Vec::with_capacity(keys.len());
     // key Name → the type of one committed value (a writer's snapshot / write
@@ -1386,7 +1431,9 @@ mod review_tests {
         let mut r1 = Refinement::sharing(&shared);
         let mut r2 = Refinement::sharing(&shared);
 
-        let mut ctx = InferCtx::new(std::collections::HashMap::new());
+        // Our stack seeds the blame cursor at construction; this unit test has no
+        // enclosing tree, so the predicate term itself is the root to blame.
+        let mut ctx = InferCtx::new(std::collections::HashMap::new(), shared.node_id());
         let d1 = ctx.fresh();
         let d2 = ctx.fresh();
         emit_bare_predicate(&mut r1, &d1, &mut ctx).expect("first occurrence types");

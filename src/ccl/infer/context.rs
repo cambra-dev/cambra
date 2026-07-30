@@ -5,12 +5,13 @@
 use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::TermMemo;
-use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype, fresh_var, fun, type_level,
 };
 use std::rc::Rc;
 
+use crate::ccl::infer::{InferError, LocatedInferError};
+use crate::ccl::provenance::NodeId;
 use crate::ccl::{Expr, Level, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode};
 use crate::util::ScopeStack;
 
@@ -96,10 +97,27 @@ pub(super) struct InferCtx {
     /// sharing it carries none of the context-dependence that makes sharing
     /// delicate elsewhere.
     lit_singletons: HashMap<Lit, Rc<TypedExpr>>,
+    /// The node whose typing rule is currently running, maintained by the
+    /// [`emit_node`](super::emit::emit_node) wrapper: set on entry and restored
+    /// on exit, error path included. Read only through
+    /// [`Typing::current_node`](super::typing::Typing::current_node), to stamp an
+    /// error being raised — never after the walk unwinds, so it always names the
+    /// node under emission and nothing else. Provenance metadata for
+    /// diagnostics; it never influences inference.
+    ///
+    /// Not an `Option`: it is **seeded with the tree's root id** at construction,
+    /// so a rule always has a node to blame. Nothing can raise before the root
+    /// frame opens (the walk's first act is to enter it), but if the code ever
+    /// grew such a path, the root is a truthful blame rather than an absent one —
+    /// which is what lets `LocatedInferError` require a node instead of carrying
+    /// an `Option` that every consumer must then interpret.
+    current_node_id: NodeId,
 }
 
 impl InferCtx {
-    pub(super) fn new(sources: HashMap<String, Type>) -> Self {
+    /// `root` seeds [`current_node_id`](Self::current_node_id) so the context is
+    /// never in a state where an error has no node to blame.
+    pub(super) fn new(sources: HashMap<String, Type>, root: NodeId) -> Self {
         Self {
             scopes: ScopeStack::default(),
             sources,
@@ -108,7 +126,19 @@ impl InferCtx {
             level: 0,
             pred_memo: Default::default(),
             lit_singletons: HashMap::new(),
+            current_node_id: root,
         }
+    }
+
+    /// Enter `node`'s rule, returning the previous node for the caller to
+    /// restore. Only [`emit_node`](super::emit::emit_node) calls this.
+    pub(super) fn enter_node(&mut self, node: NodeId) -> NodeId {
+        std::mem::replace(&mut self.current_node_id, node)
+    }
+
+    /// Restore the node whose rule is running, on both exit paths.
+    pub(super) fn leave_node(&mut self, prev: NodeId) {
+        self.current_node_id = prev;
     }
 
     /// Normalize a user annotation / source type into a solver-ready
@@ -196,7 +226,11 @@ impl Typing for InferCtx {
         self.pred_memo.clone()
     }
 
-    fn subexpr(&mut self, child: &mut Expr) -> Result<Type, InferError> {
+    fn current_node(&self) -> NodeId {
+        self.current_node_id
+    }
+
+    fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
         emit_node(child, self)
     }
 
@@ -217,8 +251,9 @@ impl Typing for InferCtx {
         sub: &Type,
         sup: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(), InferError> {
-        constrain_subtype(sub, sup, &mut self.cache).map_err(|e| map_constrain_err(e, &at()))
+    ) -> Result<(), LocatedInferError> {
+        constrain_subtype(sub, sup, &mut self.cache)
+            .map_err(|e| self.raise(map_constrain_err(e, &at())))
     }
 
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -295,7 +330,7 @@ impl Typing for InferCtx {
         body_ty
     }
 
-    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), InferError> {
+    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), LocatedInferError> {
         // Shared by *binder* annotations (trait call sites in the emit rules)
         // and *node* annotations (`emit_node`'s `user_annotation` tail) — the
         // reconciliation is identical: annotation wins on success, conflict
@@ -324,10 +359,10 @@ impl Typing for InferCtx {
         // modified state after a failed constrain_subtype.
         let inferred_ty = coalesce_for_error(inferred);
         constrain_subtype(inferred, &ann_simple, &mut self.cache).map_err(|_| {
-            InferError::AnnotationMismatch {
+            self.raise(InferError::AnnotationMismatch {
                 annotation: ann.clone(),
                 inferred: inferred_ty,
-            }
+            })
         })?;
         Ok(())
     }
@@ -342,7 +377,7 @@ impl Typing for InferCtx {
         &mut self,
         t: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(Type, Type), InferError> {
+    ) -> Result<(Type, Type), LocatedInferError> {
         let d = self.fresh();
         let c = self.fresh();
         self.require_sub(t, &fun(d.clone(), c.clone()), at)?;
@@ -353,7 +388,7 @@ impl Typing for InferCtx {
         &mut self,
         t: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(Type, Type), InferError> {
+    ) -> Result<(Type, Type), LocatedInferError> {
         let d = self.fresh();
         let c = self.fresh();
         // One-way `domain ⇒ codomain <: t`: the node supplies the function
@@ -368,7 +403,7 @@ impl Typing for InferCtx {
         arg: &Type,
         domain: &Type,
         at: &dyn Fn() -> String,
-    ) -> Result<(), InferError> {
+    ) -> Result<(), LocatedInferError> {
         // One-way: the sound subtyping rule `arg <: domain` (the argument must fit
         // the parameter). The contravariant domain var's shape — the record/tuple
         // actually flowing in — is recovered structurally in `coalesce_node` (its
@@ -385,7 +420,7 @@ impl Typing for InferCtx {
         arg_ty: &Type,
         argument: &Expr,
         at: &dyn Fn() -> String,
-    ) -> Result<Type, InferError> {
+    ) -> Result<Type, LocatedInferError> {
         // Expect a *named* Pi `(x: d) ⇒ result`, so the codomain edge derives the
         // binder correspondence when `fn_ty`'s real Pi flows in (constrain's
         // Fun/Fun arm). The shape edge is one-way (`fn_ty <: (x: d) ⇒ result`),

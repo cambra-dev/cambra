@@ -17,8 +17,10 @@ use crate::{
             check_pre_desugar, infer, typecheck,
         },
         inline, lambda_elim,
+        lineage::{Leak, RecorderSession, SourceProjection, collapse_lowering},
         lower::{LoweringContext, LoweringError, lower_stmts},
         mut_elim, planning,
+        provenance::NodeId,
         symbolic::{symbolic, symbolic_typed},
         transact_phase, uniquify,
     },
@@ -54,14 +56,11 @@ use crate::{
 /// single-stage; the parser's multi-error output is flattened into one
 /// [`CompileError::Parse`] per [`ParseError`].
 ///
-/// Use [`eprint_errors`] for source-context rendering: parse errors get
-/// ariadne reports with red/yellow underlines; the other variants render as
-/// plain `error: …` lines. Source-aware spans for lowering/inference errors
-/// are future work; this enum is shaped so those variants can be migrated to
-/// a unified [`Diagnostic`]-style representation later without changing the
-/// list-of-errors return contract.
-///
-/// [`Diagnostic`]: https://docs.rs/ariadne/latest/ariadne/
+/// Use [`eprint_errors`] for source-context rendering: parse, lowering, and
+/// span-carrying inference errors get ariadne reports with underlines; the
+/// remaining variants render as plain `error: …` lines. Lambda-elim/conversion
+/// spans remain future work; the enum is shaped so they migrate without
+/// changing the list-of-errors return contract.
 #[derive(Debug)]
 pub enum CompileError {
     /// The parser rejected one token / token sequence.
@@ -79,7 +78,18 @@ pub enum CompileError {
     /// first.
     DesugarDefers(channelize::DeferError),
     /// Type inference rejected one expression.
-    Infer(InferError),
+    ///
+    /// `span` is the offending source range, resolved at the `compile_program`
+    /// boundary via the `lowering_projection` one-hop lookup. `None` when no
+    /// precise node was known (coalesce/scope errors, or a caller without the table) —
+    /// the error then renders as a plain `error: …` line instead of an ariadne
+    /// report with source context.
+    Infer {
+        /// The underlying inference error (its `Debug` impl is the human message).
+        error: InferError,
+        /// The resolved source span, when known.
+        span: Option<chl_parser::ast::Span>,
+    },
     /// Lambda elimination failed.
     LambdaElim(lambda_elim::LambdaElimError),
     /// Operator-graph conversion failed.
@@ -96,12 +106,13 @@ pub enum CompileError {
 impl CompileError {
     /// Render this single error as a plain-ASCII string with source-code context.
     ///
-    /// - [`CompileError::Parse`] is rendered via ariadne with colour
-    ///   disabled (gutter, source line, underlines, labels — all rendered
-    ///   in Unicode box-drawing). Suitable for inclusion in panic
-    ///   messages, log files, snapshots, or piping through grep.
-    /// - The other variants render as plain `error: …` lines because
-    ///   they don't yet carry source spans.
+    /// - [`CompileError::Parse`], [`CompileError::Lower`], and a
+    ///   span-carrying [`CompileError::Infer`] are rendered via ariadne with
+    ///   colour disabled (gutter, source line, underlines, labels — all in
+    ///   Unicode box-drawing). Suitable for panic messages, log files,
+    ///   snapshots, or piping through grep.
+    /// - The remaining variants (and a spanless `Infer`) render as plain
+    ///   `error: …` lines.
     ///
     /// To render a whole [`Vec<CompileError>`] from `compile_program`, use
     /// [`render_errors`].
@@ -121,8 +132,21 @@ impl CompileError {
             CompileError::DesugarDefers(e) => {
                 buf.extend_from_slice(format!("error: deferred collection: {e}\n").as_bytes());
             }
-            CompileError::Infer(e) => {
-                buf.extend_from_slice(format!("error: type inference: {e:?}\n").as_bytes());
+            CompileError::Infer {
+                error,
+                span: Some(span),
+            } => {
+                infer_report(
+                    error,
+                    *span,
+                    src_name,
+                    ariadne::Config::default().with_color(false),
+                )
+                .write((src_name, ariadne::Source::from(src)), &mut buf)
+                .expect("ariadne write should not fail on Vec<u8>");
+            }
+            CompileError::Infer { error, span: None } => {
+                buf.extend_from_slice(format!("error: type inference: {error:?}\n").as_bytes());
             }
             CompileError::LambdaElim(e) => {
                 buf.extend_from_slice(format!("error: lambda elimination: {e:?}\n").as_bytes());
@@ -156,9 +180,42 @@ impl CompileError {
                     .eprint((src_name, ariadne::Source::from(src)))
                     .expect("ariadne eprint should not fail on stderr");
             }
+            CompileError::Infer {
+                error,
+                span: Some(span),
+            } => {
+                infer_report(error, *span, src_name, ariadne::Config::default())
+                    .eprint((src_name, ariadne::Source::from(src)))
+                    .expect("ariadne eprint should not fail on stderr");
+            }
             other => eprint!("{}", other.render(src_name, src)),
         }
     }
+}
+
+/// Build an ariadne report for an inference error pinned to a source span.
+///
+/// Mirrors the parse/lower report builders: the `Debug` impl of [`InferError`]
+/// is already the human-readable message, used as both the report title and the
+/// label. Colour is governed by `config` (off for [`CompileError::render`], on
+/// for [`CompileError::eprint`]), matching the other arms' conventions.
+fn infer_report<'a>(
+    error: &InferError,
+    span: chl_parser::ast::Span,
+    src_name: &'a str,
+    config: ariadne::Config,
+) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
+    use ariadne::{Color, Label, Report, ReportKind};
+    let message = format!("{error:?}");
+    Report::build(ReportKind::Error, src_name, span.start)
+        .with_config(config)
+        .with_message("type inference error")
+        .with_label(
+            Label::new((src_name, span.into()))
+                .with_message(message)
+                .with_color(Color::Red),
+        )
+        .finish()
 }
 
 /// Render every error in `errs` and concatenate the output.
@@ -215,7 +272,13 @@ pub trait IntoCompileErrors {
 
 impl IntoCompileErrors for Vec<InferError> {
     fn into_compile_errors(self) -> Vec<CompileError> {
-        self.into_iter().map(CompileError::Infer).collect()
+        // Fallback for callers without the `lowering_projection` (i.e. not
+        // `compile_program`): no span resolution, so `span: None`. The
+        // `compile_program` path resolves spans explicitly and constructs the
+        // `Infer` variant itself rather than going through `.errs()`.
+        self.into_iter()
+            .map(|error| CompileError::Infer { error, span: None })
+            .collect()
     }
 }
 
@@ -403,6 +466,97 @@ pub struct CompiledProgram {
     /// programs the sender is dropped immediately, so `try_recv` never returns
     /// `Ok` — pure programs are driven entirely by the `main` producer.
     pub done: std::sync::mpsc::Receiver<()>,
+    /// The always-on **lowering projection**: **every** lowered node's
+    /// [`NodeId`](crate::ccl::provenance::NodeId) mapped to the
+    /// [`SourceAttribution`](crate::ccl::lineage::SourceAttribution) folded from
+    /// lowering's [`LoweringLog`](crate::ccl::lineage::LoweringLog). Every entry
+    /// is `via: Lower`; the tag is one of **three** shapes, not two:
+    ///
+    /// - `Nature::Source` + `"lower.image"` — the root of a lowered
+    ///   `Spanned<ChlExpr>`. Structural and decidable; emitted only by
+    ///   `lower_expr` (see `LoweringContext::tag_source`).
+    /// - `Nature::Machinery` + `"lower.image"` — **the common case**: a node the
+    ///   minting rule considered an image of source text but which is not an
+    ///   expression root (a callee `Var`, a chained comparison, a statement-level
+    ///   image).
+    /// - `Nature::Machinery` + `"lower.<rule>"` — lowering-manufactured plumbing.
+    ///
+    /// The `"lower.image"` label carries no cross-site guarantee — it is per-rule
+    /// judgment, and the taxonomy is provisional (`LoweringContext::tag_image`).
+    /// Coverage, by contrast, is guaranteed: the whole `walk_children` domain is
+    /// present, since an unrecorded mint surfaces as `Leak::Unexplained` at the
+    /// fold. Produced by
+    /// [`collapse_lowering`](crate::ccl::lineage::collapse_lowering) at the
+    /// lowering boundary, never mutated incrementally. It is always-on and the
+    /// release `InferError` diagnostics read it one-hop (spans of the blame node).
+    pub lowering_projection: SourceProjection,
+    /// The **pre-inference** IR snapshot — the inspector's upstream (source-shaped,
+    /// pre-monomorphization) pane, captured right after `uniquify` and before
+    /// `infer`.
+    ///
+    /// It is the same tree `infer` consumes: source-shaped (lambdas intact,
+    /// Defer/Feed/Define still present) and **untyped** — every node's `ty` is a
+    /// `Hole`/`Infer`. The inspector renders those holes; the resolved downstream
+    /// type is stitched in from [`post_inference_ir`](Self::post_inference_ir) via
+    /// shared/remapped `NodeId`s.
+    ///
+    /// Monomorphization runs *inside* `infer`, freshening cloned ids, so this
+    /// snapshot holds the pre-mono **originals**; every ordinary node keeps its
+    /// id identical across the pair. Its ids resolve against the
+    /// [`lowering_projection`](Self::lowering_projection) (they are the pre-mono originals, keyed by lowering's
+    /// directly-lowered attributions).
+    pub pre_inference_ir: Expr,
+    /// The post-inference IR snapshot — the program inspector's anchor.
+    ///
+    /// This is `expr` captured **right after `infer`/`typecheck` and before
+    /// `inline::inline_non_iterable_lambdas` consumes it**: fully typed, but
+    /// still *source-shaped* (lambdas intact, not yet point-free — `inline`,
+    /// `lambda_elim`, and `planning` have not run).
+    ///
+    /// Distinct from [`ast`](Self::ast), which holds `join_planned` (the
+    /// *post-planning* tree): `lambda_elim`/`planning` re-mint every `NodeId`,
+    /// so `ast`'s ids don't resolve against the lowering projection, and it is
+    /// execution-shaped (point-free, fused) — the wrong tree for a source-level
+    /// view. The inspector anchors here instead.
+    pub post_inference_ir: Expr,
+    /// The post-desugar IR snapshot — the inspector's **downstream** pane, one
+    /// pipeline stage *below* [`post_inference_ir`](Self::post_inference_ir).
+    ///
+    /// This is `expr` captured **right after `channelize`** (which now runs
+    /// after `infer`/`inline`/`transact`/`letrec`): fully typed and structurally
+    /// final for the source view — no Defer/Feed/Define nodes remain, and the
+    /// channelization artifacts (`Compose` wrapper chains, `CollectionUnion`
+    /// fan-ins) are present. Because monomorphization ran earlier (inside
+    /// `infer`), this tree is post-mono like [`post_inference_ir`](Self::post_inference_ir).
+    ///
+    /// Every id preserved through inline/transact/letrec/desugar is shared with
+    /// [`post_inference_ir`](Self::post_inference_ir).
+    pub post_desugar_ir: Expr,
+    /// The parsed CHL surface AST — the source-of-truth for source-level
+    /// (lexical) inspector queries.
+    ///
+    /// This is the [`Module`](crate::chl_parser::ast::Module) lowering consumed,
+    /// retained verbatim. It is the anchor for *source-language* questions —
+    /// name resolution (`goto-definition`, the binder half of `scope-at`) —
+    /// answered by the inspector's name-binder index.
+    ///
+    /// It is deliberately **distinct from [`post_inference_ir`](Self::post_inference_ir)**
+    /// (the typed IR): lowering destroys some source variables before any IR
+    /// node exists — notably `uncurry_params` rewrites multi-param references
+    /// `Var(x)` to `__arg_tuple_N ▷ .i` *before* uniquify, so the lowered/typed
+    /// tree structurally cannot resolve a multi-param `def`/`lambda` parameter
+    /// back to its binder. The surface AST still has `x`/`y` with their
+    /// `Param.name_span`, so lexical resolution over *this* is lossless.
+    pub source_ast: chl_parser::ast::Module,
+    /// The original program source text, retained verbatim.
+    ///
+    /// Inspector queries need the source string to produce snippets (`hover`'s
+    /// `snippet` = `source[span]`) and to serve the snapshot wire's
+    /// `source.text`. Every
+    /// span-keyed projection above (the [`lowering_projection`](Self::lowering_projection), the surface AST's
+    /// spans) is a byte offset *into this string*, so retaining it is what makes
+    /// those offsets resolvable to text. Cheap (one program's source).
+    pub source: String,
 }
 
 impl CompiledProgram {
@@ -420,6 +574,104 @@ impl CompiledProgram {
     pub fn sinks(&self) -> impl Iterator<Item = &CompiledOutput> {
         self.outputs.iter().filter(|o| !o.is_main())
     }
+}
+
+/// Every main-tree node id reachable in `expr` (the `walk_children` node set,
+/// refinement-predicate interiors excluded — the domain the lineage steps and
+/// the pane projections reason about).
+pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId> {
+    fn go(e: &Expr, acc: &mut std::collections::HashSet<NodeId>) {
+        acc.insert(e.node_id());
+        e.walk_children(|c| go(c, acc));
+    }
+    let mut acc = std::collections::HashSet::new();
+    go(expr, &mut acc);
+    acc
+}
+
+/// The lowering-boundary leak gate: the lowering log records every mint and
+/// copy at its site, so [`collapse_lowering`]'s fold must explain every
+/// output-tree node with **no** leak of any class — an `Unexplained` (an
+/// unrecorded lowering mint) is a recording bug, not tolerated residue.
+/// Debug/test only, single code path (`cfg!`, not `#[cfg]`).
+fn assert_leaks_clean(leaks: &[Leak], boundary: &str) {
+    if !cfg!(any(debug_assertions, test)) {
+        return;
+    }
+    assert!(
+        leaks.is_empty(),
+        "lineage leak at the fully-recorded {boundary} boundary (expected none): {leaks:?}"
+    );
+}
+
+/// Every duplicated [`NodeId`] over the **main tree** — the `walk_children`
+/// node-set, refinement predicates excluded (matching inline's blind spot, so the
+/// check does not false-fire there). Returns `(id, node kind)` for each
+/// occurrence *beyond the first*.
+fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
+    fn walk(
+        e: &Expr,
+        seen: &mut std::collections::HashSet<NodeId>,
+        dups: &mut Vec<(NodeId, &'static str)>,
+    ) {
+        if !seen.insert(e.node_id()) {
+            dups.push((e.node_id(), e.node.kind_name()));
+        }
+        e.walk_children(|c| walk(c, seen, dups));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut dups = Vec::new();
+    walk(expr, &mut seen, &mut dups);
+    dups
+}
+
+/// Pipeline-wide id-uniqueness tripwire: panic if `expr` carries a duplicated
+/// [`NodeId`], naming the `boundary` and the offending id(s) + node kinds.
+///
+/// Uniqueness within a tree is what makes a `NodeId` an *identity*: the lineage
+/// map is keyed by id, so two live nodes sharing one id make their attributions
+/// and edges indistinguishable. The failure mode this catches is a clone that
+/// forgot to freshen, or a rewrite that preserved an id where it minted.
+///
+/// This asserts a *tree invariant* at a pass boundary and encodes no pass order,
+/// so it is robust to pass reordering (a moved pass carries its check with it).
+/// It catches the *class* of preserve-as-mint / clone-without-freshen bugs
+/// across the whole test suite, not just a crafted program.
+///
+/// The walk is the same main-tree `walk_children` walk as
+/// [`duplicate_node_ids`]/[`collect_tree_ids`] — a predicate-inclusive walk would
+/// false-fire on inline's known predicate blind spot. Gated
+/// via `cfg!(...)` as an expression (not a `#[cfg]` item) so the same call site
+/// compiles under both `./ci.sh` clippy passes without a release-only
+/// gated-item-reference failure.
+pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
+    if !cfg!(any(debug_assertions, test)) {
+        return;
+    }
+    let dups = duplicate_node_ids(expr);
+    assert!(
+        dups.is_empty(),
+        "node-id uniqueness invariant violated at `{boundary}`: {} duplicated id(s) \
+         (id, kind): {:?}",
+        dups.len(),
+        dups
+    );
+    // The `Default`/`mem::take` sentinel (see `NodeId::PLACEHOLDER`) is a
+    // transient throwaway that must always be overwritten before it reaches a
+    // pass boundary; a persisted placeholder means a `mem::take` slot was left
+    // unfilled, which would silently corrupt provenance.
+    fn walk_placeholder(e: &Expr, found: &mut bool) {
+        if e.node_id() == NodeId::PLACEHOLDER {
+            *found = true;
+        }
+        e.walk_children(|c| walk_placeholder(c, found));
+    }
+    let mut placeholder = false;
+    walk_placeholder(expr, &mut placeholder);
+    assert!(
+        !placeholder,
+        "Default/mem::take placeholder node persisted into the tree at `{boundary}`"
+    );
 }
 
 /// Compile a CHL program and return its operator graph plus subscribed outputs.
@@ -473,6 +725,12 @@ pub fn compile_program(
         return Err(errors);
     }
 
+    // The always-on lowering session: installed in every
+    // build for the whole of lowering. Its leaf entries (`tag_source`/
+    // `tag_machinery`) and copy-frame flushes (uncurry, compare-chain) record a
+    // `LoweringLog`, folded once at the handoff below into the always-on lowering
+    // projection. It must fully drain before the first pass (Mono) session opens.
+    let lowering_session = RecorderSession::lowering();
     let lower_result = lower_stmts(&module.body, ctx.lowering_ctx());
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
@@ -489,6 +747,34 @@ pub fn compile_program(
     // Drain sink bindings discovered during lowering before taking sources.
     let sink_bindings_registry = ctx.lowering_ctx().take_sink_bindings();
 
+    // Drain the lowering log and fold it once, at the lowering→pipeline
+    // handoff (before uniquify/inference, so the release `InferError` read timing
+    // is unchanged), into the always-on **lowering projection**: every lowered
+    // node's [`SourceAttribution`], keyed by NodeId. It is the base every later
+    // pane fold bottoms out in, and the source the release `InferError`
+    // diagnostics resolve against one-hop. `uniquify` preserves every id in
+    // place, so the projection's keys survive into the pre-inference pane.
+    //
+    // The fold's leak taxonomy enforces mint coverage: an unrecorded lowering
+    // mint surfaces as `Leak::Unexplained` (every output-tree node must be
+    // explained by a leaf or a copy). The checks are debug/test
+    // gated at the boundary via `assert_leaks_clean`; the fold itself is
+    // always-on (its product is release-critical).
+    // Id uniqueness is the precondition for keying anything by `NodeId`, so gate
+    // it before the fold that does exactly that: a duplicate here would silently
+    // collapse two nodes' attributions into one projection entry. Lowering's own
+    // copy sites (uncurry's template discharge, the chained-comparison operand
+    // freshens) are what make this a live risk at this boundary.
+    assert_unique_node_ids(&expr, "post-lowering");
+
+    let lowering_log = lowering_session.into_lowering_log();
+    let lowering_projection = {
+        let output_ids = collect_tree_ids(&expr);
+        let (projection, leaks) = collapse_lowering(&lowering_log, &output_ids);
+        assert_leaks_clean(&leaks, "lowering");
+        projection
+    };
+
     debug!("Lowered (pre-desugar):\n{}", symbolic(&expr));
 
     // α-uniquify all binders (Barendregt convention): every binding site gets
@@ -497,6 +783,12 @@ pub fn compile_program(
     // rewrites splice and rename terms under the assumption that distinct
     // binders are distinct names. (Desugar now runs after inference; see below.)
     expr = uniquify::run(expr);
+
+    // Retain the pre-inference IR for the inspector's upstream pane before
+    // `infer` mutates `expr` in place. This is the source-shaped, pre-mono,
+    // still-hole-typed tree. Its ids resolve against the `lowering_projection`
+    // (the pre-mono originals). See `CompiledProgram::pre_inference_ir`.
+    let pre_inference_ir = expr.clone();
 
     // Register every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
@@ -514,13 +806,31 @@ pub fn compile_program(
         ctx.conversion_ctx().register_source(name, source);
     }
 
-    // Inference runs on the user-shaped tree — before channelize — so
-    // type errors are reported against the program the user wrote, not the
-    // channelized rewrite. Defer reads necessarily carry `Feed` types with
-    // `Infer` channel domains here (only desugar can know the domains), so
-    // the post-inference consistency check is the relaxed pre-desugar one.
-    let infer_ctx = ctx.inference_ctx();
-    infer(&mut expr, infer_ctx).errs()?;
+    debug!("Lowered:\n{}", symbolic(&expr));
+
+    // Inference runs on the user-shaped tree — before channelize — so type
+    // errors are reported against the program the user wrote, not the
+    // channelized rewrite.
+    let infer_outcome = infer(&mut expr, ctx.inference_ctx());
+    // On failure, resolve each error's own blame node to a source span *here* —
+    // the lowering projection is in scope and holds the lowered attribution (this
+    // is the always-on release read: one hop, no fold). Every error names a node;
+    // an id the projection doesn't cover (a node minted after lowering, e.g. by
+    // monomorphization) degrades to a span-less diagnostic.
+    if let Err(errors) = infer_outcome {
+        return Err(errors
+            .into_iter()
+            .map(|located| {
+                let span = lowering_projection
+                    .get(&located.node_id)
+                    .and_then(|attr| attr.spans.first().copied());
+                CompileError::Infer {
+                    error: located.error,
+                    span,
+                }
+            })
+            .collect());
+    }
     debug!("Inferred:\n{}", symbolic(&expr));
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
     // Consistency wall between `infer` and `channelize`. It is the relaxed
@@ -569,6 +879,14 @@ pub fn compile_program(
     // beta-reduction) and preserves defer-returning generators, so the
     // post-inline wall is the relaxed `check_pre_desugar`, not strict
     // `typecheck`.
+    // Retain the post-inference IR for the inspector before `inline` consumes
+    // `expr`. This is the source-shaped, fully-typed anchor (lambdas intact, not
+    // yet point-free; inline/transact/letrec/desugar/lambda_elim/planning have
+    // not run). `ast` (`join_planned`) is the *wrong* tree for a source
+    // view — `lambda_elim`/`planning` re-mint ids and produce execution shape.
+    // See `CompiledProgram::post_inference_ir`.
+    let post_inference_ir = expr.clone();
+
     expr = inline::inline_non_iterable_lambdas(expr);
     debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).map_err(|errs| {
@@ -644,6 +962,12 @@ pub fn compile_program(
     debug!("Channelized:\n{}", symbolic(&desugared));
     typecheck(&desugared).expect("channelize produced an ill-typed tree");
 
+    // Retain the post-channelize tree for the inspector's downstream pane. On the
+    // post-inference desugar order this snapshot is *downstream* of
+    // `post_inference_ir` (post-inline/transact/letrec/channelize); see the doc
+    // comment on `post_desugar_ir`.
+    let post_desugar_ir = desugared.clone();
+
     // Fed-out register reads: rewrite a read-only reply that reads a register out of
     // its block into an outer-indexed as-of join (an as-of read at the reading
     // transaction's arbitrary commit position), *before* lambda elimination — so a
@@ -658,8 +982,8 @@ pub fn compile_program(
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
     debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
 
-    // `typecheck` now enforces hole-freeness as its first phase, so a separate
-    // `check_fully_typed` call is no longer needed here.
+    // `typecheck` enforces hole-freeness as its first phase, so this call
+    // alone covers both checks.
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
     // Recognition: lower each causal group — now in its point-free normal
@@ -771,6 +1095,12 @@ pub fn compile_program(
         ast: join_planned,
         outputs,
         done: done_rx,
+        lowering_projection,
+        pre_inference_ir,
+        post_inference_ir,
+        post_desugar_ir,
+        source_ast: module,
+        source: code.to_string(),
     })
 }
 
@@ -830,6 +1160,110 @@ Error: lowering error
             normalize(&out),
             normalize(expected),
             "actual rendered output:\n{out}"
+        );
+    }
+
+    /// Resolution: a deliberate type error carries a blame node
+    /// whose provenance resolves to a source span. `1 and 2` constrains the
+    /// integer literal against `and`'s `Bool` operand during pass-1 emission,
+    /// so the blame node is that pass-1 emit site and its id round-trips
+    /// through the lowering projection (`SourceProjection`, keyed by `NodeId`)
+    /// to a `Some` span over the offending expression.
+    ///
+    /// (`1 + "a"` reaches the same outcome by the other route: its `Int`/`String`
+    /// collision surfaces in pass-2 coalesce, which blames per error — see
+    /// `coalesce_error_carries_resolved_span`.)
+    #[test]
+    fn infer_error_carries_resolved_span() {
+        let code = "1 and 2\n";
+        let errs = compile_err(code);
+        let (error, span) = errs
+            .iter()
+            .find_map(|e| match e {
+                CompileError::Infer { error, span } => Some((error, *span)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
+        assert!(
+            matches!(error, InferError::TypeMismatch { .. }),
+            "expected a pass-1 TypeMismatch, got {error:?}"
+        );
+        let span = span.expect("the type error resolves to a source span");
+        let pointed = &code[span.start..span.end];
+        assert!(
+            pointed.contains("and"),
+            "span {span:?} should cover the offending expression, points at {pointed:?}"
+        );
+    }
+
+    /// The pass-2 counterpart: a collision the emitter accepts and *coalesce*
+    /// rejects still resolves to a span.
+    ///
+    /// `1 + "a"` constrains one variable against both `Int` and `String`, which
+    /// only fails when the bounds are resolved — so this is the accumulating
+    /// walk's blame path (`CoalesceCtx::current_node`, stamped by `coalesce_node`),
+    /// not emission's. Coalesce blames per error, so each of several errors
+    /// renders with its own source context.
+    #[test]
+    fn coalesce_error_carries_resolved_span() {
+        let code = "1 + \"a\"\n";
+        let errs = compile_err(code);
+        let (error, span) = errs
+            .iter()
+            .find_map(|e| match e {
+                CompileError::Infer { error, span } => Some((error, *span)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
+        let span = span.unwrap_or_else(|| {
+            panic!("the coalesce error resolves to a source span, got {error:?} with no span")
+        });
+        let pointed = &code[span.start..span.end];
+        assert_eq!(
+            pointed, "1 + \"a\"",
+            "the blame is the node whose coalesce frame raised the error — here the \
+             `+` application over both operands, not the whole program or nothing"
+        );
+    }
+
+    /// An unbound variable (the canonical pass-1 emit error) also resolves to
+    /// its single-token source span.
+    #[test]
+    fn unbound_variable_carries_resolved_span() {
+        let code = "y\n";
+        let errs = compile_err(code);
+        let (error, span) = errs
+            .iter()
+            .find_map(|e| match e {
+                CompileError::Infer { error, span } => Some((error, *span)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
+        assert!(matches!(error, InferError::UnboundVariable(_)));
+        assert_eq!(
+            span,
+            Some(chl_parser::ast::Span::new(0, 1)),
+            "the use of `y` spans byte offsets 0..1"
+        );
+    }
+
+    /// Terminal rendering: a span-carrying inference error renders
+    /// as an ariadne report with the source line and an underline, NOT the
+    /// bare `error: type inference: …` plain-text fallback.
+    #[test]
+    fn infer_error_renders_with_source_context() {
+        let code = "1 and 2\n";
+        let errs = compile_err(code);
+        let out = render_errors(&errs, "<test>", code);
+        assert!(
+            !out.contains("error: type inference:"),
+            "span-carrying infer error must not use the plain-text fallback; got:\n{out}"
+        );
+        // ariadne report markers: the source line, the file:line:col header,
+        // and box-drawing for the underline/gutter.
+        assert!(
+            out.contains("<test>:1") && out.contains("1 and 2") && out.contains('│'),
+            "expected an ariadne report with source context; got:\n{out}"
         );
     }
 

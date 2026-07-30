@@ -98,6 +98,7 @@ pub(super) fn validate_function_params(
 pub(super) fn uncurry_params(
     params: &[Param],
     body_expr: Expr,
+    fn_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if params.len() == 1 {
@@ -152,7 +153,9 @@ pub(super) fn uncurry_params(
             {
                 p.user_annotation = Some(param_ty);
             }
-            lam
+            // Each curried lambda images one written parameter; the outermost
+            // is re-tagged identically by the `def`/lambda caller.
+            ctx.tag_image(lam, fn_span)
         }));
     }
 
@@ -164,8 +167,24 @@ pub(super) fn uncurry_params(
     // substitution's inserted `Var(outer_name)` never collides with an
     // inner binder.
     let tuple_name = ctx.fresh_tuple_arg();
+    let up = "lower.uncurry_proj";
     let body_with_subs = params.iter().enumerate().fold(body_expr, |acc, (i, arg)| {
-        let proj = Expr::apply(Expr::var(&tuple_name), Expr::proj_index(i));
+        // The projection plumbing is manufactured per *occurrence*: the
+        // substitution deep-freshens the template's INTERIOR into every
+        // occurrence of the parameter (root-carry keeps each occurrence's own
+        // id/attribution — see `substitute_param_in_body`), so tag the template's
+        // three nodes as machinery leaves.
+        //
+        // The template itself never enters the tree. Its two interior ids reach
+        // the tree as the freshened copies the frame below captures, so they are
+        // origins of live nodes; its ROOT does not — root-carry replaces it with
+        // each occurrence's own id — so that one id is tagged and then carried by
+        // nothing. Harmless in the product (the projection is filtered to the
+        // output tree, so the entry drops out), and the reason there is no
+        // produced-side leak class: see `design/provenance.md`, "The collapse".
+        let var = ctx.tag_machinery(Expr::var(&tuple_name), fn_span, up);
+        let idx = ctx.tag_machinery(Expr::proj_index(i), fn_span, up);
+        let proj = ctx.tag_machinery(Expr::apply(var, idx), fn_span, up);
         substitute_param_in_body(acc, &Name::raw(arg.name.as_str()), &proj)
     });
     // Attach the *tuple* of per-parameter annotations (checking mode), mirroring the
@@ -215,7 +234,7 @@ pub(super) fn lower_lambda(
     // meaning. The shadow set is keyed by pre-uniquify base name.
     let param_names: Vec<String> = params.iter().map(|p| p.name.as_str().to_string()).collect();
     let body_expr = ctx.with_shadowed(param_names, |ctx| lower_expr(body, ctx));
-    uncurry_params(params, body_expr?, ctx)
+    uncurry_params(params, body_expr?, lambda_span, ctx)
 }
 
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`,
@@ -230,13 +249,30 @@ pub(super) fn lower_lambda(
 /// into the comprehension's `Cast::target` predicate with `lo` free in it,
 /// and the engine rewrites it there along with the term spine.
 ///
+/// **Root-carry** — the substitution engine's identity rule for a compound
+/// replacement: it carries each *occurrence*'s own id onto the replacement root
+/// (a preserve, so the root inherits the occurrence's own `Source` attribution)
+/// and deep-freshens only the replacement's *interior* into fresh nodes. That is
+/// what buys occurrence fidelity here: every `x` in `def f(x, y)`'s body becomes
+/// its own `__arg_tuple.0` whose root still points at that `x`'s span, rather
+/// than every projection mirroring the one shared `def` span. The interior
+/// freshens land as ambient `Copy`s in the open lowering copy-frame below,
+/// mirroring the template's machinery attribution — so every substituted node
+/// stays covered by the lowering fold.
+///
 /// Capture is structurally impossible at this (pre-uniquify, raw-name) call
 /// site: the replacement's `Var` uses the reserved `__arg_tuple_` prefix
 /// that user code cannot bind, with a fresh unique id per multi-arg lambda
 /// ([`LoweringContext::fresh_tuple_arg`]), so the engine's no-capture assert
 /// cannot fire.
 fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
+    use crate::ccl::lineage::copy_frame;
     let mut expr = expr;
+    // A lowering copy-frame: the discharge's interior freshens fire `on_copy`
+    // into this frame, which flushes them as `Copy` LoweringSteps (mirroring the
+    // template) into the always-on lowering log. A no-op when no session is
+    // installed (the lower unit tests).
+    let _frame = copy_frame("lower.uncurry_proj");
     crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
     expr
 }
@@ -310,7 +346,11 @@ pub(super) fn lower_function_body(
     // pre-uniquify name a sibling function could reuse.
     ctx.restore_transactional(snapshot);
 
-    uncurry_params(params, body_result?, ctx)
+    // Tag the function's lambda wrapper with the `def` span. (The synthetic
+    // tuple-arg lambda for the multi-param case is the user's function node,
+    // so the def span is the right blame here.)
+    let func = uncurry_params(params, body_result?, fn_span, ctx)?;
+    Ok(ctx.tag_image(func, fn_span))
 }
 
 #[cfg(test)]
@@ -351,5 +391,74 @@ in add"
             .into_result()
             .expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
+    }
+
+    /// Occurrence fidelity: in a multi-param `def` whose params occur more than
+    /// once, uncurry substitutes a fresh tuple-projection template into each
+    /// occurrence — and root-carry (see [`substitute_param_in_body`]) makes each
+    /// projection *root* preserve the occurrence's own id, so it inherits that
+    /// occurrence's own source span instead of the one `def` span shared by every
+    /// copy. The corpus otherwise has no multi-param `def`, so pin the span
+    /// fidelity here.
+    #[test]
+    fn uncurry_projection_roots_carry_occurrence_spans() {
+        use crate::ccl::TypedExprNode;
+        use crate::ccl::lineage::{Nature, RecorderSession, SourceProjection, collapse_lowering};
+        use crate::ccl::provenance::NodeId;
+        use crate::chl_parser::ast::Span;
+        use std::collections::HashSet;
+
+        // `def add(a, b):` newline `    a + a + b` newline `add(1, 2)` newline.
+        // The two `a` occurrences sit at distinct source spans; `b` at a third.
+        let src = "def add(a, b):\n    a + a + b\nadd(1, 2)\n";
+        let a1 = Span::new(19, 20);
+        let a2 = Span::new(23, 24);
+        let b = Span::new(27, 28);
+
+        let stmts = parse_module(src);
+        let mut ctx = LoweringContext::default();
+        let session = RecorderSession::lowering();
+        let ccl = lower_stmts(&stmts, &mut ctx)
+            .into_result()
+            .expect("lowering failed");
+        let log = session.into_lowering_log();
+
+        let mut ids: HashSet<NodeId> = HashSet::new();
+        fn all_ids(e: &Expr, acc: &mut HashSet<NodeId>) {
+            acc.insert(e.node_id());
+            e.walk_children(|c| all_ids(c, acc));
+        }
+        all_ids(&ccl, &mut ids);
+        let (projection, leaks) = collapse_lowering(&log, &ids);
+        assert!(leaks.is_empty(), "lowering fold is leak-free: {leaks:?}");
+
+        // Collect the source span each uncurry-projection ROOT carries. A
+        // projection node is `Apply { function: Proj(Index(_)) }` — its argument
+        // is the synthetic tuple var. Its own id is the occurrence's, carried by
+        // root-carry, so its projection entry is the occurrence's `Source` image.
+        fn projection_spans(e: &Expr, proj: &SourceProjection, out: &mut Vec<Span>) {
+            if let TypedExprNode::Apply { function, .. } = &e.node
+                && matches!(function.node, TypedExprNode::Proj(_))
+                && let Some(attr) = proj.get(&e.node_id())
+            {
+                assert_eq!(
+                    attr.rewritten.nature,
+                    Nature::Source,
+                    "a root-carried projection preserves the occurrence's Source image"
+                );
+                out.extend(attr.spans.iter().copied());
+            }
+            e.walk_children(|c| projection_spans(c, proj, out));
+        }
+        let mut spans = Vec::new();
+        projection_spans(&ccl, &projection, &mut spans);
+        spans.sort_by_key(|s| (s.start, s.end));
+
+        assert_eq!(
+            spans,
+            vec![a1, a2, b],
+            "each projection root carries its OWN occurrence's span — the two `a` \
+             uses at distinct spans, plus `b`, not the shared `def` span"
+        );
     }
 }
