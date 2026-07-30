@@ -7,17 +7,19 @@ Three checks, run together (see `.github/scripts/doc-refs/README.md`):
      to a file that exists, and when it carries a `#fragment` into a Markdown
      file, that anchor exists among the target's headings (GitHub slug rules).
 
-  B. code -> doc: every `<name>.md` mentioned in a Rust *comment* resolves to a
-     doc that exists, and any section title quoted immediately after it (the
-     checkable citation convention) exists as a heading in that doc.
+  B. prose -> doc section: every `<name>.md` mentioned in a Rust *comment* or in
+     doc prose resolves to a doc that exists, and any section title quoted
+     immediately after it (the checkable citation convention) exists as a
+     heading in that doc.
 
   C. doc -> source: every backtick source-path mention in doc prose (e.g.
      `ast.rs`, `src/ccl/lower/loops.rs`) resolves to a file that exists. A line
      may opt out with a `doc-refs-ignore` marker (deleted/renamed files,
      illustrative examples).
 
-Both share one primitive: the set of valid anchors for a Markdown file, computed
-with GitHub's heading-slug algorithm. No external dependencies — stdlib only.
+A and B share one primitive: the set of valid anchors for a Markdown file,
+computed with GitHub's heading-slug algorithm — an anchor link and a quoted
+heading are the same reference in two notations. No dependencies — stdlib only.
 
 Exit status is non-zero if any reference is broken, so `ci.sh` can gate on it.
 """
@@ -152,8 +154,38 @@ class Repo:
         """Resolve a loosely-written path (e.g. `design/mutability.md`, a bare
         `ast.rs`, or a full repo path) by unique path-suffix match. Returns
         (resolved, candidates); resolved is None when zero or >1 candidates."""
-        cands = self._by_suffix.get(written.lstrip("./"), [])
+        # `lstrip("./")` would eat the leading dot of a dotfile path such as
+        # `.github/scripts/...`; only a `./` prefix is noise.
+        cands = self._by_suffix.get(re.sub(r"^(?:\./)+", "", written), [])
         return (cands[0] if len(cands) == 1 else None, cands)
+
+
+# --------------------------------------------------------------------------- #
+# Wrapping matches                                                            #
+# --------------------------------------------------------------------------- #
+#
+# Prose here is hard-wrapped, in docs and in Rust comments alike, so a reference
+# near the right margin routinely continues on the next line: a Markdown link
+# whose text wraps, a quoted section title split across two `///` lines. A
+# scanner that reads one line at a time simply does not see those references —
+# and an unchecked reference is worse than a broken one, because nothing says so.
+#
+# The counter-pressure is that a delimiter allowed to roam too far pairs up with
+# an unrelated one and invents a match out of ordinary prose. So a wrapping run
+# is bounded twice: by a line budget, and by never crossing a blank line, which
+# ends the thought a reference belongs to.
+
+
+def _wrapping(chars: str, breaks: int = 2) -> str:
+    """A run of `chars` (a newline-free character class) that may continue onto
+    up to `breaks` further lines, each of which must carry content."""
+    cont = rf"\n[ \t]*(?![\n \t]){chars}*"
+    return rf"{chars}*(?:{cont}){{0,{breaks}}}"
+
+
+def _line_at(text: str, offset: int, first_line: int = 1) -> int:
+    """The source line an offset falls on, for text whose newlines are intact."""
+    return first_line + text.count("\n", 0, offset)
 
 
 # --------------------------------------------------------------------------- #
@@ -171,10 +203,12 @@ class Problem:
 # Check A — Markdown link targets and anchors                                 #
 # --------------------------------------------------------------------------- #
 
-# Inline `[text](target)`. Targets with spaces/`)` are rare here; take up to the
-# first whitespace or `)` and drop an optional `"title"` suffix.
-_MD_LINK = re.compile(r"\[[^\]]*\]\(\s*(<[^>]+>|[^)\s]+)")
-_INLINE_CODE = re.compile(r"`[^`]*`")
+# Inline `[text](target)`, whose text may wrap. Targets with spaces/`)` are rare
+# here; take up to the first whitespace or `)` and drop an optional `"title"`
+# suffix. (The `](` seam never wraps — Markdown does not read `[text]\n(url)` as
+# a link — so only the text needs the wrapping treatment.)
+_MD_LINK = re.compile(r"\[" + _wrapping(r"[^\]\n]") + r"\]\(\s*(<[^>]+>|[^)\s]+)")
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
 
 
 def check_markdown_links(repo: Repo, problems: list[Problem]) -> int:
@@ -183,20 +217,27 @@ def check_markdown_links(repo: Repo, problems: list[Problem]) -> int:
         if rel.suffix != ".md":
             continue
         text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
-        # Number lines but only scan those outside code fences; inline code
-        # spans within a prose line are stripped so example links don't count.
-        fenced = set(_fenced_line_numbers(text))
-        for lineno, raw in enumerate(text.splitlines(), start=1):
-            if lineno in fenced:
+        prose = _prose_lines(text)
+        for m in _MD_LINK.finditer(prose):
+            target = m.group(1).strip("<>")
+            if EXTERNAL_SCHEME.match(target):
                 continue
-            line = _INLINE_CODE.sub("", raw)
-            for m in _MD_LINK.finditer(line):
-                target = m.group(1).strip("<>")
-                if EXTERNAL_SCHEME.match(target):
-                    continue
-                checked += 1
-                _check_one_link(repo, rel, lineno, target, problems)
+            if IGNORE_MARKER in _line_of(prose, m.start()):
+                continue
+            checked += 1
+            _check_one_link(repo, rel, _line_at(prose, m.start()), target, problems)
     return checked
+
+
+def _prose_lines(md_text: str) -> str:
+    """`md_text` with everything that is not prose blanked out: fenced-code
+    lines and inline code spans (an example link must not be checked). Line
+    breaks survive, so offsets still map back to source lines."""
+    fenced = set(_fenced_line_numbers(md_text))
+    return "\n".join(
+        "" if lineno in fenced else _INLINE_CODE.sub("", line)
+        for lineno, line in enumerate(md_text.splitlines(), start=1)
+    )
 
 
 def _check_one_link(
@@ -260,10 +301,11 @@ _INLINE_SPAN = re.compile(r"`([^`\n]+)`")
 _SRC_PATH = re.compile(
     r"^([A-Za-z0-9_][\w./-]*\.(?:" + "|".join(_SRC_EXT) + r"))(?::\d+(?:-\d+)?)?$"
 )
-# A line carrying this marker opts out of the source-path check. For the
-# legitimate cases a pure existence check can't tell from rot: illustrative
-# example paths, and deliberate mentions of a deleted/renamed file (migration
-# notes, changelogs — "`foo.rs` was deleted").
+# A line carrying this marker opts out of *every* check on that line — links,
+# citations, source paths alike. For the legitimate cases a pure existence check
+# can't tell from rot: prose that illustrates the reference syntax itself, and
+# deliberate mentions of a deleted/renamed file (migration notes, changelogs —
+# "`foo.rs` was deleted").
 IGNORE_MARKER = "doc-refs-ignore"
 
 
@@ -302,33 +344,85 @@ def check_doc_source_paths(repo: Repo, problems: list[Problem]) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Check B — Rust comment references to docs                                    #
+# Check B — quoted-title citations, from Rust comments and from doc prose      #
 # --------------------------------------------------------------------------- #
 
-# A `<name>.md` path token as written in a comment (backticks, quotes, and other
-# wrappers are handled by the comment-extraction step around it).
+# A `<name>.md` path token as written in prose (backticks, quotes, and other
+# wrappers are handled by the extraction step around it).
 _MD_REF = re.compile(r"(?<![\w./-])([\w./-]+\.md)")
+
+# A ref sitting inside a `[text](destination)`. The link's own path and anchor
+# are check A's; re-reporting them here would double up on one link.
+_LINK_DEST = re.compile(r"\]\(\s*<?[^)\s]*$")
+
+
+def _citation_tail(text: str, ref: re.Match) -> tuple[int, bool] | None:
+    """Where a citation after the doc ref `ref` would begin, and whether the ref
+    is a link destination.
+
+    A citation commonly hangs off a link rather than a bare path —
+    `[x](doc.md), "Title"` is the usual shape in doc prose — so there the title
+    follows the closing paren, not the path. `None` if the link never closes.
+    """
+    if _LINK_DEST.search(text, 0, ref.start()) is None:
+        return ref.end(), False
+    close = text.find(")", ref.end())
+    return None if close == -1 else (close + 1, True)
 
 # The checkable-citation tail: after a doc ref, a run of one-or-more quoted
 # section titles joined only by "glue" (separators/wrappers/§N/`and`). Any other
 # word (`rule`, a `:`- introduced clause, a sentence) ends the run, so incidental
 # body-text quotes further along the sentence are NOT treated as titles.
-_CITATION_STEP = re.compile(r'(?:[\s,/()`§\d.]|and\b|—)*"([^"]+)"')
+#
+# Both the glue and the title itself may wrap onto the next comment line (see
+# "Wrapping matches" above): the glue by one break — the title starts on this
+# line or the next — and the title by the general budget.
+_GLUE = r"(?:[ \t,/()`§\d.]|and\b|—)*"
+_WRAP = r"(?:\n" + _GLUE + r")?"  # at most one line break inside the glue
+_QUOTED_TITLE = '"(' + _wrapping(r'[^"\n]') + ')"'
+_CITATION_STEP = re.compile(_GLUE + _WRAP + _QUOTED_TITLE)
+# The same window with only an *opening* quote: a citation that never closes,
+# which is exactly what an over-long wrap or a typo looks like.
+_DANGLING_QUOTE = re.compile(_GLUE + _WRAP + '"')
 
 
-def check_code_refs(repo: Repo, problems: list[Problem]) -> int:
+def check_doc_citations(repo: Repo, problems: list[Problem]) -> int:
+    """Check B over both places the quoted-title convention is written: Rust
+    comments, and doc prose (a doc citing a *section* of another doc names it
+    the same way). A link is the better form in a doc and check A validates it
+    end to end — but the quoted form is what rots unnoticed, so it is the one
+    that needs checking."""
     checked = 0
     for rel in repo.files:
-        if rel.suffix != ".rs":
+        if rel.suffix not in (".rs", ".md"):
             continue
         text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
-        for lineno, comment in _rust_comment_spans(text):
-            for m in _MD_REF.finditer(comment):
+        units = _rust_comments(text) if rel.suffix == ".rs" else [_doc_prose(text)]
+        for unit in units:
+            for m in _MD_REF.finditer(unit.text):
                 written = m.group(1)
+                if IGNORE_MARKER in _line_of(unit.text, m.start()):
+                    continue
+                tail = _citation_tail(unit.text, m)
+                if tail is None:
+                    continue
+                tail_at, in_link = tail
+                titles, dangling = _cited_titles(unit.text[tail_at:])
+                # In a *comment* the `.md` mention is itself the citation —
+                # there is no link syntax to use — so it must resolve. In a doc,
+                # the citation form is a link (check A), and a bare doc name in
+                # prose is just prose, as legitimately loose as the source paths
+                # check C stays lenient about. What makes it a citation is a
+                # quoted title, and that is exactly when the path has to be
+                # pinned down: an ambiguous one leaves nothing to check against.
+                if rel.suffix == ".md" and not titles and not dangling:
+                    continue
                 checked += 1
                 resolved, cands = repo.resolve_suffix(written)
-                src = f"{rel}:{lineno}"
+                src = f"{rel}:{unit.line_at(m.start())}"
                 if resolved is None:
+                    if in_link:
+                        continue  # check A already reports a bad link target
                     if not cands:
                         problems.append(
                             Problem(src, f"doc ref does not resolve: {written}")
@@ -343,38 +437,111 @@ def check_code_refs(repo: Repo, problems: list[Problem]) -> int:
                             )
                         )
                     continue
-                # Validate any section titles cited right after the ref.
-                for title in _cited_titles(comment[m.end():]):
-                    slug = _slug_base(_strip_md_markers(title))
+                for title in titles:
+                    slug = _slug_base(_normalize_title(title))
                     if slug not in repo.anchors(resolved):
+                        shown = " ".join(title.split())
                         problems.append(
                             Problem(
                                 src,
-                                f'cited section "{title}" not found as a '
+                                f'cited section "{shown}" not found as a '
                                 f"heading in {resolved} (see the citation "
                                 f"convention in the doc-refs README)",
                             )
                         )
+                if dangling:
+                    problems.append(
+                        Problem(
+                            src,
+                            f"unterminated quoted citation after {written}: the "
+                            f"opening quote has no closing quote within the next "
+                            f"few lines, so no section title could be checked "
+                            f"(see the citation convention in the doc-refs "
+                            f"README)",
+                        )
+                    )
     return checked
 
 
-def _cited_titles(tail: str):
-    """Titles in the adjacent quoted-citation run at the start of `tail`."""
+def _cited_titles(tail: str) -> tuple[list[str], bool]:
+    """Titles in the adjacent quoted-citation run at the start of `tail`.
+
+    Returns the titles plus a flag for a *dangling* citation: an opening quote
+    sitting exactly where a title would be, with nothing closing it inside the
+    citation window. That is what an unclosed or over-wrapped citation looks
+    like, and it is worth reporting precisely because the alternative — treating
+    an unparseable citation as "no citation" — is how a title goes unchecked
+    without anyone noticing.
+    """
+    titles: list[str] = []
     pos = 0
     while True:
         m = _CITATION_STEP.match(tail, pos)
         if not m:
-            return
-        yield m.group(1)
+            return titles, _DANGLING_QUOTE.match(tail, pos) is not None
+        titles.append(m.group(1))
         pos = m.end()
 
 
-def _strip_md_markers(title: str) -> str:
-    return title.replace("`", "")
+def _normalize_title(title: str) -> str:
+    """A cited title as it would read on one line: no Markdown code ticks, and
+    a wrap's line break plus indentation collapsed back to the single space it
+    stands for (headings never contain a newline, and `_slug_base` maps each
+    whitespace character to its own hyphen)."""
+    return " ".join(title.replace("`", "").split())
 
 
-def _rust_comment_spans(text: str):
-    """Yield (line_number, comment_text) for every Rust comment in `text`.
+@dataclass
+class Prose:
+    """A run of prose to scan for citations, with its line breaks intact.
+
+    The unit a *sentence* is written in — a Rust comment run, or a whole doc —
+    because a citation near the right margin wraps, and a scanner that reads
+    one line at a time would not see it. Markup that is not prose is stripped
+    in place (comment markers, code fences) rather than deleted, so `line_at`
+    stays an exact offset→line map for reporting.
+    """
+
+    first_line: int
+    text: str
+
+    def line_at(self, offset: int) -> int:
+        return _line_at(self.text, offset, self.first_line)
+
+
+def _doc_prose(md_text: str) -> Prose:
+    """A Markdown file as one prose run: fenced code blanked out, inline code
+    *kept* — a cited heading routinely contains backticks (`` "`Mut` is a CCL
+    type" ``), and dropping the spans would mangle the title."""
+    fenced = set(_fenced_line_numbers(md_text))
+    return Prose(
+        1,
+        "\n".join(
+            "" if lineno in fenced else line
+            for lineno, line in enumerate(md_text.splitlines(), start=1)
+        ),
+    )
+
+
+def _line_of(text: str, offset: int) -> str:
+    """The whole line `offset` falls on — for the opt-out marker, which applies
+    to the line that carries it."""
+    return text[text.rfind("\n", 0, offset) + 1 :].partition("\n")[0]
+
+
+# A line whose content begins with a line comment, i.e. one that continues a
+# run. A comment trailing *code* does not continue a run: the code between them
+# means they are two separate thoughts on two separate lines.
+_LINE_COMMENT_START = re.compile(r"[ \t]*//")
+# `///`, `//!`, `//` — the marker itself carries no prose.
+_LINE_MARKER = re.compile(r"^[ \t]*//[/!]?")
+# Block-comment decoration: the leading `*` of a continuation line.
+_BLOCK_DECORATION = re.compile(r"(?m)^[ \t]*\*")
+
+
+def _rust_comments(text: str):
+    """Yield every comment in `text` as a `Prose` run, in source order — a block
+    comment, or a run of consecutive line comments, markers stripped.
 
     A small scanner that tracks strings (incl. raw `r#".."#`), char/lifetime
     tokens, line comments, and *nesting* block comments, so a `.md` inside a
@@ -389,9 +556,18 @@ def _rust_comment_spans(text: str):
             line += 1
             i += 1
         elif c == "/" and i + 1 < n and text[i + 1] == "/":
-            j = text.find("\n", i)
-            j = n if j == -1 else j
-            yield line, text[i:j]
+            start_line = line
+            parts = []
+            while True:
+                j = text.find("\n", i)
+                j = n if j == -1 else j
+                parts.append(_LINE_MARKER.sub("", text[i:j]))
+                nxt = _LINE_COMMENT_START.match(text, j + 1) if j < n else None
+                if nxt is None:
+                    break
+                i = nxt.end() - 2  # the `//` opening the next line's comment
+                line += 1
+            yield Prose(start_line, "\n".join(parts))
             i = j
         elif c == "/" and i + 1 < n and text[i + 1] == "*":
             start_line = line
@@ -406,7 +582,7 @@ def _rust_comment_spans(text: str):
                     i += 2
                 else:
                     i += 1
-            yield start_line, text[prev:i]
+            yield Prose(start_line, _BLOCK_DECORATION.sub("", text[prev:i]))
             line += text.count("\n", prev, i)
         elif c == '"':
             i = _skip_string(text, i)
@@ -463,7 +639,7 @@ def main() -> int:
     problems: list[Problem] = []
     n_links = check_markdown_links(repo, problems)
     n_paths = check_doc_source_paths(repo, problems)
-    n_refs = check_code_refs(repo, problems)
+    n_refs = check_doc_citations(repo, problems)
 
     if problems:
         problems.sort(key=lambda p: p.source)
@@ -472,14 +648,14 @@ def main() -> int:
             print(f"  {p.source}: {p.detail}", file=sys.stderr)
         print(
             f"\n{len(problems)} broken reference(s) across {n_links} Markdown "
-            f"link(s), {n_paths} source-path mention(s), and {n_refs} code ref(s).",
+            f"link(s), {n_paths} source-path mention(s), and {n_refs} doc citation(s).",
             file=sys.stderr,
         )
         return 1
 
     print(
         f"doc-refs OK: {n_links} Markdown link(s), {n_paths} source-path "
-        f"mention(s), {n_refs} code ref(s) checked."
+        f"mention(s), {n_refs} doc citation(s) checked."
     )
     return 0
 

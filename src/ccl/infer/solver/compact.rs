@@ -578,7 +578,8 @@ fn compact_go(
             // `specialize_lambda_domain`. Both Apply edges are one-way (no
             // emit-time reverse whose eager cross-component propagation would
             // cover these halves); see `design/type-inference.md` ("Apply is
-            // one-way" and "Closing the single-sided blind spots").
+            // one-way" and "Closing the single-sided blind spots (no separate
+            // pass)").
             let primary_bounds = primary.clone();
             let opposite_bounds = if pol {
                 s.upper.clone()

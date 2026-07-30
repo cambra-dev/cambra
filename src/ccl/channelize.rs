@@ -20,7 +20,8 @@
 //! a feed-only-loop or scalar feed.
 //!
 //! Type errors report against the user-shaped tree (inference types the defer
-//! constructs directly: see `design/type-inference.md` §"Feed handles as an invariant `History` constructor (`Type::History { kind: Feed }`)"), so this
+//! constructs directly: see `design/type-inference.md`, "Feed handles as an
+//! invariant `History` constructor (`Type::History { kind: Feed }`)"), so this
 //! step never fails on a user error — it only rejects internally-inconsistent
 //! shapes.
 //!

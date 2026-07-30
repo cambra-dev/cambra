@@ -876,11 +876,11 @@ fn annotation_peels_to_hole(ty: &Type) -> bool {
 
 /// Enforce the second-class `Mut` discipline (design doc
 /// `src/ccl/design/mutability.md`, "No aliasing: `Mut` values are
-/// second-class"): a post-inference structural pass over the fully-typed,
-/// still-`Mut`-bearing tree. Runs *after* [`check_pre_desugar`] and *before*
-/// `inline`, so it sees the pre-inline `Apply`/parameter structure (rule 1's
-/// argument check) and the coalesced `.ty` slots plus each binder's
-/// [`TypedBinding::user_annotation`].
+/// second-class (downward-only)"): a post-inference structural pass over the
+/// fully-typed, still-`Mut`-bearing tree. Runs *after* [`check_pre_desugar`]
+/// and *before* `inline`, so it sees the pre-inline `Apply`/parameter
+/// structure (rule 1's argument check) and the coalesced `.ty` slots plus each
+/// binder's [`TypedBinding::user_annotation`].
 ///
 /// The three rules, all of which keep a mutable value statically traceable to
 /// a single introduction (so the writer set of every mutable variable is known):

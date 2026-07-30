@@ -359,11 +359,11 @@ fn test_mutability(#[case] code: &str, #[case] expected: Tile) {
 }
 
 // ---------------------------------------------------------------------------
-// Second-class `Mut` discipline (design doc, "No aliasing: `Mut` values are
-// second-class"). A mutable value must stay traceable to one introduction:
-// it may only be a bare variable reference (rule 1), never nested in a
-// composite type or returned from a function (rule 2), and an unannotated
-// binding may not have `Mut` type (rule 3).
+// Second-class `Mut` discipline (`src/ccl/design/mutability.md`, "No aliasing:
+// `Mut` values are second-class (downward-only)"). A mutable value must stay
+// traceable to one introduction: it may only be a bare variable reference
+// (rule 1), never nested in a composite type or returned from a function
+// (rule 2), and an unannotated binding may not have `Mut` type (rule 3).
 // ---------------------------------------------------------------------------
 
 /// Compile `code`, expect failure, and assert the rendered errors contain

@@ -5,8 +5,8 @@
 //! `LetRec`**: the accumulators' history over the loop's induction domain,
 //! recursion causal by [`Builtin::GetPrevSeq`], trailing reads rewritten to
 //! `final_or_default` over the completed history. This is the induction slice
-//! of the unified phase in `src/ccl/design/mutability.md` ("The unified
-//! phase"); transactions join it in a later step.
+//! of the phase in `src/ccl/design/mutability.md` ("mut_elim: eliminating
+//! overwrite mutability"); transactions join it in a later step.
 //!
 //! The phase runs **after inlining** on a fully-typed tree and is
 //! type-preserving: every constructed node is stamped with its concrete

@@ -31,9 +31,9 @@
 //!
 //! Both layers preserve the original chumsky error in the returned
 //! `ParseResult::errors` list, so a file with multiple syntax errors
-//! reports them all in one pass. See `design-chl-parser.md` (sibling
-//! file) for the "Load-bearing detail" about `.at_least(1)` and the
-//! lexer-level `UnclosedBracket` interaction.
+//! reports them all in one pass. See the sibling `design-chl-parser.md`,
+//! "Statement-level recovery" — the load-bearing `.at_least(1)` detail and
+//! the lexer-level `UnclosedBracket` interaction.
 //!
 //! ## Error message quality
 //!

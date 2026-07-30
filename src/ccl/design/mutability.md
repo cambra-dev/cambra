@@ -220,9 +220,10 @@ Typing:
   check, post-inline — so one `bump` can serve an induction accumulator and a transactional
   register.
 
-**No aliasing: `Mut` values are second-class (downward-only).** Passing a reference *down* is safe
-exactly as long as the compiler can statically resolve which introduction every write targets. The
-discipline:
+#### No aliasing: `Mut` values are second-class (downward-only)
+
+Passing a reference *down* is safe exactly as long as the compiler can statically resolve which
+introduction every write targets. The discipline:
 
 1. A `Mut`-typed expression must be a **bare variable reference** — an argument to a `Mut`
    parameter is a variable, never a conditional or computed expression. The two halves catch
