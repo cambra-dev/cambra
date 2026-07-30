@@ -22,7 +22,9 @@ Determine the review scope from the user's request:
 
 Execute the following to build context:
 
-- **Git Changes**: Use `git show [range] -p` to read both commit messages and the full diff.
+- **Repo Changes**: Use `jj` if available or referenced, otherwise `git`, to read commit messages and the full diff.
+  - **Git**: `git show [range] -p`
+  - **jj**: `jj show [range]`
 - **Design Docs**: Read `docs/design.md` and any other specified documents to understand the intended semantics and architecture.
 
 ### 3. Analysis Criteria
@@ -47,6 +49,8 @@ Provide a structured response:
 - **Architectural Notes**: How well the code aligns with the design.
 - **Detailed Feedback**: Specific line-by-line or function-level observations, categorized by "Critical," "Important," or "Nit."
 - **Next Steps**: Recommended actions or refactors.
+
+If there are Critical or Important findings, attempt to produce an illustrative, concise test case which exercises the gap in logic or bug, or comment why this is challenging to do.
 
 ## Example Triggers
 
