@@ -852,13 +852,14 @@ pub fn compile_program(
         }
     })?;
 
-    // Enforce the second-class `Mut` discipline (design doc, "No aliasing:
-    // `Mut` values are second-class") on the fully-typed, still-`Mut`-bearing
-    // tree — after the consistency wall, before inlining. It needs the
-    // pre-inline `Apply`/parameter structure (rule 1's argument check) and the
-    // coalesced `.ty` slots and `user_annotation`s. Unlike the surrounding
-    // `check_pre_desugar` walls (compiler-bug backstops), these are user
-    // errors: aliasing or nesting a mutable reference.
+    // Enforce the second-class `Mut` discipline (`src/ccl/design/mutability.md`,
+    // "No aliasing: `Mut` values are second-class (downward-only)") on the
+    // fully-typed, still-`Mut`-bearing tree — after the consistency wall,
+    // before inlining. It needs the pre-inline `Apply`/parameter structure
+    // (rule 1's argument check) and the coalesced `.ty` slots and
+    // `user_annotation`s. Unlike the surrounding `check_pre_desugar` walls
+    // (compiler-bug backstops), these are user errors: aliasing or nesting a
+    // mutable reference.
     check_mut_discipline(&expr).map_err(|errs| errs.into_compile_errors())?;
 
     // Enforce that every `:=` / `+=` write targets a mutable variable (a write is

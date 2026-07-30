@@ -66,7 +66,8 @@ feed-routing step (channelize) of mutability elimination. A generator with loop-
 is a `<<` against a synthesized result defer.
 
 The design of record for the recurrence construction and feed routing is
-[mutability.md](mutability.md) ("The model", "mut_elim", and §4); the
+[The model: histories and causal recursion](mutability.md#the-model-histories-and-causal-recursion)
+and [mut_elim: eliminating overwrite mutability](mutability.md#mut_elim-eliminating-overwrite-mutability); the
 implementation lives in `src/ccl/mut_elim.rs` (the `For`/`MutWrite` → `LetRec`
 → `Transact` via loop planning) and `src/ccl/channelize.rs` (feed routing).
 
@@ -82,7 +83,7 @@ Generator expressions `(expr for x in xs)` are lowered via `lower_list_comp` to 
 
 ## Deferred collection operators — `defer` / `<<` / `<<=`
 
-`defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** — after type inference and mut_elim — by the feed-channelization step `channelize::run` (§"The `channelize` step" below).
+`defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** — after type inference and mut_elim — by the feed-channelization step `channelize::run` ([The `channelize` step](#the-channelize-step-feed-channelization), below).
 
 > TODO: `x = defer()` should be replaced with `deferred x` once we implement a custom parser and aren't stuck with CHL parsing rules.
 
@@ -125,6 +126,6 @@ The design of record — where this step sits in mutability elimination and why 
 
 ### Inference before desugaring
 
-The inference pass types `Defer`/`Feed`/`Define` directly — `Defer : Feed(ChanDom(d) ⇒ V)`, `Feed`/`Define : Unit` with their contributions constrained into the channel (see [type-inference.md](type-inference.md) §"Feed handles"). `channelize` then rewrites each resolved defer cluster into a `Feed`-kind `LetRec` group of assembled channels, erasing the transient `Feed` histories and substituting each rigid `ChanDom(d)` domain for the concrete channel domain. No special `DeferredCollectionDomain` type is needed — standard inference does the job, every channel node is typed by construction, and reads type concretely via their `ChanDom` domains (no `retype` pass, no bounded read-type fixup).
+The inference pass types `Defer`/`Feed`/`Define` directly — `Defer : Feed(ChanDom(d) ⇒ V)`, `Feed`/`Define : Unit` with their contributions constrained into the channel (see [Feed handles as an invariant `History` constructor](type-inference.md#feed-handles-as-an-invariant-history-constructor-typehistory--kind-feed-)). `channelize` then rewrites each resolved defer cluster into a `Feed`-kind `LetRec` group of assembled channels, erasing the transient `Feed` histories and substituting each rigid `ChanDom(d)` domain for the concrete channel domain. No special `DeferredCollectionDomain` type is needed — standard inference does the job, every channel node is typed by construction, and reads type concretely via their `ChanDom` domains (no `retype` pass, no bounded read-type fixup).
 
 Mutation-loop inference (`emit_loop`) learns the loop body's full Record codomain from the body itself via a one-way subtyping constraint: `require_sub(body_codomain, product({step: σ}))` pins the `step` field while width-subtyping lets the body's Record literal supply whatever `to_<defer>` fields it carries. This is the general pattern for "a known core plus an open set of additional fields" — an open record demanded by `require_sub`, not a dedicated partial-record type.

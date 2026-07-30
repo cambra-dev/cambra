@@ -37,7 +37,8 @@ preserves node identity and records what it rewrote, so
 rebuilds nodes.
 
 The feed-channelization step (`ccl/channelize.rs`) has no dedicated design doc: its design of
-record is [mutability.md](mutability.md) §4 ("Retire `desugar_defers`"), and the in-depth
+record is [Compilation pipeline](mutability.md#compilation-pipeline) in `mutability.md` — feed
+routing is the append-law half of mutability elimination — and the in-depth
 implementation notes (cluster algorithm, per-shape extraction, error modes, navigation map) live in
 the module's own rustdoc.
 

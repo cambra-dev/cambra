@@ -73,33 +73,42 @@ Avoid comments that describe the history of the codebase.  Comments should expla
 ### Referencing docs and sections
 
 Cross-references into the docs are checked by `./ci.sh doc_refs` (Markdown
-links/anchors between docs, and `<name>.md` citations in Rust comments) and a
-broken one fails CI. Two rules keep references from rotting:
+links/anchors between docs, and `<name>.md` citations in Rust comments *and* doc
+prose) and a broken one fails CI. Two rules keep references from rotting:
 
 **Use a checkable form.**
 
 - *Doc → doc*: a Markdown link — `[text](path.md#anchor)`. The `#anchor` is
-  validated against the target's headings.
+  validated against the target's headings. This is the preferred form in a doc:
+  it survives the same renames a quoted title does, and the anchor is checked too.
 - *Code → doc*: the doc path followed by the section's **exact heading text** in
   double quotes, adjacent — e.g. ``see `src/ccl/design/ir.md`, "Application
   shape"``. The checker confirms the quoted title is a real heading. Prefer this
   over an anchor fragment in code: a title survives section reordering and reads
   as prose. (Details and the citation grammar: `.github/scripts/doc-refs/README.md`.)
 
+Either form must name a **heading**, spelled **exactly**. A bold paragraph
+lead-in is not citable (no anchor, nothing to check) — promote it to a heading in
+the same change if you need to point at it. An abbreviated title (`"The model"`
+for *The model: histories and causal recursion*) reads fine and fails the check;
+that gap is where silent rot lives. A quoted title in doc prose is checked
+wherever it sits, including hanging off a link — both halves of `[mutability.md](mutability.md), "The model"` are validated. <!-- doc-refs-ignore: illustrative -->
+
 **Never reference something uncheckable — it rots silently because nothing can
 validate it.** Specifically avoid:
 
 - *Section numbers across docs* (`§4.6`) — cite the heading (anchor link or
   quoted title) instead. (Existing `§`-refs are being migrated to links as a
-  follow-up; don't add new ones.)
+  follow-up; don't add new ones.) A `§` *followed by a quoted title* is now
+  checked on the title, but the number in front of it still isn't — drop it.
 - *Transient identifiers*, which are wrong almost immediately: PR-stack positions
   ("the PR above/below", "PR 3 in the stack"), PR/issue numbers used as if they
   were stable section markers, review-comment numbers, and dated notes ("the
   2026-06-29 notes"). If the thing you want to point at is durable, give it a
   heading and cite that; if it isn't, inline the substance instead of pointing.
 
-When you rename a heading, `./ci.sh doc_refs` flags every inbound link and code
-citation — update them in the same change.
+When you rename a heading, `./ci.sh doc_refs` flags every inbound link and
+citation, from code and from docs — update them in the same change.
 
 ### Rendering CCL ASTs in conversation
 
