@@ -27,7 +27,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::symbolic::symbolic;
-use crate::ccl::{Expr, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{
+    Expr, FieldKey, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode,
+};
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
@@ -275,6 +277,26 @@ pub enum InferError {
         type_b: Box<Type>,
         ctx: String,
     },
+    /// A product type lacked a field a structural edge required — the violation of
+    /// width subtyping, whose rule is that the required shape's keys all appear in the
+    /// one that flows into it.
+    ///
+    /// Its own variant rather than a [`InferError::TypeMismatch`] because there is no
+    /// second *type* worth reporting. What failed is a shape's **field set**, and the
+    /// shape that made the demand is typically partial — a projection requires only the
+    /// one field it reads — so rendering it opposite the found type describes a type the
+    /// program never had.
+    MissingField {
+        /// The key the required shape demands and `found` does not carry. For a
+        /// positional key this is the **widest** position demanded, not the first
+        /// absent one: [`Type::Tuple`] is dense, so `.99` on a 3-tuple demands a
+        /// 100-wide tuple, and the position that is actually missing is `.99`.
+        key: FieldKey,
+        /// The product that should have carried `key`.
+        found: Type,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
     /// A [`Type::Fun`] was required — e.g. in a function-application or
     /// [`TypedExprNode::Compose`] position — but a non-function type was found.
     ExpectedFunction {
@@ -459,6 +481,28 @@ impl LocatedInferError {
     }
 }
 
+/// The hint for a mismatch between a [`Type::Record`] and a [`Type::Tuple`].
+///
+/// The two are the same thing — a product — keyed differently, by field *name* and by
+/// *position*, so a mismatch between them is never about depth: it is always that one
+/// keying was used where the other applies, which the bare shapes do not say. It is the
+/// failure `r.0` and `t.name` produce, and the required side of such an edge is a
+/// projection's *partial* shape (`(?31)` names only the position it reads), so the raw
+/// message reads as internal machinery rather than as the mistake.
+///
+/// Both messages are facts about the *pair*, true whichever side the solver reports as
+/// "expected" — an application's domain can be raised from either side of its edge.
+fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
+    match (type_a, type_b) {
+        (Type::Record(_), Type::Tuple(_)) | (Type::Tuple(_), Type::Record(_)) => Some(
+            "hint: a record is keyed by field *name* and a tuple by *position* — a record \
+             has no `.0` and a tuple has no named fields, so project a record with \
+             `.name` and a tuple with `.0`",
+        ),
+        _ => None,
+    }
+}
+
 impl std::fmt::Debug for InferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -472,10 +516,41 @@ impl std::fmt::Debug for InferError {
                     f,
                     "Type mismatch for {}: expected {}, found {}",
                     ctx, type_a, type_b
-                )
+                )?;
+                if let Some(hint) = product_keying_hint(type_a, type_b) {
+                    write!(f, "\n  {hint}")?;
+                }
+                Ok(())
             }
+            InferError::MissingField { key, found, at } => match (key, found) {
+                // A tuple's positions are its width, so that is the fact to state: the
+                // projection asked for a position past the end.
+                (FieldKey::Index(i), Type::Tuple(elems)) => write!(
+                    f,
+                    "No position .{i} for {at}: {found} is a tuple with {} position{}",
+                    elems.len(),
+                    if elems.len() == 1 { "" } else { "s" },
+                ),
+                // A record's `Display` already lists its fields, so naming the absent
+                // one against it is the whole message.
+                (FieldKey::Name(name), _) => {
+                    write!(f, "No field .{name} for {at}: {found} has no such field")
+                }
+                // `found` degraded to a shape whose keying the message cannot lean on
+                // (`coalesce_for_error` falls back to `Type::Hole`).
+                _ => write!(f, "No field .{key} for {at}: {found}"),
+            },
             InferError::ExpectedFunction { found, at } => {
-                write!(f, "Expected function type at {at}, found {found}")
+                write!(f, "Expected function type at {at}, found {found}")?;
+                if matches!(found, Type::Tuple(_) | Type::Record(_)) {
+                    write!(
+                        f,
+                        "\n  hint: a tuple or record is a heterogeneous product, not a \
+                         finite function — project it with `.0` (position) or `.name` \
+                         (field) rather than applying or subscripting it"
+                    )?;
+                }
+                Ok(())
             }
             InferError::AnnotationMismatch {
                 annotation,

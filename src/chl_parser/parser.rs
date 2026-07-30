@@ -159,7 +159,7 @@ type PErr<'src> = extra::Err<Rich<'src, Token, Span>>;
 /// 12. `+`, `-`
 /// 13. `*`, `//`
 /// 14. unary `-`
-/// 15. postfix: call `f(...)`, subscript `x[...]`, attribute `x.name`
+/// 15. postfix: call `f(...)`, subscript `x[...]`, attribute `x.name` / `x.0`
 /// 16. atom: literal, name, parenthesised, list, dict/record, comprehension
 fn expression<'src, I>() -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
 where
@@ -429,8 +429,19 @@ where
                 };
                 PostfixOp::Subscript(Box::new(idx))
             });
+        // `.name` or `.0` — one operation, projecting a field keyed by name or by
+        // position. A positional key is spelled as an integer literal because an
+        // identifier can never begin with a digit, so the two forms cannot collide; the
+        // digits ride in the same `attr` slot and lowering resolves which `ProjKey` they
+        // mean. (`.0` lexes as `Dot` then `Int` — there is no float token to swallow it.)
+        let attr_key = choice((
+            ident_only,
+            select! { Token::Int(n) => n }
+                .map_with(|n, e| (SmolStr::from(n.to_string()), e.span())),
+        ))
+        .labelled("field name or index");
         let attribute = just(Token::Dot)
-            .ignore_then(ident_only)
+            .ignore_then(attr_key)
             .map(|(name, span)| PostfixOp::Attribute(name, span));
 
         let postfix = atom

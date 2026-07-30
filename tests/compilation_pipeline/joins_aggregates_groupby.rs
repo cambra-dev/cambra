@@ -517,11 +517,11 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 /// Join where `y` acts as a lookup table connecting `x`-values to `z`-values via projections.
 ///
-/// Verifies that multi-site tuple-element projection constraints (`y[0]` and `y[1]`)
+/// Verifies that multi-site tuple-element projection constraints (`y.0` and `y.1`)
 /// are correctly inferred: `y` acquires type `Tuple([Int, Int])` from the list element type,
 /// enabling both projections to type-check as `Int`.
 #[case(
-    "[(x , z) for x in [1,2,3] for y in [(3, 30), (2, 20), (1, 10)] for z in [20, 10, 30] if z == y[1] and y[0] == x]",
+    "[(x , z) for x in [1,2,3] for y in [(3, 30), (2, 20), (1, 10)] for z in [20, 10, 30] if z == y.1 and y.0 == x]",
     "(iterate ≫ [1, 2, 3] ≫ ((iterate ≫ [(3, 30), (2, 20), (1, 10)] ≫ .1 ≫ (iterate ≫ [20, 10, 30]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [(3, 30), (2, 20), (1, 10)] ≫ .0) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .2 ≫ [20, 10, 30]) ▷ zip):(([0, 2], [0, 2], [0, 2]) ⇒ (Int, Int))",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([

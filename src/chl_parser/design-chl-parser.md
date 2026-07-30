@@ -95,7 +95,7 @@ highest precedence:
 12. `+`, `-`
 13. `*`, `//`
 14. unary `-`
-15. postfix: call `f(…)`, subscript `x[…]`, attribute `x.name`
+15. postfix: call `f(…)`, subscript `x[…]`, attribute `x.name` / `x.0`
 16. atom: literal, name, parenthesised, list, dict/record, comprehension
 
 Notably absent vs. Python: `/` (true division), `%` (modulo), `**`

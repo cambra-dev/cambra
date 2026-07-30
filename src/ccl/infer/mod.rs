@@ -161,11 +161,15 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
                 }
             }
         }
-        ConstrainError::MissingField { key, in_type } => InferError::TypeMismatch {
-            ctx: format!("{ctx_label} (missing field {key:?})"),
-            type_a: Box::new(coalesce_for_error(&in_type)),
-            type_b: Box::new(Type::Hole),
+        ConstrainError::MissingField { key, in_type } => InferError::MissingField {
+            key,
+            found: coalesce_for_error(&in_type),
+            at: ctx_label.to_string(),
         },
+        // `ExtraTag` is `MissingField`'s dual and has the same shape problem — the
+        // width violation is a *tag set*, not a second type, so `type_b` is filled
+        // with a placeholder. Naming it as its own variant is the same fix, and is
+        // left to whoever next works the variant diagnostics.
         ConstrainError::ExtraTag { tag, in_type } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (variant tag .{tag} not accepted)"),
             type_a: Box::new(coalesce_for_error(&in_type)),

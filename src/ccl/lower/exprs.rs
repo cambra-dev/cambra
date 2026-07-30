@@ -195,6 +195,29 @@ fn lower_call_arg(
     }
 }
 
+/// Lower a subscript `target[index]`.
+///
+/// Subscript and application are the *same* operation — evaluate a finite function at a
+/// point (`docs/chl-spec.md`, "3.9 Subscript and attribute access") — so `c[k]` lowers to
+/// exactly what the application `c(k)` does, and inherits its proof obligation: the index
+/// must lie in the collection's domain.
+///
+/// `[…]` is therefore **only** collection lookup, with no case on the index's shape. A
+/// tuple is a heterogeneous product rather than a finite function, so projecting one is a
+/// different operation with a different spelling — `t.0`, alongside `r.name` — resolved in
+/// the [`ChlExpr::Attribute`] arm of [`lower_expr`]. Deciding between the two by whether
+/// the index happened to be a literal would be a guess lowering has no types to make, and
+/// it is the wrong guess for `xs[0]`, the commonest subscript anyone writes.
+pub(super) fn lower_subscript(
+    target: &Spanned<ChlExpr>,
+    index: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    // The collection is the *function* and the index the *argument*: `c[k]` is `c(k)`.
+    let collection = lower_expr(target, ctx)?;
+    Ok(Expr::apply(lower_expr(index, ctx)?, collection))
+}
+
 pub(super) fn lower_binop(
     left: &Spanned<ChlExpr>,
     op: ChlBinOp,

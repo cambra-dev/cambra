@@ -324,7 +324,7 @@ noted:
 | 12 | `+` `-` | additive |
 | 13 | `*` `//` | multiplicative |
 | 14 | unary `-` | prefix |
-| 15 | postfix: `f(args)`, `x[i]`, `x.attr` | left-fold |
+| 15 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0` | left-fold |
 | 16 | atom | literal, name, `(...)`, `[...]`, `{...}`, comprehension |
 
 ```ebnf
@@ -764,7 +764,8 @@ error.
 
 ```
 target[index]    -- subscript: list element or map lookup
-target.attr      -- attribute: record field access
+target.attr      -- attribute: record field by name
+target.0         -- attribute: tuple field by position
 ```
 
 - **Subscript** on a list with integer index `i` denotes the i-th
@@ -774,13 +775,24 @@ target.attr      -- attribute: record field access
 - **Subscript** on a map with key `k` denotes the value associated
   with `k`. Looking up a missing key is not defined (see *Partiality*,
   §3).
-- **Attribute** on a record denotes the value of the named field. The
-  field must exist; missing fields are a compile-time type error.
+- **Attribute** denotes the value of a field of a product (§3.11),
+  keyed either by **name** (`r.age`, on a record) or by **position**
+  (`t.0`, on a tuple). The field must exist; a missing one is a
+  compile-time type error. An identifier cannot begin with a digit, so
+  the two forms never collide. The forms compose freely, since they are
+  one operation differing only in the key: `r.p.1`, `t.0.b`.
 
-Lists, maps, and records all denote *finite functions* from their
-respective index domains (`UInt`, `K`, field-name) to their element /
-value type — so subscript and attribute access are uniformly
-"evaluate the finite function at a point," just spelt differently.
+Lists and maps denote *finite functions* from their index domains
+(`UInt`, `K`) to their element / value type, so a subscript is
+"evaluate the finite function at a point" — the same operation as a
+call, `c[k]` and `c(k)` alike.
+
+**`[…]` is lookup and `.` is projection — they are not
+interchangeable.** A product is heterogeneous, so it is not a finite
+function and has no domain to look up in: `t[0]` is an error pointing
+at `t.0`. Conversely `.` does not index a collection. The distinction
+is by *spelling*, not by whether the index happens to be a literal, so
+the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 
 > **Direction [Tentative].** The collections sketch
 > (2026-06-29 §2, §6.3
@@ -831,6 +843,8 @@ A trailing comma is allowed in every form (and required to disambiguate
 **Tuple vs. record.** Both use `( … )`: a comma-list of bare expressions is
 a tuple (`(1, 2)`), a comma-list of `name=value` fields is a record
 (`(x=1, y=2)`). `(e)` (no field, no trailing comma) is a parenthesised `e`.
+Both are projected with `.` (§3.9), keyed by position for a tuple (`t.0`)
+and by name for a record (`r.x`); neither is subscripted.
 
 **Records are not braces.** `{...}` is type syntax (§6.1) — a record *type*
 `{name: T}` or a tuple type `{T, U}`. A `{...}` in value position is a
