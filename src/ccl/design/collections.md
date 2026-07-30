@@ -189,7 +189,9 @@ column names the branch that *will* land it.
 | driving a keyed collection as a *nested* comprehension source, and a bare `groupby` tail | Planned | — |
 | the operation layer: iteration element, `[]`/`[]?`, `in`, ordering, `keys`/`values`/`items` | Planned | — |
 | domain invariance modulo refinements (the one new subtyping arm) | Planned | — |
-| lookup discharge + `Option` | Planned | — |
+| checked lookup `𝑐[𝑘]?` — application with the membership refinement dropped, `Option(𝑉)`, Pi binder still discharged | Implemented (typing) | `checked-lookup-typing` |
+| consuming an `Option` (surface `match`) and a runtime presence test | Planned | — |
+| proven lookup `𝑐[𝑘]` — waits on a key *source* (`keys` / entry iteration), not on a rule | Planned | — |
 | mutable / deferred / recursive keyed collections | Planned | — |
 | `box` as the **sole** way into a sum — `𝑇 <: Σ` removed from subtyping, so a join forms no sum ([type-inference.md, Only a term builds a sum](type-inference.md#only-a-term-builds-a-sum)) | Implemented | `collections-design` |
 | the Σ **carrier** — a `sigma` slot beside `fun`, with the merge laws derived from width and consumption rather than chosen ([type-inference.md, How a sum flows through the solver](type-inference.md#how-a-sum-flows-through-the-solver)) | Implemented | `collections-design` |
@@ -547,14 +549,21 @@ is its carried domain, and enumerability comes from the `⤇`, not the witness.
 
 ## Lookup: membership discharge
 
-> **[Planned]** — the two surface operators, proven `c[k] : 𝑇` and checked
+> **[Partly implemented]** — the two surface operators, proven `c[k] : 𝑇` and checked
 > `c[k]? : Option(𝑇)`, are specified in
 > [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access).
-> `c[k]` *parses and lowers* today — to exactly what the application `c(k)` lowers
-> to, since they are one operation — and `c[k]?` reports a not-implemented error.
-> What is missing is the **discharge**, which is this section: the single rule that
-> decides which of the two type-checks. Until it lands no index can carry the proof,
-> so every `c[k]` is rejected with a hint naming `c[k]?`.
+> **`c[k]?` types today** for a keyed collection whose type is known at the lookup:
+> `Option(𝑉)`, with the key's base type checked and the Pi binder discharged
+> ([`Builtin::LookupChecked`]). It is *application with the membership refinement
+> dropped*, which is why it needs no discharge — dropping the token is precisely
+> declining to ask the question this section answers.
+>
+> **`c[k]` is still rejected**, with a hint naming `c[k]?`, and that is the design:
+> a bare key carries no proof. What is missing is not a rule but a *source* — no
+> expression yields a key that carries its collection's key domain, because iteration
+> binds the codomain
+> ([Interim](#iterating-a-setmap-binds-the-codomain-not-the-keys-interim)). The proven
+> operator therefore lands with `keys` / entry iteration, not before it.
 >
 > Note what a range domain costs here. A keyed domain is a *refinement*
 > `{𝐾 | 𝑘 ▷ keydom#id}`, so a key interoperates with `𝐾` by refinement drop and the
@@ -1327,19 +1336,45 @@ rest in, and why that order. Each step is independently landable and pins a test
    > `Member`'s `κ` deliberately de-linked, which is how the pin was confirmed to have
    > moved rather than merely been duplicated.
 
-2. **Restore direct group-by key application; then lookup discharge + `Option`.**
-   Two halves of one mechanic, and the first half is a *regression fix*, not a new
-   capability. `groupby`'s honest keyed type makes `g(k)` a type error — the bare key
-   cannot prove `𝑘 ∈ 𝐸` — which turned off nine previously-green tests: six
-   end-to-end value cases (`test_dependent_groupby_lookup` in
-   `tests/compilation_pipeline/misc.rs`) and three dependent-application type tests
-   (`test_groupby_aggregate`, `test_groupby_dependent_application_discharges_key`,
-   `test_higher_order_dependent_application_discharges_key` in
-   `tests/type_check.rs`), each `#[ignore]`d naming this step. **Un-ignoring all nine
-   is the acceptance criterion.** The prerequisite is [making the membership proof
-   survive being consumed](#prerequisite-the-proof-has-to-survive-being-consumed);
-   the surface pair `𝑐[𝑘]` / `𝑐[𝑘]?` and `Option` over the landed `Variant` nodes
-   (shared with `txn_kv`) sit directly on top.
+2. **Lookup: the checked operator, then the proven one.** Not "restore `g(k)`" — that
+   framing was wrong, and so was the acceptance criterion it implied. `groupby`'s honest
+   keyed type makes `g(k)` at a bare key a type error, and it **must**: an arbitrary key
+   is not known to be present, which is the whole content of
+   [Lookup](#lookup-membership-discharge). The nine tests it turned off all assert a bare
+   literal key *succeeding*, so none of them can be un-ignored — they have to be restated
+   against the checked operator. Three are already resolved that way:
+
+   - The two dependent-application tests were testing the **Pi discharge**, using a
+     group-by key lookup only as a vehicle. That machinery was never broken —
+     `groupby` keeps its named binder and dependent codomain — so they now run on a
+     filtered comprehension over a parameter, which is dependent for the ordinary reason
+     and needs no membership proof (`dependent_application_discharges_the_binder`,
+     `higher_order_dependent_application_discharges_the_binder`).
+   - `test_groupby_aggregate` asserts the *proven* form and stays red by design; it is
+     rewritten with `match` when that lands.
+
+   **`𝑐[𝑘]?` types today** as `Option(𝑉)`, and the rule is *application with the
+   membership refinement dropped*: the key's base type is still checked and the Pi binder
+   is still discharged, so a group-by lookup's partition predicate reflects the key it was
+   looked up at ([`Builtin::LookupChecked`],
+   `checked_lookup_is_application_modulo_membership`). The proven form is the same edge
+   without the drop, which is what makes the two one mechanic. Only the **key-domain
+   token** is dropped — a restricted map's `valid(𝑘)` stays an obligation, because
+   `Option` answers "is this key present", never "is this key admissible".
+
+   Three boundaries remain, each a decision rather than a missing case
+   (`checked_lookup_boundaries`): a **range** domain has no membership refinement to strip
+   (the representation question above); a **parameter** target is unresolved where the
+   relaxation runs, so it needs the application re-derived at coalesce as the higher-order
+   dependent `apply` is; and consuming an `Option` needs surface **`match`** (shared with
+   `txn_kv`) plus a runtime that answers presence — which is what the six end-to-end
+   value cases in `tests/compilation_pipeline/misc.rs` wait on.
+
+   The **proven** operator waits on step 3 for a different reason: there is nowhere to
+   obtain a key that carries the proof. Iteration binds the codomain for every kind
+   ([Interim](#iterating-a-setmap-binds-the-codomain-not-the-keys-interim)), so until
+   `keys` / entry iteration lands, proven `𝑚[𝑘]` could be written but not exercised. It
+   belongs with its key source, not before it.
 3. **The operation layer.** The per-kind iteration element (`Set` → key, `Map` →
    `(𝐾, 𝑉)` entry), membership `in`, the `keys` / `values` / `items` views, and the
    `Ord[𝐾]` given that an ordered operation over an unordered domain requires — all

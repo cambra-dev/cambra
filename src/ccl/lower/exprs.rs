@@ -441,16 +441,20 @@ pub(super) fn lower_subscript(
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    let collection = lower_expr(target, ctx)?;
+    let key = lower_expr(index, ctx)?;
     if checked {
-        return Err(LoweringError::unsupported(
-            span,
-            "checked lookup `c[k]?` is not implemented yet: it needs the lookup \
-             operator that yields `some(v)`/`none`",
+        // `(collection, key) ▷ lookup?` — the pair keeps the builtin a plain unary
+        // application, so inference reaches it through the ordinary `Apply` arm
+        // ([`Builtin::LookupChecked`]).
+        let _ = span;
+        return Ok(Expr::apply(
+            Expr::tuple(vec![collection, key]),
+            Expr::builtin(Builtin::LookupChecked),
         ));
     }
     // Evaluate the finite function at the point.
-    let collection = lower_expr(target, ctx)?;
-    Ok(Expr::apply(lower_expr(index, ctx)?, collection))
+    Ok(Expr::apply(key, collection))
 }
 
 /// Lower a user-function call argument. A **bare variable** argument is the only

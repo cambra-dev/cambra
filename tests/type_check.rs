@@ -1057,14 +1057,23 @@ fn set_injects_into_nominal_set_annotation() {
     );
 }
 
-// NOTE: direct key lookup on a group-by (`g = groups(k)`) is deferred. `groupby`
-// infers the honest keyed type `{K | __elem ▷ keydom#id} ⤇ group` (see
-// `src/ccl/design/collections.md`, "`groupby` is a `Map`"), so applying it at a plain
-// key demands proving the key is in *that* key domain — the discharge described in
-// `src/ccl/design/collections.md`, "Lookup: membership discharge", which will
-// re-enable this test as a discharged / `Option`-typed lookup. It "worked" before
-// only because the old total-function type was too loose.
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+// Aggregating **one group** of a group-by, reached by key.
+//
+// As written this asserts the *proven* form `groups(1)`, and that will not come back:
+// `groupby` infers the honest keyed type `{K | __elem ▷ keydom#id} ⤇ group` (see
+// `src/ccl/design/collections.md`, "`groupby` is a `Map`"), so a bare literal key cannot
+// be shown present, and rejecting it is the design rather than a gap
+// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). It "worked" before
+// only because the old total-function type admitted every key.
+//
+// The blocker is therefore no longer the *type* — `groups[1]?` type-checks today as
+// `Option(group)`, pinned by `checked_lookup_is_application_modulo_membership`. What is
+// missing is a way to **consume** that `Option` from source (surface `match`) and a runtime
+// that answers presence. When those land this becomes
+// `match groups[1]? { some(g) -> sum(g), none -> 0 }`, which is a different assertion than
+// the one below — so it is rewritten there rather than un-ignored here.
+#[ignore = "superseded: `groups(1)` is rejected by design; awaiting surface `match` + the \
+            runtime presence test to restate as a checked lookup"]
 #[test]
 fn test_groupby_aggregate() {
     // groups = groupby([1, 2, 3], \x -> x)
@@ -1082,76 +1091,63 @@ sum(g)
     assert_eq!(ty, int(), "expected Int, got {ty}");
 }
 
-/// Dependent application: looking up one partition of a group-by applies the
-/// key function `(k) ⇒ {i | key(i) == k} ⇒ V` at a concrete key, and the
-/// surviving partition predicate must reflect that key — the binder is
-/// *discharged* to the argument (design §5 / Appendix A). This is the headline
-/// case the Pi-type + substitution machinery unlocks: before it, the predicate
-/// kept the unbound group-by key.
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+/// **Dependent application discharges the binder to the argument.** The headline case
+/// the Pi-type + substitution machinery unlocks: a function whose *result type mentions
+/// its parameter*, applied at a concrete value, must have that value substituted into the
+/// result — before it, the predicate kept the unbound binder.
+///
+/// The vehicle is a filtered comprehension over the parameter, which is dependent for the
+/// ordinary reason (the body's type mentions `k`) and needs **no membership proof**. It
+/// used to be a group-by key lookup, which coupled this machinery to whether a bare key
+/// could be shown present in a keyed collection — an unrelated question, and one whose
+/// answer is now "no" by design (`src/ccl/design/collections.md`, "Lookup: membership
+/// discharge"). The discharge itself was never what broke.
 #[test]
-fn test_groupby_dependent_application_discharges_key() {
-    // groups : (k) ⇒ ({i | i ▷ xs ▷ key_fn == k} ⇒ Int); groups(0) discharges
-    // k ↦ 0, so the partition predicate must mention the literal 0 and no
-    // longer reference the group-by key binder `__gb_k`.
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-groups(0)
-"#
-        .trim(),
-    );
-    let Type::Fun { domain: dom, .. } = &ty else {
-        panic!("expected a partition function type, got {ty}");
-    };
-    let Type::Refinement(_, r) = &**dom else {
-        panic!("expected a refined partition domain, got {ty}");
-    };
-    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
+fn dependent_application_discharges_the_binder() {
+    let f = "f = \\k -> [x for x in [1,2,3] if x == k]\n";
+    // The function is genuinely dependent: its codomain refinement mentions the binder.
     assert!(
-        !pred.contains("__gb_k"),
-        "group-by key binder should be discharged, but predicate still has it: {pred}"
+        infer_program(&format!("{f}f"))
+            .to_string()
+            .starts_with("((k: Int) ⇒ "),
+        "the vehicle must be a dependent function"
     );
-    assert!(
-        pred.contains('0'),
-        "discharged predicate should mention the argument 0: {pred}"
+    assert_predicate_discharged(&infer_program(&format!("{f}f(0)")), "k");
+}
+
+/// O3 (**higher-order** dependent application): apply a dependent function through a
+/// function-typed *parameter* whose type is still an inference variable at emit time.
+/// `apply0`'s parameter `g` is a var when `g(0)` is emitted, so `apply` cannot peek its Pi
+/// binder to build the identity correspondence — the discharge `[k ↦ 0]` must instead be
+/// resolved at coalesce, once `g` resolves to the dependent function.
+///
+/// `apply0(f)` must therefore land on exactly what the *direct* `f(0)` yields.
+#[test]
+fn higher_order_dependent_application_discharges_the_binder() {
+    let f = "f = \\k -> [x for x in [1,2,3] if x == k]\n";
+    let direct = infer_program(&format!("{f}f(0)"));
+    let through = infer_program(&format!("{f}apply0 = \\g -> g(0)\napply0(f)"));
+    assert_predicate_discharged(&through, "k");
+    assert_eq!(
+        through, direct,
+        "applying through a function-typed parameter must give the same type as applying \
+         directly"
     );
 }
 
-// O3 (higher-order dependent application): apply a dependent function through a
-// function-typed *parameter* whose type is still an inference variable at emit
-// time. `apply0`'s parameter `g` is a var when `g(0)` is emitted, so `apply`
-// cannot peek its Pi binder to build the identity correspondence — the discharge
-// `[k ↦ 0]` must instead be resolved at coalesce, once `g` resolves to the
-// group-by partition function. The result of `apply0(groups)` must be the same
-// `{i | key(i) == 0} ⇒ Int` partition the *direct* `groups(0)` yields: predicate
-// mentions `0`, not the group-by key binder `__gb_k`.
-//
-// Was blocked on O3 until the apply discharge moved to coalesce: `coalesce_node`
-// re-derives each application's type from its already-resolved function child,
-// discharging on the function's *real* binder rather than the fresh `__arg`
-// binder `emit_apply` peeks when the function is still an inference variable.
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
-#[test]
-fn test_higher_order_dependent_application_discharges_key() {
-    let ty = infer_program(
-        r#"
-groups = groupby([1, 2, 3], \x -> x)
-apply0 = \g -> g(0)
-apply0(groups)
-"#
-        .trim(),
-    );
-    let Type::Fun { domain: dom, .. } = &ty else {
-        panic!("expected a partition function type, got {ty}");
+/// Shared assertion for the two discharge tests: `ty` is a data function whose domain
+/// refinement mentions the discharged argument `0` and no longer references `binder`.
+fn assert_predicate_discharged(ty: &Type, binder: &str) {
+    let Type::Fun { domain: dom, .. } = ty else {
+        panic!("expected a refined data function, got {ty}");
     };
     let Type::Refinement(_, r) = &**dom else {
-        panic!("expected a refined partition domain, got {ty}");
+        panic!("expected a refined domain, got {ty}");
     };
     let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
     assert!(
-        !pred.contains("__gb_k"),
-        "group-by key binder should be discharged through the higher-order apply, but: {pred}"
+        !pred.contains(binder),
+        "binder `{binder}` should be discharged, but the predicate still has it: {pred}"
     );
     assert!(
         pred.contains('0'),
@@ -2981,6 +2977,86 @@ fn subscript_is_lookup_and_dot_is_projection() {
         assert!(
             !infer_program_err(program).is_empty(),
             "no index proves membership yet, so `{program}` must be rejected"
+        );
+    }
+}
+
+/// The **checked** lookup `c[k]?` types as `Option(𝑉)`, and it is *application with the
+/// membership refinement dropped* rather than a rule of its own. Two consequences are
+/// asserted here because they are what make it one mechanic with the proven form:
+///
+/// The **Pi binder is still discharged.** A group-by's codomain mentions its key binder,
+/// so the payload's partition predicate must reflect the key looked up at — `== 1`, not
+/// `== __gb_k`. Nothing about `Option` is allowed to decompose that codomain out of the
+/// binder's scope.
+///
+/// And the **key's base type is still checked.** Only the key-domain token is dropped, so
+/// a `String` key against an `Int`-keyed collection is still an error. `Option` answers
+/// "is this key *present*", never "is this a key at all".
+#[test]
+fn checked_lookup_is_application_modulo_membership() {
+    let g = "g = groupby([1, 2, 3], \\x -> x)\n";
+    let ty = infer_program(&format!("{g}g[1]?")).to_string();
+    assert!(
+        ty.starts_with("[.none | .some(") && ty.contains("⤇ Int)"),
+        "a checked lookup yields Option of the group, got {ty}"
+    );
+    assert!(
+        ty.contains("== 1") && !ty.contains("__gb_k"),
+        "the key binder must be discharged to the looked-up key, got {ty}"
+    );
+
+    // The proven form is the same edge *without* the drop, so it still rejects: a bare
+    // key is not known to be present. This is the pair, not two unrelated rules.
+    assert!(
+        !infer_program_err(&format!("{g}g(1)")).is_empty(),
+        "the proven form must still demand a membership proof"
+    );
+
+    // A wrong key *type* is rejected either way — the drop is narrow.
+    assert!(
+        !infer_program_err("g = set([1, 2, 3])\ng[\"nope\"]?").is_empty(),
+        "a String key must not reach an Int-keyed collection"
+    );
+
+    // A `Set(K)` is `Map(K, unit)`, so its checked lookup is an `Option(unit)` —
+    // membership as a value, which is what `k in s` will be built on.
+    assert_eq!(
+        infer_program("g = set([1, 2, 3])\ng[1]?").to_string(),
+        "[.none | .some]"
+    );
+}
+
+/// What the checked operator does **not** reach yet, pinned so the boundary is a decision
+/// rather than a surprise.
+///
+/// A **range** domain has no membership refinement to drop: `UIntRange(𝑛)` is a primitive
+/// relating only by equality, not an index type refined by a bound, so no integer
+/// discharges against it and there is nothing for the relaxation to strip. Closing this is
+/// the representation question in `src/ccl/design/collections.md`, "Lookup: membership
+/// discharge" — deciding it is what makes `lst[𝑖]?` work, not a missing case in the rule.
+///
+/// A **parameter** target is unresolved at emit, where the relaxation runs. A use of a
+/// binder carries the binder's variable rather than its annotation, so the domain is not
+/// yet known; resolving it means re-deriving the application at coalesce.
+///
+/// A **tuple** is not a finite function at all, so it has no lookup — `t.0` projects it.
+#[test]
+fn checked_lookup_boundaries() {
+    for (program, why) in [
+        (
+            "xs = [10, 20, 30]\nxs[0]?",
+            "a range domain has no membership refinement",
+        ),
+        (
+            "def f(m: Map(Int, Int)):\n    m[1]?\nf",
+            "a parameter target is unresolved where the relaxation runs",
+        ),
+        ("t = (1, \"a\")\nt[0]?", "a tuple is not a finite function"),
+    ] {
+        assert!(
+            !infer_program_err(program).is_empty(),
+            "expected a rejection: {why}"
         );
     }
 }
