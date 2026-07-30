@@ -469,11 +469,23 @@ pub struct CompiledProgram {
     /// The always-on **lowering projection**: **every** lowered node's
     /// [`NodeId`](crate::ccl::provenance::NodeId) mapped to the
     /// [`SourceAttribution`](crate::ccl::lineage::SourceAttribution) folded from
-    /// lowering's [`LoweringLog`](crate::ccl::lineage::LoweringLog) — a
-    /// `Nature::Source` direct-image tag for a source construct's image, a
-    /// `Lower/Machinery/label` tag for lowering-manufactured plumbing (full
-    /// coverage of the `walk_children` domain — an unrecorded mint would surface
-    /// as `Leak::Unexplained` at the fold). Produced by
+    /// lowering's [`LoweringLog`](crate::ccl::lineage::LoweringLog). Every entry
+    /// is `via: Lower`; the tag is one of **three** shapes, not two:
+    ///
+    /// - `Nature::Source` + `"lower.image"` — the root of a lowered
+    ///   `Spanned<ChlExpr>`. Structural and decidable; emitted only by
+    ///   `lower_expr` (see `LoweringContext::tag_source`).
+    /// - `Nature::Machinery` + `"lower.image"` — **the common case**: a node the
+    ///   minting rule considered an image of source text but which is not an
+    ///   expression root (a callee `Var`, a chained comparison, a statement-level
+    ///   image).
+    /// - `Nature::Machinery` + `"lower.<rule>"` — lowering-manufactured plumbing.
+    ///
+    /// The `"lower.image"` label carries no cross-site guarantee — it is per-rule
+    /// judgment, and the taxonomy is provisional (`LoweringContext::tag_image`).
+    /// Coverage, by contrast, is guaranteed: the whole `walk_children` domain is
+    /// present, since an unrecorded mint surfaces as `Leak::Unexplained` at the
+    /// fold. Produced by
     /// [`collapse_lowering`](crate::ccl::lineage::collapse_lowering) at the
     /// lowering boundary, never mutated incrementally. It is always-on and the
     /// release `InferError` diagnostics read it one-hop (spans of the blame node).
@@ -539,8 +551,8 @@ pub struct CompiledProgram {
     /// The original program source text, retained verbatim.
     ///
     /// Inspector queries need the source string to produce snippets (`hover`'s
-    /// `snippet` = `source[span]`) and, in I3, to serve the `/api/snapshot`
-    /// `source.text`. `CompiledProgram` did not retain it before; every
+    /// `snippet` = `source[span]`) and to serve the snapshot wire's
+    /// `source.text`. Every
     /// span-keyed projection above (the [`lowering_projection`](Self::lowering_projection), the surface AST's
     /// spans) is a byte offset *into this string*, so retaining it is what makes
     /// those offsets resolvable to text. Cheap (one program's source).

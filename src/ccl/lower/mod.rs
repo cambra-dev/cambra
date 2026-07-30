@@ -419,6 +419,29 @@ impl LoweringContext {
     /// It carries the same `"lower.image"` label as a root image, so the two are
     /// distinguishable from plumbing ([`tag_machinery`](Self::tag_machinery)'s
     /// per-rule labels) even though both are `Nature::Machinery`.
+    ///
+    /// # `label` is per-rule judgment, and carries no cross-site guarantee
+    ///
+    /// Unlike `Nature::Source`, which is structural and decidable (see
+    /// [`tag_source`](Self::tag_source)), the choice between this and
+    /// `tag_machinery` is **the lowering author's judgment about their own rule**.
+    /// There is no rule to apply, and the codebase does not agree with itself: the
+    /// same node kind at the same span role is tagged both ways — an `ExprStmt` at
+    /// a statement's span is `"lower.image"` at five sites and
+    /// `"lower.stmt_seq"` at nine.
+    ///
+    /// So the guarantee is deliberately weak, and stating it is the point:
+    /// **`"lower.image"` means "the rule that minted this node considered it an
+    /// image", nothing more.** No consumer may treat it as a cross-site
+    /// classification — not "every image has a 1:1 source construct", not "a
+    /// non-image is machinery". A consumer that needs one of those needs a datum
+    /// that guarantees it, and none exists yet.
+    ///
+    /// The whole nature/label taxonomy is **provisional**. It has no consumer that
+    /// branches on it today, which is exactly why it has drifted; expect it to
+    /// move — most likely to collapse or be recomputed by a label-keyed remap —
+    /// once real consumption tells us what distinction is actually load-bearing.
+    /// Do not build on the current shape.
     pub(super) fn tag_image(&mut self, expr: Expr, span: Span) -> Expr {
         crate::ccl::lineage::lowering_leaf(expr.node_id(), span, Nature::Machinery, "lower.image");
         expr
@@ -598,16 +621,21 @@ pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String
 /// Lower a single CHL expression to a CCL expression, tagging the root of the
 /// lowered subtree with the source span it came from.
 ///
-/// The recursion proper lives in [`lower_expr_inner`]; this thin wrapper tags
-/// the returned node's [`NodeId`](crate::ccl::provenance::NodeId) as the
-/// construct's direct image (`Nature::Source`) via
-/// [`LoweringContext::tag_source`] — overwriting any interim tag an arm put on
-/// its own root, so the root of every lowered expression is uniformly the
-/// construct's image. Interior nodes an arm builds are each tagged at their mint
-/// site — [`LoweringContext::tag_source`] for a direct image of something the
-/// user wrote, [`LoweringContext::tag_machinery`] for manufactured plumbing —
-/// and [`collapse_lowering`](crate::ccl::lineage::collapse_lowering)'s leak
-/// taxonomy enforces full coverage of the lowered tree.
+/// The recursion proper lives in [`lower_expr_inner`]; this thin wrapper is the
+/// **sole** emitter of `Nature::Source`, and so the one place the rule is applied:
+/// `Source` ⟺ the node is the root of a lowered `Spanned<ChlExpr>`. It re-tags the
+/// returned node via [`LoweringContext::tag_source`], overwriting any interim tag
+/// an arm put on its own root (last tag wins, through the fold's re-image path).
+/// The rule is positional, so no lowering arm ever decides it — see
+/// [`LoweringContext::tag_source`] for the rule and its costs.
+///
+/// Interior nodes an arm builds are each tagged at their mint site with
+/// [`LoweringContext::tag_image`] for a node that images source text or
+/// [`LoweringContext::tag_machinery`] for manufactured plumbing. **That choice is
+/// per-rule judgment, not a rule** — `tag_image`'s docs state what it does and
+/// does not guarantee. Whichever of them lands at the root is re-tagged here.
+/// [`collapse_lowering`](crate::ccl::lineage::collapse_lowering)'s leak taxonomy
+/// enforces full coverage of the lowered tree either way.
 pub fn lower_expr(
     expr: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,

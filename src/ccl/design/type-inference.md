@@ -308,7 +308,9 @@ Two things make this load-bearing rather than housekeeping:
   retains every origin for its own lifetime; that is why passes use it rather
   than a bare map.
 
-**One known exception, scoped and unfixed: generic instantiation.** The list above
+#### One known exception, scoped and unfixed: generic instantiation
+
+The list above
 is the *rebuilding passes*. `freshen_above`'s `Refinement` arm does not thread a
 memo — `freshen_refinement_predicate` clones the predicate term, freshens its type
 slots, and installs an unconditional `Rc::new` — so every refinement a scheme

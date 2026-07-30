@@ -377,8 +377,11 @@ pub(super) fn lower_compare(
             copy
         };
         let rhs = operands[i + 1].clone();
-        // Each pair comparison is a `Nature::Source` direct image of its `<op>`
-        // in the chain, spanning its two operands.
+        // Each pair comparison images its `<op>` in the chain, spanning its two
+        // operands. It is *not* `Nature::Source` — a chained comparison is one of
+        // the cost cases of the structural rule (see `tag_source`): only the
+        // whole chain's root is an expression root, so the pair comparisons carry
+        // the `"lower.image"` label at `Nature::Machinery`.
         let pair_span = operand_spans[i].join(operand_spans[i + 1]);
         comparisons.push(ctx.tag_image(Expr::binop(lhs, BinOpKind::Compare(kind), rhs), pair_span));
     }

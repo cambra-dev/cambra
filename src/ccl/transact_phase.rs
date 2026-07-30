@@ -915,6 +915,8 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
                     node: other,
                     ty: block.ty,
                     user_annotation: block.user_annotation,
+                    // TODO(preserve): hand-rolled preserve — fold into
+                    // `Expr::preserve`.
                     node_id: block.node_id,
                 }),
                 body: Box::new(rest),

@@ -29,44 +29,47 @@ prose describes code you can go read.
   `NodeId` itself is `Hash`/`Ord`, as a map key.) `NodeId::PLACEHOLDER` is the reserved sentinel for
   `Default`/`mem::take` throwaways (ignored by the recorder; `assert_unique_node_ids`
   backstops that it never persists into a checked tree).
-- **The id domain: the main tree, and nothing else.** A `NodeId` lives on the
-  `walk_children` node-set. A `Type` carries no identity — the only `NodeId`s
-  reachable *through* a type are the `TypedExpr`s inside a
-  `Refinement.predicate`, and those are outside the domain: duplication does not
-  freshen them, and no walk that matters enumerates them.
-  `assert_unique_node_ids` excludes predicates deliberately (a predicate-inclusive
-  walk would false-fire on inline's blind spot); the fold's leak classes and every
-  `SourceProjection` enumerate from `collect_tree_ids`; the remaining
-  predicate-interior readers key on `PredicateId` (transient pointer identity) or
-  `Name`. So predicate-interior ids are *carried*, never *checked*, and a
-  duplicated subtree's predicate interior may alias its source's ids. Freshening
-  them would be write-only, and it splits predicate `Rc` sharing — planning's
-  compile memo is `Rc`-keyed, so a split predicate is compiled once per copy.
-  The rule cuts the other way too, and usefully: because predicate-interior ids
-  are unread, a duplication path is free to *share* a predicate `Rc` with its
-  source rather than rebuild one, with no identity consequence to weigh (see
-  `design/type-inference.md`, "Sharing is an invariant").
-
-  `uniquify::collect_node_ids` is the one predicate-inclusive walk, and is not a
-  counterexample: it is a debug tripwire on uniquify itself, asserting
-  **multiset preservation** over the nodes `Uniquifier::expr` visits — uniquify
-  *rebuilds* predicate terms through a `PredMemo`, which is exactly where ids
-  could be dropped or re-minted. It checks preservation, not uniqueness, and
-  deliberately does not dedup by `PredicateId`.
-
-  The cost, accepted: an inference error blamed on a predicate-interior node
-  resolves to no span (the guard of `[x for x in xs if x > "a"]` reports without
-  a caret) because the id is not in the lowering projection. Fixing that means
-  seeding predicate-position nodes into the fold as live roots and making
-  `output_ids` predicate-inclusive — deferred; see the lineage-redesign doc's
-  decisions 16-17. Sharing ids with the main tree is *not* a fix: lowering
-  already shares a few incidentally (`pred_sources = gen_sources.clone()`), but
-  the nodes actually blamed for guard errors are minted fresh in predicate
-  position and have no main-tree twin.
 - **`Pass`** — the compiler stage that produced/rewrote a node (`Lower`,
   `Uniquify`, `Inline`, `Desugar`, `Transact`, `Letrec`, `Mono`, `LambdaElim`,
   `Planning`). It lives in the lineage *data* (each step's `via`), never in a
   type.
+
+### The id domain
+
+**The main tree, and nothing else.** A `NodeId` lives on the `walk_children`
+node-set. A `Type` carries no identity — the only `NodeId`s reachable *through* a
+type are the `TypedExpr`s inside a `Refinement.predicate`, and those are outside
+the domain: duplication does not freshen them, and no walk that matters
+enumerates them. `assert_unique_node_ids` excludes predicates deliberately (a
+predicate-inclusive walk would false-fire on inline's blind spot); the fold's
+leak classes and every `SourceProjection` enumerate from `collect_tree_ids`; the
+remaining predicate-interior readers key on `PredicateId` (transient pointer
+identity) or `Name`. So predicate-interior ids are *carried*, never *checked*, and
+a duplicated subtree's predicate interior may alias its source's ids. Freshening
+them would be write-only, and it splits predicate `Rc` sharing — planning's
+compile memo is `Rc`-keyed, so a split predicate is compiled once per copy. The
+rule cuts the other way too, and usefully: because predicate-interior ids are
+unread, a duplication path is free to *share* a predicate `Rc` with its source
+rather than rebuild one, with no identity consequence to weigh (see
+`design/type-inference.md`, "Sharing is an invariant, not an optimization
+detail").
+
+`uniquify::collect_node_ids` is the one predicate-inclusive walk, and is not a
+counterexample: it is a debug tripwire on uniquify itself, asserting **multiset
+preservation** over the nodes `Uniquifier::expr` visits — uniquify *rebuilds*
+predicate terms through a `PredMemo`, which is exactly where ids could be dropped
+or re-minted. It checks preservation, not uniqueness, and deliberately does not
+dedup by `PredicateId`.
+
+The cost, accepted: an inference error blamed on a predicate-interior node
+resolves to no span (the guard of `[x for x in xs if x > "a"]` reports without a
+caret) because the id is not in the lowering projection. Fixing that means
+seeding predicate-position nodes into the fold as live roots and making
+`output_ids` predicate-inclusive — deferred; see the lineage-redesign doc's
+decisions 16-17. Sharing ids with the main tree is *not* a fix: lowering already
+shares a few incidentally (`pred_sources = gen_sources.clone()`), but the nodes
+actually blamed for guard errors are minted fresh in predicate position and have
+no main-tree twin.
 
 ## The lineage model (`src/ccl/lineage.rs`)
 
@@ -189,9 +192,26 @@ boundaries, which needs the pass logs above.
   `Spanned<ChlExpr>`s, so a statement has no `Source` node at all). The converse
   holds too: a comprehension lowers to a `Cast` wrapper the user never wrote, and
   as the expression's root that `Cast` *is* `Source`. What is lost from `nature`
-  is preserved in the `label` — `"lower.image"` marks an image either way — and
-  the per-site label is the datum consumers read, with nature a coarse projection
-  a label-keyed remap can refine when a consumer earns it.
+  is preserved in the `label` — `"lower.image"` marks an image either way.
+
+  **`label`, unlike `nature`, has no rule: it is per-rule judgment, and carries no
+  cross-site guarantee.** Making `Source` structural moved the judgment call from
+  `nature` onto `label` rather than removing it, and the disagreement moved with
+  it: an `ExprStmt` at a statement's span is `"lower.image"` at five sites and
+  `tag_machinery(…, "lower.stmt_seq")` at nine — the same node kind in the same
+  span role, tagged both ways. So the guarantee is stated weakly on purpose.
+  `"lower.image"` means *the rule that minted this node considered it an image*,
+  and nothing more; no consumer may read it as a cross-site classification. A
+  consumer needing "this has a 1:1 source construct" needs a datum that
+  guarantees that, and none exists yet.
+
+  **The whole nature/label taxonomy is provisional.** Nothing branches on it
+  today, which is precisely why it drifted into two disagreeing rules in the first
+  place, and why a third of this doc's history is spent re-deciding it. Expect it
+  to change — most plausibly `nature` collapsing to what is decidable, with a
+  finer taxonomy recomputed by a label-keyed remap — as the inspector's real
+  consumption shows which distinction is load-bearing. Treat both axes as
+  unstable until then.
 
   At the lowering→pipeline handoff (before uniquify/inference, so the release
   `InferError` read timing is unchanged) `collapse_lowering` folds the log

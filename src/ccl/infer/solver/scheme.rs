@@ -269,7 +269,8 @@ pub fn freshen_above(
 /// [`PredicateId`](crate::ccl::PredicateId) with `PredMemo`'s keepalive
 /// discipline, or keep the origin `Rc` when the freshen is vacuous) is chosen
 /// only once that cost is known. See `ccl/design/type-inference.md`, "One known
-/// exception, scoped and unfixed", for the numbers and the decision.
+/// exception, scoped and unfixed: generic instantiation", for the numbers and
+/// the decision.
 ///
 /// Note the freshened copy's predicate interior carries the *origin's*
 /// [`NodeId`](crate::ccl::provenance::NodeId)s: predicate interiors are outside

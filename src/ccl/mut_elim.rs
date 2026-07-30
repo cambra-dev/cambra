@@ -559,9 +559,9 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
     for (defer, view) in feeds.into_iter().rev() {
         let mut feed = Expr::feed(defer, view);
         feed.ty = Type::Base(BaseType::Unit);
-        let body_ty = body.ty.clone();
+        // `expr_stmt` carries the body's type itself — an `ExprStmt`'s type *is*
+        // its body's.
         body = Expr::expr_stmt(feed, body);
-        body.ty = body_ty;
     }
     body
 }
@@ -872,9 +872,8 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
         map.ty = Type::fun(domain_ty.clone(), value_ty);
         let mut feed = Expr::feed(defer, map);
         feed.ty = Type::Base(BaseType::Unit);
-        let cont_ty = body_out.ty.clone();
+        // As above: `expr_stmt` carries the continuation's type itself.
         body_out = Expr::expr_stmt(feed, body_out);
-        body_out.ty = cont_ty;
     }
     body_out
 }

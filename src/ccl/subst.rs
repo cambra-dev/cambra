@@ -96,15 +96,13 @@ impl Mapping {
     /// A `Rename` is built directly at `node_id` rather than minted and then
     /// overwritten: a mint fires `on_mint`, and an id no node ends up carrying is
     /// a phantom birth in the lineage log. A `Discharge` clones (which mints
-    /// nothing) and re-roots that clone.
+    /// nothing) and re-roots that clone
+    /// ([`re_root`](TypedExpr::re_root)) — the two shapes reach a preserved
+    /// identity by different routes, and neither mints.
     fn as_expr_preserving(&self, node_id: NodeId) -> TypedExpr {
         match self {
             Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone())),
-            Mapping::Discharge(t) => {
-                let mut e = (**t).clone();
-                e.node_id = node_id;
-                e
-            }
+            Mapping::Discharge(t) => (**t).clone().re_root(node_id),
         }
     }
 }

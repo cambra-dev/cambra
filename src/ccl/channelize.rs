@@ -2726,6 +2726,52 @@ mod tests {
         Expr::var(s)
     }
 
+    /// The lifted-prefix spine is typed, not `Hole`.
+    ///
+    /// `try_lift_defer` rebuilds the prefix onto the lifted body with
+    /// `Expr::expr_stmt`, which carries the body's type — an `ExprStmt`'s type
+    /// *is* its body's. That constructor used to leave `Type::Hole` here, and
+    /// `Hole` is [`has_type_residue`], so an escaping one is exactly what
+    /// [`assert_no_type_residue`] exists to catch. Pinned because the spine is
+    /// built by a shared constructor: a future change there would otherwise
+    /// reintroduce the residue silently on a path no other test types.
+    ///
+    /// Asserts on `Type::Hole` directly rather than calling `has_type_residue`,
+    /// which is `#[cfg(debug_assertions)]` — reaching for it here would make the
+    /// test exist only in debug, and `Hole` is the residue this path can produce.
+    #[test]
+    fn lifted_prefix_spine_carries_the_body_type() {
+        let int = Type::Base(BaseType::Int);
+        // `bound_expr` = `feed(x, 1); let x = Defer in (feed(x, 2); x)`, i.e. a
+        // one-statement prefix ahead of the inner defer. Typed throughout, as a
+        // post-inference tree is — the retype only matters in typed mode, and an
+        // under-typed fixture would report its own `Hole`s as the failure.
+        let inner_body = Expr::expr_stmt(Expr::feed("x", lit(2)), var("x").with_ty(int.clone()));
+        let inner =
+            Expr::let_bind("x", Expr::new(TypedExprNode::Defer), inner_body).with_ty(int.clone());
+        let bound_expr = Expr::expr_stmt(Expr::feed("x", lit(1)), inner);
+        let body = var("y").with_ty(int.clone());
+
+        let (lifted, inner_name) =
+            try_lift_defer(&Name::raw("y"), &bound_expr, &body).expect("the lift shape matches");
+        assert_eq!(inner_name, Name::raw("x"));
+
+        // Every `ExprStmt` on the spine carries a type. Checking for the absence
+        // of `Hole` rather than for equality with `int` keeps this honest if the
+        // lift ever wraps the body in something typed differently.
+        fn assert_spine_typed(e: &Expr) {
+            if matches!(e.node, TypedExprNode::ExprStmt { .. }) {
+                assert!(
+                    !matches!(e.ty, Type::Hole),
+                    "lifted spine ExprStmt left a `Hole`: {}",
+                    symbolic(e)
+                );
+            }
+            e.walk_children(assert_spine_typed);
+        }
+        assert_spine_typed(&lifted);
+    }
+
     #[test]
     fn run_single_feed() {
         let body = Expr::expr_stmt(Expr::feed("d", lit(1)), var("d"));

@@ -545,8 +545,17 @@ pub(super) fn lower_middle_stmt(
                 let mut scope = outer_bindings.clone();
                 collect_stmt_names(preceding, &mut scope);
                 if scope.contains(&name) {
+                    // The `MutWrite` is the image of `x := e`; the `ExprStmt`
+                    // that sequences it onto the rest of the block is
+                    // manufactured — the user wrote no sequencing operator. Two
+                    // `"lower.image"` tags at one `stmt.span` would have two
+                    // nodes each claiming to be the image of one statement.
                     let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
-                    return Ok(ctx.tag_image(Expr::expr_stmt(write, body), stmt.span));
+                    return Ok(ctx.tag_machinery(
+                        Expr::expr_stmt(write, body),
+                        stmt.span,
+                        "lower.stmt_seq",
+                    ));
                 }
             }
             // Otherwise this is an *introduction*. Resolve the optional

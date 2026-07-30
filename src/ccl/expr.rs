@@ -631,10 +631,24 @@ pub struct TypedExpr {
     /// matters (monomorphization calls [`freshen_node_id`](Self::freshen_node_id)
     /// or [`freshen_node_ids_deep`](Self::freshen_node_ids_deep) explicitly).
     ///
-    /// `pub(super)` (visible within `crate::ccl`) so the pass submodules that
-    /// build `TypedExpr` struct literals directly (`desugar_defers`, `inline`,
-    /// `lambda_elim`, …) can set it; external crates still go through the
-    /// accessor methods.
+    /// # What is forbidden is a mint, not a write
+    ///
+    /// `pub(super)` (visible within `crate::ccl`) so a pass can carry the id
+    /// through a field-wise rebuild — see [`preserve`](Self::preserve) on why such
+    /// a rebuild stays a struct literal. That is safe by construction: **a literal
+    /// mints nothing**, so it cannot record a birth for an id no node carries.
+    ///
+    /// The hazard the constructors close is the *phantom birth* — minting an id
+    /// and then overwriting it, so `on_mint` fires for an id that ends up on no
+    /// node. That is now unrepresentable: `with_node_id` is deleted,
+    /// [`freshen_node_id`](Self::freshen_node_id) is fresh-only, and there is no
+    /// `set_node_id(arbitrary)`.
+    ///
+    /// So the thing to grep for is not a write to this field but
+    /// `node_id: NodeId::fresh()` inside a literal — a *mint* that bypasses
+    /// [`new`](Self::new) and therefore `on_mint`, giving a node an identity with
+    /// no recorded birth. That is the exact dual of the phantom, and it is what
+    /// makes the id-preserving literals worth reading carefully.
     pub(super) node_id: NodeId,
 }
 
@@ -708,14 +722,26 @@ impl TypedExpr {
     /// These are the only two ways to build a node, and the recorder sees exactly
     /// the difference: `new` mints and records a birth, `preserve` does neither.
     ///
-    /// Some passes still hand-roll this as a `TypedExpr { … node_id: src.node_id }`
-    /// struct literal (grep `TODO(preserve)`). Those are correct — a literal mints
-    /// nothing — but they make a preserve and a mint one token apart in otherwise
-    /// identical code, which is how a raw `node_id: NodeId::fresh()` (a mint the
-    /// recorder never sees) hides among them. Folding them in needs an
-    /// `Option`-taking annotation setter, since most carry `user_annotation`
-    /// through from the source node.
-    pub fn preserve(node_id: NodeId, node: TypedExprNode) -> Self {
+    /// # Two shapes build a node at an existing id; only one of them is this
+    ///
+    /// **Reaching into another node for its id** — `node_id: src.node_id`, where
+    /// `src` is some *other* node — is this constructor's shape, and the one where
+    /// a stray `node_id: NodeId::fresh()` hides: a preserve and a mint differ by
+    /// one token in otherwise identical five-line literals. Those sites are marked
+    /// `TODO(preserve)` and are greppable; five remain, in `channelize`,
+    /// `mut_elim`, and `transact_phase`.
+    ///
+    /// **A field-wise rebuild** — `let TypedExpr { node, ty, user_annotation,
+    /// node_id } = expr;` then rebuilding with one child swapped — is *not* this
+    /// shape and deliberately stays a struct literal. Nothing is reached for; the
+    /// literal says "the same node, new child" in one expression, and its
+    /// exhaustive field check is load-bearing: omit a field and it fails to
+    /// compile, where `preserve(id, node).with_ty(…)` would silently default `ty`
+    /// to [`Type::Hole`] — a type residue that surfaces, if at all, as a runtime
+    /// assertion far away. Roughly three dozen such rebuilds live in
+    /// `transact_phase`, `inline`, and `channelize`; converting them would trade a
+    /// compile-time guarantee for a runtime one, once per site.
+    pub(crate) fn preserve(node_id: NodeId, node: TypedExprNode) -> Self {
         TypedExpr {
             node,
             ty: Type::Hole,
@@ -731,13 +757,30 @@ impl TypedExpr {
     /// consumes no id and records no birth: a diagnostic must not perturb the
     /// lineage log it may be reporting on. `assert_unique_node_ids` backstops that
     /// a placeholder never reaches a checked tree.
-    pub fn throwaway(node: TypedExprNode) -> Self {
+    pub(crate) fn throwaway(node: TypedExprNode) -> Self {
         Self::preserve(NodeId::PLACEHOLDER, node)
     }
 
     /// The stable provenance id of this node (see [`crate::ccl::provenance`]).
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// Move an **already-cloned** node onto `node_id`, consuming and returning it
+    /// — the root-carry step of a compound substitution.
+    ///
+    /// This is the one legitimate write to `node_id` outside a constructor, and it
+    /// is named so it reads as deliberate rather than as a stray assignment. It is
+    /// sound for the same reason a preserving struct literal is: a clone mints
+    /// nothing, so overwriting its root id records no birth and strands none. The
+    /// id it drops is the clone's copied one, which no recorded step ever claimed.
+    ///
+    /// Not a way to *set* an arbitrary id on a freshly-minted node — that is the
+    /// phantom [`preserve`](Self::preserve) exists to prevent. The caller must
+    /// already hold a clone, and `node_id` must be an id some occurrence carries.
+    pub(crate) fn re_root(mut self, node_id: NodeId) -> Self {
+        self.node_id = node_id;
+        self
     }
 
     /// Re-mint this node's [`NodeId`], returning `(old, new)`. A cloned subtree
@@ -861,7 +904,7 @@ impl TypedExpr {
     /// [`expr_stmt`](Self::expr_stmt) at a **preserved** identity: the same
     /// logical statement rebuilt at a new spine position, carrying `node_id`
     /// rather than minting. See [`preserve`](Self::preserve).
-    pub fn expr_stmt_preserving(node_id: NodeId, expr: Self, body: Self) -> Self {
+    pub(crate) fn expr_stmt_preserving(node_id: NodeId, expr: Self, body: Self) -> Self {
         let ty = body.ty.clone();
         Self::preserve(
             node_id,
