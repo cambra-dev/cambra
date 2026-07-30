@@ -31,6 +31,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 # Repo root: this file lives at <root>/.github/scripts/doc-refs/check_doc_refs.py
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -108,17 +109,26 @@ def _outside_code_fences(md_text: str):
 
 
 class Repo:
-    """File index + anchor cache, all rooted at REPO_ROOT."""
+    """File index + anchor cache for the tree under `root`.
 
-    def __init__(self) -> None:
+    The root is a parameter, not the module global, so the checks can run over
+    a fixture tree: every check takes a `Repo` and reads through it, which is
+    what makes them testable at all.
+    """
+
+    def __init__(self, root: Path = REPO_ROOT) -> None:
+        self.root = root
         self.files: list[Path] = []
-        for p in REPO_ROOT.rglob("*"):
-            if p.is_dir():
-                continue
-            rel = p.relative_to(REPO_ROOT)
-            if any(part in SKIP_DIRS for part in rel.parts):
-                continue
-            self.files.append(rel)
+        # Prune the skipped directories rather than walking them and filtering
+        # after — `target/` alone dwarfs the rest of the tree.
+        stack = [root]
+        while stack:
+            for p in sorted(stack.pop().iterdir()):
+                if p.is_dir():
+                    if p.name not in SKIP_DIRS and not p.is_symlink():
+                        stack.append(p)
+                    continue
+                self.files.append(p.relative_to(root))
         self._file_set = set(self.files)
         # For suffix resolution of loosely-written path references (a bare
         # filename, a partial path, or a full repo path): map every path-suffix
@@ -136,18 +146,20 @@ class Repo:
         # path is inside the repo and indexed (files) or a real directory.
         try:
             norm = Path(*rel.parts)
-            resolved = (REPO_ROOT / rel).resolve()
-            resolved.relative_to(REPO_ROOT)
+            resolved = (self.root / rel).resolve()
+            resolved.relative_to(self.root.resolve())
         except ValueError:
             return False
         if resolved.is_dir():
             return True
         return norm in self._file_set or resolved.is_file()
 
+    def read(self, rel: Path) -> str:
+        return (self.root / rel).read_text(encoding="utf-8", errors="replace")
+
     def anchors(self, rel: Path) -> set[str]:
         if rel not in self._anchor_cache:
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
-            self._anchor_cache[rel] = heading_anchors(text)
+            self._anchor_cache[rel] = heading_anchors(self.read(rel))
         return self._anchor_cache[rel]
 
     def resolve_suffix(self, written: str) -> tuple[Path | None, list[Path]]:
@@ -216,7 +228,7 @@ def check_markdown_links(repo: Repo, problems: list[Problem]) -> int:
     for rel in repo.files:
         if rel.suffix != ".md":
             continue
-        text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        text = repo.read(rel)
         prose = _prose_lines(text)
         for m in _MD_LINK.finditer(prose):
             target = m.group(1).strip("<>")
@@ -257,7 +269,7 @@ def _check_one_link(
     try:
         # A target that escapes the repo root is a GitHub-relative *web* link
         # (e.g. `../../security/advisories/new`), not a file — leave it alone.
-        (REPO_ROOT / tgt).resolve().relative_to(REPO_ROOT)
+        (repo.root / tgt).resolve().relative_to(repo.root.resolve())
     except ValueError:
         return
     if not repo.exists(tgt):
@@ -265,7 +277,7 @@ def _check_one_link(
         return
     if frag and tgt.suffix == ".md":
         # Fragment normalized like the repo path: resolve `..`/`.`.
-        norm = Path(*(REPO_ROOT / tgt).resolve().relative_to(REPO_ROOT).parts)
+        norm = Path(*(repo.root / tgt).resolve().relative_to(repo.root.resolve()).parts)
         if frag not in repo.anchors(norm):
             problems.append(
                 Problem(src, f"anchor #{frag} not found in {tgt.name} ({target})")
@@ -314,7 +326,7 @@ def check_doc_source_paths(repo: Repo, problems: list[Problem]) -> int:
     for rel in repo.files:
         if rel.suffix != ".md":
             continue
-        text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        text = repo.read(rel)
         fenced = set(_fenced_line_numbers(text))
         for lineno, line in enumerate(text.splitlines(), start=1):
             if lineno in fenced or IGNORE_MARKER in line:
@@ -396,7 +408,7 @@ def check_doc_citations(repo: Repo, problems: list[Problem]) -> int:
     for rel in repo.files:
         if rel.suffix not in (".rs", ".md"):
             continue
-        text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        text = repo.read(rel)
         units = _rust_comments(text) if rel.suffix == ".rs" else [_doc_prose(text)]
         for unit in units:
             for m in _MD_REF.finditer(unit.text):
@@ -407,7 +419,7 @@ def check_doc_citations(repo: Repo, problems: list[Problem]) -> int:
                 if tail is None:
                     continue
                 tail_at, in_link = tail
-                titles, dangling = _cited_titles(unit.text[tail_at:])
+                cites = _cited_titles(unit.text[tail_at:])
                 # In a *comment* the `.md` mention is itself the citation —
                 # there is no link syntax to use — so it must resolve. In a doc,
                 # the citation form is a link (check A), and a bare doc name in
@@ -415,7 +427,7 @@ def check_doc_citations(repo: Repo, problems: list[Problem]) -> int:
                 # check C stays lenient about. What makes it a citation is a
                 # quoted title, and that is exactly when the path has to be
                 # pinned down: an ambiguous one leaves nothing to check against.
-                if rel.suffix == ".md" and not titles and not dangling:
+                if rel.suffix == ".md" and not cites.titles and not cites.dangling:
                     continue
                 checked += 1
                 resolved, cands = repo.resolve_suffix(written)
@@ -437,19 +449,18 @@ def check_doc_citations(repo: Repo, problems: list[Problem]) -> int:
                             )
                         )
                     continue
-                for title in titles:
+                for title in cites.titles:
                     slug = _slug_base(_normalize_title(title))
                     if slug not in repo.anchors(resolved):
-                        shown = " ".join(title.split())
                         problems.append(
                             Problem(
                                 src,
-                                f'cited section "{shown}" not found as a '
+                                f'cited section "{_one_line(title)}" not found as a '
                                 f"heading in {resolved} (see the citation "
                                 f"convention in the doc-refs README)",
                             )
                         )
-                if dangling:
+                if cites.dangling:
                     problems.append(
                         Problem(
                             src,
@@ -463,32 +474,44 @@ def check_doc_citations(repo: Repo, problems: list[Problem]) -> int:
     return checked
 
 
-def _cited_titles(tail: str) -> tuple[list[str], bool]:
-    """Titles in the adjacent quoted-citation run at the start of `tail`.
+class Citations(NamedTuple):
+    """What follows a doc ref: the quoted titles, and whether a citation was
+    left hanging.
 
-    Returns the titles plus a flag for a *dangling* citation: an opening quote
-    sitting exactly where a title would be, with nothing closing it inside the
-    citation window. That is what an unclosed or over-wrapped citation looks
-    like, and it is worth reporting precisely because the alternative — treating
-    an unparseable citation as "no citation" — is how a title goes unchecked
-    without anyone noticing.
+    `dangling` is an opening quote sitting exactly where a title would be, with
+    nothing closing it inside the citation window — an unclosed or over-wrapped
+    citation. It is reported rather than skipped precisely because the
+    alternative — treating an unparseable citation as "no citation" — is how a
+    title goes unchecked without anyone noticing.
     """
+
+    titles: list[str]
+    dangling: bool
+
+
+def _cited_titles(tail: str) -> Citations:
+    """The adjacent quoted-citation run at the start of `tail`."""
     titles: list[str] = []
     pos = 0
     while True:
         m = _CITATION_STEP.match(tail, pos)
         if not m:
-            return titles, _DANGLING_QUOTE.match(tail, pos) is not None
+            return Citations(titles, _DANGLING_QUOTE.match(tail, pos) is not None)
         titles.append(m.group(1))
         pos = m.end()
 
 
+def _one_line(text: str) -> str:
+    """`text` with every whitespace run — a wrap's line break and the next
+    line's indentation included — collapsed to the single space it stands for."""
+    return " ".join(text.split())
+
+
 def _normalize_title(title: str) -> str:
-    """A cited title as it would read on one line: no Markdown code ticks, and
-    a wrap's line break plus indentation collapsed back to the single space it
-    stands for (headings never contain a newline, and `_slug_base` maps each
-    whitespace character to its own hyphen)."""
-    return " ".join(title.replace("`", "").split())
+    """A cited title as it would read in a heading: on one line (headings never
+    contain a newline, and `_slug_base` maps each whitespace character to its
+    own hyphen), with Markdown code ticks dropped as the slug drops them."""
+    return _one_line(title.replace("`", ""))
 
 
 @dataclass

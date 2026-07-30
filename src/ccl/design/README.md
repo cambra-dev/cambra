@@ -31,7 +31,7 @@ CHL source
 | [optimization.md](optimization.md) | The optimization/compilation passes: inlining, lambda elimination, join/aggregate planning, algebraic simplification, and conversion to tile operators. |
 
 The feed-channelization step (`ccl/channelize.rs`) has no dedicated design doc: its design of
-record is [mutability.md](mutability.md), [Compilation pipeline](mutability.md#compilation-pipeline) — feed
+record is [Compilation pipeline](mutability.md#compilation-pipeline) in `mutability.md` — feed
 routing is the append-law half of mutability elimination — and the in-depth
 implementation notes (cluster algorithm, per-shape extraction, error modes, navigation map) live in
 the module's own rustdoc.
