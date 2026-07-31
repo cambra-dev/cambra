@@ -386,8 +386,8 @@ pub enum InferError {
     /// variable — its (peeled) type is not [`Type::History`]. The second-class
     /// discipline's rule 1: a `Mut` argument must be a `Mut`-*introduced* variable,
     /// so the callee's writes advance a real mutable variable the caller shares. A plain value would
-    /// otherwise satisfy the lenient pass-by-reference coercion (`V <: Mut[V,
-    /// D]`) and be silently mutated in name only. Reported by
+    /// otherwise satisfy the lenient pass-by-reference coercion (`V <: Mut(V,
+    /// D)`) and be silently mutated in name only. Reported by
     /// [`check_mut_discipline`].
     MutArgNotMutable {
         /// Display label for the message (see the type docs — not the location).

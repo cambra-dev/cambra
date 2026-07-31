@@ -15,11 +15,11 @@
 //! typed tree). This phase:
 //!
 //! 1. **strips** every such `For` site, building one [`WriterSite`] per site
-//!    (its read/write footprint, its loop source, and a `{commit, writes,
-//!    to_<defer>*}` decision lambda built from the block by read-your-writes
-//!    substitution — each in-block `<<` feed rides the decision as a
-//!    `to_<defer>` tap). This is the **same** writer/key building the direct
-//!    fold used; only the assembly below differs.
+//!    (its read/write footprint, its loop source, and a
+//!    `[.Commit(⟨writes, to_<defer>*⟩) | .Abort]` decision lambda built from the
+//!    block by read-your-writes substitution — each in-block `<<` feed rides the
+//!    `.Commit` payload as a `to_<defer>` tap). This is the **same** writer/key
+//!    building the direct fold used; only the assembly below differs.
 //! 2. **assembles** the `LetRec` (see [`build_letrec`]): one **history** binding
 //!    `reg_k : Txn ⇒ V = λ t → get_prev_txn(view, t, init)` per key — reading
 //!    its writing site's commit stream (or self-guarded for a read-only key) —
@@ -504,14 +504,14 @@ struct RawSite {
 }
 
 /// A per-transaction feed (`out << e`) collected from a `with begin():` block:
-/// the target defer, the fresh `to_<defer>` tap field the writer decision
-/// carries beside `{commit, writes}`, and the tap value's type. The writer
+/// the target defer, the fresh `to_<defer>` tap field the writer decision's
+/// `.Commit` payload carries beside `writes`, and the tap value's type. The writer
 /// decision computes the tap value alongside the write set (read-your-writes at
 /// the feed's position); the phase hoists `Feed(defer, __reg ▷ .to_<defer>)`
 /// into the register body so `channelize` routes it as an ordinary channel
 /// contribution — mirroring `mut_elim`'s in-loop induction feeds. The tap
-/// commits with the transaction (a denied commit contributes no reply, since
-/// the engine appends nothing for a `commit: false` decision).
+/// commits with the transaction (a denied `.Abort` contributes no reply, since
+/// the engine appends nothing for an aborted decision).
 struct FeedSite {
     defer: Name,
     field: String,
@@ -1270,11 +1270,11 @@ fn proj_tuple(p: &Name, tuple_ty: &Type, i: usize, elt_ty: Type) -> Expr {
     app
 }
 
-/// Build one [`WriterSite`] from a stripped site: its `{commit, writes}`
-/// decision lambda over the snapshot-tuple parameter, plus its footprint and
-/// source. The decision reads register snapshots and the loop item off the tuple,
-/// threads read-your-writes by substitution, and gates the whole write set on
-/// the conjunction of any `if` guards (`commit`).
+/// Build one [`WriterSite`] from a stripped site: its `[.Commit(⟨writes⟩) |
+/// .Abort]` decision lambda over the snapshot-tuple parameter, plus its footprint
+/// and source. The decision reads register snapshots and the loop item off the tuple,
+/// threads read-your-writes by substitution, and picks the `.Commit`/`.Abort` tag
+/// on the disjunction of any `if` guards' write paths.
 fn build_writer(
     site: RawSite,
     key_init: &HashMap<Name, Expr>,
@@ -1430,6 +1430,10 @@ fn build_writer(
         .map(|(_, field, val, fpath)| (field, val, fpath))
         .collect();
     let decision = crate::ccl::ccl_utils::writer_decision_record(commit.clone(), writes, &feeds);
+    // Wrap the `{commit, writes, to_<defer>*}` record into the decision **variant**
+    // `Case[commit → .Commit(⟨writes, taps⟩); true → .Abort]`: the whole-transaction
+    // grant/deny is the tag, the (dense) payload rides `Commit`.
+    let decision = crate::ccl::ccl_utils::wrap_decision_variant(decision);
     let decision_ty = decision.ty.clone();
 
     let mut body = Expr::lambda(p, tuple_ty.clone(), decision);
@@ -1617,11 +1621,12 @@ fn walk_block(
 /// branch under its first-match path condition, walking it against a *cloned*
 /// read-your-writes environment; then **rejoin** each written key as a
 /// carry-forward value-`Case` over the branches (an arm that didn't write a key
-/// contributes its snapshot). Guards resolve against the incoming env (RYW). The
-/// rejoined `Case`s are value-selecting inside the writer lambda, so `lambda_elim`
-/// compiles them to a value-preserving `filter_values` union-of-restricts;
-/// sequencing after the join reads the merged value (RYW across the join). Commit
-/// paths accumulate across the arms.
+/// contributes its snapshot — keeping the `.Commit` payload dense). Guards resolve
+/// against the incoming env (RYW). The rejoined `Case`s are value-selecting inside
+/// the writer lambda, so `lambda_elim` compiles them to the lazy `filter_values`
+/// union-of-restricts (an off-path partial op is never evaluated); sequencing after
+/// the join reads the merged value (RYW across the join). Commit paths accumulate
+/// across the arms and select the writer's `.Commit`/`.Abort` tag.
 #[allow(clippy::too_many_arguments)]
 fn walk_case(
     branches: &[crate::ccl::Branch],
@@ -1843,21 +1848,33 @@ fn final_or_default_read(stream: Expr, init: Expr, value_ty: Type) -> Expr {
     app
 }
 
-/// One site's **per-key commit view** — the pointwise projection of its
-/// commit-record stream to `{time, write}` for one written key:
+/// One site's **per-key commit view** — the point-free projection of its
+/// commit-record stream to `{time, write}` for one written key, eliminating the
+/// `[.Commit(𝑃) | .Abort]` decision with a one-arm `Commit` read:
 ///
-/// `commits_j ≫ (λ __c → {time: __c.time, write: __c.decision.writes.idx})`
+/// `⟨time: commits_j ≫ .time,
+///    write: commits_j ≫ .decision ≫ variant_project(Commit) ≫ .writes ≫ .idx⟩ ▷ zip`
 ///
-/// This is the record shape `get_prev_txn`'s history argument searches (its
-/// declared `{time, write}` codomain — see [`crate::ccl::Builtin::GetPrevTxn`]);
-/// a multi-writer key's history unions one view per writing site. There is **no
-/// `commit` field**: the commit-record stream `commits_j` carries only committed
-/// transactions (allocate-on-commit — a denied decision proposes nothing, so the
-/// engine allocates no tick and appends no entry), so a grant/deny bit would be
-/// vestigially `true` everywhere. `get_prev_txn` therefore searches the latest
-/// write `≤ t` directly, with no filter. The map is a *pointwise* view of the
-/// (guarded) commit stream, so the reference to `commits_j` stays guarded
-/// (`letrec::is_guarded_history_slot`).
+/// The `write` leg is **partial** — `variant_project(Commit)` restricts to the
+/// requests that committed (an `Abort` position carries nothing), so the `zip`'s
+/// inner-join keeps exactly the committing positions. (At runtime this narrowing
+/// is effectively vacuous: `commits_j` is allocate-on-commit, so its positions
+/// are already all `Commit`. The `variant_project` is load-bearing for the *type*
+/// and the causal-slot story — not for dropping `Abort` rows that never arrive.)
+/// This is the record shape
+/// `get_prev_txn`'s history argument searches (its declared `{time, write}`
+/// codomain — see [`crate::ccl::Builtin::GetPrevTxn`]); a multi-writer key's
+/// history unions one view per writing site. There is **no `commit` field**: the
+/// tag *is* the grant/deny, and the eliminator drops denied positions, so
+/// `get_prev_txn` searches the latest committed write `≤ t` with no filter.
+///
+/// Built point-free (a `zip` of two `commits_j` views) rather than as a one-arm
+/// `match` lambda: a `match` covering only `Commit` over a two-tag scrutinee is a
+/// width-subtyping error at the strict wall (`[.Commit|.Abort] ≮: [.Commit]`),
+/// whereas `variant_project` carries its own stamped type and reads the payload
+/// off the stream directly. The views are pointwise reads of the (guarded) commit
+/// stream, so the references to `commits_j` stay guarded
+/// (`letrec::is_causal_history_slot` accepts a `variant_project` step).
 #[allow(clippy::too_many_arguments)]
 fn per_key_view(
     commits_j: &Name,
@@ -1873,35 +1890,43 @@ fn per_key_view(
         p.ty = Type::fun(from.clone(), to.clone());
         p
     };
-    let writes_ty = record_field_ty(decision_ty, F_WRITES);
-    let c = Name::fresh("__c");
-    let cvar = tvar(&c, rec_ty.clone());
-    let time = apply_ty(cvar.clone(), fproj(F_TIME, rec_ty, &Type::Txn), Type::Txn);
-    let decision = apply_ty(
-        cvar,
-        fproj(F_DECISION, rec_ty, decision_ty),
-        decision_ty.clone(),
-    );
-    let writes = apply_ty(
-        decision,
-        fproj(F_WRITES, decision_ty, &writes_ty),
-        writes_ty.clone(),
-    );
-    let mut iproj = Expr::proj_index(idx);
-    iproj.ty = Type::fun(writes_ty, value_ty.clone());
-    let write = apply_ty(writes, iproj, value_ty.clone());
+    let commits_ty = Type::fun(dom.clone(), rec_ty.clone());
+    let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
+    let writes_ty = record_field_ty(&payload_ty, F_WRITES);
 
-    let mut body = Expr::new(TypedExprNode::Record(vec![
-        (F_TIME.to_string(), time),
-        (F_WRITE.to_string(), write),
-    ]));
-    body.ty = view_rec_ty.clone();
-    let mut lam = Expr::lambda(c, rec_ty.clone(), body);
-    lam.ty = Type::fun(rec_ty.clone(), view_rec_ty.clone());
-    let mut tap = Expr::compose(vec![
-        tvar(commits_j, Type::fun(dom.clone(), rec_ty.clone())),
-        lam,
+    // time leg: commits_j ≫ .time : dom ⇒ Txn.
+    let mut time_view = Expr::compose(vec![
+        tvar(commits_j, commits_ty.clone()),
+        fproj(F_TIME, rec_ty, &Type::Txn),
     ]);
+    time_view.ty = Type::fun(dom.clone(), Type::Txn);
+
+    // write leg: commits_j ≫ .decision ≫ variant_project(Commit) ≫ .writes ≫ .idx.
+    let mut iproj = Expr::proj_index(idx);
+    iproj.ty = Type::fun(writes_ty.clone(), value_ty.clone());
+    let mut write_view = Expr::compose(vec![
+        tvar(commits_j, commits_ty),
+        fproj(F_DECISION, rec_ty, decision_ty),
+        crate::ccl::ccl_utils::commit_project(decision_ty),
+        fproj(F_WRITES, &payload_ty, &writes_ty),
+        iproj,
+    ]);
+    write_view.ty = Type::fun(dom.clone(), value_ty.clone());
+
+    // ⟨time, write⟩ ▷ zip : dom ⇒ {time, write} — the zip inner-joins, so the
+    // total `time` leg is narrowed to the committing positions of the `write` leg.
+    let views_rec_ty = Type::Record(vec![
+        (F_TIME.to_string(), time_view.ty.clone()),
+        (F_WRITE.to_string(), write_view.ty.clone()),
+    ]);
+    let mut views = Expr::new(TypedExprNode::Record(vec![
+        (F_TIME.to_string(), time_view),
+        (F_WRITE.to_string(), write_view),
+    ]));
+    views.ty = views_rec_ty.clone();
+    let mut zip = Expr::builtin(Builtin::Zip);
+    zip.ty = Type::fun(views_rec_ty, Type::fun(dom.clone(), view_rec_ty.clone()));
+    let mut tap = Expr::apply(views, zip);
     tap.ty = Type::fun(dom.clone(), view_rec_ty.clone());
     tap
 }
@@ -2042,8 +2067,8 @@ fn build_letrec(
         let mut snap_tuple = Expr::tuple(snap);
         snap_tuple.ty = Type::Tuple(snap_tys);
 
-        // decision = snapshot ▷ body — the writer's `{commit, writes,
-        // to_<defer>*}` decision, body embedded verbatim.
+        // decision = snapshot ▷ body — the writer's
+        // `[.Commit(⟨writes, to_<defer>*⟩) | .Abort]` decision, body embedded verbatim.
         let decision = apply_ty(snap_tuple, body, decision_ty.clone());
 
         // write_targets: the write-set keys' history bindings, in write order —
@@ -2080,19 +2105,25 @@ fn build_letrec(
             commit_lambda,
         ));
 
-        // One tap binding per in-block feed: `commits_j ≫ .decision ≫ .field`,
-        // the per-commit tap stream. recognition maps its ref to the register
-        // record's `field` tap. Emitted in feed (source) order across sites.
+        // One tap binding per in-block feed:
+        // `commits_j ≫ .decision ≫ variant_project(Commit) ≫ .field`, the
+        // per-commit tap stream — the tap rides the (dense) `Commit` payload, so
+        // eliminate the `[.Commit(𝑃) | .Abort]` decision before the field read.
+        // recognition maps its ref to the register record's `field` tap. Emitted in
+        // feed (source) order across sites.
+        let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(&decision_ty);
         for f in feeds {
             let tap_name = Name::fresh(f.field.clone());
             let tap_ty = Type::fun(dom.clone(), f.value_ty.clone());
             let mut dec_proj = Expr::proj_field(F_DECISION);
             dec_proj.ty = Type::fun(rec_ty.clone(), decision_ty.clone());
+            let vp = crate::ccl::ccl_utils::commit_project(&decision_ty);
             let mut field_proj = Expr::proj_field(f.field.clone());
-            field_proj.ty = Type::fun(decision_ty.clone(), f.value_ty.clone());
+            field_proj.ty = Type::fun(payload_ty.clone(), f.value_ty.clone());
             let mut tap_expr = Expr::compose(vec![
                 tvar(&commits[j], Type::fun(dom.clone(), rec_ty.clone())),
                 dec_proj,
+                vp,
                 field_proj,
             ]);
             tap_expr.ty = tap_ty.clone();
