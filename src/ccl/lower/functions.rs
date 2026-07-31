@@ -116,7 +116,7 @@ pub(super) fn uncurry_params(
         let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
         if let TypedExprNode::Lambda { param, .. } = &mut lam.node {
             if matches!(param_ty, Type::History { .. }) {
-                // `Mut[…]` pass-by-reference: the annotation rides `user_annotation`
+                // `Mut(…)` pass-by-reference: the annotation rides `user_annotation`
                 // for the mutability discipline check (rule 3).
                 param.user_annotation = Some(param_ty);
             } else if let Some(ann) = &params[0].annotation
