@@ -162,6 +162,26 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
         TypedExprNode::CollectionUnion(ops) => {
             !ops.is_empty() && ops.iter().all(|o| is_causal_history_slot(o, live))
         }
+        // A **`zip` of causal slots** — `⟨causal, …⟩ ▷ zip` (a per-key commit
+        // view combining several pointwise reads of the same commit stream, e.g.
+        // `⟨commits ≫ .time, commits ≫ .decision ≫ variant_project(Commit) ≫
+        // .writes ≫ .i⟩ ▷ zip`). Each leg consults only strictly-earlier
+        // positions; a `zip` combines them by position, so the whole slot is
+        // causal exactly when every leg is.
+        TypedExprNode::Apply { function, argument }
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::Zip)) =>
+        {
+            match &argument.node {
+                TypedExprNode::Record(fields) => {
+                    !fields.is_empty()
+                        && fields.iter().all(|(_, e)| is_causal_history_slot(e, live))
+                }
+                TypedExprNode::Tuple(elts) => {
+                    !elts.is_empty() && elts.iter().all(|e| is_causal_history_slot(e, live))
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }

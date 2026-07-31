@@ -3,7 +3,7 @@ use log::trace;
 use crate::{
     ccl::{
         AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
-        Type, TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate,
+        Type, TypedExprNode, V_COMMIT, WriterSite, ccl_utils::is_trivially_true_predicate,
         symbolic::symbolic,
     },
     interpreter::{
@@ -1311,32 +1311,40 @@ fn build_transact_store(
     build_commit_store(keys, writers, ctx)
 }
 
-/// The reply taps on a writer body's `{commit, writes, to_<defer>*}` decision —
-/// every field other than `commit`/`writes`, with its per-commit value type. A
-/// tap is a reply (`out << e`) that desugar folded onto the writer body; for a
-/// commit store, op-conversion commits each tap as a write-only key so the reply
-/// rides the transaction's commit and is read back as a value-stream. Empty for a
-/// writer with no reply.
+/// The reply taps on a writer body's `[.Commit(⟨writes, to_<defer>*⟩) | .Abort]`
+/// decision — every field of the (dense) `Commit` payload record other than
+/// `writes`, with its per-commit value type. A tap is a reply (`out << e`) that
+/// desugar folded onto the writer body; for a commit store, op-conversion commits
+/// each tap as a write-only key so the reply rides the transaction's commit and is
+/// read back as a value-stream. Empty for a writer with no reply.
 fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
-    let Some(Type::Record(fields)) = body_ty.codomain() else {
+    let Some(codom) = body_ty.codomain() else {
+        return Vec::new();
+    };
+    // Peel the `Commit` payload record out of the decision variant.
+    let Type::Variant(tags) = codom else {
+        return Vec::new();
+    };
+    let Some((_, Type::Record(fields))) = tags
+        .into_iter()
+        .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
+    else {
         return Vec::new();
     };
     fields
         .into_iter()
-        // `commit`/`writes` are the decision core; a `*__fire` field is a tap's
-        // *fire gate* (read by `body_decision_at`), not a tap value itself.
-        .filter(|(f, _)| {
-            f != crate::ccl::F_COMMIT && f != F_WRITES && !f.ends_with(crate::ccl::F_FIRE_SUFFIX)
-        })
+        // `writes` is the decision core; a `*__fire` field is a tap's *fire gate*
+        // (read by `body_decision_at`), not a tap value itself.
+        .filter(|(f, _)| f != F_WRITES && !f.ends_with(crate::ccl::F_FIRE_SUFFIX))
         .collect()
 }
 
 /// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`]
 /// wired in a cyclic [`FanOut`], one *fused* [`CommitWriter`] per writer (a
 /// branch of the shared store output). Each fused writer reads the cyclic store,
-/// runs its body — the `let k₀ = p.0 in … let item = p.r in {commit, writes}`
-/// decision, fed via a buffer the writer owns — and either grants (appends a
-/// proposal) or denies. A single writer is the degenerate case (no conflicts →
+/// runs its body — the `let k₀ = p.0 in … let item = p.r in [.Commit(⟨writes⟩) |
+/// .Abort]` decision, fed via a buffer the writer owns — and either grants (appends
+/// a proposal) or denies. A single writer is the degenerate case (no conflicts →
 /// no retries); ≥2 writers serialize through the operator with conflict + retry.
 /// A *fused* writer (not fanned) is load-bearing: a stateful sequencing producer
 /// cannot be fanned without desyncing its append-only proposal positions.
