@@ -416,7 +416,7 @@ pub enum Builtin {
     /// Merges two function-typed (collection) values into a single collection whose
     /// domain is the discriminated union of both input domains and whose codomain is
     /// the deduplicated union of both input codomains.  Lowered from Python `a @ b`.
-    CollectionUnion,
+    Copair,
 
     /// `as_of : Tuple(Fun(B, _), Fun(Txn, V)) → Fun(B, V)` — the **as-of
     /// (temporal) join**, the live cross-endpoint read. Applied as a tupled
@@ -522,7 +522,7 @@ impl Builtin {
             Self::GetPrevSeq => "get_prev_seq",
             Self::GetPrevTxn => "get_prev_txn",
             Self::BeginTxn => "begin",
-            Self::CollectionUnion => "collection_union",
+            Self::Copair => "copair",
             Self::AsOf => "as_of",
             // The arm index is rendered by `symbolic` (a `&'static str` cannot
             // carry it); this bare name is the fallback for other callers.
@@ -557,7 +557,7 @@ impl Builtin {
     ///
     /// - `is_internalising_builtin_function` — at `Apply { function }`
     ///   positions during the iteration-site walk, decides which
-    ///   builtins' arguments to wrap with `iterate(_)`.  `CollectionUnion`
+    ///   builtins' arguments to wrap with `iterate(_)`.  `Copair`
     ///   and `FinalOrDefault` are in this list because they self-iterate
     ///   from sub-parts of their tuple argument, but the walk's
     ///   per-shape match arms handle them before the catch-all that
@@ -588,7 +588,7 @@ impl Builtin {
                 | Self::Uncurry
                 | Self::PermuteDomain
                 | Self::FlattenDomain
-                | Self::CollectionUnion
+                | Self::Copair
                 // `GetPrevSeq`/`GetPrevTxn` share `FinalOrDefault`'s
                 // classification (a scalar-result builtin over a tuple whose
                 // stream sub-part self-iterates), but op-conversion never sees

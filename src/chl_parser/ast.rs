@@ -211,6 +211,19 @@ pub enum Stmt {
         else_body: Option<Vec<Spanned<Stmt>>>,
     },
 
+    /// `match scrutinee: case tag(binder): … case tag2: …` — tag dispatch over
+    /// a [`crate::ccl::Type::Variant`].
+    ///
+    /// A block statement mirroring [`Stmt::If`], and value-yielding by the same
+    /// rule: in a position that requires a value, every arm's block must end in
+    /// a value-yielding statement (`docs/chl-spec.md`, "4.5 `if` / `elif` / `else`").
+    /// `arms` is non-empty and in source order; first match wins, though the
+    /// arms are tag-disjoint so order is not observable.
+    Match {
+        scrutinee: Spanned<Expr>,
+        arms: Vec<MatchArm>,
+    },
+
     /// `for target in iter: body`.
     For {
         target: Spanned<AssignTarget>,
@@ -259,6 +272,33 @@ pub enum Stmt {
 pub struct IfBranch {
     pub cond: Spanned<Expr>,
     pub body: Vec<Spanned<Stmt>>,
+}
+
+/// One arm of a [`Stmt::Match`]: `case tag(binder): body`.
+///
+/// The pattern position takes a **bare** tag, not the `.tag` of
+/// [`Expr::VariantCtor`]: after `case` there is nothing a tag could be confused
+/// with, so the disambiguating dot would be noise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    /// The tag this arm matches, or `None` for the **default arm** `case _:`,
+    /// which matches whatever the tagged arms did not.
+    ///
+    /// Mirrors [`crate::ccl::Branch`]'s `pattern: Option<Pattern>`, which is
+    /// the shape this lowers to: a tag-less branch in a scrutinee-`Case`.
+    pub pattern: Option<MatchPattern>,
+    pub body: Vec<Spanned<Stmt>>,
+}
+
+/// The tag a [`MatchArm`] matches, and the name its payload binds to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchPattern {
+    pub tag: SmolStr,
+    pub tag_span: Span,
+    /// Name bound to the tag's payload for the arm's body. `None` for the
+    /// binder-less form `case tag:`, which discards a payload it does not read
+    /// (and is the natural spelling for a `Unit` payload such as `none`).
+    pub binder: Option<SmolStr>,
 }
 
 /// A function parameter: a name with an optional type annotation.
@@ -380,6 +420,26 @@ pub enum Expr {
         target: Box<Spanned<Expr>>,
         attr: SmolStr,
         attr_span: Span,
+    },
+
+    /// Tagged variant constructor: `.tag(payload)`, or `.tag` for a `Unit`
+    /// payload.
+    ///
+    /// The **leading** dot is what distinguishes this from
+    /// [`Expr::Attribute`] (which always has a target to its left) and from a
+    /// [`Expr::Call`] to a function that happens to share the tag's name.
+    /// Tags need no declaration: [`crate::ccl::Type::Variant`] is structural,
+    /// so `.tag(𝑒)` synthesises the singleton variant `{tag: 𝑇}` and width
+    /// subtyping flows it into any consumer whose tag set contains it. See
+    /// `docs/chl-spec.md`, "3.15 Variant constructors".
+    VariantCtor {
+        /// The tag name. Lowercase by the term/type capitalisation rule.
+        tag: SmolStr,
+        tag_span: Span,
+        /// The payload, or `None` for the nullary form `.tag` (which lowers to
+        /// a `Unit` payload — the nullary constructor is not a *distinct* kind
+        /// of tag, just one whose payload carries no information).
+        payload: Option<Box<Spanned<Expr>>>,
     },
 
     /// Lambda: `\params -> body`.

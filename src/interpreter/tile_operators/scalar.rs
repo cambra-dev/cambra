@@ -370,11 +370,17 @@ impl VariantProject {
     /// while a `SealedFunction { D ⇒ Scalar(Union) }` scrutinee keeps `D`. All
     /// arms of one `match` share the scrutinee's domain extent, so they
     /// flat-merge back to the full domain.
-    pub fn new(input: Box<dyn TileOperator>, tag: FieldKey) -> Self {
-        let (domain_extent, variant_extents) = match input.tiling() {
-            Tiling::Scalar(Extent::Union(exts)) => (Extent::Base(BaseType::UInt), exts.clone()),
+    /// `payload_extent` is the projected arm's extent, taken from the node's own
+    /// type rather than looked up in the scrutinee's extent — because the
+    /// scrutinee legitimately **may not carry this tag**. A scrutinee that is a
+    /// width-subtype of what the `match` was written for simply never produces the
+    /// tag, and the projection is empty; the operator still needs a codomain
+    /// extent to describe that empty result, and only the type knows it.
+    pub fn new(input: Box<dyn TileOperator>, tag: FieldKey, payload_extent: Extent) -> Self {
+        let domain_extent = match input.tiling() {
+            Tiling::Scalar(Extent::Union(_)) => Extent::Base(BaseType::UInt),
             Tiling::SealedFunction { domain, codomain } => match codomain.as_ref() {
-                Tiling::Scalar(Extent::Union(exts)) => (domain.clone(), exts.clone()),
+                Tiling::Scalar(Extent::Union(_)) => domain.clone(),
                 other => panic!(
                     "VariantProject: SealedFunction scrutinee must have a Scalar(Union) codomain, \
                      got {other:?}"
@@ -382,19 +388,9 @@ impl VariantProject {
             },
             other => panic!("VariantProject: scrutinee must be a (Sealed)Union, got {other:?}"),
         };
-        assert!(
-            variant_extents.get(&tag).is_some(),
-            "VariantProject: tag `{tag}` is not an arm of the union being projected (arms: {:?})",
-            variant_extents.keys().collect::<Vec<_>>()
-        );
         let tiling = Tiling::SealedFunction {
             domain: domain_extent,
-            codomain: Box::new(Tiling::Scalar(
-                variant_extents
-                    .get(&tag)
-                    .expect("checked just above")
-                    .clone(),
-            )),
+            codomain: Box::new(Tiling::Scalar(payload_extent)),
         };
         Self { input, tag, tiling }
     }
@@ -615,7 +611,7 @@ mod tests {
     #[test]
     fn variant_project_commit_arm() {
         let scrut = Box::new(commit_abort_scrutinee());
-        let mut op = VariantProject::new(scrut, FieldKey::Index(0));
+        let mut op = VariantProject::new(scrut, FieldKey::Index(0), Extent::Base(BaseType::Int));
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
         let tile = producer.get(producer.tiling().universal_guard());
@@ -635,7 +631,7 @@ mod tests {
     #[test]
     fn variant_project_abort_arm() {
         let scrut = Box::new(commit_abort_scrutinee());
-        let mut op = VariantProject::new(scrut, FieldKey::Index(1));
+        let mut op = VariantProject::new(scrut, FieldKey::Index(1), Extent::Base(BaseType::Unit));
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
         let tile = producer.get(producer.tiling().universal_guard());
@@ -677,10 +673,12 @@ mod tests {
                 tiling: tiling.clone(),
             }),
             FieldKey::Index(0),
+            Extent::Base(BaseType::Int),
         ));
         let arm1: Box<dyn TileOperator> = Box::new(VariantProject::new(
             Box::new(FixedOp { tile, tiling }),
             FieldKey::Index(1),
+            Extent::Base(BaseType::Int),
         ));
 
         let mut union = UnionOperator::new_flat(vec![arm0, arm1]);
@@ -741,6 +739,7 @@ mod tests {
                 tiling: union_stream_tiling.clone(),
             }),
             FieldKey::Index(0),
+            Extent::Base(BaseType::Int),
         );
         assert_eq!(
             vp.tiling(),

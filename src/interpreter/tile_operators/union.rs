@@ -167,6 +167,24 @@ fn flat_merge(tiles: Vec<Tile>, value_extent: &Extent) -> Tile {
             pairs.push((pos, values.index_at(row)));
         }
     }
+    // The arms must occupy **disjoint** positions. That is the whole precondition of
+    // a flat merge: two arms claiming one position would be merging the same
+    // position twice, which the tile contract forbids ("known data inside a Tile is
+    // immutable" — see the interpreter's module docs), and here it would silently
+    // keep whichever pair the sort happened to order last rather than fail. The
+    // guard fan-out gets disjointness from first-match and the tag fan-out from the
+    // tags, but neither is checked by any type, so check it.
+    debug_assert!(
+        {
+            let mut seen: Vec<usize> = pairs.iter().map(|(pos, _)| *pos).collect();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            seen.len() == before
+        },
+        "flat_merge: union arms claim overlapping positions, so they are not a \
+         partition of the fed domain"
+    );
     // Disjoint by first-match, so a stable sort by position reassembles the full
     // column in the fed order — matching the sibling `commit` field's domain.
     pairs.sort_by_key(|(pos, _)| *pos);

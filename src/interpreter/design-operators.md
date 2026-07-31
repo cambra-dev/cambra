@@ -234,7 +234,7 @@ Op-conversion's arms split into two groups by how they handle their parent's
   argument with `input=None`.  The argument is an iteration source compiled in
   isolation, with its own iteration extent at the bottom of its chain.  Examples:
   `Iterate` (the canonical chain-head extent producer), `MapDomain`, `Uncurry`,
-  `FlattenDomain`, `PermuteDomain`, `CollectionUnion`, `Sum` / `Max`,
+  `FlattenDomain`, `PermuteDomain`, `Copair` / `DisjointJoin`, `Sum` / `Max`,
   `FinalOrDefault`, and the catch-all `Apply` arm (where the function position
   is a `Proj` / `Var` / curried `Apply`).
 

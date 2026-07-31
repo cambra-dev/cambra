@@ -598,6 +598,17 @@ impl LoweringContext {
     pub(super) fn fresh_txn_item(&mut self) -> String {
         self.mint_synthetic_id("__txn_item")
     }
+
+    /// Mint a unique `__match_payload_N` name for a binder-less `case tag:` arm.
+    ///
+    /// A [`crate::ccl::expr::Pattern`] always names the payload it narrows, so an
+    /// arm that declines to bind still needs *a* name; minting one the user
+    /// cannot spell is what makes "does not bind" and "binds something
+    /// unreadable" the same thing downstream, so variant elimination needs no
+    /// separate no-binder case.
+    pub(super) fn fresh_ignored_payload(&mut self) -> String {
+        self.mint_synthetic_id("__match_payload")
+    }
 }
 
 /// Prefix for synthetic parameter names representing the tupled domain of a
@@ -746,6 +757,22 @@ fn lower_expr_inner(
             let target_expr = lower_expr(target, ctx)?;
             let proj = ctx.tag_image(Expr::proj_field(attr.as_str()), expr.span);
             Ok(Expr::apply(target_expr, proj))
+        }
+        // Tagged variant constructor `.tag(payload)` → `VariantCtor`. The
+        // nullary form `.tag` carries a `Unit` payload: a tag that names no
+        // payload still injects *something*, and `Unit` is the value that
+        // carries no information. So there is one constructor shape, not a
+        // nullary/unary pair. The `VariantCtor` itself is this expression's
+        // root, so `lower_expr` re-tags it `Source`; only the synthesized
+        // payload is manufactured and tagged here.
+        ChlExpr::VariantCtor { tag, payload, .. } => {
+            let payload = match payload {
+                Some(p) => lower_expr(p, ctx)?,
+                None => {
+                    ctx.tag_machinery(Expr::lit(Lit::Unit), expr.span, "lower.variant_ctor_unit")
+                }
+            };
+            Ok(Expr::variant_ctor(tag.as_str(), payload))
         }
         ChlExpr::Lambda { params, body } => lower_lambda(expr.span, params, body, ctx),
         ChlExpr::UnaryOp { op, operand } => lower_unaryop(*op, operand, ctx),

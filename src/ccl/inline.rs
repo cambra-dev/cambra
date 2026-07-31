@@ -123,6 +123,13 @@ fn is_iterable_domain(ty: &Type) -> bool {
         Type::Tuple(ts) => ts.iter().all(is_iterable_domain),
         // Records are structurally equivalent to tuples for domain purposes.
         Type::Record(fields) => fields.iter().all(|(_, t)| is_iterable_domain(t)),
+        // A sum is enumerable exactly when every arm's payload is — enumerating it
+        // means enumerating each arm in turn, which is what `iterate_union` does.
+        // Same rule as the product cases above, and the reason it has to be stated:
+        // the `_ => true` fallthrough would call `[.a(Int) | .b(Int)]` iterable, so a
+        // `def` matching on a variant parameter would not be inlined, and
+        // op-conversion would try to tabulate it by enumerating `Int`.
+        Type::Variant(tags) => tags.iter().all(|(_, t)| is_iterable_domain(t)),
         // Refinement inherits the iterability of its base type.
         Type::Refinement(inner, _) => is_iterable_domain(inner),
         // Natively iterable types.

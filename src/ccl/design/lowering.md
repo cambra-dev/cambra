@@ -139,3 +139,53 @@ The design of record — where this step sits in mutability elimination and why 
 The inference pass types `Defer`/`Feed`/`Define` directly — `Defer : Feed(ChanDom(d) ⇒ V)`, `Feed`/`Define : Unit` with their contributions constrained into the channel (see [Feed handles as an invariant `History` constructor](type-inference.md#feed-handles-as-an-invariant-history-constructor-typehistory--kind-feed-)). `channelize` then rewrites each resolved defer cluster into a `Feed`-kind `LetRec` group of assembled channels, erasing the transient `Feed` histories and substituting each rigid `ChanDom(d)` domain for the concrete channel domain. No special `DeferredCollectionDomain` type is needed — standard inference does the job, every channel node is typed by construction, and reads type concretely via their `ChanDom` domains (no `retype` pass, no bounded read-type fixup).
 
 Mutation-loop inference (`emit_loop`) learns the loop body's full Record codomain from the body itself via a one-way subtyping constraint: `require_sub(body_codomain, product({step: σ}))` pins the `step` field while width-subtyping lets the body's Record literal supply whatever `to_<defer>` fields it carries. This is the general pattern for "a known core plus an open set of additional fields" — an open record demanded by `require_sub`, not a dedicated partial-record type.
+
+## Variants and match
+
+Surface variants ([chl-spec.md](../../../docs/chl-spec.md#315-variant-constructors) §3.15, [§4.10](../../../docs/chl-spec.md#410-match--tag-dispatch)) add **no IR node**. Both halves already existed for the conditionals stack, which is the point: `match` is not a new concept, it is the surface for one.
+
+- `.tag(e)` lowers to `VariantCtor { tag, payload }`. The nullary `.tag` lowers to the same node with a `Lit(Unit)` payload, so there is one constructor shape rather than a nullary/unary pair.
+- `match s: case tag(w): body …` lowers to `Case { scrutinee: Some(s), branches }`, one `Branch` per arm carrying a `Pattern { tag, binding }`. Every arm's guard is the literal `true`, which is what makes tag dispatch and the guarded `if`/`elif` chain the *same* first-match rule over one node. A binder-less `case tag:` still binds — to a minted `__match_payload_N` the body cannot spell — so downstream passes need no separate no-binder case.
+
+`Option(T)` is a built-in *abbreviation* for the two-tag variant `{some: T, none: Unit}`, handled in `lower_type_application` beside `List(T)`. It is the only place the compiler mentions either tag spelling; nothing at the term level knows the names `some` or `none`, so `.some`/`.none` are ordinary constructors and `Option` is not a special case but a peer of its neighbours. `Type::option_of` lists its tags in **name order**, matching the name-ordered form the solver materializes a coalesced variant in, so an annotation compares equal to an inferred type structurally.
+
+### Unreachable arms are kept, and cost nothing
+
+Variant width subtyping constrains the scrutinee to a **subtype** of the arms' tag set (`emit_case`'s `require_sub`), so a `match` written for the full `Option` over a scrutinee inference has pinned to one tag is well-typed with a dead arm. Surplus arms are the normal case, not a user error.
+
+Nothing prunes them. `variant_project` names the tag it reads, and a tag the column does not carry yields an empty restriction that contributes nothing to the union — so a dead arm is simply inert. The one thing it needs is a payload *type*: its variable never received a bound, so `coalesce_node` defaults an otherwise-unresolved pattern payload to `Unit`, an unobservable payload carrying no information.
+
+Exhaustiveness is correspondingly **directional**, and `lambda_elim` asserts it that way: every tag the *scrutinee* can carry must be covered by some arm (otherwise the union re-totals to a domain with gaps), while arms beyond that are unconstrained. Two arms for one tag remains a violation — it would union two partitions onto the same domain positions.
+
+An earlier version of this pass pruned unreachable arms at coalesce. That narrowed a `Case`'s arm set relative to the enclosing lambda's declared domain, which is what made `match` on a function parameter miscompile: specialization narrows a *read* to its lower bound while the parameter keeps the arms' union, so pruning against the read left a body handling fewer tags than the domain it claimed.
+
+The fan-out a `match` inside a lambda produces is a **`DisjointJoin`**, not a `Copair`: its arms restrict the *same* fed domain and merge back onto it. See [ir.md](ir.md), "`Copair` and `DisjointJoin` — two collection-combining operations, not one".
+
+### A scalar match is the C-form, gated by tag
+
+`elim_lambda` compiles a scrutinee-`Case` *inside* a lambda to the union of tag-restricts `⧺ᵢ (𝑑 ▷ variant_project(cᵢ) ▷ (λ 𝑤ᵢ → 𝑒ᵢ))`. A `match` in value position with **no** enclosing lambda does not reuse that by applying it to the scrutinee; it takes the same C-form the scalar *guard*-`Case` takes, with the boolean gate replaced by the tag projection:
+
+    guard:  ⧺ᵢ ( iterate ▷ restrict(π̂ᵢ)                  ≫ const(𝑒ᵢ) ) ▷ final_or_default(…, 𝑒ₙ)
+    tag:    ⧺ᵢ ( iterate ▷ const(𝑠) ≫ variant_project(cᵢ) ≫ 𝑒ᵢ       ) ▷ final_or_default
+
+Three things follow from lifting onto the synthetic one-shot driver rather than applying the arms to the scrutinee:
+
+- **The scrutinee enters by `const`**, exactly as the guard form's arm *values* do. Planning prepends an `iterate` to the union — it is an iteration source — and that `iterate` takes **no input**. This is why the obvious-looking eta-expansion `𝑠 ▷ (λ __scrut → match __scrut { … })` cannot work: it makes the union's domain the *scrutinee's*, so the scrutinee has to be fed into an operator that accepts nothing. That shape appeared to work only while unreachable arms were being pruned, because a single-arm fan-out emits no union and so gets no `iterate`.
+- **No first-match predicate is synthesised.** Disjointness is structural: `variant_project(cᵢ)` is empty at any position not carrying `cᵢ`, so the arms partition the driver with no gate at all. The guard form needs `π̂ᵢ = 𝑔ᵢ ∧ ¬⋁ⱼ<ᵢ 𝑔ⱼ`; the tag form needs nothing.
+- **The collapse needs no default.** The arms cover every tag the scrutinee can carry, so exactly one position survives and `final_or_default` is applied to the **bare stream** rather than a `(stream, default)` tuple. `ExtractLast` carries an `Option` default for this and fails loudly on an empty source rather than inventing a value. The guard form's default is its trailing `true` arm's value; a tag partition has no such arm.
+
+`VariantProject` takes its payload extent from the *node's* type, not from the scrutinee's extent, precisely because a width-subtype scrutinee may not carry the projected tag — there would be no arm to read the extent from, yet the empty result still needs describing.
+
+The two scalar `Case` forms are therefore one shape — lift onto a one-shot driver, fan out over disjoint sub-domains, `⧺`, collapse — differing only in what disjoins the sub-domains. That is also the shape a *mixed* arm needs (`case tag(x) if p:`): the composition `variant_project(cᵢ) ≫ restrict(π̂ᵢ)`, with the first-match complement taken only over prior arms **sharing that tag** rather than over all prior arms.
+
+**Known gap.** A *single-arm* `match` does not compile: the driver is made an iteration source by unioning the arms, and `CollectionUnion` requires at least two operands, so a lone arm leaves its leading `const` with nothing to lift over. Either one arm wants a driver-free shape (its partition is trivially total, so there is no sibling to share a domain with) or the driver wants materializing without a union. `tests/compilation_pipeline/variants.rs` carries it as an ignored test.
+
+### The default arm
+
+`case _:` lowers to a `Branch` with `pattern: None` inside the scrutinee-`Case` — the shape `Branch` already had — and needs **no runtime work at all**: it fires exactly when no tagged arm matched, which is precisely the empty-stream case `final_or_default` handles, so it becomes that operator's *default* rather than an arm of the union. The tagged arms form the union as before; the collapse switches from the bare-stream form to the `(stream, default)` tuple form. No tag-complement predicate is synthesised.
+
+What it does need is an **inference** change, and it is the dual of exhaustiveness. Without a default arm the arms must cover everything the scrutinee can carry, so `scrut <: Variant({tagᵢ: αᵢ})` — the scrutinee's tags are *at most* the arms'. With one, the scrutinee may carry tags no arm names, so that constraint would make the default arm unreachable by construction: every scrutinee it could fire on is rejected first. `emit_case` instead relates both to a fresh variable *above* the arms' variant — `expected <: open` and `scrut <: open` — which drops the subset requirement without needing a row variable.
+
+The consequence for elimination is that `arms_variant` becomes a **join**: the projections consume the arms' demand *unioned with the scrutinee's own tags*, since with a default arm the arms' tag set is no longer above the scrutinee. Without a default arm the join adds nothing, so the no-default path is unchanged.
+
+`case _:` is special-cased in the parser rather than falling through as a tag, because `_` lexes as an ordinary identifier and would otherwise parse as a tag literally *named* `_` — silently unmatchable. The default arm must be last and unique; both are rejected at lowering.

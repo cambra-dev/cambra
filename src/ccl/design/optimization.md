@@ -98,7 +98,7 @@ The output references built-in primitives via the `Builtin` enum carried by `Typ
 | `Builtin::BinOp(op)` for any `op: BinOpKind` | `add`, `sub`, `eq`, `lt`, `and`, `or`, `concat`, … | every arithmetic / compare / boolean-logic / string-concat binary op (one variant, parameterised by the existing `BinOpKind` so the operator enum has a single source of truth) |
 | `Builtin::{Neg,NotFn}` | `neg`, `not_fn` | unary operations |
 | `Builtin::{Sum,Max}` | `sum`, `max` | aggregations (fold/reduce) |
-| `Builtin::CollectionUnion` | `collection_union` | point-free function form of N-ary collection union, emitted only by lambda elimination when an inside-a-lambda `TypedExprNode::CollectionUnion` needs to be lifted out: `Apply(Tuple([a, b]), Builtin(CollectionUnion))`. The value-form node (top-level `TypedExprNode::CollectionUnion`) is the canonical shape; both compile to a `UnionOperator` tile. Surface `a ++ b ++ c` lowers directly to a flat N-ary value-form node — see [ir.md](ir.md) and [type-inference.md](type-inference.md#union-flattening-construction-time) for the construction-time invariant. |
+| `Builtin::Copair` | `copair` | point-free function form of N-ary collection union, emitted only by lambda elimination when an inside-a-lambda `TypedExprNode::CollectionUnion` needs to be lifted out: `Apply(Tuple([a, b]), Builtin(CollectionUnion))`. The value-form node (top-level `TypedExprNode::CollectionUnion`) is the canonical shape; both compile to a `UnionOperator` tile. Surface `a ++ b ++ c` lowers directly to a flat N-ary value-form node — see [ir.md](ir.md) and [type-inference.md](type-inference.md#union-flattening-construction-time) for the construction-time invariant. |
 
 Downstream passes (`simplify`, `planning`, `operator_conversion`) match directly on the `Builtin` variant.
 
@@ -260,7 +260,7 @@ Three op-conversion arms have child-input policies that don't fit the single-arg
 
 - **`Apply(Tuple | Record, Zip)`** — Zip fans the upstream input out to each tuple/record element.  Those elements receive `Some(fan_out_branch)`, so they are not iteration sites.  The pass walks into the elements (to reach deeper iteration sites) without triggering the value-position `Record` / `Tuple` wrap.
 - **`Apply(Tuple([stream, default]), FinalOrDefault)`** — the tuple's first element (`stream`) is iterated; the second (`default`) is a scalar fallback for empty iteration and needs no marker.
-- **`CollectionUnion`** — both the value-form node (`CollectionUnion(operands)`) and the function-form `Apply(Tuple(ops), CollectionUnion)` need each operand wrapped independently; op-conversion compiles each with `input=None`.
+- **`Copair` / `DisjointJoin`** — for `Copair`, both the value-form node (`Copair(operands)`) and the function-form `Apply(Tuple(ops), Copair)` need each operand wrapped independently; op-conversion compiles each with `input=None`. `DisjointJoin` is the sibling operation (see [ir.md](ir.md), "`Copair` and `DisjointJoin` — two collection-combining operations, not one") and behaves the same way here: its operands are compiled with `input=None` when nothing is fed, so each is its own iteration site.
 
 #### `Let` recursion
 

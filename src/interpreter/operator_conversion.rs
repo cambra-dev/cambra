@@ -692,23 +692,36 @@ fn convert_impl(
         // and preserved through lambda elimination (top-level path).
         // Compiles directly to a `UnionOperator` over the N operand
         // collections.
-        TypedExprNode::CollectionUnion(operands) => {
+        TypedExprNode::Copair(operands) => {
             if operands.len() < 2 {
                 return Err(ConversionError::Unsupported(format!(
                     "collection_union expects at least 2 inputs, got {}",
                     operands.len()
                 )));
             }
-            union_operand_ops(operands, input, ctx)
+            union_operand_ops(operands, UnionShape::Copair, input, ctx)
         }
 
-        // `Apply(Tuple(ops), Builtin::CollectionUnion)` — the point-free
+        // A **disjoint join**: the operands are partial collections over one domain,
+        // so the result stays on that domain (`UnionOperator::new_flat`) rather than
+        // on a coproduct of their domains. The node says which operation this is, so
+        // nothing has to be re-derived here — see [`UnionShape`].
+        TypedExprNode::DisjointJoin(operands) => {
+            if operands.is_empty() {
+                return Err(ConversionError::Unsupported(
+                    "disjoint_join expects at least one operand".to_string(),
+                ));
+            }
+            union_operand_ops(operands, UnionShape::DisjointJoin, input, ctx)
+        }
+
+        // `Apply(Tuple(ops), Builtin::Copair)` — the point-free
         // function-form, produced by lambda elimination when a
-        // `CollectionUnion` appears inside a lambda body whose operands
+        // `Copair` appears inside a lambda body whose operands
         // reference the lambda parameter.  Same `UnionOperator` output as
         // the top-level node above.
         TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::CollectionUnion) =>
+            if as_builtin(function) == Some(Builtin::Copair) =>
         {
             let TypedExprNode::Tuple(elts) = &argument.node else {
                 return Err(ConversionError::Unsupported(format!(
@@ -722,7 +735,7 @@ fn convert_impl(
                     elts.len()
                 )));
             }
-            union_operand_ops(elts, input, ctx)
+            union_operand_ops(elts, UnionShape::Copair, input, ctx)
         }
 
         // `as_of((trigger, source))` — the live cross-endpoint read. For each
@@ -885,29 +898,33 @@ fn convert_impl(
         }
 
         // `FinalOrDefault` is the stream-to-scalar primitive that extracts the
-        // codomain value at the final position of an iteration stream, falling
-        // back to a default scalar when the stream is empty.  Argument is a
-        // 2-element `Tuple([stream, default])`; compiles directly to the
-        // `ExtractLast` tile operator (which takes both ops).
+        // codomain value at the final position of an iteration stream. Compiles
+        // directly to the `ExtractLast` tile operator.
+        //
+        // **Two argument shapes.** A 2-element `Tuple([stream, default])` falls back
+        // to `default` when the stream is empty — the guard-`Case` C-form, whose
+        // trailing `true` arm supplies it, and the mutation loop whose pre-loop
+        // accumulator does. A **bare stream** declares the source *total*: an
+        // exhaustive tag partition always covers exactly one position, so there is
+        // no empty case and no default value has to be invented.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::FinalOrDefault) =>
         {
             expect_no_input(input, "final_or_default")?;
-            let TypedExprNode::Tuple(elts) = &argument.node else {
-                return Err(ConversionError::Unsupported(format!(
-                    "FinalOrDefault expects a 2-element Tuple argument, got {:?}",
-                    argument.node
-                )));
-            };
-            if elts.len() != 2 {
-                return Err(ConversionError::Unsupported(format!(
-                    "FinalOrDefault expects a 2-element Tuple argument, got {} elements",
+            match &argument.node {
+                TypedExprNode::Tuple(elts) if elts.len() == 2 => {
+                    let stream_op = convert_impl(&elts[0], None, ctx)?;
+                    let default_op = convert_impl(&elts[1], None, ctx)?;
+                    Ok(Box::new(ExtractLast::new(stream_op, default_op)))
+                }
+                TypedExprNode::Tuple(elts) => Err(ConversionError::Unsupported(format!(
+                    "FinalOrDefault with a Tuple argument expects 2 elements, got {}",
                     elts.len()
-                )));
+                ))),
+                _ => Ok(Box::new(ExtractLast::without_default(convert_impl(
+                    argument, None, ctx,
+                )?))),
             }
-            let stream_op = convert_impl(&elts[0], None, ctx)?;
-            let default_op = convert_impl(&elts[1], None, ctx)?;
-            Ok(Box::new(ExtractLast::new(stream_op, default_op)))
         }
 
         // `GetPrevSeq` is a letrec guard accessor, never compiled directly:
@@ -1037,7 +1054,21 @@ fn convert_impl(
                             input.tiling()
                         )));
                     }
-                    Ok(Box::new(VariantProject::new(input, tag.clone())))
+                    // The projected arm's extent comes from this node's codomain:
+                    // the scrutinee may be a width-subtype that never carries the
+                    // tag, in which case its extent has no arm to read it from.
+                    let payload_ty = expr.ty.codomain().ok_or_else(|| {
+                        ConversionError::TypeError(format!(
+                            "variant_project({tag}) node must have a function type, got {}",
+                            expr.ty
+                        ))
+                    })?;
+                    let payload_extent = ctx.extent_of(&payload_ty)?;
+                    Ok(Box::new(VariantProject::new(
+                        input,
+                        tag.clone(),
+                        payload_extent,
+                    )))
                 }
                 // `variant_wrap(c)` — the point-free constructor. Consumes the fed
                 // payload stream and injects it at tag `c`. The union extents come
@@ -1871,7 +1902,7 @@ fn apply_binop(
     )))
 }
 
-/// Build the `UnionOperator` for a `CollectionUnion`. With no input (the top-level
+/// Build the `UnionOperator` for a `Copair`. With no input (the top-level
 /// / comprehension union, or a Σ / C-form dispatch), each operand is a
 /// self-contained collection and the union is **tagged** (`UnionOperator::new`) —
 /// distinct-extent arms keep their `Extent::Union` domain, which `final_or_default`
@@ -1881,8 +1912,23 @@ fn apply_binop(
 /// (`UnionOperator::new_flat`): the arms share one domain extent and disjoint
 /// positions, so the union stays on that extent and co-iterates with the sibling
 /// `commit` field of the decision record.
+/// Which of the two collection-combining operations a union node denotes.
+///
+/// Read off the node rather than inferred: `Copair` is a **copairing**
+/// (operands over distinct index sets, result on their coproduct) and
+/// `DisjointJoin` is a **join of partial maps over one domain** (result on that
+/// domain, defined only where the operands are disjoint). Both can appear with or
+/// without a fed input, so input-presence does not distinguish them — it only
+/// decides *how* the operands are wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnionShape {
+    Copair,
+    DisjointJoin,
+}
+
 fn union_operand_ops(
     operands: &[Expr],
+    shape: UnionShape,
     input: Option<Box<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
@@ -1892,7 +1938,10 @@ fn union_operand_ops(
                 .iter()
                 .map(|e| convert_impl(e, None, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Box::new(UnionOperator::new(ops)))
+            Ok(match shape {
+                UnionShape::Copair => Box::new(UnionOperator::new(ops)) as Box<dyn TileOperator>,
+                UnionShape::DisjointJoin => Box::new(UnionOperator::new_flat(ops)),
+            })
         }
         Some(inp) => {
             // `Memo` the shared fed input so the fan's branches (one per arm) stay

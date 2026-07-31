@@ -81,6 +81,10 @@ pub enum Token {
     Pass,
     #[token("with", priority = 3)]
     With,
+    #[token("match", priority = 3)]
+    Match,
+    #[token("case", priority = 3)]
+    Case,
 
     // -- Multi-char operators (must precede their single-char prefixes) ---
     #[token("<<=")]
@@ -216,6 +220,8 @@ impl fmt::Display for Token {
             Token::Yield => "yield",
             Token::Pass => "pass",
             Token::With => "with",
+            Token::Match => "match",
+            Token::Case => "case",
             // Operators (multi-char before single-char)
             Token::LShiftEq => "<<=",
             Token::LShift => "<<",

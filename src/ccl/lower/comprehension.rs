@@ -185,7 +185,7 @@ pub(super) fn lower_list_comp(
     // `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`. Each arm restricts the source by its
     // (element-dependent) gate — the ordinary filter refinement — and maps by
     // that arm's value; the gates partition the source, so the union recombines
-    // the arms by position into the fully-mapped collection. A `CollectionUnion`
+    // the arms by position into the fully-mapped collection. A `Copair`
     // (not a `Case`), so the compute-kinded per-arm maps do not need to join.
     // Single generator, no comprehension filter; the value arms may reference `x`.
     if single_gen
@@ -419,7 +419,7 @@ fn fan_out_element_case(
     if arms.len() == 1 {
         arms.into_iter().next().expect("checked len == 1")
     } else {
-        ctx.tag_machinery(Expr::collection_union(arms), span, "lower.comp_elem_case")
+        ctx.tag_machinery(Expr::copair(arms), span, "lower.comp_elem_case")
     }
 }
 

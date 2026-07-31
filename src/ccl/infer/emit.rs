@@ -173,7 +173,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             emit_define(&target_ty, value, &label, ctx)?
         }
 
-        TypedExprNode::CollectionUnion(exprs) => emit_collection_union(exprs, ctx)?,
+        TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
+        TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, ctx)?,
 
         // `Transact` is born by `planning::plan_loops`, which runs *after*
         // inference, so constraint emission never sees one. Gathered
@@ -799,11 +800,11 @@ fn constrain_into_feed<C: Typing>(
     Ok(prim(BaseType::Unit))
 }
 
-pub(super) fn emit_collection_union<C: Typing>(
+pub(super) fn emit_copair<C: Typing>(
     exprs: &mut [Expr],
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // CollectionUnion: the result is a collection (a function from index
+    // Copair: the result is a collection (a function from index
     // to element) whose *domain* is tagged and whose *codomain* is the
     // join of branch codomains.
     //
@@ -837,14 +838,45 @@ pub(super) fn emit_collection_union<C: Typing>(
         let ty = ctx.subexpr(e)?;
         // Each operand is a collection (function); its codomain joins into the
         // shared `cod_var`, its domain becomes the variant tag for operand `i`.
-        let (dom, cod) = ctx.as_function(&ty, &|| "CollectionUnion element".to_string())?;
-        ctx.require_sub(&cod, &cod_var, &|| "CollectionUnion codomain".to_string())?;
+        let (dom, cod) = ctx.as_function(&ty, &|| "Copair element".to_string())?;
+        ctx.require_sub(&cod, &cod_var, &|| "Copair codomain".to_string())?;
         tags.insert(FieldKey::Index(i), dom);
     }
     let dom_variant = variant_type(tags);
     // `++` produces a collection — a **data** function over the tagged union of
     // its operands' domains.
     Ok(Type::data_fun(dom_variant, cod_var))
+}
+
+/// Disjoint join: every operand is a partial collection over the **same** domain,
+/// so the result lives on that domain rather than on a coproduct of them.
+///
+/// The dual of [`emit_copair`], and the difference is the whole point of
+/// the two nodes: copairing takes operands over *distinct* index sets and tags them
+/// apart, so its domain is `Variant({Index(i): dᵢ})`; a disjoint join takes operands
+/// over *one* index set and merges them, so its domain is that set. Definedness
+/// differs too — a join requires the operands' domains to be disjoint, which no type
+/// records, so it is checked where it is relied on (`flat_merge`).
+pub(super) fn emit_disjoint_join<C: Typing>(
+    exprs: &mut [Expr],
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    assert!(
+        !exprs.is_empty(),
+        "DisjointJoin requires at least one operand"
+    );
+    let cod_var = ctx.fresh();
+    let dom_var = ctx.fresh();
+    for e in exprs.iter_mut() {
+        let ty = ctx.subexpr(e)?;
+        let (dom, cod) = ctx.as_function(&ty, &|| "DisjointJoin element".to_string())?;
+        // One shared domain: each operand's domain flows into the same variable, so
+        // operands over genuinely different index sets are a type error here rather
+        // than being silently tagged apart.
+        ctx.require_sub(&dom, &dom_var, &|| "DisjointJoin domain".to_string())?;
+        ctx.require_sub(&cod, &cod_var, &|| "DisjointJoin codomain".to_string())?;
+    }
+    Ok(Type::data_fun(dom_var, cod_var))
 }
 
 /// Aggregate (`Sum`, `Max`): the scheme is the full operator type
@@ -1215,7 +1247,25 @@ pub(super) fn emit_case<C: Typing>(
             }
         }
         let expected = variant_type(expected_tags);
-        ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
+        // Whether the arms are *exhaustive* decides which way the scrutinee is
+        // related to them.
+        //
+        // - **No default arm**: the arms must cover everything the scrutinee can
+        //   carry, so `scrut <: expected` — the scrutinee's tags are *at most* the
+        //   arms'. An unhandled tag is the `ExtraTag` error.
+        // - **With a default arm**: the scrutinee may carry tags no arm names — that
+        //   is what the default is *for* — so requiring a subset would make the
+        //   default arm unreachable by construction. Relate both to a fresh variable
+        //   *above* the arms' variant and constrain the scrutinee into that instead,
+        //   which drops the subset requirement without inventing a row variable.
+        let has_default = branches.iter().any(|b| b.pattern.is_none());
+        if has_default {
+            let open = ctx.fresh();
+            ctx.require_sub(&expected, &open, &|| "Case arms".to_string())?;
+            ctx.require_sub(&scrut_ty, &open, &|| "Case scrutinee".to_string())?;
+        } else {
+            ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
+        }
     }
 
     // Every arm joins by the **lattice**: each arm's type is a subtype of one

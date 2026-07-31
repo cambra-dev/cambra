@@ -788,6 +788,29 @@ impl Type {
         }
     }
 
+    /// `Option(𝑇)` — the two-tag variant `{some: 𝑇, none: Unit}`.
+    ///
+    /// A built-in type *abbreviation*, in the same category as `List(T)` and
+    /// `Map(K, V)` under the term/type syntax split — see `docs/chl-spec.md`, "3.15 Variant constructors".
+    /// It is **not** a distinguished kind of type: the result is an ordinary
+    /// structural [`Type::Variant`], and the constructors `.some(𝑒)` / `.none`
+    /// are ordinary variant constructors that no pass gives special treatment.
+    /// This function is the only place in the compiler that mentions either tag
+    /// spelling; when type aliases land it is replaced by a prelude
+    /// `Option(T) = some(T) | none` and deleted.
+    ///
+    /// Tags are listed in **name order** (`none` before `some`) on purpose: the
+    /// solver materializes a coalesced variant from a `BTreeMap`, so an inferred
+    /// variant's tags always come out name-ordered. Writing the abbreviation in
+    /// that same order is what lets an `Option(T)` *annotation* compare equal to
+    /// the inferred type structurally instead of differing only by tag order.
+    pub fn option_of(payload: Self) -> Self {
+        Type::Variant(vec![
+            (FieldKey::Name("none".into()), Type::Base(BaseType::Unit)),
+            (FieldKey::Name("some".into()), payload),
+        ])
+    }
+
     /// Helper for creating a dependent (Pi) **compute** function type
     /// `(name: domain) ⇒ codomain`.
     pub fn pi(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
@@ -1304,7 +1327,7 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
         | (N::Compose(x), N::Compose(y))
-        | (N::CollectionUnion(x), N::CollectionUnion(y)) => all_eq(x, y),
+        | (N::Copair(x), N::Copair(y)) => all_eq(x, y),
         (
             N::Case {
                 scrutinee: s1,

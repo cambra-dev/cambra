@@ -802,7 +802,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         TypedExprNode::List(elts)
         | TypedExprNode::Tuple(elts)
-        | TypedExprNode::CollectionUnion(elts) => {
+        | TypedExprNode::Copair(elts)
+        | TypedExprNode::DisjointJoin(elts) => {
             for e in elts.iter_mut() {
                 coalesce_node(e, level, ctx);
             }
@@ -907,7 +908,22 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // for `expr.ty` so it ends up concrete.
                 if let Some(p) = &mut b.pattern {
                     match resolve_var_type(&p.binding.ty) {
-                        Ok(ty) => p.binding.ty = ty,
+                        // An arm the scrutinee can never reach leaves its payload
+                        // variable with no bound at all, so it resolves to a bare
+                        // `Infer`. That is not an error: the arm is unreachable, so
+                        // its payload type is unobservable and any type will do.
+                        // `Unit` is the one that carries no information.
+                        //
+                        // Such arms are *kept*, not pruned. `variant_project` names
+                        // the tag it reads, and a tag the column does not carry
+                        // yields an empty restriction that contributes nothing to
+                        // the union — so a dead arm costs nothing and needs no
+                        // special handling downstream. (Pruning them here instead
+                        // would narrow the arm set relative to the enclosing
+                        // lambda's declared domain, which is what made `match` on a
+                        // function parameter miscompile.)
+                        Ok(ty) if !matches!(ty, Type::Infer(_)) => p.binding.ty = ty,
+                        Ok(_) => p.binding.ty = Type::Base(crate::ccl::BaseType::Unit),
                         Err(err) => {
                             let label = format!("Case pattern `.{}` payload", p.tag);
                             ctx.push_error(map_coalesce_err(err, &label), label);
