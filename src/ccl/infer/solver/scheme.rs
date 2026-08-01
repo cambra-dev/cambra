@@ -302,8 +302,8 @@ pub fn freshen_above(
                 .collect();
             {
                 let mut s = v.bounds.borrow_mut();
-                s.lower = new_lows;
-                s.upper = new_ups;
+                s.lower = Rc::new(new_lows);
+                s.upper = Rc::new(new_ups);
             }
             Type::Infer(v)
         }

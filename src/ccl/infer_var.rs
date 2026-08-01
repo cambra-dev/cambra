@@ -190,12 +190,52 @@ impl Bound {
 /// these in place via the variable's [`RefCell`]; coalescing reads them to
 /// materialize a concrete [`Type`]. Each entry is a [`Bound`] carrying the
 /// substitution on its constraint edge.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InferBounds {
     /// Lower bounds — `L <: α`. Unioned at positive (output) positions.
-    pub lower: Vec<Bound>,
+    ///
+    /// Behind an [`Rc`] so a *reader* can take the list away from the `RefCell`
+    /// without copying it. Materialization does exactly that, once per variable
+    /// visit, and a `Bound` owns a whole [`Type`] and a `Subst` — so the copy is
+    /// deep, and on a bound-graph walk it is most of the work. Mutation goes
+    /// through [`lower_mut`](Self::lower_mut), which copies only if a reader is
+    /// still holding the old list; the passes that write bounds hold none.
+    pub lower: Rc<Vec<Bound>>,
     /// Upper bounds — `α <: U`. Intersected at negative (input) positions.
-    pub upper: Vec<Bound>,
+    /// Shared like [`lower`](Self::lower).
+    pub upper: Rc<Vec<Bound>>,
+}
+
+thread_local! {
+    /// One shared empty bound list, so a fresh variable costs no allocation.
+    ///
+    /// `Rc<Vec<_>>::default()` would allocate a control block per list, and a run
+    /// mints hundreds of thousands of variables — most of which never take a bound
+    /// at all. Handing every empty list the same `Rc` keeps that at zero; the first
+    /// write copies out of it, which is a `Vec` clone of nothing.
+    static NO_BOUNDS: Rc<Vec<Bound>> = Rc::new(Vec::new());
+}
+
+impl Default for InferBounds {
+    fn default() -> Self {
+        NO_BOUNDS.with(|empty| InferBounds {
+            lower: Rc::clone(empty),
+            upper: Rc::clone(empty),
+        })
+    }
+}
+
+impl InferBounds {
+    /// The lower bounds, for mutation — copy-on-write against any reader still
+    /// holding the list.
+    pub fn lower_mut(&mut self) -> &mut Vec<Bound> {
+        Rc::make_mut(&mut self.lower)
+    }
+
+    /// The upper bounds, for mutation — see [`lower_mut`](Self::lower_mut).
+    pub fn upper_mut(&mut self) -> &mut Vec<Bound> {
+        Rc::make_mut(&mut self.upper)
+    }
 }
 
 /// A type inference variable: an unknown type the solver pins down by

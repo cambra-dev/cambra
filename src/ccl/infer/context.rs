@@ -458,7 +458,7 @@ impl Typing for InferCtx {
         };
         v.bounds
             .borrow_mut()
-            .lower
+            .lower_mut()
             .push(crate::ccl::Bound::with_subst(
                 result,
                 crate::ccl::subst::Subst::discharge(&x, argument.clone()),
