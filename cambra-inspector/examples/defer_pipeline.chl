@@ -1,0 +1,38 @@
+# defer_pipeline.chl
+#
+# Exercises `defer` desugaring in the program inspector.
+#
+# Both surface forms that lower to Defer/Feed nodes are present:
+#   * `yield` generators  — each `def` below desugars to a defer that is
+#     fed once per loop iteration, then channelized into a stream.
+#   * the `<<` feed operator on an explicit `defer()` handle.
+#
+# The `totals` channel is fed from TWO distinct sites — one scalar seed
+# feed and one per-iteration feed inside a `for` loop — so the defer
+# *channelization* (fan-in / channel union) actually fires. That fan-in
+# is the interesting structure to look at in the inspector: the desugar
+# pass synthesizes the union node that merges both feed sites.
+
+# Generator 1: double each reading. Lowers to a yield-defer.
+def doubled(xs):
+    for x in xs:
+        yield x * 2
+
+# Generator 2: square each reading. A second, independent yield-defer.
+def squared(xs):
+    for x in xs:
+        yield x * x
+
+readings = [1, 2, 3, 4]
+
+# An explicit deferred channel, fed from two sites:
+#   1. a scalar seed derived from the `doubled` generator, and
+#   2. a per-iteration feed driven by the `squared` generator's stream.
+# The two feed sites fan in to a single channel during desugaring.
+totals = defer()
+totals << sum(doubled(readings))
+for x in squared(readings):
+    totals << x
+
+# Collapse the channelized stream to a single checkable result.
+max(totals)
