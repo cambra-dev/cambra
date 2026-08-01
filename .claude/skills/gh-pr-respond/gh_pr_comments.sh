@@ -9,12 +9,12 @@
 #   pending             — pending (draft) review comments for AUTHOR, via REST
 #   all                 — both active and pending
 #
-# Defaults: org=cambra-dev, repo=Cambra, author=groundlar
+# Defaults: org=cambra-dev, repo=cambra, author=groundlar
 
 set -euo pipefail
 
 DEFAULT_ORG="cambra-dev"
-DEFAULT_REPO="Cambra"
+DEFAULT_REPO="cambra"
 DEFAULT_AUTHOR="groundlar"
 DEFAULT_MODE="active"
 
@@ -33,21 +33,36 @@ VERBOSE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mode)    MODE="$2";   shift 2 ;;
-    --org)     ORG="$2";    shift 2 ;;
-    --repo)    REPO="$2";   shift 2 ;;
-    --author)  AUTHOR="$2"; shift 2 ;;
-    -v|--verbose) VERBOSE=true; shift ;;
-    -h|--help) usage ;;
-    *)
-      if [[ -z "${PR_NUM}" ]]; then
-        PR_NUM="$1"
-      else
-        echo "Unexpected argument: $1" >&2
-        usage
-      fi
-      shift
-      ;;
+  --mode)
+    MODE="$2"
+    shift 2
+    ;;
+  --org)
+    ORG="$2"
+    shift 2
+    ;;
+  --repo)
+    REPO="$2"
+    shift 2
+    ;;
+  --author)
+    AUTHOR="$2"
+    shift 2
+    ;;
+  -v | --verbose)
+    VERBOSE=true
+    shift
+    ;;
+  -h | --help) usage ;;
+  *)
+    if [[ -z "${PR_NUM}" ]]; then
+      PR_NUM="$1"
+    else
+      echo "Unexpected argument: $1" >&2
+      usage
+    fi
+    shift
+    ;;
   esac
 done
 
@@ -109,8 +124,8 @@ query($owner: String!, $repo: String!, $pr: Int!) {
     ) | join("\n\n")) + "\n"
   '
 
-  gh api graphql -F owner="${ORG}" -F repo="${REPO}" -F pr="${PR_NUM}" -f query="${QUERY}" \
-    | jq -r "${JQ_FILTER}"
+  gh api graphql -F owner="${ORG}" -F repo="${REPO}" -F pr="${PR_NUM}" -f query="${QUERY}" |
+    jq -r "${JQ_FILTER}"
 }
 
 # --- Pending (draft) comments via REST ---
@@ -121,10 +136,10 @@ fetch_pending() {
   REVIEWS_JSON=$(gh api "repos/${ORG}/${REPO}/pulls/${PR_NUM}/reviews")
 
   local REVIEW_ID
-  REVIEW_ID=$(echo "${REVIEWS_JSON}" \
-    | jq -r --arg author "${AUTHOR}" \
-      '.[] | select(.state == "PENDING" and .user.login == $author) | .id' \
-    | head -n 1)
+  REVIEW_ID=$(echo "${REVIEWS_JSON}" |
+    jq -r --arg author "${AUTHOR}" \
+      '.[] | select(.state == "PENDING" and .user.login == $author) | .id' |
+    head -n 1)
 
   if [[ -z "${REVIEW_ID}" || "${REVIEW_ID}" == "null" ]]; then
     echo "No pending reviews found for ${AUTHOR}."
@@ -166,20 +181,20 @@ fetch_pending() {
 
 # --- Dispatch ---
 case "${MODE}" in
-  active)
-    fetch_active
-    ;;
-  pending)
-    fetch_pending
-    ;;
-  all)
-    echo "=== Active Threads ===" >&2
-    fetch_active
-    echo "=== Pending Comments ===" >&2
-    fetch_pending
-    ;;
-  *)
-    echo "Unknown mode: ${MODE} (expected active, pending, or all)" >&2
-    usage
-    ;;
+active)
+  fetch_active
+  ;;
+pending)
+  fetch_pending
+  ;;
+all)
+  echo "=== Active Threads ===" >&2
+  fetch_active
+  echo "=== Pending Comments ===" >&2
+  fetch_pending
+  ;;
+*)
+  echo "Unknown mode: ${MODE} (expected active, pending, or all)" >&2
+  usage
+  ;;
 esac

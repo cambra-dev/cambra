@@ -1,0 +1,9 @@
+node_modules/
+.vite/
+*.tsbuildinfo
+
+# The built bundle is committed on purpose (R7): the server embeds it via
+# include_str! so `cargo build` needs no Node toolchain. Keep dist/index.html
+# tracked; ignore any other intermediate build output Vite might emit.
+dist/*
+!dist/index.html

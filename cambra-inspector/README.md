@@ -27,7 +27,7 @@ compiles zero serde (serde is an optional, default-off feature on `cambra`).
   monomorphization fan-out). Pre-inference holes (`_`/`?N`) show their resolved
   downstream type on hover.
 
-See `web/README.md` for the full interaction table and the <!-- doc-refs-ignore -->
+See [`web/README.md`](web/README.md) for the full interaction table and the
 frontend's design.
 
 ## Architecture
@@ -56,7 +56,7 @@ browser ──HTTP──> cambra-inspector (this crate) ──> cambra::inspecto
 | `src/lib.rs` | The transport edge: `snapshot_json` / `diagnose_json` (build-then-serialize). |
 | `src/server.rs` | The `tiny_http` server, its routes, and `snapshot_body` (used by `--dump-snapshot`). |
 | `src/main.rs` | The `cambra-inspector` binary / CLI (run the server, or `--dump-snapshot`). |
-| `web/` | The CodeMirror 6 / TypeScript frontend. **Has its own README (`web/README.md`)** — build, tests, module layout, and the byte↔char bridge. | <!-- doc-refs-ignore -->
+| `web/` | The CodeMirror 6 / TypeScript frontend. **Has its own [README](web/README.md)** — build, tests, module layout, and the byte↔char bridge. |
 | `web/dist/index.html` | The built, self-contained single-file bundle, committed and `include_str!`-embedded by the server (so `cargo build` needs no Node). |
 | `examples/` | Sample CHL programs (`arithmetic.chl`, `list_min.chl`, `polymorphic.chl`, `defer_*.chl`, `type_error.chl`, …). |
 | `scripts/dump_spans.py` | Frontend-independent debug tool: prints each IR node's span↔CCL mapping + a coverage summary, to isolate "the inspector won't link X" to backend (no span) vs frontend (span present, not wired). |
@@ -106,7 +106,7 @@ The model, indices, and query logic are tested in the `cambra` core
 (`src/inspector_model/`); this crate's tests cover the JSON shape and the server
 response bodies.
 
-**Frontend (TypeScript):** see `web/README.md`. In short, from <!-- doc-refs-ignore -->
+**Frontend (TypeScript):** see [`web/README.md`](web/README.md). In short, from
 `web/`: `npm run typecheck`, `npm run test` (vitest), `npm run build`.
 
 > ⚠ **Never run `npm run dev`** — it starts a Vite server that does not exit.
@@ -122,7 +122,7 @@ usage — it can manage the server for you or read a dumped/curled snapshot).
 `web/dist/index.html` is committed on purpose and embedded at compile time, so
 the binary works without Node. **After changing anything under `web/src/`,
 rerun `npm run build` and commit the regenerated bundle** (see the "Committed
-bundle" section of `web/README.md`). <!-- doc-refs-ignore -->
+bundle" section of [`web/README.md`](web/README.md)).
 
 ## Design & background
 
