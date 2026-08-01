@@ -725,7 +725,11 @@ mod tests {
         // the path is defensive.
         let v = fresh_var(0);
         if let Type::Infer(state) = &v {
-            state.bounds.borrow_mut().lower.push(Bound::conc(v.clone()));
+            state
+                .bounds
+                .borrow_mut()
+                .lower_mut()
+                .push(Bound::conc(v.clone()));
         }
         match coalesce_compact(&compact_type(&v)).unwrap() {
             Type::Infer(_) => {}
