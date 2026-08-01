@@ -677,7 +677,11 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // for its own extent, so an error is blamed on the node that raised it
     // rather than on an ancestor. Mirrors `emit_node` / `check_node`.
     let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
-    coalesce_node_inner(expr, level, ctx);
+    // One frame per node over the whole tree; grow on demand, as the other
+    // pass-level walks do.
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        coalesce_node_inner(expr, level, ctx)
+    });
     ctx.current_node = prev;
 }
 

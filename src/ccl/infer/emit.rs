@@ -45,7 +45,9 @@ use super::{product, variant_type};
 /// carry N nodes with no further change here.
 pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     let prev = ctx.enter_node(expr.node_id());
-    let result = emit_node_inner(expr, ctx);
+    // One frame per node over the whole tree; grow on demand, as the other
+    // pass-level walks do.
+    let result = stacker::maybe_grow(512 * 1024, 1024 * 1024, || emit_node_inner(expr, ctx));
     ctx.leave_node(prev);
     result
 }

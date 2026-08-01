@@ -295,7 +295,10 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
     // records or raises is blamed on it (`Typing::raise`); restored on exit,
     // error path included. Mirrors `emit_node`'s wrapper.
     let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
-    let out = check_node_rule(expr, ctx);
+    // One frame per node over the whole tree, and the frame is sized for the union
+    // of `check_node_rule`'s arms, so a deep tree can outrun a test thread's stack.
+    // Same guard, and same reason, as `lambda_elim`'s recursion entries.
+    let out = stacker::maybe_grow(512 * 1024, 1024 * 1024, || check_node_rule(expr, ctx));
     ctx.current_node = prev;
     out
 }

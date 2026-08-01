@@ -1113,6 +1113,12 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
 /// inlines the define value directly (define path).  All other nodes are
 /// recursed into structurally.
 fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
+    // One frame per node over the whole tree; grow on demand, as the other
+    // pass-level walks do.
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || desugar_inner(expr, ctx))
+}
+
+fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
     if matches!(expr.node, TypedExprNode::Error) {
         crate::unexpected_error_node!();
     }
@@ -1954,6 +1960,24 @@ fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
 /// or [`TypedExprNode::Case`] branch boundary — `Define` is disallowed in those
 /// contexts since the desugared binding would need to escape the inner scope.
 fn extract_for_defer(
+    expr: Expr,
+    defer_name: &Name,
+    feeds: &mut Vec<Expr>,
+    define: &mut Option<Expr>,
+    in_inner_scope: bool,
+    ctx: &DesugarCtx,
+) -> Result<Expr, DeferError> {
+    // Grow the stack on demand, as `lambda_elim`'s two recursion entries do. This
+    // walk descends the whole tree in one frame per node, and the frame is large
+    // (one `match` over every node kind, so it is sized for the union of all arms)
+    // — deep enough trees overflow a test thread's default stack. Every level goes
+    // through this wrapper, so each one checks the remaining headroom.
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        extract_for_defer_impl(expr, defer_name, feeds, define, in_inner_scope, ctx)
+    })
+}
+
+fn extract_for_defer_impl(
     expr: Expr,
     defer_name: &Name,
     feeds: &mut Vec<Expr>,

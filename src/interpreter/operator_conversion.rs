@@ -473,6 +473,19 @@ fn convert_impl(
     input: Option<Box<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
+    // One frame per node, sized for the union of every arm below; grow on demand as
+    // the other pass-level walks do (`lambda_elim`, `check`, `constrain`,
+    // `channelize`).
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        convert_impl_inner(expr, input, ctx)
+    })
+}
+
+fn convert_impl_inner(
+    expr: &Expr,
+    input: Option<Box<dyn TileOperator>>,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     trace!("Converting {}", symbolic(expr));
     let result: Result<Box<dyn TileOperator>, ConversionError> = match &expr.node {
         // f ≫ g: left-to-right composition.  Apply left first, then right.
