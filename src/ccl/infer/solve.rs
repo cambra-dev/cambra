@@ -28,7 +28,7 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
-use crate::ccl::{Expr, Level, Name, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{Expr, Level, Name, Pattern, Type, TypedBinding, TypedExprNode};
 
 use super::context::should_generalize;
 use super::typing::peel_refinements_outer;
@@ -570,6 +570,53 @@ fn with_shadows<R>(
     r
 }
 
+/// Pin the payload of a `Case` arm that nothing can reach or read.
+///
+/// Width subtyping gives an arm naming a tag the scrutinee cannot carry no lower
+/// bound; if its body ignores its binder it has no upper bound either. Nothing
+/// determines the payload and nothing observes it, so `Unit` — carrying no
+/// information — is the choice, and the arm is ordinary code, not an error (see
+/// `src/ccl/design/type-inference.md`, "An unobservable arm payload defaults to
+/// `Unit`").
+///
+/// Two things about *how* it is recorded are load-bearing:
+///
+/// - **On the variable, not the slot.** The same variable also occurs in the
+///   scrutinee's expected variant, and so in an enclosing lambda's parameter type.
+///   Writing `Unit` into `binding.ty` alone leaves those occurrences unresolved,
+///   which is the same defect with a smaller footprint.
+/// - **Inside the coalesce walk, before the branches.** A generalized definition's
+///   unconstrained payload is a type *parameter* — its uses instantiate freshened
+///   copies — so pinning it would make every instantiation `Unit` and reject a call
+///   that supplies that tag with a payload. Coalesce never walks such a definition
+///   in place, only its per-use clones, so pinning here reaches exactly the trees
+///   being resolved. And a `Lambda` resolves `param.ty` from its coalesced domain
+///   *after* its body, so the pin still reaches the parameter type — but only if it
+///   precedes the branch walk.
+#[allow(clippy::mutable_key_type)]
+fn pin_unobservable_arm_payload(p: &Pattern) {
+    // Unobservability is *transitive*: the variable's bound list is rarely empty
+    // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
+    // a lower bound — and what matters is whether anything concrete reaches it
+    // through the chain. Resolving is the question being asked, so ask it: a
+    // payload that resolves to a bare variable is one no value and no read
+    // determines.
+    if !matches!(resolve_var_type(&p.binding.ty), Ok(Type::Infer(_))) {
+        return;
+    }
+    let unit = Type::Base(crate::ccl::BaseType::Unit);
+    let mut cache = ConstrainCache::new();
+    let pinned = constrain_subtype(&unit, &p.binding.ty, &mut cache)
+        .and_then(|()| constrain_subtype(&p.binding.ty, &unit, &mut cache));
+    assert!(
+        pinned.is_ok(),
+        "pinning an unconstrained payload variable cannot fail: a variable with no \
+         bounds admits every type, so `Unit <: α` and `α <: Unit` have nothing to \
+         conflict with (arm `.{}`)",
+        p.tag,
+    );
+}
+
 pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
@@ -943,6 +990,15 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         } => {
             if let Some(s) = scrutinee {
                 coalesce_node(s, level, ctx);
+            }
+            // Before any occurrence of an arm's payload variable is read: an arm
+            // nothing reaches and whose body ignores its binder has no bound at
+            // all, and needs one recorded on the *variable* to resolve
+            // consistently everywhere it appears.
+            for b in branches.iter() {
+                if let Some(p) = &b.pattern {
+                    pin_unobservable_arm_payload(p);
+                }
             }
             for b in branches.iter_mut() {
                 // A pattern's payload binding scopes the branch's guard and
