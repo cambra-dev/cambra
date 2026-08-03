@@ -978,22 +978,38 @@ A leading dot is a constructor; a dot with an expression to its left
 stays attribute access (§3.9). A constructor is an ordinary atom, so it
 takes a postfix chain: `.some(r).x` is the attribute `x` of `.some(r)`.
 
-`Option(T)` abbreviates `{some: T, none: None}` and is a built-in type
-constructor in the same category as `List(T)` and `Map(K, V)` (§6.1) —
-not a distinguished kind of type. Nothing in the language privileges the
-spellings `some` and `none`; they are ordinary tags.
+A **variant type** is written as its arms, separated by `|`:
 
-> **Direction [Tentative].** Tags are undeclared today, so a *misspelled*
-> tag is caught only where it fails to meet its counterpart, and a
-> constructor's payload arity is not checked at the constructor. The
-> planned refinement is the structural type alias of §6.1 —
-> `Option(T) = some(T) | none`, `Result(T) = ok(T) | err(String)` — which
-> gives a tag a resolution site, checks the payload there, and would let
-> the disambiguating dot be dropped for a *declared* tag while keeping it
-> for an ad-hoc one. It would also replace the built-in `Option(T)` above
-> with a prelude definition. An alias is still structural: it names a
-> shape, so two aliases with the same tags are the same type. Nominality
-> is the separate `type` declaration direction (§6.1).
+```python
+x: some(Int) | none = .some(1)
+y: ok(Int) | err(String) = .err("nope")
+```
+
+Each arm is a tag with its payload type, `tag(T)`, or a bare `tag` for a tag
+carrying no payload. The arms are a *set*: they canonicalize by tag name, so
+`none | some(Int)` and `some(Int) | none` are the same type.
+
+`|` is also the logical-or operator (§3.4), and the two never collide, because
+an arm's head is lowercase where a type is capitalized (§6.1): in type position
+`some(Int)` can only be the tag `some` carrying `Int`, and a capitalized arm is
+rejected as a type where a tag belongs. In *term* position `|` is unaffected.
+
+`Option(T)` abbreviates `some(T) | none` and is a built-in type constructor in
+the same category as `List(T)` and `Map(K, V)` (§6.1) — not a distinguished kind
+of type, and interchangeable with writing those arms out. Nothing in the
+language privileges the spellings `some` and `none`; they are ordinary tags.
+
+> **Direction [Tentative].** A variant type can be *written* but not yet
+> *named*: tags have no declaration site, so a misspelled tag is caught only
+> where it fails to meet its counterpart, and a constructor's payload arity is
+> not checked at the constructor. The planned refinement is the structural type
+> alias of §6.1 — `Option(T) = some(T) | none`,
+> `Result(T) = ok(T) | err(String)` — which gives a tag a resolution site,
+> checks the payload there, and would let the disambiguating dot be dropped for
+> a *declared* tag while keeping it for an ad-hoc one. It would also replace the
+> built-in `Option(T)` above with a prelude definition. An alias is still
+> structural: it names a shape, so two aliases with the same tags are the same
+> type. Nominality is the separate `type` declaration direction (§6.1).
 
 ---
 

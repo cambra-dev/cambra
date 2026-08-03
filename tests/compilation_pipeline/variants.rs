@@ -23,6 +23,8 @@ use cambra::interpreter::Value;
 use rstest_log::rstest;
 
 use cambra::ccl::FieldKey;
+use cambra::ccl::context::{GlobalContext, compile_program};
+use cambra::interpreter::Consumer;
 
 use crate::helpers::*;
 
@@ -284,5 +286,92 @@ fn test_match_default_arm(#[case] code: &str, #[case] expected: Value) {
     Value::String("hello".into())
 )]
 fn test_match_on_parameter(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Variant *types*
+//
+// `tag(T) | tag2` is the structural variant type. `|` lexes as the logical-or
+// operator, so a variant type arrives as a `|`-chain of tag forms and is
+// distinguished by position, not by a token of its own: in type position there is
+// no boolean to disjoin, and an arm's head is lowercase, which the spec reserves
+// for terms. `Option(T)` is capitalized and so stays a type application.
+//
+// Arms canonicalize into name order, which is what makes a hand-written
+// `some(T) | none` *the same type* as `Option(T)` rather than a look-alike.
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// A payload arm and a nullary arm, against the value each admits.
+#[case(
+    "n: Int = 1\nx: some(Int) | none = .some(n)\nx",
+    union("some", Value::Int(1))
+)]
+#[case("x: some(Int) | none = .none\nx", union("none", Value::Unit))]
+// Arm order is not part of the type: the tags canonicalize by name.
+#[case(
+    "n: Int = 1\nx: none | some(Int) = .some(n)\nx",
+    union("some", Value::Int(1))
+)]
+// More than two arms, with distinct payload types.
+#[case(
+    "x: a(Int) | b(String) | c = .b(\"s\")\nx",
+    union("b", Value::String("s".into()))
+)]
+// A payload that is itself a variant type.
+#[case(
+    "n: Int = 1\nx: outer(some(Int) | none) | done = .outer(.some(n))\nx",
+    union("outer", union("some", Value::Int(1)))
+)]
+fn test_variant_type_annotation(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A variant type is interchangeable with the `Option(T)` abbreviation for the
+/// same tags — it is not a distinct type that happens to have the same arms — so
+/// `match` dispatches over it exactly as it does over an annotated `Option`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    "n: Int = 1\nx: some(Int) | none = .some(n)\nmatch x:\n    case some(v):\n        v\n    case none:\n        0",
+    Value::Int(1)
+)]
+#[case(
+    "x: some(Int) | none = .none\nmatch x:\n    case some(v):\n        v\n    case none:\n        0",
+    Value::Int(0)
+)]
+fn test_variant_type_dispatches_like_option(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// The annotation is a real constraint: a value carrying a tag the type does not
+/// name, or the wrong payload for a tag it does, is an annotation mismatch.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("x: some(Int) | none = .some(\"s\")\nx")]
+#[case("x: some(Int) | none = .other(1)\nx")]
+// A capitalized arm is a type where a tag belongs (the spec reserves `Caps` for
+// types), and each tag carries exactly one payload type.
+#[case("x: Some(Int) | none = .some(1)\nx")]
+#[case("x: some(Int) | some(String) = .some(1)\nx")]
+#[case("x: some(Int, String) | none = .some(1)\nx")]
+fn test_variant_type_rejections(#[case] code: &str) {
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    assert!(
+        compile_program(&mut ctx, code, consumer).is_err(),
+        "expected a diagnostic for `{code}`"
+    );
+}
+
+/// `|` in *term* position is still logical or — the type reading is positional,
+/// so giving variant types a spelling took nothing away from expressions.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("a: Bool = True\nb: Bool = False\n(a | b)", Value::Bool(true))]
+#[case("a: Bool = False\nb: Bool = False\n(a | b)", Value::Bool(false))]
+fn test_pipe_is_still_logical_or(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

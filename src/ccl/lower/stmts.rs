@@ -5,9 +5,10 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
 
 use super::*;
 use crate::{
-    ccl::{BaseType, Branch, Expr, Lit, Pattern, Type, TypedBinding, TypedExprNode},
+    ccl::{BaseType, Branch, Expr, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExprNode},
     chl_parser::ast::{
-        AssignTarget, IfBranch, Lit as ChlLit, MatchArm, Span, Spanned, Stmt as ChlStmt,
+        AssignTarget, BinOp as ChlBinOp, IfBranch, Lit as ChlLit, MatchArm, Span, Spanned,
+        Stmt as ChlStmt,
     },
     interpreter::{DataSink, HttpServerDataSource, http_server::SharedHttpServer},
 };
@@ -974,6 +975,18 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
             let head = type_ctor_head(func)?;
             lower_type_application(annotation.span, head, args)
         }
+        // Variant type `tag(T) | tag2 | …` — a `|`-chain of tag forms.
+        //
+        // `|` lexes as the logical-or operator, so the chain arrives as nested
+        // `BinOp` nodes. The two readings never collide: in *type* position there
+        // is no boolean to disjoin, and an arm's head is lowercase, which
+        // `docs/chl-spec.md` reserves for terms — so `some(Int)` here can only be
+        // the tag `some` carrying `Int`, never a type application. `List(T)` and
+        // `Option(T)` keep working because they are capitalized.
+        ChlExpr::BinOp {
+            op: ChlBinOp::LogicalOr,
+            ..
+        } => lower_variant_type(annotation),
         // Record type `{name: T, …}`.
         ChlExpr::BraceRecord(fields) => {
             let mut out = Vec::with_capacity(fields.len());
@@ -1003,6 +1016,94 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
             format!("unsupported type annotation form: {:?}", annotation.node),
         )),
     }
+}
+
+/// Lower a `|`-chain of tag forms into a [`Type::Variant`].
+///
+/// Arms are canonicalized into **name order**, matching [`Type::option_of`] and the
+/// order the solver materializes a coalesced variant in. Without that, a
+/// hand-written `some(T) | none` would be a distinct type from `Option(T)` that
+/// merely happens to carry the same arms, and an annotation written in the other
+/// order would not compare equal to what inference produced.
+fn lower_variant_type(ann: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
+    let mut arms: Vec<(FieldKey, Type)> = Vec::new();
+    collect_variant_arms(ann, &mut arms)?;
+    arms.sort_by(|(a, _), (b, _)| a.cmp(b));
+    if let Some(dup) = arms.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(LoweringError::unsupported(
+            ann.span,
+            format!(
+                "variant type names the tag `{}` twice; each tag carries one payload type",
+                dup[0].0
+            ),
+        ));
+    }
+    Ok(Type::Variant(arms))
+}
+
+/// Flatten one arm (or a nested `|`) of a variant type into `arms`.
+fn collect_variant_arms(
+    ann: &Spanned<ChlExpr>,
+    arms: &mut Vec<(FieldKey, Type)>,
+) -> Result<(), LoweringError> {
+    match &ann.node {
+        ChlExpr::BinOp {
+            left,
+            op: ChlBinOp::LogicalOr,
+            right,
+        } => {
+            collect_variant_arms(left, arms)?;
+            collect_variant_arms(right, arms)
+        }
+        // A bare tag carries no payload, so its payload type is `Unit` — the same
+        // type the nullary constructor `.tag` injects.
+        ChlExpr::Name(id) => {
+            arms.push((
+                variant_arm_tag(id.as_str(), ann.span)?,
+                Type::Base(BaseType::Unit),
+            ));
+            Ok(())
+        }
+        ChlExpr::Call { func, args } => {
+            let head = type_ctor_head(func)?;
+            let [payload] = args.as_slice() else {
+                return Err(LoweringError::unsupported(
+                    ann.span,
+                    format!(
+                        "a variant arm carries exactly one payload type: `{head}(T)` \
+                         (or `{head}` for no payload)"
+                    ),
+                ));
+            };
+            arms.push((
+                variant_arm_tag(head, func.span)?,
+                lower_type_annotation(payload)?,
+            ));
+            Ok(())
+        }
+        _ => Err(LoweringError::unsupported(
+            ann.span,
+            "a variant type's arms are tags: `some(Int) | none`",
+        )),
+    }
+}
+
+/// A variant arm's tag, rejecting a capitalized head.
+///
+/// `docs/chl-spec.md` reserves `Caps` for types without exception, so a
+/// capitalized arm is a type where a tag belongs — most likely a union of types
+/// was intended, which is not a form CHL has.
+fn variant_arm_tag(head: &str, span: Span) -> Result<FieldKey, LoweringError> {
+    if head.starts_with(char::is_uppercase) {
+        return Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{head}` is a type, but a variant arm names a tag, which is lowercase \
+                 (`some(Int) | none`)"
+            ),
+        ));
+    }
+    Ok(FieldKey::Name(head.into()))
 }
 
 /// Resolve a capitalized primitive type name (`Caps` means type —
