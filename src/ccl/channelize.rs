@@ -341,8 +341,7 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
     };
 
     // `body_x[x → y]` — also renames Feed/Define targets named `x` to `y`.
-    let y_var = Expr::var(binding_name);
-    let inner_subst = desugar_substitute(inner_body_x, &inner_name, &y_var);
+    let inner_subst = desugar_rename(inner_body_x, &inner_name, binding_name);
 
     // Wrap `body_y` with the prefix (renaming stale feed targets to `y`).
     let mut new_outer_body = body.clone();
@@ -495,9 +494,15 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
 /// predicate that closes over the renamed binder instead of leaving a stale
 /// reference; and a `Case` pattern binding correctly shadows `name` in its
 /// branch.
-fn desugar_substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
+fn desugar_rename(expr: Expr, from: &Name, to: &Name) -> Expr {
     let mut expr = expr;
-    crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
+    // A **rename**, not a discharge of a bare variable. Both rewrite the same
+    // occurrences, but the species is what carries the occurrence's type onto the
+    // replacement (`Mapping::as_expr`): α-renaming cannot change a term's type, while a
+    // discharge substitutes a term that brings its own — and a hand-built `Expr::var`
+    // brings `Type::Hole`, which `subst`'s typedness assertion now rejects. Keeping the
+    // species honest also keeps `Subst::invert`/`split_renames` exact here.
+    crate::ccl::subst::Subst::rename(from.clone(), to.clone()).rewrite_expr(&mut expr);
     expr
 }
 
@@ -1263,7 +1268,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 // Rename inner_name → binding.name in the spliced body
                 // so the inner defer is exposed under the outer let-y
                 // name for subsequent passes.
-                let renamed = desugar_substitute(spliced, &inner_name, &Expr::var(&binding.name));
+                let renamed = desugar_rename(spliced, &inner_name, &binding.name);
                 // Same alias recording as the lift above — types outside this
                 // subtree may carry the inner handle's rigid name.
                 if ctx.input_typed {

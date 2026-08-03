@@ -78,15 +78,49 @@ pub enum Mapping {
     Discharge(Box<TypedExpr>),
 }
 
+/// A substitution must never leave a **typed** occurrence holding an untyped
+/// replacement.
+///
+/// Every term a substitution fabricates goes through
+/// [`Mapping::as_expr`]/[`as_expr_preserving`](Mapping::as_expr_preserving), so this is
+/// the one boundary that owns the invariant. It is load-bearing rather than tidy: a
+/// substitution fires *inside refinement predicates*, and a predicate's interior is
+/// outside the walk that resolves node types — so an untyped node introduced here is
+/// never typed by anything downstream, and surfaces at the post-inference wall as an
+/// unresolved variable with no way to recover the type except a lexical-scope guess.
+///
+/// A hard `assert!`, not a `debug_assert!`: it is O(1) on a path that would otherwise
+/// silently produce a type nothing can reconstruct. An *untyped* occurrence carries no
+/// obligation — substitution runs before inference too (lowering's uncurry template
+/// discharge, the chained-comparison operand freshens), where every slot is `Hole`.
+#[track_caller]
+fn assert_preserves_typedness(replacement: &TypedExpr, occurrence_ty: &Type) {
+    assert!(
+        matches!(occurrence_ty, Type::Hole) || !matches!(replacement.ty, Type::Hole),
+        "substitution dropped the type of a replaced occurrence: `{}` had type `{occurrence_ty}`, \
+         replacement `{}` is untyped",
+        crate::ccl::symbolic::symbolic(replacement),
+        crate::ccl::symbolic::symbolic(replacement),
+    );
+}
+
 impl Mapping {
     /// The mapping's replacement as a term (a `Rename` materializes as a bare
     /// variable reference). The replacement carries a **new** identity: a fresh
     /// mint for a `Rename`, the discharged term's own ids for a `Discharge`.
-    fn as_expr(&self) -> TypedExpr {
-        match self {
-            Mapping::Rename(to) => TypedExpr::var(to.clone()),
+    fn as_expr(&self, occurrence_ty: &Type) -> TypedExpr {
+        let out = match self {
+            // α-renaming cannot change a term's type: the occurrence's type is a
+            // property of the *position*, not of the name, so the replacement
+            // carries it. Building a bare `TypedExpr::var` here would leave the
+            // node at `Type::Hole` — and a rename fires inside refinement
+            // predicates, which no later pass types, so the hole would survive to
+            // the post-inference check.
+            Mapping::Rename(to) => TypedExpr::var(to.clone()).with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => (**t).clone(),
-        }
+        };
+        assert_preserves_typedness(&out, occurrence_ty);
+        out
     }
 
     /// [`as_expr`](Self::as_expr) at a **preserved** root identity: the
@@ -99,11 +133,15 @@ impl Mapping {
     /// nothing) and re-roots that clone
     /// ([`re_root`](TypedExpr::re_root)) — the two shapes reach a preserved
     /// identity by different routes, and neither mints.
-    fn as_expr_preserving(&self, node_id: NodeId) -> TypedExpr {
-        match self {
-            Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone())),
+    fn as_expr_preserving(&self, node_id: NodeId, occurrence_ty: &Type) -> TypedExpr {
+        let out = match self {
+            // See [`as_expr`]: the rename keeps the occurrence's type.
+            Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone()))
+                .with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => (**t).clone().re_root(node_id),
-        }
+        };
+        assert_preserves_typedness(&out, occurrence_ty);
+        out
     }
 }
 
@@ -389,7 +427,7 @@ impl Subst {
             Var(n) => match self.0.get(n) {
                 // The replacement carries its own type/annotation, so return it
                 // wholesale rather than rebuilding `e`.
-                Some(repl) => return repl.as_expr(),
+                Some(repl) => return repl.as_expr(&e.ty),
                 None => Var(n.clone()),
             },
 
@@ -598,7 +636,8 @@ impl Subst {
             // id — a *preserve*, so the root inherits the occurrence's
             // span/attribution (the use-site), unique per occurrence by
             // construction.
-            *e = repl.as_expr_preserving(e.node_id);
+            let occurrence_ty = e.ty.clone();
+            *e = repl.as_expr_preserving(e.node_id, &occurrence_ty);
             if !matches!(e.node, TypedExprNode::Var(_)) {
                 // Compound replacement: `as_expr_preserving` bare-`clone()`s the
                 // whole subtree, sharing the source's NodeIds. Freshen only the
@@ -1353,6 +1392,24 @@ mod tests {
 
     // apply_type descends into a refinement predicate and discharges a free
     // outer binder — the dependent-application shape `g(5)`.
+    #[test]
+    fn rename_preserves_the_occurrence_type() {
+        // α-renaming cannot change a term's type. A rename materializes as a *fresh*
+        // `Var` node, so the replacement has to take the type from the occurrence it
+        // replaces — otherwise the node lands at `Type::Hole`. That matters most
+        // inside a refinement predicate: nothing types a predicate's interior after
+        // inference, so a hole introduced here survives to the post-inference check.
+        let mut occurrence = var("k");
+        occurrence.ty = Type::Base(crate::ccl::BaseType::Int);
+        let out = Subst::rename("k", "j").apply_expr(&occurrence);
+        assert_eq!(out.node, TypedExprNode::Var(Name::raw("j")));
+        assert_eq!(
+            out.ty,
+            Type::Base(crate::ccl::BaseType::Int),
+            "a renamed occurrence keeps its type"
+        );
+    }
+
     #[test]
     fn apply_type_discharges_refinement_predicate() {
         let r = Refinement::born(Rc::new(gt(var("i"), var("k"))));

@@ -91,13 +91,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use crate::ccl::FieldKey;
-use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::infer::solver::{CoalesceError, ConstrainError, prim};
 use crate::ccl::{BaseType, BinOpKind, CompareKind, Lit, Refinement, Type, TypedExpr};
 
 use context::InferCtx;
 use emit::emit_node;
-use solve::{coalesce_pass, resolve_var_type, retype_predicate_slots};
+use solve::{coalesce_pass, resolve_var_type};
 
 // `Name` is no longer debug-only: `lit_singleton` builds its predicate over the
 // refinement binder in every build.
@@ -329,25 +328,7 @@ pub(crate) fn run(
     if !errors.is_empty() {
         return Err(errors);
     }
-    // Stamp the resolved binder types onto free `Var` references a discharge
-    // substituted into refinement predicates (see `retype_predicate_slots`).
-    //
-    // Sharing tripwire: `retype` is a *rewrite-only* pass (it restamps existing
-    // predicates, never introduces new refinement types), so the distinct
-    // predicate-`Rc` count is non-increasing across it. A regression that
-    // restamps each occurrence independently — instead of threading its
-    // `PredMemo` — would split the sharing and grow this count, tripping here at
-    // the exact phase. (Cheap: address-set arithmetic, debug builds only. The
-    // end-to-end guard is `tests/predicate_sharing.rs`.)
     #[cfg(debug_assertions)]
-    let pred_rcs_before_retype = crate::ccl::ccl_utils::distinct_predicate_rcs(expr);
-    retype_predicate_slots(expr, &HashMap::new(), &PredMemo::new());
-    #[cfg(debug_assertions)]
-    debug_assert!(
-        crate::ccl::ccl_utils::distinct_predicate_rcs(expr) <= pred_rcs_before_retype,
-        "retype split refinement-predicate `Rc` sharing (a rewrite-only pass must not \
-         increase the distinct-predicate count) — see `ccl_utils::PredMemo`",
-    );
     // Scope-validity check (design §6.2): every coalesced node's type is
     // well-formed in the lexical scope at that node — every free term-variable
     // of its refinement predicates is bound by an enclosing Pi binder

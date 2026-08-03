@@ -119,7 +119,7 @@ fn rewrite_respects_shadowing_when_the_occurrences_are_not_shared() {
 /// A lambda's domain refinement rides both `expr.ty`'s `Fun` domain and
 /// `param.ty`, as two occurrences of one `Rc`. `rewrite_expr` rebuilds the
 /// former and never visits the latter, so after the rewrite the two slots
-/// disagree — the same stale-copy defect `retype_pred_expr` had.
+/// disagree — the stale-copy defect this file exists to pin.
 #[test]
 fn rewrite_reaches_the_lambda_param_type_slot() {
     let shared = Rc::new(gt(var("k"), int(0)));
