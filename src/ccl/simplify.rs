@@ -1025,6 +1025,7 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::FieldKey;
     use crate::ccl::ccl_utils::{
         apply_primitive, make_iterate, make_restrict, trivially_true_predicate,
     };
@@ -1485,7 +1486,8 @@ mod tests {
         // and carries no refinement to re-materialise, so dropping it would apply
         // the constant at *every* position, overlapping the other arms. Guards
         // `is_variant_project_led`.
-        let vp = Expr::builtin(Builtin::VariantProject(0)).with_ty(fun_ty(int_ty(), int_ty()));
+        let vp = Expr::builtin(Builtin::VariantProject(FieldKey::Index(0)))
+            .with_ty(fun_ty(int_ty(), int_ty()));
         let const_k = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
         let compose = typed_compose2(vp, const_k);
         assert_eq!(

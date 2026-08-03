@@ -9,6 +9,7 @@ use bit_vec::BitVec;
 use smol_str::SmolStr;
 
 use super::{BaseType, Extent, Value};
+use crate::ccl::{FieldKey, TagMap};
 
 /// Returns whether the given FuncBindings represent a logical list.
 pub fn bindings_are_list(bindings: &[FuncBinding]) -> bool {
@@ -70,17 +71,76 @@ pub enum ColumnValue {
         outputs: Box<ColumnValue>,
     },
     Records(HashMap<String, ColumnValue>),
-    /// A tagged union column: each element belongs to one of several typed variants.
+    /// A tagged union column: a partition of the row space into tag-keyed arms.
     ///
-    /// `tags[i]` is the 0-based variant index for element `i`.
-    /// `variants[j]` holds only the elements whose tag equals `j`, in the order
-    /// they appear in the overall sequence.  The total element count is `tags.len()`.
-    Union {
-        /// Variant index for each element.
-        tags: Vec<usize>,
-        /// Per-variant column; `variants[j].len()` equals the count of `j`s in `tags`.
-        variants: Vec<ColumnValue>,
-    },
+    /// Each [`UnionArm`] records *which* rows carry its tag and their payloads, so
+    /// the column is **self-describing**: nothing about it is relative to a static
+    /// type. That is what makes variant width subtyping free here — a producer of
+    /// fewer tags simply has fewer arms, and a consumer projecting a tag this
+    /// column does not carry gets an absent arm, which is correct because that tag
+    /// cannot occur. See [`TagMap`] for why keying on the tag rather than a
+    /// position is load-bearing.
+    ///
+    /// Invariants (checked by [`ColumnValue::debug_assert_union_invariants`]):
+    /// the arms' `rows` sets are disjoint and together cover `0..len`; each arm's
+    /// `rows` is ascending and parallel to its `values`.
+    Union(TagMap<UnionArm>),
+}
+
+/// One arm of a [`ColumnValue::Union`]: the rows carrying a tag, and their payloads.
+///
+/// Storing `rows` explicitly is what distinguishes this from a bare per-tag column
+/// vector. A union column is a *partition of the row space*, and the row→payload
+/// correspondence is the whole content of that partition; leaving it implicit
+/// forces every consumer that needs a payload slot to rebuild it by scanning
+/// (which made element access linear, and so iteration quadratic).
+///
+/// An arm is also exactly what `variant_project` yields: a tag-restricted
+/// sub-collection that keeps its domain keys, which the fan-out relies on so the
+/// outer element and the projected payload co-iterate by key under `zip`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionArm {
+    /// Ascending row positions this arm occupies; parallel to `values`.
+    pub rows: Vec<usize>,
+    /// This arm's payloads, dense, in `rows` order.
+    pub values: ColumnValue,
+}
+
+impl UnionArm {
+    /// An arm occupying `rows` with `values` as their payloads.
+    pub fn new(rows: Vec<usize>, values: ColumnValue) -> Self {
+        debug_assert_eq!(
+            rows.len(),
+            values.len(),
+            "UnionArm: rows must be parallel to values"
+        );
+        debug_assert!(
+            rows.windows(2).all(|w| w[0] < w[1]),
+            "UnionArm: rows must be strictly ascending"
+        );
+        UnionArm { rows, values }
+    }
+
+    /// An arm carrying no rows, shaped for `extent`.
+    ///
+    /// Empty and absent arms are interchangeable, so this exists only to keep a
+    /// column built from an extent total over that extent's tags.
+    pub fn empty_for(extent: &Extent) -> Self {
+        UnionArm {
+            rows: Vec::new(),
+            values: ColumnValue::from_values(Vec::new(), extent),
+        }
+    }
+
+    /// Number of rows this arm carries.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether this arm carries no rows.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
 }
 
 impl ColumnValue {
@@ -110,13 +170,16 @@ impl ColumnValue {
             ColumnValue::Records(r) => {
                 Value::Record(r.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
             }
-            ColumnValue::Union { tags, variants } => {
-                let tag = tags[i];
-                // Count how many elements before index i belong to the same variant.
-                let variant_idx = tags[..i].iter().filter(|&&t| t == tag).count();
+            ColumnValue::Union(arms) => {
+                // The arms partition the rows, so exactly one carries `i`, and its
+                // `rows` position *is* the payload slot — no scan to rebuild it.
+                let (tag, arm, slot) = arms
+                    .iter()
+                    .find_map(|(k, arm)| arm.rows.binary_search(&i).ok().map(|s| (k, arm, s)))
+                    .unwrap_or_else(|| panic!("union column has no arm carrying row {i}"));
                 Value::Union {
-                    tag,
-                    inner: Box::new(variants[tag].index_at(variant_idx)),
+                    tag: tag.clone(),
+                    inner: Box::new(arm.values.index_at(slot)),
                 }
             }
         }
@@ -141,17 +204,16 @@ impl ColumnValue {
             // repeats that arm's payload `n` times and its `tag` in `tags`; the
             // empty arms stay empty, preserving the `ColumnValue::Union` invariant
             // (`variants[j].len()` equals the count of `j`s in `tags`).
-            ColumnValue::Union { tags, variants } => {
-                let tag = tags[0];
-                let variants = variants
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| if i == tag { v.repeat(n) } else { v.clone() })
-                    .collect();
-                ColumnValue::Union {
-                    tags: vec![tag; n],
-                    variants,
-                }
+            ColumnValue::Union(arms) => {
+                // `len() == 1`, so exactly one arm is inhabited; it becomes every
+                // row and the empty arms stay empty.
+                ColumnValue::Union(arms.map(|_, arm| {
+                    if arm.is_empty() {
+                        arm.clone()
+                    } else {
+                        UnionArm::new((0..n).collect(), arm.values.repeat(n))
+                    }
+                }))
             }
             _ => panic!("Cannot repeat composite ColumnValue"),
         }
@@ -206,23 +268,33 @@ impl ColumnValue {
                 ColumnValue::from_values(values, &d.borrow().element_extent())
             }
             Extent::Union(sub_extents) => {
-                let mut tags: Vec<usize> = Vec::with_capacity(values.len());
-                let mut per_variant: Vec<Vec<Value>> = vec![Vec::new(); sub_extents.len()];
-                for v in values {
+                // Bucket each row by its tag, keeping the row index alongside the
+                // payload so the arm records the partition directly.
+                let mut per_tag: HashMap<FieldKey, (Vec<usize>, Vec<Value>)> = HashMap::new();
+                for (row, v) in values.into_iter().enumerate() {
                     let Value::Union { tag, inner } = v else {
                         panic!("Expected Value::Union in from_values for Union extent, got {v:?}");
                     };
-                    tags.push(tag);
-                    per_variant[tag].push(*inner);
+                    debug_assert!(
+                        sub_extents.get(&tag).is_some(),
+                        "from_values: value carries tag `{tag}` absent from its Union extent"
+                    );
+                    let bucket = per_tag.entry(tag).or_default();
+                    bucket.0.push(row);
+                    bucket.1.push(*inner);
                 }
-                ColumnValue::Union {
-                    tags,
-                    variants: per_variant
-                        .into_iter()
-                        .zip(sub_extents.iter())
-                        .map(|(vals, ext)| ColumnValue::from_values(vals, ext))
-                        .collect(),
-                }
+                // Total over the extent's tags: a tag with no rows becomes an empty
+                // arm rather than an absent one, so an extent-built column always
+                // has the shape its extent describes.
+                let cv =
+                    ColumnValue::Union(sub_extents.map(|tag, ext| match per_tag.remove(tag) {
+                        Some((rows, payloads)) => {
+                            UnionArm::new(rows, ColumnValue::from_values(payloads, ext))
+                        }
+                        None => UnionArm::empty_for(ext),
+                    }));
+                cv.debug_assert_union_invariants();
+                cv
             }
             _ => ColumnValue::Variants(values),
         }
@@ -281,41 +353,28 @@ impl ColumnValue {
                         .collect(),
                 )
             }
-            ColumnValue::Union { tags, variants } => {
-                let selected_indices: Vec<usize> = indices.collect();
-                // Build the new tags for selected elements.
-                let new_tags: Vec<usize> = selected_indices.iter().map(|&i| tags[i]).collect();
-                // Count per-variant totals in the original so we can map positions.
-                let mut variant_counts: Vec<usize> = vec![0; variants.len()];
-                for &t in tags.iter() {
-                    variant_counts[t] += 1;
-                }
-                // For each original position, record which variant-local index it is.
-                let mut running: Vec<usize> = vec![0; variants.len()];
-                let mut per_element_variant_idx: Vec<usize> = Vec::with_capacity(tags.len());
-                for &t in tags.iter() {
-                    per_element_variant_idx.push(running[t]);
-                    running[t] += 1;
-                }
-                // For each variant, collect the variant-local indices we want to keep.
-                let mut per_variant_selection: Vec<Vec<usize>> = vec![Vec::new(); variants.len()];
-                for &orig_idx in &selected_indices {
-                    let t = tags[orig_idx];
-                    per_variant_selection[t].push(per_element_variant_idx[orig_idx]);
-                }
-                let new_variants: Vec<ColumnValue> = variants
-                    .iter()
-                    .enumerate()
-                    .map(|(j, cv)| {
-                        let sel = &per_variant_selection[j];
-                        let len = sel.len();
-                        cv.select_indices(sel.iter().cloned(), len)
-                    })
-                    .collect();
-                ColumnValue::Union {
-                    tags: new_tags,
-                    variants: new_variants,
-                }
+            ColumnValue::Union(arms) => {
+                // `sel[j]` is the original row landing at new row `j`. For each arm,
+                // keep the selected rows that belong to it; the arm's own `rows`
+                // position gives the payload slot directly, so there is no
+                // row→slot correspondence to reconstruct.
+                let sel: Vec<usize> = indices.collect();
+                let out = ColumnValue::Union(arms.map(|_, arm| {
+                    let mut rows = Vec::new();
+                    let mut slots = Vec::new();
+                    for (new_row, &orig) in sel.iter().enumerate() {
+                        if let Ok(slot) = arm.rows.binary_search(&orig) {
+                            rows.push(new_row);
+                            slots.push(slot);
+                        }
+                    }
+                    let values = arm
+                        .values
+                        .select_indices(slots.iter().copied(), slots.len());
+                    UnionArm::new(rows, values)
+                }));
+                out.debug_assert_union_invariants();
+                out
             }
         }
     }
@@ -338,7 +397,8 @@ impl ColumnValue {
                 result
             }
             ColumnValue::FunctionBindings { inputs, .. } => inputs.len(),
-            ColumnValue::Union { tags, .. } => tags.len(),
+            // The arms partition the rows, so the row count is their total.
+            ColumnValue::Union(arms) => arms.values().map(UnionArm::len).sum(),
         }
     }
 
@@ -380,13 +440,14 @@ impl ColumnValue {
                     })
             }
             (ColumnValue::FunctionBindings { .. }, Extent::Function { .. }) => true,
-            (ColumnValue::Union { variants, .. }, Extent::Union(ext_variants)) => {
-                variants.len() == ext_variants.len()
-                    && variants
-                        .iter()
-                        .zip(ext_variants.iter())
-                        .all(|(cv, e)| cv.is_compatible_with_extent(e))
-            }
+            // Width subtyping: the column's tags must be a *subset* of the
+            // extent's, not equal to them. A producer of fewer tags is a subtype,
+            // so a column legitimately carries fewer arms than its extent declares.
+            (ColumnValue::Union(arms), Extent::Union(ext_arms)) => arms.iter().all(|(k, arm)| {
+                ext_arms
+                    .get(k)
+                    .is_some_and(|e| arm.values.is_compatible_with_extent(e))
+            }),
             // Variants is the fallback used for Union, unknown, etc.
             (ColumnValue::Variants(_), _) => true,
             _ => false,
@@ -429,12 +490,12 @@ impl ColumnValue {
                         .map(|e| (e.0.clone(), e.1.as_single().expect("Not single").clone()))
                         .collect(),
                 )),
-                ColumnValue::Union { tags, variants } => {
-                    let tag = tags[0];
-                    let inner = variants[tag].as_single()?;
+                ColumnValue::Union(arms) => {
+                    // `len() == 1`, so exactly one arm is inhabited.
+                    let (tag, arm) = arms.iter().find(|(_, arm)| !arm.is_empty())?;
                     Some(Value::Union {
-                        tag,
-                        inner: Box::new(inner),
+                        tag: tag.clone(),
+                        inner: Box::new(arm.values.as_single()?),
                     })
                 }
             }
@@ -500,22 +561,24 @@ impl ColumnValue {
                     Value::Record(m.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
                 }))
             }
-            ColumnValue::Union { tags, variants } => {
-                let tags = take(tags);
-                let n = tags.len();
-                // Snapshot the variants so the closure can own them.
-                let variants = variants.to_vec();
-                // Build per-variant running counts so we can derive variant-local indices.
-                let mut running: Vec<usize> = vec![0; variants.len()];
-                Box::new((0..n).map(move |i| {
-                    let tag = tags[i];
-                    let vi = running[tag];
-                    running[tag] += 1;
-                    Value::Union {
-                        tag,
-                        inner: Box::new(variants[tag].index_at(vi)),
+            ColumnValue::Union(arms) => {
+                // Flatten the partition back to row order: each arm contributes
+                // (row, value) pairs, and sorting by row restores the sequence.
+                let arms = take(arms);
+                let mut rows: Vec<(usize, Value)> = Vec::new();
+                for (tag, arm) in arms {
+                    for (slot, row) in arm.rows.iter().enumerate() {
+                        rows.push((
+                            *row,
+                            Value::Union {
+                                tag: tag.clone(),
+                                inner: Box::new(arm.values.index_at(slot)),
+                            },
+                        ));
                     }
-                }))
+                }
+                rows.sort_by_key(|(row, _)| *row);
+                Box::new(rows.into_iter().map(|(_, v)| v))
             }
         }
     }
@@ -567,6 +630,82 @@ impl ColumnValue {
         ColumnValue::Strings(values.iter().map(|s| (*s).into()).collect())
     }
 
+    /// Build an **anonymous positional** union column from a row-order tag list
+    /// plus the per-arm payload columns: arm `j` is keyed [`FieldKey::Index`]`(j)`.
+    ///
+    /// The shape `a ++ b` and the union-of-restricts fan-out produce, where a tag
+    /// *is* its position. Takes the row-order tag list and derives each arm's
+    /// `rows` from it, so callers describing a union row-by-row do not have to
+    /// compute the partition themselves.
+    pub fn positional_union(tags: &[usize], variants: Vec<ColumnValue>) -> ColumnValue {
+        let arms = variants
+            .into_iter()
+            .enumerate()
+            .map(|(j, values)| {
+                let rows: Vec<usize> = tags
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| **t == j)
+                    .map(|(row, _)| row)
+                    .collect();
+                (FieldKey::Index(j), UnionArm::new(rows, values))
+            })
+            .collect();
+        let cv = ColumnValue::Union(TagMap::from_arms(arms));
+        cv.debug_assert_union_invariants();
+        cv
+    }
+
+    /// An empty column of the same shape as `self`.
+    ///
+    /// Needed where a column has to be created to match another's representation
+    /// without an [`Extent`] in hand — appending a tag the receiver lacks.
+    pub fn empty_like(&self) -> ColumnValue {
+        match self {
+            ColumnValue::Units(_) => ColumnValue::Units(0),
+            ColumnValue::Ints(_) => ColumnValue::Ints(Vec::new()),
+            ColumnValue::UInts(_) => ColumnValue::UInts(Vec::new()),
+            ColumnValue::Strings(_) => ColumnValue::Strings(Vec::new()),
+            ColumnValue::Bools(_) => ColumnValue::Bools(BitVec::new()),
+            ColumnValue::Variants(_) => ColumnValue::Variants(Vec::new()),
+            ColumnValue::FunctionBindings { inputs, outputs } => {
+                ColumnValue::function_bindings(inputs.empty_like(), outputs.empty_like())
+            }
+            ColumnValue::Records(r) => {
+                ColumnValue::Records(r.iter().map(|(k, v)| (k.clone(), v.empty_like())).collect())
+            }
+            ColumnValue::Union(arms) => ColumnValue::Union(arms.map(|_, arm| UnionArm {
+                rows: Vec::new(),
+                values: arm.values.empty_like(),
+            })),
+        }
+    }
+
+    /// Assert the [`ColumnValue::Union`] partition invariants in debug builds.
+    ///
+    /// The arms' `rows` must be disjoint and together cover `0..len` exactly. The
+    /// invariant is real but not type-enforced, and every rebuild
+    /// (`select_indices`, `retain`, `append`) has to re-establish it, so it is
+    /// checked at those boundaries rather than trusted.
+    pub fn debug_assert_union_invariants(&self) {
+        #[cfg(debug_assertions)]
+        if let ColumnValue::Union(arms) = self {
+            let mut all: Vec<usize> = arms.values().flat_map(|a| a.rows.iter().copied()).collect();
+            all.sort_unstable();
+            debug_assert!(
+                all.iter().enumerate().all(|(i, &r)| i == r),
+                "union arms must partition 0..len exactly, got rows {all:?}"
+            );
+            for (tag, arm) in arms.iter() {
+                debug_assert_eq!(
+                    arm.rows.len(),
+                    arm.values.len(),
+                    "union arm `{tag}` rows must be parallel to values"
+                );
+            }
+        }
+    }
+
     pub fn append(&mut self, other: ColumnValue) {
         match (self, other) {
             (ColumnValue::Units(s), ColumnValue::Units(o)) => *s += o,
@@ -595,21 +734,33 @@ impl ColumnValue {
                         .append(v);
                 }
             }
-            (
-                ColumnValue::Union {
-                    tags: st,
-                    variants: sv,
-                },
-                ColumnValue::Union {
-                    tags: ot,
-                    variants: ov,
-                },
-            ) => {
-                assert_eq!(sv.len(), ov.len(), "Union append: variant count mismatch");
-                st.extend(ot);
-                for (s, o) in sv.iter_mut().zip(ov) {
-                    s.append(o);
+            (ColumnValue::Union(sa), ColumnValue::Union(oa)) => {
+                // Concatenation shifts `other`'s rows past `self`'s, and the result
+                // carries the *union* of the two tag sets: appending a column that
+                // uses a tag this one lacks grows the arm set rather than failing,
+                // which is what makes concatenation total over width-subtypes.
+                let offset = ColumnValue::Union(sa.clone()).len();
+                for (tag, other_arm) in oa {
+                    let shifted: Vec<usize> = other_arm.rows.iter().map(|r| r + offset).collect();
+                    // A tag `self` lacks starts as an empty arm shaped like the
+                    // incoming one, so the payload `append` below stays a
+                    // like-for-like concatenation.
+                    let arm = sa.get_or_insert_with(tag, || UnionArm {
+                        rows: Vec::new(),
+                        values: other_arm.values.empty_like(),
+                    });
+                    arm.rows.extend(shifted);
+                    arm.values.append(other_arm.values);
                 }
+                debug_assert!(
+                    {
+                        let mut all: Vec<usize> =
+                            sa.values().flat_map(|a| a.rows.iter().copied()).collect();
+                        all.sort_unstable();
+                        all.iter().enumerate().all(|(i, &r)| i == r)
+                    },
+                    "Union append: the arms must still partition 0..len"
+                );
             }
             _ => panic!("Mismatched ColumnValue variants in append"),
         }
@@ -667,41 +818,32 @@ impl ColumnValue {
                     v.retain(mask);
                 }
             }
-            ColumnValue::Union { tags, variants } => {
-                // Build per-variant masks, then retain in each variant.
-                let mut per_variant_mask: Vec<BitVec> = variants
-                    .iter()
-                    .map(|v| BitVec::from_elem(v.len(), false))
-                    .collect();
-                let mut running: Vec<usize> = vec![0; variants.len()];
-                for (i, &t) in tags.iter().enumerate() {
-                    let vi = running[t];
-                    running[t] += 1;
-                    if mask[i] {
-                        per_variant_mask[t].set(vi, true);
+            ColumnValue::Union(arms) => {
+                // Renumber the surviving rows densely, then per arm keep the rows
+                // that survive and remap them. Each arm's `rows` position is the
+                // payload slot, so no per-variant mask has to be built.
+                let mut new_row = vec![usize::MAX; mask.len()];
+                let mut next = 0usize;
+                for (i, keep) in mask.iter().enumerate() {
+                    if keep {
+                        new_row[i] = next;
+                        next += 1;
                     }
                 }
-                let new_tags: Vec<usize> = tags
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| mask[*i])
-                    .map(|(_, &t)| t)
-                    .collect();
-                *tags = new_tags;
-                for (v, m) in variants.iter_mut().zip(per_variant_mask.iter()) {
-                    // Use select_indices for a stable retain.  Like `retain_vec`,
-                    // this preserves source order — required because `tags` above
-                    // is filtered stably, and each variant column has to stay
-                    // aligned with the tag occurrences of its variant.
-                    let kept: Vec<usize> = m
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, b)| *b)
-                        .map(|(i, _)| i)
-                        .collect();
-                    let len = kept.len();
-                    *v = v.select_indices(kept.into_iter(), len);
-                }
+                *arms = arms.map(|_, arm| {
+                    let mut rows = Vec::new();
+                    let mut slots = Vec::new();
+                    for (slot, &row) in arm.rows.iter().enumerate() {
+                        if mask[row] {
+                            rows.push(new_row[row]);
+                            slots.push(slot);
+                        }
+                    }
+                    let values = arm
+                        .values
+                        .select_indices(slots.iter().copied(), slots.len());
+                    UnionArm::new(rows, values)
+                });
             }
         }
     }
@@ -865,16 +1007,48 @@ mod tests {
     ///
     /// `rows` is `(tag, value)` in source order.  Values for a given tag must
     /// be `Value::Int`; each variant column is `ColumnValue::Ints`.
+    /// Build an `Index`-keyed union column from `(tag, value)` rows in row order.
     fn make_union_cv(rows: &[(usize, i64)], n_variants: usize) -> ColumnValue {
-        let tags: Vec<usize> = rows.iter().map(|(t, _)| *t).collect();
-        let mut per_variant: Vec<Vec<i64>> = vec![Vec::new(); n_variants];
-        for (t, v) in rows {
-            per_variant[*t].push(*v);
+        let arms = (0..n_variants)
+            .map(|t| {
+                let mut arm_rows = Vec::new();
+                let mut values = Vec::new();
+                for (row, (tag, v)) in rows.iter().enumerate() {
+                    if *tag == t {
+                        arm_rows.push(row);
+                        values.push(*v);
+                    }
+                }
+                (
+                    FieldKey::Index(t),
+                    UnionArm::new(arm_rows, ColumnValue::Ints(values)),
+                )
+            })
+            .collect();
+        let cv = ColumnValue::Union(TagMap::from_arms(arms));
+        cv.debug_assert_union_invariants();
+        cv
+    }
+
+    /// The `(tag, value)` rows of an `Index`-keyed union column, in row order.
+    fn union_rows(cv: &ColumnValue) -> Vec<(usize, i64)> {
+        let ColumnValue::Union(arms) = cv else {
+            panic!("expected Union, got {cv:?}");
+        };
+        let mut out: Vec<(usize, usize, i64)> = Vec::new();
+        for (tag, arm) in arms.iter() {
+            let FieldKey::Index(t) = tag else {
+                panic!("expected an Index-keyed arm");
+            };
+            let ColumnValue::Ints(vs) = &arm.values else {
+                panic!("expected Ints payloads");
+            };
+            for (slot, &row) in arm.rows.iter().enumerate() {
+                out.push((row, *t, vs[slot]));
+            }
         }
-        ColumnValue::Union {
-            tags,
-            variants: per_variant.into_iter().map(ColumnValue::Ints).collect(),
-        }
+        out.sort_by_key(|(row, _, _)| *row);
+        out.into_iter().map(|(_, t, v)| (t, v)).collect()
     }
 
     fn mask(bits: &[bool]) -> BitVec {
@@ -899,11 +1073,8 @@ mod tests {
     fn retain_union_drop_all() {
         let mut cv = make_union_cv(&[(0, 1), (1, 10), (0, 2)], 2);
         cv.retain(&mask(&[false, false, false]));
-        let ColumnValue::Union { tags, variants } = &cv else {
-            panic!("expected Union");
-        };
-        assert!(tags.is_empty());
-        assert!(variants.iter().all(|v| v.is_empty()));
+        assert_eq!(cv.len(), 0);
+        assert!(union_rows(&cv).is_empty());
     }
 
     /// Dropping a row from one variant removes only that variant's value,
@@ -914,12 +1085,7 @@ mod tests {
         // Keep rows 0 and 3 (tag0→1, tag1→20); drop rows 1 and 2.
         let mut cv = make_union_cv(&[(0, 1), (1, 10), (0, 2), (1, 20)], 2);
         cv.retain(&mask(&[true, false, false, true]));
-        let ColumnValue::Union { tags, variants } = &cv else {
-            panic!("expected Union");
-        };
-        assert_eq!(tags, &[0, 1]);
-        assert_eq!(variants[0], ColumnValue::Ints(vec![1]));
-        assert_eq!(variants[1], ColumnValue::Ints(vec![20]));
+        assert_eq!(union_rows(&cv), vec![(0, 1), (1, 20)]);
     }
 
     /// Keeping only rows from one variant empties the other variant's column.
@@ -929,12 +1095,15 @@ mod tests {
         // Keep only the two tag-0 rows.
         let mut cv = make_union_cv(&[(0, 1), (1, 10), (0, 2)], 2);
         cv.retain(&mask(&[true, false, true]));
-        let ColumnValue::Union { tags, variants } = &cv else {
+        assert_eq!(union_rows(&cv), vec![(0, 1), (0, 2)]);
+        // The other arm survives as an empty arm, not as an absent one.
+        let ColumnValue::Union(arms) = &cv else {
             panic!("expected Union");
         };
-        assert_eq!(tags, &[0, 0]);
-        assert_eq!(variants[0], ColumnValue::Ints(vec![1, 2]));
-        assert_eq!(variants[1], ColumnValue::Ints(vec![]));
+        assert!(
+            arms.get(&FieldKey::Index(1))
+                .is_some_and(UnionArm::is_empty)
+        );
     }
 
     /// Retaining consecutive rows from the middle preserves source order within each variant.
@@ -944,12 +1113,7 @@ mod tests {
         // Keep rows 1,2,3 (tag0→20, tag1→100, tag0→30); drop first and last.
         let mut cv = make_union_cv(&[(0, 10), (0, 20), (1, 100), (0, 30), (1, 200)], 2);
         cv.retain(&mask(&[false, true, true, true, false]));
-        let ColumnValue::Union { tags, variants } = &cv else {
-            panic!("expected Union");
-        };
-        assert_eq!(tags, &[0, 1, 0]);
-        assert_eq!(variants[0], ColumnValue::Ints(vec![20, 30]));
-        assert_eq!(variants[1], ColumnValue::Ints(vec![100]));
+        assert_eq!(union_rows(&cv), vec![(0, 20), (1, 100), (0, 30)]);
     }
 
     /// Appending two interleaved `Commit(Int) | Abort(Unit)` union columns
@@ -960,45 +1124,86 @@ mod tests {
     /// `Commit` (carries an Int write), variant 1 = `Abort` (a unit).
     #[test]
     fn append_union_interleaved_commit_abort() {
+        let commit = FieldKey::Name("Commit".into());
+        let abort = FieldKey::Name("Abort".into());
         // Writer A's stream: Commit(1), Abort, Commit(2).
-        let mut a = ColumnValue::Union {
-            tags: vec![0, 1, 0],
-            variants: vec![ColumnValue::Ints(vec![1, 2]), ColumnValue::Units(1)],
-        };
+        let mut a = ColumnValue::Union(TagMap::from_arms(vec![
+            (
+                commit.clone(),
+                UnionArm::new(vec![0, 2], ColumnValue::Ints(vec![1, 2])),
+            ),
+            (abort.clone(), UnionArm::new(vec![1], ColumnValue::Units(1))),
+        ]));
         // Writer B's stream: Abort, Commit(3).
-        let b = ColumnValue::Union {
-            tags: vec![1, 0],
-            variants: vec![ColumnValue::Ints(vec![3]), ColumnValue::Units(1)],
-        };
+        let b = ColumnValue::Union(TagMap::from_arms(vec![
+            (
+                commit.clone(),
+                UnionArm::new(vec![1], ColumnValue::Ints(vec![3])),
+            ),
+            (abort.clone(), UnionArm::new(vec![0], ColumnValue::Units(1))),
+        ]));
         a.append(b);
-        let ColumnValue::Union { tags, variants } = &a else {
+        a.debug_assert_union_invariants();
+        let ColumnValue::Union(arms) = &a else {
             panic!("expected Union");
         };
-        // Tags concatenate in source order; each variant column concatenates too.
-        assert_eq!(tags, &[0, 1, 0, 1, 0]);
-        assert_eq!(variants[0], ColumnValue::Ints(vec![1, 2, 3]));
-        assert_eq!(variants[1], ColumnValue::Units(2));
-        // Row-wise read-back: the Commit rows carry their Ints; the Abort rows
-        // are units. `index_at` maps a row to its variant-local position.
+        // `other`'s rows shift past `self`'s, so each arm holds the rows it owns
+        // across the whole concatenation.
+        assert_eq!(arms.get(&commit).unwrap().rows, vec![0, 2, 4]);
+        assert_eq!(arms.get(&abort).unwrap().rows, vec![1, 3]);
+        assert_eq!(
+            arms.get(&commit).unwrap().values,
+            ColumnValue::Ints(vec![1, 2, 3])
+        );
+        assert_eq!(arms.get(&abort).unwrap().values, ColumnValue::Units(2));
+        // Row-wise read-back: a row's arm gives its tag, and its position within
+        // that arm's `rows` gives the payload slot directly.
         assert_eq!(
             a.index_at(0),
             Value::Union {
-                tag: 0,
+                tag: commit.clone(),
                 inner: Box::new(Value::Int(1))
             }
         );
         assert_eq!(
             a.index_at(3),
             Value::Union {
-                tag: 1,
+                tag: abort.clone(),
                 inner: Box::new(Value::Unit)
             }
         );
         assert_eq!(
             a.index_at(4),
             Value::Union {
-                tag: 0,
+                tag: commit.clone(),
                 inner: Box::new(Value::Int(3))
+            }
+        );
+    }
+
+    /// Appending a column that carries a tag the receiver lacks **grows** the arm
+    /// set rather than failing. That is what makes concatenation total over
+    /// width-subtypes: the two operands need not agree on their tag sets.
+    #[test]
+    fn append_union_grows_the_tag_set() {
+        let a_tag = FieldKey::Name("a".into());
+        let b_tag = FieldKey::Name("b".into());
+        let mut a = ColumnValue::Union(TagMap::from_arms(vec![(
+            a_tag.clone(),
+            UnionArm::new(vec![0], ColumnValue::Ints(vec![1])),
+        )]));
+        let b = ColumnValue::Union(TagMap::from_arms(vec![(
+            b_tag.clone(),
+            UnionArm::new(vec![0], ColumnValue::Ints(vec![2])),
+        )]));
+        a.append(b);
+        a.debug_assert_union_invariants();
+        assert_eq!(a.len(), 2);
+        assert_eq!(
+            a.index_at(1),
+            Value::Union {
+                tag: b_tag,
+                inner: Box::new(Value::Int(2))
             }
         );
     }

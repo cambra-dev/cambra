@@ -145,12 +145,12 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 
         TypedExprNode::Var(name) => (Precedence::Atom, name.base().to_string()),
 
-        TypedExprNode::Builtin(Builtin::VariantProject(i)) => {
-            (Precedence::Atom, format!("variant_project({i})"))
+        TypedExprNode::Builtin(Builtin::VariantProject(tag)) => {
+            (Precedence::Atom, format!("variant_project(.{tag})"))
         }
 
-        TypedExprNode::Builtin(Builtin::VariantWrap(i)) => {
-            (Precedence::Atom, format!("variant_wrap({i})"))
+        TypedExprNode::Builtin(Builtin::VariantWrap(tag)) => {
+            (Precedence::Atom, format!("variant_wrap(.{tag})"))
         }
 
         TypedExprNode::Builtin(b) => (Precedence::Atom, b.name().to_string()),

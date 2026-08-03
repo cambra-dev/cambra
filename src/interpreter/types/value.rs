@@ -7,6 +7,7 @@ use intervalsets::Side;
 use intervalsets::numeric::Domain;
 use smol_str::SmolStr;
 
+use crate::ccl::FieldKey;
 use crate::interpreter::{
     BinOpKind, UnaryOpKind, apply_binop_column, apply_unaryop_column, tuple_field,
 };
@@ -63,9 +64,16 @@ pub enum Value {
     /// A record value
     Record(HashMap<String, Value>),
     ComputableFunction(FunctionDef),
-    /// A tagged union value: `tag` identifies which variant, `inner` is the actual value.
+    /// A tagged union value: `tag` names which arm, `inner` is the payload.
+    ///
+    /// The tag is a [`FieldKey`], not a position, so a union value is
+    /// **self-describing**: its meaning does not depend on a static type that is
+    /// not attached to it. A positional tag makes equality, hashing and any
+    /// serialization of a union value only meaningful within one static type,
+    /// because the same position denotes different arms in a type and its
+    /// width-supertype.
     Union {
-        tag: usize,
+        tag: FieldKey,
         inner: Box<Value>,
     },
 }

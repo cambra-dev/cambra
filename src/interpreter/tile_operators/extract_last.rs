@@ -24,8 +24,9 @@ pub struct ExtractLast {
     /// Operator producing the `SealedFunction` tiling to extract from.
     source: Box<dyn TileOperator>,
     /// Fallback scalar operator, pulled when `source` is terminal and
-    /// emits zero values.  Must have a `Scalar` tiling whose extent
-    /// matches `source`'s codomain extent.
+    /// emits zero values.  Must have a `Scalar` tiling whose extent the
+    /// output extent *includes* — a width-narrower variant is admitted and
+    /// widened on emission.
     default: Box<dyn TileOperator>,
     /// Output tiling — the codomain of the source SealedFunction (always `Scalar`).
     tiling: Tiling,
@@ -35,18 +36,25 @@ impl ExtractLast {
     /// Construct a new `ExtractLast` wrapping `source`, with `default`
     /// as the fallback for the empty-source case.
     ///
-    /// `source` must have a `SealedFunction` tiling and `default` must
-    /// have a `Scalar` tiling with the same extent as `source`'s codomain.
-    /// The output tiling becomes that scalar codomain.
+    /// `source` must have a `SealedFunction` tiling and `default` a `Scalar`
+    /// tiling whose extent that codomain includes. The output tiling becomes
+    /// the scalar codomain.
     pub fn new(source: Box<dyn TileOperator>, default: Box<dyn TileOperator>) -> Self {
         let tiling = match source.tiling() {
             Tiling::SealedFunction { codomain, .. } => *codomain.clone(),
             other => panic!("ExtractLast source must have SealedFunction tiling, got {other}"),
         };
-        debug_assert_eq!(
+        // The default has to be *representable* in the output value space, not
+        // identical to it. A tag `match`/conditional whose arms carry different
+        // tags collapses to the arms' join, and the trailing arm supplying the
+        // default is one of those arms — so its own extent is width-narrower (it
+        // carries its tag and not its siblings'). Emission below builds the column
+        // at the declared extent, which is what makes the narrower value fit.
+        debug_assert!(
+            tiling.extent().includes(&default.tiling().extent()),
+            "ExtractLast default must be representable in the source codomain: \
+             default {} is not included in {tiling}",
             default.tiling(),
-            &tiling,
-            "ExtractLast default tiling must match source codomain tiling",
         );
         Self {
             source,
@@ -130,7 +138,15 @@ impl TileProducer for ExtractLastProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let empty = Tile::Scalar(ColumnValue::from_values(vec![], &self.tiling().extent()));
+        // Every emission below is built at the **declared** extent rather than
+        // from the value alone. A variant value carries only the tag it holds, so
+        // a column built from it would have just that one arm — narrower than this
+        // operator's tiling whenever the alternatives it collapses carry more tags
+        // between them. Building at the declared extent keeps every arm present,
+        // with the ones that did not occur empty, which is the shape downstream
+        // merges and appends require.
+        let extent = self.tiling().extent();
+        let empty = Tile::Scalar(ColumnValue::from_values(vec![], &extent));
         if self.released {
             return empty;
         }
@@ -140,7 +156,7 @@ impl TileProducer for ExtractLastProducer {
         // across pulls when the consumer doesn't release immediately
         // (e.g. while a sibling pipeline is still converging).
         if let Some(v) = &self.final_value {
-            return Tile::Scalar(ColumnValue::single(v.clone()));
+            return Tile::Scalar(ColumnValue::from_values(vec![v.clone()], &extent));
         }
         let source_tiling = self.source.tiling().clone();
         let source_tile = self.source.get(source_tiling.universal_guard());
@@ -200,7 +216,7 @@ impl TileProducer for ExtractLastProducer {
         if let Some(last_idx) = (0..n).rev().find(|&i| !deleted.contains(i)) {
             let value = cv.index_at(last_idx);
             self.final_value = Some(value.clone());
-            return Tile::Scalar(ColumnValue::single(value));
+            return Tile::Scalar(ColumnValue::from_values(vec![value], &extent));
         }
         // Source is terminal *and* empty (the loop body ran zero
         // times).  Pull the default scalar and emit that instead, then
@@ -211,7 +227,7 @@ impl TileProducer for ExtractLastProducer {
             Some(value) => {
                 self.default.release(default_tiling.universal_guard());
                 self.final_value = Some(value.clone());
-                Tile::Scalar(ColumnValue::single(value))
+                Tile::Scalar(ColumnValue::from_values(vec![value], &extent))
             }
             // Default hasn't converged yet — emit empty.  Outer pull
             // loop will retry; once default resolves, we'll cache it.
@@ -286,6 +302,154 @@ mod tests {
                 self.releases.borrow_mut().push(*w);
             }
         }
+    }
+
+    /// A **terminal** `SealedFunction` source carrying `codomain_tile` over
+    /// `domain`, used to drive `ExtractLast` to its extract / default paths.
+    struct TerminalSource {
+        tiling: Tiling,
+        domain: ColumnValue,
+        codomain_tile: ColumnValue,
+    }
+
+    struct TerminalSourceProducer {
+        base: ProducerBase,
+        domain: ColumnValue,
+        codomain_tile: ColumnValue,
+    }
+
+    impl TileOperator for TerminalSource {
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            Box::new(TerminalSourceProducer {
+                base: ProducerBase::new(TerminalSourceProducer::alloc_id(), &self.tiling),
+                domain: self.domain.clone(),
+                codomain_tile: self.codomain_tile.clone(),
+            })
+        }
+    }
+
+    impl TileProducer for TerminalSourceProducer {
+        impl_producer_base!();
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            Tile::SealedFunction {
+                domain: self.domain.clone(),
+                codomain: Box::new(Tile::Scalar(self.codomain_tile.clone())),
+                domain_predicate: Predicate::True, // terminal
+                deleted: bit_set::BitSet::new(),
+            }
+        }
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    fn named_variant(arms: &[(&str, Extent)]) -> Extent {
+        Extent::Union(crate::ccl::TagMap::from_arms(
+            arms.iter()
+                .map(|(t, e)| (crate::ccl::FieldKey::Name((*t).into()), e.clone()))
+                .collect(),
+        ))
+    }
+
+    fn union_value(tag: &str, inner: Value) -> Value {
+        Value::Union {
+            tag: crate::ccl::FieldKey::Name(tag.into()),
+            inner: Box::new(inner),
+        }
+    }
+
+    /// The tags a `ColumnValue::Union` carries, and which of them hold rows.
+    fn arm_occupancy(cv: &ColumnValue) -> Vec<(String, usize)> {
+        let ColumnValue::Union(arms) = cv else {
+            panic!("expected a union column, got {cv:?}");
+        };
+        arms.iter()
+            .map(|(k, arm)| (k.to_string(), arm.rows.len()))
+            .collect()
+    }
+
+    /// A conditional whose arms carry different tags collapses to the arms'
+    /// **join**, so the value that survives has to be emitted at that merged tag
+    /// set — every arm present, the ones that did not occur empty. Emitting the
+    /// column the value alone implies would carry only `.pos`, which then fails to
+    /// conform to this operator's own tiling and cannot merge with a sibling arm.
+    #[test]
+    fn extracted_variant_is_emitted_at_the_merged_tag_set() {
+        let merged = named_variant(&[
+            ("neg", Extent::Base(BaseType::Int)),
+            ("pos", Extent::Base(BaseType::Int)),
+        ]);
+        let source = TerminalSource {
+            tiling: Tiling::SealedFunction {
+                domain: Extent::Base(BaseType::UInt),
+                codomain: Box::new(Tiling::Scalar(merged.clone())),
+            },
+            domain: ColumnValue::from_uints(vec![0]),
+            codomain_tile: ColumnValue::from_values(
+                vec![union_value("pos", Value::Int(5))],
+                &merged,
+            ),
+        };
+        // The default is the *other* arm, so its own extent is width-narrower.
+        let default = Constant::new(
+            union_value("neg", Value::Int(0)),
+            named_variant(&[("neg", Extent::Base(BaseType::Int))]),
+        );
+        let mut op = ExtractLast::new(Box::new(source), Box::new(default));
+        let guard = op.tiling().universal_guard();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let tile = producer.get(producer.tiling().universal_guard());
+
+        let Tile::Scalar(cv) = tile else {
+            panic!("expected a scalar tile");
+        };
+        assert_eq!(
+            arm_occupancy(&cv),
+            vec![("neg".to_string(), 0), ("pos".to_string(), 1)],
+            "both tags present, only the one that occurred inhabited"
+        );
+        assert_eq!(cv.as_single(), Some(union_value("pos", Value::Int(5))));
+    }
+
+    /// The same widening on the **default** path: a terminal-but-empty source
+    /// falls back to the trailing arm, whose value carries only its own tag.
+    #[test]
+    fn default_variant_is_emitted_at_the_merged_tag_set() {
+        let merged = named_variant(&[
+            ("neg", Extent::Base(BaseType::Int)),
+            ("pos", Extent::Base(BaseType::Int)),
+        ]);
+        let source = TerminalSource {
+            tiling: Tiling::SealedFunction {
+                domain: Extent::Base(BaseType::UInt),
+                codomain: Box::new(Tiling::Scalar(merged.clone())),
+            },
+            domain: ColumnValue::from_uints(vec![]),
+            codomain_tile: ColumnValue::from_values(vec![], &merged),
+        };
+        let default = Constant::new(
+            union_value("neg", Value::Int(7)),
+            named_variant(&[("neg", Extent::Base(BaseType::Int))]),
+        );
+        let mut op = ExtractLast::new(Box::new(source), Box::new(default));
+        let guard = op.tiling().universal_guard();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let tile = producer.get(producer.tiling().universal_guard());
+
+        let Tile::Scalar(cv) = tile else {
+            panic!("expected a scalar tile");
+        };
+        assert_eq!(
+            arm_occupancy(&cv),
+            vec![("neg".to_string(), 1), ("pos".to_string(), 0)],
+        );
+        assert_eq!(cv.as_single(), Some(union_value("neg", Value::Int(7))));
     }
 
     /// On a non-terminal pull, `ExtractLast` needs only the highest-domain value,

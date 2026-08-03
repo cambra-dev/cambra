@@ -1,6 +1,8 @@
 use bit_set::BitSet;
 
 use super::*;
+use crate::ccl::{FieldKey, TagMap};
+use crate::interpreter::UnionArm;
 use crate::{
     interpreter::{BaseType, ColumnValue, Consumer, Extent, FunctionDef, Scheduler, Value},
     pretty_graph::VizOptions,
@@ -168,10 +170,10 @@ impl TileOperator for ToScalar {
 pub struct VariantWrap {
     /// The payload operator feeding `variants[tag]`.
     input: Box<dyn TileOperator>,
-    /// The resolved 0-based position of the constructed tag in the full union.
-    tag: usize,
-    /// Per-variant extents of the full union; `input` feeds position `tag`.
-    variant_extents: Vec<Extent>,
+    /// The tag being constructed.
+    tag: FieldKey,
+    /// Per-variant extents of the full union; `input` feeds the `tag` arm.
+    variant_extents: TagMap<Extent>,
     /// Output tiling — `Scalar(Union)` for a scalar payload, or
     /// `SealedFunction { D ⇒ Scalar(Union) }` for a payload stream.
     tiling: Tiling,
@@ -183,11 +185,14 @@ impl VariantWrap {
     /// payload's: a `Scalar` payload yields `Scalar(Union)`; a payload *stream*
     /// `SealedFunction { D ⇒ Scalar(_) }` yields `SealedFunction { D ⇒
     /// Scalar(Union) }` (the wrap is element-wise over the codomain).
-    pub fn new(input: Box<dyn TileOperator>, tag: usize, variant_extents: Vec<Extent>) -> Self {
+    pub fn new(
+        input: Box<dyn TileOperator>,
+        tag: FieldKey,
+        variant_extents: TagMap<Extent>,
+    ) -> Self {
         assert!(
-            tag < variant_extents.len(),
-            "VariantWrap: tag index {tag} out of range for {} variants",
-            variant_extents.len()
+            variant_extents.get(&tag).is_some(),
+            "VariantWrap: tag `{tag}` is not an arm of the union being constructed"
         );
         let union_ext = Extent::Union(variant_extents.clone());
         let tiling = match input.tiling() {
@@ -212,25 +217,20 @@ impl VariantWrap {
 /// (`variants[j].len()` equals the count of `j`s in `tags`).
 fn wrap_variant_column(
     payload: ColumnValue,
-    tag: usize,
-    variant_extents: &[Extent],
+    tag: &FieldKey,
+    variant_extents: &TagMap<Extent>,
 ) -> ColumnValue {
     let n = payload.len();
-    let variants: Vec<ColumnValue> = variant_extents
-        .iter()
-        .enumerate()
-        .map(|(i, ext)| {
-            if i == tag {
-                payload.clone()
-            } else {
-                ColumnValue::from_values(Vec::new(), ext)
-            }
-        })
-        .collect();
-    ColumnValue::Union {
-        tags: vec![tag; n],
-        variants,
-    }
+    let cv = ColumnValue::Union(variant_extents.map(|k, ext| {
+        if k == tag {
+            // The constructed tag owns every row.
+            UnionArm::new((0..n).collect(), payload.clone())
+        } else {
+            UnionArm::empty_for(ext)
+        }
+    }));
+    cv.debug_assert_union_invariants();
+    cv
 }
 
 impl TileOperator for VariantWrap {
@@ -255,7 +255,7 @@ impl TileOperator for VariantWrap {
         Box::new(VariantWrapProducer {
             base: ProducerBase::new(VariantWrapProducer::alloc_id(), &self.tiling),
             input,
-            tag: self.tag,
+            tag: self.tag.clone(),
             variant_extents: self.variant_extents.clone(),
         })
     }
@@ -265,8 +265,8 @@ struct VariantWrapProducer {
     base: ProducerBase,
     /// The subscribed payload producer.
     input: Box<dyn TileProducer>,
-    tag: usize,
-    variant_extents: Vec<Extent>,
+    tag: FieldKey,
+    variant_extents: TagMap<Extent>,
 }
 
 impl TileProducer for VariantWrapProducer {
@@ -283,7 +283,7 @@ impl TileProducer for VariantWrapProducer {
                 let payload = scalar_tile_to_column_value(tile);
                 Tile::Scalar(wrap_variant_column(
                     payload,
-                    self.tag,
+                    &self.tag,
                     &self.variant_extents,
                 ))
             }
@@ -300,7 +300,7 @@ impl TileProducer for VariantWrapProducer {
                     domain,
                     codomain: Box::new(Tile::Scalar(wrap_variant_column(
                         payload,
-                        self.tag,
+                        &self.tag,
                         &self.variant_extents,
                     ))),
                     domain_predicate,
@@ -357,9 +357,9 @@ pub struct VariantProject {
     /// The scrutinee operator, producing a `Scalar(Union)` tile or a
     /// `SealedFunction { D ⇒ Scalar(Union) }` tile.
     input: Box<dyn TileOperator>,
-    /// The 0-based variant position to project.
-    tag: usize,
-    /// Output tiling — `SealedFunction { <scrutinee domain> ⇒ variants[tag] }`.
+    /// The tag to project.
+    tag: FieldKey,
+    /// Output tiling — `SealedFunction { <scrutinee domain> ⇒ the `tag` arm }`.
     tiling: Tiling,
 }
 
@@ -370,7 +370,7 @@ impl VariantProject {
     /// while a `SealedFunction { D ⇒ Scalar(Union) }` scrutinee keeps `D`. All
     /// arms of one `match` share the scrutinee's domain extent, so they
     /// flat-merge back to the full domain.
-    pub fn new(input: Box<dyn TileOperator>, tag: usize) -> Self {
+    pub fn new(input: Box<dyn TileOperator>, tag: FieldKey) -> Self {
         let (domain_extent, variant_extents) = match input.tiling() {
             Tiling::Scalar(Extent::Union(exts)) => (Extent::Base(BaseType::UInt), exts.clone()),
             Tiling::SealedFunction { domain, codomain } => match codomain.as_ref() {
@@ -383,13 +383,18 @@ impl VariantProject {
             other => panic!("VariantProject: scrutinee must be a (Sealed)Union, got {other:?}"),
         };
         assert!(
-            tag < variant_extents.len(),
-            "VariantProject: tag index {tag} out of range for {} variants",
-            variant_extents.len()
+            variant_extents.get(&tag).is_some(),
+            "VariantProject: tag `{tag}` is not an arm of the union being projected (arms: {:?})",
+            variant_extents.keys().collect::<Vec<_>>()
         );
         let tiling = Tiling::SealedFunction {
             domain: domain_extent,
-            codomain: Box::new(Tiling::Scalar(variant_extents[tag].clone())),
+            codomain: Box::new(Tiling::Scalar(
+                variant_extents
+                    .get(&tag)
+                    .expect("checked just above")
+                    .clone(),
+            )),
         };
         Self { input, tag, tiling }
     }
@@ -417,7 +422,8 @@ impl TileOperator for VariantProject {
         Box::new(VariantProjectProducer {
             base: ProducerBase::new(VariantProjectProducer::alloc_id(), &self.tiling),
             input,
-            tag: self.tag,
+            tag: self.tag.clone(),
+            tiling: self.tiling.clone(),
         })
     }
 
@@ -436,7 +442,10 @@ struct VariantProjectProducer {
     base: ProducerBase,
     /// The subscribed scrutinee producer.
     input: Box<dyn TileProducer>,
-    tag: usize,
+    tag: FieldKey,
+    /// The projection's own codomain tiling, for shaping an empty result when the
+    /// scrutinee carries no arm for `tag`.
+    tiling: Tiling,
 }
 
 impl TileProducer for VariantProjectProducer {
@@ -467,24 +476,26 @@ impl TileProducer for VariantProjectProducer {
             ),
             other => panic!("VariantProject expects a (Sealed)Union input, got {other:?}"),
         };
-        let ColumnValue::Union { tags, variants } = cv else {
+        let ColumnValue::Union(arms) = cv else {
             panic!("VariantProject expects a Union codomain, got {cv:?}");
         };
-        // Walk positions once, keeping live tag-`i` positions. `key_positions`
-        // indexes the scrutinee's domain column; `variant_locals` indexes the
-        // dense `variants[tag]` column (its `k`-th element is the `k`-th
-        // *appearance* of tag `i`, deleted or not — so we track the running
-        // per-tag count independently of the `deleted` filter).
+        // The arm records exactly which rows carry this tag and, by position
+        // within it, where each one's payload sits — so the projection is a
+        // filter over the arm rather than a walk that reconstructs the
+        // correspondence.
+        //
+        // **An absent arm is not an error**: the scrutinee is a width-subtype of
+        // what this projection was built for, so it simply never carries this tag
+        // and the restriction is empty. That is what makes variant width
+        // subtyping free at runtime.
         let mut key_positions: Vec<usize> = Vec::new();
-        let mut variant_locals: Vec<usize> = Vec::new();
-        let mut variant_local = 0usize;
-        for (pos, &t) in tags.iter().enumerate() {
-            if t == self.tag {
+        let mut slots: Vec<usize> = Vec::new();
+        if let Some(arm) = arms.get(&self.tag) {
+            for (slot, &pos) in arm.rows.iter().enumerate() {
                 if !deleted.contains(pos) {
                     key_positions.push(pos);
-                    variant_locals.push(variant_local);
+                    slots.push(slot);
                 }
-                variant_local += 1;
             }
         }
         let out_domain = match domain_col {
@@ -493,8 +504,14 @@ impl TileProducer for VariantProjectProducer {
             // Implicit `Scalar(Union)` domain: the kept positions *are* the keys.
             None => ColumnValue::from_uints(key_positions),
         };
-        let out_codomain =
-            variants[self.tag].select_indices(variant_locals.iter().copied(), variant_locals.len());
+        let out_codomain = match arms.get(&self.tag) {
+            Some(arm) => arm
+                .values
+                .select_indices(slots.iter().copied(), slots.len()),
+            // No arm for this tag: an empty codomain shaped by the projection's own
+            // declared codomain extent.
+            None => ColumnValue::from_values(Vec::new(), &self.tiling.extent()),
+        };
         Tile::SealedFunction {
             domain: out_domain,
             codomain: Box::new(Tile::Scalar(out_codomain)),
@@ -582,14 +599,14 @@ mod tests {
     /// A mixed `[Commit(Int) | Abort(Unit)]` stream: positions 0,2 carry
     /// `Commit`, position 1 carries `Abort`.
     fn commit_abort_scrutinee() -> FixedOp {
-        let tile = Tile::Scalar(ColumnValue::Union {
-            tags: vec![0, 1, 0],
-            variants: vec![ColumnValue::Ints(vec![10, 30]), ColumnValue::Units(1)],
-        });
-        let tiling = Tiling::Scalar(Extent::Union(vec![
+        let tile = Tile::Scalar(ColumnValue::positional_union(
+            &[0, 1, 0],
+            vec![ColumnValue::Ints(vec![10, 30]), ColumnValue::Units(1)],
+        ));
+        let tiling = Tiling::Scalar(Extent::Union(TagMap::from_positional(vec![
             Extent::Base(BaseType::Int),
             Extent::Base(BaseType::Unit),
-        ]));
+        ])));
         FixedOp { tile, tiling }
     }
 
@@ -598,7 +615,7 @@ mod tests {
     #[test]
     fn variant_project_commit_arm() {
         let scrut = Box::new(commit_abort_scrutinee());
-        let mut op = VariantProject::new(scrut, 0);
+        let mut op = VariantProject::new(scrut, FieldKey::Index(0));
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
         let tile = producer.get(producer.tiling().universal_guard());
@@ -618,7 +635,7 @@ mod tests {
     #[test]
     fn variant_project_abort_arm() {
         let scrut = Box::new(commit_abort_scrutinee());
-        let mut op = VariantProject::new(scrut, 1);
+        let mut op = VariantProject::new(scrut, FieldKey::Index(1));
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
         let tile = producer.get(producer.tiling().universal_guard());
@@ -642,27 +659,29 @@ mod tests {
     fn variant_elim_fanout_re_totals() {
         // tags [0,1,0,1] → Commit(10), Abort'(20), Commit(30), Abort'(40),
         // with both arms carrying Int so the union codomain is uniform.
-        let tile = Tile::Scalar(ColumnValue::Union {
-            tags: vec![0, 1, 0, 1],
-            variants: vec![
+        let tile = Tile::Scalar(ColumnValue::positional_union(
+            &[0, 1, 0, 1],
+            vec![
                 ColumnValue::Ints(vec![10, 30]),
                 ColumnValue::Ints(vec![20, 40]),
             ],
-        });
-        let tiling = Tiling::Scalar(Extent::Union(vec![
+        ));
+        let tiling = Tiling::Scalar(Extent::Union(TagMap::from_positional(vec![
             Extent::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
-        ]));
+        ])));
 
         let arm0: Box<dyn TileOperator> = Box::new(VariantProject::new(
             Box::new(FixedOp {
                 tile: tile.clone(),
                 tiling: tiling.clone(),
             }),
-            0,
+            FieldKey::Index(0),
         ));
-        let arm1: Box<dyn TileOperator> =
-            Box::new(VariantProject::new(Box::new(FixedOp { tile, tiling }), 1));
+        let arm1: Box<dyn TileOperator> = Box::new(VariantProject::new(
+            Box::new(FixedOp { tile, tiling }),
+            FieldKey::Index(1),
+        ));
 
         let mut union = UnionOperator::new_flat(vec![arm0, arm1]);
         let mut sched = Scheduler::new();
@@ -701,19 +720,18 @@ mod tests {
         // preservation.
         let union_stream_tile = Tile::SealedFunction {
             domain: ColumnValue::from_uints(vec![10, 11, 12]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Union {
-                tags: vec![0, 1, 0],
-                variants: vec![ColumnValue::Ints(vec![100, 120]), ColumnValue::Units(1)],
-            })),
+            codomain: Box::new(Tile::Scalar(ColumnValue::positional_union(
+                &[0, 1, 0],
+                vec![ColumnValue::Ints(vec![100, 120]), ColumnValue::Units(1)],
+            ))),
             domain_predicate: Predicate::True,
             deleted: BitSet::new(),
         };
         let union_stream_tiling = Tiling::SealedFunction {
             domain: Extent::Base(BaseType::UInt),
-            codomain: Box::new(Tiling::Scalar(Extent::Union(vec![
-                Extent::Base(BaseType::Int),
-                Extent::Base(BaseType::Unit),
-            ]))),
+            codomain: Box::new(Tiling::Scalar(Extent::Union(TagMap::from_positional(
+                vec![Extent::Base(BaseType::Int), Extent::Base(BaseType::Unit)],
+            )))),
         };
 
         // `VariantProject(Commit)` keeps the *actual* keys 10 and 12.
@@ -722,7 +740,7 @@ mod tests {
                 tile: union_stream_tile.clone(),
                 tiling: union_stream_tiling.clone(),
             }),
-            0,
+            FieldKey::Index(0),
         );
         assert_eq!(
             vp.tiling(),
