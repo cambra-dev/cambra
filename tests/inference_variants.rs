@@ -361,13 +361,11 @@ fn lambda_returns_variant() {
 /// `if True then .Some(1) else .None(())` — Case unifies the two variant
 /// branches at the positive polarity, yielding the union of tags.
 ///
-/// **Ignored**: `emit_case` uses two-way constrain to unify arm bodies,
-/// which forces equality and rejects width-distinct variants. Same root
-/// cause as the bidirectional-Apply hack — see §3.1. The conceptually
-/// correct behaviour is to drop a single-direction lower-bound constraint
-/// for arm bodies, which depends on the same let-polymorphism cleanup.
+/// The payload of a tag only *one* arm carries keeps that arm's value claim: the
+/// join intersects claims across arms that meet, and these two never do — one
+/// carries `Some`, the other `None`. So `Some`'s payload stays the singleton `1`
+/// rather than widening to `Int`.
 #[test]
-#[ignore = "blocked by two-way Case arm constraining; needs let-polymorphism"]
 fn if_returns_variant() {
     let arms = vec![
         Branch {
@@ -386,10 +384,11 @@ fn if_returns_variant() {
         branches: arms,
     });
     let ty = run(expr).expect("inference ok");
-    // Both arms get mutually constrained; the resulting type is the
-    // first arm's type after the second arm flowed into it as a
-    // lower bound. Coalesce at positive polarity unions the tags.
-    let expected = variant(&[("None", unit_ty()), ("Some", int())]);
+    // Each arm flows one-way into a shared result variable, so coalescing at
+    // positive polarity unions the tags. `Some`'s payload is the literal's
+    // singleton, not `Int`, because no sibling arm carries `Some` to intersect it
+    // with.
+    let expected = variant(&[("None", unit_ty()), ("Some", int_lit(1))]);
     assert_eq!(ty, expected, "expected union of tags, got {ty}");
 }
 
@@ -400,11 +399,7 @@ fn if_returns_variant() {
 /// `.A(5)` flowing into a `[A(Int), B(Str)]`-annotated lambda parameter.
 /// Payload covariance accepts the Int payload against the Int slot.
 ///
-/// **Ignored**: same bidirectional-Apply collapse as
-/// `variant_param_accepts_subtype`. Will pass once the let-polymorphism
-/// work replaces the hack.
 #[test]
-#[ignore = "blocked by bidirectional Apply equality-collapse; needs let-polymorphism"]
 fn payload_covariance_accept() {
     let param_ty = variant(&[("A", int()), ("B", string())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
@@ -437,4 +432,105 @@ fn payload_mismatch_reject() {
         run(TypedExpr::apply(arg, lambda)).is_err(),
         "Int payload should not satisfy String payload slot"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Group F — Payloads of arms nothing reaches
+// ---------------------------------------------------------------------------
+
+/// The payload type recorded for the arm named `tag`, found by descending to the
+/// first `Case` in the tree (monomorphization wraps the lambda in a `let`).
+fn arm_payload_ty(expr: &TypedExpr, tag: &str) -> Type {
+    fn find(expr: &TypedExpr, tag: &str) -> Option<Type> {
+        if let TypedExprNode::Case { branches, .. } = &expr.node {
+            for b in branches {
+                if let Some(p) = &b.pattern
+                    && p.tag == tag
+                {
+                    return Some(p.binding.ty.clone());
+                }
+            }
+        }
+        let mut found = None;
+        expr.walk_children(|c| {
+            if found.is_none() {
+                found = find(c, tag);
+            }
+        });
+        found
+    }
+    find(expr, tag).unwrap_or_else(|| panic!("no arm `{tag}` in tree"))
+}
+
+/// ``let f = λ x → match x { `a(v) → v; `b(w) → 0 } in `a(1) ▷ f``.
+///
+/// The `b` arm is unreachable (the argument carries only `a`) *and* ignores its
+/// binder, so nothing in the program constrains its payload. Inference must
+/// still produce a fully concrete tree: the variable is pinned to `Unit` in the
+/// constraint graph, so the binder slot **and** the lambda's parameter type
+/// agree on it. Before the pin, `f`'s domain kept a bare `Infer` and the
+/// post-inference wall rejected this program.
+#[test]
+fn unobservable_arm_payload_resolves_everywhere() {
+    let body = TypedExpr::new(TypedExprNode::Case {
+        scrutinee: Some(Box::new(var("x"))),
+        branches: vec![
+            arm("a", "v", None, var("v")),
+            arm("b", "w", None, lit_int(0)),
+        ],
+    });
+    let lambda = TypedExpr::lambda("x", Type::Hole, body);
+    let call = TypedExpr::apply(TypedExpr::variant_ctor("a", lit_int(1)), var("f"));
+    let full = run_full(TypedExpr::let_bind("f", lambda, call)).expect("inference ok");
+
+    assert_eq!(arm_payload_ty(&full, "b"), unit_ty());
+    // The wall the residual variable used to fail: no `Infer` left anywhere,
+    // including inside the lambda's parameter type.
+    cambra::ccl::infer::check_fully_typed(&full)
+        .expect("an unobservable payload leaves no unresolved variable");
+}
+
+/// The same lambda applied to `` `b(2) `` instead.
+///
+/// Now a *call site* constrains the payload the arm ignores, and that
+/// application is emitted after the `Case` it applies to. The payload must come
+/// from the argument rather than being pinned, which is why the pin runs once
+/// constraint emission is complete rather than at the end of `emit_case`.
+#[test]
+fn ignored_arm_payload_still_takes_its_argument_type() {
+    let body = TypedExpr::new(TypedExprNode::Case {
+        scrutinee: Some(Box::new(var("x"))),
+        branches: vec![
+            arm("a", "v", None, lit_int(0)),
+            arm("b", "w", None, lit_int(0)),
+        ],
+    });
+    let lambda = TypedExpr::lambda("x", Type::Hole, body);
+    let call = TypedExpr::apply(TypedExpr::variant_ctor("b", lit_int(2)), var("f"));
+    let full = run_full(TypedExpr::let_bind("f", lambda, call)).expect("inference ok");
+
+    assert_eq!(arm_payload_ty(&full, "b"), int_lit(2));
+    cambra::ccl::infer::check_fully_typed(&full).expect("fully typed");
+}
+
+/// An arm that *reads* its binder needs no pin: the read is an upper bound, so
+/// the variable is constrained and coalesces from its use.
+///
+/// Here the use is "be the arm's result", and the result joins with the reachable
+/// arm's — so the unreachable arm's binder comes out as the singleton `1` that
+/// arm produced. The assertion is that specific type rather than merely "not
+/// `Unit`", since what is being pinned down is *where* a read binder gets its
+/// type from.
+#[test]
+fn read_arm_payload_is_not_pinned() {
+    let body = TypedExpr::new(TypedExprNode::Case {
+        scrutinee: Some(Box::new(var("x"))),
+        branches: vec![arm("a", "v", None, var("v")), arm("b", "w", None, var("w"))],
+    });
+    let lambda = TypedExpr::lambda("x", Type::Hole, body);
+    let call = TypedExpr::apply(TypedExpr::variant_ctor("a", lit_int(1)), var("f"));
+    let full = run_full(TypedExpr::let_bind("f", lambda, call)).expect("inference ok");
+
+    assert_eq!(arm_payload_ty(&full, "b"), int_lit(1));
+    cambra::ccl::infer::check_fully_typed(&full).expect("fully typed");
 }

@@ -1162,6 +1162,12 @@ For each `Branch { guard, body }`: the guard flows one-way into `Type::Base(Base
 
 The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [Data vs compute functions](#46-data-vs-compute-functions); the strict-equality behavior above is current until that lands.
 
+#### An unobservable arm payload defaults to `Unit`
+
+An arm naming a tag the scrutinee cannot carry receives no lower bound, and if its body ignores its binder it receives no upper bound either — nothing determines that payload's type and nothing can observe it. Such an arm is ordinary code rather than an error (a `match` written for the whole `Option` over a scrutinee inference has pinned to one tag), so inference completes by choosing `Unit`, the type that carries no information.
+
+The choice is recorded on the *variable*, not in the binder slot, so every occurrence of it agrees — the slot, the scrutinee's expected variant, and hence an enclosing lambda's parameter type. Unreachable arms are **kept**, not pruned: an arm for a tag the scrutinee cannot carry projects an empty restriction and contributes nothing, while pruning would narrow the arm set relative to the enclosing lambda's declared domain. `pin_unobservable_arm_payload` in `src/ccl/infer/solve.rs` holds the mechanism, including the two ordering constraints that place it inside the coalesce walk.
+
 ### Record literals and field access
 
 A CHL record value is a parenthesised list of `name=value` fields:
