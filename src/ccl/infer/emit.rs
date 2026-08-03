@@ -78,7 +78,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // as more polymorphic builtins land. All other builtins arrive
         // pre-stamped from lowering and just get converted in place.
         TypedExprNode::Builtin(b) => {
-            if let Some(scheme) = ctx.schemes.builtin(*b) {
+            if let Some(scheme) = ctx.schemes.builtin(b.clone()) {
                 scheme.instantiate(ctx.level)
             } else {
                 ctx.normalize_annotation(&expr.ty)

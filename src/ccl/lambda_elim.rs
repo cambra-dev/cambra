@@ -970,31 +970,19 @@ fn elim_lambda_impl(
         // — the `const` arm above lifts the whole scalar variant value with
         // `const(.Cᵢ(…))`, which op-conversion broadcasts.
         TypedExprNode::VariantCtor { tag, payload } => {
-            // The node's own type is the full `Variant` (inference width-subtyped
-            // the singleton up to its consumer's tag set), giving the fixed arm
-            // position — the same index `variant_wrap`/`VariantProject` share.
-            let variants = match strip_refinements(&body_ty) {
-                Type::Variant(v) => v,
-                other => {
-                    return Err(LambdaElimError::Unsupported(format!(
-                        "VariantCtor with non-variant type {other}"
-                    )));
-                }
-            };
-            let tag_key = FieldKey::Name(tag.as_str().into());
-            let idx = variants
-                .iter()
-                .position(|(k, _)| *k == tag_key)
-                .ok_or_else(|| {
-                    LambdaElimError::Unsupported(format!(
-                        "VariantCtor tag `{tag}` absent from its variant type {body_ty}"
-                    ))
-                })?;
+            // `variant_wrap` names the tag it injects, so there is no arm position
+            // to resolve here and nothing to fail: the node's type need not have
+            // been width-subtyped up to its consumer's tag set for the injection to
+            // be well-defined.
+            debug_assert!(
+                matches!(strip_refinements(&body_ty), Type::Variant(_)),
+                "VariantCtor must have a Variant type, got {body_ty}"
+            );
             let payload_ty = payload.ty.clone();
-            // eᵢ  ⟹  point-free `param_ty ⇒ Pᵢ`.
+            // eᵢ  ⟹  point-free `param_ty ⇒ P_c`.
             let payload_pf = elim_lambda(ctx, param, param_ty, *payload)?;
-            // variant_wrap(i) : Pᵢ ⇒ Union (the tag injection).
-            let vw = Expr::builtin(Builtin::VariantWrap(idx))
+            // variant_wrap(c) : P_c ⇒ Union (the tag injection).
+            let vw = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(tag.as_str().into())))
                 .with_ty(Type::fun(payload_ty, body_ty.clone()));
             Ok(typed_compose(vec![payload_pf, vw]).with_ty(result_ty))
         }
@@ -1059,7 +1047,7 @@ fn elim_lambda_impl(
             // Each branch's tag position, collected to check exhaustiveness and
             // one-arm-per-tag after the loop — load-bearing invariants inference's
             // stamping guarantees but that are not type-enforced at this boundary.
-            let mut seen_idxs: Vec<usize> = Vec::with_capacity(branches.len());
+            let mut seen_tags: Vec<FieldKey> = Vec::with_capacity(branches.len());
             for br in branches {
                 // A scrutinee-Case is a pattern match, not a guarded conditional:
                 // its branches carry the trivial `true` guard. Variant elimination
@@ -1073,21 +1061,17 @@ fn elim_lambda_impl(
                 let pat = br
                     .pattern
                     .expect("guarded: scrutinee-Case branches all bind a pattern");
+                // Projecting names the tag, so an arm the scrutinee's *type* does
+                // not list needs no special handling: `variant_project` yields an
+                // empty restriction for a tag the value never carries, which is
+                // exactly what width subtyping means. Nothing to resolve, nothing
+                // to reject.
                 let tag_key = FieldKey::Name(pat.tag.as_str().into());
-                let idx = variants
-                    .iter()
-                    .position(|(k, _)| *k == tag_key)
-                    .ok_or_else(|| {
-                        LambdaElimError::Unsupported(format!(
-                            "scrutinee-Case branch tag `{}` absent from scrutinee type {scrut_ty}",
-                            pat.tag
-                        ))
-                    })?;
-                seen_idxs.push(idx);
+                seen_tags.push(tag_key.clone());
                 let payload_ty = pat.binding.ty.clone();
                 let payload_name = pat.binding.name.clone();
                 // variant_project(i) : scrut_ty ⇒ Pᵢ (the tag-restricting projection).
-                let vp = Expr::builtin(Builtin::VariantProject(idx))
+                let vp = Expr::builtin(Builtin::VariantProject(tag_key))
                     .with_ty(Type::fun(scrut_ty.clone(), payload_ty.clone()));
                 // Does `eᵢ` close over the outer binder as well as its payload?
                 // (Checked on the raw body — the payload binder `wᵢ` shadows
@@ -1141,28 +1125,33 @@ fn elim_lambda_impl(
                 };
                 arms.push(arm);
             }
-            // One arm per tag, and every scrutinee variant covered: the tag
-            // positions are distinct and number exactly the scrutinee's variants.
-            // A duplicate tag would union two partitions onto the same domain
-            // positions (a monotonic-merge violation); a missing tag would leave
-            // that tag's positions in no arm, so the union re-totals to a domain
-            // with gaps. Both are guaranteed by inference's exhaustiveness stamping,
-            // not by any check here.
+            // Two invariants, and note they are now **directional** — which is the
+            // point of keying arms by tag rather than by position.
+            //
+            // No duplicate tag: two arms projecting one tag would union two
+            // partitions onto the same domain positions, a monotonic-merge
+            // violation.
             debug_assert!(
                 {
-                    let mut s = seen_idxs.clone();
-                    s.sort_unstable();
+                    let mut s = seen_tags.clone();
+                    s.sort();
                     s.dedup();
-                    s.len() == seen_idxs.len()
+                    s.len() == seen_tags.len()
                 },
-                "scrutinee-Case has two branches for one tag (duplicate variant_project index)"
+                "scrutinee-Case has two branches for one tag"
             );
-            debug_assert_eq!(
-                seen_idxs.len(),
-                variants.len(),
-                "scrutinee-Case is non-exhaustive: {} branches for {} scrutinee variants",
-                seen_idxs.len(),
-                variants.len()
+            // Exhaustive *over the scrutinee's* tags: every tag the scrutinee can
+            // carry must be handled, or the union re-totals to a domain with gaps.
+            // The converse is deliberately **not** required: arms for tags the
+            // scrutinee cannot carry are dead, project empty, and contribute
+            // nothing — so a `match` written for a wider type than the scrutinee
+            // was inferred to have is fine, and needs no arms pruned away.
+            debug_assert!(
+                variants.iter().all(|(k, _)| seen_tags.contains(k)),
+                "scrutinee-Case is non-exhaustive: scrutinee tags {:?} are not all \
+                 covered by arms {:?}",
+                variants.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                seen_tags
             );
             match arms.len() {
                 0 => unreachable!("a scrutinee-Case has at least one branch"),

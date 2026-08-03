@@ -230,11 +230,11 @@ fn is_internalising_builtin_function(func: &Expr) -> bool {
 /// `FlattenDomain`.
 pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
     match &func.node {
-        TypedExprNode::Builtin(b) => Some(*b),
+        TypedExprNode::Builtin(b) => Some(b.clone()),
         TypedExprNode::Apply {
             function: inner, ..
         } => match &inner.node {
-            TypedExprNode::Builtin(b) => Some(*b),
+            TypedExprNode::Builtin(b) => Some(b.clone()),
             _ => None,
         },
         _ => None,

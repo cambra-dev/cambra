@@ -9,6 +9,8 @@ use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program, ren
 use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile};
 use rstest_log::rstest;
 
+use cambra::ccl::TagMap;
+
 use crate::helpers::*;
 
 #[rstest]
@@ -83,16 +85,13 @@ o"#,
         // Tags map each domain entry to its source variant: index 0 (pre-loop
         // feed of `x = 0`) → variant 0; indices 1-3 (loop1 running sums) →
         // variant 1; indices 4-5 (loop2 running sums) → variant 2.
-        domain: ColumnValue::Union {
-            tags: vec![0, 1, 1, 1, 2, 2],
-            variants: vec![
+        domain: ColumnValue::positional_union(&[0, 1, 1, 1, 2, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1]),
-            ],
-        },
+            ]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 3, 6, 10, 15]))),
-        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+        domain_predicate: Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])),
         deleted: BitSet::new(),
     })]
 // Pre-mutation let `y = x + 1` introduces a non-trivial let that survives
@@ -187,15 +186,12 @@ for i in [1, 2, 3]:
     o << x + 100
 o"#,
     Tile::SealedFunction {
-        domain: ColumnValue::Union {
-            tags: vec![0, 0, 0, 1, 1, 1],
-            variants: vec![
+        domain: ColumnValue::positional_union(&[0, 0, 0, 1, 1, 1], vec![
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
-            ],
-        },
+            ]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6, 101, 103, 106]))),
-        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        domain_predicate: Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])),
         deleted: BitSet::new(),
     }
 )]
@@ -217,16 +213,13 @@ for i in [1, 2, 3]:
     o << x * 10
 o"#,
     Tile::SealedFunction {
-        domain: ColumnValue::Union {
-            tags: vec![0, 1, 1, 1, 2, 2, 2],
-            variants: vec![
+        domain: ColumnValue::positional_union(&[0, 1, 1, 1, 2, 2, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
-            ],
-        },
+            ]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0, 1, 3, 10, 30, 60]))),
-        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+        domain_predicate: Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])),
         deleted: BitSet::new(),
     }
 )]
@@ -378,12 +371,9 @@ for i in [10, 20, 30]:
     o << cnt
 o"#,
     Tile::SealedFunction {
-        domain: ColumnValue::Union {
-            tags: vec![0, 0, 1],
-            variants: vec![ColumnValue::from_uints(vec![1, 2]), ColumnValue::from_uints(vec![0])],
-        },
+        domain: ColumnValue::positional_union(&[0, 0, 1], vec![ColumnValue::from_uints(vec![1, 2]), ColumnValue::from_uints(vec![0])]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 0]))),
-        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        domain_predicate: Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])),
         deleted: BitSet::new(),
     }
 )]
@@ -403,12 +393,9 @@ for i in [0, 1, 2, 3]:
     o << x
 o"#,
     Tile::SealedFunction {
-        domain: ColumnValue::Union {
-            tags: vec![0, 0, 1, 1],
-            variants: vec![ColumnValue::from_uints(vec![0, 1]), ColumnValue::from_uints(vec![2, 3])],
-        },
+        domain: ColumnValue::positional_union(&[0, 0, 1, 1], vec![ColumnValue::from_uints(vec![0, 1]), ColumnValue::from_uints(vec![2, 3])]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 101, 201]))),
-        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        domain_predicate: Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])),
         deleted: BitSet::new(),
     }
 )]

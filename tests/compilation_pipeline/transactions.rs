@@ -28,6 +28,8 @@ use cambra::interpreter::{
 use rstest_log::rstest;
 use smol_str::SmolStr;
 
+use cambra::ccl::TagMap;
+
 use crate::helpers::*;
 use indoc::{formatdoc, indoc};
 
@@ -667,12 +669,15 @@ fn both_arms_feed_in_committing_block() {
         // (x=1 → 0). Same union shape as the read-only both-arms reply, over the
         // committing-block feed indexing (cf. `reply_feed_under_one_route`).
         Tile::SealedFunction {
-            domain: ColumnValue::Union {
-                tags: vec![0, 0, 1],
-                variants: vec![ColumnValue::UInts(vec![2, 3]), ColumnValue::UInts(vec![1])],
-            },
+            domain: ColumnValue::positional_union(
+                &[0, 0, 1],
+                vec![ColumnValue::UInts(vec![2, 3]), ColumnValue::UInts(vec![1])],
+            ),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
-            domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+            domain_predicate: Predicate::Union(TagMap::from_positional(vec![
+                Predicate::True,
+                Predicate::True,
+            ])),
             deleted: BitSet::new(),
         },
     );
@@ -752,12 +757,15 @@ fn conditional_if_else_reply_in_readonly_block() {
             resp
         "#},
         Tile::SealedFunction {
-            domain: ColumnValue::Union {
-                tags: vec![0, 0, 1],
-                variants: vec![ColumnValue::UInts(vec![1, 2]), ColumnValue::UInts(vec![0])],
-            },
+            domain: ColumnValue::positional_union(
+                &[0, 0, 1],
+                vec![ColumnValue::UInts(vec![1, 2]), ColumnValue::UInts(vec![0])],
+            ),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
-            domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+            domain_predicate: Predicate::Union(TagMap::from_positional(vec![
+                Predicate::True,
+                Predicate::True,
+            ])),
             deleted: BitSet::new(),
         },
     );

@@ -2,8 +2,9 @@ use log::trace;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TransactKey, Type,
-        TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
+        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
+        Type, TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate,
+        symbolic::symbolic,
     },
     interpreter::{
         ArithmeticKind,
@@ -433,12 +434,14 @@ impl OpConversionContext {
             // additional dispatch information here; payloads lower to an
             // `Extent::Union`. This covers both the anonymous positional
             // sums that `++`/CollectionUnion produces (all `Index` tags)
-            // and named source-level variants; the tags are stripped at
-            // this boundary.
+            // and named source-level variants. The tags carry through: they are
+            // the arm identities every union column and predicate is keyed by.
             Type::Variant(tags) => {
-                let extents: Result<Vec<_>, _> =
-                    tags.iter().map(|(_, t)| self.extent_of(t)).collect();
-                Ok(Extent::Union(extents?))
+                let mut arms = Vec::with_capacity(tags.len());
+                for (k, t) in tags {
+                    arms.push((k.clone(), self.extent_of(t)?));
+                }
+                Ok(Extent::Union(TagMap::from_arms(arms)))
             }
             // Leaf types — no refinements possible, handle inline.
             Type::Base(b) => Ok(Extent::Base(b.clone())),
@@ -1012,10 +1015,10 @@ fn convert_impl(
                 Builtin::Id => Ok(input),
                 Builtin::MapDomain => Ok(Box::new(MapDomain::new(input))),
                 // `variant_project(i)` consumes the fed scrutinee stream and
-                // narrows it to arm `i`'s tag-restricted sub-domain, yielding
-                // that arm's inner payload column. The union extents come from
-                // the fed input's `Scalar(Union)` tiling — the tag names are
-                // already erased to positions at this boundary (see `VariantWrap`).
+                // narrows it to that tag's restricted sub-domain, yielding the
+                // arm's inner payload column. The union extents come from the fed
+                // input's `Scalar(Union)` tiling, and the arms are keyed by tag all
+                // the way through — nothing is erased to a position here.
                 Builtin::VariantProject(tag) => {
                     // The scrutinee is either a bare `Scalar(Union)` (the
                     // `VariantCtor` shape) or a union *stream* `SealedFunction {
@@ -1034,11 +1037,11 @@ fn convert_impl(
                             input.tiling()
                         )));
                     }
-                    Ok(Box::new(VariantProject::new(input, *tag)))
+                    Ok(Box::new(VariantProject::new(input, tag.clone())))
                 }
-                // `variant_wrap(i)` — the point-free constructor. Consumes the
-                // fed payload stream and injects it at variant position `i`. The
-                // union extents come from the node's codomain (`Pᵢ ⇒ Union`); the
+                // `variant_wrap(c)` — the point-free constructor. Consumes the fed
+                // payload stream and injects it at tag `c`. The union extents come
+                // from the node's codomain (`P_c ⇒ Union`); the
                 // existing `VariantWrap` tile wraps the payload stream element-wise
                 // (preserving its domain), so it composes as `payload ≫ variant_wrap`.
                 Builtin::VariantWrap(tag) => {
@@ -1057,16 +1060,22 @@ fn convert_impl(
                             "variant_wrap({tag}) codomain must be a Variant, got {codomain}"
                         )));
                     };
-                    let variant_extents = variants
-                        .iter()
-                        .map(|(_, t)| ctx.extent_of(t))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(Box::new(VariantWrap::new(input, *tag, variant_extents)))
+                    // Keep the tags: they are the arm identities the constructed
+                    // column is keyed by.
+                    let mut variant_extents = Vec::with_capacity(variants.len());
+                    for (k, t) in variants {
+                        variant_extents.push((k.clone(), ctx.extent_of(t)?));
+                    }
+                    Ok(Box::new(VariantWrap::new(
+                        input,
+                        tag.clone(),
+                        TagMap::from_arms(variant_extents),
+                    )))
                 }
-                b if let Some(op) = builtin_to_binop(*b) => apply_binop(input, op),
-                b if let Some(op) = builtin_to_unaryop(*b) => apply_unaryop(input, op),
+                b if let Some(op) = builtin_to_binop(b.clone()) => apply_binop(input, op),
+                b if let Some(op) = builtin_to_unaryop(b.clone()) => apply_unaryop(input, op),
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
-                b if let Some(kind) = builtin_to_aggregate(*b) => Ok(Box::new(
+                b if let Some(kind) = builtin_to_aggregate(b.clone()) => Ok(Box::new(
                     MapExtractAggregate::new(Box::new(MapAggregate::new(input, kind)), kind),
                 )),
                 _ => Err(ConversionError::Unsupported(format!(
@@ -1142,22 +1151,20 @@ fn convert_impl(
                     expr.ty
                 )));
             };
+            // No arm position to resolve: `VariantWrap` names the tag it injects,
+            // and the column it builds is keyed the same way.
             let tag_key = FieldKey::Name(tag.as_str().into());
-            let idx = variants
-                .iter()
-                .position(|(k, _)| *k == tag_key)
-                .ok_or_else(|| {
-                    ConversionError::TypeError(format!(
-                        "VariantCtor tag `{tag}` not present in its variant type {}",
-                        expr.ty
-                    ))
-                })?;
-            let variant_extents = variants
-                .iter()
-                .map(|(_, t)| ctx.extent_of(t))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut variant_extents = Vec::with_capacity(variants.len());
+            for (k, t) in variants {
+                variant_extents.push((k.clone(), ctx.extent_of(t)?));
+            }
+            let variant_extents = TagMap::from_arms(variant_extents);
             let payload_op = convert_impl(payload, None, ctx)?;
-            Ok(Box::new(VariantWrap::new(payload_op, idx, variant_extents)))
+            Ok(Box::new(VariantWrap::new(
+                payload_op,
+                tag_key,
+                variant_extents,
+            )))
         }
 
         // Data source: produces MapResultWithSource(IterateExtent(domain), source).
@@ -1379,7 +1386,7 @@ fn build_commit_store(
     let value_extent = match value_extents.len() {
         0 => Extent::Base(BaseType::Unit),
         1 => value_extents.pop().expect("len == 1"),
-        _ => Extent::Union(value_extents),
+        _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
     let commit = CommitOperator::with_init_ops(
         init_ops,
@@ -1619,7 +1626,7 @@ fn build_induction_store_single(
     let value_extent = match value_extents.len() {
         0 => Extent::Base(BaseType::Unit),
         1 => value_extents.pop().expect("len == 1"),
-        _ => Extent::Union(value_extents),
+        _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
 
     let store = InductionStore::new(
@@ -1938,7 +1945,7 @@ fn apply_aggregate(
 /// individual primitives.
 fn as_builtin(expr: &Expr) -> Option<Builtin> {
     if let TypedExprNode::Builtin(b) = &expr.node {
-        Some(*b)
+        Some(b.clone())
     } else {
         None
     }
@@ -2167,6 +2174,7 @@ fn convert_flatten_domain(
 mod variant_ctor_tests {
     use super::*;
     use crate::ccl::{BaseType as CclBase, Lit, Type, TypedExpr, TypedExprNode};
+    use crate::interpreter::UnionArm;
     use crate::interpreter::tile_operators::{
         ProducerBase, Tile, TileProducer, impl_producer_base,
     };
@@ -2199,7 +2207,7 @@ mod variant_ctor_tests {
     }
 
     /// A scalar `.Commit(7)` op-converts to a `Scalar(Union)` tile whose single
-    /// row reads back as `Value::Union { tag: 0, inner: Int(7) }`. This exercises
+    /// row reads back as `Value::Union { tag: Name("Commit"), inner: Int(7) }`. This exercises
     /// the net-new `VariantCtor` op-conversion arm end-to-end (construct → read).
     #[test]
     fn variant_ctor_op_conversion_reads_back_union() {
@@ -2223,14 +2231,14 @@ mod variant_ctor_tests {
         assert_eq!(
             cv.index_at(0),
             Value::Union {
-                tag: 0,
+                tag: FieldKey::Name("Commit".into()),
                 inner: Box::new(Value::Int(7)),
             }
         );
     }
 
-    /// The `Abort` arm (a nullary unit payload at tag position 1) reads back as
-    /// `Value::Union { tag: 1, inner: Unit }`.
+    /// The `Abort` arm (a nullary unit payload) reads back as
+    /// `Value::Union { tag: Name("Abort"), inner: Unit }`.
     #[test]
     fn variant_ctor_abort_arm() {
         let payload = typed(TypedExprNode::Lit(Lit::Unit), Type::Base(CclBase::Unit));
@@ -2252,7 +2260,7 @@ mod variant_ctor_tests {
         assert_eq!(
             cv.index_at(0),
             Value::Union {
-                tag: 1,
+                tag: FieldKey::Name("Abort".into()),
                 inner: Box::new(Value::Unit),
             }
         );
@@ -2286,7 +2294,7 @@ mod variant_ctor_tests {
         assert_eq!(
             cv.index_at(0),
             Value::Union {
-                tag: 0,
+                tag: FieldKey::Name("Commit".into()),
                 inner: Box::new(Value::Int(3)),
             }
         );
@@ -2634,7 +2642,13 @@ mod variant_ctor_tests {
             ("time".to_string(), Extent::Base(BaseType::Int)),
             (
                 "decision".to_string(),
-                Extent::Union(vec![Extent::Base(BaseType::Int)]),
+                // Keyed by the tag the `decision_ty` above declares: a named sum's
+                // extent carries its names, and the projection looks `Commit` up by
+                // name.
+                Extent::Union(TagMap::from_arms(vec![(
+                    FieldKey::Name("Commit".into()),
+                    Extent::Base(BaseType::Int),
+                )])),
             ),
         ]));
         let stream_tile = Tile::SealedFunction {
@@ -2643,10 +2657,11 @@ mod variant_ctor_tests {
                 ("time".to_string(), ColumnValue::Ints(vec![10, 20])),
                 (
                     "decision".to_string(),
-                    ColumnValue::Union {
-                        tags: vec![0, 0],
-                        variants: vec![ColumnValue::Ints(vec![1, 2])],
-                    },
+                    // Both rows carry `Commit`, so the arm owns rows 0 and 1.
+                    ColumnValue::Union(TagMap::from_arms(vec![(
+                        FieldKey::Name("Commit".into()),
+                        UnionArm::new(vec![0, 1], ColumnValue::Ints(vec![1, 2])),
+                    )])),
                 ),
             ])))),
             domain_predicate: Predicate::True,
@@ -2798,14 +2813,14 @@ mod variant_ctor_tests {
         assert_eq!(
             cv.index_at(0),
             Value::Union {
-                tag: 0,
+                tag: FieldKey::Name("Commit".into()),
                 inner: Box::new(Value::Int(1)),
             }
         );
         assert_eq!(
             cv.index_at(1),
             Value::Union {
-                tag: 1,
+                tag: FieldKey::Name("Abort".into()),
                 inner: Box::new(Value::Unit),
             }
         );

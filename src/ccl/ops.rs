@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use crate::ccl::AggregateKind;
+use crate::ccl::{AggregateKind, FieldKey};
 
 /// Primitive base types shared between the CCL type system and the interpreter.
 ///
@@ -221,7 +221,7 @@ pub enum UnaryOpKind {
 /// to lambda elimination, so type inference does not need to reason about
 /// them — types are stamped onto the surrounding
 /// [`TypedExpr`](crate::ccl::TypedExpr) at the point each built-in is emitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Builtin {
     // Categorical combinators (introduced by lambda elimination).
     /// `id : A → A` — identity morphism.
@@ -443,7 +443,7 @@ pub enum Builtin {
     /// inside its tuple rather than prepending an `iterate`).
     AsOf,
 
-    /// `variant_project(i) : Union([P₀,…,Pₙ]) ⇒ Pᵢ` — the elimination-side dual
+    /// `variant_project(c) : Union({cᵢ: Pᵢ}) ⇒ P_c` — the elimination-side dual
     /// of [`crate::ccl::TypedExprNode::VariantCtor`]/`VariantWrap`. Projects arm
     /// `i` out of a tagged-union stream, **restricting to the sub-domain of
     /// positions that carry tag `i`** and yielding that arm's inner payload
@@ -466,9 +466,9 @@ pub enum Builtin {
     /// Minted after inference, so it carries no [`crate::ccl::infer::OperatorSchemes`]
     /// scheme: its type `Union ⇒ Pᵢ` is stamped on the node and the post-phase
     /// CHECK-mode `typecheck` trusts it (like [`Self::BeginTxn`]).
-    VariantProject(usize),
+    VariantProject(FieldKey),
 
-    /// `variant_wrap(i) : Pᵢ ⇒ Union([P₀,…,Pₙ])` — the introduction-side dual of
+    /// `variant_wrap(c) : P_c ⇒ Union({cᵢ: Pᵢ})` — the introduction-side dual of
     /// [`Self::VariantProject`]: injects a payload at variant position `i`,
     /// producing a tagged union value. The **point-free** form of
     /// [`crate::ccl::TypedExprNode::VariantCtor`].
@@ -489,7 +489,7 @@ pub enum Builtin {
     /// Minted after inference, so it carries no [`crate::ccl::infer::OperatorSchemes`]
     /// scheme: its type `Pᵢ ⇒ Union` is stamped on the node and the post-phase
     /// CHECK-mode `typecheck` trusts it (like [`Self::BeginTxn`]).
-    VariantWrap(usize),
+    VariantWrap(FieldKey),
 }
 
 impl Builtin {
