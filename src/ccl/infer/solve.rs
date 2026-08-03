@@ -29,7 +29,7 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
-use crate::ccl::{Expr, Level, Name, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{Expr, Level, Name, Pattern, Type, TypedBinding, TypedExprNode};
 
 use super::context::should_generalize;
 use super::{LocatedInferError, map_coalesce_err, map_constrain_err};
@@ -659,6 +659,103 @@ fn with_shadows<R>(
     r
 }
 
+/// Pin the payload of a `Case` arm nothing can reach, so it resolves to *some*
+/// type rather than staying an inference variable.
+///
+/// Width subtyping gives an arm naming a tag the scrutinee cannot carry no lower
+/// bound: nothing determines the payload, and nothing can, so it would reach the
+/// post-inference wall unresolved. The arm is ordinary code rather than an error
+/// (see `src/ccl/design/type-inference.md`, "An unobservable arm payload defaults
+/// to `Unit`"), so a type is chosen here instead.
+///
+/// **Which** type depends on whether the arm's body reads the binder:
+///
+/// - **It does not.** Nothing observes the payload either, so `Unit` — carrying no
+///   information — is the choice.
+/// - **It does.** The read states what it needs of the payload, as a trait
+///   obligation (`v + 1` records `Addable`), and `Unit` would contradict it: the
+///   pin would reject the very read that makes the payload observable. So the
+///   obligations choose, from the types their surviving instances still accept
+///   ([`TraitObligation::accepted_at`]).
+///
+/// A read need not narrow the choice to one — `v + v` leaves every `Addable` row
+/// standing (`Int`, `UInt`, `String`) — and **any of them is as good as any other
+/// here**, because the arm is unreachable: no value ever flows through the binder,
+/// so nothing observes which was picked. So one is taken, by instance-table order,
+/// for reproducibility rather than for meaning. That is a placeholder for saying
+/// what is actually true of such a payload — *for all `T` satisfying the arm's
+/// requirements* — which needs bounded quantification the type language does not
+/// have yet; with it, a dead arm would carry its requirements instead of a
+/// representative satisfying them.
+///
+/// Two things about *how* it is recorded are load-bearing:
+///
+/// - **On the variable, not the slot.** The same variable also occurs in the
+///   scrutinee's expected variant, and so in an enclosing lambda's parameter type.
+///   Writing `Unit` into `binding.ty` alone leaves those occurrences unresolved,
+///   which is the same defect with a smaller footprint.
+/// - **Inside the coalesce walk, before the branches.** A generalized definition's
+///   unconstrained payload is a type *parameter* — its uses instantiate freshened
+///   copies — so pinning it would make every instantiation `Unit` and reject a call
+///   that supplies that tag with a payload. Coalesce never walks such a definition
+///   in place, only its per-use clones, so pinning here reaches exactly the trees
+///   being resolved. And a `Lambda` resolves `param.ty` from its coalesced domain
+///   *after* its body, so the pin still reaches the parameter type — but only if it
+///   precedes the branch walk.
+#[allow(clippy::mutable_key_type)]
+fn pin_unobservable_arm_payload(p: &Pattern) {
+    // Unobservability is *transitive*: the variable's bound list is rarely empty
+    // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
+    // a lower bound — and what matters is whether anything concrete reaches it
+    // through the chain. Resolving is the question being asked, so ask it: a
+    // payload that resolves to a bare variable is one no value and no read
+    // determines.
+    if !matches!(resolve_var_type(&p.binding.ty), Ok(Type::Infer(_))) {
+        return;
+    }
+    let chosen = Type::Base(payload_default(&p.binding.ty));
+    let mut cache = ConstrainCache::new();
+    let pinned = constrain_subtype(&chosen, &p.binding.ty, &mut cache)
+        .and_then(|()| constrain_subtype(&p.binding.ty, &chosen, &mut cache));
+    assert!(
+        pinned.is_ok(),
+        "pinning an unreachable payload variable cannot fail: its only bounds are \
+         the requirements its own body stated, and `{chosen}` is a type they all \
+         still accept (arm `` `{} ``)",
+        p.tag,
+    );
+}
+
+/// The type to pin an unreachable arm's payload to: `Unit` when nothing reads it,
+/// otherwise one the reads' requirements accept. See
+/// [`pin_unobservable_arm_payload`], which is the whole rationale.
+fn payload_default(payload: &Type) -> crate::ccl::BaseType {
+    use crate::ccl::BaseType;
+
+    let Type::Infer(v) = payload else {
+        return BaseType::Unit;
+    };
+    let watches = v.watches.borrow();
+    let Some(((first, pos), rest)) = watches.split_first() else {
+        return BaseType::Unit;
+    };
+    // Every requirement on the payload has to hold at once, so the choices are the
+    // *intersection* of what each still accepts. No test separates this from taking
+    // the first watch's own list, because every trait table today begins with `Int`
+    // — but the pin must not choose a type some requirement rejects, and that is a
+    // property of the tables rather than of this code.
+    let mut candidates = first.accepted_at(*pos);
+    for (obligation, pos) in rest {
+        let also = obligation.accepted_at(*pos);
+        candidates.retain(|c| also.contains(c));
+    }
+    // An empty intersection means the body's own requirements cannot be met
+    // together, which is a real type error in the arm — one this function has no
+    // business reporting. Leave `Unit` to fail the pin's assertion rather than
+    // inventing a type that hides it.
+    candidates.first().cloned().unwrap_or(BaseType::Unit)
+}
+
 pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
@@ -778,6 +875,36 @@ pub(super) fn check_scope_valid(
 /// `Type`, via the compact → simplify → coalesce pipeline.
 pub(super) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     coalesce_compact(&simplify_type(compact_type(ty)))
+}
+
+/// Resolve a **binder slot** — a type the bottom-up `expr.ty` walk does not
+/// reach (a `let`/`letrec`/mutable-variable binder, a `Case` pattern payload, a
+/// `for` target).
+///
+/// Resolving such a slot is two jobs, not one, and doing only the first is a
+/// silent defect. [`resolve_var_type`] settles the type's *structure*; the
+/// refinement predicates riding it are expression trees hanging off type slots,
+/// with their own inference variables, and they are resolved by
+/// [`coalesce_type_predicates`] — which is what `coalesce_node` runs for every
+/// `expr.ty`. A slot that skips it keeps the pre-coalesce predicate `Rc`: the
+/// memo redirects only the occurrences it visits, so the stale copy survives
+/// with unresolved variables in a program where nothing else rebuilds the
+/// binder (a *value* binding — one that is not generalized, so no
+/// [`specialize_use`] re-coalesce reaches it).
+fn resolve_binder_slot(
+    slot: &mut Type,
+    label: impl FnOnce() -> String,
+    level: Level,
+    ctx: &mut CoalesceCtx,
+) {
+    match resolve_var_type(slot) {
+        Ok(ty) => *slot = ty,
+        Err(err) => {
+            let label = label();
+            ctx.push_error(map_coalesce_err(err, &label), label);
+        }
+    }
+    coalesce_type_predicates(slot, level, ctx);
 }
 
 /// Coalesce every node's `expr.ty` in place, resolving its inference variables
@@ -947,13 +1074,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // and disagree for the annotated ones — a deref-copy binds at the
             // value type where the RHS is a handle, and a mutable variable introduction
             // binds at the handle where the RHS is a value.
-            match resolve_var_type(&binding.ty) {
-                Ok(ty) => binding.ty = ty,
-                Err(err) => {
-                    let label = format!("let binding `{}`", binding.name);
-                    ctx.push_error(map_coalesce_err(err, &label), label);
-                }
-            }
+            let name = binding.name.clone();
+            resolve_binder_slot(
+                &mut binding.ty,
+                || format!("let binding `{name}`"),
+                level,
+                ctx,
+            );
             let binding_name = binding.name.clone();
             with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
         }
@@ -967,13 +1094,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             body,
         } => {
             coalesce_node(init, level + 1, ctx);
-            match resolve_var_type(&binding.ty) {
-                Ok(ty) => binding.ty = ty,
-                Err(err) => {
-                    let label = format!("mutable `{}`", binding.name);
-                    ctx.push_error(map_coalesce_err(err, &label), label);
-                }
-            }
+            let name = binding.name.clone();
+            resolve_binder_slot(&mut binding.ty, || format!("mutable `{name}`"), level, ctx);
             let binding_name = binding.name.clone();
             with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
         }
@@ -1065,6 +1187,15 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             if let Some(s) = scrutinee {
                 coalesce_node(s, level, ctx);
             }
+            // Before any occurrence of an arm's payload variable is read: an arm
+            // nothing reaches and whose body ignores its binder has no bound at
+            // all, and needs one recorded on the *variable* to resolve
+            // consistently everywhere it appears.
+            for b in branches.iter() {
+                if let Some(p) = &b.pattern {
+                    pin_unobservable_arm_payload(p);
+                }
+            }
             for b in branches.iter_mut() {
                 // A pattern's payload binding scopes the branch's guard and
                 // body, shadowing an outer generalized binding of its name.
@@ -1078,13 +1209,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // `Pattern::binding.ty`; run it through the same pipeline used
                 // for `expr.ty` so it ends up concrete.
                 if let Some(p) = &mut b.pattern {
-                    match resolve_var_type(&p.binding.ty) {
-                        Ok(ty) => p.binding.ty = ty,
-                        Err(err) => {
-                            let label = format!("Case pattern `.{}` payload", p.tag);
-                            ctx.push_error(map_coalesce_err(err, &label), label);
-                        }
-                    }
+                    let tag = p.tag.clone();
+                    resolve_binder_slot(
+                        &mut p.binding.ty,
+                        || format!("Case pattern `.{tag}` payload"),
+                        level,
+                        ctx,
+                    );
                 }
             }
         }
@@ -1115,13 +1246,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             with_shadows(ctx, [target_name], |ctx| coalesce_node(body, level, ctx));
             // Binder slot: resolve the target's element type in place, like
             // `Loop` params (`emit_for` wrote the slot var).
-            match resolve_var_type(&target.ty) {
-                Ok(ty) => target.ty = ty,
-                Err(err) => {
-                    let label = "For target".to_string();
-                    ctx.push_error(map_coalesce_err(err, &label), label);
-                }
-            }
+            resolve_binder_slot(&mut target.ty, || "For target".to_string(), level, ctx);
         }
         // `Transact` is born by `planning::plan_loops`, after inference (and
         // so after coalesce), so a `Transact` never reaches here.
@@ -1145,13 +1270,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // Binder slots: resolve each declared type in place (`emit_letrec`
             // normalized the slot, possibly to a fresh var for a `Hole`).
             for (binding, _) in bindings.iter_mut() {
-                match resolve_var_type(&binding.ty) {
-                    Ok(ty) => binding.ty = ty,
-                    Err(err) => {
-                        let label = format!("LetRec binding `{}`", binding.name);
-                        ctx.push_error(map_coalesce_err(err, &label), label);
-                    }
-                }
+                let name = binding.name.clone();
+                resolve_binder_slot(
+                    &mut binding.ty,
+                    || format!("LetRec binding `{name}`"),
+                    level,
+                    ctx,
+                );
             }
         }
 
