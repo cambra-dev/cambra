@@ -572,16 +572,74 @@ impl TileProducer for ScalarFanInProducer {
         Tile::Record(fields)
     }
 
-    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
-        // Nothing to do
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if obsolete_guard.is_universal() {
+            self.inputs
+                .iter_mut()
+                .for_each(|i| i.release(i.tiling().universal_guard()));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+    use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
     use crate::interpreter::{BaseType, ColumnValue, Extent};
+
+    /// A `ScalarFanIn` re-reads every operand on every pull, so it can only pass a
+    /// release on once there will be no next pull — which is exactly what a
+    /// universal release from its consumer says. Swallowing it strands every
+    /// producer beneath a binop operand or record field, and because [`FanOut`]
+    /// forwards the *intersection* of its branches' guards, one branch that never
+    /// releases blocks reclamation for all of them.
+    #[test]
+    fn scalar_fan_in_forwards_a_universal_release_to_every_operand() {
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let mut logs = Vec::new();
+        let mut inputs: Vec<Box<dyn TileProducer>> = Vec::new();
+        for _ in 0..2 {
+            let (spy, log) =
+                ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
+            logs.push(log);
+            inputs.push(Box::new(spy));
+        }
+        let out_tiling = Tiling::Record((0..2).map(|i| (tuple_field(i), tiling.clone())).collect());
+        let mut producer = ScalarFanInProducer {
+            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &out_tiling),
+            names: (0..2).map(tuple_field).collect(),
+            inputs,
+        };
+
+        producer.release(out_tiling.universal_guard());
+        for (i, log) in logs.iter().enumerate() {
+            let seen = log.borrow();
+            assert!(
+                seen.iter().any(|g| g.is_universal()),
+                "operand {i} should have been released universally, saw {seen:?}"
+            );
+        }
+    }
+
+    /// Nothing narrower travels: a scalar has no sub-region, so a partial guard
+    /// names no operand positions to free — and the operands are still being read.
+    #[test]
+    fn scalar_fan_in_does_not_forward_a_narrower_release() {
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let (spy, log) = ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
+        let out_tiling = Tiling::Record([(tuple_field(0), tiling.clone())].into_iter().collect());
+        let mut producer = ScalarFanInProducer {
+            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &out_tiling),
+            names: vec![tuple_field(0)],
+            inputs: vec![Box::new(spy)],
+        };
+
+        producer.release(out_tiling.empty_guard());
+        assert!(
+            log.borrow().is_empty(),
+            "an empty release names nothing to free, so nothing is forwarded"
+        );
+    }
 
     // ── FanInProducer: asymmetric per-branch presence ────────────────────────
     //

@@ -456,6 +456,7 @@ impl TileOperator for Memo {
             base: ProducerBase::new(MemoProducer::alloc_id(), &self.tiling),
             input: self.input.subscribe(intent_guard, consumer, scheduler),
             cached_tile: self.tiling().empty_tile(),
+            upstream_drained: false,
         })
     }
 
@@ -468,6 +469,17 @@ struct MemoProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     cached_tile: Tile,
+    /// Set once this producer has released its input **universally**, which it
+    /// does as soon as the input hands over a complete tile.
+    ///
+    /// A universal release is a promise never to request those positions again,
+    /// so pulling the input afterwards contradicts it — and a pull that reaches an
+    /// upstream which has not gone quiet gets the *same* data a second time. The
+    /// cache then `merge`s it, and for a `Tile::Scalar` (whose positions are
+    /// implicit, so "this position again" is indistinguishable from "one more
+    /// position") merge appends: one value becomes two, silently. Keeping the
+    /// promise is what makes the cache the single source of the drained value.
+    upstream_drained: bool,
 }
 
 impl TileProducer for MemoProducer {
@@ -478,11 +490,17 @@ impl TileProducer for MemoProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        // Everything the input will ever produce is already cached (see
+        // `upstream_drained`); serve it rather than re-requesting released data.
+        if self.upstream_drained {
+            return self.cached_tile.clone();
+        }
         let mut input = self.input.get(projection_guard);
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
         input.compact();
         trace!("{} releasing {upstream_obsolete:?}", self.name());
+        self.upstream_drained = upstream_obsolete.is_universal();
         self.input.release(upstream_obsolete);
         trace!(
             "{} merging {input:?} into {:?}",
@@ -503,5 +521,45 @@ impl TileProducer for MemoProducer {
         // data that was never produced.
         self.input.release(obsolete_guard.clone());
         trace!("{} now has cached {:?}", self.name(), self.cached_tile);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+    use crate::interpreter::{BaseType, ColumnValue, Extent};
+
+    /// A `Memo` releases its input universally as soon as the input hands over a
+    /// complete tile, and must not pull it again afterwards — a universal release
+    /// is a promise never to re-request those positions.
+    ///
+    /// The upstream here re-emits its tile on every `get` and ignores releases,
+    /// which is what a recomputing scalar operator does when nothing beneath it has
+    /// gone quiet. Without the promise kept, the second pull merges the same value
+    /// into the cache again; because a `Tile::Scalar`'s positions are implicit,
+    /// `merge` cannot tell "this position again" from "one more position" and
+    /// appends, so one value silently becomes two and then three. Any consumer that
+    /// broadcasts the result then fails on a scalar that is no longer single.
+    #[test]
+    fn memo_does_not_re_request_a_drained_input() {
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let upstream =
+            TestTileProducer::new(Tile::Scalar(ColumnValue::Ints(vec![-5])), tiling.clone());
+        let mut memo = MemoProducer {
+            base: ProducerBase::new(MemoProducer::alloc_id(), &tiling),
+            input: Box::new(upstream),
+            cached_tile: tiling.empty_tile(),
+            upstream_drained: false,
+        };
+
+        for pull in 1..=3 {
+            let tile = memo.get(tiling.universal_guard());
+            assert_eq!(
+                tile,
+                Tile::Scalar(ColumnValue::Ints(vec![-5])),
+                "pull {pull}: the cache holds the one drained value, not one copy per pull"
+            );
+        }
     }
 }

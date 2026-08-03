@@ -221,6 +221,24 @@ pub trait TileProducer {
 
     /// Fetch the current tile value.  Contains generic logic for all producers
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
+        // A universal release is a promise never to request those positions
+        // again, so a pull afterwards breaks it — and breaks it *silently*: the
+        // upstream is entitled to have thrown the data away, and the ones that
+        // have not simply answer again, so the caller sees a plausible tile
+        // either way. What it sees is wrong in two different directions. An
+        // upstream that went quiet (`Constant`, `ExtractLast`) answers empty, and
+        // the puller maps over nothing; one that recomputes answers with the same
+        // data, which a caching consumer then merges in a second time — and a
+        // `Tile::Scalar`'s positions are implicit, so merge cannot tell "this
+        // position again" from "one more position" and appends. One value becomes
+        // two. Neither shows up where it was caused, which is why this is checked
+        // centrally rather than left to each operator.
+        debug_assert!(
+            !self.obsolete_guard().is_universal(),
+            "{} was pulled after releasing its output universally: a universal \
+             release promises never to request those positions again",
+            self.name(),
+        );
         let result = self.get_impl(projection_guard);
         trace!(
             "{} produced {:?} for tiling {}",
@@ -337,6 +355,47 @@ pub(crate) mod test_helpers {
                 base: ProducerBase::new(Self::alloc_id(), &tiling),
                 tile,
             }
+        }
+    }
+
+    /// A [`TileProducer`] that answers with a fixed tile and records every release
+    /// guard it is handed, for asserting that a release *propagates*.
+    pub(crate) struct ReleaseSpy {
+        pub(crate) base: ProducerBase,
+        pub(crate) tile: Tile,
+        pub(crate) released: std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>,
+    }
+
+    impl ReleaseSpy {
+        pub(crate) fn new(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>) {
+            let released = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            (
+                Self {
+                    base: ProducerBase::new(Self::alloc_id(), &tiling),
+                    tile,
+                    released: released.clone(),
+                },
+                released,
+            )
+        }
+    }
+
+    impl TileProducer for ReleaseSpy {
+        impl_producer_base!();
+
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.tile.clone()
+        }
+
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.released.borrow_mut().push(obsolete_guard);
         }
     }
 

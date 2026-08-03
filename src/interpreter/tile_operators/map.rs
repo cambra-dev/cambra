@@ -351,8 +351,11 @@ impl TileProducer for MapResultProducer {
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // TODO once we have guards that express codomain predicates, handle them here
+        // A guard is shaped by the tiling it is handed to, so the input's is built
+        // from the input's tiling — never from the function's, whose tiling is
+        // unrelated (a function tiling, against the input's stream).
         let upstream_guard = match obsolete_guard {
-            g if g.is_empty() => self.function.tiling().empty_guard(),
+            g if g.is_empty() => self.input.tiling().empty_guard(),
             g if g.is_universal() => self.input.tiling().universal_guard(),
             TileGuard::Function(FunctionGuard::Domain(p)) => {
                 TileGuard::Function(FunctionGuard::Domain(p))
@@ -362,7 +365,18 @@ impl TileProducer for MapResultProducer {
             }
             g => todo!("Unimplemented guard in MapResultProducer: {g:?}"),
         };
+        let done = upstream_guard.is_universal();
         self.input.release(upstream_guard);
+        // The **function** is re-read on every pull, so it can only be released
+        // once there will be no next pull — which is what a universal release from
+        // the consumer says. Releasing it on a narrower guard would leave the next
+        // pull mapping over an emptied function; never releasing it strands whatever
+        // produces it, and a function operand is not always a small `Constant` (a
+        // UDF's materialized table lives here too).
+        if done {
+            self.function
+                .release(self.function.tiling().universal_guard());
+        }
     }
 }
 
@@ -728,8 +742,77 @@ impl TileProducer for MapResultWithSourceProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
-    use crate::interpreter::{ColumnValue, Extent, Value};
+    use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
+    use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
+
+    /// Build a `MapResultProducer` whose `function` operand records its releases.
+    fn map_result_with_function_spy() -> (MapResultProducer, Rc<RefCell<Vec<TileGuard>>>, Tiling) {
+        let in_tiling = Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        let fn_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+        let (fn_spy, released) = ReleaseSpy::new(
+            Tile::CurriedFunction {
+                domain1: ColumnValue::UInts(vec![0]),
+                offsets: ColumnValue::UInts(vec![0]),
+                domain2: ColumnValue::UInts(vec![1]),
+                codomain: ColumnValue::UInts(vec![1]),
+                domain_predicate: Predicate::True,
+                deleted: BitSet::new(),
+            },
+            fn_tiling,
+        );
+        let input = TestTileProducer::new(
+            Tile::SealedFunction {
+                domain: ColumnValue::from_uints(vec![0]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                domain_predicate: Predicate::True,
+                deleted: BitSet::new(),
+            },
+            in_tiling.clone(),
+        );
+        let producer = MapResultProducer {
+            base: ProducerBase::new(MapResultProducer::alloc_id(), &in_tiling),
+            input: Box::new(input),
+            function: Box::new(fn_spy),
+        };
+        (producer, released, in_tiling)
+    }
+
+    /// The function operand is re-read on **every** pull, so it can only be
+    /// released once there will be no next pull — which is what a universal release
+    /// from the consumer says. Never releasing it strands whatever produces it, and
+    /// a function operand is not always a small `Constant`.
+    #[test]
+    fn map_result_releases_its_function_when_the_consumer_is_done() {
+        let (mut producer, released, tiling) = map_result_with_function_spy();
+        producer.release(tiling.universal_guard());
+        assert!(
+            released.borrow().iter().any(|g| g.is_universal()),
+            "a universal release means no further pull, so the function is free: {:?}",
+            released.borrow()
+        );
+    }
+
+    /// A narrower release must *not* reach the function: the next pull still needs
+    /// it, and an emptied function would leave that pull mapping over nothing.
+    #[test]
+    fn map_result_keeps_its_function_for_a_narrower_release() {
+        let (mut producer, released, _) = map_result_with_function_spy();
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(0)),
+        )));
+        assert!(
+            released.borrow().is_empty(),
+            "the function is still being read: {:?}",
+            released.borrow()
+        );
+    }
 
     #[test]
     fn map_result_producer_curried_function() {
