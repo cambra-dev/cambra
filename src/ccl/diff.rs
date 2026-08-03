@@ -1337,7 +1337,7 @@ fn collect_deleted_roots<'a>(
 mod tests {
     use super::*;
     use crate::ccl::content_hash::content_hash;
-    use crate::ccl::{ArithmeticKind, BinOpKind, Lit, Type, TypedExpr, TypedExprNode};
+    use crate::ccl::{ArithmeticKind, BinOpKind, Lit, TypedExpr, TypedExprNode};
 
     fn var(name: &str) -> TypedExpr {
         TypedExpr::var(name)
@@ -1552,15 +1552,13 @@ mod tests {
 
     #[test]
     fn record_field_reorder_is_not_a_move() {
-        let rec = |fields: Vec<(&str, TypedExpr)>| TypedExpr {
-            ty: Type::Hole,
-            node: TypedExprNode::Record(
+        let rec = |fields: Vec<(&str, TypedExpr)>| {
+            TypedExpr::new(TypedExprNode::Record(
                 fields
                     .into_iter()
                     .map(|(n, e)| (n.to_string(), e))
                     .collect(),
-            ),
-            user_annotation: None,
+            ))
         };
         // Records are order-insensitive, so a field swap is a no-op to the diff
         // — on the content axis *and* the placement axis.

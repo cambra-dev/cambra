@@ -611,16 +611,14 @@ mod tests {
 
     #[test]
     fn records_are_order_insensitive_tuples_are_not() {
-        let rec_ab = TypedExpr {
-            ty: Type::Hole,
-            node: TypedExprNode::Record(vec![("a".into(), int(1)), ("b".into(), int(2))]),
-            user_annotation: None,
-        };
-        let rec_ba = TypedExpr {
-            ty: Type::Hole,
-            node: TypedExprNode::Record(vec![("b".into(), int(2)), ("a".into(), int(1))]),
-            user_annotation: None,
-        };
+        let rec_ab = TypedExpr::new(TypedExprNode::Record(vec![
+            ("a".into(), int(1)),
+            ("b".into(), int(2)),
+        ]));
+        let rec_ba = TypedExpr::new(TypedExprNode::Record(vec![
+            ("b".into(), int(2)),
+            ("a".into(), int(1)),
+        ]));
         assert_eq!(h(&rec_ab), h(&rec_ba));
 
         let tup_12 = TypedExpr::tuple(vec![int(1), int(2)]);
@@ -647,11 +645,7 @@ mod tests {
     /// A `Var(x)` node carrying type `ty` — for exercising type-awareness with
     /// the term structure held fixed.
     fn typed(ty: Type) -> TypedExpr {
-        TypedExpr {
-            ty,
-            node: TypedExprNode::Var("x".into()),
-            user_annotation: None,
-        }
+        TypedExpr::new(TypedExprNode::Var("x".into())).with_ty(ty)
     }
 
     #[test]
@@ -732,10 +726,12 @@ mod tests {
 
     #[test]
     fn user_annotation_participates_in_the_hash() {
-        let annotated = |ann: Option<Type>| TypedExpr {
-            ty: Type::Hole,
-            node: TypedExprNode::Var("x".into()),
-            user_annotation: ann,
+        let annotated = |ann: Option<Type>| {
+            let e = TypedExpr::new(TypedExprNode::Var("x".into()));
+            match ann {
+                Some(ty) => e.with_user_annotation(ty),
+                None => e,
+            }
         };
         assert_ne!(
             h(&annotated(Some(Type::Base(BaseType::Int)))),
