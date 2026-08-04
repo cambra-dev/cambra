@@ -185,6 +185,16 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             type_a: Box::new(coalesce_for_error(&lhs)),
             type_b: Box::new(coalesce_for_error(&rhs)),
         },
+        ConstrainError::DataDomainMismatch { lhs, rhs } => InferError::TypeMismatch {
+            ctx: format!(
+                "collection domain conflict at {ctx_label} (a collection's domain is \
+                 its data, so a join may not narrow it — two collections over distinct \
+                 domains have no common data-function type, and their lossless join is \
+                 a dependent sum over the candidate domains)"
+            ),
+            type_a: Box::new(coalesce_for_error(&lhs)),
+            type_b: Box::new(coalesce_for_error(&rhs)),
+        },
     }
 }
 

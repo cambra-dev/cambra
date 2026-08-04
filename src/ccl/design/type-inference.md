@@ -575,16 +575,17 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ## 4.6 Data vs compute functions
 
-> **Status: implemented.** The `FunKind` marker, kind inference, and kind-aware
-> subtyping (the `Compute <: Data` rejection) are all live, as is the rejection of
-> a data join that would narrow a domain. Data-domain invariance holds for the
-> base and is unenforced for a domain *refinement* — see the callout below.
+> **Status: implemented, minus Σ.** The `FunKind` marker, kind inference,
+> kind-aware subtyping (the `Compute <: Data` rejection) and the invariant data
+> domain are all live. What is missing is the type the model says a domain join
+> *produces* — the Σ — so a join over distinct domains is diagnosed rather than
+> typed. See the callout below.
 
 The unresolved domain-join corner of §4.5 (O1/O4 — two collections meeting at one
 join point) is resolved by making a missing distinction explicit. The distinction
 does not by itself make every such join *typeable*; what it does is make the
 untypeable ones an **error** rather than a silently short collection. See
-[The domain-join rejection](#the-domain-join-rejection).
+[The domain join is a Σ](#the-domain-join-is-a-σ).
 
 **The distinction.** A function's domain can mean two things. A **compute
 function** `α ⇒ β` treats it as a *capability* — the inputs accepted; no data
@@ -644,34 +645,47 @@ sets `kind` explicitly.
 > a kind-aware re-check would false-reject. `sum([x for x in xs])`,
 > comprehensions, and `groupby` type fine because they are stamped concrete
 > `Data` at construction (the provenance annotation / `refined_data_fun` cast
-> target). One guard is only half in force — see
+> target). The same arm carries the data-domain invariance guard — see
 > [Data domains are invariant](#data-domains-are-invariant) below.
 
-### The domain-join rejection
+### The domain join is a Σ
 
 A join of two data functions is **not** the contravariant meet of their domains. The
 domain of a collection *is* its data, so meeting `[0,1] ⤇ Int` with `[0,2] ⤇ Int`
 down to `[0,1] ⤇ Int` silently discards the third row — a wrong answer with nothing
-in the type recording that it happened. The join is therefore defined only where
-narrowing is a no-op: where the two arms turn out to hold the **same** domain, the
-join is that collection (`[1,2] if c else [3,4]` is `[0,1] ⤇ Int`, and so is
-`xs if c else xs`). Where the domains differ, the join is **rejected**
-(`CoalesceError::DomainJoinConflict`).
+in the type recording that it happened.
 
-This is the whole payoff of tracking the kind. Without it, both arrows are just
-functions and the compute lattice's meet applies — which is correct for
-capabilities and destroys rows for collections. With it, the two cases are distinct
-and the collection case can refuse.
+Nor is the join undefined. It is the dependent sum `Σ (𝑤 ∈ {𝐷ᵢ}). 𝑤 ⤇ 𝑉` over the
+candidate domains, whose witness `𝑤` is the runtime branch discriminant and which is
+eliminated by distributing the consumer over it. **That Σ is the least upper bound**
+— data functions over distinct domains are incomparable, and their join is a
+different element of the lattice rather than one of them. So the lattice is
+*incomplete* without Σ, and the three rules here are one model:
 
-The lossless answer exists and is not this: it is the dependent sum
-`Σ (𝑤 ∈ {𝐷ᵢ}). 𝑤 ⤇ V` over the arms' candidate domains, whose witness `𝑤` is the
-runtime branch discriminant, eliminated by distributing the consumer over it. That
-is the collections work — a type-level construct with formation, subtyping and
-elimination rules of its own, plus the value-`Case` fan-out that compiles the
-elimination. Until it lands the rejection is the contract, and the reason a
-rejection is an acceptable interim state (rather than a gap that has to be closed
-first) is that it is *loud*: the alternative to a Σ is a diagnosed error, not a
-silent miscompile. Pinned end-to-end by `conditional_collection_rejected_cleanly`.
+- **Subtyping** relates two data functions when their domains are the same domain
+  ([Data domains are invariant](#data-domains-are-invariant)).
+- **Joining** two whose domains differ yields the Σ.
+- Where the Σ collapses — the candidates turn out to be one domain — the join is
+  that plain data function (`[1,2] if c else [3,4]` is `[0,1] ⤇ Int`, and so is
+  `xs if c else xs`).
+
+Σ is not yet representable, so the middle rule currently has no answer to produce
+and **diagnoses** instead. That is an acceptable interim state only because it is
+*loud*: the alternative to a Σ is an error, not a silent miscompile. Pinned
+end-to-end by `conditional_collection_rejected_cleanly`.
+
+Tracking the kind is what makes the three rules statable at all. Without it both
+arrows are just functions, the compute lattice's meet applies, and the join silently
+narrows — correct for capabilities, row-destroying for collections.
+
+**The same fact surfaces at two phases**, because a join can be forced at either.
+When a consumer imposes a concrete demand on the joined value, the domains meet at a
+`Fun`/`Fun` edge and the invariant domain rule reports it there
+(`ConstrainError::DataDomainMismatch`). When nothing forces it — the joined
+collection *is* the program's value, or is only let-bound — the candidates ride to
+coalesce as alternatives and are reported there
+(`CoalesceError::DomainJoinConflict`). Both are "the join is a Σ"; neither path is
+redundant, and Σ has to satisfy both.
 
 **Mechanics.** The decision is split across two phases, and the split is forced. At
 the compact merge, a positive `Data ⊔ Data` accumulates its domain **alternatives**
@@ -744,19 +758,17 @@ the tagged variant is the substitute.
 The `Fun`/`Fun` domain edge is contravariant, which is right for a *compute*
 function: the domain is a parameter, nothing in the language can ask a capability
 which inputs it accepts, and shrinking the accepted set only under-promises. A
-**data** function's domain is invariant instead — and that is not a second
-principle standing beside [the domain-join rejection](#the-domain-join-rejection),
-it is the same rule read at the other site.
+**data** function's domain is invariant instead — the subtyping half of the same
+model [The domain join is a Σ](#the-domain-join-is-a-σ) states.
 
-**One lattice.** A join *is* the least upper bound of the subtype order, so the two
-cannot disagree. Suppose the contravariant edge applied to data functions, making a
-wider collection a subtype of a narrower one — `[0,10] ⤇ 𝑉 <: [0,5] ⤇ 𝑉`, which is
-`[0,5] <: [0,10]` at the domain. Then the least upper bound of the arms of
-`[1,2] if c else [1,2,3]` is `[0,1] ⤇ Int`, and `sum` of it returns `3` even when
-the else-arm ran, with nothing in the type recording that a row was dropped. That is
-precisely the miscompile `DomainJoinConflict` exists to prevent. Contravariant data
-domains and the domain-join rejection are one choice made twice in opposite
-directions; whichever is adopted, the other has to go.
+**One lattice.** Subtyping and joining are the same order, so they cannot disagree.
+Suppose the contravariant edge applied to data functions, making a wider collection
+a subtype of a narrower one — `[0,10] ⤇ 𝑉 <: [0,5] ⤇ 𝑉`, which is `[0,5] <: [0,10]`
+at the domain. Then the least upper bound of the arms of `[1,2] if c else [1,2,3]`
+is `[0,1] ⤇ Int`, and `sum` of it returns `3` even when the else-arm ran, with
+nothing in the type recording that a row was dropped. Under invariance the two
+collections are instead incomparable and their least upper bound is the Σ — which
+loses nothing, and is why the two halves fit together rather than trading off.
 
 **Why the stand-in is not free.** The contravariant reading is tempting because it
 looks like record width subtyping, which *is* sound: `{a: Int, b: Int} <: {a: Int}`
@@ -800,19 +812,38 @@ So the rule is stable under a surface data domain. What the syntax changes is th
 the explicit forms invariance requires become *writable*, which argues for the rule
 rather than against it.
 
-**What is enforced, and the hole.** The *base* half is in force, structurally rather
-than by a kind-aware guard: [`Type::UIntRange`] relates only by equality, so a wider
-or a narrower range domain is rejected under either kind, in both directions. The
-*refinement* half is *not* enforced. Because the domain is contravariant, the
-ordinary drop-only refinement lattice (`{𝐷 | 𝑝} <: 𝐷`) inverts behind the arrow: of
-the two edges over one base, the surviving one is **acquisition** — `𝐷 ⤇ 𝑉 <:
-{𝐷 | 𝑝} ⤇ 𝑉`, an unfiltered collection standing where a filtered domain is declared
-— while *dropping* a domain refinement does not hold at all. Both change which rows
-the consumer reads, so by the rule above neither should hold; the guard that would
-reject acquisition is missing.
-`data_domain_refinement_relates_only_by_acquisition` pins all three facts together —
-both refinement edges and the base equality — so what is absent is a recorded fact
-rather than an assumption.
+**How it is enforced: both edges, unconditionally.** When both kinds are concretely
+`Data`, the `Fun`/`Fun` arm constrains the domains in *both* directions rather than
+contravariantly. That is the only order-independent spelling available: any rule
+conditioned on what a domain looks like *at the moment the edge fires* — is it still
+a variable, does it carry a refinement yet — makes typing depend on constraint
+emission order, so two programs differing only in traversal order could type
+differently. Invariance is a property of two types, not of when they are compared.
+
+Both directions is also all it takes. `[`Type::UIntRange`]` relating only by equality
+already rejects both base directions, and refinement **drop** (`{𝐷 | 𝑝} ⤇ 𝑉 <:
+𝐷 ⤇ 𝑉`) is already rejected one step less obviously, since behind a contravariant
+domain it demands `𝐷 <: {𝐷 | 𝑝}`. What the reverse edge adds is the case that
+inversion left admitted — refinement **acquisition**, `𝐷 ⤇ 𝑉 <: {𝐷 | 𝑝} ⤇ 𝑉`, an
+unfiltered collection standing where a filtered domain is declared. A failure in
+either direction is reported as `ConstrainError::DataDomainMismatch`, naming the two
+domains; `a_data_domain_relates_only_to_itself` pins all four directions plus the
+reflexive case, and the compute counterpart that still relates contravariantly.
+
+**Emitting both directions does not preempt a join.** Two domains meeting at one
+variable is a join like any other, so what a domain variable joining `[0,1]` and
+`[0,2]` *should* become is the same Σ that the arms of a `Case` become — Σ is the
+join wherever it arises, not a `Case`-specific construct, and a domain position is
+not privileged. Until Σ is representable that join has no answer at either site,
+which is why the same program can be diagnosed from the edge or from coalesce
+depending on whether a consumer forces the question early (see
+[The domain join is a Σ](#the-domain-join-is-a-σ)). The consequence for the Σ work is
+that candidate domains must be expected at a domain variable, not only at a `Case`
+result.
+
+Like the `Compute <: Data` rejection, the rule fires only when the cache is
+kind-aware, because elimination preserves denotation but not kind representation and
+the post-inference re-check must not see it.
 
 ### Deliberately incomplete here
 
@@ -824,7 +855,7 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
   (`sum([1,2] if c else [1,2,3])` is unambiguously `3` or `6`). What makes this an
   acceptable interim state is only that it is diagnosed rather than miscompiled; it
   is not a semantic position. The dependent sum described in
-  [The domain-join rejection](#the-domain-join-rejection) is the answer, and it
+  [The domain join is a Σ](#the-domain-join-is-a-σ) is the answer, and it
   arrives with the collections work.
 
 - **`KindMerge::Conflict` is covered only by hand-constructed compact graphs.** Both
@@ -840,13 +871,13 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
   source-level route is found, it belongs in the suite; if one provably does not
   exist, the branch should collapse into the constraint-level check.
 
-- **The refinement half of data-domain invariance is not enforced.** Base domains
-  are invariant structurally — [`Type::UIntRange`] relates only by equality — but the
-  contravariant domain edge still admits *acquisition*: an unfiltered collection
-  standing where a filtered domain is declared. The guard cannot live on that edge —
-  the demanded domain is often an unresolved variable there — so it belongs at
-  coalesce, on the materialized domain alternatives, and it is not written. See
-  [Data domains are invariant](#data-domains-are-invariant) above.
+- **Σ is the missing type, and it is missing at two sites.** Because a domain join
+  can be forced from a `Fun`/`Fun` edge as well as at coalesce, the Σ work has to
+  answer both: candidate domains arrive at a **domain variable**, not only at a
+  `Case` result. `DataDomainMismatch` and `DomainJoinConflict` are the two faces of
+  the same unrepresentable join, and both are live from source
+  (`sum([1,2] if c else [1,2,3])` reaches the first; the same conditional as the
+  program's own value reaches the second).
 
 ---
 

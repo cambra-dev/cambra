@@ -90,6 +90,21 @@ pub enum ConstrainError {
         /// The demanded data collection.
         rhs: Type,
     },
+    /// Two collections over domains that are not the same domain met at one
+    /// position. A data domain is invariant (see
+    /// `src/ccl/design/type-inference.md`, "Data domains are invariant"), so
+    /// neither collection stands in for the other; their join is a Σ over the two
+    /// candidate domains, which is not yet representable. The coalesce-time face
+    /// of the same fact — reached when no edge forces the question earlier — is
+    /// [`super::coalesce::CoalesceError::DomainJoinConflict`]. Like
+    /// [`Self::ComputeWhereDataRequired`], raised only when the cache is
+    /// kind-aware.
+    DataDomainMismatch {
+        /// The supplied collection's domain.
+        lhs: Type,
+        /// The domain demanded at the position.
+        rhs: Type,
+    },
 }
 
 /// Cache of in-progress subtyping checks. Breaks cycles introduced through
@@ -415,25 +430,34 @@ fn constrain_go(
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
                 _ => sl.clone(),
             };
-            constrain_go(d1, d0, sr, sl, cache)?;
-            // A `Data` domain should be **invariant**: it is the loop bound
-            // op-conversion emits, so subsuming it in either direction changes
-            // which rows the consumer reads (`src/ccl/design/type-inference.md`,
-            // "Data domains are invariant"). Only the *base* half of that is in
-            // force, and structurally rather than here — `UIntRange` relates only
-            // by equality, so the contravariant edge above already rejects a wider
-            // or a narrower range domain. What the missing guard would add is
-            // rejecting *acquisition*, `D ⤇ V <: {D | p} ⤇ V`: contravariance
-            // inverts the drop-only refinement lattice, so an unfiltered
-            // collection is admitted where a filtered domain is declared
-            // (`data_domain_refinement_relates_only_by_acquisition`).
+            // The domain edge. A *compute* domain is contravariant: it is a
+            // parameter, nothing can enumerate it, and accepting more inputs than
+            // demanded only under-promises. A **data** domain is *invariant* — it is
+            // the loop bound op-conversion emits and it reappears in every
+            // eliminator's result, so narrowing or widening it changes which rows the
+            // consumer reads (`src/ccl/design/type-inference.md`, "Data domains are
+            // invariant"). Invariance is spelled the only order-independent way it
+            // can be, as both edges; anything conditional on *when* the edge fires
+            // would make typing depend on constraint order.
             //
-            // What the guard should be is open. Requiring the two domains to be
-            // *equal* here does not work: when this edge is emitted the demanded
-            // domain is routinely an unresolved variable whose refinement arrives
-            // later through its bounds (a filtered comprehension into an aggregate
-            // emits `{?i | p} ⤇ V <: ?j ⤇ V`), so comparing layers rejects sound
-            // programs.
+            // Emitting both directions does not preempt a domain join. Two domains
+            // meeting at one variable is a join like any other, and the join of two
+            // data functions is a Σ over the candidate domains — at a domain position
+            // exactly as at a `Case` result. Until Σ is representable that join has
+            // no answer, which is the error below; the same fact reaches coalesce as
+            // `CoalesceError::DomainJoinConflict` when no edge forces it earlier.
+            if kind_aware && matches!(k0, FunKind::Data) && matches!(k1, FunKind::Data) {
+                if constrain_go(d1, d0, sr, sl, cache).is_err()
+                    || constrain_go(d0, d1, sl, sr, cache).is_err()
+                {
+                    return Err(ConstrainError::DataDomainMismatch {
+                        lhs: (**d0).clone(),
+                        rhs: (**d1).clone(),
+                    });
+                }
+            } else {
+                constrain_go(d1, d0, sr, sl, cache)?;
+            }
             constrain_go(c0, c1, &cod_sl, sr, cache)
         }
 
@@ -1127,17 +1151,12 @@ mod tests {
     }
 
     #[test]
-    fn data_domain_refinement_relates_only_by_acquisition() {
-        // A data domain should be invariant (`design/type-inference.md`, "Data
-        // domains are invariant"). This pins how much of that holds: the base half
-        // does, because `UIntRange` relates only by equality; the refinement half
-        // does not.
-        //
-        // The domain is contravariant, so the ordinary refinement-width rule
-        // (`{D | p} <: D`, drop-only) *inverts* behind the arrow: the relation that
-        // survives is the one whose **supertype** is the more refined. That is
-        // *acquisition* — an unfiltered collection standing where a filtered one is
-        // declared — and it is the edge the missing guard would reject.
+    fn a_data_domain_relates_only_to_itself() {
+        // A data domain is invariant (`design/type-inference.md`, "Data domains are
+        // invariant"), so a data function relates to another only when the domains
+        // are the same domain — pinned in all four directions, base and refinement.
+        // Two collections that differ are not ordered either way; their join is a Σ,
+        // not one of them.
         use crate::ccl::{Lit, TypedExpr};
         let refined_dom = || {
             Type::Refinement(
@@ -1169,17 +1188,32 @@ mod tests {
             .is_err()
         );
 
-        // The same refinement behind a data arrow: inverted by contravariance.
+        // Behind a data arrow, neither refinement direction relates.
         assert!(
-            constrain_subtype(&bare, &refined, &mut ConstrainCache::new()).is_ok(),
-            "acquisition is the edge that survives — and the one left unguarded"
+            matches!(
+                constrain_subtype(&bare, &refined, &mut ConstrainCache::new()),
+                Err(ConstrainError::DataDomainMismatch { .. })
+            ),
+            "a collection may not acquire a domain filter by subsumption"
         );
         assert!(
             constrain_subtype(&refined, &bare, &mut ConstrainCache::new()).is_err(),
-            "dropping a domain refinement does not hold at the arrow"
+            "nor drop one"
         );
 
-        // The base half of invariance, in force in both directions.
+        // A *compute* arrow over the same domains keeps the contravariant lattice:
+        // invariance is about collections, not about refinements behind any arrow.
+        assert!(
+            constrain_subtype(
+                &fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &fun(refined_dom(), prim(BaseType::Int)),
+                &mut ConstrainCache::new()
+            )
+            .is_ok(),
+            "a capability's domain is not data — acquiring a refinement is sound"
+        );
+
+        // Nor either base direction.
         assert!(
             constrain_subtype(&bare, &wider, &mut ConstrainCache::new()).is_err(),
             "a narrower range domain does not stand in for a wider one"
@@ -1187,6 +1221,17 @@ mod tests {
         assert!(
             constrain_subtype(&wider, &bare, &mut ConstrainCache::new()).is_err(),
             "nor a wider one for a narrower — no contravariant widening of a data domain"
+        );
+
+        // The same domain does relate: invariance is equality, not a blanket
+        // rejection of `Data`/`Data` edges.
+        assert!(
+            constrain_subtype(&bare, &bare, &mut ConstrainCache::new()).is_ok(),
+            "a data function relates to itself"
+        );
+        assert!(
+            constrain_subtype(&refined, &refined, &mut ConstrainCache::new()).is_ok(),
+            "including through a domain refinement"
         );
     }
 

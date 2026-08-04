@@ -1176,7 +1176,7 @@ pub(super) fn emit_list<C: Typing>(
     // element (codomain) type takes the dereferenced element type so no `Mut`
     // appears in the list type. A list literal is a **data** function — its
     // domain is the index set, so a join with another collection may not narrow
-    // it — see `src/ccl/design/type-inference.md`, "The domain-join rejection".
+    // it — see `src/ccl/design/type-inference.md`, "The domain join is a Σ".
     Ok(Type::data_fun(Type::UIntRange(n), deref_mut(&first_ty)))
 }
 

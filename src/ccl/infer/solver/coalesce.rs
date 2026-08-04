@@ -61,7 +61,7 @@ pub enum CoalesceError {
     /// by a `Data ⊔ Data` join (the common case) or by a multi-alternative slot
     /// meeting a compute function, where collapsing to the ordinary meet would drop
     /// domains. Reported loudly rather than silently losing rows. See
-    /// `src/ccl/design/type-inference.md`, "The domain-join rejection".
+    /// `src/ccl/design/type-inference.md`, "The domain join is a Σ".
     DomainJoinConflict {
         /// Pretty representation of the conflicting function shapes.
         details: String,
@@ -176,7 +176,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                 // Two or more surviving domains mean a data function's domains
                 // would be dropped by collapsing to a compute meet (a genuine
                 // domain-join collision). See `src/ccl/design/type-inference.md`,
-                // "The domain-join rejection".
+                // "The domain join is a Σ".
                 if doms.len() <= 1 {
                     return Err(CoalesceError::ComputeWhereDataRequired {
                         details: format!("a compute function (capability) over {{{doms_s}}}"),
