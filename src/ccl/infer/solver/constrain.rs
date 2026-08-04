@@ -416,19 +416,24 @@ fn constrain_go(
                 _ => sl.clone(),
             };
             constrain_go(d1, d0, sr, sl, cache)?;
-            // NB: Data-domain **invariance** (equating both arrows' domains when
-            // both are `Data`, to stop a wider collection standing where a
-            // narrower declared domain is expected — the silent-row-drop guard
-            // of design §5) is deliberately *not* enabled here. A naive
-            // strict-equality reverse edge breaks the sound, common pattern of a
-            // *filtered* collection (`{[0, n] | p} ⤇ V`) flowing where the
-            // unfiltered domain (`[0, n] ⤇ V`) is expected: the reverse edge
-            // demands `[0, n] <: {[0, n] | p}`, i.e. acquiring a refinement by
-            // subsumption, which the lattice strictly forbids. Invariance must
-            // therefore be *modulo refinements* and range-aware; see
-            // `src/ccl/design/type-inference.md`, "Deferred: data-domain invariance".
-            // The contravariant edge above plus the strict refinement lattice
-            // already reject *acquiring* a collection by subsumption.
+            // A `Data` domain should be **invariant**: it is the loop bound
+            // op-conversion emits, so subsuming it in either direction changes
+            // which rows the consumer reads (`src/ccl/design/type-inference.md`,
+            // "Data domains are invariant"). Only the *base* half of that is in
+            // force, and structurally rather than here — `UIntRange` relates only
+            // by equality, so the contravariant edge above already rejects a wider
+            // or a narrower range domain. What the missing guard would add is
+            // rejecting *acquisition*, `D ⤇ V <: {D | p} ⤇ V`: contravariance
+            // inverts the drop-only refinement lattice, so an unfiltered
+            // collection is admitted where a filtered domain is declared
+            // (`data_domain_refinement_relates_only_by_acquisition`).
+            //
+            // What the guard should be is open. Requiring the two domains to be
+            // *equal* here does not work: when this edge is emitted the demanded
+            // domain is routinely an unresolved variable whose refinement arrives
+            // later through its bounds (a filtered comprehension into an aggregate
+            // emits `{?i | p} ⤇ V <: ?j ⤇ V`), so comparing layers rejects sound
+            // programs.
             constrain_go(c0, c1, &cod_sl, sr, cache)
         }
 
@@ -1122,18 +1127,17 @@ mod tests {
     }
 
     #[test]
-    fn a_refined_data_domain_relates_only_by_acquisition_today() {
-        // What the `Fun`/`Fun` arm does to a *data* function whose domain carries a
-        // refinement — pinned because the direction is the opposite of what a reader
-        // expects, and because it is the edge `design/type-inference.md`, "Deferred:
-        // data-domain invariance" is about.
+    fn data_domain_refinement_relates_only_by_acquisition() {
+        // A data domain should be invariant (`design/type-inference.md`, "Data
+        // domains are invariant"). This pins how much of that holds: the base half
+        // does, because `UIntRange` relates only by equality; the refinement half
+        // does not.
         //
         // The domain is contravariant, so the ordinary refinement-width rule
         // (`{D | p} <: D`, drop-only) *inverts* behind the arrow: the relation that
-        // holds is the one whose **supertype** is the more refined. That is row
-        // *addition* — an unfiltered collection standing where a filtered one is
-        // declared — which is the direction a data function must not admit. Base
-        // domains are already invariant: `UIntRange` relates only by equality.
+        // survives is the one whose **supertype** is the more refined. That is
+        // *acquisition* — an unfiltered collection standing where a filtered one is
+        // declared — and it is the edge the missing guard would reject.
         use crate::ccl::{Lit, TypedExpr};
         let refined_dom = || {
             Type::Refinement(
@@ -1168,16 +1172,22 @@ mod tests {
         // The same refinement behind a data arrow: inverted by contravariance.
         assert!(
             constrain_subtype(&bare, &refined, &mut ConstrainCache::new()).is_ok(),
-            "acquisition holds today — the row-addition direction"
+            "acquisition is the edge that survives — and the one left unguarded"
         );
         assert!(
             constrain_subtype(&refined, &bare, &mut ConstrainCache::new()).is_err(),
             "dropping a domain refinement does not hold at the arrow"
         );
 
-        // Bases relate only by equality, in both directions.
-        assert!(constrain_subtype(&bare, &wider, &mut ConstrainCache::new()).is_err());
-        assert!(constrain_subtype(&wider, &bare, &mut ConstrainCache::new()).is_err());
+        // The base half of invariance, in force in both directions.
+        assert!(
+            constrain_subtype(&bare, &wider, &mut ConstrainCache::new()).is_err(),
+            "a narrower range domain does not stand in for a wider one"
+        );
+        assert!(
+            constrain_subtype(&wider, &bare, &mut ConstrainCache::new()).is_err(),
+            "nor a wider one for a narrower — no contravariant widening of a data domain"
+        );
     }
 
     #[test]

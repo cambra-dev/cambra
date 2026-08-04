@@ -577,8 +577,8 @@ The pipeline passes downstream of inference treat function types structurally an
 
 > **Status: implemented.** The `FunKind` marker, kind inference, and kind-aware
 > subtyping (the `Compute <: Data` rejection) are all live, as is the rejection of
-> a data join that would narrow a domain. One guard is deferred with rationale
-> (data-domain invariance — see the callout below).
+> a data join that would narrow a domain. Data-domain invariance holds for the
+> base and is unenforced for a domain *refinement* — see the callout below.
 
 The unresolved domain-join corner of §4.5 (O1/O4 — two collections meeting at one
 join point) is resolved by making a missing distinction explicit. The distinction
@@ -644,8 +644,8 @@ sets `kind` explicitly.
 > a kind-aware re-check would false-reject. `sum([x for x in xs])`,
 > comprehensions, and `groupby` type fine because they are stamped concrete
 > `Data` at construction (the provenance annotation / `refined_data_fun` cast
-> target). One guard is deferred — see
-> [Deferred: data-domain invariance](#deferred-data-domain-invariance) below.
+> target). One guard is only half in force — see
+> [Data domains are invariant](#data-domains-are-invariant) below.
 
 ### The domain-join rejection
 
@@ -739,45 +739,80 @@ occurrence-typing language could keep the arms correlated through the path
 condition `flag` itself, with no tag; Cambra does not narrow on opaque `Bool`s, and
 the tagged variant is the substitute.
 
-### Deferred: data-domain invariance
+### Data domains are invariant
 
-The `Fun`/`Fun` domain edge is contravariant for **both** kinds. For a *compute*
-function that is right — the domain is a parameter. For a *data* function it is not:
-the domain **is** the data, so a `[0,10] ⤇ 𝑉` standing where a `[0,5] ⤇ 𝑉` is declared
-is silent row addition, and the reverse is silent row loss. Neither should typecheck.
+The `Fun`/`Fun` domain edge is contravariant, which is right for a *compute*
+function: the domain is a parameter, nothing in the language can ask a capability
+which inputs it accepts, and shrinking the accepted set only under-promises. A
+**data** function's domain is invariant instead — and that is not a second
+principle standing beside [the domain-join rejection](#the-domain-join-rejection),
+it is the same rule read at the other site.
 
-The guard is nonetheless **not** enabled. The **base** half of it is settled — strip
-refinements, require the *base* domains equal — and is already in force in practice,
-because [`Type::UIntRange`] relates only by equality. What the **refinement** half should
-be is open, and stating it needs the two candidate edges named.
+**One lattice.** A join *is* the least upper bound of the subtype order, so the two
+cannot disagree. Suppose the contravariant edge applied to data functions, making a
+wider collection a subtype of a narrower one — `[0,10] ⤇ 𝑉 <: [0,5] ⤇ 𝑉`, which is
+`[0,5] <: [0,10]` at the domain. Then the least upper bound of the arms of
+`[1,2] if c else [1,2,3]` is `[0,1] ⤇ Int`, and `sum` of it returns `3` even when
+the else-arm ran, with nothing in the type recording that a row was dropped. That is
+precisely the miscompile `DomainJoinConflict` exists to prevent. Contravariant data
+domains and the domain-join rejection are one choice made twice in opposite
+directions; whichever is adopted, the other has to go.
 
-**What the arm does today, precisely.** For two data functions over one base differing
-only in a domain refinement, exactly one of the two edges holds
-(`a_refined_data_domain_relates_only_by_acquisition_today`):
+**Why the stand-in is not free.** The contravariant reading is tempting because it
+looks like record width subtyping, which *is* sound: `{a: Int, b: Int} <: {a: Int}`
+because a consumer of `{a: Int}` can only apply a key it declared, so the extra
+field is unobservable. A data function has eliminators that **reflect** its domain
+rather than index into it, and they make the difference observable twice over.
 
-| edge | holds today | what it means when the domain *is* the data |
-| --- | --- | --- |
-| `𝐷 ⤇ 𝑉 <: {𝐷 \| 𝑝} ⤇ 𝑉` — *acquire* | **yes** | row **addition**: an unfiltered collection standing where a filtered one is declared |
-| `{𝐷 \| 𝑝} ⤇ 𝑉 <: 𝐷 ⤇ 𝑉` — *drop* | no | row **loss** |
+- The declared domain **is the loop bound the program runs**. Op-conversion's
+  `Builtin::Iterate` arm builds its iteration source as
+  `IterateExtent::new(extent_of(𝐷))` from the *static* domain of the iterate
+  marker's predicate. So handing an 11-row collection to a slot declared
+  `[0,5] ⤇ 𝑉` does not forget rows the way the record forgets `b`; it emits a
+  program that reads six of them and reports the result as the collection's.
+- The domain is **reproduced in eliminator results**. A comprehension has the shape
+  `𝐷 ⤇ 𝐴 ⇒ 𝐷 ⤇ 𝐵`, so `𝐷` occurs covariantly — in an output — as well as
+  contravariantly at application, and a variable occurring in both positions is
+  invariant. That is the ordinary variance calculus, not a Cambra-specific rule, and
+  it is the whole content of the `Data`/`Compute` split: a compute domain occurs
+  contravariantly only, because nothing enumerates it.
 
-The direction is the opposite of the one a reader expects, and the reason is that the
-domain is **contravariant**. At a bare domain position the ordinary lattice is drop-only
-(`{𝐷 | 𝑝} <: 𝐷`); behind the arrow that inverts, so the relation that survives is the one
-whose *supertype* is the more refined.
+There is a coherent language in which the wider collection *should* stand in: one
+where a declared domain is a **view**, and narrowing it means "give me this much of
+it". Cambra is not that language — and the reason is *not* that a data domain is
+currently unwritable. It will not stay unwritable:
+[`Array(𝑛, 𝑇)`](../../../docs/chl-spec.md#63-direction-collections-as-functions-tentative),
+a data function over `Fin(𝑛)`, is a planned surface type. The reason is that both
+things the view reading would buy are better bought elsewhere, and the surface
+syntax is what makes them cheap:
 
-So the edge that is live is the row-addition one, and a *drop* pattern is not something a
-strict guard would break, because it does not hold in the first place.
+- **"Works for any length" is quantification, not subsumption.** The function that
+  accepts every extent is `∀𝑛. Array(𝑛, 𝑇) ⇒ …`, an ordinary scheme the solver
+  already freshens per use. Contravariant widening is a poor stand-in for
+  polymorphism: it relates one pair of extents at one site, and charges the row-set
+  guarantee everywhere for it.
+- **A deliberate prefix is a term, not a coercion.** A program that wants the first
+  five rows takes them, and the truncation is then visible where it happens, at an
+  extent chosen by the use site. A subsumption edge hides the same truncation in a
+  declaration, and only ever at the width that declaration happens to name.
 
-**The open question is which of those two edges to keep.** Under the "domain is the data"
-reading the answer looks like *neither* — both change the row set — which is full
-invariance: `strip`-equal bases **and** equal refinements. The cost is not a
-filtered-flows-where-unfiltered pattern (there isn't one) but whatever relies on
-acquisition. Establishing what that is, and what replaces it, is the work.
+So the rule is stable under a surface data domain. What the syntax changes is that
+the explicit forms invariance requires become *writable*, which argues for the rule
+rather than against it.
 
-It is deferred rather than wrong-by-omission because of what the domains actually are
-today: ranges, which are already invariant, and fresh join variables, which carry no
-refinement to acquire. The acquisition edge becomes reachable — and the omission
-load-bearing — as soon as *refined* domains are pervasive.
+**What is enforced, and the hole.** The *base* half is in force, structurally rather
+than by a kind-aware guard: [`Type::UIntRange`] relates only by equality, so a wider
+or a narrower range domain is rejected under either kind, in both directions. The
+*refinement* half is *not* enforced. Because the domain is contravariant, the
+ordinary drop-only refinement lattice (`{𝐷 | 𝑝} <: 𝐷`) inverts behind the arrow: of
+the two edges over one base, the surviving one is **acquisition** — `𝐷 ⤇ 𝑉 <:
+{𝐷 | 𝑝} ⤇ 𝑉`, an unfiltered collection standing where a filtered domain is declared
+— while *dropping* a domain refinement does not hold at all. Both change which rows
+the consumer reads, so by the rule above neither should hold; the guard that would
+reject acquisition is missing.
+`data_domain_refinement_relates_only_by_acquisition` pins all three facts together —
+both refinement edges and the base equality — so what is absent is a recorded fact
+rather than an assumption.
 
 ### Deliberately incomplete here
 
@@ -805,11 +840,13 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
   source-level route is found, it belongs in the suite; if one provably does not
   exist, the branch should collapse into the constraint-level check.
 
-- **Data-domain invariance is not enforced**, so the contravariant `Fun`/`Fun`
-  domain edge still admits a data function standing where a differently-domained one
-  is declared. See
-  [Deferred: data-domain invariance](#deferred-data-domain-invariance) above for why
-  the obvious formulation is wrong and what the correct rule is.
+- **The refinement half of data-domain invariance is not enforced.** Base domains
+  are invariant structurally — [`Type::UIntRange`] relates only by equality — but the
+  contravariant domain edge still admits *acquisition*: an unfiltered collection
+  standing where a filtered domain is declared. The guard cannot live on that edge —
+  the demanded domain is often an unresolved variable there — so it belongs at
+  coalesce, on the materialized domain alternatives, and it is not written. See
+  [Data domains are invariant](#data-domains-are-invariant) above.
 
 ---
 
