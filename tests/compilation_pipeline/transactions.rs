@@ -563,7 +563,15 @@ fn trailing_commit_value(code: &str) -> Value {
     out
 "#}, make_tuple(&[Value::Int(3), Value::Int(30)]))]
 // Named record register.
-#[case("out = defer()\np: Mut({x: Int, y: Int}, Txn) := (x=100, y=0)\nfor r in [10, 20]:\n    with begin():\n        p := (x=p.x - r, y=p.y + r)\nwith begin():\n    out << p\nout", make_record(&[("x", Value::Int(70)), ("y", Value::Int(30))]))]
+#[case(r"
+out = defer()
+p: Mut({x: Int, y: Int}, Txn) := (x=100, y=0)
+for r in [10, 20]:
+    with begin():
+        p := (x=p.x - r, y=p.y + r)
+with begin():
+    out << p
+out", make_record(&[("x", Value::Int(70)), ("y", Value::Int(30))]))]
 // Mixed multi-key store: a scalar key `s` and a tuple key `p`, atomic per commit.
 // s = 10+20 = 30; p = (70, 30); trailing read `(s, p)`.
 #[case(indoc! {r#"
