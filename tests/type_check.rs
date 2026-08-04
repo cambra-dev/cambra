@@ -291,7 +291,11 @@ fn test_aggregate_over_scalar_lambda_is_rejected() {
     // Regression that a capability supplied where a collection is demanded is a
     // clean error, not a
     // silent miskind or a debug panic.
-    let errs = infer_program_err("f = \\i -> i + 1\nsum(f)");
+    let errs = infer_program_err(
+        r"
+f = \i -> i + 1
+sum(f)",
+    );
     assert!(
         errs.iter().any(|e| matches!(
             e,
@@ -1287,12 +1291,30 @@ fn conditional_collection_rejects_under_every_consumer() {
     for program in [
         // Collapsing consumer: directly, through a `let`, through a UDF parameter.
         format!("sum({c})"),
-        format!("x = {c}\nsum(x)"),
-        format!("def f(c):\n    sum(c)\nf({c})"),
+        format!(
+            r"
+x = {c}
+sum(x)"
+        ),
+        format!(
+            r"
+def f(c):
+    sum(c)
+f({c})"
+        ),
         // Domain-preserving consumer: the same three routes.
         format!("[y + 1 for y in {c}]"),
-        format!("x = {c}\n[y + 1 for y in x]"),
-        format!("def f(c):\n    [y + 1 for y in c]\nf({c})"),
+        format!(
+            r"
+x = {c}
+[y + 1 for y in x]"
+        ),
+        format!(
+            r"
+def f(c):
+    [y + 1 for y in c]
+f({c})"
+        ),
     ] {
         assert!(
             !infer_program_err(&program).is_empty(),
