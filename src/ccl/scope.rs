@@ -2,11 +2,12 @@
 //!
 //! Every scope-aware pass — free-variable counting, capture-avoiding
 //! substitution, α-uniquification — needs the same answer to one question:
-//! *which binders scope over which of a node's children?* [`for_each_scoped_item`] is the single place that answers it. Its
-//! `match` is **exhaustive with no wildcard arm**, deliberately: a new
-//! [`TypedExprNode`] variant must declare its scope here before the crate
-//! compiles, instead of falling into a `_ => walk_children(..)` catch-all in
-//! five separate passes and silently getting the wrong one.
+//! *which binders scope over which of a node's children?* [`for_each_scoped_item`]
+//! is the single place that answers it. Its `match` is **exhaustive with no
+//! wildcard arm**, deliberately: a new [`TypedExprNode`] variant must declare
+//! its scope here before the crate compiles, instead of falling into a
+//! `_ => walk_children(..)` catch-all in five separate passes and silently
+//! getting the wrong one.
 //!
 //! Design of record: `src/ccl/design/ir.md`, "Binding structure lives in one
 //! place".
@@ -41,18 +42,19 @@
 //! # Invariants
 //!
 //! - **Child order matches [`TypedExpr::walk_children`]** — the `Child` items
-//!   are yielded in exactly that order. [`for_each_scoped_child_mut`] relies on
-//!   it to pair binder lists with a `&mut` traversal, and the corpus test in
-//!   this module checks it pointer-for-pointer over every variant.
+//!   are yielded in exactly that order. [`for_each_scoped_item_mut`] relies on
+//!   it to pair scopes with a `&mut` traversal, and the corpus test in this
+//!   module checks it pointer-for-pointer over every variant.
 //! - **A scope's children are consecutive, and a scope is entered once** — all
 //!   children under one binder list are yielded together, and a binder-
 //!   introducing scope, once left, is never re-entered. (The node's *own* scope
-//!   — the empty binder list — recurs freely: it is the ambient scope, not a
+//!   — [`Binders::Ambient`] — recurs freely: it is the ambient scope, not a
 //!   scope this node opens. A `Case` alternates between the two as its branches
 //!   do or do not bind a payload.) A consumer may therefore carry per-scope
 //!   state — a shadowed substitution, a pushed environment frame — across a run
-//!   of children and rebuild it only when the binder list changes.
-//! - **Binders are innermost-last** within a list — the order a consumer that
+//!   of children and rebuild it only when the scope changes; the `&mut` walk
+//!   hands it the change point directly, as a [`ScopedItemMut::Scope`] item.
+//! - **Binders are innermost-last** within a scope — the order a consumer that
 //!   maintains a De Bruijn environment needs to push them in.
 //!
 //! # What does *not* live here
@@ -66,16 +68,99 @@
 
 use super::{Name, TypedBinding, TypedExpr, TypedExprNode};
 
+/// The binders a node puts in scope over one of its children.
+///
+/// A type rather than a slice of binder references, for two reasons.
+///
+/// It borrows the node's binder slots **in place**, so the walk allocates
+/// nothing. [`for_each_scoped_item`] sits under
+/// [`is_free`](crate::ccl::ccl_utils::is_free), which capture-avoiding
+/// substitution consults once per mapped binder per node, so collecting a
+/// `LetRec` group into a `Vec` would be an allocation per group *per query*.
+///
+/// And it owns [`shadows`](Self::shadows) — "does this scope shadow this
+/// name?", which is the question every consumer of the walk actually asks.
+/// Answering it here is what keeps it from being re-spelled as
+/// `binders.iter().any(|b| &b.name == name)` once per fold.
+#[derive(Clone, Copy)]
+pub enum Binders<'a> {
+    /// No binder: the child sits in the node's own scope.
+    Ambient,
+    /// A single binder — a [`Lambda`](TypedExprNode::Lambda) param, a
+    /// [`Let`](TypedExprNode::Let) binding, a [`For`](TypedExprNode::For)
+    /// target, a [`Case`](TypedExprNode::Case) branch's payload.
+    One(&'a TypedBinding),
+    /// A whole mutually-recursive group: every member scopes over every child
+    /// the group covers (see [`LetRec`](TypedExprNode::LetRec)).
+    Group(&'a [(TypedBinding, TypedExpr)]),
+}
+
+impl<'a> Binders<'a> {
+    /// Does this scope shadow `name`? A child under a scope that shadows it
+    /// contributes no *free* occurrence of it.
+    pub fn shadows(self, name: &Name) -> bool {
+        match self {
+            Binders::Ambient => false,
+            Binders::One(b) => &b.name == name,
+            Binders::Group(g) => g.iter().any(|(b, _)| &b.name == name),
+        }
+    }
+
+    /// The binders, innermost last — the order a consumer maintaining an
+    /// environment stack pushes them in.
+    pub fn iter(self) -> impl Iterator<Item = &'a TypedBinding> {
+        const EMPTY: &[(TypedBinding, TypedExpr)] = &[];
+        let (one, group) = match self {
+            Binders::Ambient => (None, EMPTY),
+            Binders::One(b) => (Some(b), EMPTY),
+            Binders::Group(g) => (None, g),
+        };
+        one.into_iter().chain(group.iter().map(|(b, _)| b))
+    }
+
+    /// Does this scope introduce nothing? True for [`Binders::Ambient`] — the
+    /// node's own scope, which is not a scope the node opens — and for the
+    /// degenerate empty `Group`. The question a consumer asks when it only needs
+    /// to know whether crossing to this child changes anything: pushing an
+    /// environment frame, restricting a substitution, recording that a subtree
+    /// binds new names.
+    pub fn is_empty(self) -> bool {
+        match self {
+            Binders::Ambient => true,
+            Binders::One(_) => false,
+            Binders::Group(g) => g.is_empty(),
+        }
+    }
+
+    /// Are these the *same* scope — the same binder slots of the same node?
+    ///
+    /// Compared by slot identity rather than by name, because that is what
+    /// "same scope" means: two `Case` branches binding a payload spelled the
+    /// same way are two scopes, and a consumer that reused one branch's
+    /// environment frame for the other would be right only by accident.
+    /// Consecutive children under one scope compare equal here, which is what
+    /// lets [`for_each_scoped_item_mut`] group them into runs.
+    fn is_same_scope(self, other: Binders<'_>) -> bool {
+        match (self, other) {
+            (Binders::Ambient, Binders::Ambient) => true,
+            (Binders::One(a), Binders::One(b)) => std::ptr::eq(a, b),
+            (Binders::Group(a), Binders::Group(b)) => {
+                a.as_ptr() == b.as_ptr() && a.len() == b.len()
+            }
+            _ => false,
+        }
+    }
+}
+
 /// One item of a node's scope structure, as yielded by
 /// [`for_each_scoped_item`].
-pub enum ScopedItem<'a, 'b> {
-    /// A direct child expression together with the binders that scope over it
-    /// (innermost last). Empty when the child sits in the node's own scope.
+pub enum ScopedItem<'a> {
+    /// A direct child expression together with the binders that scope over it.
     Child {
         /// The child term.
         expr: &'a TypedExpr,
         /// The binders this node puts in scope over `expr`.
-        binders: &'b [&'a TypedBinding],
+        binders: Binders<'a>,
     },
     /// A *variable* occurrence the node makes itself: a
     /// [`Var`](TypedExprNode::Var), or the write target of a
@@ -102,19 +187,22 @@ pub enum ScopedItem<'a, 'b> {
 /// single closure type — so monomorphization stays flat.
 pub fn for_each_scoped_item<'a, F>(e: &'a TypedExpr, f: &mut F)
 where
-    F: FnMut(ScopedItem<'a, '_>) + ?Sized,
+    F: FnMut(ScopedItem<'a>) + ?Sized,
 {
     use TypedExprNode as N;
 
     /// Yield a child in the node's own scope (no binder introduced).
-    fn open<'a, F: FnMut(ScopedItem<'a, '_>) + ?Sized>(f: &mut F, expr: &'a TypedExpr) {
-        f(ScopedItem::Child { expr, binders: &[] });
+    fn open<'a, F: FnMut(ScopedItem<'a>) + ?Sized>(f: &mut F, expr: &'a TypedExpr) {
+        f(ScopedItem::Child {
+            expr,
+            binders: Binders::Ambient,
+        });
     }
     /// Yield a child scoped by `binders`.
-    fn under<'a, F: FnMut(ScopedItem<'a, '_>) + ?Sized>(
+    fn under<'a, F: FnMut(ScopedItem<'a>) + ?Sized>(
         f: &mut F,
         expr: &'a TypedExpr,
-        binders: &[&'a TypedBinding],
+        binders: Binders<'a>,
     ) {
         f(ScopedItem::Child { expr, binders });
     }
@@ -163,7 +251,7 @@ where
         }
 
         // ---- Binding nodes --------------------------------------------------
-        N::Lambda { param, body } => under(f, body, &[param]),
+        N::Lambda { param, body } => under(f, body, Binders::One(param)),
 
         N::Let {
             binding,
@@ -171,21 +259,21 @@ where
             body,
         } => {
             open(f, bound_expr);
-            under(f, body, &[binding]);
+            under(f, body, Binders::One(binding));
         }
 
         // Mutual recursion: the whole group is in scope throughout the group.
         N::LetRec { bindings, body } => {
-            let group: Vec<&TypedBinding> = bindings.iter().map(|(b, _)| b).collect();
+            let group = Binders::Group(bindings);
             for (_, def) in bindings {
-                under(f, def, &group);
+                under(f, def, group);
             }
-            under(f, body, &group);
+            under(f, body, group);
         }
 
         N::For { target, iter, body } => {
             open(f, iter);
-            under(f, body, &[target]);
+            under(f, body, Binders::One(target));
         }
 
         N::Case {
@@ -198,9 +286,9 @@ where
             for b in branches {
                 match &b.pattern {
                     Some(p) => {
-                        let bound = [&p.binding];
-                        under(f, &b.guard, &bound);
-                        under(f, &b.body, &bound);
+                        let bound = Binders::One(&p.binding);
+                        under(f, &b.guard, bound);
+                        under(f, &b.body, bound);
                     }
                     None => {
                         open(f, &b.guard);
@@ -229,61 +317,168 @@ where
     }
 }
 
-/// In-place counterpart of [`for_each_scoped_item`]: visit each direct child of
-/// `e` mutably, paired with the names of the binders that scope over it.
+/// One item of a node's scope structure, mutably — the `&mut` counterpart of
+/// [`ScopedItem`], as yielded by [`for_each_scoped_item_mut`].
+pub enum ScopedItemMut<'a> {
+    /// Opens the scope that the `Child` items following it sit in, until the
+    /// next `Scope`. Every `Child` is preceded by the scope it sits in, and a
+    /// scope is opened **once** (the consecutiveness invariant), so a consumer
+    /// builds per-scope state here — a shadowed substitution, a capture check —
+    /// and reuses it across the whole run.
+    ///
+    /// Binder *names*, not `&mut TypedBinding`s: a `&mut` walk cannot hand out a
+    /// borrow into the node whose children it is also handing out.
+    Scope(&'a [Name]),
+    /// A direct child, in the scope most recently opened.
+    Child(&'a mut TypedExpr),
+    /// A variable occurrence the node makes itself — see [`ScopedItem::VarRef`].
+    /// Yielded before any `Scope`, since a node's own occurrences are resolved
+    /// in the node's own scope, not under a binder it introduces.
+    VarRef(&'a mut Name),
+    /// A register-key label occurrence — see [`ScopedItem::KeyRef`]. Every
+    /// occurrence of a key is yielded (the `keys` entry and each writer
+    /// footprint mention), so a consumer that rewrites one can keep them in
+    /// step.
+    KeyRef(&'a mut Name),
+}
+
+/// In-place counterpart of [`for_each_scoped_item`]: visit `e`'s own name
+/// occurrences and each of its direct children mutably, the children grouped
+/// into the scopes that cover them.
 ///
-/// Derived from [`for_each_scoped_item`], so the scoping rules stay stated
-/// once. A `&mut` walk cannot hold borrows into the node it is mutating, so the
-/// binder *names* are cloned up front and the children are then enumerated by
-/// [`TypedExpr::walk_children_mut`]; only the binder-introducing nodes allocate.
-/// The two enumerations agreeing is the invariant this pairing rests on — it is
-/// documented on [`for_each_scoped_item`], checked pointer-for-pointer by this
-/// module's corpus test, and its arity half is asserted here.
-///
-/// Name *occurrences* (`ScopedItem::VarRef` / `KeyRef`) are not surfaced: a
-/// caller that rewrites them (only [`crate::ccl::subst`] does, to retarget a
-/// renamed defer handle) reaches them through its own node match.
-pub fn for_each_scoped_child_mut<F>(e: &mut TypedExpr, f: &mut F)
+/// Derived from [`for_each_scoped_item`], so the scoping rules stay stated once.
+/// A `&mut` walk cannot hold borrows into the node it is mutating, so the binder
+/// *names* are cloned up front — once per scope, not once per child — and the
+/// children are then enumerated by [`TypedExpr::walk_children_mut`]; only
+/// binder-introducing nodes pay for that pass at all. The two enumerations
+/// agreeing is the invariant this pairing rests on: it is documented on
+/// [`for_each_scoped_item`], checked pointer-for-pointer by this module's corpus
+/// test, and its arity half is asserted here.
+pub fn for_each_scoped_item_mut<F>(e: &mut TypedExpr, f: &mut F)
 where
-    F: FnMut(&mut TypedExpr, &[Name]) + ?Sized,
+    F: FnMut(ScopedItemMut<'_>) + ?Sized,
 {
+    for_each_name_mut(e, f);
+
     // A node that declares no binder scopes every child in its own scope, so
-    // there is nothing to collect and nothing to pair — skip straight to the
-    // mutable walk. This is the overwhelmingly common node, and skipping the
-    // collection pass is what keeps the adapter from costing every node in the
-    // tree a second traversal. `binds_any` is `walk_binders`, whose agreement
-    // with the scoping rules is `declared_binders_match_walk_binders` below.
+    // there is nothing to collect and nothing to group — go straight to the
+    // mutable child walk. This is the overwhelmingly common node, and skipping
+    // the collection pass is what keeps the adapter from costing every node in
+    // the tree a second traversal and a `Vec`. `binds_any` is `walk_binders`,
+    // whose agreement with the scoping rules is
+    // `declared_binders_match_walk_binders` below.
     if !e.binds_any() {
-        e.walk_children_mut(|c| f(c, &[]));
+        let mut opened = false;
+        e.walk_children_mut(|c| {
+            if !opened {
+                f(ScopedItemMut::Scope(&[]));
+                opened = true;
+            }
+            f(ScopedItemMut::Child(c));
+        });
         return;
     }
 
-    // Sparse by construction: `scopes` is only as long as the last scoped
-    // child's position, so a `Let` (binder on the second of two children)
-    // allocates one empty leading entry and nothing more.
-    let mut scopes: Vec<Vec<Name>> = Vec::new();
+    // The scope runs, in child order: each run's first-child index and the
+    // binder names it introduces. Children under one scope share an entry —
+    // which is what keeps a `LetRec` group's names to a single clone rather than
+    // one per child, and is what makes the per-scope `Scope` item expressible at
+    // all. Sound because a scope's children are consecutive.
+    let mut runs: Vec<(usize, Vec<Name>)> = Vec::new();
     let mut children = 0usize;
-    for_each_scoped_item(e, &mut |item| {
-        if let ScopedItem::Child { binders, .. } = item {
-            children += 1;
-            if !binders.is_empty() {
-                scopes.resize(children - 1, Vec::new());
-                scopes.push(binders.iter().map(|b| b.name.clone()).collect());
+    {
+        let mut prev: Option<Binders<'_>> = None;
+        for_each_scoped_item(&*e, &mut |item| {
+            if let ScopedItem::Child { binders, .. } = item {
+                if !prev.is_some_and(|p| p.is_same_scope(binders)) {
+                    runs.push((children, binders.iter().map(|b| b.name.clone()).collect()));
+                    prev = Some(binders);
+                }
+                children += 1;
             }
-        }
-    });
+        });
+    }
 
     let mut i = 0usize;
+    let mut next_run = 0usize;
     e.walk_children_mut(|c| {
-        let binders = scopes.get(i).map_or(&[][..], Vec::as_slice);
+        if let Some((start, names)) = runs.get(next_run)
+            && *start == i
+        {
+            f(ScopedItemMut::Scope(names));
+            next_run += 1;
+        }
         i += 1;
-        f(c, binders);
+        f(ScopedItemMut::Child(c));
     });
     debug_assert_eq!(
         i, children,
         "`walk_children_mut` and `for_each_scoped_item` must enumerate the same children — \
-         the binder lists are paired with the child sequence by position"
+         the scope runs are paired with the child sequence by position"
     );
+    debug_assert_eq!(
+        next_run,
+        runs.len(),
+        "every scope run must be reached: run starts are strictly increasing child indices, \
+         which is what lets one forward pass pair them with the children"
+    );
+}
+
+/// The name occurrences `e` makes itself, mutably — the `&mut` half of
+/// [`ScopedItem::VarRef`] / [`ScopedItem::KeyRef`].
+///
+/// Exhaustive with no wildcard arm for the same reason [`for_each_scoped_item`]
+/// is: which names a node mentions of its own is part of its binding structure,
+/// and a wildcard here would let a new name-mentioning node be silently skipped
+/// by the rename that has to retarget it. `mut_walk_surfaces_the_same_names`
+/// checks this against the immutable walk over the whole corpus.
+fn for_each_name_mut<F>(e: &mut TypedExpr, f: &mut F)
+where
+    F: FnMut(ScopedItemMut<'_>) + ?Sized,
+{
+    use TypedExprNode as N;
+    match &mut e.node {
+        N::Var(n) => f(ScopedItemMut::VarRef(n)),
+        N::Feed { name, .. } | N::Define { name, .. } | N::MutWrite { name, .. } => {
+            f(ScopedItemMut::VarRef(name));
+        }
+        N::Transact { keys, writers, .. } => {
+            for k in keys {
+                f(ScopedItemMut::KeyRef(&mut k.name));
+            }
+            for w in writers {
+                for k in w.read_keys.iter_mut().chain(&mut w.write_keys) {
+                    f(ScopedItemMut::KeyRef(k));
+                }
+            }
+        }
+        // Mentions no name of its own. Enumerated rather than wildcarded — see
+        // above.
+        N::Lit(_)
+        | N::Builtin(_)
+        | N::Proj(_)
+        | N::Source(_)
+        | N::Defer
+        | N::Error
+        | N::Apply { .. }
+        | N::Cast { .. }
+        | N::BinOp { .. }
+        | N::UnaryOp(..)
+        | N::Aggregate { .. }
+        | N::VariantCtor { .. }
+        | N::List(_)
+        | N::Tuple(_)
+        | N::Record(_)
+        | N::Compose(_)
+        | N::CollectionUnion(_)
+        | N::ExprStmt { .. }
+        | N::Begin { .. }
+        | N::Lambda { .. }
+        | N::Let { .. }
+        | N::LetRec { .. }
+        | N::For { .. }
+        | N::Case { .. } => {}
+    }
 }
 
 #[cfg(test)]
@@ -308,9 +503,8 @@ mod tests {
 
     /// One instance of **every** [`TypedExprNode`] variant.
     ///
-    /// [`variant_name`] is exhaustive, so a new variant fails to compile there
-    /// first; extend this corpus at the same time so the consistency checks
-    /// below actually cover it.
+    /// Completeness is *checked*, not merely prompted — see
+    /// [`corpus_covers_every_variant`].
     fn corpus() -> Vec<TypedExpr> {
         vec![
             int(1),
@@ -334,38 +528,9 @@ mod tests {
             }),
             TypedExpr::let_bind("l", var("bound"), var("l")),
             node(N::List(vec![var("e0"), var("e1")])),
-            node(N::Case {
-                scrutinee: Some(Box::new(var("s"))),
-                branches: vec![
-                    Branch {
-                        pattern: Some(Pattern {
-                            tag: "T".into(),
-                            binding: bind("payload"),
-                        }),
-                        guard: var("g0"),
-                        body: var("payload"),
-                    },
-                    Branch {
-                        pattern: None,
-                        guard: var("g1"),
-                        body: var("b1"),
-                    },
-                ],
-            }),
+            case_with_two_branches(),
             TypedExpr::variant_ctor("T", var("pl")),
-            node(N::Transact {
-                keys: vec![crate::ccl::TransactKey {
-                    name: Name::raw("k"),
-                    init: int(0),
-                }],
-                writers: vec![WriterSite {
-                    read_keys: vec![Name::raw("k")],
-                    write_keys: vec![Name::raw("k")],
-                    source: var("src"),
-                    body: var("wbody"),
-                }],
-                domain: Type::Txn,
-            }),
+            transact_one_key_one_writer(),
             TypedExpr::letrec(vec![(bind("f"), var("g")), (bind("g"), var("f"))], var("f")),
             node(N::For {
                 target: bind("t"),
@@ -399,47 +564,116 @@ mod tests {
         ]
     }
 
-    /// Labels a node for the assertion messages below, and — being exhaustive —
-    /// is the prompt to give [`corpus`] an instance of a newly-added variant.
-    /// Only a prompt: nothing here *proves* the corpus is complete (that would
-    /// need reflection over the enum). The guarantee that matters is
-    /// [`for_each_scoped_item`]'s own wildcard-free match, which refuses to
-    /// compile until a new variant declares its scope.
-    fn variant_name(node: &TypedExprNode) -> &'static str {
-        match node {
-            N::Lit(_) => "Lit",
-            N::Var(_) => "Var",
-            N::Builtin(_) => "Builtin",
-            N::Apply { .. } => "Apply",
-            N::Cast { .. } => "Cast",
-            N::BinOp { .. } => "BinOp",
-            N::UnaryOp(..) => "UnaryOp",
-            N::Lambda { .. } => "Lambda",
-            N::Aggregate { .. } => "Aggregate",
-            N::Let { .. } => "Let",
-            N::List(_) => "List",
-            N::Case { .. } => "Case",
-            N::VariantCtor { .. } => "VariantCtor",
-            N::Transact { .. } => "Transact",
-            N::LetRec { .. } => "LetRec",
-            N::For { .. } => "For",
-            N::Tuple(_) => "Tuple",
-            N::Record(_) => "Record",
-            N::Compose(_) => "Compose",
-            N::CollectionUnion(_) => "CollectionUnion",
-            N::ExprStmt { .. } => "ExprStmt",
-            N::Begin { .. } => "Begin",
-            N::Feed { .. } => "Feed",
-            N::Define { .. } => "Define",
-            N::MutWrite { .. } => "MutWrite",
-            N::Proj(_) => "Proj",
-            N::Source(_) => "Source",
-            N::Defer => "Defer",
-            N::Error => "Error",
-        }
+    /// A payload-binding branch followed by a payload-free one: the node that
+    /// alternates between a real scope and the ambient one.
+    fn case_with_two_branches() -> TypedExpr {
+        node(N::Case {
+            scrutinee: Some(Box::new(var("s"))),
+            branches: vec![
+                Branch {
+                    pattern: Some(Pattern {
+                        tag: "T".into(),
+                        binding: bind("payload"),
+                    }),
+                    guard: var("g0"),
+                    body: var("payload"),
+                },
+                Branch {
+                    pattern: None,
+                    guard: var("g1"),
+                    body: var("b1"),
+                },
+            ],
+        })
     }
 
-    /// The invariant [`for_each_scoped_child_mut`] rests on: the scoped walk
+    fn transact_one_key_one_writer() -> TypedExpr {
+        node(N::Transact {
+            keys: vec![crate::ccl::TransactKey {
+                name: Name::raw("k"),
+                init: int(0),
+            }],
+            writers: vec![WriterSite {
+                read_keys: vec![Name::raw("k")],
+                write_keys: vec![Name::raw("k")],
+                source: var("src"),
+                body: var("wbody"),
+            }],
+            domain: Type::Txn,
+        })
+    }
+
+    /// Declares `variant_name` and derives `VARIANT_COUNT` from the *same* arm
+    /// list, which is what turns corpus completeness from a prompt into a check:
+    /// a new [`TypedExprNode`] variant makes the match non-exhaustive, adding
+    /// the arm bumps the count, and the bumped count fails
+    /// [`corpus_covers_every_variant`] until [`corpus`] gains an instance.
+    macro_rules! variants {
+        ($($pat:pat => $name:literal),+ $(,)?) => {
+            /// Labels a node for the assertion messages below.
+            fn variant_name(node: &TypedExprNode) -> &'static str {
+                match node { $($pat => $name),+ }
+            }
+            /// The number of [`TypedExprNode`] variants, derived from the arm
+            /// list above rather than declared independently of it.
+            const VARIANT_COUNT: usize = [$($name),+].len();
+        };
+    }
+
+    variants! {
+        N::Lit(_) => "Lit",
+        N::Var(_) => "Var",
+        N::Builtin(_) => "Builtin",
+        N::Apply { .. } => "Apply",
+        N::Cast { .. } => "Cast",
+        N::BinOp { .. } => "BinOp",
+        N::UnaryOp(..) => "UnaryOp",
+        N::Lambda { .. } => "Lambda",
+        N::Aggregate { .. } => "Aggregate",
+        N::Let { .. } => "Let",
+        N::List(_) => "List",
+        N::Case { .. } => "Case",
+        N::VariantCtor { .. } => "VariantCtor",
+        N::Transact { .. } => "Transact",
+        N::LetRec { .. } => "LetRec",
+        N::For { .. } => "For",
+        N::Tuple(_) => "Tuple",
+        N::Record(_) => "Record",
+        N::Compose(_) => "Compose",
+        N::CollectionUnion(_) => "CollectionUnion",
+        N::ExprStmt { .. } => "ExprStmt",
+        N::Begin { .. } => "Begin",
+        N::Feed { .. } => "Feed",
+        N::Define { .. } => "Define",
+        N::MutWrite { .. } => "MutWrite",
+        N::Proj(_) => "Proj",
+        N::Source(_) => "Source",
+        N::Defer => "Defer",
+        N::Error => "Error",
+    }
+
+    /// Every consistency check below is only as good as the corpus, so the
+    /// corpus is checked too: one instance per variant, no duplicates (a second
+    /// `Apply` would otherwise mask a missing `Begin`).
+    #[test]
+    fn corpus_covers_every_variant() {
+        let mut names: Vec<&str> = corpus().iter().map(|e| variant_name(&e.node)).collect();
+        let instances = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            instances,
+            "the corpus has two instances of one variant, which would mask a missing one"
+        );
+        assert_eq!(
+            instances, VARIANT_COUNT,
+            "the corpus is missing a `TypedExprNode` variant — every variant needs an instance \
+             for the walk-consistency checks in this module to cover it"
+        );
+    }
+
+    /// The invariant [`for_each_scoped_item_mut`] rests on: the scoped walk
     /// yields exactly `walk_children`'s children, in order.
     #[test]
     fn child_enumeration_matches_walk_children() {
@@ -469,20 +703,10 @@ mod tests {
             let mut declared: Vec<*const TypedBinding> = Vec::new();
             e.walk_binders(|b| declared.push(b));
 
-            // Consecutive scopes: a binder list repeats across the children it
-            // covers, so dedup adjacent repeats to recover the declaration set.
-            let mut scoped: Vec<*const TypedBinding> = Vec::new();
-            let mut prev: Vec<*const TypedBinding> = Vec::new();
-            for_each_scoped_item(&e, &mut |item| {
-                if let ScopedItem::Child { binders, .. } = item {
-                    let here: Vec<*const TypedBinding> =
-                        binders.iter().map(|b| *b as *const _).collect();
-                    if here != prev {
-                        scoped.extend(here.iter().copied());
-                        prev = here;
-                    }
-                }
-            });
+            let scoped: Vec<*const TypedBinding> = scope_runs(&e)
+                .into_iter()
+                .flat_map(|s| s.iter().map(|b| b as *const _).collect::<Vec<_>>())
+                .collect();
             assert_eq!(
                 declared,
                 scoped,
@@ -492,44 +716,52 @@ mod tests {
         }
     }
 
+    /// The scopes a node opens, in child order, with each run collapsed to one
+    /// entry — the same grouping [`for_each_scoped_item_mut`] performs, and
+    /// well-defined only because a scope's children are consecutive.
+    fn scope_runs(e: &TypedExpr) -> Vec<Binders<'_>> {
+        let mut runs: Vec<Binders<'_>> = Vec::new();
+        for_each_scoped_item(e, &mut |item| {
+            if let ScopedItem::Child { binders, .. } = item
+                && !runs.last().is_some_and(|p| p.is_same_scope(binders))
+            {
+                runs.push(binders);
+            }
+        });
+        runs
+    }
+
     /// The consecutiveness invariant, which two things rest on:
-    /// `declared_binders_match_walk_binders` above recovers the declaration set
-    /// by deduping *adjacent* binder lists, and a consumer that carries
-    /// per-scope state may rebuild it only when the list changes. A node that
-    /// interleaved two scopes would break both. The ambient (empty) list is
-    /// exempt — it is not a scope the node opens, and a `Case` returns to it
-    /// whenever a branch binds no payload.
+    /// [`scope_runs`] recovers each scope by collapsing *adjacent* children, and
+    /// a consumer that carries per-scope state rebuilds it only when the scope
+    /// changes. A node that interleaved two scopes would break both. The
+    /// ambient scope is exempt — it is not a scope the node opens, and a `Case`
+    /// returns to it whenever a branch binds no payload.
     #[test]
     fn scopes_are_consecutive_and_entered_once() {
         for e in corpus() {
-            let mut runs: Vec<Vec<*const TypedBinding>> = Vec::new();
-            for_each_scoped_item(&e, &mut |item| {
-                if let ScopedItem::Child { binders, .. } = item {
-                    let here: Vec<*const TypedBinding> =
-                        binders.iter().map(|b| *b as *const _).collect();
-                    if runs.last() != Some(&here) {
-                        runs.push(here);
-                    }
-                }
-            });
-            let mut scoped: Vec<Vec<*const TypedBinding>> =
-                runs.into_iter().filter(|r| !r.is_empty()).collect();
-            let entered = scoped.len();
-            scoped.sort();
-            scoped.dedup();
+            let opened: Vec<Vec<*const TypedBinding>> = scope_runs(&e)
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.iter().map(|b| b as *const _).collect())
+                .collect();
+            let entered = opened.len();
+            let mut distinct = opened;
+            distinct.sort();
+            distinct.dedup();
             assert_eq!(
                 entered,
-                scoped.len(),
+                distinct.len(),
                 "a scope was re-entered after being left in `{}`",
                 variant_name(&e.node)
             );
         }
     }
 
-    /// The mutable adapter must hand each child the same binder names the
-    /// immutable walk scopes over it.
+    /// The mutable walk must hand each child the same binder names the
+    /// immutable walk scopes over it — the positional pairing both rest on.
     #[test]
-    fn mut_adapter_pairs_the_same_binders() {
+    fn mut_walk_pairs_the_same_binders() {
         for e in corpus() {
             let expected: Vec<Vec<Name>> = {
                 let mut v = Vec::new();
@@ -541,12 +773,70 @@ mod tests {
                 v
             };
             let mut actual: Vec<Vec<Name>> = Vec::new();
+            let mut scope: Vec<Name> = Vec::new();
             let mut e = e;
-            for_each_scoped_child_mut(&mut e, &mut |_, binders| actual.push(binders.to_vec()));
+            for_each_scoped_item_mut(&mut e, &mut |item| match item {
+                ScopedItemMut::Scope(names) => scope = names.to_vec(),
+                ScopedItemMut::Child(_) => actual.push(scope.clone()),
+                ScopedItemMut::VarRef(_) | ScopedItemMut::KeyRef(_) => {}
+            });
             assert_eq!(
                 expected,
                 actual,
-                "mut adapter diverged for `{}`",
+                "mut walk diverged for `{}`",
+                variant_name(&e.node)
+            );
+        }
+    }
+
+    /// A `Scope` item per *scope*, not per child. This is what lets a consumer
+    /// pay for a scope crossing once — substitution's Barendregt check walks
+    /// every replacement term, so per-child would make a `LetRec` group
+    /// quadratic in its width.
+    #[test]
+    fn one_scope_item_per_scope_run() {
+        for e in corpus() {
+            let expected = scope_runs(&e).len();
+            let mut opened = 0usize;
+            let mut e = e;
+            for_each_scoped_item_mut(&mut e, &mut |item| {
+                if matches!(item, ScopedItemMut::Scope(_)) {
+                    opened += 1;
+                }
+            });
+            assert_eq!(
+                expected,
+                opened,
+                "`{}` opened {opened} scopes for {expected} runs",
+                variant_name(&e.node)
+            );
+        }
+    }
+
+    /// The mutable walk's own exhaustive name match must surface exactly the
+    /// occurrences the immutable one declares — the agreement that lets
+    /// substitution retarget a renamed handle by folding over the walk instead
+    /// of re-deriving the set behind a wildcard.
+    #[test]
+    fn mut_walk_surfaces_the_same_names() {
+        for e in corpus() {
+            let mut expected: Vec<(&str, Name)> = Vec::new();
+            for_each_scoped_item(&e, &mut |item| match item {
+                ScopedItem::VarRef(n) => expected.push(("var", n.clone())),
+                ScopedItem::KeyRef(n) => expected.push(("key", n.clone())),
+                ScopedItem::Child { .. } => {}
+            });
+            let mut actual: Vec<(&str, Name)> = Vec::new();
+            let mut e = e;
+            for_each_scoped_item_mut(&mut e, &mut |item| match item {
+                ScopedItemMut::VarRef(n) => actual.push(("var", n.clone())),
+                ScopedItemMut::KeyRef(n) => actual.push(("key", n.clone())),
+                ScopedItemMut::Scope(_) | ScopedItemMut::Child(_) => {}
+            });
+            assert_eq!(
+                expected,
+                actual,
+                "name occurrences diverged for `{}`",
                 variant_name(&e.node)
             );
         }
@@ -595,24 +885,7 @@ mod tests {
         );
         // Case: the pattern binder covers its own branch only.
         assert_eq!(
-            binders_of(&node(N::Case {
-                scrutinee: Some(Box::new(var("s"))),
-                branches: vec![
-                    Branch {
-                        pattern: Some(Pattern {
-                            tag: "T".into(),
-                            binding: bind("payload"),
-                        }),
-                        guard: var("g0"),
-                        body: var("payload"),
-                    },
-                    Branch {
-                        pattern: None,
-                        guard: var("g1"),
-                        body: var("b1"),
-                    },
-                ],
-            })),
+            binders_of(&case_with_two_branches()),
             vec![
                 Vec::<String>::new(),
                 vec!["payload".to_string()],
@@ -638,19 +911,7 @@ mod tests {
             });
         };
         record(&TypedExpr::feed("d", var("v")));
-        record(&node(N::Transact {
-            keys: vec![crate::ccl::TransactKey {
-                name: Name::raw("k"),
-                init: int(0),
-            }],
-            writers: vec![WriterSite {
-                read_keys: vec![Name::raw("k")],
-                write_keys: vec![Name::raw("k")],
-                source: var("src"),
-                body: var("wbody"),
-            }],
-            domain: Type::Txn,
-        }));
+        record(&transact_one_key_one_writer());
         assert_eq!(vars, vec!["d".to_string()]);
         assert_eq!(
             keys,

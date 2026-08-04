@@ -461,7 +461,7 @@ fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<Predi
             expr: child,
             binders,
         } => {
-            if !binders.iter().any(|b| &b.name == name) {
+            if !binders.shadows(name) {
                 in_node += count_free_with_visited(name, child, visited);
             }
         }
@@ -504,7 +504,7 @@ fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
             expr: child,
             binders,
         } => {
-            if !binders.iter().any(|b| &b.name == name) {
+            if !binders.shadows(name) {
                 sum += count_free_in_value(name, child);
             }
         }

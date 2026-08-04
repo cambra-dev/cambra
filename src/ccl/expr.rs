@@ -1660,7 +1660,7 @@ impl TypedExpr {
     /// Does this node declare any binder? The cheap half of
     /// [`walk_binders`](Self::walk_binders), for callers that only need to know
     /// whether a node opens a scope at all (see
-    /// [`crate::ccl::scope::for_each_scoped_child_mut`], which skips its
+    /// [`crate::ccl::scope::for_each_scoped_item_mut`], which skips its
     /// scope-collection pass entirely for the overwhelmingly common node that
     /// binds nothing).
     pub fn binds_any(&self) -> bool {

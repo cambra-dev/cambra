@@ -51,7 +51,7 @@ Renaming happens at the name level only — the tree shape is untouched, so this
 
 ### Binding structure lives in one place
 
-Which children a node's binders scope over is stated once, in `ccl/scope.rs`'s `for_each_scoped_item`: it visits each direct child paired with the binders in scope for it, plus the name *occurrences* the node makes itself. Every scope-aware walk in the crate is a fold over it — free-occurrence counting (`ccl_utils`'s `count_free`, `count_free_in_value`), free-variable collection (`subst`'s `collect_expr_fv`), and capture-avoiding substitution (`Subst::rewrite_expr`, via the `for_each_scoped_child_mut` adapter).
+Which children a node's binders scope over is stated once, in `ccl/scope.rs`'s `for_each_scoped_item`: it visits each direct child paired with the binders in scope for it, plus the name *occurrences* the node makes itself. Every scope-aware walk in the crate is a fold over it — free-occurrence counting (`ccl_utils`'s `count_free`, `count_free_in_value`), free-variable collection (`subst`'s `collect_expr_fv`), and capture-avoiding substitution (`Subst::rewrite_expr`, via the `for_each_scoped_item_mut` adapter).
 
 The rules themselves:
 
@@ -63,11 +63,17 @@ The rules themselves:
 - `Feed` / `Define` / `MutWrite` — the `name` field is a *use* of the binder it names, not a binder.
 - `Transact` — introduces no binder; its keys are labels of the register record the node denotes, so they are surfaced as a distinct occurrence kind that free-*variable* analyses skip while an identity-sensitive consumer still folds them in.
 
-The walk's `match` is exhaustive with **no wildcard arm**, deliberately: before this existed, the walkers ended in `_ => walk_children(..)`, so a new binding form compiled clean in all of them and silently got the wrong scope in every one. Now it is a compile error until the new form declares its scope. `TypedExpr::walk_binders` — the enumeration of binding *slots*, which the scoped walk is checked against and which `uniquify`'s post-pass mint assertion runs on — is exhaustive for the same reason: a wildcard there would let a new binding form be invisible to the assertion that is supposed to catch a forgotten mint, which is the same failure mode one layer down.
+Every `match` that decides one of these rules is exhaustive with **no wildcard arm**, deliberately: before this existed, the walkers ended in `_ => walk_children(..)`, so a new binding form compiled clean in all of them and silently got the wrong scope in every one. Now it is a compile error until the new form declares its scope. That covers three matches, each closing the same failure mode at a different layer:
+
+- `for_each_scoped_item` — which children each binder scopes over.
+- `for_each_scoped_item_mut`'s name half — which names a node mentions of its own, so that a rename retargets a new node's name reference instead of walking past it. Its agreement with the immutable walk is a corpus test.
+- `TypedExpr::walk_binders` — the enumeration of binding *slots*, which the scoped walk is checked against and which `uniquify`'s post-pass mint assertion runs on. A wildcard here would let a new binding form be invisible to the assertion that is supposed to catch a forgotten mint.
 
 Two passes stay outside the fold and say why in their own docs: `ccl/uniquify.rs` *mints* binders rather than observing them, and substitution's transport mode (`Subst::apply_expr_inner`) rebuilds nodes rather than walking them.
 
-Consumers may rely on three properties of the walk, each asserted in `scope.rs`'s tests: the `Child` items come in `walk_children` order (so the `&mut` adapter can pair binder lists positionally), the binders it declares are exactly `walk_binders`', and a scope's children are consecutive with a binder-introducing scope entered only once. The last is what lets a consumer build per-scope state once per scope rather than once per child — `Subst::shadow_all` restricting a substitution across a `LetRec` group, for instance, which borrows instead of cloning whenever the group names nothing the substitution acts on.
+A scope is a type, `Binders`, not a collected list of binder references: it borrows the node's binder slots in place, so the walk allocates nothing even for a `LetRec` group — which matters because it sits under `is_free`, and substitution consults that once per mapped binder per node. `Binders` also owns `shadows`, the question every consumer actually asks, so "does this scope shadow this name" is answered once rather than at each fold.
+
+Consumers may rely on three properties of the walk, each asserted in `scope.rs`'s tests: the `Child` items come in `walk_children` order (so the `&mut` walk can pair scopes with children positionally), the binders it declares are exactly `walk_binders`', and a scope's children are consecutive with a binder-introducing scope entered only once. The last is what lets a consumer build per-scope state once per scope rather than once per child, and the `&mut` walk hands it the change point directly, as a `Scope` item ahead of the run of children it covers. Substitution needs both halves of that: restricting the substitution across the scope (`Subst::shadow_all`, which borrows instead of cloning whenever the scope names nothing the substitution acts on) and the Barendregt no-capture check, which is release-active and walks every replacement term — so a `LetRec` group of *n* binders owes *n* checks, and paying per child instead would cost *n*(*n*+1).
 
 ### Application shape
 
