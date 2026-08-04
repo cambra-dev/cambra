@@ -595,7 +595,12 @@ total",
 // *written* value (1+2 = 3), not undercount because the changelog's last change
 // tick sits below the position watermark — the terminality-vs-watermark fix.
 #[case(
-    "total := 0\nfor x in [1, 2, 3, 4, 5]:\n    if x < 3:\n        total += x\ntotal",
+    r"
+total := 0
+for x in [1, 2, 3, 4, 5]:
+    if x < 3:
+        total += x
+total",
     3
 )]
 // A **partial op** (`//`) in the written value, guarded away from its bad input.
