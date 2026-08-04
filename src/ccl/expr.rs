@@ -1483,13 +1483,18 @@ impl TypedExpr {
     /// child expressions.
     ///
     /// This is the single source of truth for "which nodes bind names", so a
-    /// pass that must cover every binder's type slot (a type-erasing pass, an
-    /// α-renamer) enumerates them here rather than re-deriving the set — adding
-    /// a new binding node updates this one match instead of every such pass.
-    /// Immutable analog of [`walk_binders_mut`](Self::walk_binders_mut): visit
-    /// each `TypedBinding` this node declares (the single source of truth for
-    /// binder-slot coverage, for read-only passes). Kept in lockstep with the
-    /// mutable version — any new binder-bearing variant must appear in both.
+    /// pass that must cover every binder's slot (a type-erasing pass, an
+    /// α-renamer, `uniquify`'s post-pass mint check) enumerates them here rather
+    /// than re-deriving the set. The match is **exhaustive with no wildcard
+    /// arm**, deliberately and for the same reason
+    /// [`crate::ccl::scope::for_each_scoped_item`] is: a `_ => {}` catch-all
+    /// would make a newly-added binding form silently invisible to every such
+    /// pass, which is exactly the failure mode both walks exist to prevent.
+    /// Whether the two agree on the declaration set is a test in
+    /// `crate::ccl::scope`.
+    ///
+    /// Immutable analog of [`walk_binders_mut`](Self::walk_binders_mut), which
+    /// is kept in lockstep — a new binder-bearing variant appears in both.
     pub fn walk_binders(&self, mut f: impl FnMut(&TypedBinding)) {
         match &self.node {
             TypedExprNode::Lambda { param, .. }
@@ -1505,10 +1510,36 @@ impl TypedExpr {
                     }
                 }
             }
-            _ => {}
+            // Declares no binder. Enumerated rather than wildcarded — see above.
+            TypedExprNode::Lit(_)
+            | TypedExprNode::Var(_)
+            | TypedExprNode::Builtin(_)
+            | TypedExprNode::Proj(_)
+            | TypedExprNode::Source(_)
+            | TypedExprNode::Defer
+            | TypedExprNode::Error
+            | TypedExprNode::Apply { .. }
+            | TypedExprNode::Cast { .. }
+            | TypedExprNode::BinOp { .. }
+            | TypedExprNode::UnaryOp(..)
+            | TypedExprNode::Aggregate { .. }
+            | TypedExprNode::VariantCtor { .. }
+            | TypedExprNode::List(_)
+            | TypedExprNode::Tuple(_)
+            | TypedExprNode::Record(_)
+            | TypedExprNode::Compose(_)
+            | TypedExprNode::CollectionUnion(_)
+            | TypedExprNode::ExprStmt { .. }
+            | TypedExprNode::Begin { .. }
+            | TypedExprNode::Feed { .. }
+            | TypedExprNode::Define { .. }
+            | TypedExprNode::MutWrite { .. }
+            | TypedExprNode::Transact { .. } => {}
         }
     }
 
+    /// Mutable analog of [`walk_binders`](Self::walk_binders) — same
+    /// declaration set, same deliberate exhaustiveness.
     pub fn walk_binders_mut(&mut self, mut f: impl FnMut(&mut TypedBinding)) {
         match &mut self.node {
             TypedExprNode::Lambda { param, .. }
@@ -1524,7 +1555,32 @@ impl TypedExpr {
                     }
                 }
             }
-            _ => {}
+            // Declares no binder. Enumerated rather than wildcarded — see
+            // [`walk_binders`](Self::walk_binders).
+            TypedExprNode::Lit(_)
+            | TypedExprNode::Var(_)
+            | TypedExprNode::Builtin(_)
+            | TypedExprNode::Proj(_)
+            | TypedExprNode::Source(_)
+            | TypedExprNode::Defer
+            | TypedExprNode::Error
+            | TypedExprNode::Apply { .. }
+            | TypedExprNode::Cast { .. }
+            | TypedExprNode::BinOp { .. }
+            | TypedExprNode::UnaryOp(..)
+            | TypedExprNode::Aggregate { .. }
+            | TypedExprNode::VariantCtor { .. }
+            | TypedExprNode::List(_)
+            | TypedExprNode::Tuple(_)
+            | TypedExprNode::Record(_)
+            | TypedExprNode::Compose(_)
+            | TypedExprNode::CollectionUnion(_)
+            | TypedExprNode::ExprStmt { .. }
+            | TypedExprNode::Begin { .. }
+            | TypedExprNode::Feed { .. }
+            | TypedExprNode::Define { .. }
+            | TypedExprNode::MutWrite { .. }
+            | TypedExprNode::Transact { .. } => {}
         }
     }
 
@@ -1599,6 +1655,18 @@ impl TypedExpr {
                 f(annotation);
             }
         });
+    }
+
+    /// Does this node declare any binder? The cheap half of
+    /// [`walk_binders`](Self::walk_binders), for callers that only need to know
+    /// whether a node opens a scope at all (see
+    /// [`crate::ccl::scope::for_each_scoped_item_mut`], which skips its
+    /// scope-collection pass entirely for the overwhelmingly common node that
+    /// binds nothing).
+    pub fn binds_any(&self) -> bool {
+        let mut binds = false;
+        self.walk_binders(|_| binds = true);
+        binds
     }
 
     /// Mutable analog of [`fold_children`](Self::fold_children).

@@ -51,11 +51,15 @@
 //! correct — acting differently in different scopes is the whole job of a
 //! substitution, so scope cannot be left out of the key.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, is_free};
 use crate::ccl::provenance::NodeId;
+use crate::ccl::scope::{
+    ScopedItem, ScopedItemMut, for_each_scoped_item, for_each_scoped_item_mut,
+};
 use crate::ccl::{Branch, Name, PredicateId, Type, TypedExpr, TypedExprNode};
 
 /// A term binder name.
@@ -506,9 +510,7 @@ impl Subst {
                 // Mutual recursion: every group binder is in scope in every
                 // binding body AND the letrec body, so all of them shadow the
                 // substitution throughout the group.
-                let inner = bindings
-                    .iter()
-                    .fold(self.clone(), |s, (b, _)| s.shadow(&b.name));
+                let inner = self.shadow_all(bindings.iter().map(|(b, _)| &b.name));
                 LetRec {
                     bindings: bindings
                         .iter()
@@ -527,11 +529,9 @@ impl Subst {
                     .iter()
                     .map(|b| {
                         // A structural pattern binds its payload name inside the
-                        // branch's guard and body.
-                        let inner = match &b.pattern {
-                            Some(p) => self.shadow(&p.binding.name),
-                            None => self.clone(),
-                        };
+                        // branch's guard and body; a guard-only branch binds
+                        // nothing, which `shadow_all` handles as the empty scope.
+                        let inner = self.shadow_all(b.pattern.iter().map(|p| &p.binding.name));
                         Branch {
                             pattern: b.pattern.clone(),
                             guard: inner.apply_expr(&b.guard),
@@ -575,18 +575,30 @@ impl Subst {
         (self.handle_target(name), Box::new(self.apply_expr(value)))
     }
 
-    /// The handle-rename half of [`Self::apply_handle_use`], shared with the
-    /// in-place mode: rename through var-shaped mappings, keep the name on a
-    /// non-variable discharge.
-    fn handle_target(&self, name: &Name) -> Name {
-        match self.0.get(name) {
-            None => name.clone(),
-            Some(Mapping::Rename(to)) => to.clone(),
-            Some(Mapping::Discharge(t)) => match &t.node {
-                TypedExprNode::Var(n) => n.clone(),
-                _ => name.clone(),
+    /// The name this substitution retargets a *name position* to, or `None` when
+    /// it leaves the position alone: an unmapped name, or one mapped to a
+    /// non-variable term (a handle or a channel domain can only hold a name, so
+    /// a compound discharge has nothing to write there — see the `Feed` arm of
+    /// [`Self::apply_expr_inner`]).
+    ///
+    /// Distinguishing "unchanged" from "changed to the same thing" is what lets
+    /// the in-place mode visit every name occurrence in the tree without a
+    /// [`Name`] clone per node.
+    fn retarget(&self, name: &Name) -> Option<Name> {
+        match self.0.get(name)? {
+            Mapping::Rename(to) => Some(to.clone()),
+            Mapping::Discharge(t) => match &t.node {
+                TypedExprNode::Var(n) => Some(n.clone()),
+                _ => None,
             },
         }
+    }
+
+    /// The handle-rename half of [`Self::apply_handle_use`], shared with the
+    /// type-slot walks: [`Self::retarget`] with the unchanged case spelled out
+    /// as the original name, for the rebuilding callers that need a value.
+    fn handle_target(&self, name: &Name) -> Name {
+        self.retarget(name).unwrap_or_else(|| name.clone())
     }
 
     /// Apply this substitution to a term **in place** — the pass-level mode
@@ -664,110 +676,66 @@ impl Subst {
         // unrestricted substitution is the right one for it, and the binder
         // crossings below still only guard the children.
         e.walk_type_slots_mut(|ty| self.rewrite_type_go(ty, memo));
-        match &mut e.node {
-            TypedExprNode::Var(_) => {}
 
-            TypedExprNode::Cast { value, .. } => {
-                self.rewrite_expr_go(value, memo);
-            }
-
-            TypedExprNode::Feed { name, value }
-            | TypedExprNode::Define { name, value }
-            | TypedExprNode::MutWrite { name, value } => {
-                *name = self.handle_target(name);
-                self.rewrite_expr_go(value, memo);
-            }
-
-            TypedExprNode::Lambda { param, body } => {
-                // `param.ty` was rewritten with the node's other type slots above
-                // — it is an independent `Rc` from the one on `e.ty`'s `Fun`
-                // domain, so it needs its own visit. Only the body is under the
-                // binder.
-                self.under_binder_mut(&param.name, body, memo);
-            }
-
-            TypedExprNode::For { target, iter, body } => {
-                self.rewrite_expr_go(iter, memo);
-                self.under_binder_mut(&target.name, body, memo);
-            }
-
-            TypedExprNode::Let {
-                binding,
-                bound_expr,
-                body,
-            } => {
-                self.rewrite_expr_go(bound_expr, memo);
-                self.under_binder_mut(&binding.name, body, memo);
-            }
-
-            TypedExprNode::LetRec { bindings, body } => {
-                // Every group binder scopes every binding body and the letrec
-                // body (mutual recursion) — shadow them all before descending
-                // anywhere inside the group.
-                let inner = bindings
-                    .iter()
-                    .fold(self.clone(), |s, (b, _)| s.shadow(&b.name));
-                for (b, _) in bindings.iter() {
-                    inner.assert_no_capture(&b.name);
-                }
-                for (_, def) in bindings.iter_mut() {
-                    inner.rewrite_expr_go(def, memo);
-                }
-                inner.rewrite_expr_go(body, memo);
-            }
-
-            TypedExprNode::Case {
-                scrutinee,
-                branches,
-            } => {
-                if let Some(sc) = scrutinee {
-                    self.rewrite_expr_go(sc, memo);
-                }
-                for b in branches.iter_mut() {
-                    let inner = match &b.pattern {
-                        Some(p) => self.shadow(&p.binding.name),
-                        None => self.clone(),
-                    };
-                    if let Some(p) = &b.pattern {
-                        inner.assert_no_capture(&p.binding.name);
-                    }
-                    inner.rewrite_expr_go(&mut b.guard, memo);
-                    inner.rewrite_expr_go(&mut b.body, memo);
+        // Capture-avoiding descent, plus the node's own name occurrences. Which
+        // children a binder scopes over, and which names a node mentions of its
+        // own, are not decided here — `crate::ccl::scope` is the crate's one
+        // statement of CCL's binding structure, and folding over it is what
+        // keeps a newly-added node from silently escaping both.
+        //
+        // The restriction and its Barendregt check are per *scope*, not per
+        // child: the walk opens a scope once for the whole run of children it
+        // covers, so a `LetRec` group of n binders pays n checks rather than
+        // n * (n + 1). Each check walks every `Discharge` replacement term, so
+        // per-child would be quadratic in the group's width. An ambient scope
+        // needs no special case: `shadow_all` borrows and the recursive call is
+        // the unrestricted one.
+        //
+        // Inertness is *not* pre-tested here. The recursive call opens with the
+        // same test against the same substitution, so testing it here would walk
+        // every child subtree twice — and returning early on it would skip the
+        // Barendregt assertion, which is the tripwire for a broken
+        // uid-preservation invariant and should fire wherever the binder is
+        // crossed, not only where the substitution happens to be live.
+        let mut scoped: Cow<'_, Subst> = Cow::Borrowed(self);
+        for_each_scoped_item_mut(e, &mut |item| match item {
+            ScopedItemMut::Scope(binders) => {
+                scoped = self.shadow_all(binders);
+                for b in binders {
+                    scoped.assert_no_capture(b);
                 }
             }
-
-            TypedExprNode::Compose(elts) => {
-                for el in elts.iter_mut() {
-                    self.rewrite_expr_go(el, memo);
-                }
-                // Recompute the chain type from the rewritten ends, when both
-                // are concrete enough to read.
-                if let (Some(first), Some(last)) = (elts.first(), elts.last())
-                    && let (Some(d), Some(c)) = (first.ty.domain(), last.ty.codomain())
-                {
-                    e.ty = Type::fun(d, c);
+            ScopedItemMut::Child(child) => scoped.rewrite_expr_go(child, memo),
+            // A handle node's write target is a *use* of the binder that
+            // introduced it, so a var-shaped mapping retargets it. (A `Var`
+            // occurrence the substitution maps never reaches here — it was
+            // replaced wholesale above — and `retarget` leaves an unmapped one
+            // alone without so much as a clone.)
+            ScopedItemMut::VarRef(name) => {
+                if let Some(to) = self.retarget(name) {
+                    *name = to;
                 }
             }
+            // A register key is a field label, not a variable occurrence:
+            // nothing a term substitution acts on.
+            ScopedItemMut::KeyRef(_) => {}
+        });
 
-            // No binders introduced: recurse structurally into child terms.
-            _ => e.walk_children_mut(|c| self.rewrite_expr_go(c, memo)),
+        // `Compose`'s type is derived from its elements, so rewriting them can
+        // concretize it (substituting a `Var` whose type was a placeholder).
+        if let TypedExprNode::Compose(elts) = &e.node
+            && let (Some(first), Some(last)) = (elts.first(), elts.last())
+            && let (Some(d), Some(c)) = (first.ty.domain(), last.ty.codomain())
+        {
+            e.ty = Type::fun(d, c);
         }
-    }
-
-    /// In-place analogue of [`Self::under_binder`]: shadow, assert
-    /// no-capture, recurse into the binder's scope.
-    fn under_binder_mut(&self, binder: &Name, body: &mut TypedExpr, memo: &PredMemo<Subst>) {
-        let restricted = self.shadow(binder);
-        if !restricted.0.keys().any(|k| is_free(k, body)) {
-            return;
-        }
-        restricted.assert_no_capture(binder);
-        restricted.rewrite_expr_go(body, memo);
     }
 
     /// The Barendregt no-capture invariant at a binder crossing (see
     /// [`Self::under_binder`] for why capture is impossible by convention).
     fn assert_no_capture(&self, binder: &Name) {
+        #[cfg(test)]
+        capture_assert_probe::bump();
         assert!(
             !self.range_mentions(binder),
             "Barendregt violation: substitution range mentions binder `{binder:?}` it passes \
@@ -950,6 +918,31 @@ impl Subst {
         let mut m = self.0.clone();
         m.remove(binder);
         Subst(m)
+    }
+
+    /// This substitution restricted so it acts on **none** of `binders` — the
+    /// whole-scope form of [`Self::shadow`], for the nodes whose binders scope
+    /// over a child as a group (a `LetRec`'s mutual-recursion group, a `Case`
+    /// branch's payload, an empty list for a child in the node's own scope).
+    ///
+    /// Returns a borrow when the restriction is vacuous, which is the common
+    /// case: a substitution's domain is usually a single binder and the scope
+    /// being crossed usually does not name it. Folding [`Self::shadow`] over the
+    /// group instead would clone the map once per binder even on a miss, since
+    /// `shadow` returns an owned `Subst`.
+    ///
+    /// The `contains_key` guard is what makes that true and is therefore
+    /// load-bearing, not a micro-optimization: `to_mut()` on a `Cow::Borrowed`
+    /// clones unconditionally, so calling it before knowing there is something to
+    /// remove would allocate on every crossing and the `Cow` would buy nothing.
+    pub fn shadow_all<'a>(&self, binders: impl IntoIterator<Item = &'a Name>) -> Cow<'_, Subst> {
+        let mut out = Cow::Borrowed(self);
+        for b in binders {
+            if out.0.contains_key(b) {
+                out.to_mut().0.remove(b);
+            }
+        }
+        out
     }
 
     /// Apply this substitution to a **type**, rewriting the term binders that
@@ -1142,11 +1135,11 @@ fn collect_type_fv(
     }
 }
 
-/// Collect the free term-variable names of an expression, respecting the
-/// binders introduced by lambdas / `let`s / loops / match arms (mirrors the
-/// shadowing rules of [`crate::ccl::ccl_utils::count_free`]). Also descends
-/// into each sub-expression's type slot, since predicate sub-terms may carry
-/// further refinements.
+/// Collect the free term-variable names of an expression — the accumulating
+/// dual of [`crate::ccl::ccl_utils::count_free`]'s by-name query, and the same
+/// fold over [`crate::ccl::scope::for_each_scoped_item`], so the two cannot
+/// disagree about what binds where. Also descends into each sub-expression's
+/// type slot, since predicate sub-terms may carry further refinements.
 fn collect_expr_fv(
     e: &TypedExpr,
     bound: &mut BTreeSet<Binder>,
@@ -1154,72 +1147,23 @@ fn collect_expr_fv(
     out: &mut BTreeSet<Binder>,
 ) {
     collect_type_fv(&e.ty, bound, visited, out);
-    match &e.node {
-        TypedExprNode::Var(n) => {
+    for_each_scoped_item(e, &mut |item| match item {
+        ScopedItem::VarRef(n) => {
             if !bound.contains(n) {
                 out.insert(n.clone());
             }
         }
-        TypedExprNode::Lambda { param, body } => {
-            with_binders(bound, [param.name.clone()], |bnd| {
-                collect_expr_fv(body, bnd, visited, out)
-            });
-        }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
+        // A register key is a field label, not a variable occurrence.
+        ScopedItem::KeyRef(_) => {}
+        ScopedItem::Child {
+            expr: child,
+            binders,
         } => {
-            collect_expr_fv(bound_expr, bound, visited, out);
-            with_binders(bound, [binding.name.clone()], |bnd| {
-                collect_expr_fv(body, bnd, visited, out)
+            with_binders(bound, binders.iter().map(|b| b.name.clone()), |bnd| {
+                collect_expr_fv(child, bnd, visited, out)
             });
         }
-        // Mutual recursion: every group binder is bound in every binding
-        // body and in the letrec body.
-        TypedExprNode::LetRec { bindings, body } => {
-            with_binders(bound, bindings.iter().map(|(b, _)| b.name.clone()), |bnd| {
-                for (_, def) in bindings {
-                    collect_expr_fv(def, bnd, visited, out);
-                }
-                collect_expr_fv(body, bnd, visited, out);
-            });
-        }
-        // The `name` of Feed/Define/MutWrite is a *use* of the defer handle
-        // / mutable variable.
-        TypedExprNode::Feed { name, value }
-        | TypedExprNode::Define { name, value }
-        | TypedExprNode::MutWrite { name, value } => {
-            if !bound.contains(name) {
-                out.insert(name.clone());
-            }
-            collect_expr_fv(value, bound, visited, out);
-        }
-        // The loop target binds only in the body.
-        TypedExprNode::For { target, iter, body } => {
-            collect_expr_fv(iter, bound, visited, out);
-            with_binders(bound, [target.name.clone()], |bnd| {
-                collect_expr_fv(body, bnd, visited, out);
-            });
-        }
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            if let Some(s) = scrutinee {
-                collect_expr_fv(s, bound, visited, out);
-            }
-            for b in branches {
-                let payload = b.pattern.iter().map(|p| p.binding.name.clone());
-                with_binders(bound, payload, |bnd| {
-                    collect_expr_fv(&b.guard, bnd, visited, out);
-                    collect_expr_fv(&b.body, bnd, visited, out);
-                });
-            }
-        }
-        // No binders introduced: recurse structurally into child terms.
-        _ => e.walk_children(|c| collect_expr_fv(c, bound, visited, out)),
-    }
+    });
 }
 
 /// A type is well-formed in context `ctx` iff every free term variable of its
@@ -1227,6 +1171,33 @@ fn collect_expr_fv(
 /// proposal (§6.2) is exactly this check.
 pub fn well_formed(ty: &Type, ctx: &BTreeSet<Binder>) -> bool {
     type_free_vars(ty).is_subset(ctx)
+}
+
+/// Counts [`Subst::assert_no_capture`] calls, so a test can assert *how many
+/// times* a descent pays for the Barendregt check rather than only that it
+/// passes. The check is release-active and walks every replacement term, so
+/// "once per scope crossed" is a cost invariant, not a detail — see
+/// `letrec_pays_the_capture_check_once_per_binder_not_once_per_child`.
+///
+/// Thread-local, because `cargo test` runs tests concurrently in one process.
+#[cfg(test)]
+mod capture_assert_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Run `body`, returning how many capture assertions it performed.
+    pub fn count(body: impl FnOnce()) -> usize {
+        COUNT.with(|c| c.set(0));
+        body();
+        COUNT.with(Cell::get)
+    }
 }
 
 #[cfg(test)]
@@ -1451,7 +1422,7 @@ mod tests {
 mod rewrite_tests {
     use super::*;
     use crate::ccl::ccl_utils::is_free;
-    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement};
+    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement, TypedBinding};
     use std::rc::Rc;
 
     fn var(s: &str) -> TypedExpr {
@@ -1597,5 +1568,139 @@ mod rewrite_tests {
             &Name::raw("d"),
             "a non-variable discharge keeps the handle for UnboundDeferHandle to report"
         );
+    }
+
+    // ---- Barendregt-check cost at a binder crossing -------------------------
+    //
+    // `assert_no_capture` is a *release-active* `assert!` whose `range_mentions`
+    // does a full `is_free` walk of every `Discharge` replacement term, so what
+    // it is paid *per* is a cost invariant. The scoped walk opens a scope once
+    // for the whole run of children it covers, and the descent restricts and
+    // checks there; asserting inside a per-child callback instead is quadratic
+    // in a scope's width, which is what these pin.
+
+    /// A `LetRec` group of *n* binders opens **one** scope covering *n*+1
+    /// children (each definition, plus the body), so the no-capture check is
+    /// owed *n* times — once per binder of the one scope crossed.
+    #[test]
+    fn letrec_pays_the_capture_check_once_per_binder_not_once_per_child() {
+        for n in [1usize, 4, 8] {
+            let bindings: Vec<_> = (0..n)
+                .map(|i| {
+                    (
+                        TypedBinding::new_unannotated(format!("f{i}")),
+                        int(i as i64),
+                    )
+                })
+                .collect();
+            let mut e = TypedExpr::letrec(bindings, var("x"));
+            let subst = Subst::discharge("x", int(0));
+
+            let asserts = capture_assert_probe::count(|| subst.rewrite_expr(&mut e));
+
+            assert_eq!(
+                asserts,
+                n,
+                "a {n}-binder letrec crosses one scope, so it owes {n} capture checks; \
+                 checking per child instead costs n*(n+1) = {}",
+                n * (n + 1)
+            );
+        }
+    }
+
+    /// A `Case` branch's payload binder opens one scope covering the branch's
+    /// guard *and* body — one scope, so one check, not one per child.
+    #[test]
+    fn case_pays_the_capture_check_once_per_branch_not_once_per_child() {
+        let branch = |tag: &str, payload: &str| Branch {
+            pattern: Some(crate::ccl::Pattern {
+                tag: tag.into(),
+                binding: TypedBinding::new_unannotated(payload),
+            }),
+            guard: int(1),
+            body: int(2),
+        };
+        let mut e = TypedExpr::new(TypedExprNode::Case {
+            scrutinee: Some(Box::new(var("x"))),
+            branches: vec![branch("A", "pa"), branch("B", "pb")],
+        });
+        let subst = Subst::discharge("x", int(0));
+
+        let asserts = capture_assert_probe::count(|| subst.rewrite_expr(&mut e));
+
+        assert_eq!(
+            asserts, 2,
+            "two payload-binding branches cross two scopes, so two capture checks; \
+             checking per child costs four (guard + body each)"
+        );
+    }
+
+    /// The descent does not pre-test inertness before crossing a binder, so the
+    /// crossing is checked wherever the binder is crossed and not only where the
+    /// substitution is still live in the body. `for y in x do 1` is live at the
+    /// node (`x` is in `iter`) and inert in the body, and the range mentions
+    /// `y`, so the tripwire must fire.
+    #[test]
+    #[should_panic(expected = "Barendregt violation")]
+    fn a_binder_crossing_is_checked_even_when_the_body_is_inert() {
+        let mut e = TypedExpr::new(TypedExprNode::For {
+            target: TypedBinding::new_unannotated("y"),
+            iter: Box::new(var("x")),
+            body: Box::new(int(1)),
+        });
+        Subst::discharge("x", var("y")).rewrite_expr(&mut e);
+    }
+
+    /// Substitution retargets every variable occurrence the scoped walk
+    /// surfaces. `crate::ccl::scope`'s corpus test checks the two walks agree on
+    /// what those occurrences *are*; this checks the descent acts on all of
+    /// them — the end-to-end half, across `Var` and the three handle nodes.
+    #[test]
+    fn a_rename_retargets_every_varref_the_scoped_walk_surfaces() {
+        use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
+
+        let handle_nodes = [
+            TypedExpr::new(TypedExprNode::Feed {
+                name: Name::raw("h"),
+                value: Box::new(int(1)),
+            }),
+            TypedExpr::new(TypedExprNode::Define {
+                name: Name::raw("h"),
+                value: Box::new(int(1)),
+            }),
+            TypedExpr::new(TypedExprNode::MutWrite {
+                name: Name::raw("h"),
+                value: Box::new(int(1)),
+            }),
+            var("h"),
+        ];
+
+        for original in handle_nodes {
+            let before: Vec<Name> = varrefs(&original);
+            assert!(
+                before.contains(&Name::raw("h")),
+                "corpus node must surface `h` as a VarRef"
+            );
+
+            let mut renamed = original.clone();
+            Subst::rename("h", "h2").rewrite_expr(&mut renamed);
+
+            assert!(
+                !varrefs(&renamed).contains(&Name::raw("h")),
+                "a rename left an occurrence of `h` behind in `{:?}` — the scoped walk \
+                 declares it a variable use, so substitution must retarget it",
+                original.node
+            );
+        }
+
+        fn varrefs(e: &TypedExpr) -> Vec<Name> {
+            let mut out = Vec::new();
+            for_each_scoped_item(e, &mut |item| {
+                if let ScopedItem::VarRef(n) = item {
+                    out.push(n.clone());
+                }
+            });
+            out
+        }
     }
 }

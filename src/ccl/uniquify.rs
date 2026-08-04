@@ -18,10 +18,25 @@
 //! (discharges, `let`-closing, monomorphization splices) copy minted names
 //! verbatim, so copies compare equal by construction.
 //!
-//! Scope rules mirror the freeness walkers in [`crate::ccl::ccl_utils`]:
-//! lambda params, `let` bindings (non-recursive: the bound expression sees
-//! the outer scope), loop accumulators, and case-pattern payloads bind;
-//! `Feed`/`Define` target names are *uses* of the defer-handle binder.
+//! Scope rules are the ones declared in [`crate::ccl::scope`]: lambda params,
+//! `let` bindings (non-recursive: the bound expression sees the outer scope),
+//! loop accumulators, `letrec` groups, and case-pattern payloads bind;
+//! `Feed`/`Define`/`MutWrite` target names are *uses* of the binder they name.
+//!
+//! This is the one scope-aware pass that does **not** fold over
+//! [`crate::ccl::scope::for_each_scoped_item`], and the reason is that it does
+//! not merely *observe* binders — it mints them. A scoped walk hands out the
+//! binders covering each child; this pass needs `&mut` access to the binding
+//! *slot* in order to rewrite the name, has to mint before descending anywhere
+//! it scopes over (`LetRec` must mint the whole group before walking any
+//! definition), and must unwind its environment stack in step. What it can and
+//! does share is the binder *enumeration*: [`assert_all_binders_minted`] checks
+//! its output through [`crate::ccl::TypedExpr::walk_binders`], which is
+//! exhaustive over [`crate::ccl::TypedExprNode`] for exactly this reason — so a
+//! binding form this pass forgets to mint cannot be invisible to the post-pass
+//! assertion, and fails it rather than passing silently. (That the enumeration
+//! and the scoping rules agree on the declaration set is a test in
+//! `crate::ccl::scope`.)
 //!
 //! Type-borne refinement predicates are full terms and are walked under the
 //! environment of their syntactic origin (a `Cast` target or a user
@@ -368,27 +383,17 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
 #[cfg(debug_assertions)]
 fn assert_all_binders_minted(expr: &Expr) {
     fn go(e: &Expr) {
-        let check = |b: &TypedBinding| {
+        // `walk_binders` is the exhaustive enumeration of binding *slots* (kept
+        // in step with `crate::ccl::scope`'s scoping rules by that module's
+        // corpus test), so this check covers a newly-added binding form for
+        // free — it cannot fall through a wildcard arm.
+        e.walk_binders(|b| {
             assert!(
                 matches!(b.name, Name::Unique { .. }),
                 "uniquify must mint every binding site to a Unique name; `{:?}` is not",
                 b.name
             );
-        };
-        match &e.node {
-            TypedExprNode::Lambda { param, .. } => check(param),
-            TypedExprNode::Let { binding, .. } => check(binding),
-            TypedExprNode::LetRec { bindings, .. } => bindings.iter().for_each(|(b, _)| check(b)),
-            TypedExprNode::For { target, .. } => check(target),
-            TypedExprNode::Case { branches, .. } => {
-                for b in branches {
-                    if let Some(p) = &b.pattern {
-                        check(&p.binding);
-                    }
-                }
-            }
-            _ => {}
-        }
+        });
         e.walk_children(go);
     }
     go(expr);
