@@ -37,47 +37,108 @@ fn codomain_ints(tile: &Tile) -> Vec<i64> {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Basic ternary, both branches.
-#[case("c: Bool = True\n1 if c else 2", Value::Int(1))]
-#[case("c: Bool = False\n1 if c else 2", Value::Int(2))]
+#[case(
+    r"
+c: Bool = True
+1 if c else 2",
+    Value::Int(1)
+)]
+#[case(
+    r"
+c: Bool = False
+1 if c else 2",
+    Value::Int(2)
+)]
 // Guard is a computed comparison, not a bare variable.
-#[case("a: Int = 1\nb: Int = 2\n10 if a < b else 20", Value::Int(10))]
-#[case("a: Int = 5\nb: Int = 2\n10 if a < b else 20", Value::Int(20))]
+#[case(
+    r"
+a: Int = 1
+b: Int = 2
+10 if a < b else 20",
+    Value::Int(10)
+)]
+#[case(
+    r"
+a: Int = 5
+b: Int = 2
+10 if a < b else 20",
+    Value::Int(20)
+)]
 // The selected value is itself a computed expression over outer bindings.
-#[case("a: Int = 5\nc: Bool = True\na * 2 if c else a - 1", Value::Int(10))]
-#[case("a: Int = 5\nc: Bool = False\na * 2 if c else a - 1", Value::Int(4))]
+#[case(
+    r"
+a: Int = 5
+c: Bool = True
+a * 2 if c else a - 1",
+    Value::Int(10)
+)]
+#[case(
+    r"
+a: Int = 5
+c: Bool = False
+a * 2 if c else a - 1",
+    Value::Int(4)
+)]
 // `elif` chain — first matching guard wins.
 #[case(
-    "n: Int = 1\n100 if n == 1 else 200 if n == 2 else 300",
+    r"
+n: Int = 1
+100 if n == 1 else 200 if n == 2 else 300",
     Value::Int(100)
 )]
 #[case(
-    "n: Int = 2\n100 if n == 1 else 200 if n == 2 else 300",
+    r"
+n: Int = 2
+100 if n == 1 else 200 if n == 2 else 300",
     Value::Int(200)
 )]
 #[case(
-    "n: Int = 9\n100 if n == 1 else 200 if n == 2 else 300",
+    r"
+n: Int = 9
+100 if n == 1 else 200 if n == 2 else 300",
     Value::Int(300)
 )]
 // Ternary in an arithmetic context — the whole `Case` is a scalar `V`.
-#[case("c: Bool = True\n(1 if c else 2) + 10", Value::Int(11))]
+#[case(
+    r"
+c: Bool = True
+(1 if c else 2) + 10",
+    Value::Int(11)
+)]
 // Nested ternary in an arm.
 #[case(
-    "a: Int = 1\nb: Int = 1\n(100 if b == 1 else 101) if a == 1 else 200",
+    r"
+a: Int = 1
+b: Int = 1
+(100 if b == 1 else 101) if a == 1 else 200",
     Value::Int(100)
 )]
 #[case(
-    "a: Int = 1\nb: Int = 9\n(100 if b == 1 else 101) if a == 1 else 200",
+    r"
+a: Int = 1
+b: Int = 9
+(100 if b == 1 else 101) if a == 1 else 200",
     Value::Int(101)
 )]
 #[case(
-    "a: Int = 9\nb: Int = 1\n(100 if b == 1 else 101) if a == 1 else 200",
+    r"
+a: Int = 9
+b: Int = 1
+(100 if b == 1 else 101) if a == 1 else 200",
     Value::Int(200)
 )]
 // Degenerate constant guard folds to the first arm.
 #[case("7 if True else 8", Value::Int(7))]
 // String and bool arms — the C-form is value-agnostic.
-#[case("c: Bool = False\n\"yes\" if c else \"no\"", Value::String("no".into()))]
-#[case("c: Bool = True\nFalse if c else True", Value::Bool(false))]
+#[case(r#"
+c: Bool = False
+"yes" if c else "no""#, Value::String("no".into()))]
+#[case(
+    r"
+c: Bool = True
+False if c else True",
+    Value::Bool(false)
+)]
 fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -91,13 +152,33 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Off-path partial arm: guard false → the `10 // b` arm is skipped, not faulted.
-#[case("b: Int = 0\n0 if b == 0 else 10 // b", Value::Int(0))]
+#[case(
+    r"
+b: Int = 0
+0 if b == 0 else 10 // b",
+    Value::Int(0)
+)]
 // On-path partial arm still evaluates normally.
-#[case("b: Int = 2\n10 // b if b != 0 else 0", Value::Int(5))]
+#[case(
+    r"
+b: Int = 2
+10 // b if b != 0 else 0",
+    Value::Int(5)
+)]
 // Guard true selects the safe arm; the partial `else` is skipped.
-#[case("b: Int = 0\n99 if b == 0 else 10 // b", Value::Int(99))]
+#[case(
+    r"
+b: Int = 0
+99 if b == 0 else 10 // b",
+    Value::Int(99)
+)]
 // The partial arm is the (excluded) `else` of an explicit guard.
-#[case("b: Int = 0\n10 // b if b != 0 else 42", Value::Int(42))]
+#[case(
+    r"
+b: Int = 0
+10 // b if b != 0 else 42",
+    Value::Int(42)
+)]
 fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -119,11 +200,31 @@ fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] exp
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Two arms at one domain.
-#[case("c: Bool = True\nsum([1, 2] if c else [3, 4])", Value::Int(3))]
-#[case("c: Bool = False\nsum([1, 2] if c else [3, 4])", Value::Int(7))]
+#[case(
+    r"
+c: Bool = True
+sum([1, 2] if c else [3, 4])",
+    Value::Int(3)
+)]
+#[case(
+    r"
+c: Bool = False
+sum([1, 2] if c else [3, 4])",
+    Value::Int(7)
+)]
 // Guard is a computed comparison.
-#[case("n: Int = 2\nsum([10, 20] if n == 1 else [1, 2])", Value::Int(3))]
-#[case("n: Int = 1\nsum([10, 20] if n == 1 else [1, 2])", Value::Int(30))]
+#[case(
+    r"
+n: Int = 2
+sum([10, 20] if n == 1 else [1, 2])",
+    Value::Int(3)
+)]
+#[case(
+    r"
+n: Int = 1
+sum([10, 20] if n == 1 else [1, 2])",
+    Value::Int(30)
+)]
 // `elif` over collections — first matching arm's collection wins. **Three legs over
 // one fiber**: the three arms all have domain `[0, 1)`, so the fan-out is a
 // three-leg `Variant` whose payloads are all that one domain under different gates.
@@ -131,15 +232,21 @@ fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] exp
 // leg↔domain bijection would reject it — and what an `if`/`elif` accumulator write
 // produces.
 #[case(
-    "n: Int = 1\nsum([1] if n == 1 else [2] if n == 2 else [3])",
+    r"
+n: Int = 1
+sum([1] if n == 1 else [2] if n == 2 else [3])",
     Value::Int(1)
 )]
 #[case(
-    "n: Int = 2\nsum([1] if n == 1 else [2] if n == 2 else [3])",
+    r"
+n: Int = 2
+sum([1] if n == 1 else [2] if n == 2 else [3])",
     Value::Int(2)
 )]
 #[case(
-    "n: Int = 9\nsum([1] if n == 1 else [2] if n == 2 else [3])",
+    r"
+n: Int = 9
+sum([1] if n == 1 else [2] if n == 2 else [3])",
     Value::Int(3)
 )]
 fn test_value_case_collection_sum(#[case] code: &str, #[case] expected: Value) {
@@ -152,9 +259,17 @@ fn test_value_case_collection_sum(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_value_case_collection_result() {
-    let result = run_pipeline("c: Bool = True\n[1, 2] if c else [3, 4]");
+    let result = run_pipeline(
+        r"
+c: Bool = True
+[1, 2] if c else [3, 4]",
+    );
     assert_eq!(codomain_ints(&result), vec![1, 2]);
-    let result = run_pipeline("c: Bool = False\n[1, 2] if c else [3, 4]");
+    let result = run_pipeline(
+        r"
+c: Bool = False
+[1, 2] if c else [3, 4]",
+    );
     assert_eq!(codomain_ints(&result), vec![3, 4]);
 }
 
@@ -175,19 +290,60 @@ fn test_value_case_collection_result() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // if/else — the selected arm's value is fed.
-#[case("c: Bool = True\nx = defer()\nif c:\n    x << 1\nelse:\n    x << 2\nx", vec![1])]
-#[case("c: Bool = False\nx = defer()\nif c:\n    x << 1\nelse:\n    x << 2\nx", vec![2])]
+#[case(r"
+c: Bool = True
+x = defer()
+if c:
+    x << 1
+else:
+    x << 2
+x", vec![1])]
+#[case(r"
+c: Bool = False
+x = defer()
+if c:
+    x << 1
+else:
+    x << 2
+x", vec![2])]
 // elif — first matching arm's value.
 #[case(
-    "n: Int = 1\nx = defer()\nif n == 1:\n    x << 10\nelif n == 2:\n    x << 20\nelse:\n    x << 30\nx",
+    r"
+n: Int = 1
+x = defer()
+if n == 1:
+    x << 10
+elif n == 2:
+    x << 20
+else:
+    x << 30
+x",
     vec![10]
 )]
 #[case(
-    "n: Int = 2\nx = defer()\nif n == 1:\n    x << 10\nelif n == 2:\n    x << 20\nelse:\n    x << 30\nx",
+    r"
+n: Int = 2
+x = defer()
+if n == 1:
+    x << 10
+elif n == 2:
+    x << 20
+else:
+    x << 30
+x",
     vec![20]
 )]
 #[case(
-    "n: Int = 9\nx = defer()\nif n == 1:\n    x << 10\nelif n == 2:\n    x << 20\nelse:\n    x << 30\nx",
+    r"
+n: Int = 9
+x = defer()
+if n == 1:
+    x << 10
+elif n == 2:
+    x << 20
+else:
+    x << 30
+x",
     vec![30]
 )]
 fn test_conditional_feed(#[case] code: &str, #[case] expected: Vec<i64>) {
@@ -207,9 +363,23 @@ fn test_conditional_feed(#[case] code: &str, #[case] expected: Vec<i64>) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // n=0 → else fires (42); the `100 // n` arm is not pulled.
-#[case("n: Int = 0\nx = defer()\nif n != 0:\n    x << 100 // n\nelse:\n    x << 42\nx", vec![42])]
+#[case(r"
+n: Int = 0
+x = defer()
+if n != 0:
+    x << 100 // n
+else:
+    x << 42
+x", vec![42])]
 // n=5 → the partial arm fires and evaluates normally (100 // 5 = 20).
-#[case("n: Int = 5\nx = defer()\nif n != 0:\n    x << 100 // n\nelse:\n    x << 42\nx", vec![20])]
+#[case(r"
+n: Int = 5
+x = defer()
+if n != 0:
+    x << 100 // n
+else:
+    x << 42
+x", vec![20])]
 fn test_conditional_feed_skips_partial_off_path_arm(
     #[case] code: &str,
     #[case] expected: Vec<i64>,
@@ -238,29 +408,41 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 #[timeout(Duration::from_secs(10))]
 // Identity comprehension over a conditional collection.
 #[case(
-    "c: Bool = True\nsum([x for x in ([1, 2] if c else [3, 4])])",
+    r"
+c: Bool = True
+sum([x for x in ([1, 2] if c else [3, 4])])",
     Value::Int(3)
 )]
 #[case(
-    "c: Bool = False\nsum([x for x in ([1, 2] if c else [3, 4])])",
+    r"
+c: Bool = False
+sum([x for x in ([1, 2] if c else [3, 4])])",
     Value::Int(7)
 )]
 // Mapping comprehension over a conditional collection.
 #[case(
-    "c: Bool = True\nsum([x * 10 for x in ([1, 2] if c else [3, 4])])",
+    r"
+c: Bool = True
+sum([x * 10 for x in ([1, 2] if c else [3, 4])])",
     Value::Int(30)
 )]
 #[case(
-    "c: Bool = False\nsum([x * 10 for x in ([1, 2] if c else [3, 4])])",
+    r"
+c: Bool = False
+sum([x * 10 for x in ([1, 2] if c else [3, 4])])",
     Value::Int(70)
 )]
 // Nested conditional source (an `elif` in the iterable) floats per arm.
 #[case(
-    "n: Int = 2\nsum([x for x in ([1] if n == 1 else [2] if n == 2 else [3])])",
+    r"
+n: Int = 2
+sum([x for x in ([1] if n == 1 else [2] if n == 2 else [3])])",
     Value::Int(2)
 )]
 #[case(
-    "n: Int = 3\nsum([x for x in ([1] if n == 1 else [2] if n == 2 else [3])])",
+    r"
+n: Int = 3
+sum([x for x in ([1] if n == 1 else [2] if n == 2 else [3])])",
     Value::Int(3)
 )]
 fn test_comprehension_over_conditional(#[case] code: &str, #[case] expected: Value) {
@@ -275,15 +457,21 @@ fn test_comprehension_over_conditional(#[case] code: &str, #[case] expected: Val
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    "c: Bool = True\nsum(([x for x in [1, 2]]) if c else ([y for y in [3, 4]]))",
+    r"
+c: Bool = True
+sum(([x for x in [1, 2]]) if c else ([y for y in [3, 4]]))",
     Value::Int(3)
 )]
 #[case(
-    "c: Bool = False\nsum(([x for x in [1, 2]]) if c else ([y for y in [3, 4]]))",
+    r"
+c: Bool = False
+sum(([x for x in [1, 2]]) if c else ([y for y in [3, 4]]))",
     Value::Int(7)
 )]
 #[case(
-    "c: Bool = True\nsum(([x * 10 for x in [1, 2]]) if c else ([y for y in [3, 4]]))",
+    r"
+c: Bool = True
+sum(([x * 10 for x in [1, 2]]) if c else ([y for y in [3, 4]]))",
     Value::Int(30)
 )]
 fn test_conditional_between_comprehensions(#[case] code: &str, #[case] expected: Value) {
