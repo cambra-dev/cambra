@@ -850,21 +850,58 @@ fn trailing_hidden_writer_loop_compiles() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Unconditional: the whole tuple is overwritten each step → last write (3, 3).
-#[case("acc := (0, 0)\nfor i in [1, 2, 3]:\n    acc := (i, i)\nacc", make_tuple(&[Value::Int(3), Value::Int(3)]))]
+#[case(r"
+acc := (0, 0)
+for i in [1, 2, 3]:
+    acc := (i, i)
+acc", make_tuple(&[Value::Int(3), Value::Int(3)]))]
 // Read-your-writes across both fields: acc.0 = 0+1+2+3 = 6, acc.1 = 10+1+2+3 = 16.
-#[case("acc := (0, 10)\nfor i in [1, 2, 3]:\n    acc := (acc[0] + i, acc[1] + i)\nacc", make_tuple(&[Value::Int(6), Value::Int(16)]))]
+#[case(r"
+acc := (0, 10)
+for i in [1, 2, 3]:
+    acc := (acc[0] + i, acc[1] + i)
+acc", make_tuple(&[Value::Int(6), Value::Int(16)]))]
 // Single-arm conditional write to a tuple: fires at i>1 → last (3, 3).
-#[case("acc := (0, 0)\nfor i in [1, 2, 3]:\n    if i > 1:\n        acc := (i, i)\nacc", make_tuple(&[Value::Int(3), Value::Int(3)]))]
+#[case(r"
+acc := (0, 0)
+for i in [1, 2, 3]:
+    if i > 1:
+        acc := (i, i)
+acc", make_tuple(&[Value::Int(3), Value::Int(3)]))]
 // if/else both arms write different tuples: i=3 → i>2 arm → (3, 30).
-#[case("acc := (0, 0)\nfor i in [1, 2, 3]:\n    if i > 2:\n        acc := (i, i * 10)\n    else:\n        acc := (i, i)\nacc", make_tuple(&[Value::Int(3), Value::Int(30)]))]
+#[case(r"
+acc := (0, 0)
+for i in [1, 2, 3]:
+    if i > 2:
+        acc := (i, i * 10)
+    else:
+        acc := (i, i)
+acc", make_tuple(&[Value::Int(3), Value::Int(30)]))]
 // Trailing carries: writes at i<3 (1,2), carries at 3,4,5 → final (2, 2).
-#[case("acc := (0, 0)\nfor i in [1, 2, 3, 4, 5]:\n    if i < 3:\n        acc := (i, i)\nacc", make_tuple(&[Value::Int(2), Value::Int(2)]))]
+#[case(r"
+acc := (0, 0)
+for i in [1, 2, 3, 4, 5]:
+    if i < 3:
+        acc := (i, i)
+acc", make_tuple(&[Value::Int(2), Value::Int(2)]))]
 // Heterogeneous tuple (Int, String).
-#[case("acc := (0, \"a\")\nfor i in [1, 2]:\n    acc := (i, \"b\")\nacc", make_tuple(&[Value::Int(2), Value::String("b".into())]))]
+#[case(r#"
+acc := (0, "a")
+for i in [1, 2]:
+    acc := (i, "b")
+acc"#, make_tuple(&[Value::Int(2), Value::String("b".into())]))]
 // Three-tuple.
-#[case("acc := (0, 0, 0)\nfor i in [1, 2, 3]:\n    acc := (i, i * 2, i * 3)\nacc", make_tuple(&[Value::Int(3), Value::Int(6), Value::Int(9)]))]
+#[case(r"
+acc := (0, 0, 0)
+for i in [1, 2, 3]:
+    acc := (i, i * 2, i * 3)
+acc", make_tuple(&[Value::Int(3), Value::Int(6), Value::Int(9)]))]
 // Named record register.
-#[case("acc := (x=0, y=0)\nfor i in [1, 2, 3]:\n    acc := (x=i, y=i + i)\nacc", make_record(&[("x", Value::Int(3)), ("y", Value::Int(6))]))]
+#[case(r"
+acc := (x=0, y=0)
+for i in [1, 2, 3]:
+    acc := (x=i, y=i + i)
+acc", make_record(&[("x", Value::Int(3)), ("y", Value::Int(6))]))]
 fn test_compound_register(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -873,7 +910,11 @@ fn test_compound_register(#[case] code: &str, #[case] expected: Value) {
 #[test]
 fn test_compound_register_field_read() {
     check_scalar(
-        "acc := (0, 0)\nfor i in [1, 2, 3]:\n    acc := (acc[0] + i, acc[1])\nacc[0]",
+        r"
+acc := (0, 0)
+for i in [1, 2, 3]:
+    acc := (acc[0] + i, acc[1])
+acc[0]",
         Value::Int(6),
     );
 }
@@ -883,7 +924,11 @@ fn test_compound_register_field_read() {
 #[test]
 fn test_compound_register_nested() {
     check_scalar(
-        "acc := ((0, 0), 0)\nfor i in [1, 2]:\n    acc := ((i, i), i)\nacc",
+        r"
+acc := ((0, 0), 0)
+for i in [1, 2]:
+    acc := ((i, i), i)
+acc",
         make_tuple(&[make_tuple(&[Value::Int(2), Value::Int(2)]), Value::Int(2)]),
     );
 }
