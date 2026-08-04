@@ -707,6 +707,8 @@ impl Subst {
     /// The Barendregt no-capture invariant at a binder crossing (see
     /// [`Self::under_binder`] for why capture is impossible by convention).
     fn assert_no_capture(&self, binder: &Name) {
+        #[cfg(test)]
+        capture_assert_probe::bump();
         assert!(
             !self.range_mentions(binder),
             "Barendregt violation: substitution range mentions binder `{binder:?}` it passes \
@@ -1141,6 +1143,29 @@ pub fn well_formed(ty: &Type, ctx: &BTreeSet<Binder>) -> bool {
     type_free_vars(ty).is_subset(ctx)
 }
 
+/// Review scaffolding: counts [`Subst::assert_no_capture`] calls so a test can
+/// assert *how many times* a binder crossing pays for the Barendregt check.
+/// Thread-local, because `cargo test` runs tests concurrently in one process.
+#[cfg(test)]
+mod capture_assert_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Run `body`, returning how many capture assertions it performed.
+    pub fn count(body: impl FnOnce()) -> usize {
+        COUNT.with(|c| c.set(0));
+        body();
+        COUNT.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,7 +1388,7 @@ mod tests {
 mod rewrite_tests {
     use super::*;
     use crate::ccl::ccl_utils::is_free;
-    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement};
+    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement, TypedBinding};
     use std::rc::Rc;
 
     fn var(s: &str) -> TypedExpr {
@@ -1509,5 +1534,142 @@ mod rewrite_tests {
             &Name::raw("d"),
             "a non-variable discharge keeps the handle for UnboundDeferHandle to report"
         );
+    }
+
+    // ---- Barendregt-check cost at a binder crossing -------------------------
+    //
+    // `assert_no_capture` is a *release-active* `assert!` whose `range_mentions`
+    // does a full `is_free` walk of every `Discharge` replacement term. The
+    // scoped descent invokes it inside the per-child callback, so a node whose
+    // binders scope over several children pays the check once per child rather
+    // than once per scope. The scoping walk guarantees a scope's children are
+    // consecutive and entered once, which is exactly what makes per-scope
+    // possible.
+
+    /// A `LetRec` group of *n* binders opens **one** scope covering *n*+1
+    /// children (each definition, plus the body), so the no-capture check is
+    /// owed *n* times — once per binder of the one scope crossed.
+    #[test]
+    fn letrec_pays_the_capture_check_once_per_binder_not_once_per_child() {
+        for n in [1usize, 4, 8] {
+            let bindings: Vec<_> = (0..n)
+                .map(|i| {
+                    (
+                        TypedBinding::new_unannotated(format!("f{i}")),
+                        int(i as i64),
+                    )
+                })
+                .collect();
+            let mut e = TypedExpr::letrec(bindings, var("x"));
+            let subst = Subst::discharge("x", int(0));
+
+            let asserts = capture_assert_probe::count(|| subst.rewrite_expr(&mut e));
+
+            assert_eq!(
+                asserts,
+                n,
+                "a {n}-binder letrec crosses one scope, so it owes {n} capture checks; \
+                 checking per child instead costs n*(n+1) = {}",
+                n * (n + 1)
+            );
+        }
+    }
+
+    /// A `Case` branch's payload binder opens one scope covering the branch's
+    /// guard *and* body — one scope, so one check, not one per child.
+    #[test]
+    fn case_pays_the_capture_check_once_per_branch_not_once_per_child() {
+        let branch = |tag: &str, payload: &str| Branch {
+            pattern: Some(crate::ccl::Pattern {
+                tag: tag.into(),
+                binding: TypedBinding::new_unannotated(payload),
+            }),
+            guard: int(1),
+            body: int(2),
+        };
+        let mut e = TypedExpr::new(TypedExprNode::Case {
+            scrutinee: Some(Box::new(var("x"))),
+            branches: vec![branch("A", "pa"), branch("B", "pb")],
+        });
+        let subst = Subst::discharge("x", int(0));
+
+        let asserts = capture_assert_probe::count(|| subst.rewrite_expr(&mut e));
+
+        assert_eq!(
+            asserts, 2,
+            "two payload-binding branches cross two scopes, so two capture checks; \
+             checking per child costs four (guard + body each)"
+        );
+    }
+
+    /// The deliberate behavior change to pin: the pre-inertness early return
+    /// used to skip the crossing entirely when the substitution was dead in the
+    /// body, so a binder shadowing a range name went unnoticed. It is now
+    /// checked wherever the binder is crossed. `for y in x do 1` is live at the
+    /// node (`x` is in `iter`) and inert in the body, and the range mentions
+    /// `y`, so the tripwire must fire.
+    #[test]
+    #[should_panic(expected = "Barendregt violation")]
+    fn a_binder_crossing_is_checked_even_when_the_body_is_inert() {
+        let mut e = TypedExpr::new(TypedExprNode::For {
+            target: TypedBinding::new_unannotated("y"),
+            iter: Box::new(var("x")),
+            body: Box::new(int(1)),
+        });
+        Subst::discharge("x", var("y")).rewrite_expr(&mut e);
+    }
+
+    /// Guards the `_ => {}` arm in `rewrite_expr_go`'s node-local match. The
+    /// scoping walk *names* every variable occurrence a node makes itself
+    /// (`ScopedItem::VarRef`), but the `&mut` adapter drops them, so subst
+    /// re-derives the set from its own wildcarded match. This checks the two
+    /// agree: a rename must retarget every `VarRef` the walk surfaces.
+    #[test]
+    fn a_rename_retargets_every_varref_the_scoped_walk_surfaces() {
+        use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
+
+        let handle_nodes = [
+            TypedExpr::new(TypedExprNode::Feed {
+                name: Name::raw("h"),
+                value: Box::new(int(1)),
+            }),
+            TypedExpr::new(TypedExprNode::Define {
+                name: Name::raw("h"),
+                value: Box::new(int(1)),
+            }),
+            TypedExpr::new(TypedExprNode::MutWrite {
+                name: Name::raw("h"),
+                value: Box::new(int(1)),
+            }),
+            var("h"),
+        ];
+
+        for original in handle_nodes {
+            let before: Vec<Name> = varrefs(&original);
+            assert!(
+                before.contains(&Name::raw("h")),
+                "corpus node must surface `h` as a VarRef"
+            );
+
+            let mut renamed = original.clone();
+            Subst::rename("h", "h2").rewrite_expr(&mut renamed);
+
+            assert!(
+                !varrefs(&renamed).contains(&Name::raw("h")),
+                "a rename left an occurrence of `h` behind in `{:?}` — the scoped walk \
+                 declares it a variable use, so substitution must retarget it",
+                original.node
+            );
+        }
+
+        fn varrefs(e: &TypedExpr) -> Vec<Name> {
+            let mut out = Vec::new();
+            for_each_scoped_item(e, &mut |item| {
+                if let ScopedItem::VarRef(n) = item {
+                    out.push(n.clone());
+                }
+            });
+            out
+        }
     }
 }
