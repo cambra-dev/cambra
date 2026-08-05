@@ -394,6 +394,32 @@ fn tap_field(def: &Expr) -> String {
     }
 }
 
+/// Build a [`TypedExprNode::Transact`] **register record** type from its
+/// `(field label, stream type)` pairs, in the field order op-conversion
+/// expects.
+///
+/// A label is a plain spelling ([`Name::field_key`]), so distinctness within
+/// *this* record is the whole of what keeps two registers apart — nothing
+/// global backs it up. Every consumer resolves a footprint key by looking its
+/// label up in a per-node map, so a collision would silently alias two
+/// registers onto one store slot (and `Type::Record` would collapse the two
+/// fields outright). Both register-record sites go through here so the
+/// invariant is checked wherever one is built.
+fn register_record_ty(fields: Vec<(String, Type)>) -> Type {
+    debug_assert!(
+        {
+            let mut seen: Vec<&str> = fields.iter().map(|(f, _)| f.as_str()).collect();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            seen.len() == before
+        },
+        "register record has duplicate field labels: {:?}",
+        fields.iter().map(|(f, _)| f).collect::<Vec<_>>(),
+    );
+    Type::Record(fields)
+}
+
 /// Destructure a transaction `LetRec` (from [`crate::ccl::transact_phase`],
 /// post-elim) into the `Transact{keys, writers, domain: Txn}` carrier. The
 /// group\'s bindings, by shape ([`classify_txn_binding`]): one **history** per
@@ -450,23 +476,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     for (_, field, stream_ty) in &taps {
         reg_field_tys.push((field.clone(), stream_ty.clone()));
     }
-    // `field_key` is a plain spelling, so distinctness within *this* record is
-    // the whole of what keeps two registers apart — nothing global backs it up.
-    // Every consumer resolves a footprint key by looking this label up in a
-    // per-node map, so a collision would silently alias two registers onto one
-    // store slot.
-    debug_assert!(
-        {
-            let mut seen: Vec<&str> = reg_field_tys.iter().map(|(f, _)| f.as_str()).collect();
-            seen.sort_unstable();
-            let before = seen.len();
-            seen.dedup();
-            seen.len() == before
-        },
-        "register record has duplicate field labels: {:?}",
-        reg_field_tys.iter().map(|(f, _)| f).collect::<Vec<_>>(),
-    );
-    let reg_ty = Type::Record(reg_field_tys);
+    let reg_ty = register_record_ty(reg_field_tys);
 
     let mut transact = Expr::new(TypedExprNode::Transact {
         keys,
@@ -611,13 +621,18 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         })
         .collect();
 
-    // One register key per accumulator. Names are fresh labels: every read is
-    // positional (`__hist ≫ .writes ≫ .i`), so only field order is
-    // load-bearing.
+    // One register key per accumulator. Every read is positional (`__hist ≫
+    // .writes ≫ .i`), so these names carry no meaning beyond labelling the
+    // register record — but the label still has to be distinct *within* that
+    // record, and `field_key` is the plain spelling. So index by position: a
+    // shared `"acc"` base would collapse two accumulators onto one field, and
+    // position is the one distinguisher that is also stable across
+    // compilations, which uid-free labels require.
     let keys: Vec<TransactKey> = inits
         .into_iter()
-        .map(|init| TransactKey {
-            name: Name::fresh("acc"),
+        .enumerate()
+        .map(|(i, init)| TransactKey {
+            name: Name::fresh(format!("acc{i}")),
             init,
         })
         .collect();
@@ -636,7 +651,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     for (f, vty) in &feed_fields {
         reg_field_tys.push((f.clone(), Type::fun(domain_ty.clone(), vty.clone())));
     }
-    let reg_ty = Type::Record(reg_field_tys);
+    let reg_ty = register_record_ty(reg_field_tys);
 
     let writer = WriterSite {
         read_keys: key_names.clone(),

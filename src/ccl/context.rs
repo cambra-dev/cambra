@@ -778,14 +778,10 @@ pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileEr
     for (_name, source) in ctx.lowering_ctx().take_sources() {
         let name = source.borrow().get_id().to_string();
         let output_type = source.borrow().output_type();
-        ctx.inference_ctx().register_source_type(
-            &name,
-            Type::Fun {
-                name: None,
-                domain: Box::new(Type::DataSource(name.clone())),
-                codomain: Box::new(output_type),
-            },
-        );
+        // The source's data-function type is constructed inside
+        // `register_source_type` from the element type — the `Data` kind is
+        // intrinsic, not stamped here.
+        ctx.inference_ctx().register_source_type(&name, output_type);
     }
     // No lowering projection is threaded here — this entry point exists to hand a
     // tree to the differ, not to render diagnostics — so an inference error keeps
