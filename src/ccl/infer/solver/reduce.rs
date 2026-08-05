@@ -118,7 +118,6 @@
 //! [`check_cycle_tolerance`] is factored out of [`reduce`] — reaching the `AllKnown`
 //! arm through `reduce` would need a rule that declares it.
 
-use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::{ArithmeticKind, BaseType, Type, TypeFn};
 
 /// One resolved argument, or the fact that resolving it re-entered the resolution
@@ -235,7 +234,7 @@ pub fn reduce(fun: &TypeFn, args: &[Arg]) -> Result<Type, ReduceError> {
             // outside the operation's domain is a violation whatever the others turn
             // out to be, which is what makes this sound at a cut.
             for operand in &available {
-                check_arithmetic_domain(*kind, &strip_refinements(operand), fun)?;
+                check_arithmetic_domain(*kind, &strip_value_claims(operand, true), fun)?;
             }
             Ok(base)
         }
@@ -262,7 +261,7 @@ pub fn reduce(fun: &TypeFn, args: &[Arg]) -> Result<Type, ReduceError> {
 /// `⊔ᵢ base(argᵢ)` — the join of the arguments' bases, defined only where it is not
 /// `⊤` (see the module docs, "What \"the operands share a base\" is, and is not").
 ///
-/// Stripping refinements is not an approximation to be improved on — it is what
+/// [`strip_value_claims`] is not an approximation to be improved on — it is what
 /// makes this the *base* join. A refinement is a fact about a value, and neither
 /// the join of several types nor the result of computing with them is any of the
 /// values the arguments described. (A range-aware arithmetic rule would *derive* a
@@ -329,7 +328,7 @@ fn check_arithmetic_domain(
 }
 
 fn shared_base(fun: &TypeFn, args: &[&Type]) -> Result<Type, ReduceError> {
-    let mut bases = args.iter().map(|t| strip_refinements(t));
+    let mut bases = args.iter().map(|t| strip_value_claims(t, true));
     let Some(first) = bases.next() else {
         return Ok(Type::Hole);
     };
@@ -348,7 +347,7 @@ fn shared_base(fun: &TypeFn, args: &[&Type]) -> Result<Type, ReduceError> {
             fun: fun.name().to_string(),
             bases: args
                 .iter()
-                .map(|t| strip_refinements(t).to_string())
+                .map(|t| strip_value_claims(t, true).to_string())
                 .collect(),
         });
     }
@@ -360,11 +359,92 @@ fn shared_base(fun: &TypeFn, args: &[&Type]) -> Result<Type, ReduceError> {
     Ok(result)
 }
 
+/// `ty` with its **value-level** refinements dropped, keeping the ones that are
+/// *structure*.
+///
+/// A refinement is a fact about a value, and that is what a computed or joined type
+/// must not inherit. But not every refinement describes a value: on a **collection
+/// domain** it describes the collection's *extent* — which positions exist — and the
+/// interpreter compiles it to a `Restrict` at the iteration boundary. Dropping it does
+/// not relax a claim, it changes which collection the type denotes.
+///
+/// The two are told apart by **polarity**, which is the distinction the lattice already
+/// draws: a value flows out of a covariant position and into a contravariant one, so a
+/// refinement at a covariant position is a claim about the value produced, and one at a
+/// contravariant position is part of the shape being consumed. So this strips
+/// covariantly and preserves contravariantly.
+///
+/// So a filtered collection `({[0, 2] | 𝑝} ⇒ {Int | 𝑞})` reduces to
+/// `({[0, 2] | 𝑝} ⇒ Int)`: the element claim goes, the extent stays, and the type still
+/// denotes the same collection. An all-depths strip yields `([0, 2] ⇒ Int)`, a *different*
+/// collection. Preserving the contravariant side is also what keeps the relation
+/// variance-stable, since relating a refined domain to a stripped one is what
+/// manufactures the illegal `𝐷 <: {𝐷 | 𝑝}` obligation.
+///
+/// **No argument that reaches this today is compound**, so the polarity distinction is
+/// pinned by unit test rather than by a program: every operand of an arithmetic or
+/// comparison operator the runtime accepts is a scalar (the same fact the agreement test
+/// above rests on). It is written this way because an all-depths strip is wrong the
+/// moment a compound argument exists, and `FieldOf(ρ, 𝑘)` / `CollectionUnion` are the
+/// named next clients.
+fn strip_value_claims(ty: &Type, covariant: bool) -> Type {
+    match ty {
+        // A refinement at a *covariant* position is a claim about the value produced
+        // and is dropped; at a *contravariant* one it is part of the shape being
+        // consumed — a collection's extent — and is kept.
+        Type::Refinement(base, r) => {
+            let inner = strip_value_claims(base, covariant);
+            if covariant {
+                inner
+            } else {
+                Type::Refinement(Box::new(inner), r.clone())
+            }
+        }
+        // Stripping claims re-views the same arrow, so the binder and the kind are
+        // copied rather than re-decided: a rebuild that dropped them would turn a
+        // collection into a capability while claiming only to drop a refinement.
+        Type::Fun {
+            domain, codomain, ..
+        } => Type::fun_like(
+            ty,
+            strip_value_claims(domain, !covariant),
+            strip_value_claims(codomain, covariant),
+        ),
+        Type::Tuple(ts) => Type::Tuple(
+            ts.iter()
+                .map(|t| strip_value_claims(t, covariant))
+                .collect(),
+        ),
+        Type::Record(fs) => Type::Record(
+            fs.iter()
+                .map(|(n, t)| (n.clone(), strip_value_claims(t, covariant)))
+                .collect(),
+        ),
+        Type::Variant(tags) => Type::Variant(
+            tags.iter()
+                .map(|(k, t)| (k.clone(), strip_value_claims(t, covariant)))
+                .collect(),
+        ),
+        // A history is invariant in both children, so neither is a "value produced"
+        // position in the sense above; leave both as they are.
+        Type::History { .. }
+        | Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::Hole
+        | Type::SharedHole(_)
+        | Type::Infer(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn
+        | Type::App { .. } => ty.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::infer::lit_singleton;
-    use crate::ccl::{ArithmeticKind, BaseType, Lit};
+    use crate::ccl::infer::{lit_singleton, singleton_predicate};
+    use crate::ccl::{ArithmeticKind, BaseType, Lit, Refinement};
 
     fn int() -> Type {
         Type::Base(BaseType::Int)
@@ -472,5 +552,54 @@ mod tests {
             .expect("constant on its domain"),
             Type::Base(BaseType::Bool)
         );
+    }
+
+    /// The polarity rule, which no *program* can reach: every operand of an
+    /// arithmetic or comparison operator the runtime accepts is a scalar, so a
+    /// compound argument never arrives from the pipeline. It is stated here because a
+    /// rule that strips at every depth is wrong the moment one does — a collection is
+    /// `(𝐷 ⇒ 𝑉)`, and a refinement on `𝐷` is its **extent**, not a claim about a
+    /// value.
+    ///
+    /// Covariant positions (the collection's element type, and a bare operand) lose
+    /// their claims; the contravariant domain keeps its filter, so the reduced type
+    /// still denotes the same collection.
+    #[test]
+    fn value_claims_drop_by_polarity() {
+        // A data arrow, so the rebuild also has to carry the kind through: a strip
+        // that returned a compute arrow would report the same element type for a
+        // collection the operator can no longer iterate.
+        let filtered_collection = |elem: Type| {
+            Type::data_fun(
+                Type::Refinement(
+                    Box::new(Type::UIntRange(3)),
+                    Refinement::born(
+                        singleton_predicate(&Lit::Int(2)).expect("Int has a singleton"),
+                    ),
+                ),
+                elem,
+            )
+        };
+
+        let stripped = strip_value_claims(
+            &filtered_collection(lit_singleton(&Lit::Int(1))),
+            /* covariant */ true,
+        );
+
+        assert_eq!(stripped, filtered_collection(int()));
+    }
+
+    /// A `Mut(𝑉, 𝐷)` is invariant in both children, so neither is a position a value
+    /// is produced at and neither child's claims may be dropped. Reducing over one is
+    /// not reachable today either — this pins the rule against a future operator whose
+    /// argument is a register.
+    #[test]
+    fn a_history_keeps_the_claims_on_both_children() {
+        let register = Type::History {
+            value: Box::new(lit_singleton(&Lit::Int(1))),
+            domain: Box::new(Type::Txn),
+            kind: crate::ccl::HistoryKind::Overwrite,
+        };
+        assert_eq!(strip_value_claims(&register, true), register);
     }
 }

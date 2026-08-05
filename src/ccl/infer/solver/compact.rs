@@ -22,8 +22,10 @@ use crate::ccl::FieldKey;
 // Thread-local rather than threaded through `compact_go`'s state, and that is
 // forced: reducing an argument re-enters the whole compact → simplify → coalesce
 // pipeline with a *fresh* `CompactState`, so a per-walk set could not see the outer
-// resolution that is already computing this argument. The set is keyed on the
-// argument's variable, which is what identifies the in-flight resolution.
+// resolution that is already computing this argument. What goes in the set is every
+// variable the in-flight argument *mentions* — its own, for the bare variable that is
+// the ordinary case ([`resolve_argument`]), and all of them for a structured one, whose
+// cycle may run through any of its interior ([`resolve_structured_argument`]).
 //
 // This is a **termination** device, not an optimization: without it, ordinary
 // programs overflow the stack (`x := 7; for i in []: x += 1; x` is enough).
@@ -101,10 +103,10 @@ fn resolve_argument(arg: &Type, subst_acc: &Subst) -> Result<Option<Type>, super
         owned = subst_acc.apply_type(arg);
         &owned
     };
-    // A concrete argument is neither cyclic nor memoizable: resolving it cannot
-    // re-enter *this* argument, and there is no variable to key an entry on.
+    // A non-variable argument is not memoizable — there is no variable to key an entry
+    // on — and it needs a cycle guard of its own.
     let Type::Infer(v) = arg else {
-        return resolved_or_poisoned(arg);
+        return resolve_structured_argument(arg);
     };
     let uid = v.uid;
     // This resolution is already running further up the stack: answering would
@@ -124,6 +126,83 @@ fn resolved_or_poisoned(arg: &Type) -> Result<Option<Type>, super::ReduceError> 
         Ok(t) => Ok(Some(t)),
         Err(super::CoalesceError::Reduce(e)) => Err(e),
         Err(_) => Ok(None),
+    }
+}
+
+/// Resolve an argument that is **not** a bare variable — a collection's `Fun`, a
+/// tuple, a refined type, or a wholly concrete leaf.
+///
+/// It still needs a cycle guard. Guarding only `Type::Infer` leaves a structured
+/// argument completely unguarded, so a cycle through its *interior* recurses until the
+/// stack runs out. So every variable the argument mentions goes in flight for the
+/// duration: any cycle must revisit some variable, and it appears syntactically in the
+/// argument of whichever operator it is reached through, which is where it is caught.
+/// A concrete argument mentions none, guards nothing, and simply resolves.
+///
+/// Nothing structured reaches here from a program today — every operand of an
+/// arithmetic or comparison operator the runtime accepts is a scalar — so the guard is
+/// pinned by unit test rather than by an end-to-end case. It stops being unreachable
+/// with the first compound-argument operator (`FieldOf(ρ, 𝑘)`, `CollectionUnion`).
+fn resolve_structured_argument(arg: &Type) -> Result<Option<Type>, super::ReduceError> {
+    let mut vars = BTreeSet::new();
+    collect_infer_vars(arg, &mut vars);
+    if ARGS_IN_FLIGHT.with(|s| {
+        let s = s.borrow();
+        vars.iter().any(|v| s.contains(v))
+    }) {
+        return Ok(None);
+    }
+    ARGS_IN_FLIGHT.with(|s| s.borrow_mut().extend(vars.iter().copied()));
+    // Deliberately not short-circuited with `?`: the in-flight marks are this
+    // function's to remove on every path, including the poisoned one.
+    let resolved = resolved_or_poisoned(arg);
+    ARGS_IN_FLIGHT.with(|s| {
+        let mut s = s.borrow_mut();
+        for v in &vars {
+            s.remove(v);
+        }
+    });
+    resolved
+}
+
+/// Every [`InferVarId`] occurring syntactically in `ty` (not through bounds).
+///
+/// A refinement's *predicate* is deliberately not walked, even though its embedded type
+/// slots can mention variables. This set exists to catch a resolution cycle, and
+/// resolution cannot reach those slots: `compact_go`'s `Refinement` arm descends into
+/// the base and treats the predicate as an opaque term it forces a substitution
+/// through. A variable reachable only from a predicate is therefore on no cycle to
+/// guard.
+///
+/// Recurses explicitly rather than through `Type::walk_children`, whose callback is
+/// higher-ranked and so cannot borrow `out`.
+fn collect_infer_vars(ty: &Type, out: &mut BTreeSet<InferVarId>) {
+    match ty {
+        Type::Infer(v) => {
+            out.insert(v.uid);
+        }
+        Type::Fun {
+            domain, codomain, ..
+        } => {
+            collect_infer_vars(domain, out);
+            collect_infer_vars(codomain, out);
+        }
+        Type::Tuple(ts) => ts.iter().for_each(|t| collect_infer_vars(t, out)),
+        Type::Record(fs) => fs.iter().for_each(|(_, t)| collect_infer_vars(t, out)),
+        Type::Variant(tags) => tags.iter().for_each(|(_, t)| collect_infer_vars(t, out)),
+        Type::Refinement(base, _) => collect_infer_vars(base, out),
+        Type::History { value, domain, .. } => {
+            collect_infer_vars(value, out);
+            collect_infer_vars(domain, out);
+        }
+        Type::App { args, .. } => args.iter().for_each(|a| collect_infer_vars(a, out)),
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::Hole
+        | Type::SharedHole(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn => {}
     }
 }
 
@@ -997,6 +1076,34 @@ fn compact_go(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::{BaseType, Bound, InferVar, TypeFn};
+
+    /// A type function whose argument is **structured** and cycles through its
+    /// interior. Guarding only a bare `Type::Infer` argument leaves this case
+    /// completely unguarded: resolving `({?a} ⇒ Int)` walks `?a`'s bound, reaches the
+    /// same operator, resolves the same argument, and recurses until the stack runs
+    /// out. Guarding on every variable the argument *mentions* catches it — any cycle
+    /// must revisit some variable, and it appears syntactically in the argument of
+    /// whichever operator it is reached through.
+    ///
+    /// A program cannot build this today (every operand of an arithmetic or comparison
+    /// operator the runtime accepts is a scalar), so the guard is pinned here rather
+    /// than end-to-end. It stops being latent the moment an operator takes a compound
+    /// argument.
+    #[test]
+    fn a_cycle_through_a_structured_argument_terminates() {
+        let a = InferVar::fresh(0);
+        let collection = Type::data_fun(Type::Infer(a.clone()), Type::Base(BaseType::Int));
+        let app = Type::App {
+            fun: TypeFn::Arithmetic(crate::ccl::ArithmeticKind::Add),
+            args: vec![collection],
+        };
+        // `?a`'s own bound reaches the application whose argument mentions `?a`.
+        a.bounds_mut().lower.push(Bound::conc(app.clone()));
+
+        // Terminating *is* the assertion: unguarded this overflows the stack.
+        compact_type(&app);
+    }
 
     /// Compact merge at positive polarity unions tags.
     #[test]

@@ -534,6 +534,25 @@ pub fn refined_data_fun(base_domain: Type, predicate: Expr, codomain: Type) -> T
 /// the two sides may carry the same predicate at different compilation stages
 /// (bare `__elem ▷ p` before vs after planning normalizes `p` to point-free),
 /// so refinements must not participate in the comparison at any depth.
+///
+/// **Only meaningful on a resolved type.** This is a *syntactic* peel: it removes the
+/// `Type::Refinement` layers it can see and returns a [`Type::Infer`] untouched. During
+/// constraint emission, where most types are still inference variables, it therefore
+/// silently does nothing for every operand that is not a literal — while looking like
+/// it works, which is the trap. It cannot express a *relation* between two types that
+/// are still variables, because at the moment it runs there is nothing to peel.
+///
+/// So: fine for **comparing** two already-resolved types, and fine in any pass after
+/// inference. There is no call for it in `emit`, and the two things a rule reaches for
+/// it wanting are elsewhere:
+///
+/// - "these are related on their base, not on their refinements" during inference:
+///   a [`TypeFn`](crate::ccl::TypeFn) over the positions, whose rule defers the same
+///   question until the arguments resolve. `Arithmetic`'s does exactly this, via
+///   `shared_base`.
+/// - "look *past* the outer layers" — what a shape test wants, since a refinement is
+///   not part of the shape: [`Type::peel_refinements`](crate::ccl::Type::peel_refinements),
+///   which borrows rather than dropping.
 pub(crate) fn strip_refinements(ty: &Type) -> Type {
     match ty {
         Type::Refinement(base, _) => strip_refinements(base),
