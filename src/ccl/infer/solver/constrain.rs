@@ -985,6 +985,11 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         return ty.clone();
     }
     match ty {
+        // Not a type — an annotation-position obligation, erased by
+        // `normalize_annotation` before any constraint is emitted (see `Type::Below`).
+        Type::Below(_) => {
+            unreachable!("Type::Below reached the solver; `normalize_annotation` must erase it")
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)

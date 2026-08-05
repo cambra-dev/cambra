@@ -662,7 +662,21 @@ fn mut_annotation_with_non_txn_domain_rejected() {
         t += y
     t
 "#})]
-fn mut_var_declared_inside_loop_rejected(#[case] code: &str) {
+#[case::bounded_mut(indoc! {r#"
+    t := 0
+    for i in [1, 2, 3]:
+        y <: Mut(Int) := i
+        t += y
+    t
+"#})]
+#[case::bounded_value(indoc! {r#"
+    t := 0
+    for i in [1, 2, 3]:
+        y <: Int := i
+        t += y
+    t
+"#})]
+fn register_declared_inside_loop_rejected(#[case] code: &str) {
     expect_compile_error(code, "introduced inside a for-loop body");
 }
 
@@ -1220,17 +1234,21 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
 /// value type all the way through inlining.
 ///
 /// The mutable variable is unwritten, so its value type is still its seed's singleton
-/// (`Mut({Int | __elem == 5}, ?d)`), and the parameter — whose type is inferred, since an
-/// annotation bounds rather than fixes it — takes that refinement, because the call site
-/// is typed against the dereferenced value. Beta-reduction then has to discharge a
-/// refinement demanded of the value against an argument node still stamped with the
-/// handle: the `Mut` survives on the bare `Var` for the phase to find the read. Reading
-/// through the handle is what makes the two comparable; comparing the stamp directly asks
-/// a handle to entail a fact about a value and trips `inline`'s entailment assert.
+/// (`Mut({Int | __elem == 5}, ?d)`), and a parameter whose type is left to inference takes
+/// that refinement, because the call site is typed against the dereferenced value.
+/// Beta-reduction then has to discharge a refinement demanded of the value against an
+/// argument node still stamped with the handle: the `Mut` survives on the bare `Var` for
+/// the phase to find the read. Reading through the handle is what makes the two
+/// comparable; comparing the stamp directly asks a handle to entail a fact about a value
+/// and trips `inline`'s entailment assert.
 ///
-/// The last case is the surrounding one that reaches the same parameter *without* a
-/// refinement — the use demands `Int`, which widens it — so a future narrowing of the
-/// read shows up as a difference between the cases rather than as silence.
+/// The last two cases are the surrounding ones that reach the same parameter *without* a
+/// refinement, so a future narrowing of the read shows up as a difference between the
+/// cases rather than as silence. Each is a distinct reason for the singleton not to
+/// arrive: an exact annotation is a specialization boundary that fixes the domain at
+/// `Int`, and a use demanding `Int` widens an inferred parameter. A **bounded**
+/// annotation is not one of them — it constrains without fixing, so it lands on the
+/// singleton exactly as no annotation does.
 #[rstest]
 #[case::unannotated(indoc! {r#"
     def id(v):
@@ -1238,7 +1256,13 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
     x := 5
     id(x)
 "#})]
-#[case::annotated(indoc! {r#"
+#[case::bounded(indoc! {r#"
+    def id(v <: Int):
+        v
+    x := 5
+    id(x)
+"#})]
+#[case::exact(indoc! {r#"
     def id(v: Int):
         v
     x := 5

@@ -27,10 +27,12 @@ use crate::{
 /// time (the block-classification decision runs before inference).
 fn mut_param_history_type(param: &Param) -> Option<Result<(Type, bool), LoweringError>> {
     let annotation = param.annotation.as_ref()?;
-    match mut_annotation_parts(annotation) {
+    match mut_annotation_parts(&annotation.ty) {
+        // The mode rides the *value* type, as at a `:=` introduction: a bounded
+        // `def f(v <: Mut(V))` infers the parameter's value type under `<: V`.
         Some(Ok((value, is_txn))) => Some(Ok((
             Type::History {
-                value: Box::new(value),
+                value: Box::new(apply_annotation_mode(annotation.mode, value)),
                 domain: Box::new(Type::Hole),
                 kind: crate::ccl::HistoryKind::Overwrite,
             },

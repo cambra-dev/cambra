@@ -1325,6 +1325,12 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// uses `TermMemo` instead (`emit_bare_predicate`).
 fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) {
     match ty {
+        // `Below` is a *pre-inference* annotation marker: `normalize_annotation`
+        // erases it into a bounded variable before any constraint is emitted, so
+        // the solver never sees one.
+        Type::Below(_) => {
+            unreachable!("Type::Below reached the solver; `normalize_annotation` must erase it")
+        }
         Type::Refinement(inner, r) => {
             // A handle clone, so `ctx` stays freely borrowable for the rebuild —
             // which re-enters this same memo through `coalesce_node` →
