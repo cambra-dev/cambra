@@ -49,9 +49,16 @@ ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a 
 # links/anchors (doc -> doc) and `<name>.md` citations in Rust comments
 # (code -> doc). Stdlib Python only; no Rust toolchain needed. Unit tests for
 # the checker run first so a checker bug can't mask real breakage.
+# `|| return 1` per command, not bare `set -e`: `ci_all` calls each gate on the
+# left of a `||` to collect the failing gate's name, and that disables errexit
+# for the whole dynamic extent — including this function. Without it a failing
+# checker unit test would fall through to the check below and the function would
+# report the *check's* status, defeating the very ordering this gate relies on.
+# (`return`, not `exit`: this body is not a subshell, so `exit` would tear down
+# the whole run instead of recording one failed gate.)
 ci_doc_refs() {
-  python3 .github/scripts/doc-refs/test_check_doc_refs.py
-  python3 .github/scripts/doc-refs/check_doc_refs.py
+  python3 .github/scripts/doc-refs/test_check_doc_refs.py || return 1
+  python3 .github/scripts/doc-refs/check_doc_refs.py || return 1
 }
 
 # Fast inner-loop gate for local iteration: format, lint (debug, lib+bins only),
