@@ -6,7 +6,11 @@ use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
-use crate::ccl::{AggregateKind, BaseType, BinOpKind, Builtin, Level, Type, UnaryOpKind};
+use crate::ccl::infer_var::Bound;
+use crate::ccl::{
+    AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Level, Type, TypeFn,
+    UnaryOpKind,
+};
 
 use super::product;
 
@@ -18,14 +22,89 @@ use super::product;
 /// whose typing rules require AST-level reasoning (`Apply`, `Lambda`,
 /// `Let`, `Case`, `List`, …) are handled by per-case rules in
 /// `emit_node` rather than via this registry.
+///
+/// # An operand requirement must be reachable from the result type
+///
+/// **A scheme that states a requirement on its operand variables must mention
+/// those variables in its result**, as a [`Type::App`] over them. Writing a
+/// concrete result instead compiles, infers, and silently accepts programs the
+/// requirement was written to reject.
+///
+/// The reason is the solver's, not the operator's. A bound is read when something
+/// **materializes** the variable it sits on, and a variable is materialized only
+/// when some node's type reaches it. A requirement recorded as a bound on the
+/// scheme's *own* operand variables — `α <: CommonBase(α, β)`, which is how
+/// [`binary_operands`] states one — sits on variables that are nobody's node type:
+/// a use site records `left <: α` and `right <: β`, so `α` and `β` are reachable
+/// from the operands, but nothing walks *from* them. The only thing that can reach
+/// them is the result, because the result is the node's type.
+///
+/// So arithmetic's result is `Add(α, β)` and a comparison's is `Greater(α, β)`,
+/// reducing to `Bool` for any operands that share a base and to an error for any
+/// that do not. A bare `Bool` there would let `1 > "a"` type-check and then panic
+/// in the interpreter: the requirement is stated, and never read.
+///
+/// The rule bites *only* for requirements carried this way. Every other scheme here
+/// states its requirement **structurally**, in an operand's own shape — `Sum`'s
+/// `∀α. (α ⇒ Int) ⇒ Int` puts the `Int` in the argument's codomain position, so
+/// `constrain_go` records it on the argument expression's variable, which is a
+/// node's type and is materialized like any other. Those need nothing. The trap is
+/// specific to a requirement riding a scheme variable that appears nowhere else.
 pub struct OperatorSchemes {
-    /// `∀α. α → α → α` — both operands agree, result is the same type.
-    /// Matches today's `infer_binop` Arithmetic rule which only enforces
-    /// operand agreement, not numeric-ness (operator conversion catches
-    /// non-numeric arithmetic later).
-    arithmetic: PolyScheme,
-    /// `∀α. α → α → Bool`.
-    compare: PolyScheme,
+    /// One scheme per arithmetic operator: `∀α β. α → β → Add(α, β)` and
+    /// siblings, each carrying the operand requirement `α, β <: CommonBase(α, β)`
+    /// as a bound on its own variables.
+    ///
+    /// **Nothing here is shared between the operands and the result**, and that is
+    /// the point. A shared variable (`∀α. α → α → α`) states *equality*, which
+    /// drags the whole lattice along with the base, once per polarity: the operand
+    /// occurrences are negative positions where refinement sets union, so one
+    /// operand's refinement becomes a *requirement* on the other (`\x -> x + 1`
+    /// demanding `x : {Int | __elem == 1}`), while the result occurrence is
+    /// positive where they intersect, so a refinement both operands carry survives
+    /// onto the result (`x + x` where `x` is `2` claiming the sum is `2`).
+    /// Arithmetic *computes* a new value, so it may inherit neither.
+    ///
+    /// The two halves are therefore stated separately:
+    ///
+    /// * The **result** is a type function: `Add(α, β)` reduces to the operands'
+    ///   common base once they resolve. It keeps the operator kind because a
+    ///   sharper rule needs it — `+` and `*` map operand ranges to different result
+    ///   ranges — so this is where `([0,2], [5,7]) ⇒ [5,9]` will live. One scheme
+    ///   per kind follows from the kind being part of the type.
+    /// * The **requirement** is a bound on the scheme's own variables:
+    ///   `α <: CommonBase(α, β)` and `β <: CommonBase(α, β)`. That keeps operand
+    ///   agreement (still only agreement — numeric-ness is the reduction rule's to
+    ///   enforce, and today it doesn't) *and* gives base inference through the
+    ///   existing negative read: `?x`'s upper-bound chain reaches
+    ///   `CommonBase(α, β)`, which materializes to the common base with refinements
+    ///   dropped, so `x + 1` still tells us `x : Int`.
+    ///
+    /// The requirement being **self-referential** — `α` occurring in its own bound —
+    /// is deliberate, and it is what makes the inference work rather than a trick to
+    /// tolerate. Reached while resolving `α`, the type function answers from `β`
+    /// with the common base of the rest; that *is* the propagation, and
+    /// [`reduce`](mod@crate::ccl::infer::solver::reduce)'s law 3 is what makes it
+    /// terminate. It survives instantiation for free: `freshen_above` copies a
+    /// variable's bounds and freshens the bound types through the same cache, so
+    /// each instantiation gets `α' <: CommonBase(α', β')` relating exactly its own
+    /// operands.
+    arithmetic: BTreeMap<ArithmeticKind, PolyScheme>,
+    /// One scheme per comparison: `∀α β. α → β → Greater(α, β)` and siblings, with
+    /// the same `CommonBase` operand requirement as
+    /// [`arithmetic`](Self::arithmetic).
+    ///
+    /// A comparison is exposed to only the *operand* half of the shared-variable
+    /// problem — its result is `Bool` and so could never inherit a refinement — but
+    /// that half is the same shared variable, so it takes the same treatment.
+    ///
+    /// The result is a type function even though it reduces to a constant, and that
+    /// is the section above in miniature: `Bool` mentions neither operand, so
+    /// nothing would ever materialize `α` or `β` and the requirement relating them
+    /// would never be read. `Compare(kind, α, β)` reduces to `Bool` for operands
+    /// that share a base and to an error for operands that do not, which is both
+    /// what a comparison means and what makes the requirement load-bearing.
+    compare: BTreeMap<CompareKind, PolyScheme>,
     /// `Bool → Bool → Bool`.
     bool_logic: PolyScheme,
     /// `String → String → String`.
@@ -65,6 +144,39 @@ pub struct OperatorSchemes {
     get_prev_txn: PolyScheme,
 }
 
+/// Two fresh operand variables for a binary operator, each **bounded above by
+/// their common base**: `α <: CommonBase(α, β)` and `β <: CommonBase(α, β)`.
+///
+/// This is how an operator states a requirement on its operands now that they no
+/// longer share a variable. The bound does two jobs at once: it agrees the operands'
+/// bases, and it is the channel through which one operand's base reaches the other
+/// (`x + 1` giving `x : Int`) — reached while resolving `α`, the operator answers
+/// from `β`. Crucially it carries *only* the base, because that is what
+/// `CommonBase` computes; a shared variable would have carried the refinements too.
+///
+/// Recorded once here, at registry construction. `PolyScheme::instantiate`'s
+/// freshen copies a variable's bounds, so every use site gets its own copy of the
+/// requirement over its own variables.
+fn binary_operands() -> (Type, Type) {
+    const BODY_LEVEL: Level = 1;
+    let alpha = fresh_var(BODY_LEVEL);
+    let beta = fresh_var(BODY_LEVEL);
+    let common = Type::App {
+        fun: TypeFn::CommonBase,
+        args: vec![alpha.clone(), beta.clone()],
+    };
+    // Recorded directly rather than through `constrain_subtype`: these are the
+    // scheme's *declared* bounds, not a derived obligation, and routing them through
+    // the solver would try to close them against bounds that do not exist yet.
+    for v in [&alpha, &beta] {
+        let Type::Infer(var) = v else {
+            unreachable!("fresh_var yields Type::Infer");
+        };
+        var.bounds_mut().upper.push(Bound::conc(common.clone()));
+    }
+    (alpha, beta)
+}
+
 impl OperatorSchemes {
     /// Build the registry. Schemes are quantified at level 0; their
     /// internal fresh vars live at level 1 so `instantiate(0)` mints
@@ -73,17 +185,40 @@ impl OperatorSchemes {
         const SCHEME_LEVEL: Level = 0;
         const BODY_LEVEL: Level = 1;
 
-        // Arithmetic: ∀α. α → α → α
-        let alpha = fresh_var(BODY_LEVEL);
-        let arithmetic =
-            PolyScheme::poly(SCHEME_LEVEL, fun(alpha.clone(), fun(alpha.clone(), alpha)));
+        // Arithmetic: one scheme per operator, ∀α β. α → β → <Op>(α, β), with the
+        // operand requirement recorded as a bound on α and β (see the field doc).
+        let arithmetic = ArithmeticKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let (alpha, beta) = binary_operands();
+                let result = Type::App {
+                    fun: TypeFn::Arithmetic(kind),
+                    args: vec![alpha.clone(), beta.clone()],
+                };
+                (
+                    kind,
+                    PolyScheme::poly(SCHEME_LEVEL, fun(alpha, fun(beta, result))),
+                )
+            })
+            .collect();
 
-        // Compare: ∀α. α → α → Bool
-        let alpha = fresh_var(BODY_LEVEL);
-        let compare = PolyScheme::poly(
-            SCHEME_LEVEL,
-            fun(alpha.clone(), fun(alpha, prim(BaseType::Bool))),
-        );
+        // Compare: one scheme per operator, ∀α β. α → β → <Op>(α, β), same operand
+        // requirement. The result is an operator rather than a bare `Bool` so that
+        // the requirement is reachable from it — see the type doc.
+        let compare = CompareKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let (alpha, beta) = binary_operands();
+                let result = Type::App {
+                    fun: TypeFn::Compare(kind),
+                    args: vec![alpha.clone(), beta.clone()],
+                };
+                (
+                    kind,
+                    PolyScheme::poly(SCHEME_LEVEL, fun(alpha, fun(beta, result))),
+                )
+            })
+            .collect();
 
         // BoolLogic: Bool → Bool → Bool
         let bool_logic = PolyScheme::mono(fun(
@@ -189,8 +324,14 @@ impl OperatorSchemes {
 
     pub(super) fn binop(&self, op: BinOpKind) -> &PolyScheme {
         match op {
-            BinOpKind::Arithmetic(_) => &self.arithmetic,
-            BinOpKind::Compare(_) => &self.compare,
+            BinOpKind::Arithmetic(k) => self
+                .arithmetic
+                .get(&k)
+                .expect("every ArithmeticKind has a scheme"),
+            BinOpKind::Compare(k) => self
+                .compare
+                .get(&k)
+                .expect("every CompareKind has a scheme"),
             BinOpKind::BoolLogic(_) => &self.bool_logic,
             BinOpKind::Concat => &self.concat,
         }

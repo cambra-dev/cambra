@@ -142,6 +142,7 @@ pub enum ConstrainError {
 pub struct ConstrainCache {
     edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
     kind_aware: bool,
+    parked: Vec<(Type, Type)>,
 }
 
 impl ConstrainCache {
@@ -152,6 +153,7 @@ impl ConstrainCache {
         Self {
             edges: HashMap::new(),
             kind_aware: true,
+            parked: Vec::new(),
         }
     }
 
@@ -161,7 +163,25 @@ impl ConstrainCache {
         Self {
             edges: HashMap::new(),
             kind_aware: false,
+            parked: Vec::new(),
         }
+    }
+
+    /// Hold an obligation the solver cannot decide yet because one side is an
+    /// unreduced [`Type::App`] — see [`constrain_go`]'s `App` arm.
+    fn park(&mut self, lhs: Type, rhs: Type) {
+        self.parked.push((lhs, rhs));
+    }
+
+    /// How many obligations are parked, so a caller can claim the ones its own
+    /// call added and tag them with the node to blame.
+    pub fn parked_len(&self) -> usize {
+        self.parked.len()
+    }
+
+    /// Take the obligations parked at or after `mark`.
+    pub fn take_parked_from(&mut self, mark: usize) -> Vec<(Type, Type)> {
+        self.parked.split_off(mark.min(self.parked.len()))
     }
 
     /// The composite-substitution bridges recorded for a subtyping edge,
@@ -629,7 +649,7 @@ fn constrain_go(
         // onto the two content sides.
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
-                let mut s = lv.bounds.borrow_mut();
+                let mut s = lv.bounds_mut();
                 s.upper
                     .push(Bound::edge(sl.clone(), rhs.clone(), sr.clone()));
                 s.lower.clone()
@@ -657,7 +677,7 @@ fn constrain_go(
         // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
-                let mut s = rv.bounds.borrow_mut();
+                let mut s = rv.bounds_mut();
                 s.lower
                     .push(Bound::edge(sr.clone(), lhs.clone(), sl.clone()));
                 s.upper.clone()
@@ -882,6 +902,38 @@ fn constrain_go(
             }
         }
 
+        // An unreduced type-function application on either side. **Deliberately not
+        // reduced here**: constraint emission runs while the graph is still being
+        // built, and reduction resolves its arguments off that graph — an answer read
+        // now could be superseded by an edge recorded a moment later, which is exactly
+        // the staleness the demand-driven design exists to rule out.
+        //
+        // So the obligation is **parked**, not dropped: held until emission completes,
+        // then retried against the finished graph, where reduction is meaningful
+        // (`InferCtx::check_parked_obligations`). Two same-function applications of
+        // equal arguments already short-circuited as trivially equal above.
+        //
+        // Both directions are parked, and only one of them needs to be. The common
+        // traffic is an **operand requirement** being closed — `Int <: CommonBase(α,
+        // β)`, as a concrete operand flows into a scheme variable the registry already
+        // bounded by the function — and dropping *that* would be sound, because the
+        // requirement is re-checked when the function's result is materialized and the
+        // scheme rule guarantees something materializes it (see `OperatorSchemes`, "An
+        // operand requirement must be reachable from the result type"). The other
+        // direction is the real hole: an application on the *lower* side against a
+        // concrete demand, `Add(α, β) <: Bool`, which bound closure produces for
+        // `(1 + 2) and True`. Nothing downstream re-derives that one, so accepting it
+        // silently turned an ordinary type error into a panic at the
+        // `check_pre_desugar` wall. Parking both is what makes the arm's rule
+        // "undecidable now" rather than a claim about which shapes arrive.
+        //
+        // The substitutions in flight are applied on the way in: a parked obligation
+        // outlives this frame, so it must not depend on morphisms the frame carries.
+        (Type::App { .. }, _) | (_, Type::App { .. }) => {
+            cache.park(sl.apply_type(lhs), sr.apply_type(rhs));
+            Ok(())
+        }
+
         _ => Err(ConstrainError::Mismatch {
             lhs: lhs.clone(),
             rhs: rhs.clone(),
@@ -964,6 +1016,17 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 .map(|(k, t)| (k.clone(), extrude(t, pol, target_level, cache)))
                 .collect(),
         ),
+        // A type function extrudes argumentwise. Arguments keep the enclosing
+        // polarity: an operator declares no variance, and extrusion only needs to
+        // copy structure across a level boundary — reduction is what eventually
+        // interprets the arguments, and it runs on the copy just as on the original.
+        Type::App { fun, args } => Type::App {
+            fun: fun.clone(),
+            args: args
+                .iter()
+                .map(|a| extrude(a, pol, target_level, cache))
+                .collect(),
+        },
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(extrude(inner, pol, target_level, cache)),
             r.clone(),
@@ -992,7 +1055,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // Snapshot the bounds we'll need to extrude before we mutate
             // the original; otherwise we'd race the borrow checker.
             let (lows, ups) = {
-                let s = tv.bounds.borrow();
+                let s = tv.bounds();
                 (s.lower.clone(), s.upper.clone())
             };
 
@@ -1000,8 +1063,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 // Positive: original flows into new var. Original gains
                 // `nvs` as an upper bound; new var inherits original's
                 // lower bounds (extruded at the same polarity).
-                tv.bounds
-                    .borrow_mut()
+                tv.bounds_mut()
                     .upper
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_lows: Vec<_> = lows
@@ -1012,13 +1074,12 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                         ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().lower = new_lows;
+                nvs.bounds_mut().lower = new_lows;
             } else {
                 // Negative: new var flows into original. Original gains
                 // `nvs` as a lower bound; new var inherits original's
                 // upper bounds.
-                tv.bounds
-                    .borrow_mut()
+                tv.bounds_mut()
                     .lower
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_ups: Vec<_> = ups
@@ -1029,7 +1090,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                         ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().upper = new_ups;
+                nvs.bounds_mut().upper = new_ups;
             }
             Type::Infer(nvs)
         }
@@ -1095,7 +1156,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             // `tv`); re-seeding from it would create a spurious `proxy <: proxy`
             // self-edge.
             let (lows, ups) = {
-                let s = tv.bounds.borrow();
+                let s = tv.bounds();
                 let not_proxy = |b: &Bound| !matches!(&b.ty, Type::Infer(v) if v.uid == nvs.uid);
                 (
                     s.lower
@@ -1112,8 +1173,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             };
             // Positive link: `tv <: proxy`; proxy inherits `tv`'s lower bounds.
             if !has_pos_link {
-                tv.bounds
-                    .borrow_mut()
+                tv.bounds_mut()
                     .upper
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_lows: Vec<_> = lows
@@ -1124,12 +1184,11 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                         ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().lower.extend(new_lows);
+                nvs.bounds_mut().lower.extend(new_lows);
             }
             // Negative link: `proxy <: tv`; proxy inherits `tv`'s upper bounds.
             if !has_neg_link {
-                tv.bounds
-                    .borrow_mut()
+                tv.bounds_mut()
                     .lower
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_ups: Vec<_> = ups
@@ -1140,7 +1199,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                         ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().upper.extend(new_ups);
+                nvs.bounds_mut().upper.extend(new_ups);
             }
             Type::Infer(nvs)
         }
@@ -1373,9 +1432,9 @@ mod tests {
         let Type::Infer(v) = &a else { unreachable!() };
         let expected = refined(prim(BaseType::Int), p);
         assert!(
-            v.bounds.borrow().upper.iter().any(|u| u.ty == expected),
+            v.bounds().upper.iter().any(|u| u.ty == expected),
             "?a should carry {{Int | p}} as an upper bound, got {:?}",
-            v.bounds.borrow().upper
+            v.bounds().upper
         );
     }
 
@@ -1482,7 +1541,7 @@ mod tests {
         let mut cache = ConstrainCache::new();
         constrain_subtype(&v, &p, &mut cache).unwrap();
         if let Type::Infer(state) = &v {
-            let s = state.bounds.borrow();
+            let s = state.bounds();
             assert_eq!(s.upper.len(), 1);
             assert!(s.lower.is_empty());
         } else {
@@ -1498,7 +1557,7 @@ mod tests {
         let mut cache = ConstrainCache::new();
         constrain_subtype(&p, &v, &mut cache).unwrap();
         if let Type::Infer(state) = &v {
-            let s = state.bounds.borrow();
+            let s = state.bounds();
             assert!(s.upper.is_empty());
             assert_eq!(s.lower.len(), 1);
         } else {
@@ -1524,7 +1583,7 @@ mod tests {
         constrain_subtype(&beta, &alpha, &mut cache).unwrap();
 
         if let Type::Infer(state) = &beta {
-            let s = state.bounds.borrow();
+            let s = state.bounds();
             assert_eq!(s.upper.len(), 1);
             // The recorded upper bound is α itself, not Int.
             assert!(matches!(&s.upper[0].ty, Type::Infer(_)));
@@ -1769,7 +1828,7 @@ mod tests {
         let Type::Infer(orig) = &v1 else {
             unreachable!("fresh_var yields Type::Infer");
         };
-        let bounds = orig.bounds.borrow();
+        let bounds = orig.bounds();
         let proxy_ty = Type::Infer(Rc::clone(proxy));
         assert!(
             bounds.upper.iter().any(|b| b.ty == proxy_ty),
@@ -1822,7 +1881,7 @@ mod tests {
         );
         // Both bound directions must survive the cache hit.
         let proxy_ty = Type::Infer(Rc::clone(feed_proxy));
-        let bounds = orig.bounds.borrow();
+        let bounds = orig.bounds();
         assert!(
             bounds.upper.iter().any(|b| b.ty == proxy_ty),
             "original is missing the upper (positive) link to its proxy"
@@ -2008,7 +2067,7 @@ mod tests {
         let Type::Infer(gamma_var) = &gamma else {
             unreachable!()
         };
-        gamma_var.bounds.borrow_mut().lower.push(Bound::with_subst(
+        gamma_var.bounds_mut().lower.push(Bound::with_subst(
             Type::Infer(Rc::clone(result_var)),
             Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
         ));
@@ -2061,7 +2120,7 @@ mod tests {
         let Type::Infer(gamma_var) = &gamma else {
             unreachable!()
         };
-        gamma_var.bounds.borrow_mut().lower.push(Bound::with_subst(
+        gamma_var.bounds_mut().lower.push(Bound::with_subst(
             Type::Infer(Rc::clone(result_var)),
             Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
         ));
@@ -2108,14 +2167,14 @@ mod tests {
             let Type::Infer(av) = &app else {
                 unreachable!()
             };
-            av.bounds.borrow_mut().lower.push(Bound::with_subst(
+            av.bounds_mut().lower.push(Bound::with_subst(
                 r.clone(),
                 Subst::discharge("k", TypedExpr::lit(Lit::Int(lit))),
             ));
             constrain_subtype(&app, &v, &mut cache).expect("app <: V");
         }
 
-        let lows = vv.bounds.borrow().lower.clone();
+        let lows = vv.bounds().lower.clone();
         let rendered: Vec<String> = lows
             .iter()
             .map(|b| format!("{}", b.materialize()))

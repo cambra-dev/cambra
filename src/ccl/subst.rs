@@ -769,6 +769,14 @@ impl Subst {
             // otherwise the type slot would keep naming the dead binder.
             Type::ChanDom(name, _) => *name = self.handle_target(name),
 
+            // A type function: rewrite its arguments in place. The function is
+            // data and binds nothing, so there is no scope to restrict.
+            Type::App { args, .. } => {
+                for arg in args.iter_mut() {
+                    self.rewrite_type_go(arg, memo);
+                }
+            }
+
             // A transient history handle (an `Overwrite` erased by the unified phase,
             // a `Feed` by `channelize`): rewrite both children in place. Renaming
             // does not cross the kind — the value and domain are ordinary types.
@@ -985,6 +993,12 @@ impl Subst {
             // in-place mode (`rewrite_type_go`).
             Type::ChanDom(name, lvl) => Type::ChanDom(self.handle_target(name), *lvl),
 
+            // A type function applies argumentwise; the function binds nothing.
+            Type::App { fun, args } => Type::App {
+                fun: fun.clone(),
+                args: args.iter().map(|a| self.apply_type(a)).collect(),
+            },
+
             Type::Fun {
                 name: None,
                 domain,
@@ -1101,6 +1115,11 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Variant(tags) => tags.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Refinement(base, _) => type_contains_infer(base),
+        // An unreduced application is ground exactly when every argument is: an
+        // undetermined argument is precisely where the `Infer` a caller is asking
+        // about lives, and it is what leaves the application unreduced in the first
+        // place.
+        Type::App { args, .. } => args.iter().any(type_contains_infer),
     }
 }
 
@@ -1138,6 +1157,13 @@ fn collect_type_fv(
         | Type::Txn
         | Type::Hole
         | Type::Infer(_) => {}
+        // A type function binds nothing, so its arguments' free variables are
+        // free in the application.
+        Type::App { args, .. } => {
+            for a in args {
+                collect_type_fv(a, bound, visited, out);
+            }
+        }
         Type::Fun {
             name,
             domain,

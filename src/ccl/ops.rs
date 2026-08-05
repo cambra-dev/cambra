@@ -82,7 +82,12 @@ pub enum Lit {
 }
 
 /// Arithmetic sub-operations for [`BinOpKind::Arithmetic`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Ord` carries no semantics — the operators are unordered alternatives. It exists
+/// so a kind can key the per-operator scheme map in `infer`'s `OperatorSchemes`,
+/// which is per-kind because the kind is part of the result *type*
+/// ([`TypeFn::Arithmetic`](crate::ccl::TypeFn::Arithmetic)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ArithmeticKind {
     /// Integer addition (`+`).
     Add,
@@ -94,8 +99,40 @@ pub enum ArithmeticKind {
     FloorDiv,
 }
 
+impl ArithmeticKind {
+    /// Every kind, for the registry that builds one scheme per operator.
+    ///
+    /// A list rather than a derive, so it has to be maintained by hand — but not
+    /// silently: [`type_fn_name`](Self::type_fn_name)'s match is exhaustive, so a
+    /// new variant stops compiling there first, right beside this. The registry
+    /// looking a kind up in a map is what makes an omission matter, and
+    /// `every_arithmetic_kind_has_a_scheme` is the backstop.
+    pub const ALL: [ArithmeticKind; 4] = [
+        ArithmeticKind::Add,
+        ArithmeticKind::Sub,
+        ArithmeticKind::Mul,
+        ArithmeticKind::FloorDiv,
+    ];
+
+    /// The spelling of this operator when it appears as a **type** operator
+    /// ([`TypeFn::Arithmetic`](crate::ccl::TypeFn::Arithmetic)) — i.e. inside the
+    /// unreduced result type of an arithmetic expression. Ordinary type names, not
+    /// the source symbols, because a type reads as a type: `Add(Int, Int)`.
+    pub fn type_fn_name(&self) -> &'static str {
+        match self {
+            ArithmeticKind::Add => "Add",
+            ArithmeticKind::Sub => "Sub",
+            ArithmeticKind::Mul => "Mul",
+            ArithmeticKind::FloorDiv => "FloorDiv",
+        }
+    }
+}
+
 /// Comparison sub-operations for [`BinOpKind::Compare`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Ord` carries no semantics, exactly as on [`ArithmeticKind`] — it exists so a
+/// kind can key the per-operator scheme map in `infer`'s `OperatorSchemes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CompareKind {
     /// Equality (`==`).
     Equals,
@@ -109,6 +146,33 @@ pub enum CompareKind {
     Greater,
     /// Greater than or equal (`>=`).
     GreaterOrEq,
+}
+
+impl CompareKind {
+    /// Every kind — see [`ArithmeticKind::ALL`], including why this is a
+    /// hand-maintained list that cannot silently fall behind.
+    pub const ALL: [CompareKind; 6] = [
+        CompareKind::Equals,
+        CompareKind::NotEquals,
+        CompareKind::Less,
+        CompareKind::LessOrEq,
+        CompareKind::Greater,
+        CompareKind::GreaterOrEq,
+    ];
+
+    /// The spelling of this operator when it appears as a **type** operator
+    /// ([`TypeFn::Compare`](crate::ccl::TypeFn::Compare)) — see
+    /// [`ArithmeticKind::type_fn_name`].
+    pub fn type_fn_name(&self) -> &'static str {
+        match self {
+            CompareKind::Equals => "Equals",
+            CompareKind::NotEquals => "NotEquals",
+            CompareKind::Less => "Less",
+            CompareKind::LessOrEq => "LessOrEq",
+            CompareKind::Greater => "Greater",
+            CompareKind::GreaterOrEq => "GreaterOrEq",
+        }
+    }
 }
 
 /// Boolean logic sub-operations for [`BinOpKind::BoolLogic`].

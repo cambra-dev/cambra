@@ -16,6 +16,7 @@ use super::emit::{
     emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
+use super::solve::resolve_var_type;
 use super::typing::{Typing, peel_refinements_outer};
 use super::{lit_base, map_constrain_err};
 
@@ -425,6 +426,23 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
     // case — eliminators that destructure return the function's own codomain,
     // constructors rebuild the same product), the subtype check is reflexive
     // and trivially holds, so skip the (deeper, allocating) `constrain_subtype`.
+    // A rule that applies an operator scheme hands back a fresh variable whose only
+    // content is the scheme's result, so comparing it directly to the recorded type
+    // records an upper bound and discovers a disagreement only if the bound-closure
+    // reaches one — and a `Type::Compute` on the variable's lower bounds stops that
+    // walk, since an unreduced operator is opaque to the solver. Resolving first is
+    // what makes the operator reduce, which is the whole reason its result *is* an
+    // operator (see `OperatorSchemes`, "An operand requirement must be reachable
+    // from the result type"). Without this the wall cannot see a wrong `1 + 2 :
+    // String` or `1 < 2 : Int` at all.
+    //
+    // Narrow on purpose: only a rule-derived type that is still a bare variable is
+    // resolved. Every other rule rebuilds a ground type from its children, where
+    // resolution is the identity and the comparison already has everything.
+    let ty = match &ty {
+        Type::Infer(_) => resolve_var_type(&ty).unwrap_or(ty),
+        _ => ty,
+    };
     if ty != expr.ty {
         // Refinements included: this is the plain strict relation, like every other
         // check here. A rule that rebuilds a node's type from its children rebuilds

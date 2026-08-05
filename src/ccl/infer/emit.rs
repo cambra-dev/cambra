@@ -335,6 +335,13 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), L
             emit_annotation_predicates(value, ctx)?;
             emit_annotation_predicates(domain, ctx)
         }
+        // Arguments can carry refinements of their own; reach them.
+        Type::App { args, .. } => {
+            for a in args.iter_mut() {
+                emit_annotation_predicates(a, ctx)?;
+            }
+            Ok(())
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
@@ -406,19 +413,19 @@ fn emit_bare_predicate<C: Typing>(
 /// Apply a binary scheme: instantiate, build the expected call shape,
 /// constrain_subtype. Returns the fresh result variable.
 ///
-/// Operand types enter **stripped of refinements**, and that is load-bearing rather
-/// than tidying. An operator scheme relates *base* types — arithmetic is
-/// `∀α. α → α → α`, one variable shared across both operands and the result — so any
-/// refinement reaching α propagates to the result, claiming the operator preserved
-/// it. No binary operator does: `+` on two values that are each `2` produces `4`, not
-/// a `2`. The claim is invisible while both operands merely *join* (distinct
-/// refinements intersect to none), and wrong the moment they do not — `x + x` keeps
-/// `x`'s refinement, because intersecting a set with itself is that set.
+/// Operand types enter **verbatim**. Keeping an operator's refinements from
+/// crossing to its other operand or to its result is the *scheme*'s business: the
+/// operands do not share a variable, the result is a type function, and the
+/// requirement relating them is a `CommonBase` bound that carries the base and
+/// nothing else (see [`OperatorSchemes::arithmetic`](super::schemes::OperatorSchemes)).
 ///
-/// A refinement is a fact about a *value*; carrying it across an operator that
-/// computes a new value is exactly the mistake this prevents. (An operator that
-/// genuinely refines its result — a future constant fold — states that itself,
-/// rather than inheriting it by variable sharing.)
+/// The tempting shortcut here is `strip_refinements` on each operand type, and it
+/// is worth recording why it cannot work: it peels *syntactic* `Type::Refinement`
+/// layers and returns a `Type::Infer` untouched, so it erases a literal's
+/// refinement and does nothing at all for an operand whose type is still an
+/// inference variable — every operand that is not a literal. A syntactic peel
+/// cannot implement a semantic relation, because at emit time the thing it needs to
+/// look through has not been resolved yet.
 fn apply_binary_scheme<C: Typing>(
     ctx: &mut C,
     scheme: &PolyScheme,
@@ -428,10 +435,7 @@ fn apply_binary_scheme<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     let body = ctx.instantiate(scheme);
     let result = ctx.fresh();
-    let expected = fun(
-        strip_refinements(left),
-        fun(strip_refinements(right), result.clone()),
-    );
+    let expected = fun(left.clone(), fun(right.clone(), result.clone()));
     ctx.require_sub(&body, &expected, at)?;
     Ok(result)
 }
@@ -1537,7 +1541,7 @@ mod review_tests {
             let Type::Infer(v) = t else {
                 panic!("fresh() yields a variable");
             };
-            let b = v.bounds.borrow();
+            let b = v.bounds();
             b.lower.len() + b.upper.len()
         };
         assert!(

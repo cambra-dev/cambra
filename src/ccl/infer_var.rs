@@ -206,14 +206,54 @@ pub struct InferBounds {
 /// borrow-free and never inspects the bound graph — which is what lets
 /// [`Type`] keep deriving `PartialEq`/`Eq`/`Hash`/`Debug` even while a
 /// variable's bounds are cyclic (a recursive type, pre-rejection) or
-/// mutably borrowed mid-constraint. Only [`InferVar::bounds`] is mutable.
+/// mutably borrowed mid-constraint. Only the bound lists are mutable, and only
+/// through [`InferVar::bounds_mut`].
 pub struct InferVar {
     /// Stable, globally-unique identity.
     pub uid: InferVarId,
     /// Scope level at which the variable was minted.
     pub level: Level,
-    /// Mutable lower/upper bound lists.
-    pub bounds: RefCell<InferBounds>,
+    /// Mutable lower/upper bound lists. **Private on purpose** — see
+    /// [`InferVar::bounds_mut`] and [`graph_generation`].
+    bound_lists: RefCell<InferBounds>,
+}
+
+thread_local! {
+    // How many times the bound graph has been mutated on this thread — see
+    // `graph_generation`.
+    static GRAPH_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the bound graph has been mutated on this thread.
+///
+/// A counter rather than a flag, because a cache can then record the generation it
+/// was built under and check it in O(1) — which is what lets a resolution cache
+/// outlive the walk that filled it. Demand-driven reduction reads the graph *now*,
+/// so anything it remembers stays valid exactly as long as the graph has not moved;
+/// see `reconcile_cache` in the compaction module.
+pub fn graph_generation() -> u64 {
+    GRAPH_GENERATION.with(|g| g.get())
+}
+
+impl InferVar {
+    /// Read the bound lists.
+    pub fn bounds(&self) -> std::cell::Ref<'_, InferBounds> {
+        self.bound_lists.borrow()
+    }
+
+    /// Mutate the bound lists, **bumping [`graph_generation`]**.
+    ///
+    /// Every write to the graph goes through here, and that is enforced by
+    /// `bound_lists` being private rather than by convention: a cache keyed on the
+    /// generation is only sound if no mutation can slip past the counter, and
+    /// "remember to bump it" is exactly the kind of obligation that gets missed.
+    /// The bump is unconditional — a `bounds_mut` that writes nothing still
+    /// invalidates — because reading intent out of a `RefMut` is not possible and
+    /// over-invalidating only costs a recomputation.
+    pub fn bounds_mut(&self) -> std::cell::RefMut<'_, InferBounds> {
+        GRAPH_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+        self.bound_lists.borrow_mut()
+    }
 }
 
 thread_local! {
@@ -268,7 +308,7 @@ impl InferVar {
         let var = Rc::new(InferVar {
             uid: fresh_infer_var_id(),
             level,
-            bounds: RefCell::new(InferBounds::default()),
+            bound_lists: RefCell::new(InferBounds::default()),
         });
         ACTIVE_ARENA.with(|slot| {
             if let Some(vars) = slot.borrow_mut().as_mut() {
