@@ -198,6 +198,23 @@ impl Uniquifier {
                 self.unbind(base);
             }
 
+            // A register introduction binds exactly like a `let`: the seed is
+            // walked *outside* the binder's scope (a seed cannot reference the
+            // register it seeds), then the name is minted over the body — which is
+            // where its `MutWrite`s and reads live, and they must resolve to this
+            // binder's α-unique name for the write-target map to key on.
+            TypedExprNode::MutDecl {
+                binding,
+                init,
+                body,
+            } => {
+                self.expr(init);
+                self.binding_tys(binding);
+                let base = self.bind(binding);
+                self.expr(body);
+                self.unbind(base);
+            }
+
             // Mutual recursion: mint *all* group binders before walking any
             // binding body, so a reference to any group name — in any body or
             // in the letrec body — resolves to its group binder.

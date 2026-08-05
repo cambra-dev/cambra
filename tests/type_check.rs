@@ -1648,3 +1648,103 @@ f({c})"
         );
     }
 }
+
+/// The binder slot records the type the binder is **bound at**, which for an
+/// annotated `let` is not its initializer's type.
+///
+/// This is the property the `Mut` discipline and the transaction-register scan
+/// read, and it is the reason neither has to consult `user_annotation` (which
+/// inference clears) as a proxy. Each case below is one where the two types
+/// differ, so a slot filled from the initializer would give the wrong answer.
+mod binder_slot_records_the_bound_at_type {
+    use super::*;
+    use cambra::ccl::{Expr, TypedBinding};
+
+    /// The `Let` binder for `name`, after lowering + inference.
+    fn binder_of(code: &str, name: &str) -> TypedBinding {
+        // Via `walk_binders`, so a register introduction (`MutDecl`) is found as
+        // readily as a `let` — and so this helper cannot go stale against a new
+        // binder-bearing node.
+        fn find(expr: &Expr, name: &str, out: &mut Option<TypedBinding>) {
+            expr.walk_binders(|b| {
+                if b.name.base() == name {
+                    *out = Some(b.clone());
+                }
+            });
+            expr.walk_children(|c| find(c, name, out));
+        }
+        let mut lctx = LoweringContext::default();
+        let stmts = parse_module(code);
+        let mut expr = lower_stmts(&stmts, &mut lctx)
+            .into_result()
+            .expect("lowering failed");
+        infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
+        let mut out = None;
+        find(&expr, name, &mut out);
+        out.unwrap_or_else(|| panic!("no binder named `{name}`"))
+    }
+
+    /// A register introduction binds at the **history**, though its initializer
+    /// is a plain value. Reading the initializer's type here is what used to make
+    /// `collect_txn_registers` fall back to the annotation.
+    #[test]
+    fn register_introduction_binds_at_the_history() {
+        let b = binder_of("a: Mut(Int) := 0\na", "a");
+        assert!(
+            b.ty.as_register().is_some(),
+            "register binder bound at {} — expected a history",
+            b.ty
+        );
+        assert!(
+            matches!(
+                b.ty,
+                cambra::ccl::Type::History {
+                    kind: HistoryKind::Overwrite,
+                    ..
+                }
+            ),
+            "a `:=` introduction binds at an Overwrite history"
+        );
+    }
+
+    /// A deref-copy binds at the **value type**, though its initializer is a
+    /// history. Reading the initializer's type here made `y` an alias of the
+    /// register in the type system.
+    #[test]
+    fn deref_copy_binds_at_the_value_type() {
+        let b = binder_of("a: Mut(Int) := 0\nb: Int = a\nb", "b");
+        assert_eq!(b.ty, int(), "deref-copy binder bound at {}", b.ty);
+    }
+
+    /// A bare `_` declares nothing, so `b: _ = a` binds exactly where `b = a`
+    /// does: at the register's *value*. A register-typed initializer derefs before
+    /// any annotation is consulted, so `_` needs no special handling — and a `Let`
+    /// cannot bind a register at all.
+    #[test]
+    fn a_let_never_binds_a_register() {
+        for code in [
+            "a: Mut(Int) := 0\nb = a\nb",
+            "a: Mut(Int) := 0\nb: _ = a\nb",
+        ] {
+            let b = binder_of(code, "b");
+            assert_eq!(b.ty, int(), "`{code}` bound `b` at {}", b.ty);
+        }
+    }
+
+    /// Inference consumes annotations: none survives it.
+    #[test]
+    fn annotations_do_not_survive_inference() {
+        for (code, name) in [
+            ("a: Mut(Int) := 0\nb: Int = a\nb", "b"),
+            ("x: _ = 5\nx", "x"),
+            ("y: Int = 5\ny", "y"),
+        ] {
+            let b = binder_of(code, name);
+            assert!(
+                b.user_annotation.is_none(),
+                "annotation survived inference on `{name}`: {:?}",
+                b.user_annotation
+            );
+        }
+    }
+}
