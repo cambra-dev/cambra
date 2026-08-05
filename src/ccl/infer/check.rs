@@ -42,7 +42,7 @@ use super::{lit_base, map_constrain_err};
 ///
 /// There is no cast escape in the adjacency rule: a producer must already
 /// carry the refinement its consumer demands. Join planning makes this hold by
-/// surfacing each iterated/join-satisfying extent on the *producing* morphism's
+/// surfacing each iterated/join-satisfying domain on the *producing* morphism's
 /// codomain (`planning`'s `refine_codomain` / iteration-source `set_codomain`),
 /// so a `… ≫ (id ≫ cast({D | r} ⇒ V))` chain composes because the upstream
 /// genuinely supplies `{D | r}`. Because planning re-mints a fresh refinement
@@ -123,7 +123,7 @@ impl Typing for CheckCtx {
         // truth for width/variance and (since refinements ride the lattice as
         // restriction witnesses) witness subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
-        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new()) {
+        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new_kind_blind()) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }

@@ -82,7 +82,158 @@ impl AtomKey {
 /// neither directly, so [`coalesce_compact`](super::coalesce::coalesce_compact)
 /// picks a single concrete type from these bag-of-types contributions and
 /// errors on conflict.
-#[derive(Debug, Clone, Default)]
+/// The kind of a merged function slot. Three-state so [`CompactType::merge`]
+/// stays infallible: a `Data ⊔ Compute` collision that would collapse a
+/// data function's domain alternatives becomes `Conflict` and is reported loudly at coalesce
+/// ([`super::coalesce::CoalesceError::DomainJoinConflict`]), never a mid-merge
+/// panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindMerge {
+    /// domain — the ordinary contravariant meet.
+    Compute,
+    /// domain — joins are lossless (`union_domains`).
+    Data,
+    /// A data/compute or multi-domain collision; deferred to coalesce.
+    Conflict,
+}
+
+impl KindMerge {
+    /// Resolve a function's kind. FunKind is a **provenance** property, not a
+    /// function of the domain: a concrete [`FunKind`](crate::ccl::ty::FunKind)
+    /// passes through unchanged. Data collections — list literals, comprehensions,
+    /// `groupby` — are concrete-stamped `Data` at construction; a bare lambda is
+    /// concrete `Compute` (a capability, `emit_lambda`). Only an *inferred* kind
+    /// ([`FunKind::Var`](crate::ccl::ty::FunKind::Var) — a function parameter or a
+    /// freshened scheme kind) resolves from its bounds over the two-point lattice
+    /// `Data ⊑ Compute`: a `Compute` lower bound → `Compute`, a `Data` upper bound
+    /// (demand) → `Data`, both → the `Compute <: Data` conflict, neither → the
+    /// `Compute` capability default. No domain inspection is involved: a capability
+    /// supplied where a collection is demanded (e.g. `sum(λ x → x + 1)`) is a concrete
+    /// `Compute` value against a `Data` demand, rejected up front in
+    /// [`constrain_kind`](super::constrain) — it never reaches a var here.
+    fn of(kind: &crate::ccl::ty::FunKind) -> Self {
+        use crate::ccl::ty::FunKind;
+        match kind {
+            FunKind::Compute => KindMerge::Compute,
+            FunKind::Data => KindMerge::Data,
+            FunKind::Var(v) => {
+                let b = v.bounds.borrow();
+                match (b.forced_compute, b.forced_data) {
+                    (true, true) => KindMerge::Conflict,
+                    // A var demanded as data with no compute lower bound is `Data`
+                    // (e.g. a parameter used only as a collection). A capability
+                    // flowing in would carry a concrete `Compute`, forcing the
+                    // `(true, _)` arms or failing at `constrain_kind` first.
+                    (false, true) => KindMerge::Data,
+                    (true, false) => KindMerge::Compute,
+                    // Unconstrained → `Compute` (a capability is the default).
+                    (false, false) => KindMerge::Compute,
+                }
+            }
+        }
+    }
+}
+
+/// A merged function shape. `domains` holds one entry for an ordinary function
+/// (the meet of the merged domains); a positive `Data ⊔ Data` join accumulates
+/// ≥ 2 deduplicated alternatives, which coalesce reconciles (see `union_domains`).
+/// `Compute` slots always carry exactly one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactFun {
+    /// The Pi (element) binder, `na.or(nb)` on merge.
+    pub name: Option<Name>,
+    /// The merged kind.
+    pub kind: KindMerge,
+    /// Domain alternatives — `len == 1` unless a `Data ⊔ Data` join accumulated more.
+    pub domains: Vec<CompactType>,
+    /// The codomain (covariant).
+    pub codomain: Box<CompactType>,
+}
+
+/// The join of two data-function domain-alternative lists: the union of the
+/// alternatives, deduplicated by structural [`CompactType`] equality. Never a
+/// meet — a `Data` domain *is* the data, so narrowing it drops rows.
+///
+/// Both alternatives are kept because whether they are really two domains cannot
+/// be decided here: at compact time a domain still carries unresolved variable
+/// identity, so two structurally identical domains can compare unequal. Coalesce
+/// re-runs the comparison on the materialized [`Type`]s and decides there — one
+/// surviving domain is a plain data function, and more than one is a join with no
+/// lossless single-domain answer.
+fn union_domains(mut a: Vec<CompactType>, b: Vec<CompactType>) -> Vec<CompactType> {
+    for d in b {
+        if !a.contains(&d) {
+            a.push(d);
+        }
+    }
+    a
+}
+
+impl CompactFun {
+    /// Merge two function slots. `pol` is the *outer* polarity; domains merge
+    /// contravariantly (at `!pol`), the codomain covariantly (at `pol`).
+    fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
+        use KindMerge::*;
+        let name = a.name.clone().or_else(|| b.name.clone());
+        let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
+        // The contravariant domain meet, defined only when both sides carry a
+        // single domain (a multi-domain collection has no single domain to meet).
+        let meet = |x: Vec<CompactType>, y: Vec<CompactType>| -> Vec<CompactType> {
+            debug_assert!(x.len() == 1 && y.len() == 1, "meet of a multi-domain");
+            vec![CompactType::merge(
+                !pol,
+                x.into_iter().next().unwrap(),
+                y.into_iter().next().unwrap(),
+            )]
+        };
+        // On any prior conflict, stay conflicted (keep the wider domain list
+        // so coalesce can render diagnostics).
+        let widest = |x: Vec<CompactType>, y: Vec<CompactType>| {
+            if x.len() >= y.len() { x } else { y }
+        };
+        let (kind, domains) = if a.kind == Conflict || b.kind == Conflict {
+            (Conflict, widest(a.domains, b.domains))
+        } else if pol {
+            // Positive (join).
+            match (a.kind, b.kind) {
+                (Data, Data) => (Data, union_domains(a.domains, b.domains)),
+                (Compute, Compute) => (Compute, meet(a.domains, b.domains)),
+                // Data ⊔ Compute: an honest upcast to a callable (Compute) iff
+                // the data side is a single domain; collapsing several alternatives
+                // to a meet would drop domains → Conflict.
+                _ => {
+                    if a.domains.len() == 1 && b.domains.len() == 1 {
+                        (Compute, meet(a.domains, b.domains))
+                    } else {
+                        (Conflict, widest(a.domains, b.domains))
+                    }
+                }
+            }
+        } else {
+            // Negative (meet): the stronger contract wins (Data if either is).
+            let k = if a.kind == Data || b.kind == Data {
+                Data
+            } else {
+                Compute
+            };
+            if a.domains.len() == 1 && b.domains.len() == 1 {
+                (k, meet(a.domains, b.domains))
+            } else {
+                // Two multi-domain requirements meeting at a negative position — no current
+                // program produces this; flag it loudly at coalesce.
+                (Conflict, widest(a.domains, b.domains))
+            }
+        };
+        CompactFun {
+            name,
+            kind,
+            domains,
+            codomain,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactType {
     /// Variable contributions from this position. Multiple variables
     /// can co-occur (e.g. when two projection morphisms both flow into
@@ -116,13 +267,11 @@ pub struct CompactType {
     /// the absorbing element (here from intersecting disjoint tag sets at
     /// negative polarity).
     pub var: Option<BTreeMap<FieldKey, CompactType>>,
-    /// Function shape, if any: an optional Pi binder name plus the domain
-    /// and codomain. Recursively merged with polarity flip on the domain.
-    /// The name is preserved so a dependent codomain's refinement predicate
-    /// keeps its binder bound through coalesce; it is stripped at
-    /// materialization when the codomain does not actually reference it
-    /// (keeping ordinary functions `name: None`).
-    pub fun: Option<(Option<Name>, Box<CompactType>, Box<CompactType>)>,
+    /// Function shape, if any: see [`CompactFun`]. Carries the Pi binder, the
+    /// merged [`KindMerge`], the domain alternatives (one, unless a positive
+    /// `Data ⊔ Data` join accumulated alternatives via [`union_domains`]), and the
+    /// codomain. Recursively merged with polarity flip on the domain.
+    pub fun: Option<CompactFun>,
     /// Witness contributions at this position. A set with `==`
     /// membership (deduplicated by [`Refinement`]'s structural `PartialEq`),
     /// stored as a `Vec` in first-insertion order. A refinement-set is
@@ -176,15 +325,7 @@ impl CompactType {
         };
         let fun = match (lhs.fun, rhs.fun) {
             (None, f) | (f, None) => f,
-            (Some((na, la, ra)), Some((nb, lb, rb))) => Some((
-                // Prefer a present binder name; two distinct names at one
-                // position only arise for unrelated functions merging, where
-                // either is as good (the name is stripped at coalesce unless
-                // the codomain references it).
-                na.or(nb),
-                Box::new(Self::merge(!pol, *la, *lb)),
-                Box::new(Self::merge(pol, *ra, *rb)),
-            )),
+            (Some(a), Some(b)) => Some(CompactFun::merge(pol, a, b)),
         };
         let refinements = Self::merge_refinements(pol, lhs.refinements, rhs.refinements);
         // History children merge componentwise at the outer polarity
@@ -430,6 +571,7 @@ fn compact_go(
         Type::Hole => CompactType::empty(),
         Type::Fun {
             name,
+            kind,
             domain: d,
             codomain: c,
         } => {
@@ -446,7 +588,12 @@ fn compact_go(
             };
             let cod = compact_go(c, pol, &cod_acc, &BTreeSet::new(), st);
             CompactType {
-                fun: Some((name.clone(), Box::new(dom), Box::new(cod))),
+                fun: Some(CompactFun {
+                    name: name.clone(),
+                    kind: KindMerge::of(kind),
+                    domains: vec![dom],
+                    codomain: Box::new(cod),
+                }),
                 ..Default::default()
             }
         }

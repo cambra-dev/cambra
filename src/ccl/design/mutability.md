@@ -621,7 +621,7 @@ A consumer reading "as of `𝑡`" must know no further commits will land at `≤
 carries this: function tiles hold a `domain_predicate` marking the complete region of the domain. A
 watermark *is* a `domain_predicate` advancing over `Txn`. Conflict validation — which depends on
 which value combinations were observed — is deliberately engine-level, above the tiling algebra,
-because that is exactly what extent predicates cannot express.
+because that is exactly what domain predicates cannot express.
 
 ## Concurrency and distribution
 

@@ -191,39 +191,19 @@ fn simplify_once(expr: &mut Expr, memo: &PredMemo) -> (bool, bool) {
 /// and whether any child's subtree contains an `iterate` source (OR-ed up so
 /// the parent need not re-scan its descendants).
 fn recurse_simplify(expr: &mut Expr, memo: &PredMemo) -> (bool, bool) {
-    let (mut changed, has_iteration) = expr.fold_children_mut((false, false), |(c, it), e| {
+    let (changed, has_iteration) = expr.fold_children_mut((false, false), |(c, it), e| {
         let (child_changed, child_has_iteration) = simplify_once(e, memo);
         (c | child_changed, it | child_has_iteration)
     });
-    // After simplifying children, propagate the Let body's type up to the Let
-    // itself. Simplification can change the body's type (e.g., union flattening
-    // rewrites Fun(Union(Union(A,B),C), D) → Fun(Union(A,B,C), D)); the Let
-    // must stay in sync so downstream passes see a consistent representation.
-    // Lifting the body's type out of the binder's scope must discharge
-    // `[v ↦ bound]` into its refinement predicates (design §6.2 move-site
-    // rule), matching inference's let-closing so the recorded type stays
-    // well-formed (closed over `v`) and the post-pass check reconciles.
-    if let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = &expr.node
-    {
-        // The discharge only changes the type in the dependent case (binder
-        // free in the body type's refinement predicates); skip cloning the
-        // bound expression otherwise. The sync below still runs so a body type
-        // simplify rewrote stays mirrored on the `let`.
-        let body_ty = if crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name) {
-            crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone())
-                .apply_type(&body.ty)
-        } else {
-            body.ty.clone()
-        };
-        if expr.ty != body_ty {
-            expr.ty = body_ty;
-            changed = true;
-        }
-    }
+    // NB: simplify is **type-preserving** — no rule mutates a node's type — so a
+    // `Let`'s recorded type (already closed over its binder by inference's
+    // let-closing) stays valid and needs no re-sync here. A former propagation
+    // re-derived `Let.ty` from `body.ty` (for a since-removed union-flatten rule
+    // that changed body types); it also *downgraded* a let-bound-source
+    // comprehension's kind `⤇ → ⇒` and re-discharged marker-bearing sources into
+    // predicates. Both are bugs, so it is gone; the marker-free predicate
+    // invariant is upheld at the substitution boundary instead
+    // (`ccl_utils::strip_iterate_markers`).
     (changed, has_iteration)
 }
 
@@ -1037,6 +1017,7 @@ mod tests {
     fn fun_ty(a: Type, b: Type) -> Type {
         Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
         }
@@ -1058,6 +1039,7 @@ mod tests {
         }
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: fun_tys.first().unwrap().0.clone(),
             codomain: fun_tys.last().unwrap().1.clone(),
         };

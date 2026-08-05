@@ -331,11 +331,13 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, witnesses: bool) -> bool {
                 name: n1,
                 domain: d1,
                 codomain: c1,
+                ..
             },
             Type::Fun {
                 name: n2,
                 domain: d2,
                 codomain: c2,
+                ..
             },
         ) => {
             n1 == n2
@@ -398,6 +400,8 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, witnesses: bool) -> bool {
             crate::ccl::HistoryKind::Append => {
                 let stream = Type::Fun {
                     name: None,
+                    // A feed's read view is a collection stream: a data function.
+                    kind: crate::ccl::ty::FunKind::Data,
                     domain: domain.clone(),
                     codomain: value.clone(),
                 };
@@ -847,7 +851,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             if let (Some(first), Some(last)) = (elts.first(), elts.last())
                 && let (
                     Type::Fun {
-                        domain: first_dom, ..
+                        domain: first_dom,
+                        kind: first_kind,
+                        ..
                     },
                     Type::Fun {
                         name: last_name,
@@ -867,6 +873,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // dependence.
                 expr.ty = Type::Fun {
                     name: last_name.clone(),
+                    // FunKind is the first morphism's (mirrors `emit_compose`): a
+                    // chain over a data source is a data collection.
+                    kind: first_kind.clone(),
                     domain: Box::new((**first_dom).clone()),
                     codomain: Box::new((**last_cod).clone()),
                 };
@@ -1495,6 +1504,7 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
     }
     let Type::Fun {
         name,
+        kind,
         domain: dom,
         codomain: cod,
     } = cur
@@ -1526,6 +1536,7 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
         // *shape*; a dependent codomain still refers to the same binder.
         Type::Fun {
             name,
+            kind,
             domain: Box::new(new_dom),
             codomain: cod,
         },
@@ -1630,6 +1641,7 @@ mod tests {
         let mut lam = TypedExpr::lambda("x", Type::Base(BaseType::Int), body);
         lam.ty = Type::Fun {
             name: Some("x".into()),
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(refined_int(TypedExpr::var("x"))),
         };

@@ -55,7 +55,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Loc
 fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
-    let ty = match &mut expr.node {
+    let mut ty = match &mut expr.node {
         TypedExprNode::Lit(lit) => ctx.lit_singleton(lit),
 
         // Resolve a variable through its bound scheme. A monomorphic binder
@@ -249,6 +249,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             .user_annotation
             .clone()
             .expect("user_annotation is present");
+        // A **concrete** function kind on the annotation is a *provenance stamp*:
+        // lowering marks a data collection (a comprehension / `groupby`) with a
+        // `data_fun(_, _)` annotation, and here we set that kind concretely on the
+        // node's own type (see `stamp_kind_from`). `bind_annotation` below still
+        // reconciles the domain/codomain.
+        stamp_kind_from(&mut ty, &annotation);
         ctx.bind_annotation(&ty, &annotation)?;
     }
 
@@ -259,6 +265,29 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
     expr.ty = ty.clone();
 
     Ok(ty)
+}
+
+/// Stamp a concrete function **kind** from a *provenance-declaring* reference
+/// type onto a `target` function type. FunKind is a provenance property, not a
+/// function of the domain (see `KindMerge::of`, `src/ccl/infer/solver/compact.rs`),
+/// and a bare lambda is built `Compute` by construction (`emit_lambda`). The two
+/// sites that *declare* a lambda to be a data collection instead — a `data_fun`
+/// annotation on a comprehension / `groupby`, and a declared `Data` recurrence
+/// carrier on a `letrec` binder — carry a concrete (non-`Var`) function kind;
+/// this copies that kind onto the target so it is data by construction over *any*
+/// domain, rather than routed through `bind_annotation`/`require_sub` (which only
+/// draws a kind *edge* — and `Compute <: Data` is a hard reject, not a coercion).
+/// A concrete `Data` kind here is always lowering-internal or a declared carrier
+/// type — user function annotations are `Compute`/unkinded — so this never
+/// silently relabels a user's kind.
+fn stamp_kind_from(target: &mut Type, reference: &Type) {
+    use crate::ccl::ty::FunKind;
+    if let Type::Fun { kind: ref_kind, .. } = peel_refinements_outer(reference)
+        && !matches!(ref_kind, FunKind::Var(_))
+        && let Type::Fun { kind, .. } = target
+    {
+        *kind = ref_kind.clone();
+    }
 }
 
 /// Emit constraints for every refinement predicate embedded in an
@@ -459,6 +488,16 @@ pub(super) fn emit_lambda<C: Typing>(
     // ordinary functions — coalesce strips it when the codomain does not
     // reference it (see `coalesce_compact_go`) — so monomorphic output is
     // unchanged.
+    //
+    // The lambda's **kind is `Compute` by construction**: kind is a provenance
+    // property (see `KindMerge::of`, `src/ccl/infer/solver/compact.rs`), and a
+    // bare `λ` *is* a capability. A data collection is not born here — it is a
+    // comprehension / `groupby` / list literal, each concrete-stamped `Data` via
+    // a `data_fun` annotation that `emit_node` reads as a provenance stamp
+    // (overriding this `Compute`). Because a capability is now concrete `Compute`
+    // rather than a kind var, a capability supplied where a collection is demanded
+    // (`sum(λ x → x + 1)`) is the plain `Compute <: Data` rejection in
+    // `constrain_kind` — no domain-shape guess is needed to catch it.
     Ok(Type::pi(&param.name, param_simple, body_ty))
 }
 
@@ -511,15 +550,35 @@ pub(super) fn emit_cast<C: Typing>(
         Some(r) => Type::Refinement(Box::new(d), r),
         None => d,
     };
+    // A cast re-views the value *at* `target`, so the result carries `target`'s
+    // kind: a cast to a filtered-collection target (`refined_data_fun`, `Data`)
+    // yields a `Data` collection even though the underlying value is a `Compute`
+    // element projection (`λ u → u.score`, record ⇒ scalar). Preserving only the
+    // domain refinement while dropping `Data` would make every filtered
+    // comprehension / groupby a compute function again, and the aggregate that
+    // consumes it would reject it as compute-where-data.
+    // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
+    // still carries its arrow's kind, which a match on the raw target would drop
+    // to the `Compute` default.
+    let kind = match peel_refinements_outer(target) {
+        Type::Fun { kind, .. } => kind.clone(),
+        _ => crate::ccl::ty::FunKind::Compute,
+    };
     // Preserve the value's Pi binder so the cast result stays a *named* function.
     // A dependent application of the cast then reconciles binders by the identity
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
     // which is what keeps the O8 contravariant-domain discharge from leaving an
     // undischarged binder in the domain's refinement predicate (design §5.2, O8).
-    match peel_refinements_outer(&value_ty) {
-        Type::Fun { name: Some(k), .. } => Ok(Type::pi(k.clone(), domain, v)),
-        _ => Ok(fun(domain, v)),
-    }
+    let name = match peel_refinements_outer(&value_ty) {
+        Type::Fun { name: Some(k), .. } => Some(k.clone()),
+        _ => None,
+    };
+    Ok(Type::Fun {
+        name,
+        kind,
+        domain: Box::new(domain),
+        codomain: Box::new(v),
+    })
 }
 
 pub(super) fn emit_apply<C: Typing>(
@@ -783,7 +842,9 @@ pub(super) fn emit_collection_union<C: Typing>(
         tags.insert(FieldKey::Index(i), dom);
     }
     let dom_variant = variant_type(tags);
-    Ok(fun(dom_variant, cod_var))
+    // `++` produces a collection — a **data** function over the tagged union of
+    // its operands' domains.
+    Ok(Type::data_fun(dom_variant, cod_var))
 }
 
 /// Aggregate (`Sum`, `Max`): the scheme is the full operator type
@@ -986,7 +1047,14 @@ pub(super) fn emit_letrec<C: Typing>(
     }
     scoped_group(ctx, &declared, &mut |ctx| {
         for (i, (b, def)) in bindings.iter_mut().enumerate() {
-            let def_ty = ctx.subexpr(def)?;
+            let mut def_ty = ctx.subexpr(def)?;
+            // The declared binder type is the recurrence carrier's type; when it
+            // is a `Data` collection (an induction store indexed by the iteration
+            // domain), it declares the value lambda's kind by provenance — stamp
+            // it, so a `Compute`-by-construction accumulator body reconciles rather
+            // than tripping the `Compute <: Data` reject in `require_sub`.
+            stamp_kind_from(&mut def_ty, &declared[i].1);
+            stamp_kind_from(&mut def.ty, &declared[i].1);
             let label = b.name.clone();
             ctx.require_sub(&def_ty, &declared[i].1, &|| {
                 format!("LetRec binding `{label}`")
@@ -1086,7 +1154,7 @@ pub(super) fn emit_list<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     if elts.is_empty() {
-        return Ok(fun(Type::UIntRange(0), prim(BaseType::Unit)));
+        return Ok(Type::data_fun(Type::UIntRange(0), prim(BaseType::Unit)));
     }
     // Element type: the **join** of the elements, not a type the first one fixes and
     // the rest must equal. Every element flows one-way into a shared variable, so
@@ -1106,8 +1174,10 @@ pub(super) fn emit_list<C: Typing>(
     let n = elts.len();
     // Deref a bare mutable read to its value, as in `emit_tuple`: the list's
     // element (codomain) type takes the dereferenced element type so no `Mut`
-    // appears in the list type.
-    Ok(fun(Type::UIntRange(n), deref_mut(&first_ty)))
+    // appears in the list type. A list literal is a **data** function — its
+    // domain is the index set, so a join with another collection may not narrow
+    // it — see `src/ccl/design/type-inference.md`, "The domain join is a Σ".
+    Ok(Type::data_fun(Type::UIntRange(n), deref_mut(&first_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified
@@ -1148,20 +1218,30 @@ pub(super) fn emit_case<C: Typing>(
         ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
     }
 
-    // A `Case` selects one arm at runtime, so its type is what the arms have in
-    // common: the **join**, exactly as a list's element type is the join of its
+    // Every arm joins by the **lattice**: each arm's type is a subtype of one
+    // fresh result variable, so the result is their least upper bound — what the
+    // arms have in common, exactly as a list's element type is the join of its
     // elements. Refinements ride in untouched and the join is what decides which
-    // survive — arms depositing different singletons intersect to none (`if c: 1
+    // survive: arms depositing different singletons intersect to none (`if c: 1
     // else: 2` is an `Int`), while a restriction *every* arm establishes is kept
     // (identical filtered comprehensions stay filtered). Relating each arm to a
-    // *stripped* sibling instead loses that, and for a collection arm — whose extent
-    // rides the contravariant `Fun` domain — it demands `D <: {D | p}`, rejecting two
-    // arms that are the same expression.
+    // *stripped* sibling instead loses that, and for a collection arm — whose
+    // domain rides the contravariant `Fun` domain — it demands `D <: {D | p}`,
+    // rejecting two arms that are the same expression.
+    //
+    // Data-collection arms with distinct domains are rejected at coalesce rather
+    // than met (`CoalesceError::DomainJoinConflict`). (Heterogeneous *scalar* arms
+    // remain a hard `IncompatibleBounds` error — the sound union relaxation for
+    // them is deferred; see `coalesce`.)
+    //
+    // A `Mut` arm needs no special case: it derefs into the join like any other
+    // read, so a `Case` over two registers types as their *value*. The
+    // second-class discipline is unaffected — what it forbids is a selected
+    // register reaching a position that writes through it, and that rule reads
+    // the argument *node*, not its type (mutability.md, "No aliasing: `Mut`
+    // values are second-class (downward-only)").
     let result_ty = ctx.fresh();
     for b in branches.iter_mut() {
-        // A pattern binds its payload (the var just written to `binding.ty`)
-        // over the branch's guard and body. `scoped` restores the scope on
-        // both the happy and error paths.
         let scope_info = b
             .pattern
             .as_ref()
@@ -1222,7 +1302,7 @@ pub(super) fn emit_compose<C: Typing>(
         // Strict refinement-aware adjacency: `prev_cod <: next_dom`, refinement
         // witnesses and all — no cast escape. A producer must already supply the
         // refinement its consumer demands. Join planning surfaces the
-        // join-satisfying / iterated extent on each producing morphism's
+        // join-satisfying / iterated domain on each producing morphism's
         // codomain (`planning`'s `refine_codomain` / iteration-source
         // `set_codomain`), so a `… ≫ (id ≫ cast({D|r} ⇒ V))` chain composes
         // because the upstream genuinely carries `{D | r}` — matched
@@ -1244,8 +1324,22 @@ pub(super) fn emit_compose<C: Typing>(
         Type::Fun { name, .. } => name.clone(),
         _ => None,
     };
+    // The chain's kind is the **first** morphism's: a chain over a data source
+    // (`xs ≫ f`, a comprehension) is a data collection; a chain of compute
+    // morphisms is compute. When the first morphism is still a bare `Infer`
+    // (the common case in Emit — a comprehension composed over a source whose
+    // type has not yet resolved to a `Fun`), the chain's kind is genuinely
+    // use-dependent: mint a fresh kind var so a `Data`-demanding consumer (an
+    // aggregate) forces it `Data` via `constrain_kind`, and it otherwise
+    // resolves from its (now-concrete) domain at coalesce. Hardcoding `Compute`
+    // here would reject every composed comprehension flowing into an aggregate.
+    let kind = match peel_refinements_outer(&tys[0]) {
+        Type::Fun { kind, .. } => kind.clone(),
+        _ => crate::ccl::ty::FunKind::fresh_var(),
+    };
     Ok(Type::Fun {
         name: last_name,
+        kind,
         domain: Box::new(first_dom),
         codomain: Box::new(prev_cod),
     })

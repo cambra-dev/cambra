@@ -224,3 +224,31 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
 fn test_tuples(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
+
+// ---------------------------------------------------------------------------
+// The domain-join rejection: the safety chokepoint
+// ---------------------------------------------------------------------------
+
+/// A control-flow join of two differently-sized collections has no domain that holds
+/// both branches' rows, so it is **rejected**. What this pins is that the rejection
+/// happens end-to-end and *cleanly* — a returned compile error, never a panic and
+/// never a silent miscompile that quietly compiles one branch's domain. The
+/// alternative to rejecting is the lossless join (a dependent sum over the candidate
+/// domains), which is the collections work; until it exists this is the contract, and
+/// it is the whole reason a data function's kind is tracked separately from a
+/// capability's.
+#[test]
+fn conditional_collection_rejected_cleanly() {
+    use cambra::ccl::context::{GlobalContext, compile_program};
+    use cambra::interpreter::Consumer;
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let errs = compile_program(&mut ctx, "sum([1, 2] if True else [1, 2, 3])", consumer)
+        .err()
+        .expect("a domain-joining program must fail to compile, not miscompile or panic");
+    let rendered = format!("{errs:?}");
+    assert!(
+        rendered.contains("collection domain conflict"),
+        "expected the domain-join rejection, got:\n{rendered}"
+    );
+}

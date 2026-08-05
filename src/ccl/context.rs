@@ -11,7 +11,7 @@ use log::debug;
 
 use crate::{
     ccl::{
-        Expr, Type, channelize,
+        Expr, channelize,
         infer::{
             InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
             check_pre_desugar, infer, typecheck,
@@ -795,14 +795,10 @@ pub fn compile_program(
     for (_name, source) in ctx.lowering_ctx().take_sources() {
         let name = source.borrow().get_id().to_string();
         let output_type = source.borrow().output_type();
-        ctx.inference_ctx().register_source_type(
-            &name,
-            Type::Fun {
-                name: None,
-                domain: Box::new(Type::DataSource(name.clone())),
-                codomain: Box::new(output_type),
-            },
-        );
+        // The source's data-function type is constructed inside
+        // `register_source_type` from the element type — the `Data` kind is
+        // intrinsic, not stamped here.
+        ctx.inference_ctx().register_source_type(&name, output_type);
         ctx.conversion_ctx().register_source(name, source);
     }
 
@@ -1016,6 +1012,13 @@ pub fn compile_program(
     // equality, so the staging shapes now validate without re-blinding the
     // check or peeling cast refinements.
     typecheck(&join_planned).expect("type error after join planning");
+    // Invariant (debug): planning's `iterate`/`restrict` markers live in the
+    // term tree, never inside a type's refinement predicates — the substitution
+    // boundary strips the neutral `iterate` marker (`ccl_utils::strip_iterate_markers`),
+    // and a `restrict` reaching a predicate (a filtered source used in a refined
+    // domain) is unsupported and must surface loudly, not miscompile.
+    #[cfg(debug_assertions)]
+    crate::ccl::ccl_utils::debug_assert_no_iteration_markers(&join_planned);
 
     // Compile to one operator per field of the trailing record.  Pure
     // programs (no sinks) end up at this point with a bare expression at the

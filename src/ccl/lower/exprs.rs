@@ -7,7 +7,7 @@ use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, LogicKind, Name, Type,
         TypedExprNode, UnaryOpKind,
-        ccl_utils::{make_cast, refined_fn_type},
+        ccl_utils::{make_cast, refined_data_fun},
     },
     chl_parser::ast::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BoolOp, CmpOp, Expr as ChlExpr, Lit as ChlLit,
@@ -93,9 +93,14 @@ pub(super) fn lower_call(
                 func.span,
                 gb,
             );
-            let target_ty = refined_fn_type(Type::Hole, bare_pred, Type::Hole);
+            let target_ty = refined_data_fun(Type::Hole, bare_pred, Type::Hole);
             let cast = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
-            Ok(Expr::lambda("__gb_k", Type::Hole, cast))
+            // A group-by is a **data function** (a keyed collection): stamp its
+            // outer arrow `Data` by provenance (the `data_fun` annotation is a
+            // concrete-kind stamp — see `emit_node`), so its kind is data-by-
+            // construction rather than guessed from its (scalar key) domain.
+            Ok(Expr::lambda("__gb_k", Type::Hole, cast)
+                .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)))
         }
         "sum" | "max" => {
             if args.len() != 1 {
@@ -577,22 +582,22 @@ mod tests {
     // Variable collection and inline key lambda
     #[case(
         "groupby(xs, \\x -> x)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], \\x -> x // 2)",
-        "λ __gb_k → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+        "λ __gb_k → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
+        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

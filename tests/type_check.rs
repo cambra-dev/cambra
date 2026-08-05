@@ -51,15 +51,9 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
             output_extent,
         )));
         lctx.register_source(*name, stub);
-        // Sources are registered with type Fun(DataSource(name), elem_ty).
-        ictx.register_source_type(
-            name,
-            Type::Fun {
-                name: None,
-                domain: Box::new(Type::DataSource(name.to_string())),
-                codomain: Box::new(elem_ty.clone()),
-            },
-        );
+        // Registered by element type; the data-function type (`DataSource(name)
+        // ⤇ elem_ty`, `Data`) is constructed inside `register_source_type`.
+        ictx.register_source_type(name, elem_ty.clone());
     }
     let stmts = parse_module(code);
     let mut expr = lower_stmts(&stmts, &mut lctx)
@@ -96,14 +90,7 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
             output_extent,
         )));
         lctx.register_source(*name, stub);
-        ictx.register_source_type(
-            name,
-            Type::Fun {
-                name: None,
-                domain: Box::new(Type::DataSource(name.to_string())),
-                codomain: Box::new(elem_ty.clone()),
-            },
-        );
+        ictx.register_source_type(name, elem_ty.clone());
     }
     let stmts = parse_module(code);
     let mut expr = lower_stmts(&stmts, &mut lctx)
@@ -218,13 +205,104 @@ fn test_unary_op(#[case] code: &str, #[case] expected: Type) {
 
 #[test]
 fn test_list_literal() {
+    // A list literal is a **data** function (collection domain).
     assert_eq!(
         infer_program("[1, 2, 3]"),
-        Type::Fun {
-            name: None,
-            domain: Box::new(Type::UIntRange(3)),
-            codomain: Box::new(int())
-        }
+        Type::data_fun(Type::UIntRange(3), int())
+    );
+}
+
+/// A control-flow join of two collections with **different** domains. The domain of
+/// a data function *is* its data, so there is no domain both branches' rows fit in:
+/// the contravariant meet the compute lattice would take drops whichever rows the
+/// narrower domain lacks. The kind distinction is what turns that into a rejection
+/// (`CoalesceError::DomainJoinConflict`) instead of a silently short collection.
+/// `[1, 2]` is `[0, 1] ⤇ Int` and `[1, 2, 3]` is `[0, 2] ⤇ Int`, so this join has no
+/// answer the lattice can express.
+#[test]
+fn test_conditional_collection_join_is_rejected() {
+    let errs = infer_program_err("[1, 2] if True else [1, 2, 3]");
+    let rendered = format!("{errs:?}");
+    assert!(
+        rendered.contains("collection domain conflict"),
+        "expected the domain-join rejection, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_conditional_collection_heterogeneous_domains_rejected() {
+    // A conditional over a list literal and a **registered source** has two
+    // unrelated domains (`[0, 2]` and `source(mysrc)`), so it rejects for the same
+    // reason. This is the regression for the source-categorization invariant: a
+    // registered source is a `Data` collection, and were it miscategorized as a
+    // `Compute` capability the join would become an honest domain meet and
+    // *succeed*, silently discarding one branch's rows. The rejection is the
+    // evidence the kind is right (`register_source_type` constructs the `Data`
+    // arrow; the kind is intrinsic, not caller-supplied).
+    let errs =
+        infer_program_with_sources_err("[1, 2, 3] if True else mysrc()", &[("mysrc", int())]);
+    let rendered = format!("{errs:?}");
+    assert!(
+        rendered.contains("collection domain conflict"),
+        "expected the domain-join rejection, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_conditional_collection_same_domain_joins() {
+    // The join *is* defined where it changes nothing: both arms over one domain
+    // stay that collection. This is the arm that keeps the `Data` rule a rule about
+    // losing data rather than a blanket ban on joining collections.
+    assert_eq!(
+        infer_program("[1, 2] if True else [3, 4]"),
+        Type::data_fun(Type::UIntRange(2), int())
+    );
+}
+
+#[test]
+fn test_conditional_record_arms_join_by_field_intersection() {
+    // `emit_case` types arms by the lattice join, so two record arms with
+    // differing fields no longer fail; they join to the common-field
+    // intersection at positive polarity. `{a, b} if c else {a, c}` → `{a: …}`.
+    // The surviving field joins like any other merge point: both arms deposit
+    // the same `1`, so its singleton survives — width-narrowing to the common
+    // fields is orthogonal to which witnesses each shared field keeps. Pins the
+    // widening so a future change to record-arm polarity can't silently alter
+    // which conditionals type-check. (design/type-inference.md, Case-arm
+    // lattice joins)
+    assert_eq!(
+        infer_program("(a=1, b=2) if True else (a=1, c=3)").to_string(),
+        "{a: 1}"
+    );
+    // Arms disagreeing on the shared field keep the field but not the witness.
+    assert_eq!(
+        infer_program("(a=1, b=2) if True else (a=7, c=3)").to_string(),
+        "{a: Int}"
+    );
+}
+
+#[test]
+fn test_aggregate_over_scalar_lambda_is_rejected() {
+    // Summing a plain lambda: a bare `λ` is a capability, built concrete
+    // `Compute` (kind is a provenance property, not a domain guess). `sum`
+    // demands a `Data` collection to iterate, so the argument constraint is
+    // `(Int ⇒ Int) <: (?  ⤇ Int)` — the `Compute <: Data` violation, rejected up
+    // front in `constrain_kind` (emission), never routed through a kind var.
+    // Regression that a capability supplied where a collection is demanded is a
+    // clean error, not a
+    // silent miskind or a debug panic.
+    let errs = infer_program_err(
+        r"
+f = \i -> i + 1
+sum(f)",
+    );
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            InferError::TypeMismatch { ctx, .. }
+                if ctx.contains("compute function") && ctx.contains("data collection")
+        )),
+        "expected a compute-where-data-required rejection, got {errs:?}"
     );
 }
 
@@ -272,6 +350,7 @@ fn test_list_comp_identity() {
         infer_program("[x for x in [1, 2]]"),
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Data,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int())
         }
@@ -285,6 +364,7 @@ fn test_list_comp_arithmetic_body() {
         infer_program("[x + 1 for x in [1, 2]]"),
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Data,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int())
         }
@@ -299,6 +379,7 @@ fn test_list_comp_two_gens() {
         ty,
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Data,
             domain: Box::new(Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(2)])),
             codomain: Box::new(int())
         },
@@ -700,14 +781,14 @@ fn test_self_application_types() {
 f = \x -> x > 1
 f
 ",
-    Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
+    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
 )]
 #[case::arithmetic(
     r"
 f = \x -> x + 1
 f
 ",
-    Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(int()) }
+    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(int()) }
 )]
 fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
     assert_eq!(infer_program(code), expected);
@@ -797,13 +878,13 @@ fn infer_and_check(code: &str) -> Type {
 
 /// A `Case` whose arms are *collections* survives the consistency wall, and the
 /// restriction **both** arms establish survives with it: two identical filtered
-/// comprehensions join to that same filtered extent, not to the bare `[0, 2]`.
+/// comprehensions join to that same filtered domain, not to the bare `[0, 2]`.
 ///
-/// A collection carries its extent as a refinement on its `Fun` *domain*, where
+/// A collection carries its filter as a refinement on its `Fun` *domain*, where
 /// subtyping is contravariant — which is why the arms must reach the node's type
 /// by a join rather than by relating each arm to a *stripped* sibling: stripping
 /// one side of a domain edge demands `[0, N] <: {[0, N] | p}` and rejects two arms
-/// that are the same expression, and stripping both discards an extent that no
+/// that are the same expression, and stripping both discards a domain that no
 /// branch widens.
 #[test]
 fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
@@ -857,7 +938,7 @@ xs = [1, 2, 3]
     );
     assert!(
         matches!(&**codomain, Type::Fun { domain: d, .. } if matches!(&**d, Type::Refinement(..))),
-        "the element's filtered extent must survive, got {ty}"
+        "the element's filtered domain must survive, got {ty}"
     );
 }
 
@@ -876,15 +957,14 @@ fn test_case_arms_join(#[case] code: &str, #[case] expected: Type) {
     assert_eq!(infer_and_check(code), expected);
 }
 
-/// Arms whose extents differ. A function type's join *meets* its domain, so the
-/// two filters accumulate as two witnesses on one domain — the extent both arms
-/// admit — rather than one arm's filter being picked (which would claim positions
-/// the other branch does not produce). Nothing downstream can observe the choice
-/// yet: a logical `Case` over collections is rejected by lambda elimination, so
-/// this pins the typing rule, not a compiled extent.
+/// Arms whose domains differ, both refinements of the *same* source domain. Refinement
+/// is not a special case: `{[0, 2] | x > 1}` and `{[0, 2] | x < 3}` are two distinct
+/// domains, so this rejects exactly like two structurally unrelated domains. Meeting
+/// them would claim one domain satisfying both filters; picking either would claim
+/// positions the other branch does not produce.
 #[test]
-fn test_case_arms_with_different_filters_accumulate_witnesses() {
-    let ty = infer_and_check(
+fn test_case_arms_with_different_filters_are_rejected() {
+    let errs = infer_program_err(
         r"
 xs = [1, 2, 3]
 c = 1 > 0
@@ -894,20 +974,10 @@ else:
     [x for x in xs if x < 3]
 ",
     );
-    let Type::Fun { domain, .. } = &ty else {
-        panic!("expected a collection type, got {ty}");
-    };
-    let mut layers = 0;
-    let mut cur = &**domain;
-    while let Type::Refinement(inner, _) = cur {
-        layers += 1;
-        cur = inner;
-    }
-    assert_eq!(layers, 2, "expected both arms' witnesses, got {ty}");
-    assert_eq!(
-        *cur,
-        Type::UIntRange(3),
-        "expected the source extent, got {ty}"
+    let rendered = format!("{errs:?}");
+    assert!(
+        rendered.contains("collection domain conflict"),
+        "expected the domain-join rejection, got:\n{rendered}"
     );
 }
 
@@ -1136,7 +1206,12 @@ mod letrec_typing {
     /// `ι = [0,3]`, `ν = Int`.
     #[test]
     fn guarded_single_binding_letrec_typechecks() {
-        let cnt_ty = Type::fun(Type::UIntRange(3), int());
+        // The recurrence carrier is a *data collection* (`⤇`): `cnt` is indexed
+        // by the iteration domain `[0, 2]` and read back through `get_prev_seq`,
+        // whose history argument demands `Data`. Declaring it `Compute`
+        // (`Type::fun`) is the miskind the `Compute <: Data` rejection now
+        // catches at the recurrence's introduction.
+        let cnt_ty = Type::data_fun(Type::UIntRange(3), int());
         let def = Expr::lambda(
             "r",
             Type::UIntRange(3),
@@ -1201,5 +1276,49 @@ mod letrec_typing {
             .expect("mutually referencing bindings resolve");
         assert_eq!(ty, int());
         typecheck(&expr).expect("strict typecheck passes");
+    }
+}
+
+/// The domain-join rejection must not be reachable-around: a consumer downstream of
+/// the join cannot make it succeed, whichever way the domains arrive at the domain
+/// position. Directly, two arrow shapes meet there; through a `let` or a UDF
+/// parameter, the two domains arrive as bounds on one position instead. Both routes
+/// reject, and so does a consumer that *preserves* the domain (a comprehension) as
+/// well as one that collapses it (`sum`).
+#[test]
+fn conditional_collection_rejects_under_every_consumer() {
+    let c = "[1, 2] if True else [1, 2, 3]";
+    for program in [
+        // Collapsing consumer: directly, through a `let`, through a UDF parameter.
+        format!("sum({c})"),
+        format!(
+            r"
+x = {c}
+sum(x)"
+        ),
+        format!(
+            r"
+def f(c):
+    sum(c)
+f({c})"
+        ),
+        // Domain-preserving consumer: the same three routes.
+        format!("[y + 1 for y in {c}]"),
+        format!(
+            r"
+x = {c}
+[y + 1 for y in x]"
+        ),
+        format!(
+            r"
+def f(c):
+    [y + 1 for y in c]
+f({c})"
+        ),
+    ] {
+        assert!(
+            !infer_program_err(&program).is_empty(),
+            "expected a rejection, not a silent miscompile: {program}"
+        );
     }
 }

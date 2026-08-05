@@ -1030,10 +1030,11 @@ fn lower_type_application(
     args: &[Spanned<ChlExpr>],
 ) -> Result<Type, LoweringError> {
     match head {
-        // A list type is a mapping `index-range ⇒ element`; the length
+        // A list type is a mapping `index-range ⤇ element`; the length
         // (domain) is unknown at annotation time, so it is a `Hole` (inferred,
         // like the value slot of a bare `_`). The element type is the sole
-        // argument lowered recursively.
+        // argument lowered recursively. A `List` annotation is a collection
+        // type: a data function.
         "List" => {
             let [elem] = args else {
                 return Err(LoweringError::unsupported(
@@ -1043,6 +1044,7 @@ fn lower_type_application(
             };
             Ok(Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Data,
                 domain: Box::new(Type::Hole),
                 codomain: Box::new(lower_type_annotation(elem)?),
             })

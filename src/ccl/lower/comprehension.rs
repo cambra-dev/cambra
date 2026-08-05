@@ -5,7 +5,7 @@ use super::*;
 use crate::{
     ccl::{
         BinOpKind, Expr, LogicKind, Name, Type,
-        ccl_utils::{make_cast, refined_fn_type},
+        ccl_utils::{make_cast, refined_data_fun},
         uniquify,
     },
     chl_parser::ast::{AssignTarget, CompClause, Comprehension, Expr as ChlExpr, Spanned},
@@ -186,7 +186,7 @@ pub(super) fn lower_list_comp(
                 Expr::lambda(iter_var, Type::Hole, pred_expr),
             );
         }
-        // A refined parameter lowers to a `cast(refined_fn_type, λ outer_var →
+        // A refined parameter lowers to a `cast(refined_data_fun, λ outer_var →
         // body_expr)` — a pure type-level assertion of the predicate-refined
         // domain.  The refinement is carried by the cast's target type; the
         // Cast Apply arm in `infer::emit` constructs the refined result
@@ -201,11 +201,18 @@ pub(super) fn lower_list_comp(
             element_span,
             lc,
         );
-        let target_ty = refined_fn_type(Type::Hole, pred_expr, Type::Hole);
+        let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole);
         Ok(ctx.tag_machinery(make_cast(unrefined_lambda, target_ty), element_span, lc))
     } else {
+        // A comprehension is a **data collection** (a map over its source's
+        // extent): stamp it `Data` by provenance. The `data_fun(_, _)` annotation
+        // is a concrete-kind stamp (`emit_node`), the unfiltered counterpart of
+        // the filtered branch's `refined_data_fun` (also `Data`) cast target — so a
+        // comprehension is data-by-construction, not by a domain guess. (Filtered
+        // comprehensions above already get `Data` from their cast.)
         Ok(ctx.tag_machinery(
-            Expr::lambda(outer_var, Type::Hole, body_expr),
+            Expr::lambda(outer_var, Type::Hole, body_expr)
+                .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
             comp.element.span,
             lc,
         ))

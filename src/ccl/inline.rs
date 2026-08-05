@@ -15,7 +15,7 @@
 //! - **List-producing UDFs**: `Fun(Fun(iterable_domain, _), _)`.  Functions
 //!   whose domain is itself a function type — generator functions and
 //!   list-returning `def`s lowered to `λ user_arg → λ __iter_record → body`.
-//!   A `Fun` domain has no iterable extent, so these are covered by the same
+//!   A `Fun` domain has no iterable domain, so these are covered by the same
 //!   non-iterable-domain rule.
 //!
 //! After substituting the bound lambda at each call site, the resulting
@@ -98,10 +98,10 @@ pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
 }
 
 // ---------------------------------------------------------------------------
-// Domain extent predicates
+// Domain predicates
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when `ty` has a finite, enumerable extent — i.e., when the
+/// Returns `true` when `ty` has a finite, enumerable domain — i.e., when the
 /// operator graph can natively schedule a function over this domain as
 /// `IterateExtent` without inlining.
 ///
@@ -109,7 +109,7 @@ pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
 /// |------|-----------|--------|
 /// | `Base(_)` | no | No finite enumeration of all integers / strings / bools |
 /// | `Tuple(ts)` | yes only if ALL `t` are iterable | A tuple can only be iterated if every component can |
-/// | `Record(fields)` | yes only if ALL fields are iterable | Same logic as tuples: a record with an unbounded field has no finite extent |
+/// | `Record(fields)` | yes only if ALL fields are iterable | Same logic as tuples: a record with an unbounded field has no finite domain |
 /// | `Refinement(inner, _)` | same as `inner` | Refinement doesn't add iterability |
 /// | `UIntRange(_)` | yes | Finite, bounded range |
 /// | `DataSource(_)` | yes | Externally-backed finite collection |
@@ -121,7 +121,7 @@ fn is_iterable_domain(ty: &Type) -> bool {
         // A tuple domain is iterable only if ALL components are iterable; you
         // can't enumerate (UIntRange(3), Int) because Int is unbounded.
         Type::Tuple(ts) => ts.iter().all(is_iterable_domain),
-        // Records are structurally equivalent to tuples for extent purposes.
+        // Records are structurally equivalent to tuples for domain purposes.
         Type::Record(fields) => fields.iter().all(|(_, t)| is_iterable_domain(t)),
         // Refinement inherits the iterability of its base type.
         Type::Refinement(inner, _) => is_iterable_domain(inner),
@@ -130,7 +130,7 @@ fn is_iterable_domain(ty: &Type) -> bool {
         // There are infinitely many possible functions for any given function
         // type, so function-typed domains cannot be enumerated.
         Type::Fun { .. } => false,
-        // A history-typed domain has no enumerable extent — treat it
+        // A history-typed domain has no enumerable domain — treat it
         // non-iterable like a function so a history-param UDF is inlined; the
         // `_ => true` fallthrough would otherwise strand it. Two cases reach
         // here, both pre-erasure (inlining runs before `channelize` and the
@@ -734,9 +734,10 @@ mod tests {
     #[test]
     fn non_iterable_domain_fun() {
         // There are infinitely many possible Int → Int functions, so Fun-as-domain
-        // has no finite, enumerable extent.
+        // has no finite, enumerable domain.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -751,6 +752,7 @@ mod tests {
     fn should_inline_scalar_to_scalar() {
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -764,9 +766,11 @@ mod tests {
         // eliminates the nested lambda before any `curry` combinator is produced.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
             }),
@@ -784,11 +788,13 @@ mod tests {
         let refinement = Refinement::born(pred);
         let inner_fun = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Refinement(Box::new(inner_fun), refinement)),
         };
@@ -800,6 +806,7 @@ mod tests {
         // UIntRange(3) → Int: iterable domain, don't inline.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -811,6 +818,7 @@ mod tests {
         // (Int, Int) → Int: both components non-iterable, should inline.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::Base(BaseType::Int),
                 Type::Base(BaseType::Int),
@@ -826,6 +834,7 @@ mod tests {
         // non-iterable, so this is inlined.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::UIntRange(3),
                 Type::Base(BaseType::Int),
@@ -1050,6 +1059,7 @@ mod tests {
     fn fn_ty(domain: Type, codomain: Type) -> Type {
         Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
