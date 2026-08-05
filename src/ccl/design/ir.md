@@ -143,18 +143,87 @@ The type system uses distinct transient placeholders with strict ownership:
 |---|---|---|---|
 | `Type::Hole` | Lowering | "This slot needs a type; not yet known" | Constraint emission  |
 | `Type::Infer(id)` | Type checker only | "Inference variable N, produced by the solver" | Constraint solution |
-| `Type::History { value, domain, kind }` | Type checker only | The unified history handle: a function `domain ⇒ value` plus a `HistoryKind` marker (`Overwrite` = mutable variable, displayed `Mut(value, domain)`; `Feed` = deferred-output channel, displayed `feed(domain ⇒ value)`) | `Overwrite` by mut_elim (overwrite) / `transact_phase` (Txn); `Feed` by `channelize` — both erased to a bare `Type::Fun` before `operator_conversion` |
+| `Type::History { value, domain, kind }` | Type checker only | The unified history handle: a function `domain ⇒ value` plus a `HistoryKind` marker (`Overwrite` = mutable variable, displayed `Mut(value, domain)`; `Append` = deferred-output channel, displayed `feed(domain ⇒ value)`) | `Overwrite` by mut_elim (overwrite) / `transact_phase` (Txn); `Append` by `channelize` — both erased to a bare `Type::Fun` before `operator_conversion` |
 | `Type::ChanDom(d)` | Type checker only | A defer channel's *rigid nominal domain*, minted per `let d = defer()`, so channel reads type concretely at inference with no `Infer` residue | `channelize` (`erase_chan_domains` substitutes the assembled channel domain) |
 
 **`Type::Hole`** is stamped by `TypedExpr::new()` and `TypedBinding::new_unannotated()`. It is a structural placeholder that carries no identity. The inference pass eliminates all `Hole` placeholders and replaces them with concrete types or `Type::Infer` variables. `fresh_infer_var_id()` must not be called from lowering code; use `Type::Hole` instead.
 
 **`Type::Infer(id)`** is produced by the inference pass (`ccl/infer/`) when a type cannot yet be determined. Any `Infer` remaining after inference represents an ambiguous type. Inference is the sole creator of `Infer` variables; lowering always uses `Type::Hole`. A defer channel's domain is *not* an `Infer` — it is a rigid `Type::ChanDom` typed at inference (see below), so no re-typing pass is needed to resolve it.
 
-**`Type::History`** collapses what were once two separate variants (`Type::Mut` and `Type::Feed`) into one `domain ⇒ value` function distinguished only by a two-valued `HistoryKind` (`Overwrite | Feed`) — see [`Mut` is a CCL type](mutability.md#mut-is-a-ccl-type) and [`Feed` is a CCL type](mutability.md#feed-is-a-ccl-type). A mutable variable derefs on read to the scalar `value` (carry-forward terminal, scalar-last read); a feed reads as its whole stream `domain ⇒ value`. Both are erased before `operator_conversion`, so no history type survives to planning.
+**`Type::History`** collapses what were once two separate variants (`Type::Mut` and `Type::Feed`) into one `domain ⇒ value` function distinguished only by a two-valued `HistoryKind` (`Overwrite | Append`) — see [`Mut` is a CCL type](mutability.md#mut-is-a-ccl-type) and [`Feed` is a CCL type](mutability.md#feed-is-a-ccl-type). A mutable variable derefs on read to the scalar `value` (carry-forward terminal, scalar-last read); a feed reads as its whole stream `domain ⇒ value`. Both are erased before `operator_conversion`, so no history type survives to planning.
 
 **`Type::ChanDom`** carries its introduction level (an identity-transparent `ChanLevel`) and freshens like a quantified variable, so a defer minted inside a generalized generator names a distinct channel per specialization. `channelize` closes the tree by the pure whole-tree substitution `erase_chan_domains` — the feed-side analog of the mutable-elimination phase's `erase_mut`.
 
 This separation makes test expression construction straightforward: tests that build expressions without running inference use `Type::Hole` (via `TypedExpr::new()`) and never need to synthesize `InferVarId` values.
+---
+
+## Symbolic rendering
+
+The IR's reading surface is the symbolic printer (`ccl::symbolic::symbolic` / `symbolic_typed` for expressions, `Display for Type` in `src/ccl/ty.rs` for types) — a linear λ-calculus notation that makes the algebra legible where the `Debug` form buries it. Test expectations, `--dump` output, and hand-written examples in docs and comments all use it, so the forms below are a shared vocabulary, not a presentation detail.
+
+The tables are **pinned by tests**: `symbolic::tests::test_symbolic_expr` covers one case per expression form and `ty::tests::type_display_forms` one per type variant. Change a form and both the test and this section fail together; add a variant and the missing row is a failing case, not a silent omission.
+
+### Expression forms
+
+| Node | Renders as | Notes |
+|---|---|---|
+| `Lit` | `42`, `"hi"`, `true`, `unit` | strings escape via `escape_default` |
+| `Var`, `Builtin` | `x`, `map` | the base name, never the α-uniquified suffix |
+| `BinOp` | `a + b`, `x == y`, `p and q` | infix, parenthesized by precedence |
+| `UnaryOp` | `-x`, `not x` | |
+| `Apply` | `arg ▷ func` | left-associative: `a ▷ f ▷ g` is `(a ▷ f) ▷ g` |
+| `Apply` with a `Proj` function | `t.0`, `rec.name` | postfix dot-access, no `▷` |
+| `Apply` of `Iterate` to a trivially-true predicate | `iterate` | the implicit-predicate form planning emits at unrefined sites |
+| `Compose` | `f ≫ g ≫ h` | n-ary, looser than arithmetic |
+| `CollectionUnion` | `c₀ ⊎ c₁` | `⊎`, not the surface `++`, to distinguish it from string `Concat` |
+| `Lambda` | `λ x → body`, `λ x : T → body` | a domain refinement rides `param.ty`, so it renders `λ x : {T \| p} → body` |
+| `Let` | `let x = e`⏎`in body` | the `in` is on its own line; ` : T` appears once the binding type is known |
+| `LetRec` | `letrec b₁ = e₁; …`⏎`in body` | bindings `; `-separated, `in` on its own line as with `Let` |
+| `Transact` | `transact (k = init, …) { [reads]⇒[writes] over src do body; … }` | keys with seeds, then one clause per writer site |
+| `For` | `for i in xs do body` | |
+| `MutWrite` | `x := e` | `:=` marks a write to an existing binding, not a fresh binder |
+| `Aggregate` | `Sum(xs)`, `Max(xs)` | the `AggregateKind` name, then parens |
+| `Case` | `match s { .Tag(x) if g → b; … }` | a scrutinee-less `Case` drops to `{ g → b; … }`; a literal-`true` guard is suppressed |
+| `VariantCtor` | `.Tag(payload)` | |
+| `Cast` | `cast(value)`, `cast(target, value)` | the two-argument form only pre-inference, when `expr.ty` is still a placeholder |
+| `List`, `Tuple` | `[a, b]`, `(a, b)` | |
+| `Record` | `(name: a, age: b)` | parens for a record **value**; braces are the record *type* |
+| `Proj` | `.0`, `.name` | bare, when not in an `Apply` function position |
+| `ExprStmt` | `e; body` | |
+| `Source` | `source(name)` | |
+| `Feed`, `Define` | `feed(name, value)`, `define(name, value)` | |
+| `Defer`, `Error` | `defer`, `<error>` | |
+| `Begin` | `begin { body }` | |
+
+`symbolic_typed` suffixes every node with its type in angle brackets — `x:<Int>`, not a bare `x:Int`.
+
+Render an AST this way rather than in constructor style (`Apply(f, x)`, `Compose([f, g])`): those are node names, and the point of the notation is the algebra they encode.
+
+### Type forms
+
+| Variant | Renders as |
+|---|---|
+| `Base` | the keyword — `Int`, `UInt`, `String`, `Bool`, `Unit` |
+| `Fun { name: None }` | `(D ⇒ C)` |
+| `Fun { name: Some(x) }` | `((x: D) ⇒ C)` |
+| `Fun { kind: Data }` | the same shapes with `⤇` — `([0, 1] ⤇ Int)`. The arrow *is* the `FunKind` (`FunKind::arrow`): `⇒` for a compute capability, `⤇` for a data collection, and `⇒` for a still-unresolved kind variable. See [type-inference.md](type-inference.md), "4.6 Data vs compute functions" |
+| `UIntRange(n)` | `[0, n-1]`, or `∅` when the range is empty |
+| `Tuple` | `(A, B)` |
+| `Record` | `{a: A, b: B}` |
+| `Variant` | `[.tag(T) \| .other]` — a unit payload drops its parens; an all-positional variant flattens to `A \| B` |
+| `Refinement` | `{T \| predicate}`, the predicate via `symbolic` — a singleton prints as the literal it pins (`5`) |
+| `Hole` | `_` |
+| `Infer(id)` | `?N` |
+| `DataSource` | `source(name)` |
+| `ChanDom` | `chan(name)` |
+| `Txn` | `Txn` |
+| `History { kind: Overwrite }` | `Mut(value, domain)` |
+| `History { kind: Append }` | `feed(domain ⇒ value)` |
+
+There is no `Mut` or `Feed` type variant to render — both are `History`, distinguished by `HistoryKind`, and both are erased before `operator_conversion`.
+
+For the metavariable and function-type conventions that govern *prose* (as opposed to printer output), see [docs/design.md](../../../docs/design.md), "Notation conventions".
+
 ---
 
 ## Temporary Hacks

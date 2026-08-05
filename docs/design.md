@@ -242,6 +242,11 @@ Cambra's `Type::Fun` has an optional binder name; the symbolic form distinguishe
 - `(𝑥: 𝐴) ⇒ 𝐵` — function type with named binder. `𝑥` is bound in `𝐵` and may be referenced by refinements or other types nested there.
 - `𝐴 ⇒ 𝐵` — function type with no named binder. The codomain is independent of the argument value.
 
+A second arrow distinguishes the function's **kind** (`FunKind`, inferred by the solver and rendered live):
+
+- `𝐴 ⤇ 𝐵`, named-binder form `(𝑥: 𝐴) ⤇ 𝐵` — a **data function**: the domain *is* the data, so joins over it must be lossless. Same associativity as `⇒`; the doubled bar reads "the domain is the data". A compute function (a capability, where a lossy meet at a join is fine) keeps `⇒`, as does a kind variable the solver has not yet resolved. See [src/ccl/design/type-inference.md](../src/ccl/design/type-inference.md), "4.6 Data vs compute functions".
+- `Σ 𝑛 ∈ {𝐷₀, 𝐷₁}. 𝑛 ⤇ 𝑉` — the **Σ type**: a data function whose domain is exactly one of the candidate domains, which is what the join of two data functions over different domains denotes. The anonymous-witness shorthand drops the binder: `Σ{𝐷₀, 𝐷₁} ⤇ 𝑉`.
+
 Refinement types use the standard subset-type notation `{𝑥: 𝑇 | 𝑝(𝑥)}`. The function-type arrow `⇒` is right-associative: `𝐴 ⇒ 𝐵 ⇒ 𝐶` parses as `𝐴 ⇒ (𝐵 ⇒ 𝐶)`.
 
 At the term level: `λ 𝑥 → body` is a lambda (the `→` separates the binder from the body); `𝑎 ▷ 𝑓` is forward apply (`𝑓(𝑎)` with the argument first); `𝑓 ≫ 𝑔` is forward compose (`λ 𝑥 → 𝑔(𝑓(𝑥))`).

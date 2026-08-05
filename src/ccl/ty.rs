@@ -266,7 +266,7 @@ pub fn reset_kind_var_counter() {
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
 /// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); an induction accumulator's *domain* is necessarily `Infer` until the unified phase resolves it (see `Strictness::PreDesugar`) |
 /// | `History` (`kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
-/// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
+/// | `History` (`kind: Append`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 /// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its domain resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -1246,6 +1246,7 @@ impl std::hash::Hash for Refinement {
 mod tests {
     use super::*;
     use crate::ccl::{BinOpKind, CompareKind};
+    use rstest::rstest;
 
     /// Two predicates that each contain a [`TypedExprNode::Cast`] and differ
     /// only in the *target's* domain-refinement predicate denote different
@@ -1292,5 +1293,144 @@ mod tests {
             Type::fun(Type::Txn, Type::Base(BaseType::Int)).to_string(),
             "(Txn ⇒ Int)"
         );
+    }
+
+    /// One case per [`Type`] variant, pinning the rendered vocabulary that
+    /// `src/ccl/design/ir.md`, "Symbolic rendering" documents and that dumps,
+    /// test expectations, and hand-written examples in docs all read as one
+    /// notation. A form changed here without the doc (or the reverse) is the
+    /// drift this pairing exists to make loud; `Infer` and `ChanDom` are
+    /// covered separately below because their rendering embeds a
+    /// counter-allocated identity.
+    #[rstest]
+    // Base types render as their keyword.
+    #[case(Type::Base(BaseType::Int), "Int")]
+    #[case(Type::Base(BaseType::Bool), "Bool")]
+    #[case(Type::Base(BaseType::Unit), "Unit")]
+    // Function types: parenthesized, and a named binder shows inside its own parens.
+    #[case(
+        Type::fun(Type::Base(BaseType::Int), Type::Base(BaseType::Bool)),
+        "(Int ⇒ Bool)"
+    )]
+    #[case(
+        Type::Fun {
+            name: Some("k".into()),
+            kind: FunKind::Compute,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Bool)),
+        },
+        "((k: Int) ⇒ Bool)"
+    )]
+    // The arrow is the `FunKind`, not decoration: a data function's domain *is*
+    // its data, and `⤇` is what makes that legible in every rendered type.
+    #[case(
+        Type::Fun {
+            name: None,
+            kind: FunKind::Data,
+            domain: Box::new(Type::UIntRange(2)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        },
+        "([0, 1] ⤇ Int)"
+    )]
+    // A UIntRange prints its inclusive bounds; an empty one is ∅ rather than an
+    // underflowed `[0, -1]`.
+    #[case(Type::UIntRange(3), "[0, 2]")]
+    #[case(Type::UIntRange(0), "∅")]
+    // Aggregates: a tuple keeps parens, a record takes braces (the brace/paren
+    // split against a record *value*'s `(a: 1)` is load-bearing).
+    #[case(
+        Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Bool)]),
+        "(Int, Bool)"
+    )]
+    #[case(
+        Type::Record(vec![
+            ("a".to_string(), Type::Base(BaseType::Int)),
+            ("b".to_string(), Type::Base(BaseType::Bool)),
+        ]),
+        "{a: Int, b: Bool}"
+    )]
+    // Named-tag variants show their tags; a unit payload drops the parens.
+    #[case(
+        Type::Variant(vec![
+            (FieldKey::Name("Some".into()), Type::Base(BaseType::Int)),
+            (FieldKey::Name("None".into()), Type::Base(BaseType::Unit)),
+        ]),
+        "[.Some(Int) | .None]"
+    )]
+    // An all-positional variant is an anonymous sum, so it flattens to a bare join.
+    #[case(
+        Type::Variant(vec![
+            (FieldKey::Index(0), Type::Base(BaseType::Int)),
+            (FieldKey::Index(1), Type::Base(BaseType::Bool)),
+        ]),
+        "Int | Bool"
+    )]
+    // Placeholders and nominal handles.
+    #[case(Type::Hole, "_")]
+    #[case(Type::DataSource("events".into()), "source(events)")]
+    #[case(Type::Txn, "Txn")]
+    // History is one variant with two faces: a mutable register reads as its
+    // scalar `value` over a `domain`, a feed as the whole stream.
+    #[case(
+        Type::History {
+            value: Box::new(Type::Base(BaseType::Int)),
+            domain: Box::new(Type::Txn),
+            kind: HistoryKind::Overwrite,
+        },
+        "Mut(Int, Txn)"
+    )]
+    #[case(
+        Type::History {
+            value: Box::new(Type::Base(BaseType::Int)),
+            domain: Box::new(Type::UIntRange(3)),
+            kind: HistoryKind::Append,
+        },
+        "feed([0, 2] ⇒ Int)"
+    )]
+    fn type_display_forms(#[case] ty: Type, #[case] expected: &str) {
+        assert_eq!(ty.to_string(), expected);
+    }
+
+    /// Refinements print in subset-type form, except a **singleton** — a base
+    /// refined by exactly `__elem == <lit>` — which prints as the literal it
+    /// pins, so a program full of literals does not read as a wall of
+    /// predicates.
+    #[test]
+    fn refinement_display_forms() {
+        let general = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(Rc::new(TypedExpr::binop(
+                TypedExpr::var("x"),
+                BinOpKind::Compare(CompareKind::Greater),
+                TypedExpr::lit(Lit::Int(0)),
+            ))),
+        );
+        assert_eq!(general.to_string(), "{Int | x > 0}");
+
+        let singleton = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(Rc::new(TypedExpr::binop(
+                TypedExpr::var(crate::ccl::Name::elem()),
+                BinOpKind::Compare(CompareKind::Equals),
+                TypedExpr::lit(Lit::Int(5)),
+            ))),
+        );
+        assert_eq!(singleton.to_string(), "5");
+    }
+
+    /// `Infer` and `ChanDom` render their identity, which a global counter
+    /// allocates — so the assertion pins the *shape* (`?<uid>`, `chan(<name>)`)
+    /// against the identity the value actually carries rather than a literal
+    /// that would depend on test execution order.
+    #[test]
+    fn identity_bearing_type_display_forms() {
+        let inferred = Type::infer();
+        let Type::Infer(var) = &inferred else {
+            panic!("Type::infer() constructs an Infer");
+        };
+        assert_eq!(inferred.to_string(), format!("?{}", var.uid));
+
+        let chan = Type::ChanDom("d".into(), ChanLevel(0));
+        assert_eq!(chan.to_string(), "chan(d)");
     }
 }

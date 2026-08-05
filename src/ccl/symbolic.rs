@@ -4,11 +4,14 @@
 //! CCL symbolic syntax defined in the design docs:
 //!
 //! - `▷` for function application (`arg ▷ func`)
-//! - `↦` for list index mappings (`[0 ↦ e0, 1 ↦ e1]`)
+//! - `≫` for composition (`f ≫ g`)
+//! - `⊎` for collection union (`xs ⊎ ys`)
 //! - `⇒` for function types (`A ⇒ B`)
 //! - `λ … →` for lambda abstractions
 //!
-//! The public entry point is [`symbolic`].
+//! The public entry point is [`symbolic`]. Every form this module emits is
+//! tabulated in `src/ccl/design/ir.md`, "Symbolic rendering" and pinned by the
+//! per-variant cases in this module's tests.
 
 use crate::ccl::{
     ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, ProjKey, Type, TypedExprNode,
@@ -552,17 +555,23 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
 
 #[cfg(test)]
 mod tests {
-    use super::symbolic;
+    use super::{symbolic, symbolic_typed};
     use crate::ccl::BaseType;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Refinement,
-        TransactKey, Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind, WriterSite,
+        AggregateKind, ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, Pattern,
+        Refinement, TransactKey, Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
+        WriterSite,
     };
     use rstest::rstest;
     use std::rc::Rc;
 
     // -----------------------------------------------------------------------
     // Per-variant direct-construction tests
+    //
+    // One case per expression form, pinning the vocabulary that
+    // `src/ccl/design/ir.md`, "Symbolic rendering" documents. The doc is the
+    // reading surface and this table is its ground truth: a form changed in one
+    // without the other is exactly the drift the pairing exists to make loud.
     // -----------------------------------------------------------------------
 
     #[rstest]
@@ -878,8 +887,118 @@ in y"
 letrec x : Int = 0
 in x"
     )]
+    // Builtin: its operator name, as an atom
+    #[case(Expr::builtin(Builtin::Const), "const")]
+    // Compose: n-ary, rendered as a `≫` chain
+    #[case(
+        Expr::compose(vec![Expr::var("f"), Expr::var("g"), Expr::var("h")]),
+        "f ≫ g ≫ h"
+    )]
+    // CollectionUnion: `⊎`, not the surface `++` — `Concat` already owns `++`,
+    // and one symbol for both would make dumps ambiguous.
+    #[case(
+        Expr::collection_union(vec![Expr::var("xs"), Expr::var("ys")]),
+        "xs ⊎ ys"
+    )]
+    // Apply of `iterate` to the trivially-true predicate: the bare atom, not
+    // the `true ▷ const ▷ iterate` spelling planning actually builds.
+    #[case(
+        Expr::apply(
+            Expr::apply(Expr::lit(Lit::Bool(true)), Expr::builtin(Builtin::Const)),
+            Expr::builtin(Builtin::Iterate),
+        ),
+        "iterate"
+    )]
+    // Apply of `iterate` to a non-trivial predicate: the general form survives.
+    #[case(
+        Expr::apply(Expr::var("p"), Expr::builtin(Builtin::Iterate)),
+        "p ▷ iterate"
+    )]
+    // Cast pre-inference: `expr.ty` is still a placeholder, so the target is
+    // the only visible type and renders inline.
+    #[case(Expr::cast(Expr::var("x"), Type::Base(BaseType::Int)), "cast(Int, x)")]
+    // Cast post-inference: the resolved type lives on `expr.ty` and callers
+    // surface it separately, so the target is not repeated.
+    #[case(
+        Expr::cast(Expr::var("x"), Type::Base(BaseType::Int)).with_ty(Type::Base(BaseType::Int)),
+        "cast(x)"
+    )]
+    // Case with a scrutinee and a tag pattern
+    #[case(
+        Expr::match_expr(
+            Expr::var("o"),
+            vec![Branch {
+                pattern: Some(Pattern {
+                    tag: "Some".to_string(),
+                    binding: TypedBinding::new_unannotated("v"),
+                }),
+                guard: Expr::lit(Lit::Bool(true)),
+                body: Expr::var("v"),
+            }],
+        ),
+        "match o { .Some(v) → v }"
+    )]
+    // Case with a pattern *and* a secondary guard: the guard is only suppressed
+    // when it is the literal-`true` "no filter" sentinel.
+    #[case(
+        Expr::match_expr(
+            Expr::var("o"),
+            vec![Branch {
+                pattern: Some(Pattern {
+                    tag: "Some".to_string(),
+                    binding: TypedBinding::new_unannotated("v"),
+                }),
+                guard: Expr::var("keep"),
+                body: Expr::var("v"),
+            }],
+        ),
+        "match o { .Some(v) if keep → v }"
+    )]
+    // VariantCtor
+    #[case(Expr::variant_ctor("Some", Expr::lit(Lit::Int(1))), ".Some(1)")]
+    // For: the direct-mirror statement loop. Built node-directly because
+    // `Expr::for_loop` is the desugaring helper — it emits `Compose([src, λ])`,
+    // not a `For`.
+    #[case(
+        TypedExpr::new(TypedExprNode::For {
+            target: TypedBinding::new_unannotated("i"),
+            iter: Box::new(Expr::var("xs")),
+            body: Box::new(Expr::var("i")),
+        }),
+        "for i in xs do i"
+    )]
+    // MutWrite: `:=` distinguishes a write from a `let`'s `=`
+    #[case(Expr::mut_write("x", Expr::lit(Lit::Int(1))), "x := 1")]
+    // Source
+    #[case(
+        TypedExpr::new(TypedExprNode::Source("events".into())),
+        "source(events)"
+    )]
+    // ExprStmt: sequencing
+    #[case(Expr::expr_stmt(Expr::var("e"), Expr::var("body")), "e; body")]
+    // Feed / Define / Defer / Begin — the deferred-output boundary forms
+    #[case(Expr::feed("out", Expr::lit(Lit::Int(1))), "feed(out, 1)")]
+    #[case(Expr::define("d", Expr::lit(Lit::Int(1))), "define(d, 1)")]
+    #[case(TypedExpr::new(TypedExprNode::Defer), "defer")]
+    #[case(Expr::begin(Expr::var("body")), "begin { body }")]
+    // Error: the lowering-failure placeholder
+    #[case(Expr::error(), "<error>")]
     fn test_symbolic_expr(#[case] expr: Expr, #[case] expected: &str) {
         assert_eq!(symbolic(&expr), expected);
+    }
+
+    /// `symbolic_typed` suffixes every node with its type in **angle
+    /// brackets** — `x:<Int>`. The brackets are what keep a function type's own
+    /// `⇒` from reading as part of the surrounding term.
+    #[test]
+    fn test_symbolic_typed_suffixes_each_node() {
+        let expr = Expr::binop(
+            Expr::var("x").with_ty(Type::Base(BaseType::Int)),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::Int(1)).with_ty(Type::Base(BaseType::Int)),
+        )
+        .with_ty(Type::Base(BaseType::Int));
+        assert_eq!(symbolic_typed(&expr), "x:<Int> + 1:<Int>:<Int>");
     }
 
     // -----------------------------------------------------------------------
