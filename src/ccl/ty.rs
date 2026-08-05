@@ -922,6 +922,73 @@ impl Type {
         }
     }
 
+    /// Look through every outer [`Type::Refinement`] layer, returning the bare
+    /// structural type underneath. Borrowing and non-allocating; refinements
+    /// nested inside the structure are left in place.
+    ///
+    /// **A shape test looks through a refinement**, and that is not leniency: a
+    /// refinement is a claim about a value, not part of the shape carrying it, so
+    /// `{(𝐷 ⇒ 𝑉) | 𝑝}` *is* a function and `{Mut(𝑉, 𝐷) | 𝑝}` *is* a register.
+    /// Anything that dispatches on or destructures a shape peels first — including
+    /// the handle accessors below.
+    ///
+    /// The all-depths counterpart, [`crate::ccl::ccl_utils::strip_refinements`],
+    /// is a different operation: it *drops* claims rather than looking past them,
+    /// allocates, and is only meaningful on a resolved type.
+    pub fn peel_refinements(&self) -> &Type {
+        let mut cur = self;
+        while let Type::Refinement(inner, _) = cur {
+            cur = inner;
+        }
+        cur
+    }
+
+    /// The value type of the mutable register this denotes, or `None` if it is not
+    /// one.
+    ///
+    /// A register is a [`HistoryKind::Overwrite`] history `Mut(𝑉, 𝐷)`, and this is
+    /// `𝑉` — what one read of the register yields. A feed channel is deliberately
+    /// *not* a register ([`Type::as_feed`]): it reads as its whole stream, so the
+    /// two are never interchangeable at a read.
+    pub fn as_register(&self) -> Option<&Type> {
+        match self.peel_refinements() {
+            Type::History {
+                value,
+                kind: HistoryKind::Overwrite,
+                ..
+            } => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The `(domain, value)` of the feed channel this denotes, or `None` if it is
+    /// not one.
+    ///
+    /// A channel is a [`HistoryKind::Append`] history, and what a read of it yields
+    /// is the whole stream `domain ⇒ value` — hence the pair, where
+    /// [`Type::as_register`] returns a single value type.
+    pub fn as_feed(&self) -> Option<(&Type, &Type)> {
+        match self.peel_refinements() {
+            Type::History {
+                domain,
+                value,
+                kind: HistoryKind::Append,
+            } => Some((domain, value)),
+            _ => None,
+        }
+    }
+
+    /// Whether this denotes a **handle** to state introduced elsewhere — a mutable
+    /// register or a feed channel, either [`HistoryKind`].
+    ///
+    /// This is the kind-agnostic question, and the thing that asks it is a
+    /// *binding*: naming a handle aliases the state behind it whichever kind it is,
+    /// so the choice between binding the handle and binding a copy of its value
+    /// turns on handle-ness alone.
+    pub fn is_handle(&self) -> bool {
+        matches!(self.peel_refinements(), Type::History { .. })
+    }
+
     /// If this is a function type, return the domain type, otherwise None.
     pub fn domain(&self) -> Option<Type> {
         if let Type::Fun { domain, .. } = &self {
@@ -1556,6 +1623,53 @@ mod tests {
             gt, lt,
             "casts differing only in the target's nested filter are distinct refinements"
         );
+    }
+
+    /// A shape test looks *through* a refinement: a refined register is still a
+    /// register and a refined channel is still a channel. Nothing in the pipeline
+    /// wraps a handle today — a handle type is built structurally rather than
+    /// resolved from a variable, so no position accumulates a claim onto one — which
+    /// is exactly why the rule needs stating here: it is the accessors' contract,
+    /// not a shape a program can be written to exercise.
+    #[test]
+    fn handle_accessors_see_through_a_refinement() {
+        let claim = Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true))));
+        let refine = |t: Type| Type::Refinement(Box::new(t), claim.clone());
+        let int = Type::Base(BaseType::Int);
+        let register = Type::History {
+            value: Box::new(int.clone()),
+            domain: Box::new(Type::Txn),
+            kind: HistoryKind::Overwrite,
+        };
+        let channel = Type::History {
+            value: Box::new(int.clone()),
+            domain: Box::new(Type::UIntRange(3)),
+            kind: HistoryKind::Append,
+        };
+
+        assert_eq!(refine(register.clone()).as_register(), Some(&int));
+        assert_eq!(
+            refine(channel.clone()).as_feed(),
+            Some((&Type::UIntRange(3), &int))
+        );
+        assert!(refine(register).is_handle() && refine(channel.clone()).is_handle());
+
+        // The two kinds are not interchangeable: a channel reads as its whole
+        // stream, a register as one value, so neither accessor answers for the other.
+        assert_eq!(channel.as_register(), None);
+        assert_eq!(
+            Type::History {
+                value: Box::new(int.clone()),
+                domain: Box::new(Type::Txn),
+                kind: HistoryKind::Overwrite,
+            }
+            .as_feed(),
+            None
+        );
+
+        // A refined *non*-handle peels to a non-handle, which is the case every
+        // caller of these accessors actually hits (`x = 0; x += 1`).
+        assert_eq!(refine(int).as_register(), None);
     }
 
     /// The transaction-commit domain renders by its bare name (mirrors the

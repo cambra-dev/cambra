@@ -628,7 +628,18 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
     if demanded.is_empty() {
         return true;
     }
-    let supplied = layers(arg_ty);
+    // A register mention at a value operand is a *read*, so what the argument denotes is
+    // the value the register holds and the refinements it supplies are the ones on that
+    // value type. The two sides are otherwise recorded at different levels: the deref
+    // decides what the operand was *constrained* against, so the parameter holds the
+    // value type, while the argument node keeps its `Mut` stamp — the handle has to
+    // survive on the bare `Var` for the phase to find the read. Comparing the stamp
+    // against the parameter would ask a handle to entail a fact about a value. See
+    // `src/ccl/design/mutability.md`, "`Mut` is a CCL type".
+    let mut supplied = layers(arg_ty);
+    if let Some(value) = arg_ty.as_register() {
+        supplied.extend(layers(value));
+    }
     demanded.iter().all(|d| supplied.contains(d))
 }
 
@@ -639,7 +650,7 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{BaseType, Lit, Type, TypedExpr, TypedExprNode};
+    use crate::ccl::{BaseType, HistoryKind, Lit, Type, TypedExpr, TypedExprNode};
 
     // -----------------------------------------------------------------------
     // is_iterable_domain predicate
@@ -1223,6 +1234,60 @@ mod tests {
 
         let expected = TypedExpr::lambda("__iter_record", range, arg).with_ty(list);
         assert_eq!(result, expected);
+    }
+
+    /// A **register** argument at a value operand: the demanded refinement rides the
+    /// value the register holds, not the handle stamped on the `Var`.
+    ///
+    /// `def id(v): v` called as `x := 5; id(x)` is the surface shape. The read derefs
+    /// the *constraint*, so the parameter acquires the dereferenced
+    /// `{Int | __elem == 5}`, while the argument node keeps `Mut({Int | __elem == 5}, D)`
+    /// — the handle has to survive on the bare `Var` for the phase to find the read. The
+    /// two sides therefore sit at different levels, and only reading through the handle
+    /// compares them at the same one.
+    #[test]
+    fn refined_outer_param_discharged_by_register_argument() {
+        let int = Type::Base(BaseType::Int);
+        let singleton = crate::ccl::infer::lit_singleton(&Lit::Int(5));
+        let handle = Type::History {
+            value: Box::new(singleton.clone()),
+            domain: Box::new(Type::Txn),
+            kind: HistoryKind::Overwrite,
+        };
+        let udf_ty = fn_ty(singleton.clone(), int.clone());
+
+        let lambda = TypedExpr::lambda("v", singleton, TypedExpr::var("v").with_ty(int.clone()))
+            .with_ty(udf_ty.clone());
+        let arg = TypedExpr::var("x").with_ty(handle);
+        let call = TypedExpr::apply(arg.clone(), TypedExpr::var("id").with_ty(udf_ty)).with_ty(int);
+        let expr = TypedExpr::let_bind("id", lambda, call);
+
+        assert_eq!(inline_non_iterable_lambdas(expr), arg);
+    }
+
+    /// Reading through the handle does not weaken the guard: a register whose *value*
+    /// carries a different refinement than the parameter demands still asserts.
+    #[test]
+    #[should_panic(expected = "does not entail")]
+    fn register_argument_with_other_refinement_still_asserts() {
+        let int = Type::Base(BaseType::Int);
+        let demanded = crate::ccl::infer::lit_singleton(&Lit::Int(5));
+        let handle = Type::History {
+            value: Box::new(crate::ccl::infer::lit_singleton(&Lit::Int(7))),
+            domain: Box::new(Type::Txn),
+            kind: HistoryKind::Overwrite,
+        };
+        let udf_ty = fn_ty(demanded.clone(), int.clone());
+
+        let lambda = TypedExpr::lambda("v", demanded, TypedExpr::var("v").with_ty(int.clone()))
+            .with_ty(udf_ty.clone());
+        let call = TypedExpr::apply(
+            TypedExpr::var("x").with_ty(handle),
+            TypedExpr::var("id").with_ty(udf_ty),
+        )
+        .with_ty(int);
+
+        let _ = inline_non_iterable_lambdas(TypedExpr::let_bind("id", lambda, call));
     }
 
     /// The complement: a parameter refinement the argument does *not* carry is a
