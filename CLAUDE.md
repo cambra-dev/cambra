@@ -66,9 +66,15 @@ Specific decision points where this matters:
 
 ### Code Comments
 
-Comment when the *why* is non-obvious — a hidden constraint, a load-bearing invariant, an unusual choice, behavior that would surprise a reader. Skip comments when a good name and a clear signature already convey the intent. Follow rustdoc best practices for public items; don't manufacture docstrings to hit a coverage target.
+Comment when the *why* is non-obvious — a hidden constraint, a load-bearing invariant, an unusual choice, a failure mode or edge case a reader would not predict from the signature. Name the invariant instead of gesturing at it: "callers have already erased `Mut`" beats "assumes normalized input". Skip comments when a good name and a clear signature already convey the intent. Follow rustdoc best practices for public items; don't manufacture docstrings to hit a coverage target.
+
+No filler adjectives — "robust", "fast", "seamless", "efficient" say nothing about the code. State the mechanism or the bound instead, and cite a number only when a benchmark produced it.
 
 Avoid comments that describe the history of the codebase.  Comments should explain how and why the code works.  If there is an alternative approach that seems reasonable but doesn't work, it's ok to describe that, but the comments should always fully make sense just by looking at the current version of the code.
+
+### Documentation
+
+Design docs live next to their subsystem (`src/ccl/design/ir.md`); cross-cutting docs and how-tos live in `docs/`; status and issue tracking live in `vault/`, not here. Invoke the `docs-style` skill before writing, editing, or reviewing any `*.md`, and before rendering a CCL AST or a type in symbolic notation.
 
 ### Referencing docs and sections
 
@@ -87,20 +93,16 @@ prose) and a broken one fails CI. Two rules keep references from rotting:
   over an anchor fragment in code: a title survives section reordering and reads
   as prose. (Details and the citation grammar: `.github/scripts/doc-refs/README.md`.)
 
-Either form must name a **heading**, spelled **exactly**. A bold paragraph
-lead-in is not citable (no anchor, nothing to check) — promote it to a heading in
-the same change if you need to point at it. An abbreviated title (`"The model"`
-for *The model: histories and causal recursion*) reads fine and fails the check;
-that gap is where silent rot lives. A quoted title in doc prose is checked
-wherever it sits, including hanging off a link — both halves of `[mutability.md](mutability.md), "The model"` are validated. <!-- doc-refs-ignore: illustrative -->
+Either form must name a **heading**, spelled **exactly** — an abbreviated title
+reads fine and fails the check, and that gap is where silent rot lives. A bold
+paragraph lead-in is not citable (no anchor, nothing to check); promote it to a
+heading in the same change if you need to point at it.
 
 **Never reference something uncheckable — it rots silently because nothing can
 validate it.** Specifically avoid:
 
-- *Section numbers across docs* (`§4.6`) — cite the heading (anchor link or
-  quoted title) instead. (Existing `§`-refs are being migrated to links as a
-  follow-up; don't add new ones.) A `§` *followed by a quoted title* is now
-  checked on the title, but the number in front of it still isn't — drop it.
+- *Section numbers across docs* (`§4.6`) — cite the heading instead. (Existing
+  `§`-refs are being migrated to links as a follow-up; don't add new ones.)
 - *Transient identifiers*, which are wrong almost immediately: PR-stack positions
   ("the PR above/below", "PR 3 in the stack"), PR/issue numbers used as if they
   were stable section markers, review-comment numbers, and dated notes ("the
@@ -108,66 +110,17 @@ validate it.** Specifically avoid:
   heading and cite that; if it isn't, inline the substance instead of pointing.
 
 When you rename a heading, `./ci.sh doc_refs` flags every inbound link and
-citation, from code and from docs — update them in the same change.
+citation, from code and from docs — update them in the same change. Worked
+examples of near-miss citations, and the citation grammar:
+`.github/scripts/doc-refs/README.md`.
 
 ### Rendering CCL ASTs in conversation
 
-When showing a CCL AST in chat or when writing code comments — walking through an example, illustrating what a pass sees, comparing before/after a rewrite — **render it in symbolic form** (the output shape of `ccl::symbolic::symbolic` / `symbolic_typed`). The whole reasoning surface here is the algebra; symbolic notation makes that legible at a glance.
+When showing a CCL AST in chat or in a code comment — walking through an example, illustrating what a pass sees, comparing before/after a rewrite — **render it in symbolic form** (the output shape of `ccl::symbolic::symbolic` / `symbolic_typed`). The whole reasoning surface here is the algebra; symbolic notation makes that legible at a glance.
 
-Vocabulary, matching `src/ccl/symbolic.rs`:
+Read `src/ccl/design/ir.md`, "Symbolic rendering" for the expression and type forms before rendering either — both tables are pinned by tests, and a form recalled from memory will be wrong. For the metavariable and function-type conventions that govern *prose* rather than printer output, see `docs/design.md`, "Notation conventions".
 
-- **Apply**: `arg ▷ func` (left-assoc; `a ▷ f ▷ g` means `(a ▷ f) ▷ g`).
-- **Apply with `Proj` as function**: postfix dot-access. `t ▷ .0` → `t.0`, `rec ▷ .name` → `rec.name`.
-- **Compose**: `f ≫ g ≫ h`.
-- **Lambda**: `λ x → body`. With annotated param: `λ x : T → body`. With refinement: `λ x : {T | predicate} → body` (an unresolved refined base renders by its own type form: `{_ | predicate}` for a `Hole`, `{?N | predicate}` for an `Infer`). The refinement rides the param *type* — there is no separate lambda refinement slot — and the predicate appears bare inside the braces; do not write `{T | Refined(p)}`.
-- **Let**: `let x = e in body`.
-- **Aggregate**: `Sum(input)`, `Max(input)`, etc. — the kind name then parens.
-- **LetRec** (causal mutually-recursive group): `letrec b₁ = e₁; …; bₙ = eₙ in body` (bindings separated by `;`) — what the mutability-elimination phases (`mut_elim` for overwrite, `channelize` for append) emit before loop planning.
-- **Transact** (the domain-parameterized recurrence carrier `plan_loops` produces from a `LetRec`): `transact (k₁ = init₁, …) { [reads]⇒[writes] over source do body; … }` — the store keys with their seeds, then one writer per site (its read/write footprint, iteration source, and decision body). `Transact` is born by loop planning (`plan_loops`, in `planning/loops.rs`) *after* `lambda_elim` (its writer bodies are already point-free); op-conversion dispatches on the domain: a concrete iteration extent → the `InductionStore` changelog, `Txn` → the commit operator. `Transact` is the only recurrence carrier — every loop and every transaction renders as one.
-- **Literals**: `1`, `true`/`false`, `"str"`, `unit`.
-- **Binops**: standard infix with precedence parens (`a + b`, `x == y`, `p and q`, etc.).
-- **Unary**: `-x`, `not x`.
-- **Tuples / lists**: `(a, b)`, `[a, b, c]`.
-- **Records**: a record **value** renders with parens + colons — `(name: a, age: b)` (the renderer emits `(field: val, …)`, `src/ccl/symbolic.rs`); a record **type** renders with braces + colons — `{name: T, age: U}` (`Display for Type`, `src/ccl/mod.rs`). Braces are for types only; do not render a record value with braces.
-- **List mappings** (in lowered list literals): `[0 ↦ e0, 1 ↦ e1]`.
-
-Types (from `Display for Type` in `src/ccl/mod.rs`):
-
-- **Function**: `(T ⇒ U)` for a compute function; `(T ⤇ U)` (plain-text `|=>`) for a data function (the domain is the data map, joins must be lossless). FunKind is inferred by the solver (`FunKind::Var`, resolved at coalesce — see `src/ccl/design/type-inference.md` §4.6) and `Display` renders it live: a data collection shows `⤇`, a capability (and a genuinely unresolved kind var) `⇒`. A comprehension over a **let-bound** collection source resolves to `⤇` just like one over a literal source (`let x = [1,2,3] in [y + 10 for y in x]` is `⤇`) — its domain is a data collection.
-- **Sigma** (in-flight, same stack): `Σ{D0, D1} ⤇ V` — a data function whose domain is exactly one of the listed choices; with a live witness binder, `(Σ n ∈ {D0, D1}. n ⤇ V)`.
-- **Refinement**: `{T | predicate}` — predicate is rendered via `symbolic`.
-- **UIntRange**: `[0, N]`, or `∅` when empty.
-- **Hole**: `_`.
-- **Infer**: `?N` (where `N` is the variable id).
-- **DataSource**: `source(name)`.
-- **Union**: `T1 | T2`.
-- **Feed**: `Feed(T)` — a transient deferred-output type inference threads and `channelize` erases.
-- **Mut**: `Mut(value, domain)` — a transient mutable-variable type inference threads and the mutability-elimination phases (`mut_elim`) erase; the domain is an induction extent or `Txn`. Its `HistoryKind` is `Overwrite` (the last-write-wins merge law); the append-law sibling is `Feed`'s `Append` kind.
-- **Txn**: `Txn` — the (nullary) transaction-commit sequencing domain, the second slot of a `Mut(V, Txn)` register.
-
-Do **not** write `Apply { function: ..., argument: ... }`, `Apply(f, x)`, `Compose([f, g])`, or other constructor-style forms — those are AST node names, not the rendering. Do **not** fall back to source syntax when the point is what the *AST* looks like. Only deviate if explicitly asked (e.g. "show me the Debug form", "give me the source").
-
-When the type matters to the point being made (e.g. showing a domain refinement that triggers operator dispatch), include type annotations via `symbolic_typed`-style suffixes: `expr:type`.
-
-### Metavariable notation in design docs
-
-When design-doc prose and inline pseudo-code mix CCL syntax with meta-theoretic placeholders (stand-ins for any specific term, type, or predicate), italicize the placeholders using Unicode mathematical italic characters. Single-letter Latin: `𝑎`–`𝑧` (U+1D44E–U+1D467, lowercase, for term/value metas) and `𝐴`–`𝑍` (U+1D434–U+1D44D, uppercase, for type metas). One gotcha — italic lowercase `ℎ` lives at the legacy codepoint U+210E, not in the contiguous range. Digit subscripts: `₀`–`₉` (U+2080–U+2089) for indexed variants (`𝐷₁`, `𝐶₂`). Multi-character placeholders (`body`, `arg`, `param`, `predicate`, ...) and concrete identifiers (`xs`, `__gb_k`, `key_fn`, ...) stay upright. The convention applies to inline pseudo-code in backticks and to prose mentions, **not** to fenced code blocks — those represent literal source and stay in regular characters throughout. String literals (`"x"`, `"k"`) are also literal, not metavariables, and stay upright. Stars/underscores for italics don't work inside backticks; the Unicode math characters are pre-rendered italic glyphs that render correctly in any modern Markdown viewer.
-
-### Symbolic notation for types and terms
-
-Use the symbolic forms below in prose and inline pseudo-code (not in fenced code blocks, which represent literal source):
-
-- **Function type with named binder** (`Type::Fun` with `name: Some(_)`): `(𝑥: 𝐴) ⇒ 𝐵`. `𝑥` is bound in `𝐵`.
-- **Function type with no named binder** (`Type::Fun` with `name: None`): `𝐴 ⇒ 𝐵`.
-- **Data function type** (`FunKind::Data`, kind inferred and rendered live): `𝐴 ⤇ 𝐵`, named-binder form `(𝑥: 𝐴) ⤇ 𝐵` — same associativity as `⇒`; the bar reads "the domain is the data". **Σ type** (formation live; witness binder still dormant): `Σ 𝑛 ∈ {𝐷₀, 𝐷₁}. 𝑛 ⤇ 𝑉` — a dependent sum over candidate domains; anonymous-witness shorthand `Σ{𝐷₀, 𝐷₁} ⤇ 𝑉`.
-- **Refinement type**: `{𝑥: 𝑇 | 𝑝(𝑥)}` — standard subset-type notation.
-- **Lambda** (term): `λ 𝑥 → body`. The `→` after the binder separates the parameter from the body.
-- **Forward apply** (term level): `𝑎 ▷ 𝑓` means `𝑓(𝑎)`.
-- **Forward compose** (term level): `𝑓 ≫ 𝑔` means `λ 𝑥 → 𝑔(𝑓(𝑥))`.
-
-Both `⇒` and `→` are right-associative. They are distinct: `⇒` is for *types*, `→` is for *terms* (lambda body separator and similar). Don't mix them.
-
-Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k"), domain: K, codomain: ... }`) when prose calls for symbolic notation — the struct form is appropriate inside fenced ` ```rust ` blocks that show actual Rust source, but in symbolic positions use the arrow / refinement-bracket notation above.
+Do **not** write `Apply { function: ..., argument: ... }`, `Apply(f, x)`, `Compose([f, g])`, or other constructor-style forms — those are AST node names, not the rendering. Do **not** fall back to source syntax when the point is what the *AST* looks like, and do not render type information as Rust struct syntax (`Fun { name: Some("k"), … }`) where prose calls for the arrow form. Only deviate if explicitly asked (e.g. "show me the Debug form", "give me the source").
 
 ### Workflow
 
