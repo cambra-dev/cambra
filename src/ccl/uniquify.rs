@@ -60,7 +60,7 @@
 //! predicate; chained comparisons clone the shared middle operand). A copy
 //! made of *raw* trees would mint distinct uids per copy here, making
 //! α-equivalent copies structurally unequal — and the loop-join shape relies
-//! on the copies comparing equal (witness dedup collapses the
+//! on the copies comparing equal (refinement dedup collapses the
 //! predicate's source against the body's). So lowering runs this pass on a
 //! subtree *before* cloning it (see `lower_list_comp` Phase 1), and the
 //! whole-program run treats minted names as settled: minted binding sites

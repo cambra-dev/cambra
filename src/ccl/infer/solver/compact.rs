@@ -1,6 +1,6 @@
 //! Bound-graph flattening: `compact_type` walks a [`Type`] and produces a
 //! [`CompactGraph`] — a per-position bag of contributions (variables, atoms,
-//! a record/variant shape, a function shape, and a refinement witness set)
+//! a record/variant shape, a function shape, and a refinement set)
 //! ready for simplification and coalescing.
 //!
 //! [`CompactType`] / [`CompactGraph`] are the shared currency consumed by the
@@ -52,7 +52,10 @@ pub enum AtomKey {
 }
 
 impl AtomKey {
-    fn from_type(ty: &Type) -> Option<AtomKey> {
+    /// The atom `ty` contributes, or `None` for a non-atomic type. Shared with
+    /// the sibling specialization-key walk, which classifies leaves the same way
+    /// (see `src/ccl/infer/solver/spec_key.rs`).
+    pub(super) fn from_type(ty: &Type) -> Option<AtomKey> {
         match ty {
             Type::Base(b) => Some(AtomKey::Prim(b.clone())),
             Type::UIntRange(n) => Some(AtomKey::UIntRange(*n)),
@@ -87,7 +90,7 @@ impl AtomKey {
 /// data function's domain alternatives becomes `Conflict` and is reported loudly at coalesce
 /// ([`super::coalesce::CoalesceError::DomainJoinConflict`]), never a mid-merge
 /// panic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum KindMerge {
     /// domain — the ordinary contravariant meet.
     Compute,
@@ -111,7 +114,7 @@ impl KindMerge {
     /// supplied where a collection is demanded (e.g. `sum(λ x → x + 1)`) is a concrete
     /// `Compute` value against a `Data` demand, rejected up front in
     /// [`constrain_kind`](super::constrain) — it never reaches a var here.
-    fn of(kind: &crate::ccl::ty::FunKind) -> Self {
+    pub(super) fn of(kind: &crate::ccl::ty::FunKind) -> Self {
         use crate::ccl::ty::FunKind;
         match kind {
             FunKind::Compute => KindMerge::Compute,
@@ -272,7 +275,7 @@ pub struct CompactType {
     /// `Data ⊔ Data` join accumulated alternatives via [`union_domains`]), and the
     /// codomain. Recursively merged with polarity flip on the domain.
     pub fun: Option<CompactFun>,
-    /// Witness contributions at this position. A set with `==`
+    /// Refinement contributions at this position. A set with `==`
     /// membership (deduplicated by [`Refinement`]'s structural `PartialEq`),
     /// stored as a `Vec` in first-insertion order. A refinement-set is
     /// width-subtyped exactly like `rec`: more refinements ⇒ subtype
@@ -355,19 +358,19 @@ impl CompactType {
         }
     }
 
-    /// Merge two witness sets. The set-op tracks
+    /// Merge two refinement sets. The set-op tracks
     /// polarity the same way `rec` does — positive ⇒ *intersect*,
     /// negative ⇒ *union* — because refinement-sets width-subtype like
     /// record fields (more refinements ⇒ subtype). At a positive
-    /// position the value reliably carries only the witnesses *both*
+    /// position the value reliably carries only the refinements *both*
     /// sides guarantee; at a negative position a consumer that may
     /// impose either set imposes their union.
     fn merge_refinements(pol: bool, lhs: Vec<Refinement>, rhs: Vec<Refinement>) -> Vec<Refinement> {
         if pol {
-            // The types are being unioned, so the refinement witnesses should be intersected.
+            // The types are being unioned, so the refinements should be intersected.
             lhs.into_iter().filter(|r| rhs.contains(r)).collect()
         } else {
-            // The types are being intersected, so the refinement witnesses should be unioned.
+            // The types are being intersected, so the refinements should be unioned.
             let mut out = lhs;
             for r in rhs {
                 if !out.contains(&r) {
@@ -549,13 +552,13 @@ fn compact_go(
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Txn => CompactType::from_atom(AtomKey::from_type(ty).unwrap()),
-        // Refinements ride the lattice as a witness set: compact the underlying
-        // type, then attach this layer's witness. Walking a variable's bound
+        // Refinements ride the lattice as a refinement set: compact the underlying
+        // type, then attach this layer's refinement. Walking a variable's bound
         // that is `Refinement(D, r)` therefore unions `r` into that variable's
         // compacted position — the propagation path. The accumulated
-        // substitution is *forced* on the witness: it rebuilds the predicate
+        // substitution is *forced* on the refinement: it rebuilds the predicate
         // with its free binders rewritten (e.g. discharging a dependent
-        // application's argument) before the witness lands in the position.
+        // application's argument) before the refinement lands in the position.
         // The predicate is an immutable term, so a non-vacuous force builds a
         // fresh predicate from the (freshened) bound's content directly.
         Type::Refinement(inner, r) => {
@@ -740,7 +743,7 @@ fn compact_go(
             // end. Seeding with `from_var` would mix the variable's *empty*
             // refinement set into the merge, and at positive polarity `merge`
             // *intersects* refinement sets (`merge_refinements`) — so the empty
-            // seed would intersect away every bound's witnesses (∅ is absorbing under
+            // seed would intersect away every bound's refinements (∅ is absorbing under
             // intersection). The variable identity must be refinement-*neutral*;
             // `rec`/`var`/`fun` get this for free from their `None` merge
             // identity, but refinement sets have no such sentinel, so we keep

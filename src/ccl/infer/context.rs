@@ -37,7 +37,7 @@ pub(super) struct Binding {
 
 /// Whether a `let` bound to `def` at `level` should be **generalized** —
 /// typed polymorphically, with each use [`PolyScheme::instantiate`]ing a fresh
-/// copy and the coalesce walk specializing per distinct resolved use type
+/// copy and the coalesce walk specializing per distinct use instantiation
 /// ([`specialize_use`](super::solve::specialize_use)). Requires both of:
 ///
 /// - **A function definition** (`def` is a `Lambda`). Let-polymorphism
@@ -145,7 +145,7 @@ impl InferCtx {
     /// `Type`: every `Hole` becomes a fresh inference variable at the
     /// current level. Everything else — including existing `Infer` vars,
     /// the structural variants the solver operates on, and `Refinement`
-    /// wrappers (refinements ride the lattice as refinement witnesses) — is
+    /// wrappers (refinements ride the lattice as refinements) — is
     /// kept, recursing to normalize nested holes.
     pub(super) fn normalize_annotation(&self, ty: &Type) -> Type {
         match ty {
@@ -153,7 +153,7 @@ impl InferCtx {
             Type::Hole => fresh_var(self.level),
             // Refinements ride the lattice: keep the wrapper, normalize the
             // inner (so a `Refinement(Hole, r)` source annotation becomes
-            // `Refinement(?fresh, r)` rather than losing the witness).
+            // `Refinement(?fresh, r)` rather than losing the refinement).
             Type::Refinement(inner, r) => {
                 Type::Refinement(Box::new(self.normalize_annotation(inner)), r.clone())
             }
@@ -309,7 +309,7 @@ impl Typing for InferCtx {
         let scheme = if generalize {
             // Polymorphic: generalize at the outer level. Each `Var` use
             // instantiates a fresh copy; the coalesce walk then specializes
-            // the definition per distinct resolved use type
+            // the definition per distinct use instantiation
             // (`specialize_use`).
             PolyScheme::poly(self.level, bound_ty.clone())
         } else {

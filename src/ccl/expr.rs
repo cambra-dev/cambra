@@ -177,8 +177,8 @@ pub enum TypedExprNode {
     /// because `{𝐷 | 𝑝} <: 𝐷` — so viewing an unrefined-domain collection
     /// function at a refined-domain type is sound.  The
     /// refinement-aware solver ([`crate::ccl::infer::solver::constrain_subtype`])
-    /// flows the witness onto the fresh target-domain variable, *stacking* it
-    /// onto any witnesses the value already carries, so nested casts compose
+    /// flows the refinement onto the fresh target-domain variable, *stacking* it
+    /// onto any refinements the value already carries, so nested casts compose
     /// (nested list comprehensions).  `target`'s predicate is inferred by the
     /// same `emit_annotation_predicates` / `coalesce_type_predicates` path as
     /// any refinement-bearing type.  A *covariant* refinement (e.g. casting

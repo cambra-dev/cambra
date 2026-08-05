@@ -40,6 +40,46 @@ fn test_function_def_polymorphic_used_at_two_types() {
     check_scalar(code, Value::Bool(true));
 }
 
+// Two calls at the same *base* types but different argument literals. Every
+// literal carries its own singleton, so the two uses instantiate the UDF at
+// genuinely different refined types and must not share a specialization — the
+// clone's interior is resolved against the argument that pinned it, so a shared
+// clone would carry one call's argument type at the other's call site.
+//
+// These are regression guards for a specialization memo keyed on a *resolved
+// type*: because a domain resolves from its upper bounds, an argument's refinement
+// (a lower bound) was invisible in the key exactly where the definition body
+// supplied something concrete, so a difference confined to such a position keyed
+// equal. `\a, b -> a + b` at `(1, 2)` and `(1, 5)` both keyed on
+// `((1, Int) ⇒ Int)`, shared a clone typing `.1` as `2`, and the post-inline
+// consistency wall then panicked ("Type mismatch for Apply: expected 5, found
+// 2"). `SpecKey` reads both bound directions, so the two key apart.
+//
+// The controls matter as much as the cases: a difference in the *first* argument
+// always keyed apart (its refinement reached the key), and two identical calls must
+// still **share** — the fix must not degrade into cloning per call site.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Differs only in the second argument — the position the old key could not see.
+#[case("h = \\a, b -> a + b\nh(1, 2) + h(1, 5)", Value::Int(9))]
+// Differs in the first argument: keyed apart even before the fix.
+#[case("h = \\a, b -> a + b\nh(2, 1) + h(5, 1)", Value::Int(9))]
+// Three call sites, two of them differing only in an invisible position.
+#[case("h = \\a, b -> a + b\nh(1, 2) + h(1, 5) + h(1, 9)", Value::Int(19))]
+// Identical calls: one specialization, shared.
+#[case("h = \\a, b -> a + b\nh(1, 2) + h(1, 2)", Value::Int(6))]
+// A single-argument UDF, where the shared clone's body carried the first call's
+// singleton on its parameter reference (`λ x : Int → x:<1> + 1`). That happened
+// to compile to the right answer, so this case pins the *result* while the
+// unit-level `SpecKey` tests pin the keying.
+#[case("f = \\x -> x + 1\nf(1) + f(2)", Value::Int(5))]
+fn test_polymorphic_udf_calls_differing_only_in_a_literal(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
 // ---------------------------------------------------------------------------
 // Generator functions — def f(xs): for x in xs: yield expr
 // ---------------------------------------------------------------------------

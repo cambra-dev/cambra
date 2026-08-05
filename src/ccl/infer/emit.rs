@@ -472,7 +472,7 @@ pub(super) fn emit_lambda<C: Typing>(
     let param_simple = ctx.normalize(&param.ty);
     param.ty = param_simple.clone();
     // The param is bound in scope under the *unrefined* `param_simple`, so
-    // `Var(param)` body references stay bare; restriction witnesses decorate only
+    // `Var(param)` body references stay bare; restriction refinements decorate only
     // the function boundary.
     let body_ty = ctx.scoped(&param.name, &param_simple, |ctx| ctx.subexpr(body))?;
 
@@ -511,7 +511,7 @@ pub(super) fn emit_lambda<C: Typing>(
 /// rather than as a bare `value <: target` obligation, because the refinement
 /// lattice is strict (`unrefined ⊀ refined`) so the value cannot flow *into*
 /// the refined target by subtyping. Re-wrapping the domain stacks `r` over any
-/// witnesses `value` already carries, so chained casts (nested list-comprehension
+/// refinements `value` already carries, so chained casts (nested list-comprehension
 /// filters) compose.
 ///
 /// `as_function` is the mode-generic decompose: in Emit the one-way
@@ -525,7 +525,7 @@ pub(super) fn emit_lambda<C: Typing>(
 /// domain-refinement's bare predicate is typed by `emit_bare_predicate` (the
 /// element bound to `D`, the predicate checked `Bool`) exactly as [`emit_lambda`]
 /// handles a lambda's own refinement; `coalesce_type_predicates(&expr.ty)`
-/// resolves it later (the result shares `target`'s witness `r`).
+/// resolves it later (the result shares `target`'s refinement `r`).
 ///
 /// Shared by `emit_node` (Emit) and `check_node` (Check) via [`Typing`].
 pub(super) fn emit_cast<C: Typing>(
@@ -864,7 +864,7 @@ pub(super) fn emit_aggregate<C: Typing>(
 ///
 /// A genuinely-polymorphic function definition ([`Typing::is_generalizable`])
 /// is generalized so each `Var` use instantiates a fresh copy; the coalesce
-/// walk later specializes the definition per distinct resolved use type
+/// walk later specializes the definition per distinct use instantiation
 /// ([`specialize_use`](super::solve::specialize_use)). Everything else is bound
 /// monomorphically and shared (the pre-let-poly behavior). Generalization
 /// carries no use-count or generator condition — see
@@ -1300,7 +1300,7 @@ pub(super) fn emit_compose<C: Typing>(
     for (i, t) in tys.iter().enumerate().skip(1) {
         let (d_i, c_i) = ctx.as_function(t, &|| "Compose[i]".to_string())?;
         // Strict refinement-aware adjacency: `prev_cod <: next_dom`, refinement
-        // witnesses and all — no cast escape. A producer must already supply the
+        // refinements and all — no cast escape. A producer must already supply the
         // refinement its consumer demands. Join planning surfaces the
         // join-satisfying / iterated domain on each producing morphism's
         // codomain (`planning`'s `refine_codomain` / iteration-source

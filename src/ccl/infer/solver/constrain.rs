@@ -4,7 +4,7 @@
 //! variables' bound lists, propagating transitively (`constrain_go`),
 //! bridging two-sided edge substitutions (`bridge_holder_gap`), and recovering
 //! from level mismatches by `extrude`. Refinement layers are peeled/wrapped
-//! (`peel_refinements` / `wrap_refinements`) so a witness deficit can flow onto
+//! (`peel_refinements` / `wrap_refinements`) so a refinement deficit can flow onto
 //! a variable base.
 
 // The `constrain` cycle cache (`ConstrainCache`) keys on `(Type, Type)`. `Type`
@@ -809,12 +809,12 @@ fn constrain_go(
         ) => Ok(()),
 
         // Refinement subtyping:
-        //   {b₁ | S₁} <: {b₂ | S₂}  iff  b₁ <: b₂  and  σ(S₂) ⊆ σ(S₁) ∪ witnesses(b₁)
+        //   {b₁ | S₁} <: {b₂ | S₂}  iff  b₁ <: b₂  and  σ(S₂) ⊆ σ(S₁) ∪ refinements(b₁)
         // (more refinements ⇒ subtype). Refinements match by [`Refinement`]'s
-        // `PartialEq` — structural predicate equality — so a witness join planning
+        // `PartialEq` — structural predicate equality — so a refinement join planning
         // rebuilt as a fresh term still matches; never by predicate
         // implication. The two sides live in different binder contexts, so an
-        // lhs witness is transported through the correspondence (`σ(S₁)`, via
+        // lhs refinement is transported through the correspondence (`σ(S₁)`, via
         // [`Subst::force_refinement`]) before comparing: a predicate mentioning
         // a Pi binder matches its renamed — or, when a discharge edge composed
         // into σ on the way through a variable, *discharged* — copy on the
@@ -830,8 +830,8 @@ fn constrain_go(
         // rather than rejecting — the refinement analog of how the
         // record/function arms thread structure through variables. The
         // requirement then fails later iff the variable resolves to a concrete
-        // base lacking those witnesses. Without this, a value that is *already*
-        // refined could never be cast to add a further witness (nested
+        // base lacking those refinements. Without this, a value that is *already*
+        // refined could never be cast to add a further refinement (nested
         // list-comprehension filters: `{D|p} ⇒ V <: {?a|q} ⇒ V`), even though
         // the assignment `?a := {D|p}` exists.
         //
@@ -846,9 +846,9 @@ fn constrain_go(
             let (rbase, rrefs) = peel_refinements(rhs);
             // The refinements rhs requires that no transported lhs layer
             // matches (by `Refinement`'s structural `PartialEq`). Each side's
-            // witnesses are forced through its own morphism into the ambient frame
+            // refinements are forced through its own morphism into the ambient frame
             // before comparing (`sl(S₁)` vs `sr(S₂)`); the deficit keeps the
-            // *untransported* rhs witnesses, since the recursive constraint below
+            // *untransported* rhs refinements, since the recursive constraint below
             // carries `sr` for them.
             let lrefs_in_ambient: Vec<Refinement> =
                 lrefs.iter().map(|l| sl.force_refinement(l)).collect();
@@ -863,7 +863,7 @@ fn constrain_go(
             } else if matches!(lbase, Type::Infer(_)) {
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
-                // resolves to a concrete base lacking those witnesses.
+                // resolves to a concrete base lacking those refinements.
                 let demanded = wrap_refinements(rbase, &deficit);
                 constrain_go(lbase, &demanded, sl, sr, cache)
             } else {
@@ -882,7 +882,7 @@ fn constrain_go(
 }
 
 /// Peel all outer [`Type::Refinement`] layers, returning the bare base type
-/// and the refinement witnesses carried by the peeled layers (outermost first).
+/// and the refinements carried by the peeled layers (outermost first).
 fn peel_refinements(ty: &Type) -> (&Type, Vec<&Refinement>) {
     let mut refs = Vec::new();
     let mut cur = ty;
@@ -897,7 +897,7 @@ fn peel_refinements(ty: &Type) -> (&Type, Vec<&Refinement>) {
 /// outermost-first), preserving their order.
 ///
 /// Used by [`constrain_subtype`]'s refinement arm to rebuild the deficit
-/// refinement `{rbase | S₂ \ S₁}` from the rhs's own layers, so the kept witnesses
+/// refinement `{rbase | S₂ \ S₁}` from the rhs's own layers, so the kept refinements
 /// retain their real [`crate::ccl::Refinement`] payloads (predicate `Rc`s).
 fn wrap_refinements(base: &Type, refs: &[&Refinement]) -> Type {
     refs.iter().rev().fold(base.clone(), |acc, r| {
@@ -1172,10 +1172,10 @@ mod tests {
     }
 
     #[test]
-    fn refined_missing_witness_is_not_subtype() {
+    fn refined_missing_refinement_is_not_subtype() {
         // {Int | q} </: {Int | p}  — a q-refined value cannot stand in for a
         // p-refined one. `refined` gives p and q structurally-distinct
-        // predicates, so the witnesses don't match.
+        // predicates, so the refinements don't match.
         let (p, q) = (1, 2);
         let lhs = refined(prim(BaseType::Int), q);
         let rhs = refined(prim(BaseType::Int), p);
@@ -1351,7 +1351,7 @@ mod tests {
         // {?a | q} <: {Int | p}: the explicit layer only supplies q, but the
         // base variable ?a can acquire the deficit {p}, so the constraint
         // succeeds by flowing `?a <: {Int | p}`. This is what lets a value
-        // that is *already* refined be cast to add a further witness (nested
+        // that is *already* refined be cast to add a further refinement (nested
         // list-comprehension filters: `{D|p} ⇒ V <: {?a|q} ⇒ V`); a ground
         // `{p} ⊆ {q}` check would reject it.
         let (p, q) = (1, 2);
@@ -1375,7 +1375,7 @@ mod tests {
     fn refined_concrete_base_still_rejects_deficit() {
         // {Int | q} </: {Int | p}: with a *concrete* base there is nothing to
         // absorb the deficit, so the strict rejection (`{T|q} ⊀ {T|p}`) is
-        // preserved — only a variable base can acquire missing witnesses.
+        // preserved — only a variable base can acquire missing refinements.
         let (p, q) = (1, 2);
         let lhs = refined(prim(BaseType::Int), q);
         let rhs = refined(prim(BaseType::Int), p);

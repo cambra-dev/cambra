@@ -35,7 +35,7 @@ use super::{lit_base, map_constrain_err};
 ///
 /// Refinement handling: Check is refinement-*aware* — it constrains the real
 /// (un-stripped) types via [`Typing::require_sub`], so the lattice's
-/// restriction-witness subsetting (`unrefined ⊀ refined`) is enforced. The explicit
+/// restriction-refinement subsetting (`unrefined ⊀ refined`) is enforced. The explicit
 /// cast operator canonicalizes restriction *acquisition*, so the long-standing
 /// deep strip is gone, and the check runs both after inference *and* after
 /// join planning (`context.rs`).
@@ -49,7 +49,7 @@ use super::{lit_base, map_constrain_err};
 /// `Rc` at every marker, the producer's `{D | r}` and the consumer's contract
 /// rarely share an `Rc`; [`crate::ccl::infer::solver`]'s subset check matches them
 /// by *structural predicate equality* (not just `Rc` identity) so the re-minted
-/// witnesses still chain. (Previously this gap was papered over by a
+/// refinements still chain. (Previously this gap was papered over by a
 /// `contains_cast` peel in `emit_compose` and by leaving planning output un-checked.)
 pub(super) struct CheckCtx {
     schemes: OperatorSchemes,
@@ -121,7 +121,7 @@ impl Typing for CheckCtx {
     ) -> Result<(), LocatedInferError> {
         // Delegate to the solver's `constrain_subtype` — the single source of
         // truth for width/variance and (since refinements ride the lattice as
-        // restriction witnesses) witness subsetting. A failure is recorded (not
+        // restriction refinements) refinement subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
         if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new_kind_blind()) {
             let located = self.raise(map_constrain_err(e, &at()));
@@ -191,7 +191,7 @@ impl Typing for CheckCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError> {
         // Destructure the resolved type directly (no inference vars). Peel any
-        // outer refinement witnesses the function picked up during solving,
+        // outer refinements the function picked up during solving,
         // and — pre-desugar only — read through a transparent handle to the
         // value it wraps: a defer's `Feed` to its channel, and a `Mut` history to
         // its value (a `Mut`-typed collection used as a for-loop source derefs

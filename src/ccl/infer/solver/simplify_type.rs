@@ -52,12 +52,12 @@ enum CoOccItem {
 /// [`compact_type`](super::compact::compact_type) and
 /// [`coalesce_compact`](super::coalesce::coalesce_compact) in the pipeline.
 ///
-/// **Refinements need no special handling here.** Refinement witnesses live on
+/// **Refinements need no special handling here.** Refinements live on
 /// each [`CompactType`] *position* (`ct.refinements`), not on variable
 /// identity, and [`simplify_reconstruct`] copies them through unchanged while
 /// `var_subst` only ever rewrites or drops variable uids. Co-occurring
 /// variables (the merge candidates) sit in the same position and therefore
-/// carry the same witnesses, so merging or eliminating a variable can never move
+/// carry the same refinements, so merging or eliminating a variable can never move
 /// or lose a refinement. (The classic "merge x>0 with x<10" hazard applies
 /// only to representations that fold the predicate into the variable's
 /// identity; ours keeps them positional.)

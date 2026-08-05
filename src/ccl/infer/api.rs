@@ -1223,7 +1223,7 @@ pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// `Mut` on `user_annotation` (while the coalesced `.ty` slot is the value type
 /// — reads deref), and a *non-`Mut`* annotation (`y: int = x`) declares a value,
 /// so the binding is not a mutable variable even if a write-site demand coalesced its `.ty`
-/// to `Mut`. Only when there is no annotation does `.ty` witness mutability (a
+/// to `Mut`. Only when there is no annotation does `.ty` itself decide mutability (a
 /// coalesced alias). Reading the annotation first is what makes `y += 1` on a
 /// `y: int = x` deref-copy the "not a mutable variable" error the discipline
 /// promises, rather than a silently-accepted write.

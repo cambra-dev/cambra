@@ -13,14 +13,14 @@
 //!    Because the vars are shared `Rc<InferVar>`s, later constraints
 //!    accumulate into bounds that are already visible through the stored
 //!    `Type` — no side table is needed. Domain refinements ride the type
-//!    lattice as restriction witnesses on [`Type::Refinement`] (introduced by the
+//!    lattice as restriction refinements on [`Type::Refinement`] (introduced by the
 //!    `cast` Apply arm), so they flow through the solver structurally.
 //! 2. **Coalesce + write-back + monomorphize**: walk the tree again and, for
 //!    each node, run
 //!    [`coalesce_compact`](crate::ccl::infer::solver::coalesce_compact) to
 //!    resolve the inference variables in its `expr.ty` in place. The same
 //!    walk lowers let-polymorphism: a use of a generalized `let` is
-//!    specialized at first visit, memoized per distinct resolved type
+//!    specialized at first visit, memoized per distinct instantiation
 //!    ([`specialize_use`](solve::specialize_use)), and the `let` rebuilds
 //!    itself as the chain of demanded specializations
 //!    ([`coalesce_generalized_let`](solve::coalesce_generalized_let)).
@@ -38,7 +38,7 @@
 //! monomorphic, generalization is paired with **monomorphization**,
 //! integrated into the coalesce walk: at a generalized use, the walk resolves
 //! the instantiation type off the live constraint graph (complete by then),
-//! emits one specialized clone of the definition per distinct resolved type
+//! emits one specialized clone of the definition per distinct instantiation
 //! (`freshen_expr_type_slots` + a constrain-against-the-live-use-type pin + a
 //! re-entrant coalesce), and rewrites the use to reference its
 //! specialization. So inference both type-checks the polymorphism and lowers

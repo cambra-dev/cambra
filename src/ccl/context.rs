@@ -1008,7 +1008,7 @@ pub fn compile_program(
     // graph an adjacency that doesn't chain would otherwise hide. Planning
     // surfaces each iterated / join-satisfying extent on its producer's
     // codomain (`refine_codomain` / `set_codomain`) and the strict checker
-    // matches the fresh refinement witnesses it mints by structural predicate
+    // matches the fresh refinements it mints by structural predicate
     // equality, so the staging shapes now validate without re-blinding the
     // check or peeling cast refinements.
     typecheck(&join_planned).expect("type error after join planning");

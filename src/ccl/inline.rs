@@ -1229,8 +1229,10 @@ mod tests {
     /// precondition beta-reduction would silently drop, so the assert fires
     /// rather than substituting. Pins the guard that keeps
     /// [`refinement_discharged_by`] from being weakened to "any refined param is
-    /// fine" — e.g. if specialization were ever keyed modulo refinements, one
-    /// literal's singleton could reach the param slot of a call made at another.
+    /// fine" — the shape this arrives in is a monomorphization key that cannot tell
+    /// two call sites' refinements apart, which lets one literal's singleton reach
+    /// the param slot of a call made at another (see `src/ccl/design/type-inference.md`,
+    /// "Keying a specialization").
     #[test]
     #[should_panic(expected = "does not entail")]
     fn refined_outer_param_not_entailed_by_argument_asserts() {

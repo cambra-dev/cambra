@@ -277,7 +277,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         }
     };
 
-    // Re-wrap the refinement witnesses carried at this position. `extent_of`
+    // Re-wrap the refinements carried at this position. `extent_of`
     // strips refinements at every depth and composes the resulting
     // `Restrict`s, so the wrap order is semantically irrelevant;
     // first-insertion order in the `Vec` makes it stable.
@@ -735,9 +735,9 @@ mod tests {
 
     #[test]
     fn distinct_refinements_survive_simplification() {
-        // A record carrying two *different* refinement witnesses at two field
+        // A record carrying two *different* refinements at two field
         // positions must round-trip through compact → simplify → coalesce
-        // with both witnesses intact (they are positional, not folded into a
+        // with both refinements intact (they are positional, not folded into a
         // variable identity, so co-occurrence analysis cannot merge them).
         let (p, q) = (1, 2);
         let ty = Type::Record(vec![
@@ -753,7 +753,7 @@ mod tests {
         // A fresh var equated to a refined type (both bounds) must coalesce
         // *carrying* the refinement, not drop it to the bare base. Solver-level
         // property: equality bounds may still arise (e.g. `bind_annotation`,
-        // `require_eq` on list elements), so witnesses must survive them.
+        // `require_eq` on list elements), so refinements must survive them.
         let p = 1;
         let v = fresh_var(0);
         let refined_int = refined(prim(BaseType::Int), p);
@@ -764,15 +764,15 @@ mod tests {
         let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
         assert_eq!(
             out, refined_int,
-            "var equated to {{Int|p}} lost its witness"
+            "var equated to {{Int|p}} lost its refinement"
         );
     }
 
     #[test]
     fn apply_index_var_coalesces_refined() {
-        // Solver-level witness-propagation property: an index var `v` equated
+        // Solver-level refinement-propagation property: an index var `v` equated
         // (both bounds) with the domain `dom` of a function shape that is
-        // itself equated with `{d | p} ⇒ cod` (d ⟺ Int). The witness `p` must
+        // itself equated with `{d | p} ⇒ cod` (d ⟺ Int). The refinement `p` must
         // propagate through the var⇄var equality chain onto `v`'s coalesced
         // type, `{Int | p}` — refinements ride the lattice; they must not be
         // dropped at var merges.
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(
             out,
             refined(prim(BaseType::Int), p),
-            "Apply index var lost its witness"
+            "Apply index var lost its refinement"
         );
     }
 

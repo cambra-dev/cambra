@@ -432,7 +432,12 @@ pub enum Type {
 /// Which flavour of [`Type::History`] a handle is — a mutable variable (`:=`) or a
 /// feed channel (`defer` / `<<`). The two are the same object (a `domain ⇒
 /// value` history) but read and materialize differently; see [`Type::History`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Ord` carries no semantics — the two kinds are unordered alternatives. It
+/// exists so a kind can key a `BTreeMap`, which is how the monomorphization
+/// specialization key holds a position's history contributions without having to
+/// pick a winner between two kinds (see `src/ccl/infer/solver/spec_key.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HistoryKind {
     /// A mutable variable introduced by `:=` — deref-on-read to the scalar `value`,
     /// a `get_prev_seq` / `get_prev_txn` recurrence, a `final_or_default` trailing
@@ -944,7 +949,7 @@ impl PartialEq for Refinement {
     /// predicate was constructed, so a `{D | p}` that join planning
     /// re-minted at a marker (`make_iterate` / `make_restrict` /
     /// `refine_with`) compares equal to its structural twin — which is what
-    /// lets the post-planning `typecheck` chain the re-minted witnesses. This
+    /// lets the post-planning `typecheck` chain the re-minted refinements. This
     /// is *equality*, not implication — `{T | p}` and `{T | q}` with
     /// structurally-distinct predicates remain unequal.
     ///
@@ -996,7 +1001,7 @@ impl Eq for Refinement {}
 /// ([`ccl_utils::cast_target_refinement`]) — a semantic filter, not inference
 /// metadata. Two predicates that each contain a cast and differ only in the
 /// nested filter (e.g. embedded comprehensions filtering `> 0` vs `< 0`)
-/// denote different refinements; conflating them would let witness-deficit
+/// denote different refinements; conflating them would let refinement-deficit
 /// matching accept an unsatisfied demand and refinement dedup drop a runtime
 /// `Restrict`. The target's *base* types are still skipped. The recursion
 /// terminates on tree shape alone: a predicate is an immutable `Rc<TypedExpr>`,

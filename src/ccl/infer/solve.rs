@@ -11,9 +11,10 @@
 // The coalesce walk also performs **integrated monomorphization**: let-
 // generalization is lowered to concrete, per-type code *inside* the walk. A
 // use of a generalized binding specializes at first visit (`specialize_use`,
-// from `coalesce_node`'s `Var` hook), memoized per distinct resolved type so
-// same-typed uses share one definition. The binding's `let` node then rebuilds
-// itself as the chain of demanded specializations (`coalesce_generalized_let`).
+// from `coalesce_node`'s `Var` hook), memoized per distinct instantiation
+// (`SpecKey`) so uses that instantiate it identically share one definition. The
+// binding's `let` node then rebuilds itself as the chain of demanded
+// specializations (`coalesce_generalized_let`).
 // The coalesce and monomorphization arms are mutually recursive
 // (`coalesce_node` ↔ `specialize_use`) over one shared [`CoalesceCtx`], so they
 // live in a single module.
@@ -21,8 +22,9 @@
 use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{
-    CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, coalesce_compact, compact_type,
-    constrain_subtype, freshen_expr_type_slots, seed_chan_dom_pairings, simplify_type,
+    CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
+    compact_type, constrain_subtype, freshen_expr_type_slots, seed_chan_dom_pairings,
+    simplify_type, spec_key,
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
@@ -119,7 +121,7 @@ fn push_coalesce_err(
 ///
 /// Beyond resolving types, the walk performs **integrated monomorphization**:
 /// a use of a generalized `let` is specialized at first visit (memoized per
-/// distinct resolved type), so every parent's type is derived from concrete
+/// distinct instantiation), so every parent's type is derived from concrete
 /// children on the first pass — there is no post-coalesce splice and no
 /// re-derivation of dependent types. The constraint graph is *complete* by
 /// coalesce time (emission saw the whole program), so a use's instantiation
@@ -167,16 +169,16 @@ impl CoalesceCtx {
         self.record_read_for(ReadPurpose::Stamp, unresolved, resolved, label);
     }
 
-    /// [`record_read`](Self::record_read) for a read whose result is a
-    /// specialization *key* rather than a type stamped on the tree — see
-    /// [`ReadPurpose::SpecializationKey`].
-    fn record_read_spec_key(
+    /// [`record_read`](Self::record_read) for a use's instantiation resolution,
+    /// which is consumed structurally rather than stamped on the tree — see
+    /// [`ReadPurpose::Instantiation`].
+    fn record_read_instantiation(
         &mut self,
         unresolved: &Type,
         resolved: &Type,
         label: impl Fn() -> String,
     ) {
-        self.record_read_for(ReadPurpose::SpecializationKey, unresolved, resolved, label);
+        self.record_read_for(ReadPurpose::Instantiation, unresolved, resolved, label);
     }
 
     fn record_read_for(
@@ -205,35 +207,40 @@ impl CoalesceCtx {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadPurpose {
     /// The resolution was **stamped on a node**, so every part of it is
-    /// load-bearing downstream: refinement witnesses are compared (by layer
+    /// load-bearing downstream: refinements are compared (by layer
     /// count — see [`types_agree_modulo_unread`]) along with the base skeleton.
     Stamp,
-    /// The resolution keyed a specialization (`specialize_use`'s memo lookup and
-    /// the baseline for the clone's two-way pin), and is *not* what the use node
-    /// ends up carrying — that is the clone's own coalesced type.
+    /// A use's instantiation resolution in [`specialize_use`], which is consumed
+    /// *structurally* — it seeds the clone's channel-domain pairings
+    /// (`seed_chan_dom_pairings`) and blames a resolution failure — and is **not**
+    /// what the use node ends up carrying (that is the specialization's own
+    /// coalesced type). It is also not the specialization key: keying on a resolved
+    /// type is exactly the bug [`SpecKey`] replaced.
     ///
-    /// Witnesses are excluded from the comparison here, and the reason is not that
-    /// a bound arrives late — nothing does. An argument's witness reaches the
+    /// Refinements are excluded from the comparison here, and the reason is not that
+    /// a bound arrives late — nothing does. An argument's refinement reaches the
     /// instantiation as a **lower** bound on the domain variable
     /// (`(8, 0) <: ?dom`, from the emit-time `arg <: domain` edge), and a domain is
     /// a *negative* position, where coalescing intersects **upper** bounds. So the
-    /// witness is in the graph before this read and simply not on the side the read
+    /// refinement is in the graph before this read and simply not on the side the read
     /// consults. The pin that immediately follows adds the clone's parameter
     /// variable as an upper bound of `?dom` and drives the same information into
-    /// it, which is the path that makes the witness visible — so re-resolving the
+    /// it, which is the path that makes the refinement visible — so re-resolving the
     /// snapshot at end of pass yields it (`pick = \lo, hi -> …` at `pick(8, 0)`:
     /// `?dom` has `lower=[(8, 0)] upper=[?52]` and resolves to `(Int)`; after the
     /// pin, `upper=[?52, (?89)]` and it resolves to `(8)`).
     ///
     /// That makes the drift a property of *when* the read is taken relative to the
     /// pin, not of any bound going stale — which is why every [`Stamp`](Self::Stamp)
-    /// read is stable and only this one moves. The key's only consumer is
-    /// [`Specialization::use_ty`]'s equality, where a witness the read could not see
-    /// can only cause a **miss** — a fresh private clone, at worst a wasted one,
-    /// never a mis-typed use. The *base skeleton* is still held fixed: a stale
-    /// skeleton could make the lookup **hit** the wrong clone, which is a different
-    /// thing entirely.
-    SpecializationKey,
+    /// read is stable and only this one moves. Excluding refinements is sound because
+    /// this resolution's consumers are refinement-insensitive: `seed_chan_dom_pairings`
+    /// matches positions constructor-wise *through* refinements to find rigid
+    /// `ChanDom` names, and it already tolerates a position where the two sides
+    /// disagree structurally. Nothing about *sharing* rides on this read — that is
+    /// [`SpecKey`]'s job, and it consults both bound lists precisely so it does not
+    /// depend on which polarity a rendering would have picked. The *base skeleton*
+    /// is still held fixed here: a stale skeleton would pair channel domains wrong.
+    Instantiation,
 }
 
 /// One type the walk read (debug builds): the var-laden type exactly as it
@@ -277,13 +284,13 @@ fn assert_reads_stable(reads: &[ReadRecord]) {
 /// **bounds on inference variables**, so this checks the *structural skeleton* a
 /// bound determines — bases, ranges, sources, Pi binder names,
 /// function/product/variant shape, and, for a [`ReadPurpose::Stamp`] read, the
-/// *number* of refinement layers at each position. A witness is lattice content
+/// *number* of refinement layers at each position. A refinement is lattice content
 /// like a record field, so a bound determines it as much as it determines the
 /// base: one appearing on — or vanishing from — a variable an earlier read
 /// consumed is exactly the staleness this guards, and with every literal
 /// carrying a singleton, refinement-bearing types are the common case rather
-/// than the exotic one. `witnesses` is `false` only for the specialization-key
-/// read that documents why.
+/// than the exotic one. `refinements` is `false` only for the
+/// [`Instantiation`](ReadPurpose::Instantiation) read, which documents why.
 ///
 /// Two drifts are legitimate and out of scope:
 ///
@@ -298,11 +305,11 @@ fn assert_reads_stable(reads: &[ReadRecord]) {
 ///   — both lowering by the very machinery this guards, neither a stale
 ///   bound. The predicate *terms* are checked elsewhere (`check_scope_valid`
 ///   and the post-inference `check` reconcile). Layer *count* is therefore the
-///   strongest witness comparison available here: it catches a witness arriving
+///   strongest refinement comparison available here: it catches a refinement arriving
 ///   or leaving without depending on term identity, which legitimately churns.
 #[cfg(debug_assertions)]
-fn types_agree_modulo_unread(read: &Type, now: &Type, witnesses: bool) -> bool {
-    // Peel refinement layers, counting them. The *base* under the witnesses is
+fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool {
+    // Peel refinement layers, counting them. The *base* under the refinements is
     // what recurses structurally; predicate content is out of scope (above).
     fn peel<'t>(mut t: &'t Type, layers: &mut usize) -> &'t Type {
         while let Type::Refinement(inner, _) = t {
@@ -314,7 +321,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, witnesses: bool) -> bool {
     let (mut read_layers, mut now_layers) = (0, 0);
     let read = peel(read, &mut read_layers);
     let now = peel(now, &mut now_layers);
-    if witnesses && read_layers != now_layers {
+    if refinements && read_layers != now_layers {
         return false;
     }
     match (read, now) {
@@ -341,26 +348,26 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, witnesses: bool) -> bool {
             },
         ) => {
             n1 == n2
-                && types_agree_modulo_unread(d1, d2, witnesses)
-                && types_agree_modulo_unread(c1, c2, witnesses)
+                && types_agree_modulo_unread(d1, d2, refinements)
+                && types_agree_modulo_unread(c1, c2, refinements)
         }
         (Type::Tuple(xs), Type::Tuple(ys)) => {
             xs.len() == ys.len()
                 && xs
                     .iter()
                     .zip(ys)
-                    .all(|(x, y)| types_agree_modulo_unread(x, y, witnesses))
+                    .all(|(x, y)| types_agree_modulo_unread(x, y, refinements))
         }
         (Type::Record(xs), Type::Record(ys)) => {
             xs.len() == ys.len()
                 && xs.iter().zip(ys).all(|((nx, x), (ny, y))| {
-                    nx == ny && types_agree_modulo_unread(x, y, witnesses)
+                    nx == ny && types_agree_modulo_unread(x, y, refinements)
                 })
         }
         (Type::Variant(xs), Type::Variant(ys)) => {
             xs.len() == ys.len()
                 && xs.iter().zip(ys).all(|((kx, x), (ky, y))| {
-                    kx == ky && types_agree_modulo_unread(x, y, witnesses)
+                    kx == ky && types_agree_modulo_unread(x, y, refinements)
                 })
         }
         // Two histories of *different* kinds never agree — an `Overwrite` and a
@@ -405,10 +412,10 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, witnesses: bool) -> bool {
                     domain: domain.clone(),
                     codomain: value.clone(),
                 };
-                types_agree_modulo_unread(&stream, other, witnesses)
+                types_agree_modulo_unread(&stream, other, refinements)
             }
             crate::ccl::HistoryKind::Overwrite => {
-                types_agree_modulo_unread(value, other, witnesses)
+                types_agree_modulo_unread(value, other, refinements)
             }
         },
         _ => false,
@@ -438,48 +445,70 @@ struct SpecializeFrame {
     /// The binding's polymorphism level — the freshen cutoff: variables
     /// deeper than this are the quantified ones.
     cutoff: Level,
-    /// Specializations minted so far. Scanned linearly, comparing a candidate use's
-    /// resolved type against each entry's [`Specialization::use_ty`] by `PartialEq`
-    /// — structural, with refinement witnesses comparing by type-blind predicate
-    /// equality — so same-typed uses share one specialization.
+    /// Specializations minted so far, scanned linearly (a binding has a handful).
+    /// A candidate use's [`SpecKey`] is compared against each entry's — both
+    /// computed by the *same* procedure at the *same* point in the pin's lifecycle
+    /// (from the use's live type, before its own pin), so the comparison is
+    /// self-consistent.
     ///
-    /// **A refinement makes two uses distinct**, so `f(1)` and `f(2)` mint separate
-    /// clones now that a literal carries its own singleton. Keying modulo refinements
-    /// would be the better rule — a refinement changes no code — but the clone is
-    /// pinned to its use type, so a shared clone would carry one use's refinement and
-    /// reject the others. Sharing needs the clone built at the stripped type
-    /// throughout, which is more than a key change.
+    /// **Both sides being one procedure is the load-bearing part.** Keying an entry
+    /// on the clone's *coalesced* type instead is what made this table write-only:
+    /// a clone type carries whatever the pin settled, a candidate's pre-pin
+    /// resolution does not, and for any definition whose clone type acquires a
+    /// refinement across the pin the two could never be equal — so even two *identical*
+    /// call sites missed each other and minted a clone apiece. (The rationale that
+    /// justified it — that a later same-typed use resolves through the first pin's
+    /// extended chains — does not hold: every use instantiates its own fresh
+    /// variables, which the first clone's pin never touches.)
     ///
-    /// The comparison is deliberately conservative in one direction, and it matters
-    /// that it is *this* direction: an entry's key is the clone's **coalesced** type,
-    /// which carries every witness the pin delivered, while a candidate's is its
-    /// instantiation resolved *before* its own pin runs — where a witness sitting on
-    /// the domain's *lower* bounds is invisible (see
-    /// [`ReadPurpose::SpecializationKey`]). So a use whose witness the pre-pin
-    /// resolution cannot see does not match an otherwise-identical entry, and mints
-    /// its own clone: a wasted clone, never a use served by a clone pinned to
-    /// someone else's refinement.
+    /// **Why the key is not a resolved `Type`.** A resolved type is a
+    /// polarity-correct *rendering*: a domain resolves from upper bounds (what the
+    /// body demands), so a position the body ignores is narrowed away and an
+    /// argument's refinement — a *lower* bound — is invisible unless
+    /// `compact_type`'s opposite-polarity fallback happens to fire there. The
+    /// clone's interior reads its parameter at a positive position and sees exactly
+    /// those refinements. Keying on a rendering therefore compared one polarity's view
+    /// against a clone built from the other's, and two uses differing only in a
+    /// key-invisible position shared a clone whose interior asserted the *first*
+    /// use's argument (`\a, b -> a + b` at `(1, 2)` and `(1, 5)` both keyed on
+    /// `((1, Int) ⇒ Int)`, and the shared clone typed `.1` as `2`). A [`SpecKey`]
+    /// keeps *both* directed reads of the instantiation instead — including the one
+    /// whose domain follows lower bounds — so it sees what the pin transmits.
     ///
-    /// The waste is per **call site**, not per distinct type, for any definition
-    /// whose clone type acquires a witness only across the pin — two calls at the
-    /// *same* literal miss each other too. Which definitions those are depends on
-    /// how the body uses the parameter: `\a, b -> a + b` applied at `(1, 2)` keys on
-    /// `((1, Int) ⇒ Int)` and shares one clone, while `\lo, hi -> sum([v for v in xs
-    /// if v >= lo])` applied at `(8, 0)` keys on `((Int) ⇒ Int)` against an entry
-    /// stored as `((8) ⇒ Int)` and does not. Both candidate fixes are the ones noted
-    /// above — key modulo refinements (needs the clone built at the stripped type),
-    /// or resolve the key *after* the pin.
+    /// **The remaining gap: this over-splits.** The key summarizes the pin's
+    /// *input*, so two uses that differ in a position the clone never reads still
+    /// key apart — `\a, b -> a` at `(1, 2)` and `(1, 5)` mints two identical clones,
+    /// and a definition containing a `defer` mints one per use (its channel domain is
+    /// named per instantiation, so those clones genuinely *are* distinct). Every
+    /// literal carries a singleton, so the practical rule is one clone per distinct
+    /// argument tuple; `inline` beta-reduces scalar UDFs, but a
+    /// collection-producing one stays cached, so that is where code size grows.
+    ///
+    /// Closing it means keying on the pin's *output* — the finished clone — which
+    /// cannot be a lookup, only a build-then-dedupe: build for every use, then
+    /// discard a clone that is structurally equal to an existing entry
+    /// (`TypedExpr`'s `PartialEq` already excludes `NodeId` and compares types with
+    /// type-blind refinement equality, which is the right notion). That shares
+    /// exactly when the emitted code is identical. It needs three things this does
+    /// not: α-equivalence over the names minted fresh per clone (`Name::mono` uids
+    /// from nested specializations, coalesce's `Infer` placeholders, and the
+    /// per-instantiation `ChanDom` names) — most cheaply by drawing them from a
+    /// clone-local counter and globalizing on retention; a way to undo the discarded
+    /// clone's pin, which has already deposited bounds into the live graph; and
+    /// reference-liveness filtering at the splice, since a discarded clone's walk can
+    /// leave specializations on an *enclosing* frame with no surviving use. The two
+    /// compose — this key as the fast path, clone-equality as a precision tier on a
+    /// miss — so nothing here has to be undone to get there.
     specs: Vec<Specialization>,
 }
 
 /// One memoized specialization of a generalized definition.
 struct Specialization {
-    /// The memo key: this specialization's **own coalesced type** — which is what
-    /// the use node carrying it is stamped with, and is the use's instantiation type
-    /// plus whatever the two-way pin settled. Not the pre-pin `resolved` snapshot the
-    /// lookup compares against; see [`SpecializeFrame::specs`] for why the asymmetry
-    /// is the safe direction.
-    use_ty: Type,
+    /// The memo key: the [`SpecKey`] of the use that minted this specialization,
+    /// taken from its live instantiation type *before* its pin —
+    /// the same procedure at the same point every candidate's key is taken, which
+    /// is what makes the comparison self-consistent (see [`SpecializeFrame::specs`]).
+    key: SpecKey,
     /// Its binding name — a [`Name::mono`] carrying the source binding's name
     /// as provenance and a globally-fresh uid for identity (so it can neither
     /// capture nor be captured).
@@ -775,7 +804,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             with_shadows(ctx, [param_name], |ctx| coalesce_node(body, level, ctx));
             // `param.ty` is resolved from the lambda's coalesced domain in
             // the end-of-function block (it can't be coalesced standalone:
-            // body-usage refinement witnesses are negative-polarity upper-bound
+            // body-usage refinements are negative-polarity upper-bound
             // facts that only materialize in the contravariant domain
             // position of `expr.ty`). Domain-refinement predicates ride
             // `expr.ty` and are coalesced with it.
@@ -829,7 +858,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // resolved — rather than via an emit-time reverse-adjacency bound
             // is what keeps it robust under let-polymorphism's monomorphization
             // (which re-mints var identities a recorded bound would not follow).
-            // A morphism's coalesced type may carry *outer* refinement witnesses
+            // A morphism's coalesced type may carry *outer* refinements
             // it acquired during solving (`{Fun(d, c) | r}` — the same shape
             // `CheckCtx::as_function` peels); the value flowing to the next
             // morphism is still the bare codomain, so peel before
@@ -991,7 +1020,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // compact → simplify → coalesce pipeline to materialize a concrete
     // `Type`.
     //
-    // Refinements ride the lattice as refinement witnesses, so a refined
+    // Refinements ride the lattice as refinements, so a refined
     // domain coalesces straight onto `expr.ty` here — downstream passes
     // (`lambda_elim` included) read it from the type.
     let label = symbolic(expr);
@@ -1159,10 +1188,11 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
 // Integrated monomorphization (the coalesce walk's specialization arms).
 //
 // A use of a generalized binding specializes at first visit (`specialize_use`,
-// from `coalesce_node`'s `Var` hook), memoized per distinct resolved type so
-// same-typed uses share one definition — a collection/generator UDF used at
-// several element types compiles to one *cached* binding per element type
-// rather than a copy per call site (cf. [`crate::ccl::inline`]). The binding's
+// from `coalesce_node`'s `Var` hook), memoized per distinct instantiation
+// (`SpecKey`) so uses that instantiate it identically share one definition — a
+// collection/generator UDF used at several element types compiles to one
+// *cached* binding per element type rather than a copy per call site (cf.
+// [`crate::ccl::inline`]). The binding's
 // `let` node then rebuilds itself as the chain of demanded specializations
 // (`coalesce_generalized_let`). A binding used at K distinct types becomes K
 // nested `let`s; one never used at all is dropped as dead code.
@@ -1190,32 +1220,12 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
 // logs every graph read (`record_read`) as a `(var-laden type, resolution)`
 // pair — the snapshot shares the live `InferVar`s — and `assert_reads_stable`
 // re-resolves each against the *final* graph at end of pass, requiring the
-// skeleton *and its refinement witnesses* to be unchanged
+// skeleton *and its refinements* to be unchanged
 // (`types_agree_modulo_unread`). A pin that retroactively changed an
 // already-read variable's resolution trips it by name. The lone exception is
-// the read that produces a specialization's own memo key, where witnesses are
-// excluded and the reason is on `ReadPurpose::SpecializationKey`. Debug builds
-// only; free in release.
+// the use's own instantiation resolution, where refinements are excluded and the
+// reason is on `ReadPurpose::Instantiation`. Debug builds only; free in release.
 
-/// Specialize a use of a generalized binding (frame at `frame_idx` in the
-/// walk's scope) to its resolved instantiation type, then rewrite the use to
-/// reference the specialization and stamp the specialization's resolved type
-/// on it.
-///
-/// On a memo miss this clones the frame's definition, freshens it
-/// independently ([`freshen_expr_type_slots`] — quantified-variable renaming
-/// over every type slot, including refinement predicates and bound-edge
-/// discharge payloads), **pins it two-way to the use's live instantiation
-/// type** (the use type is itself
-/// var-laden for a use inside another clone — the chained poly-calls-poly
-/// case — and the live pin is what lets such interior uses resolve concrete),
-/// and coalesces the clone re-entrantly. The re-entrant walk runs in the
-/// *definition site's* scope — entries above the frame are suspended — so a
-/// name the definition references resolves to what was in scope where it was
-/// written, not to a same-named binder introduced between definition and use.
-// `ConstrainCache` keys on `Type`, whose `Refinement` predicates carry interior
-// mutability; the solver relies on identity-by-`uid`, not the mutable payload
-// (matching the solver's module-level allow).
 /// Mint a fresh [`NodeId`](crate::ccl::provenance::NodeId) for every node in a
 /// monomorphization clone.
 ///
@@ -1232,6 +1242,26 @@ fn freshen_clone_node_ids(expr: &mut Expr) {
     expr.freshen_node_ids_deep();
 }
 
+/// Specialize a use of a generalized binding (frame at `frame_idx` in the
+/// walk's scope) to its instantiation, then rewrite the use to reference the
+/// specialization and stamp the specialization's resolved type on it.
+///
+/// Sharing is decided by the use's [`SpecKey`] — both directed reads of its
+/// instantiation, taken off the live graph before the pin. On a miss this clones
+/// the frame's definition, freshens it independently ([`freshen_expr_type_slots`]
+/// — quantified-variable renaming over every type slot, including refinement
+/// predicates and bound-edge discharge payloads), **pins it two-way to the use's
+/// live instantiation type** (the use type is itself var-laden for a use inside
+/// another clone — the chained poly-calls-poly case — and the live pin is what
+/// lets such interior uses resolve concrete), and coalesces the clone
+/// re-entrantly. The re-entrant walk runs in the *definition site's* scope —
+/// entries above the frame are suspended — so a name the definition references
+/// resolves to what was in scope where it was written, not to a same-named binder
+/// introduced between definition and use. On a hit the use is simply renamed and
+/// stamped — see the hit path for why it is deliberately *not* re-pinned.
+// `ConstrainCache` keys on `Type`, whose `Refinement` predicates carry interior
+// mutability; the solver relies on identity-by-`uid`, not the mutable payload
+// (matching the solver's module-level allow).
 #[allow(clippy::mutable_key_type)]
 pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) {
     // The use's instantiation type, resolved off the live graph. The graph is
@@ -1249,23 +1279,41 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // Log the use's instantiation read for the ordering-invariant check. The
     // snapshot keeps the live instantiation vars; the pin below (and any
     // later specialization) may only *add* bounds to them, so re-resolving at
-    // end-of-pass must still agree on the *skeleton* (the use node itself is
-    // overwritten with the specialization name, but the read is what the walk
-    // consumed here — as a memo key, which is why witnesses are excluded from
-    // the comparison; see `ReadPurpose::SpecializationKey`).
-    ctx.record_read_spec_key(&use_expr.ty, &resolved, || symbolic(use_expr));
-    // A use type can resolve with residual `Infer` placeholders only when
-    // nothing concrete ever reached its instantiation (a generic definition
-    // the program never exercises at a concrete type). Inference deliberately
-    // tolerates the residue (`Type::Infer`'s invariant); the strict
-    // post-inference typecheck is the layer that rejects it. Placeholder
-    // identities are fresh per resolution, so such uses never share a memo
-    // entry — each gets its own (under-determined) specialization.
+    // end-of-pass must still agree on the *skeleton*. Refinements are excluded
+    // because the pin that immediately follows is itself what moves them, and
+    // this resolution's consumers are refinement-insensitive (see
+    // `ReadPurpose::Instantiation`).
+    ctx.record_read_instantiation(&use_expr.ty, &resolved, || symbolic(use_expr));
+    // The specialization key: what decides whether this use may share an
+    // existing clone. Read off the live graph *before* the pin, exactly as every
+    // other use's is, so both sides of the comparison below are one procedure at
+    // one point in the pin's lifecycle. It is deliberately not `resolved` — a
+    // resolved type is a polarity-correct rendering, which narrows away positions
+    // the definition body ignores and cannot see an argument's refinement on a
+    // domain's lower bounds; see `SpecializeFrame::specs`.
+    //
+    // An under-determined instantiation (a generic definition the program never
+    // exercises at a concrete type) keys as the canonical empty `SpecKey` rather
+    // than on fresh `Infer` placeholder ids, so such uses *do* share one
+    // specialization. Inference deliberately tolerates the residue
+    // (`Type::Infer`'s invariant); the strict post-inference typecheck rejects it.
+    let key = spec_key(&use_expr.ty);
     let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
-    if let Some(spec) = frame.specs.iter().find(|s| s.use_ty == resolved) {
+    if let Some(spec) = frame.specs.iter().find(|s| s.key == key) {
         let (name, ty) = (spec.name.clone(), spec.def.ty.clone());
+        // A hit is *not* re-pinned, and the reason is worth recording because
+        // pinning here looks like the obvious way to make the key's faithfulness
+        // checked rather than argued. It is not available: a miss pins a
+        // *var-laden* clone, so its pin identifies variables, while a hit's
+        // specialization is already coalesced and concrete — pinning that against
+        // a still-var-laden use type is a strictly stronger demand, and it
+        // rejects uses the key correctly considers shareable (an unrefined lower
+        // bound on the use's domain variable that the clone's own coalesce would
+        // have intersected away instead fails `T ⊀ {T | p}` outright). Checking a
+        // hit needs a non-recording *subsumption* test rather than a constrain,
+        // which the solver has no notion of today.
         use_expr.node = TypedExprNode::Var(name);
         use_expr.ty = ty;
         return;
@@ -1346,13 +1394,19 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
         unreachable!("suspended entries were restored above the frame");
     };
-    // The memo key is the *specialization's* resolved type, not this use's
-    // pre-pin resolution: the two differ exactly by the canonical-chain
-    // extension above, and every later same-typed use resolves its witnesses
-    // through the now-extended chains — i.e. to the predicate terms `clone.ty`
-    // carries.
+    // The entry is keyed on the pre-pin key computed above — *not* on
+    // `clone.ty`. A clone type is the pin's output and a candidate's key is its
+    // input; keying an entry on one and the lookup on the other is what made this
+    // table write-only (see `SpecializeFrame::specs`).
+    debug_assert!(
+        frame.specs.iter().all(|s| s.key != key),
+        "specialization memo invariant (one entry per distinct key) violated: \
+         minting a second specialization of `{}` for key {key} — the lookup and \
+         the insert disagree about what identifies a specialization",
+        frame.name,
+    );
     frame.specs.push(Specialization {
-        use_ty: clone.ty.clone(),
+        key,
         name: spec_name,
         def: clone,
     });
@@ -1473,11 +1527,11 @@ pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
 /// Overwriting (rather than merging) the base is sound: `arg <: domain` was
 /// constrained at emit, so the input satisfies every body demand.
 ///
-/// The lambda's coalesced domain may carry refinement witnesses (body-usage facts
+/// The lambda's coalesced domain may carry refinements (body-usage facts
 /// that exist only in this negative-polarity position); they are preserved by
-/// re-wrapping them around `input`, deduping against witnesses `input` already
+/// re-wrapping them around `input`, deduping against refinements `input` already
 /// carries (structural [`Refinement`](crate::ccl::Refinement) equality). Outer
-/// refinement witnesses on the function type itself are likewise preserved.
+/// refinements on the function type itself are likewise preserved.
 ///
 /// `input` is supplied by the use site: the argument at a direct-redex
 /// `Apply`, the enclosing function's parameter domain when the lambda is
@@ -1518,18 +1572,18 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
         dom_layers.push(r);
         base = *inner;
     }
-    // Re-wrap the collected witnesses around `input`, skipping witnesses it
-    // already carries (the argument edge may have deposited the same witness on both).
-    let mut input_witnesses = Vec::new();
+    // Re-wrap the collected refinements around `input`, skipping refinements it
+    // already carries (the argument edge may have deposited the same refinement on both).
+    let mut input_refinements = Vec::new();
     let mut t = input;
     while let Type::Refinement(inner, r) = t {
-        input_witnesses.push(r);
+        input_refinements.push(r);
         t = inner;
     }
     let new_dom = dom_layers
         .into_iter()
         .rev()
-        .filter(|r| !input_witnesses.contains(&r))
+        .filter(|r| !input_refinements.contains(&r))
         .fold(input.clone(), |acc, r| Type::Refinement(Box::new(acc), r));
     lambda.ty = fn_layers.into_iter().rev().fold(
         // Preserve the Pi binder: specialization rewrites only the domain
@@ -1550,7 +1604,7 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
 /// Fill a lambda's `param.ty` binder slot from its coalesced function type's
 /// domain. Deriving the slot from the resolved domain — rather than
 /// coalescing the slot var standalone — is what preserves body-usage
-/// refinement witnesses, which are negative-polarity facts visible only in the
+/// refinements, which are negative-polarity facts visible only in the
 /// contravariant domain. No-op for non-lambdas and unresolved function types.
 fn refresh_lambda_param_slot(expr: &mut Expr) {
     if let TypedExprNode::Lambda { param, .. } = &mut expr.node
@@ -1568,30 +1622,31 @@ mod tests {
 
     // ----- ordering-invariant comparison (`types_agree_modulo_unread`) -----
 
-    // A witness that appears (or vanishes) between a read and the final graph is
+    // A refinement that appears (or vanishes) between a read and the final graph is
     // a bound that arrived after the read consumed the variable — the staleness
-    // the ordering invariant forbids — so a `Stamp` read rejects it. The
-    // specialization-*key* read is the one place witnesses are excluded, because
-    // the pin that follows the read is itself what moves them and two uses
-    // differing only in witnesses share a specialization by design.
+    // the ordering invariant forbids — so a `Stamp` read rejects it. A use's
+    // `Instantiation` read is the one place refinements are excluded, because the
+    // pin that follows the read is itself what moves them and that read's
+    // consumers (channel-domain pairing, error blame) do not look at refinements.
+    // Sharing does *not* ride on it — that is `SpecKey`'s job.
     #[cfg(debug_assertions)]
     #[test]
-    fn witness_drift_fails_a_stamp_read_and_passes_a_key_read() {
+    fn refinement_drift_fails_a_stamp_read_and_passes_an_instantiation_read() {
         use super::types_agree_modulo_unread;
         let plain = Type::Base(BaseType::Int);
         let refined = refined_int(TypedExpr::lit(crate::ccl::Lit::Int(8)));
         for (read, now) in [(&plain, &refined), (&refined, &plain)] {
             assert!(
                 !types_agree_modulo_unread(read, now, true),
-                "a stamp read must not tolerate witness drift ({read} vs {now})"
+                "a stamp read must not tolerate refinement drift ({read} vs {now})"
             );
             assert!(
                 types_agree_modulo_unread(read, now, false),
-                "a specialization-key read compares skeletons only ({read} vs {now})"
+                "an instantiation read compares skeletons only ({read} vs {now})"
             );
         }
-        // The skeleton *under* the witnesses is held fixed either way — keying on
-        // a stale one is what would pick the wrong specialization.
+        // The skeleton *under* the refinements is held fixed either way — a stale
+        // one would pair the clone's channel domains against the wrong positions.
         assert!(!types_agree_modulo_unread(
             &plain,
             &Type::Base(BaseType::String),
@@ -1684,13 +1739,15 @@ mod tests {
     }
 
     #[test]
-    fn monomorphize_shares_one_specialization_per_type() {
+    fn monomorphize_specializes_per_distinct_instantiation() {
         // let f = λx. x in (f 1, f 2, f "a")
         //
-        // Three uses at two *distinct* types (Int twice, String once). The lead
-        // F1 concern: specialization is keyed on the resolved type, not the use
-        // site, so the two `Int` uses share *one* definition — exactly two
-        // specializations, not three.
+        // Three uses, three distinct instantiations. Every literal carries its own
+        // singleton, so the two `Int` uses instantiate `f` at *different* refined
+        // types and get a specialization each — and that is the intended rule, not
+        // a shortfall: a refinement layer on an iterated domain is compiled (one
+        // `restrict` filter per layer), so refinements are code and two clones
+        // pinned to different ones are genuinely different code.
         let f = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
         let body = TypedExpr::new(TypedExprNode::Tuple(vec![
             TypedExpr::apply(lit_int(1), TypedExpr::var("f")),
@@ -1703,19 +1760,40 @@ mod tests {
             ty,
             Type::Tuple(vec![int_lit_ty(1), int_lit_ty(2), str_lit_ty("a"),])
         );
-        // A refinement makes two uses distinct, so a literal argument mints its own
-        // specialization — see the `specs` field doc. Sharing modulo refinements is
-        // the better rule and needs the clone built at the stripped type.
         let (specializations, used_names) = specialization_stats(&e);
         assert_eq!(
             specializations, 3,
-            "one specialization per distinct use type"
+            "one specialization per distinct instantiation"
         );
+        assert_eq!(used_names.len(), 3);
+    }
+
+    /// The complement, and the guard on the memo actually memoizing: uses that
+    /// instantiate the definition *identically* must share one specialization.
+    ///
+    /// This is the half that regressed when an entry was keyed on its clone's
+    /// coalesced type while a candidate was keyed on its own pre-pin resolution.
+    /// For any definition whose clone type gains a refinement across the pin, those
+    /// two could never be equal, so the table was write-only — even these
+    /// character-identical call sites missed each other and cloned per site, and
+    /// the table accumulated several entries under one key.
+    #[test]
+    fn identical_instantiations_share_one_specialization() {
+        // let f = λx. x in (f 1, f 1, f "a")
+        let f = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let body = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(lit_int(1), TypedExpr::var("f")),
+            TypedExpr::apply(lit_int(1), TypedExpr::var("f")),
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("f")),
+        ]));
+        let mut e = TypedExpr::let_bind("f", f, body);
+        run_inference(&mut e).expect("type-checks");
+        let (specializations, used_names) = specialization_stats(&e);
         assert_eq!(
-            used_names.len(),
-            3,
-            "a literal argument mints its own specialization, so none collapse"
+            specializations, 2,
+            "the two identical `Int` uses share one specialization"
         );
+        assert_eq!(used_names.len(), 2);
     }
 
     #[test]
@@ -1877,11 +1955,15 @@ mod tests {
         let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
         run_inference(&mut e).expect("mixed direct + chained uses type-check");
         let (specializations, used_names) = specialization_stats(&e);
-        // The direct `Int` use no longer shares the chained `Int` clone: the two
-        // literals give the two uses distinct types, so each mints its own
-        // specialization (see the `specs` field doc).
-        assert_eq!(specializations, 5, "per-use g + f specializations");
-        assert_eq!(used_names.len(), 5);
+        // Two `g` specializations (Int, String) and two `f` ones — *not* three:
+        // the direct `f(1)` and the `f(y)` reached inside `g`'s Int clone
+        // instantiate `f` identically, so they key the same and group onto one
+        // specialization. This is the "memo is per frame, not per demanding
+        // region" property, and it is what keying on a `SpecKey` restores —
+        // keying an entry on its clone's coalesced type instead made these two
+        // miss each other (see `SpecializeFrame::specs`).
+        assert_eq!(specializations, 4, "one g + one f specialization per type");
+        assert_eq!(used_names.len(), 4);
     }
 
     #[test]
