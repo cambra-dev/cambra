@@ -275,14 +275,22 @@ pub enum InferError {
     UnboundVariable(String),
     /// A type mismatch was detected between two solved types.
     ///
-    /// The two `Type`s are boxed to keep `InferError` under the
-    /// `result_large_err` budget: this is the widest variant (two `Type`s plus
-    /// a `ctx` string), and `Type` grew when [`crate::ccl::ty::FunKind`] gained
-    /// an inference variable. Boxing here keeps every
+    /// Named for the roles rather than positionally: `constrain_subtype(lhs, rhs)`
+    /// means `lhs <: rhs`, so the left side is the *value* that flowed in and the
+    /// right side is the *demand* it failed. Neutral names (`type_a`/`type_b`) are
+    /// what let the two get printed the wrong way round.
+    /// Both `Type`s are boxed to keep `InferError` under the `result_large_err`
+    /// budget: this is the widest variant, and `Type` grew when
+    /// [`crate::ccl::ty::FunKind`] gained an inference variable. Boxing keeps every
     /// `Result<_, InferError>` cheap on the common `Ok` path.
     TypeMismatch {
-        type_a: Box<Type>,
-        type_b: Box<Type>,
+        /// The type that flowed in — the `lhs` of the failed `lhs <: rhs`.
+        found: Box<Type>,
+        /// The demand it failed, when there is one. `None` for the mismatches that
+        /// name a single offending type instead of relating two (a missing record
+        /// field, an unaccepted variant tag): there is no second type to print, and
+        /// inventing one is how the message came to read backwards.
+        expected: Option<Box<Type>>,
         ctx: String,
     },
     /// A product type lacked a field a structural edge required — the violation of
@@ -374,6 +382,49 @@ pub enum InferError {
         kind: String,
         /// Display label for the message (see the type docs — not the location).
         at: String,
+    },
+    /// A **type refinement depends on a mutable variable**, where nothing can close
+    /// it over the register's scope.
+    ///
+    /// A `let` binder can be discharged into the type it is lifted out of, because the
+    /// binder *is* its bound expression. A register has no such term **at this point in
+    /// compilation**, which is the precise obstacle: closure is demanded during
+    /// coalesce, and the term that would discharge it does not exist until `mut_elim`
+    /// several passes later. That pass compiles a write-free register straight into a
+    /// `let`, and a written one into a history plus trailing
+    /// `let x_final = final_or_default(…)` bindings — either of which a predicate could
+    /// name. Nothing about a register makes it unnameable; the naming just happens too
+    /// late.
+    ///
+    /// So this is a **staging limitation reported as a rejection**, not a compiler bug
+    /// and not an impossibility. Lifting it would mean letting a predicate reference a
+    /// register through inference (registers are enumerable — `MutDecl` binders and
+    /// pass-by-reference params), staging the scope invariant across `mut_elim`, and
+    /// having that pass rewrite reads inside predicate terms as it already does in the
+    /// term tree.
+    ///
+    /// One sub-case is harder and would stay rejected: a comprehension *inside* the loop
+    /// that writes the register. There "the value of `x`" is per-iteration, so the
+    /// refinement would have to depend on the sequencing position rather than on a
+    /// single binding — and a predicate rides a type, which carries no position.
+    ///
+    /// Worth asking first whether the filter belongs in a type at all. It is there as a
+    /// *planning channel* (planning reifies it off `expr.ty.domain()`), not as a proof
+    /// obligation the way an index-in-range refinement is; a filter that reached
+    /// planning as a term would never raise this.
+    ///
+    /// There is no surface workaround today: reading the register into an immutable
+    /// first (`k = x`) does not help, because discharging `[k ↦ x]` puts the register's
+    /// name straight back into the predicate. Reported here so the program is rejected
+    /// with its source position instead of tripping the debug-only scope net (and, in
+    /// release, surviving to panic at the pre-desugar wall).
+    MutableInRefinedType {
+        /// The register's name.
+        name: String,
+        /// The refinement-bearing type that mentions it. Carries the offending
+        /// predicate, which is the informative part — the blame span already points
+        /// at the introduction, so the node is not rendered as well.
+        ty: Type,
     },
     /// A node's coalesced type references a term binder that is not in scope
     /// at that node — a violation of the scope-validity invariant (design
@@ -531,19 +582,24 @@ impl std::fmt::Debug for InferError {
             InferError::UnboundVariable(name) => write!(f, "Unbound variable: '{}'", name),
             InferError::TypeMismatch {
                 ctx,
-                type_a,
-                type_b,
-            } => {
-                write!(
-                    f,
-                    "Type mismatch for {}: expected {}, found {}",
-                    ctx, type_a, type_b
-                )?;
-                if let Some(hint) = product_keying_hint(type_a, type_b) {
-                    write!(f, "\n  {hint}")?;
+                found,
+                expected,
+            } => match expected {
+                // Both sides known: name the demand, then the value that failed it.
+                Some(expected) => {
+                    write!(
+                        f,
+                        "Type mismatch for {ctx}: expected {expected}, found {found}"
+                    )?;
+                    if let Some(hint) = product_keying_hint(expected, found) {
+                        write!(f, "\n  {hint}")?;
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
+                // A one-sided violation (`ExtraTag`): the `ctx` says what is wrong and
+                // there is no second type the demand could be.
+                None => write!(f, "Type mismatch for {ctx}: found {found}"),
+            },
             InferError::NoTraitInstance {
                 trait_,
                 position,
@@ -615,6 +671,15 @@ impl std::fmt::Debug for InferError {
             }
             InferError::UnresolvedPartial { kind, at } => {
                 write!(f, "Unresolved partial {kind} in expression: {at}")
+            }
+            InferError::MutableInRefinedType { name, ty } => {
+                write!(
+                    f,
+                    "a type refinement here depends on the mutable variable `{name}`: \
+                     {ty}. A mutable variable has no single value for a type to refer \
+                     to, so a type cannot depend on one — a limitation, not a mistake \
+                     in the program."
+                )
             }
             InferError::ScopeViolation { at, ty, unbound } => {
                 write!(
@@ -2086,11 +2151,9 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::TypeMismatch { type_a, type_b, .. }
-                    if matches!(
-                        (type_a.as_ref(), type_b.as_ref()),
-                        (Type::Base(BaseType::Int), Type::Base(BaseType::String))
-                    )
+                InferError::TypeMismatch { found, expected, .. }
+                    if **found == Type::Base(BaseType::Int)
+                        && expected.as_deref() == Some(&Type::Base(BaseType::String))
             )),
             "expected TypeMismatch Int/String, got {errs:?}"
         );

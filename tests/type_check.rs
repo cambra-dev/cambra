@@ -2382,3 +2382,52 @@ mod binder_slot_records_the_bound_at_type {
         assert!(out.is_empty(), "annotations survived inference: {out:?}");
     }
 }
+
+/// A mismatch names the demand as `expected` and the value as `found`, in that
+/// direction.
+///
+/// `constrain_subtype(lhs, rhs)` means `lhs <: rhs`, so the left side is the value
+/// that flowed in and the right side is the demand it failed. The two were printed
+/// the wrong way round — `x: Mut(Int) := "s"` reported *expected String, found Int*
+/// — which the neutral field names `type_a`/`type_b` made easy to miss.
+#[test]
+fn a_mismatch_names_the_demand_as_expected() {
+    let rendered = |code: &str| format!("{:?}", infer_program_err(code));
+
+    // A register's seed: the bound/annotation is the demand, the seed is the value.
+    let seed = rendered("x: Mut(Int) := \"s\"\nx");
+    assert!(
+        seed.contains("expected Int, found String"),
+        "the annotation is the demand and the seed is the value, got: {seed}"
+    );
+
+    // An argument against a declared parameter, the same way round.
+    let arg = rendered("def f(a: Int):\n    a\nf(\"x\")");
+    assert!(
+        arg.contains("expected Int, found String"),
+        "the parameter is the demand and the argument is the value, got: {arg}"
+    );
+}
+
+/// A mismatch that names *one* offending type prints only that type.
+///
+/// A missing field and an unaccepted variant tag are faults in a single type, not a
+/// relation between two, so there is no demand to name. They previously borrowed the
+/// second slot with a `Type::Hole`, which rendered as a bare `_` on whichever side
+/// the formatter happened to put it.
+///
+/// A missing field now has its own `InferError::MissingField`, so it states the fault
+/// in its own words; what is pinned here is the property both share — no invented
+/// demand — rather than either one's wording.
+#[test]
+fn a_single_type_fault_prints_no_demand() {
+    let missing = format!("{:?}", infer_program_err("r = (a=1)\nr.b"));
+    assert!(
+        missing.contains(".b") && missing.contains("{a: 1}"),
+        "expected a fault naming the absent field and the record, got: {missing}"
+    );
+    assert!(
+        !missing.contains("expected _") && !missing.contains("found _"),
+        "a single-type fault must not invent a demand, got: {missing}"
+    );
+}
