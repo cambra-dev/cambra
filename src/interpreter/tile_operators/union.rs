@@ -22,6 +22,10 @@ pub struct UnionOperator {
     tiling: Tiling,
     /// Input operators; each must have a `SealedFunction` tiling.
     inputs: Vec<Box<dyn TileOperator>>,
+    /// Flat-merge mode (see [`new_flat`](Self::new_flat)): arms share one domain
+    /// extent with disjoint positions, merged into a single flat `SealedFunction`
+    /// (sorted by domain key) rather than a tagged `ColumnValue::Union`.
+    flat: bool,
 }
 
 impl UnionOperator {
@@ -67,7 +71,88 @@ impl UnionOperator {
             domain: Extent::Union(domains),
             codomain: Box::new(codomain),
         };
-        Self { tiling, inputs }
+        Self {
+            tiling,
+            inputs,
+            flat: false,
+        }
+    }
+
+    /// A **flat-merge** union: arms over the *same* base extent (disjoint runtime
+    /// subsets of one domain) merge back to that base rather than a tagged
+    /// `Extent::Union`, so the result co-iterates with a sibling field. This is the
+    /// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`: every arm
+    /// filters the *same* fed element stream, so their domains share one extent and
+    /// their positions are disjoint by first-match. (The tagged [`new`](Self::new)
+    /// is for a sourceless union whose arms have genuinely distinct extents — a Σ /
+    /// C-form dispatch read by `final_or_default`.)
+    pub fn new_flat(inputs: Vec<Box<dyn TileOperator>>) -> Self {
+        let mut op = Self::new(inputs);
+        op.flat = true;
+        if let Tiling::SealedFunction { domain, codomain } = op.tiling {
+            let deduped = dedup_extents(match domain {
+                Extent::Union(ds) => ds,
+                other => vec![other],
+            });
+            let domain = if deduped.len() == 1 {
+                deduped.into_iter().next().unwrap()
+            } else {
+                Extent::Union(deduped)
+            };
+            op.tiling = Tiling::SealedFunction { domain, codomain };
+        }
+        op
+    }
+}
+
+/// Flat-merge disjoint `SealedFunction` arms into one flat tile, sorted by domain
+/// key. Each arm is a filtered slice of the *same* fed element stream (a
+/// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`), so the arms'
+/// (`UInt`) positions are disjoint and reassemble the full column — which then
+/// co-iterates with the decision record's sibling `commit` field. Scalar codomain
+/// only (the value a decision field produces); the shared fed predicate is taken
+/// from the first arm (all arms carry it).
+fn flat_merge(tiles: Vec<Tile>, value_extent: &Extent) -> Tile {
+    let mut pairs: Vec<(usize, Value)> = Vec::new();
+    let mut domain_predicate = Predicate::False;
+    for (i, tile) in tiles.into_iter().enumerate() {
+        let Tile::SealedFunction {
+            domain,
+            codomain,
+            domain_predicate: dp,
+            deleted,
+        } = tile
+        else {
+            panic!("flat_merge: expected SealedFunction arm, got {tile:?}");
+        };
+        if i == 0 {
+            domain_predicate = dp;
+        }
+        let Tile::Scalar(values) = *codomain else {
+            panic!(
+                "flat_merge: writer-body value-Case arm has a Scalar codomain, got {codomain:?}"
+            );
+        };
+        for row in 0..domain.len() {
+            if deleted.contains(row) {
+                continue;
+            }
+            let Value::UInt(pos) = domain.index_at(row) else {
+                panic!("flat_merge: writer-body fan-out arms have UInt (position) domains");
+            };
+            pairs.push((pos, values.index_at(row)));
+        }
+    }
+    // Disjoint by first-match, so a stable sort by position reassembles the full
+    // column in the fed order — matching the sibling `commit` field's domain.
+    pairs.sort_by_key(|(pos, _)| *pos);
+    let positions: Vec<usize> = pairs.iter().map(|(pos, _)| *pos).collect();
+    let values: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
+    Tile::SealedFunction {
+        domain: ColumnValue::from_uints(positions),
+        codomain: Box::new(Tile::Scalar(ColumnValue::from_values(values, value_extent))),
+        domain_predicate,
+        deleted: BitSet::new(),
     }
 }
 
@@ -117,6 +202,7 @@ impl TileOperator for UnionOperator {
         Box::new(UnionProducer {
             base: ProducerBase::new(UnionProducer::alloc_id(), &self.tiling),
             inputs: input_producers,
+            flat: self.flat,
         })
     }
 }
@@ -126,6 +212,8 @@ impl TileOperator for UnionOperator {
 struct UnionProducer {
     base: ProducerBase,
     inputs: Vec<Box<dyn TileProducer>>,
+    /// Flat-merge mode (see [`UnionOperator::new_flat`]).
+    flat: bool,
 }
 
 impl TileProducer for UnionProducer {
@@ -144,6 +232,14 @@ impl TileProducer for UnionProducer {
             .iter_mut()
             .map(|p| p.get(p.tiling().universal_guard()))
             .collect();
+
+        if self.flat {
+            let value_extent = match self.tiling() {
+                Tiling::SealedFunction { codomain, .. } => codomain.extent(),
+                other => panic!("flat union tiling is a SealedFunction, got {other}"),
+            };
+            return flat_merge(tiles, &value_extent);
+        }
 
         let mut domains: Vec<ColumnValue> = Vec::new();
         let mut codomains: Vec<Tile> = Vec::new();
@@ -264,6 +360,14 @@ impl TileProducer for UnionProducer {
                     input.release(TileGuard::Function(FunctionGuard::Domain(pred)));
                 }
             }
+            // A **flat** union has one flat domain (not per-variant tags), so a
+            // released prefix over it forwards to every arm — each arm holds a
+            // disjoint subset of those positions and ignores the rest.
+            TileGuard::Function(FunctionGuard::Domain(pred)) if self.flat => {
+                for input in &mut self.inputs {
+                    input.release(TileGuard::Function(FunctionGuard::Domain(pred.clone())));
+                }
+            }
             other => panic!("UnionProducer::release_impl: unexpected guard {other:?}"),
         }
     }
@@ -274,7 +378,6 @@ mod tests {
     use super::*;
     use crate::interpreter::{BaseType, ColumnValue, Extent};
     use std::cell::RefCell;
-    use std::rc::Rc;
 
     // ── UnionProducer::release_impl ───────────────────────────────────────────
 
@@ -347,6 +450,7 @@ mod tests {
                     log: log1.clone(),
                 }),
             ],
+            flat: false,
         };
 
         (producer, log0, log1)

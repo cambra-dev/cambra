@@ -303,6 +303,20 @@ pub enum Builtin {
     /// `not_fn : Bool → Bool` — boolean negation as a morphism.
     NotFn,
 
+    /// `filter_values : (D ⇒ Bool) ⇒ ({d: D | p(d)} ⇒ V)` — a **value-preserving**
+    /// mid-chain filter. `Apply(p, FilterValues)` requires `input=Some(_)` (the
+    /// `D ⇒ V` stream to filter) and keeps each surviving element's **codomain
+    /// value** `V` — unlike `Restrict`, which returns the domain identity
+    /// `{D | p} ⇒ {D | p}` for a source a downstream map re-indexes. Compiles to
+    /// the `Filter` tile operator (input stream + predicate, output = filtered
+    /// input). Lambda elimination emits it to desugar a value-selecting `Case`
+    /// whose gate varies with the element (`λ x → Case{[gᵢ(x) → eᵢ(x)]}`, a writer
+    /// decision body) into a **union of domain-restricts** `⧺ᵢ (filter_values(π̂ᵢ)
+    /// ≫ eᵢ)`: each arm filters the fed element stream to its first-match gate,
+    /// then maps — so a partial op (`//`, `%`) in `eᵢ` runs only where its guard
+    /// holds, never eagerly at a rejected position.
+    FilterValues,
+
     // Aggregations (codomain of a function-typed input → scalar).
     /// `sum`.
     Sum,
@@ -453,6 +467,7 @@ impl Builtin {
             Self::BinOp(op) => op.fn_name(),
             Self::Neg => "neg",
             Self::NotFn => "not_fn",
+            Self::FilterValues => "filter_values",
             Self::Sum => "sum",
             Self::Max => "max",
             Self::FinalOrDefault => "final_or_default",

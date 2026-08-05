@@ -484,9 +484,16 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
             // over the trigger and op-conversion rejects a non-empty input — so an
             // as-of-led chain is already iteration-bearing; prepending an
             // `iterate` would strand the as_of mid-chain.
+            // `FilterValues` heads a value-`Case` fan-out arm inside a writer body
+            // (`filter_values(π̂) ≫ eᵢ`); it consumes the fed element stream as its
+            // source and op-conversion rejects a non-empty extra input, so a
+            // filter-values-led chain is already source-bearing — like `Restrict`,
+            // wrapping it with an `iterate` would strand the filter mid-chain.
             Some(b) => {
-                matches!(b, Builtin::Iterate | Builtin::Restrict | Builtin::AsOf)
-                    || b.iterates_arg()
+                matches!(
+                    b,
+                    Builtin::Iterate | Builtin::Restrict | Builtin::AsOf | Builtin::FilterValues
+                ) || b.iterates_arg()
             }
             // Non-builtin function position (`Proj`, `Var`, curried
             // `Apply`, …): op-conversion's catch-all `Apply` arm
