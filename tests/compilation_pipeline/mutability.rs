@@ -812,6 +812,39 @@ fn rule2_function_returning_mut_is_rejected() {
     expect_mut_discipline_error("x := 0\nf = \\z -> x\nf", "inside a composite type");
 }
 
+/// The escape is rejected **however many tail positions sit between the function
+/// boundary and the read**, which is not free: a tail position reports its
+/// continuation's *value*, so an intervening statement or binding derefs the handle
+/// out of the enclosing node's type. Rule 2 therefore asks what the body *denotes*
+/// rather than what its root node is stamped with.
+///
+/// Without that, inserting a line changed the verdict — and not to an acceptance but
+/// to a compiler panic, since the lambda's stamped codomain (`Int`) then disagreed
+/// with its body's own type (`Mut(Int, ?d)`) at the post-inference consistency wall.
+#[rstest]
+#[case::through_a_binding("def f(c: Mut(Int)):\n    y = 1\n    c\nx := 0\nf(x)")]
+#[case::through_a_statement("def f(c: Mut(Int)):\n    c += 1\n    c\nx := 0\nf(x)")]
+#[case::through_a_register_introduction("def f(c: Mut(Int)):\n    z := 1\n    c\nx := 0\nf(x)")]
+// A register does not escape its own introduction either: returning one declared
+// *inside* the function is the same escape as returning a parameter.
+#[case::its_own_register("def g(n):\n    z := n\n    z\ng(5)")]
+#[case::its_own_register_through_a_binding("def g(n):\n    z := n\n    y = 2\n    z\ng(5)")]
+fn rule2_is_not_evaded_by_a_tail_position(#[case] code: &str) {
+    expect_mut_discipline_error(code, "inside a composite type");
+}
+
+/// The complement, and why the rule cannot simply refuse to deref a tail: a program
+/// whose own tail reads its accumulator yields that accumulator's **value**. Nothing
+/// escapes — there is no function boundary — so the deref is what makes the ordinary
+/// case work, and the check above is what keeps it from covering for an escape.
+#[test]
+fn a_programs_tail_read_of_its_accumulator_is_a_value() {
+    check_scalar(
+        "x := 0\nfor i in [1, 2, 3]:\n    x += i\ny = 1\nx",
+        cambra::interpreter::Value::Int(6),
+    );
+}
+
 /// Rule 1: an argument to a `Mut` parameter must be a bare variable reference,
 /// so a *conditional* selecting between two mutable variables — which one would
 /// the callee's write target? — is rejected. The check reads the argument node,

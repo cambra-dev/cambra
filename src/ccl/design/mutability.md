@@ -96,6 +96,46 @@ contributing loop's domain, free to reference the letrec's bindings. (They are o
 history by the same eliminator — it is only the *append* merge law, with no carry-forward, that
 lets a feed be a plain output rather than a cyclic binding.)
 
+### A register read is an explicit operation
+
+A register mention that denotes its **value** is dereffed by the rule that emits it
+(`infer::emit::read_operand`), not by the subtyping relation. `Mut(𝑉) <: 𝜏` is not a
+subtyping fact.
+
+The handle survives in exactly **two** positions, and the second-class discipline is what
+makes them enumerable: rule 1 forces a `Mut`-typed value to be a bare `Var` and rule 2
+keeps `Mut` out of every composite, so a parent always knows whether the operand it is
+about to constrain is a handle position.
+
+- A **pass-by-reference argument**, decided in `emit_apply` by reading the parameter off
+  the head of the application spine. The handle reaches the parameter, so the invariance
+  rule relates the two value types directly.
+- A **write's target**, which is resolved by name rather than as a subexpression. The
+  written *value* is an ordinary operand and reads.
+
+A lambda's result is deliberately *not* dereffed: that is where rule 2 catches a function
+returning a `Mut`, and dereffing would silently accept the escape by turning it into a
+read.
+
+That check reads what the body **denotes**, not what its root node is stamped with, and
+the difference is load-bearing. A tail position — a `Let` body, a statement's
+continuation, a register introduction's body — reports its continuation's *value*, so a
+program ending in a read of its accumulator has that accumulator's value rather than a
+handle. The same deref would hide an escape one line away from the boundary: reading the
+type alone, `λ 𝑐 → (𝑐 += 1; 𝑐)` looks like it returns an `Int` while `λ 𝑐 → 𝑐` returns the
+handle. So the escape check walks the tails to the term that actually produces the value.
+Every tail is walked, the register introduction included — a register does not escape its
+own introduction either, so returning one declared inside the function is the same escape
+as returning a parameter.
+
+Placing the deref in the relation instead was a coercion wearing a subtyping rule's
+clothes. It put `Mut(𝑉)` *below* `𝑉` while `Mut` is invariant in `𝑉`, and — because it
+fired against a fresh inference variable — nothing could distinguish a read from a handle
+being passed along. That is why passing a register to a `Mut(𝑉)` parameter used to need a
+separate compensating contribution: the handle was gone before invariance could see it.
+With the handle intact, invariance supplies both directions and the compensation is
+deleted.
+
 ## Surface language
 
 The surface syntax and the behaviour a programmer observes — `:=` mutation, `with begin():`
@@ -240,12 +280,14 @@ wrapper variant carried on the introduction's binding and on every reference to 
 
 Typing:
 
-- **Reads are implicit derefs**: `Mut(𝑉, 𝐷)` coerces to `𝑉` wherever a non-`Mut` type is demanded
-  (a coercion arm in `constrain`, not structural subtyping). `cnt + 1`, `f(cnt)` for an `Int`
-  parameter, and a trailing `cnt` all read; only a position that *expects* `Mut` (a `Mut`-annotated
-  parameter) receives the handle. After inlining, no `Mut`-expecting positions remain, so the
-  phase's rewrite is purely structural — every surviving `Mut`-typed occurrence is a write target
-  or a read, decided by context.
+- **Reads deref at the rule that emits them**: `cnt + 1`, `f(cnt)` for an `Int` parameter, and a
+  trailing `cnt` all read, and each reads because the rule typing that position asks for a value
+  operand (`emit::read_operand`). Only a position that *expects* `Mut` — a pass-by-reference
+  argument, a write's target — receives the handle. `Mut(𝑉) <: 𝜏` is deliberately not a subtyping
+  fact; see [A register read is an explicit operation](#a-register-read-is-an-explicit-operation)
+  for why putting it in the relation could not distinguish a read from a handle passed along.
+  After inlining, no `Mut`-expecting positions remain, so the phase's rewrite is purely structural
+  — every surviving `Mut`-typed occurrence is a write target or a read, decided by context.
 - **A read derefs the constraint, not the node.** The deref decides what an operand is
   *constrained against*; the operand's own type slot keeps `Mut(𝑉, 𝐷)`, because that stamp is
   how the phase finds the read in the first place. So the parameter a register was passed to
@@ -267,8 +309,8 @@ introduction every write targets. The discipline:
 1. A `Mut`-typed expression must be a **bare variable reference** — an argument to a `Mut`
    parameter is a variable, never a conditional or computed expression. The two halves catch
    different things, because a *conditional* over two registers is not itself `Mut`-typed: a
-   mutable read derefs into the arms' join exactly as it derefs into a tuple element (see *Reads
-   are implicit derefs* above), so `x if c else y` reads their values and types as a plain `V`.
+   mutable read derefs into the arms' join exactly as it derefs into a tuple element (each is a
+   value operand, above), so `x if c else y` reads their values and types as a plain `V`.
    What the rule is protecting is the write capability travelling somewhere its target can't be
    traced, and that is the **argument** half: `bump(x if c else y)` is rejected on the argument's
    node, not its type.
