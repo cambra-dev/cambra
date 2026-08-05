@@ -448,6 +448,9 @@ mod tests {
         let mut producer = UnionProducer {
             base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),
             inputs,
+            // Tagged, not flat-merged: the assertions below read per-arm
+            // variants off a `ColumnValue::Union` domain.
+            flat: false,
         };
 
         // Release arm 0 in full, leaving arm 1 live.
