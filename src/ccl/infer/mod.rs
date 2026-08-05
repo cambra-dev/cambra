@@ -156,8 +156,8 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             } else {
                 InferError::TypeMismatch {
                     ctx: ctx_label.to_string(),
-                    type_a: Box::new(lhs_ty),
-                    type_b: Box::new(rhs_ty),
+                    found: Box::new(lhs_ty),
+                    expected: Some(Box::new(rhs_ty)),
                 }
             }
         }
@@ -166,19 +166,19 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             found: coalesce_for_error(&in_type),
             at: ctx_label.to_string(),
         },
-        // `ExtraTag` is `MissingField`'s dual and has the same shape problem — the
-        // width violation is a *tag set*, not a second type, so `type_b` is filled
-        // with a placeholder. Naming it as its own variant is the same fix, and is
-        // left to whoever next works the variant diagnostics.
+        // `ExtraTag` is `MissingField`'s dual: the width violation is a *tag set*,
+        // not a second type, so there is no demand to report and `expected` is
+        // `None`. Giving it its own variant — as `MissingField` now has — is the
+        // better fix, and is left to whoever next works the variant diagnostics.
         ConstrainError::ExtraTag { tag, in_type } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (variant tag .{tag} not accepted)"),
-            type_a: Box::new(coalesce_for_error(&in_type)),
-            type_b: Box::new(Type::Hole),
+            found: Box::new(coalesce_for_error(&in_type)),
+            expected: None,
         },
         ConstrainError::NotAFeed { found, required } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (a feed handle is required here, but the value is not one)"),
-            type_a: Box::new(coalesce_for_error(&found)),
-            type_b: Box::new(coalesce_for_error(&required)),
+            found: Box::new(coalesce_for_error(&found)),
+            expected: Some(Box::new(coalesce_for_error(&required))),
         },
         ConstrainError::ComputeWhereDataRequired { lhs, rhs } => InferError::TypeMismatch {
             ctx: format!(
@@ -186,8 +186,8 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
                  collection ⤇ is required — using a capability as a collection \
                  would iterate a declared domain the value does not cover)"
             ),
-            type_a: Box::new(coalesce_for_error(&lhs)),
-            type_b: Box::new(coalesce_for_error(&rhs)),
+            found: Box::new(coalesce_for_error(&lhs)),
+            expected: Some(Box::new(coalesce_for_error(&rhs))),
         },
         ConstrainError::DataDomainMismatch { lhs, rhs } => InferError::TypeMismatch {
             ctx: format!(
@@ -196,8 +196,8 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
                  domains have no common data-function type, and their lossless join is \
                  a dependent sum over the candidate domains)"
             ),
-            type_a: Box::new(coalesce_for_error(&lhs)),
-            type_b: Box::new(coalesce_for_error(&rhs)),
+            found: Box::new(coalesce_for_error(&lhs)),
+            expected: Some(Box::new(coalesce_for_error(&rhs))),
         },
     }
 }

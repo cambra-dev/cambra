@@ -281,6 +281,26 @@ fn in_loop_register_error(span: Span, name: &str) -> LoweringError {
     )
 }
 
+/// Rejection for `x op= e` inside a for-loop body where `x` is not a mutable
+/// variable declared before the loop.
+///
+/// `op=` is a mutable write and the spec says so — *a `+=` to an immutable binding is
+/// a type error, not a silent rebind*. The fallback this replaces was a per-iteration
+/// shadowing `let`, which is wrong twice over: the update is discarded at the
+/// iteration boundary, and because `op=` reads the old value, each iteration reads the
+/// binding's *initial* value rather than the running one.
+fn in_loop_aug_assign_error(span: Span, name: &str) -> LoweringError {
+    LoweringError::unsupported(
+        span,
+        format!(
+            "`{name}` is not a mutable variable, so `{name} op= …` inside a for-loop \
+             body cannot accumulate into it: declare it before the loop with \
+             `{name} := …` so its updates carry across iterations, or compute a \
+             per-iteration value with `{name} = …`"
+        ),
+    )
+}
+
 /// `frame_introduced` — names introduced by the current for clause (the
 /// iteration variable) and any let-bindings accumulated so far. These may
 /// be re-bound (shadowed) inside the body without triggering a mutation error.
@@ -332,24 +352,20 @@ fn lower_for_body_stmts(
                 frame_introduced.insert(name.clone());
                 bindings.push((name, val, Some(ann), stmt.span));
             }
-            ChlStmt::AugAssign { target, op, value } => {
+            ChlStmt::AugAssign { target, .. } => {
                 let name = extract_name_target(target, "augmented assignment")?;
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));
                 }
-                if !frame_introduced.contains(&name) {
-                    // x op= e is only valid if x was already introduced in this frame.
-                    return Err(LoweringError::unsupported(
-                        stmt.span,
-                        format!(
-                            "augmented assignment to `{name}` in for-loop body: \
-                         `{name}` is not bound in this body. Use `{name} = expr` \
-                         for a fresh binding.",
-                        ),
-                    ));
-                }
-                let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
-                bindings.push((name, val, None, stmt.span));
+                // `op=` is a mutable write, and nothing in this body is mutable: an
+                // outer-scope target was rejected above, and everything `frame_introduced`
+                // holds was bound immutably by `=` (or is the iteration variable).
+                // Rebinding it per iteration is what the spec forbids by name — the
+                // update is discarded at the boundary, and since `op=` reads the old
+                // value, each iteration would read the *initial* one. This path has no
+                // accumulators by construction: a loop with loop-carried writes routes
+                // to `lower_direct_mirror_loop` instead.
+                return Err(in_loop_aug_assign_error(stmt.span, &name));
             }
             ChlStmt::Define { .. } => {
                 return Err(LoweringError::unsupported(
@@ -800,16 +816,22 @@ fn lower_loop_body_chain(
                 let val = lower_expr(value, ctx)?;
                 ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
             }
+            // `x op= value` — a mutable write, always. A write to an accumulator
+            // declared before the loop is the `MutWrite` the phase threads as the
+            // recurrence; `op=` on anything else is a write to a non-mutable, which
+            // is a type error and not a rebind. It cannot fall back to a shadowing
+            // `let` for the same reason `:=` cannot: the update would be discarded
+            // at the iteration boundary, and `op=` reads the old value, so a
+            // per-iteration rebind reads the *seed* every time.
             ChlStmt::AugAssign { target, op, value } => {
                 let name = extract_name_target(target, "augmented assignment")?;
+                if !acc_names.contains(&name) {
+                    return Err(in_loop_aug_assign_error(stmt.span, &name));
+                }
                 check_mut_write_context(&name, stmt.span, ctx)?;
                 let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
-                if acc_names.contains(&name) {
-                    let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
-                    ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
-                } else {
-                    ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
-                }
+                let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+                ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
             }
             // `x := value` — a write to an accumulator declared before the
             // loop, lowered to the `MutWrite` the phase threads as the
