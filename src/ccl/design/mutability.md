@@ -66,6 +66,16 @@ carry-forward, so channels never close a causal cycle — see [merge laws](#the-
 | `with begin():` transaction | `Txn`, an anonymous total order issued by the runtime | `get_prev_txn` |
 | `while` loop *(future)* | a prefix of `Nat` bounded by the running condition | `get_prev_seq` over a self-ceiling domain |
 
+A register's domain is fixed by **where it is introduced**, which is why an introduction may not
+sit inside the context that would sequence it. A `:=` inside a `for` body, or inside a
+`with begin():` block, would need a domain nested within the enclosing one — the loop's iteration
+extent per iteration, or a `Txn` order per transaction — and neither the recurrence nor the commit
+model has a carrier for that. Both are rejected at lowering, at every spelling: an annotation on
+the introduction says nothing about whether it introduces a register, so gating on one accepted
+`y := 0` and rejected `y: Mut(Int) := 0` for the same construct. The fallback that rejection
+replaces is a per-iteration shadowing `let`, which silently discards each update at the boundary —
+the failure `:=` exists to make impossible.
+
 The structural difference between the two causal accessors mirrors a difference between the two
 kinds of variable:
 
@@ -139,6 +149,14 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   the loop kinds — that classification is the phase's, post-inference (see
   [Mutability is the type](#mutability-is-the-type-no-lowering-registry)). Value `Unit`;
   `iter : 𝐼 ⇒ 𝑇`, `target : 𝑇` bound in `body`.
+- `MutDecl { binding, init, body }` — one register **introduction** (`x := init`),
+  binding `x` as a register over `body`. The declaring half of `:=`, paired with
+  `MutWrite` for its writing half; before it existed the introduction was a `Let`
+  carrying a `Mut` annotation, and every pass that had to recognize one consulted
+  that annotation as a proxy for the declaration. It is the **only** node that binds
+  a register (a pass-by-reference `Mut` parameter aside), which is what makes
+  "is this binder mutable?" a question about the node rather than about a type that
+  happened to survive inference.
 - `MutWrite { name, value }` — one write to a variable. Value `Unit`. Its target **must** be
   `Mut`-typed: inference peels the target's `Mut(𝑉, 𝐷)` and requires `value ⊑ 𝑉`; a write whose
   target is *not* `Mut` is a **type error**, never a shadowing rebind (`x += e` on a plain `x` is
@@ -256,11 +274,17 @@ introduction every write targets. The discipline:
    node, not its type.
 2. `Mut` may not appear **inside any composite type** — tuples, records, lists, function codomains
    (so it is never a return type), `Feed` payloads, or another `Mut`.
-3. An **unannotated binding may not have `Mut` type**: `b = a` is an error, not an alias. To copy
-   the current value, demand the deref (`b: Int = a`); to seed a *new* mutable variable from it, introduce one
-   with `:=` (`b: Mut(Int) := a`, the initializer being a read).
+3. A plain `=` off a mutable **reads** it: `b = a` binds `b` at `a`'s value — a
+   snapshot, exactly as any other value position reads a register. This is not a
+   rule but a consequence: `emit_let` derefs a register-typed initializer, so a
+   `Let` *cannot* bind a register and the alias is unrepresentable rather than
+   rejected. Writing through the copy (`b += 1`) is then the ordinary
+   write-to-a-non-mutable error, which blames the write instead of the binding.
+   The only register binders are `MutDecl` (a `:=` introduction) and a
+   pass-by-reference `Mut` parameter — both declarations by construction. Pinned
+   by `infer::api::debug_assert_no_register_let`.
 
-One structural check after inference enforces all three. The real fault line is the **merge law**,
+One structural check after inference enforces the two rules. The real fault line is the **merge law**,
 not `Feed`-vs-`Mut`. *Append-only* mutability merges commutatively — a feed by `++`, and (at
 runtime) a `Txn` register by the commit operator's timestamped merge — so multiple writers are
 already the semantics and aliasing is benign; that is why `Feed` deliberately stays first-class (it

@@ -861,10 +861,11 @@ pub fn compile_program(
     // Enforce that every `:=` / `+=` write targets a mutable variable (a write is
     // never a shadowing rebind of an immutable). Post-inference so binder types
     // are resolved, post-`uniquify` so write targets carry their binder's
-    // α-unique name — see `check_mut_write_targets`. (Currently satisfied by
-    // construction, since lowering only emits `MutWrite` for registered mutable variables;
-    // it becomes load-bearing once lowering emits writes uniformly and drops the
-    // registry — see src/ccl/design/mutability.md, "Mutability is the type (no lowering registry)".)
+    // α-unique name — see `check_mut_write_targets`. Load-bearing rather than a
+    // formality: lowering emits a `MutWrite` for any `x := e` whose name is already in
+    // scope, register or not (see `src/ccl/design/mutability.md`, "Mutability is the
+    // type (no lowering registry)"), so this is what rejects a write to an immutable
+    // binding — or to one monomorphization has since dropped.
     check_mut_write_targets(&expr).map_err(|errs| errs.into_compile_errors())?;
 
     // Inline UDFs *before* desugar: a defer-mediating UDF (`λ out → out << e`)
@@ -955,7 +956,7 @@ pub fn compile_program(
     // remain: channelization is type-preserving by construction and closes
     // channel domains by substitution; the strict `typecheck` below is the
     // release-visible enforcement.
-    let mut desugared = channelize::run(phase_out, /* input_typed= */ true).errs()?;
+    let mut desugared = channelize::run(phase_out).errs()?;
     debug!("Channelized:\n{}", symbolic(&desugared));
     typecheck(&desugared).expect("channelize produced an ill-typed tree");
 

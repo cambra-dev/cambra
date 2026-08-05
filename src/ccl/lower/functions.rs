@@ -105,21 +105,20 @@ pub(super) fn uncurry_params(
         // A `Mut(…)`-annotated single parameter is a pass-by-reference mutable variable:
         // bind it at `Mut(V, D)` so body references carry `Mut` (reads deref,
         // writes lower to `MutWrite`) and inference generalizes its domain per
-        // call site. The annotation rides `user_annotation` too, so the
-        // discipline check's rule 3 (no *unannotated* `Mut` binding) treats it
-        // as the deliberate declaration it is. Non-`Mut` params stay `Hole`
-        // (inferred), as before. Multi-arg pass-by-ref lands with transactions.
+        // call site. That binder type *is* the declaration — a `Lambda` param is
+        // one of the two binders that may hold a register, and nothing asks an
+        // annotation about it. Non-`Mut` params stay `Hole` (inferred), as before.
+        // Multi-arg pass-by-ref lands with transactions.
         let param_ty = match mut_param_history_type(&params[0]) {
             Some(Ok((mut_ty, _is_txn))) => mut_ty,
             _ => Type::Hole,
         };
         let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
         if let TypedExprNode::Lambda { param, .. } = &mut lam.node {
-            if matches!(param_ty, Type::History { .. }) {
-                // `Mut[…]` pass-by-reference: the annotation rides `user_annotation`
-                // for the mutability discipline check (rule 3).
-                param.user_annotation = Some(param_ty);
-            } else if let Some(ann) = &params[0].annotation
+            // A `Mut(…)` annotation is already *in* `param.ty` above, and
+            // `emit_lambda` binds at `user_annotation.or(param.ty)`, so restating it
+            // as an annotation would be the same type twice.
+            if let Some(ann) = &params[0].annotation
                 && mut_param_history_type(&params[0]).is_none()
             {
                 // Any *other* annotation (`int`, `List[T]`, …) is a
@@ -128,7 +127,7 @@ pub(super) fn uncurry_params(
                 // rejected at the call site. Without this the annotation was
                 // silently dropped and the param inferred purely from its body (so
                 // `def g(a: int)` with an identity body accepted any argument).
-                param.user_annotation = Some(lower_type_annotation(ann)?);
+                param.declare(lower_type_annotation(ann)?);
             }
         }
         return Ok(lam);
@@ -151,7 +150,7 @@ pub(super) fn uncurry_params(
             if matches!(param_ty, Type::History { .. })
                 && let TypedExprNode::Lambda { param: p, .. } = &mut lam.node
             {
-                p.user_annotation = Some(param_ty);
+                p.declare(param_ty);
             }
             // Each curried lambda images one written parameter; the outermost
             // is re-tagged identically by the `def`/lambda caller.
@@ -202,7 +201,7 @@ pub(super) fn uncurry_params(
     if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
         && let TypedExprNode::Lambda { param, .. } = &mut lam.node
     {
-        param.user_annotation = Some(Type::Tuple(elem_anns));
+        param.declare(Type::Tuple(elem_anns));
     }
     Ok(lam)
 }
