@@ -2444,3 +2444,26 @@ fn a_single_type_fault_prints_no_demand() {
         "a single-type fault must not invent a demand, got: {missing}"
     );
 }
+
+/// A mutable variable mention in an operand position yields its **value type**, never the
+/// handle — and it does so because the emitting rule derefs, not because subtyping
+/// says a mutable variable is a subtype of its value.
+///
+/// `cnt + 1` is the case that pins the placement: `+` is `∀α. α → α → α`, so the
+/// operand meets a *fresh inference variable*. While the deref lived in the subtyping
+/// relation this worked only because that arm was ordered before the `Infer` arms — and
+/// that same ordering is what made a pass-by-reference argument indistinguishable from
+/// a read, since it too meets a fresh variable.
+#[test]
+fn a_register_read_yields_its_value_in_an_operand_position() {
+    assert_eq!(infer_program("x := 5\nx + 1\n"), int());
+    // The value still has to satisfy the operand's demand: what reaches the operator's
+    // obligation is `String`, the *value* the read yielded, so the implementation table
+    // rejects it at that operand position. A handle arriving here instead would offer no
+    // base at all and the obligation would have nothing to reject.
+    let errs = format!("{:?}", infer_program_err("x := 5\nx + \"s\"\n"));
+    assert!(
+        errs.contains("Addable") && errs.contains("String"),
+        "a read's value type is still checked against the operator, got: {errs}"
+    );
+}

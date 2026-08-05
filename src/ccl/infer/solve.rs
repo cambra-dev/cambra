@@ -1793,12 +1793,44 @@ fn typecheck_discarded_definition(def: &mut Expr, level: Level, ctx: &mut Coales
 /// cast-target / join-filter predicate case is reached the same way:
 /// `coalesce_type_predicates` runs `coalesce_node` over each refinement
 /// predicate, so its projections recover through the `Apply` arm too.
+/// The type a use-site domain recovery writes, given the position's own coalesced
+/// `domain` and the value `input` flowing in.
+///
+/// A recovery overwrites a domain with the type flowing in, read off the argument
+/// **node** — and a node's recorded type is the mutable variable *handle* wherever one was
+/// passed, because the read [`emit_apply`](super::emit::emit_apply) performed lives
+/// in the `arg <: domain` edge, not on the node. So a recovery has to make that same
+/// decision again, and it is the same decision: **a mutable variable mention reads, unless
+/// the position being specialized is itself a handle position** — which its own
+/// coalesced domain states outright, no spine walk required.
+///
+/// Both recoveries need this, and they need opposite halves of it:
+///
+/// - A **projection**'s domain is never a mutable variable — rule 2 keeps `Mut` out of every
+///   composite, so nothing projects *into* one, only through one — so this always
+///   derefs there. Without it a projection off a mutable variable (`acc.0` on a compound
+///   accumulator) re-acquires the handle here and fails `emit_proj`'s
+///   `domain <: {tuple/record}` requirement at the post-inference wall.
+/// - A **lambda**'s domain *is* a mutable variable exactly when the parameter was declared
+///   `Mut(…)`: pass-by-reference, the one position where the handle must reach the
+///   parameter. Overwriting with the handle is right there and wrong everywhere else
+///   — and wrong *silently*, since it retypes an ordinary value parameter as a
+///   mutable variable that the body still reads at its value type.
+fn recovered_input(domain: &Type, input: &Type) -> Type {
+    if domain.peel_refinements().mut_value_type().is_some() {
+        input.clone()
+    } else {
+        input.mut_value_type().unwrap_or(input).clone()
+    }
+}
+
 pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
     if matches!(morphism.node, TypedExprNode::Proj(_))
+        && let Some(dom) = morphism.ty.domain()
         && let Some(cod) = morphism.ty.codomain()
     {
         // A projection is non-dependent, so the rebuilt arrow keeps `name: None`.
-        morphism.ty = Type::fun(input.clone(), cod);
+        morphism.ty = Type::fun(recovered_input(&dom, input), cod);
     }
 }
 
@@ -1868,11 +1900,16 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
         input_refinements.push(r);
         t = inner;
     }
+    // A mutable variable mention reads unless this parameter was *declared* one — see
+    // [`recovered_input`]. `base` is the peeled domain, so a declared `Mut(V, D)`
+    // parameter is visible here whatever refinements rode in on it.
     let new_dom = dom_layers
         .into_iter()
         .rev()
         .filter(|r| !input_refinements.contains(&r))
-        .fold(input.clone(), |acc, r| Type::Refinement(Box::new(acc), r));
+        .fold(recovered_input(&base, input), |acc, r| {
+            Type::Refinement(Box::new(acc), r)
+        });
     lambda.ty = fn_layers.into_iter().rev().fold(
         // Preserve the Pi binder: specialization rewrites only the domain
         // *shape*; a dependent codomain still refers to the same binder.
@@ -1908,6 +1945,60 @@ mod tests {
     use crate::ccl::infer::{int_lit_ty, str_lit_ty};
     use crate::ccl::symbolic::symbolic;
     use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Lit, Type, TypedExpr, TypedExprNode};
+
+    // ----- use-site domain recovery (`recovered_input`) -----
+
+    /// A use-site domain recovery overwrites a morphism's domain with the type read
+    /// off the argument **node**, and that type is the mutable variable *handle* — the read
+    /// `emit_apply` performed lives in the `arg <: domain` edge, not on the node. So
+    /// the recovery has to redo the decision, and it must land on the same answer.
+    ///
+    /// Driven at [`recovered_input`] rather than through a program because neither
+    /// arm is reachable from source today: a lambda in function position is only ever
+    /// the comprehension shape until `inline` runs (after inference), and a lambda
+    /// parameter cannot be annotated at all, so a directly-applied `Mut` parameter has
+    /// no spelling. Both become reachable the moment direct application does, and the
+    /// wrong answer is silent in both directions — a value parameter retyped as a
+    /// mutable variable, or a pass-by-reference parameter degraded to a value copy.
+    #[test]
+    fn a_recovery_reads_a_register_unless_the_position_is_a_handle() {
+        use super::recovered_input;
+        use crate::ccl::{HistoryKind, Refinement};
+        let mut_var = |value: Type| Type::History {
+            value: Box::new(value),
+            domain: Box::new(Type::Txn),
+            kind: HistoryKind::Overwrite,
+        };
+        // Refinements are built here rather than via `refined_int`, which is
+        // `debug_assertions`-only: the rule under test is not.
+        let refined = |inner: Type| {
+            Type::Refinement(
+                Box::new(inner),
+                Refinement::born(std::rc::Rc::new(TypedExpr::lit(crate::ccl::Lit::Bool(
+                    true,
+                )))),
+            )
+        };
+        let int = Type::Base(BaseType::Int);
+        let handle = mut_var(int.clone());
+
+        // An ordinary value position reads through the handle.
+        assert_eq!(recovered_input(&int, &handle), int);
+        // ...including one still unresolved, and one carrying body-usage refinements:
+        // the decision is the *position's*, and neither of those is a handle position.
+        assert_eq!(recovered_input(&Type::Hole, &handle), int);
+        assert_eq!(recovered_input(&refined(int.clone()), &handle), int);
+
+        // A declared `Mut(…)` parameter is the one position the handle must reach —
+        // dereffing here would turn pass-by-reference into a silent value copy.
+        assert_eq!(recovered_input(&handle, &handle), handle);
+        // A refinement on the handle does not stop it being one (a refined mutable variable is
+        // still a mutable variable), so the position is still recognised.
+        assert_eq!(recovered_input(&refined(handle.clone()), &handle), handle);
+
+        // A non-mutable variable input is untouched either way.
+        assert_eq!(recovered_input(&int, &int), int);
+    }
 
     // ----- ordering-invariant comparison (`types_agree_modulo_unread`) -----
 

@@ -652,16 +652,16 @@ pub enum Type {
     /// provenance, not a property of a type*: a variance rule sees two types and
     /// cannot ask where either came from.
     ///
-    /// **The rule is not what currently enforces that across a function boundary.**
-    /// At an argument position the deref arm fires first — `Typing::apply` records
-    /// `arg <: ?d` against a fresh variable, so a mutable variable meets an `Infer` and reads
-    /// through — so the `(History, History)` arm never runs there. Invariance at a
-    /// pass-by-reference call is assembled from two other edges instead: the
-    /// application edge supplies `caller <: callee`, and `emit::contribute_pbr_writes`
-    /// supplies `callee <: caller`. Equal in strength to the rule, spread across two
-    /// mechanisms — which is why the property is pinned by test
-    /// (`a_mut_vars_value_type_is_invariant_across_a_mut_parameter`) rather than
-    /// argued from this paragraph.
+    /// **The rule is what enforces that across a function boundary**, and it can be
+    /// because the handle reaches the parameter: `emit_apply` decides pass-by-reference
+    /// from the parameter read off the head of the application spine and leaves the
+    /// argument's `Mut` intact, so the `(History, History)` arm relates the two value
+    /// types directly. Both directions come from the one rule rather than being
+    /// assembled from an application edge plus a compensating write contribution — the
+    /// shape this needed while a deref coercion erased the handle before invariance
+    /// could see it. The property is still pinned by test
+    /// (`a_registers_value_type_is_invariant_across_a_mut_parameter`), which is what
+    /// would catch a future consolidation quietly dropping one direction.
     ///
     /// It is also a **transient** variant like `Hole` / `Infer`: it exists only between type
     /// inference (which stamps it on `:=` / `defer` introductions and every

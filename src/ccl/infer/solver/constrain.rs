@@ -620,9 +620,10 @@ fn constrain_go_impl(
         // Two histories of the **same kind** equate invariantly in both value
         // and domain (a mutable param reads *and* writes; a feed handle both feeds
         // and is read). A cross-kind pair (a mutable variable demanded as a feed, or vice
-        // versa) is *not* matched here: it falls through to the deref arms below,
-        // where a mutable variable demanded as a feed lands in `NotAFeed` — the type-level
-        // guardrail that `<<` targets a `defer` channel, not a `:=` mutable variable.
+        // versa) is *not* matched here: it falls through to the `(_, Append)` arm below,
+        // which accepts any left-hand shape, so a mutable variable demanded as a feed
+        // lands in `NotAFeed` — the type-level guardrail that `<<` targets a `defer`
+        // channel, not a `:=` mutable variable.
         (
             Type::History {
                 value: v0,
@@ -640,22 +641,18 @@ fn constrain_go_impl(
             constrain_go(d0, d1, &Subst::id(), &Subst::id(), cache)?;
             constrain_go(d1, d0, &Subst::id(), &Subst::id(), cache)
         }
-        // Implicit deref (read): a `Mut` handle meeting any non-`Mut` demand —
-        // concrete OR an inference variable — reads its value. This MUST precede
-        // the `Infer` arms below: an operator constrains its operand against a fresh
-        // variable (`cnt + 1` emits `Mut(Int, D) <: ?α` for `Addable`'s first operand
-        // position), and dereffing here flows `Int` onto `?α` — where the narrowing
-        // hook can read a base off it. The `(_, Infer)` arm would instead record the
-        // handle itself as a lower bound, offering the obligation nothing and
-        // coalescing `?α` to a `Mut`.
-        (
-            Type::History {
-                value,
-                kind: HistoryKind::Overwrite,
-                ..
-            },
-            _,
-        ) => constrain_go(value, rhs, sl, sr, cache),
+        // There is deliberately **no deref arm here.** A mutable variable mention that denotes
+        // its value is dereffed by the rule that emits it (`emit::emit_value_read`), so a
+        // handle reaching this relation is a handle: the only edges that carry one are
+        // a pass-by-reference argument against its parameter, which the invariance arm
+        // above relates, and a write's target.
+        //
+        // As a subtyping rule the deref was a coercion in disguise — it made `Mut(V)`
+        // sit *below* `V` while `Mut` is invariant in `V`, and it fired against a fresh
+        // inference variable, so nothing downstream could tell a read from a handle
+        // being passed along. That is precisely why passing a mutable variable to a `Mut(V)`
+        // parameter needed a separate compensating contribution: the handle was gone
+        // before the invariance rule could see it.
 
         // Variable on lhs, rhs has compatible level: record the upper edge in
         // native form (`V‹sl› <: rhs‹sr›`, no inversion), then close each
@@ -805,8 +802,9 @@ fn constrain_go_impl(
         }
         // Any other plain value can never satisfy a feed requirement: reading is
         // transparent, but the write capability cannot be conjured (`g(5)` where
-        // `g` feeds its parameter, or a `<<` targeting a `:=` mutable variable — which the
-        // mutable deref above reduced to `(value, feed)` landing here).
+        // `g` feeds its parameter). A `<<` targeting a `:=` mutable variable lands here
+        // too, as the handle it is — the left side matches `_`, so the cross-kind pair
+        // the invariance arm above declined needs no rule of its own.
         (
             _,
             Type::History {
@@ -1795,8 +1793,9 @@ mod tests {
     fn feed_var_coalesces_to_feed() {
         // A var bounded by feed(D, Int) coalesces carrying the Feed
         // constructor (the `history_slot` survives compact → simplify →
-        // coalesce). Contrast `mut_derefs_at_a_variable_not_the_handle`, where
-        // the deref arm collapses an `Overwrite` var to its bare value.
+        // coalesce). An `Overwrite` handle reaching a variable survives the same
+        // way — the relation holds no rule that would collapse it to its value,
+        // because a read derefs at the rule that emits it instead.
         use crate::ccl::infer::solver::simplify_type;
         let v = fresh_var(0);
         let h = feed_ty(Type::UIntRange(3), prim(BaseType::Int));
@@ -1921,36 +1920,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mut_reads_transparently_as_value() {
-        // Mut(Int, D) <: Int — a read derefs to the value…
-        let m = mut_ty(prim(BaseType::Int), prim(BaseType::UInt));
-        let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&m, &prim(BaseType::Int), &mut cache).is_ok());
-        // …but the value still has to match the consumer.
-        let mut cache = ConstrainCache::new();
-        assert!(matches!(
-            constrain_subtype(&m, &prim(BaseType::String), &mut cache),
-            Err(ConstrainError::Mismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn mut_derefs_at_a_variable_not_the_handle() {
-        // THE crux (plan decision #1): `cnt + 1` emits `Mut(Int, D) <: ?α`. The
-        // deref arm fires *before* the `Infer` arm, so `?α` coalesces to `Int`,
-        // NOT to a `Mut` handle — the deliberate contrast with
-        // `feed_var_coalesces_to_feed`. If the deref arm were placed after the
-        // `Infer` arms, `?α` would carry the `Mut` constructor and reads would
-        // break.
-        use crate::ccl::infer::solver::simplify_type;
-        let v = fresh_var(0);
-        let m = mut_ty(prim(BaseType::Int), prim(BaseType::UInt));
-        let mut cache = ConstrainCache::new();
-        constrain_subtype(&m, &v, &mut cache).unwrap();
-        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
-        assert_eq!(out, prim(BaseType::Int));
-    }
+    // The deref arm these two tests covered is gone: a mutable variable mention that denotes
+    // its value is dereffed by the rule that emits it (`emit::emit_value_read`), so
+    // `Mut(V) <: τ` is no longer a subtyping fact and there is nothing to assert here.
+    // The property they protected — `cnt + 1` yields `Int` rather than leaving a `Mut`
+    // on an inference variable — is now pinned where it is decided:
+    // `a_register_read_yields_its_value_in_an_operand_position` in `tests/type_check.rs`,
+    // and the `mutability` integration suite end to end.
 
     #[test]
     fn mut_meets_mut_invariantly() {

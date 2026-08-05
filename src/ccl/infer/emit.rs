@@ -209,11 +209,14 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                 Some(binding) => binding.scheme.instantiate(ctx.level),
             };
             // The written value flows into the mutable variable's *value* type, not
-            // the `Mut` handle itself. (The `(_, Mut)` lenient coercion arm would
-            // deref anyway, but naming the mutable variable's value type says what a write
-            // means — it updates `V`.)
+            // the `Mut` handle itself — which is what a write means: it updates `V`.
+            // Nothing would deref it on the way in, since the relation holds no
+            // mutable variable rule; naming `V` here is the whole of it.
             let mut_value = var_ty.mut_value_type();
-            let value_ty = ctx.subexpr(value)?;
+            // The *target* is a handle, resolved by name above. The written **value** is
+            // an ordinary value operand, so a mutable variable mention there reads: `b := a`
+            // between two mutable variables writes `a`'s current value into `b`.
+            let value_ty = emit_value_read(value, ctx)?;
             let write_label = name.clone();
             // The written value flows in **verbatim**, as one contribution to the
             // mutable variable's value type. A refinement is a fact about *a value*, and a
@@ -483,7 +486,20 @@ pub(super) fn emit_lambda<C: Typing>(
     // The param is bound in scope under the *unrefined* `param_simple`, so
     // `Var(param)` body references stay bare; restriction refinements decorate only
     // the function boundary.
+    // Deliberately *not* `emit_value_read`: a lambda's result is where rule 2 catches a
+    // function returning a `Mut`, whose reference would escape to where its writer set
+    // is no longer statically known. Dereffing here would silently accept that program
+    // by turning the escape into a read.
     let body_ty = ctx.scoped(&param.name, &param_simple, |ctx| ctx.subexpr(body))?;
+    // …and the same reason it is not dereffed here is why the *reported* codomain is
+    // what the body denotes rather than what its root node happens to be stamped with.
+    // A statement's type is its continuation's, and `emit_expr_stmt` derefs it; without
+    // this, inserting a statement before the escape hides the handle from rule 2 —
+    // `λ c → (c += 1; c)` would pass where `λ c → c` is rejected.
+    let body_ty = match denoted_expr(body).ty.mut_value_type() {
+        Some(_) => denoted_expr(body).ty.clone(),
+        None => body_ty,
+    };
 
     // Param user-annotation: reconcile the inferred param type with the
     // annotation (two-way; see `bind_annotation`).
@@ -595,8 +611,30 @@ pub(super) fn emit_apply<C: Typing>(
     argument: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let arg_ty = ctx.subexpr(argument)?;
+    let raw_arg_ty = ctx.subexpr(argument)?;
     let fn_ty = ctx.subexpr(function)?;
+    // **The one position where a mutable variable's handle survives.** If the parameter is a
+    // mutable variable the argument is passed *by reference* and the handle must reach the
+    // parameter, so the invariance rule relates the two value types directly — that is
+    // what makes the callee's writes and the caller's declaration one constraint rather
+    // than two edges that have to agree. Every other argument is a value operand, so a
+    // mutable variable mention there reads.
+    //
+    // Deciding it here is sound because the parameter is read off the *head of the
+    // spine* (`parameter_type`) rather than off the immediately-applied type — a call is
+    // curried, so the applied type says nothing about an argument past the first — and
+    // because a pass-by-reference parameter is bound at its `Mut(V, D)` by the only code
+    // that mints one (`lower::functions::uncurry_params`). Rule 2 guarantees the
+    // mutable variable is the parameter itself and never nested inside it, so there is no
+    // composite to walk.
+    let param_is_register = parameter_type(function, &fn_ty)
+        .and_then(Type::mut_value_type)
+        .is_some();
+    let arg_ty = if param_is_register {
+        raw_arg_ty
+    } else {
+        read_through(&raw_arg_ty)
+    };
     // The application's type is the function's codomain with its Pi binder
     // discharged to the argument (dependent application, design §5). `apply`
     // also pins the function/argument shapes with the one-way Apply edges
@@ -605,9 +643,6 @@ pub(super) fn emit_apply<C: Typing>(
     // A morphism's contravariant domain, left under-determined by the one-way
     // edges, is recovered structurally at coalesce
     // (`specialize_projection_domain` / `specialize_lambda_domain`).
-    // A mutable argument is a *contribution* to its mutable variable, not just a value
-    // flowing in — record that before the ordinary edges (below).
-    contribute_pbr_writes(function, &fn_ty, &arg_ty, ctx)?;
     ctx.apply(&fn_ty, &arg_ty, argument, &|| "Apply".to_string())
 }
 
@@ -632,50 +667,6 @@ fn require_single_obligation<C: Typing>(
             Ok(Type::Base(base.clone()))
         }
     }
-}
-
-/// Passing a mutable variable to a `Mut(V)` parameter contributes `V` to the mutable variable's value
-/// type, because that is what the call *means*: the callee may write any `V` here.
-///
-/// Without this the contribution is simply missing, and the mutable variable's value type is
-/// left claiming whatever its lexically-visible writes agree on. The ordinary
-/// application edges cannot supply it: `Typing::apply` records `arg <: d` against a
-/// **fresh variable** `d`, so a `Mut` argument meets an `Infer` rather than the
-/// parameter's `Mut(V)` — and `(History, Infer)` is deliberately the *deref* arm, since
-/// a bare read like `cnt + 1` must read through the handle. The handle is dereffed, the
-/// invariance rule that would relate the two value types never runs, and `V` arrives
-/// only as an *upper* bound. So the mutable variable's value variable ends up with the seed as
-/// its sole lower bound: `x := 0` passed to `Mut(Int)` typed as `{Int | __elem == 0}`,
-/// which the invariance check then rejected against the parameter.
-///
-/// The parameter is read off the head of the application spine rather than off the
-/// immediately-applied type ([`parameter_type`]) — otherwise only a call's *first*
-/// argument is ever seen.
-///
-/// A mutable variable can only ever be the parameter itself, never nested inside one: rule 2 of
-/// the mutability discipline (`check_no_nested_mut`) rejects a `Mut` at every position
-/// but a function domain's root, so there is no composite to walk into.
-///
-/// Reading the parameter's `Mut` syntactically is sound here, and it is the one place
-/// that is true of a `Mut`: a pass-by-reference parameter is *bound at* its `Mut(V, D)`
-/// by lowering (`lower::functions::uncurry_params`, the only thing that mints one), so
-/// the domain is a `History` by construction at every call this needs to see — no
-/// annotation is consulted, and none survives inference to consult.
-fn contribute_pbr_writes<C: Typing>(
-    function: &Expr,
-    fn_ty: &Type,
-    arg_ty: &Type,
-    ctx: &mut C,
-) -> Result<(), LocatedInferError> {
-    let Some(arg_value) = arg_ty.mut_value_type() else {
-        return Ok(());
-    };
-    let Some(param_value) = parameter_type(function, fn_ty).and_then(Type::mut_value_type) else {
-        return Ok(());
-    };
-    ctx.require_sub(param_value, arg_value, &|| {
-        "writes through a mutable parameter".to_string()
-    })
 }
 
 /// The declared parameter type an argument is passed at, or `None` when the callee is
@@ -719,8 +710,8 @@ pub(super) fn emit_binop<C: Typing>(
     sig: &OpSignature,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let left_ty = ctx.subexpr(left)?;
-    let right_ty = ctx.subexpr(right)?;
+    let left_ty = emit_value_read(left, ctx)?;
+    let right_ty = emit_value_read(right, ctx)?;
     let at = || "BinOp".to_string();
     match sig {
         OpSignature::Scheme(scheme) => apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at),
@@ -735,7 +726,7 @@ pub(super) fn emit_unary<C: Typing>(
     sig: &OpSignature,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let inner_ty = ctx.subexpr(inner)?;
+    let inner_ty = emit_value_read(inner, ctx)?;
     let at = || "UnaryOp".to_string();
     match sig {
         OpSignature::Scheme(scheme) => apply_unary_scheme(ctx, scheme, &inner_ty, &at),
@@ -758,7 +749,7 @@ pub(super) fn emit_tuple<C: Typing>(
         // carrying `Mut` (rule 1 accepts it; the phase erases the type later) —
         // only the *composite type* is dereferenced, so a `Mut` never appears
         // nested in it. A non-`Mut` element is unchanged.
-        fields.insert(FieldKey::Index(i), read_through(&ctx.subexpr(e)?));
+        fields.insert(FieldKey::Index(i), emit_value_read(e, ctx)?);
     }
     Ok(product(fields))
 }
@@ -774,7 +765,7 @@ pub(super) fn emit_record<C: Typing>(
         // takes the dereferenced type so no `Mut` appears in the record type.
         fields.insert(
             FieldKey::Name(SmolStr::from(n.as_str())),
-            read_through(&ctx.subexpr(e)?),
+            emit_value_read(e, ctx)?,
         );
     }
     Ok(product(fields))
@@ -788,7 +779,7 @@ pub(super) fn emit_expr_stmt<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     ctx.subexpr(e)?;
-    ctx.subexpr(body)
+    emit_value_read(body, ctx)
 }
 
 /// Type a `Defer` node: a fresh feed handle. `let d = Defer in body` binds
@@ -823,6 +814,47 @@ fn read_through(ty: &Type) -> Type {
     ty.mut_value_type().unwrap_or(ty).clone()
 }
 
+/// The expression a body ultimately **denotes**, seen through the tail positions that
+/// carry their continuation's value.
+///
+/// A tail position reports a value where a mutable variable is read — a program ending in a
+/// read of its accumulator has that accumulator's *value* — so the handle is no longer
+/// visible in the enclosing node's type. Anything that must reason about the handle
+/// rather than the value asks the term instead, which is what this walks to.
+///
+/// Every tail is walked, [`TypedExprNode::MutDecl`] included: a mutable variable does not
+/// escape its introduction either, so a function whose body ends in a read of a
+/// register it declared is the same escape as one that returns a parameter. Each of
+/// these nodes reports its continuation's value, and none of them is a place a
+/// handle stops being one.
+fn denoted_expr(e: &Expr) -> &Expr {
+    match &e.node {
+        TypedExprNode::Let { body, .. }
+        | TypedExprNode::MutDecl { body, .. }
+        | TypedExprNode::ExprStmt { body, .. } => denoted_expr(body),
+        _ => e,
+    }
+}
+
+/// Emit a **value operand**: a mutable variable mention here is a *read*, so its handle
+/// derefs to the value it holds.
+///
+/// This is the ordinary case. A mutable variable's handle survives in exactly two positions —
+/// a pass-by-reference argument (see [`emit_apply`]) and a `MutWrite` target, which is
+/// resolved by name rather than as a subexpression — and the mutability discipline is
+/// what makes that enumerable: rule 1 forces a `Mut`-typed value to be a bare `Var`,
+/// and rule 2 keeps `Mut` out of every composite, so a parent always knows whether the
+/// operand it is about to constrain is a handle position without inspecting it.
+///
+/// Dereffing *here* rather than inside the subtyping relation is the point. A rule
+/// `Mut(V) <: τ` reads as "a mutable variable is a subtype of its value", which is a coercion
+/// wearing a subtyping rule's clothes: it makes `Mut(V)` sit below `V` while `Mut` is
+/// invariant in `V`, and it fires against a fresh inference variable, so it cannot tell
+/// a read from a handle being passed along.
+fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, LocatedInferError> {
+    Ok(read_through(&ctx.subexpr(e)?))
+}
+
 /// Type a `Feed { name, value }`: the fed value contributes one element to
 /// the target handle's channel; the feed expression itself is `Unit` (it is
 /// statement-positioned — channelize extracts the value into a channel and
@@ -840,13 +872,15 @@ pub(super) fn emit_feed<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     // A feed payload is a *value* (`Mut` never appears in a feed payload — the
-    // discipline forbids it), so deref a bare mutable reference to its value
-    // type here. This wrapping into a `Fun` codomain buries the type where the
-    // solver's `(Mut, _)` deref arm cannot reach it: two contributions to one
-    // channel become `Fun` lower bounds that are *joined* (codomains lub'd),
-    // not constrained against a demand, so an undereferenced `Mut(V, D)` would
-    // collide with a plain-`V` feed to the same channel instead of dereffing.
-    let value_ty = read_through(&ctx.subexpr(value)?);
+    // discipline forbids it), so a mutable variable mention here reads.
+    //
+    // Dereffing at the emitting rule is what makes that work at all, and this is the
+    // site that shows why no later fixup could: the payload is wrapped into a `Fun`
+    // codomain, and two contributions to one channel become `Fun` lower bounds that
+    // are *joined* (codomains lub'd) rather than constrained against a demand. There
+    // is no demand for a handle to be reconciled against — an undereferenced
+    // `Mut(V, D)` would simply collide with a plain-`V` feed to the same channel.
+    let value_ty = emit_value_read(value, ctx)?;
     let contribution = fun(ctx.fresh(), value_ty);
     constrain_into_feed(target_ty, &contribution, label, ctx)
 }
@@ -971,7 +1005,7 @@ pub(super) fn emit_aggregate<C: Typing>(
     kind: AggregateKind,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let input_ty = ctx.subexpr(input)?;
+    let input_ty = emit_value_read(input, ctx)?;
     let at = || "Aggregate".to_string();
     let result = apply_unary_scheme(ctx, scheme, &input_ty, &at)?;
     // `max` returns an element of what it consumes, so the scheme already gives it a
@@ -1155,7 +1189,9 @@ pub(super) fn emit_letrec<C: Typing>(
 /// Emit/check a [`TypedExprNode::MutDecl`] — a mutable variable introduction `x := init`.
 ///
 /// The binder is bound at the history `Mut(V, D)`, so references to `x` carry
-/// `Mut` and reads deref to `V` (the coercion arms in `constrain.rs`). `normalize`
+/// `Mut` and a read derefs to `V` at the rule that emits it ([`emit_value_read`], not
+/// the subtyping relation — see `src/ccl/design/mutability.md`, "A mutable variable read is
+/// an explicit operation"). `normalize`
 /// mints the declared type's `Hole` value/domain as fresh variables in Emit — so
 /// `?V` receives the seed and every write — and is the identity in Check.
 ///
@@ -1174,7 +1210,7 @@ pub(super) fn emit_mut_decl<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let init_ty = ctx.in_let_rhs(|ctx| ctx.subexpr(init))?;
+    let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx))?;
     let history = ctx.normalize(&binding.ty);
     debug_assert!(
         history.mut_value_type().is_some(),
@@ -1193,7 +1229,7 @@ pub(super) fn emit_mut_decl<C: Typing>(
     // Monomorphic, like every other non-`let` binder: a mutable variable is a single
     // object with one writer set, so there is nothing to generalize and
     // specializing it would duplicate the mutable variable.
-    let body_ty = ctx.scoped(&binding.name, &history, |ctx| ctx.subexpr(body))?;
+    let body_ty = ctx.scoped(&binding.name, &history, |ctx| emit_value_read(body, ctx))?;
     // The body type is returned as-is, *not* through `close_let_type`. A `let`'s
     // binder can be discharged into the lifted type because the binder simply *is*
     // its bound expression; a mutable variable is not — its value is the join over the seed
@@ -1219,7 +1255,7 @@ pub(super) fn emit_for<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let iter_ty = ctx.subexpr(iter)?;
+    let iter_ty = emit_value_read(iter, ctx)?;
     let iter_label = symbolic(iter);
     let (_domain, item_ty) =
         ctx.as_function(&iter_ty, &|| format!("for-loop source `{iter_label}`"))?;
@@ -1310,7 +1346,7 @@ pub(super) fn emit_list<C: Typing>(
     // `IncompatibleBounds` at coalesce, reported there rather than here.
     let elem_ty = ctx.fresh();
     for elt in elts.iter_mut() {
-        let t = ctx.subexpr(elt)?;
+        let t = emit_value_read(elt, ctx)?;
         ctx.require_sub(&t, &elem_ty, &|| "List element".to_string())?;
     }
     let first_ty = elem_ty;
@@ -1349,7 +1385,7 @@ pub(super) fn emit_case<C: Typing>(
     // branch pattern tags, minting one payload var αᵢ per pattern branch and
     // writing it into the branch's binding slot (coalesce resolves it later).
     if let Some(scrut) = scrutinee {
-        let scrut_ty = ctx.subexpr(scrut)?;
+        let scrut_ty = emit_value_read(scrut, ctx)?;
         let mut expected_tags: BTreeMap<FieldKey, Type> = BTreeMap::new();
         for b in branches.iter_mut() {
             if let Some(p) = &mut b.pattern {
@@ -1401,7 +1437,7 @@ pub(super) fn emit_case<C: Typing>(
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the
 /// body's type. The pattern binding (if any) is already in scope.
 fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, LocatedInferError> {
-    let guard_ty = ctx.subexpr(&mut b.guard)?;
+    let guard_ty = emit_value_read(&mut b.guard, ctx)?;
     // One-way: a guard must *be* a `Bool`, not be exactly `Bool`. A refined boolean
     // is still a boolean, and a refinement drops on the way up.
     ctx.require_sub(&guard_ty, &prim(BaseType::Bool), &|| {
@@ -1415,7 +1451,7 @@ pub(super) fn emit_variant_ctor<C: Typing>(
     payload: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let payload_ty = ctx.subexpr(payload)?;
+    let payload_ty = emit_value_read(payload, ctx)?;
     let mut tags = BTreeMap::new();
     tags.insert(FieldKey::Name(SmolStr::from(tag)), payload_ty);
     Ok(variant_type(tags))
