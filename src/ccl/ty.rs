@@ -449,7 +449,21 @@ pub enum Type {
     /// write edge reads as a demand *on* the writes rather than a contribution
     /// *to* them: without it, passing a `Mut({a: Int, b: Int})` register to a
     /// parameter declared `Mut({a: Int})` would let the callee's `r := (a=5)`
-    /// drop a field the caller's declaration requires.
+    /// drop a field the caller's declaration requires. That cannot be narrowed to
+    /// "invariant only where the value type is declared", because *declaredness is
+    /// provenance, not a property of a type*: a variance rule sees two types and
+    /// cannot ask where either came from.
+    ///
+    /// **The rule is not what currently enforces that across a function boundary.**
+    /// At an argument position the deref arm fires first — `Typing::apply` records
+    /// `arg <: ?d` against a fresh variable, so a register meets an `Infer` and reads
+    /// through — so the `(History, History)` arm never runs there. Invariance at a
+    /// pass-by-reference call is assembled from two other edges instead: the
+    /// application edge supplies `caller <: callee`, and `emit::contribute_pbr_writes`
+    /// supplies `callee <: caller`. Equal in strength to the rule, spread across two
+    /// mechanisms — which is why the property is pinned by test
+    /// (`a_registers_value_type_is_invariant_across_a_mut_parameter`) rather than
+    /// argued from this paragraph.
     ///
     /// It is also a **transient** variant like `Hole` / `Infer`: it exists only between type
     /// inference (which stamps it on `:=` / `defer` introductions and every
