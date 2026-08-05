@@ -389,6 +389,11 @@ fn shared_base(fun: &TypeFn, args: &[&Type]) -> Result<Type, ReduceError> {
 /// named next clients.
 fn strip_value_claims(ty: &Type, covariant: bool) -> Type {
     match ty {
+        // Not a type — an annotation-position obligation, erased by
+        // `normalize_annotation` before any constraint is emitted (see `Type::Below`).
+        Type::Below(_) => {
+            unreachable!("Type::Below reached the solver; `normalize_annotation` must erase it")
+        }
         // A refinement at a *covariant* position is a claim about the value produced
         // and is dropped; at a *contravariant* one it is part of the shape being
         // consumed — a collection's extent — and is kept.

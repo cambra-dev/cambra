@@ -547,14 +547,17 @@ pub fn refined_data_fun(base_domain: Type, predicate: Expr, codomain: Type) -> T
 /// it wanting are elsewhere:
 ///
 /// - "these are related on their base, not on their refinements" during inference:
-///   a [`TypeFn`](crate::ccl::TypeFn) over the positions, whose rule defers the same
-///   question until the arguments resolve. `Arithmetic`'s does exactly this, via
+///   a [`Type::App`](crate::ccl::Type::App) over them, whose rule defers the same
+///   question until the types resolve — `Arithmetic`'s does exactly this, via
 ///   `shared_base`.
 /// - "look *past* the outer layers" — what a shape test wants, since a refinement is
 ///   not part of the shape: [`Type::peel_refinements`](crate::ccl::Type::peel_refinements),
 ///   which borrows rather than dropping.
 pub(crate) fn strip_refinements(ty: &Type) -> Type {
     match ty {
+        // Annotation-position only, and structural: keep the wrapper and strip
+        // inside it, so a bounded annotation's bound is stripped like any other.
+        Type::Below(t) => Type::Below(Box::new(strip_refinements(t))),
         Type::Refinement(base, _) => strip_refinements(base),
         Type::Fun {
             domain, codomain, ..

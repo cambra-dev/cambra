@@ -6,7 +6,10 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
 use super::*;
 use crate::{
     ccl::{BaseType, Branch, Expr, Lit, Type, TypedExprNode},
-    chl_parser::ast::{AssignTarget, IfBranch, Lit as ChlLit, Span, Spanned, Stmt as ChlStmt},
+    chl_parser::ast::{
+        AnnotationMode, AssignTarget, IfBranch, Lit as ChlLit, Span, Spanned, Stmt as ChlStmt,
+        TypeAnnotation,
+    },
     interpreter::{DataSink, HttpServerDataSource, http_server::SharedHttpServer},
 };
 
@@ -499,7 +502,7 @@ pub(super) fn lower_middle_stmt(
             value,
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
-            if mut_annotation_parts(annotation).is_some() {
+            if mut_annotation_parts(&annotation.ty).is_some() {
                 // `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut`
                 // annotation with the *immutable* `=` operator. This is
                 // contradictory under the cutover: `=` is a plain immutable
@@ -580,10 +583,18 @@ pub(super) fn lower_middle_stmt(
             //   `x: Mut(V) := e`   → induction accumulator at value type `V`
             //   `x: Mut(V, Txn)`   → transactional register at value type `V`
             //   `x: T := e`        → induction accumulator at value type `T`
+            //   `x <: T := e`      → value type inferred, bounded above by `T`
+            //
+            // In every annotated case the mode applies to the *value* type, which is
+            // what the annotation names: `Mut(V)` contributes `V` and the domain is
+            // decided below, so `x <: Mut(V) := e` and `x <: V := e` agree.
             let (value_ty, is_txn) = match annotation {
                 None => (Type::Hole, false),
-                Some(ann) => match mut_annotation_parts(ann) {
-                    Some(parts) => parts?,
+                Some(ann) => match mut_annotation_parts(&ann.ty) {
+                    Some(parts) => {
+                        let (value, is_txn) = parts?;
+                        (apply_annotation_mode(ann.mode, value), is_txn)
+                    }
                     None => (lower_type_annotation(ann)?, false),
                 },
             };
@@ -864,9 +875,9 @@ pub(super) fn mut_annotation_parts(
         return None;
     }
     match args.as_slice() {
-        [value] => Some(lower_type_annotation(value).map(|t| (t, false))),
+        [value] => Some(lower_type_expr(value).map(|t| (t, false))),
         [value, domain] => {
-            let value_ty = match lower_type_annotation(value) {
+            let value_ty = match lower_type_expr(value) {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e)),
             };
@@ -924,7 +935,7 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                 // A malformed `Mut(…)` annotation (`Err`) surfaces its real error
                 // when the `MutAssign` itself is lowered; not registering it here
                 // is harmless.
-                if matches!(mut_annotation_parts(annotation), Some(Ok((_, true)))) {
+                if matches!(mut_annotation_parts(&annotation.ty), Some(Ok((_, true)))) {
                     ctx.register_transactional(id.as_str());
                 }
             }
@@ -950,12 +961,46 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
     }
 }
 
-/// Whether a type annotation is a pass-by-reference `Mut(…)` form.
-fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
-    mut_annotation_parts(annotation).is_some()
+/// Whether a binder annotation is a pass-by-reference `Mut(…)` form.
+///
+/// Reads the annotation's *type* only: the mode is orthogonal to whether the
+/// binder names a register (`x <: Mut(V) := e` introduces one just as
+/// `x: Mut(V) := e` does).
+fn is_mut_annotation(annotation: &TypeAnnotation) -> bool {
+    mut_annotation_parts(&annotation.ty).is_some()
 }
 
-/// Lower a CHL type annotation expression to a CCL [`Type`].
+/// Lower a binder's type annotation, applying its [`AnnotationMode`].
+///
+/// `x: T` lowers to `T`; `x <: T` lowers to [`Type::Below`], the marker
+/// `normalize_annotation` turns into an inference variable bounded above by `T`.
+/// The mode is a property of the *binder*, not of a type: `<:` is grammatical only
+/// where a binder is introduced, so nested positions inside `T` are always exact
+/// and [`lower_type_expr`] needs no mode parameter. (Design:
+/// `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".)
+pub(super) fn lower_type_annotation(annotation: &TypeAnnotation) -> Result<Type, LoweringError> {
+    Ok(apply_annotation_mode(
+        annotation.mode,
+        lower_type_expr(&annotation.ty)?,
+    ))
+}
+
+/// Wrap a lowered annotation type in its binder's mode.
+///
+/// Separate from [`lower_type_annotation`] because a `Mut(…)` annotation is not
+/// lowered as one type: `mut_annotation_parts` splits it into a *value* type and a
+/// domain, and the binder's mode belongs to the value — `x <: Mut(V) := e` bounds
+/// the register's value type, exactly as `x <: V := e` does. Applying the mode in
+/// one place is what keeps those two spellings from disagreeing, which is how the
+/// `Mut` form came to silently drop its mode and read as exact.
+pub(super) fn apply_annotation_mode(mode: AnnotationMode, ty: Type) -> Type {
+    match mode {
+        AnnotationMode::Exact => ty,
+        AnnotationMode::Bounded => Type::Below(Box::new(ty)),
+    }
+}
+
+/// Lower a CHL type *expression* to a CCL [`Type`].
 ///
 /// Recognised forms:
 /// - Capitalized primitive names (`Caps` means type — `docs/chl-spec.md`):
@@ -969,7 +1014,7 @@ fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
 ///   (`docs/chl-spec.md`).
 /// - A record type `{name: T, …}` and a tuple type `{T, U}`
 ///   (`Expr::BraceGroup`).
-pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
+pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
         ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
             LoweringError::unsupported(annotation.span, format!("unknown type annotation: {id}"))
@@ -988,7 +1033,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
             for field in fields {
                 out.push((
                     field.name.as_str().to_string(),
-                    lower_type_annotation(&field.value)?,
+                    lower_type_expr(&field.value)?,
                 ));
             }
             Ok(Type::Record(out))
@@ -997,7 +1042,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
         ChlExpr::BraceGroup(parts) => Ok(Type::Tuple(
             parts
                 .iter()
-                .map(lower_type_annotation)
+                .map(lower_type_expr)
                 .collect::<Result<_, _>>()?,
         )),
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple
@@ -1063,7 +1108,7 @@ fn lower_type_application(
                 name: None,
                 kind: crate::ccl::ty::FunKind::Data,
                 domain: Box::new(Type::Hole),
-                codomain: Box::new(lower_type_annotation(elem)?),
+                codomain: Box::new(lower_type_expr(elem)?),
             })
         }
         // `Mut(…)` in a nested position is handled by `mut_annotation_parts`

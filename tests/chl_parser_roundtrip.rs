@@ -599,8 +599,8 @@ fn mut_txn_annotation_parses_as_type_application() {
     let Stmt::AnnAssign { annotation, .. } = &m.body[0].node else {
         panic!("expected an AnnAssign, got {:?}", m.body[0].node);
     };
-    let Expr::Call { func, args } = &annotation.node else {
-        panic!("expected a Call annotation, got {:?}", annotation.node);
+    let Expr::Call { func, args } = &annotation.ty.node else {
+        panic!("expected a Call annotation, got {:?}", annotation.ty.node);
     };
     assert!(
         matches!(&func.node, Expr::Name(n) if n == "Mut"),
