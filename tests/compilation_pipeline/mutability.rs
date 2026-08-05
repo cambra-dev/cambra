@@ -21,6 +21,100 @@ for i in [1, 2, 3]:
 x"#,
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
+// A register seeded from a **computed** expression rather than a literal.
+//
+// Every other case here seeds from a bare literal, which is a weaker exercise of the
+// register law than it looks: a projection *selects*, so `r.a` carries the field's
+// refinement into the seed, and the register's value type is right only because the
+// loop's writes join with it. A seed contributes verbatim and the join is the lattice's
+// — the intersection over every contribution — so the refinement drops out here and the
+// register types as `Mut(Int)`.
+#[case(
+    r#"
+r = (a=0, b=9)
+x := r.a
+for i in [1, 2, 3]:
+    x += i
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![6]))
+)]
+// The same seed with **no writes at all**. The join has one member, so the register
+// keeps its seed's refinement — and that is correct, since it really does hold that
+// value at every position. Nothing pre-emptively widens it.
+#[case(
+    r#"
+r = (a=7, b=9)
+x := r.a
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![7]))
+)]
+// A register whose only write goes **through a `Mut` parameter**. The write is not
+// lexically visible at `x`, so the join needs the call itself to contribute: passing a
+// register to a `Mut(V)` parameter means the callee may write any `V` there.
+//
+// Without that contribution the register's value type was left claiming its seed
+// (`{Int | __elem == 0}`) while the parameter demanded `Mut(Int)`, and since `Mut` is
+// invariant the call was rejected outright. The ordinary application edges cannot supply
+// it — `apply` records `arg <: d` against a *fresh variable*, so a `Mut` argument meets
+// an `Infer` and takes the deliberate deref arm, which is right for a bare read
+// (`cnt + 1`) and drops the handle here.
+#[case(
+    r#"
+def fw(c: Mut(Int)):
+  c += 1
+x := 0
+for i in [1, 2, 3]:
+  fw(x)
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![3]))
+)]
+// The same contribution at an argument position that is **not the first**. A call is
+// curried, and `apply` types each application as a fresh variable, so the type of the
+// function being applied says nothing about this parameter — the contribution has to
+// come off the head of the spine (`parameter_type`). Reading it off the applied type
+// instead covers `fw(x, n)` and silently skips this, which then fails the invariance
+// check against `Mut(Int)` because the register still claims its seed.
+#[case(
+    r#"
+def fw(n: Int, c: Mut(Int)):
+  c += n
+x := 0
+for i in [1, 2, 3]:
+  fw(2, x)
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![6]))
+)]
+// Two registers in one call: every argument position is walked, not just one.
+#[case(
+    r#"
+def fw(a: Mut(Int), b: Mut(Int)):
+  a += 1
+  b += 2
+x := 0
+y := 0
+for i in [1, 2, 3]:
+  fw(x, y)
+(x, y)"#,
+    Tile::Record(HashMap::from([
+        ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
+    ]))
+)]
+// A register reaching its writer through *two* calls. The inner call's contribution is
+// `Mut(Int)`'s value against the outer parameter's, so the register's join closes over
+// the whole forwarding chain rather than just the frame it was named in.
+#[case(
+    r#"
+def inner(c: Mut(Int)):
+  c += 1
+def outer(n: Int, c: Mut(Int)):
+  inner(c)
+x := 0
+for i in [1, 2, 3]:
+  outer(7, x)
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![3]))
+)]
 // The `:=` operator marks mutability syntactically — a bare `x := 0` induction
 // accumulator (no `Mut(…)` annotation) written with `x := x + i`.
 #[case(
@@ -473,9 +567,26 @@ fn expect_compile_error(code: &str, needle: &str) {
 
 /// A `+=` (or `:=` write) to a plain `=` binding is rejected: writes require a
 /// mutable variable, they never mean shadowing. Introduce the mutable variable with `:=`.
+///
+/// This is also what pins the *skipped* half of the write rule. A non-register target
+/// gets **no** type constraint at all — the diagnosis belongs to the mutability
+/// discipline, and a type error raised at the write would pre-empt it with a worse
+/// message. The write's own demand is exercised by
+/// [`write_of_the_wrong_type_is_rejected_against_the_registers_value_type`].
 #[test]
 fn augmented_assignment_to_non_mutable_rejected() {
     expect_mut_discipline_error("x = 0\nx += 1\nx", "not a mutable variable");
+}
+
+/// The other half: when the target *is* a register, the write is demanded against the
+/// register's real value type — the demand is not relaxed to buy diagnostic ordering.
+/// `Mut(Int)` genuinely demands `Int` of every write.
+#[test]
+fn write_of_the_wrong_type_is_rejected_against_the_registers_value_type() {
+    expect_compile_error(
+        "x: Mut(Int) := 0\nfor i in [1]:\n    x := \"s\"\nx",
+        "write to mutable variable `x`",
+    );
 }
 
 /// `Mut(…)` takes one or two type arguments (`Mut(V)` or `Mut(V, Txn)`); three
@@ -770,6 +881,41 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
     check_scalar(
         "x: Mut(Int) := 1\ny: Int = x\nz = y\nz",
         cambra::interpreter::Value::Int(1),
+    );
+}
+
+/// A register passed to a **value** parameter reads, and the read carries the register's
+/// value type all the way through inlining.
+///
+/// The register is unwritten, so its value type is still its seed's singleton
+/// (`Mut({Int | __elem == 5}, ?d)`), and the parameter — whose type is inferred, since an
+/// annotation bounds rather than fixes it — takes that refinement, because the call site
+/// is typed against the dereferenced value. Beta-reduction then has to discharge a
+/// refinement demanded of the value against an argument node still stamped with the
+/// handle: the `Mut` survives on the bare `Var` for the phase to find the read. Reading
+/// through the handle is what makes the two comparable; comparing the stamp directly asks
+/// a handle to entail a fact about a value and trips `inline`'s entailment assert.
+///
+/// The last case is the surrounding one that reaches the same parameter *without* a
+/// refinement — the use demands `Int`, which widens it — so a future narrowing of the
+/// read shows up as a difference between the cases rather than as silence.
+#[rstest]
+#[case::unannotated("def id(v):\n    v\nx := 5\nid(x)")]
+#[case::annotated("def id(v: Int):\n    v\nx := 5\nid(x)")]
+#[case::widened_by_use("def inc(v):\n    v + 1\nx := 4\ninc(x)")]
+fn a_register_passed_to_a_value_parameter_reads_its_value(#[case] code: &str) {
+    check_scalar(code, cambra::interpreter::Value::Int(5));
+}
+
+/// The same read from *inside* the loop that writes the register — the combination the
+/// cases above leave out. The value type is the join over seed and writes, so no
+/// singleton survives and it is not the refinement branch that carries this one; what it
+/// pins is that a register still reaches a UDF as a per-iteration read.
+#[test]
+fn a_register_read_through_a_udf_inside_its_own_loop() {
+    check_scalar(
+        "def id(v):\n    v\nx := 5\nfor i in [1, 2, 3]:\n    x += id(x)\nx",
+        cambra::interpreter::Value::Int(40),
     );
 }
 
