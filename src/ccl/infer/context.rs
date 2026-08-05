@@ -199,6 +199,47 @@ impl InferCtx {
                 .entry(*id)
                 .or_insert_with(|| fresh_var(self.level))
                 .clone(),
+            // A bounded annotation `𝑥 <: 𝑇` means "infer this, subject to `<: 𝑇`"
+            // → the same fresh variable, carrying `𝑇` as an upper bound. This is
+            // the *only* place `Below` is consumed; every other pass either
+            // rewrites through it structurally or treats it as unreachable.
+            //
+            // A bound never wraps a **history**: lowering applies a binder's mode to
+            // the history's *value* type (`lower::stmts::apply_annotation_mode`), so
+            // `x <: Mut(V) := e` arrives as `Mut(Below(V), D)` and the `Below` is
+            // consumed by the value position below.
+            //
+            // That is not merely where it happens to sit — it is the only place it
+            // can. A register binder's slot must stay structurally a `History`:
+            // `as_register`, the deref coercion, `mut_elim`, and `transact_phase` all
+            // dispatch on the shape, and a variable standing for the whole history
+            // would skip a write's `value <: V` edge, so the register would never
+            // receive its writes. The value position has no such constraint — a
+            // variable there is the ordinary case, since an unannotated `x := 5` binds
+            // at `Mut(?v, ?d)` too — and it is where a strict subtype can differ at
+            // all. A wrapper here means a lowering path built a history without
+            // routing its annotation through the mode.
+            Type::Below(bound) if bound.is_handle() => {
+                unreachable!(
+                    "a bounded annotation wraps a history ({bound}); lowering applies \
+                     the binder's mode to the history's value type instead"
+                )
+            }
+            Type::Below(bound) => {
+                let v = fresh_var(self.level);
+                let bound = self.normalize_annotation(bound);
+                // A **local** cache, not `self.cache`: this method takes `&self`,
+                // and the memo exists only to break recursion on cyclic bounds.
+                // `v` is brand new, so the sole action is pushing one upper edge —
+                // there are no lower bounds to close against and nothing to
+                // recurse into, so a fresh memo is equivalent to the shared one.
+                //
+                // The result is discarded because a fresh variable cannot conflict
+                // with its first upper bound; a genuine mismatch surfaces later,
+                // when a value flows in and fails against this bound.
+                let _ = constrain_subtype(&v, &bound, &mut ConstrainCache::new());
+                v
+            }
             // Refinements ride the lattice: keep the wrapper, normalize the
             // inner (so a `Refinement(Hole, r)` source annotation becomes
             // `Refinement(?fresh, r)` rather than losing the refinement).
@@ -485,7 +526,7 @@ impl Typing for InferCtx {
         body_ty
     }
 
-    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), LocatedInferError> {
+    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
         // Shared by *binder* annotations (trait call sites in the emit rules)
         // and *node* annotations (`emit_node`'s `user_annotation` tail) — the
         // reconciliation is identical: annotation wins on success, conflict
@@ -523,7 +564,7 @@ impl Typing for InferCtx {
                 inferred: inferred_ty,
             })
         })?;
-        Ok(())
+        Ok(ann_simple)
     }
 
     fn binding_slot(&mut self, slot: &mut Type) -> Type {
