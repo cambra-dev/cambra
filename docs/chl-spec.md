@@ -1279,10 +1279,17 @@ nested-recurrence case below:
 > supported: declare it before the loop (`Y := …`) so its updates carry
 > across iterations, or bind a per-iteration value immutably with `Y = …``
 
-Falling back to a per-iteration binding is deliberately *not* what happens,
-for the reason a plain `=` to an outer name is rejected: it would silently
-discard every update at the iteration boundary, which is the one thing `:=`
-exists to rule out.
+The same holds for `op=`, which is a mutable write and not a rebind: `x += e`
+inside a loop body requires `x` to be a mutable variable declared before the
+loop. A target that is not gets the matching error rather than a
+per-iteration binding.
+
+Falling back to a per-iteration binding is deliberately *not* what happens in
+either case, for the reason a plain `=` to an outer name is rejected: it would
+silently discard every update at the iteration boundary, which is the one thing
+`:=` exists to rule out. For `op=` it is worse than a lost update — `op=` reads
+the old value, so a per-iteration rebind reads the binding's *initial* value on
+every iteration.
 
 *Currently unsupported* (see §12): nested for-loops with mutable
 variables, mutable variables introduced inside a loop body or a `with
