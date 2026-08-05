@@ -112,6 +112,26 @@ pub(super) struct InferCtx {
     /// which is what lets `LocatedInferError` require a node instead of carrying
     /// an `Option` that every consumer must then interpret.
     current_node_id: NodeId,
+    /// Obligations the solver could not decide during emission because one side
+    /// was an unreduced [`Type::App`], each tagged with the node and label of the
+    /// rule that raised it. Drained by
+    /// [`check_parked_obligations`](Self::check_parked_obligations) once emission
+    /// completes; see [`require_sub`](Self::require_sub).
+    parked: Vec<ParkedObligation>,
+}
+
+/// A subtyping obligation deferred out of constraint emission, with the blame it
+/// will need if it turns out to fail.
+///
+/// The types are held **by variable**, not by value: a `Type::Infer` clone shares
+/// its `Rc<InferVar>`, so a parked obligation sees every bound recorded after it
+/// was parked. That is the whole point — parking exists to read the graph once it
+/// has stopped moving.
+struct ParkedObligation {
+    lhs: Type,
+    rhs: Type,
+    node: NodeId,
+    label: String,
 }
 
 impl InferCtx {
@@ -127,6 +147,7 @@ impl InferCtx {
             pred_memo: Default::default(),
             lit_singletons: HashMap::new(),
             current_node_id: root,
+            parked: Vec::new(),
         }
     }
 
@@ -196,6 +217,11 @@ impl InferCtx {
                 kind: *kind,
             },
             // Leaves and existing inference vars pass through unchanged.
+            // A type function normalizes argumentwise; the function itself is data.
+            Type::App { fun, args } => Type::App {
+                fun: fun.clone(),
+                args: args.iter().map(|a| self.normalize_annotation(a)).collect(),
+            },
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
@@ -220,6 +246,106 @@ impl InferCtx {
             return base;
         };
         Type::Refinement(Box::new(base), Refinement::sharing(&predicate))
+    }
+
+    /// Record one emission-time subtyping obligation, claiming whatever the solver
+    /// parks while doing so.
+    ///
+    /// **Every** emission-time `constrain_subtype` goes through here. A parked
+    /// obligation is only ever retried if something tagged it with a node to blame,
+    /// and the solver has no node cursor — so a call that bypassed this would
+    /// silently drop its obligation, which is the exact defect parking exists to
+    /// fix. [`check_parked_obligations`](Self::check_parked_obligations) asserts the
+    /// solver's park list is empty on the way out, which is what makes a future
+    /// bypass loud instead of silent.
+    fn constrain_and_claim(
+        &mut self,
+        sub: &Type,
+        sup: &Type,
+        label: &dyn Fn() -> String,
+    ) -> Result<(), crate::ccl::infer::solver::ConstrainError> {
+        let mark = self.cache.parked_len();
+        let result = constrain_subtype(sub, sup, &mut self.cache);
+        let newly_parked = self.cache.take_parked_from(mark);
+        if !newly_parked.is_empty() {
+            let node = self.current_node_id;
+            let label = label();
+            self.parked
+                .extend(newly_parked.into_iter().map(|(lhs, rhs)| ParkedObligation {
+                    lhs,
+                    rhs,
+                    node,
+                    label: label.clone(),
+                }));
+        }
+        result
+    }
+
+    /// Discharge the obligations emission could not decide, now that the graph has
+    /// stopped moving.
+    ///
+    /// Every entry has an unreduced [`Type::App`] on one side or the other, which
+    /// `constrain_go` cannot see through *during* emission: reduction resolves the
+    /// application's arguments off the bound graph, and reading that graph while it
+    /// is still being built is the staleness the demand-driven design exists to rule
+    /// out. Between emission and coalesce there is no such hazard — every edge the
+    /// program implies has been recorded — so each side materializes to an
+    /// `App`-free type and the obligation becomes an ordinary subtyping check.
+    ///
+    /// **Only fully-determined obligations are checked**, and that is what keeps
+    /// this pass from perturbing the very graph it is reading. A side that still
+    /// contains a variable after materialization is one the program never
+    /// determined; re-constraining it would *record* a bound, which is a graph
+    /// mutation after emission and would make a later resolution's answer depend on
+    /// whether this pass ran. Skipping is not a hole in the check either — an
+    /// undetermined operand is an ambiguous program, and coalesce reports it as
+    /// `UnresolvedInfer`. With both sides variable-free the check cannot deposit
+    /// anything: there is nothing left to bound.
+    ///
+    /// A side that fails to materialize is skipped for a different reason: the
+    /// failure *is* the diagnostic (`NoCommonBase` for `1 + "a"`), and coalesce
+    /// raises it on the node whose type it is, which is a better blame than this
+    /// pass could give.
+    pub(super) fn check_parked_obligations(&mut self) -> Vec<LocatedInferError> {
+        use crate::ccl::infer::solver::ConstrainCache;
+        use crate::ccl::subst::type_contains_infer;
+
+        let mut errors = Vec::new();
+        for ParkedObligation {
+            lhs,
+            rhs,
+            node,
+            label,
+        } in std::mem::take(&mut self.parked)
+        {
+            let (Ok(lhs), Ok(rhs)) = (
+                super::solve::resolve_var_type(&lhs),
+                super::solve::resolve_var_type(&rhs),
+            ) else {
+                continue;
+            };
+            if type_contains_infer(&lhs) || type_contains_infer(&rhs) {
+                continue;
+            }
+            // Kind-blind for the same reason the post-inference structural check is
+            // (see `ConstrainCache`): both sides have been through coalesce, which
+            // canonicalizes every reconstructed arrow's kind, so a kind edge here
+            // would be re-deciding a question inference already settled on the
+            // pre-coalesce types.
+            if let Err(e) = constrain_subtype(&lhs, &rhs, &mut ConstrainCache::new_kind_blind()) {
+                errors.push(LocatedInferError {
+                    error: map_constrain_err(e, &label),
+                    node_id: node,
+                });
+            }
+        }
+        debug_assert_eq!(
+            self.cache.parked_len(),
+            0,
+            "an emission-time `constrain_subtype` bypassed `constrain_and_claim`: its \
+             parked obligation has no node to blame and would be dropped unchecked"
+        );
+        errors
     }
 }
 
@@ -254,7 +380,7 @@ impl Typing for InferCtx {
         sup: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        constrain_subtype(sub, sup, &mut self.cache)
+        self.constrain_and_claim(sub, sup, at)
             .map_err(|e| self.raise(map_constrain_err(e, &at())))
     }
 
@@ -360,7 +486,11 @@ impl Typing for InferCtx {
         // the error shows what was actually inferred, not the partially
         // modified state after a failed constrain_subtype.
         let inferred_ty = coalesce_for_error(inferred);
-        constrain_subtype(inferred, &ann_simple, &mut self.cache).map_err(|_| {
+        let ann_label = ann.to_string();
+        self.constrain_and_claim(inferred, &ann_simple, &|| {
+            format!("annotation `{ann_label}`")
+        })
+        .map_err(|_| {
             self.raise(InferError::AnnotationMismatch {
                 annotation: ann.clone(),
                 inferred: inferred_ty,
@@ -456,13 +586,10 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &applied else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        v.bounds
-            .borrow_mut()
-            .lower
-            .push(crate::ccl::Bound::with_subst(
-                result,
-                crate::ccl::subst::Subst::discharge(&x, argument.clone()),
-            ));
+        v.bounds_mut().lower.push(crate::ccl::Bound::with_subst(
+            result,
+            crate::ccl::subst::Subst::discharge(&x, argument.clone()),
+        ));
         Ok(applied)
     }
 }

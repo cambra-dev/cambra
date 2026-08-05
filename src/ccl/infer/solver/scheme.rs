@@ -29,7 +29,7 @@ use super::type_level;
 /// # Usage
 ///
 /// Two sources of schemes: (1) operator/projection signatures that are
-/// inherently polymorphic (`Compare : ∀α. α → α → Bool`,
+/// inherently polymorphic (`Compare : ∀α β. α → β → Greater(α, β)`,
 /// `Proj(Index n) : ∀α. {n: α, …} → α`, etc.), built once in
 /// `OperatorSchemes`; and (2) let-generalization — a multi-use function
 /// binding is generalized into a `PolyScheme` at its binding level
@@ -186,6 +186,20 @@ pub fn freshen_above(
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => {
             ty.clone()
         }
+        // A type function freshens argumentwise. This is what carries a scheme's
+        // *internal* operand requirement to each instantiation: the requirement is
+        // a bound `α <: CommonBase(α, β)` on a quantified variable, and the bound
+        // walk below freshens a bound's type through this same cache — so the
+        // instantiated copy bounds the fresh `α'` by `CommonBase(α', β')`, still
+        // self-referential and still relating exactly this instantiation's
+        // operands.
+        Type::App { fun, args } => Type::App {
+            fun: fun.clone(),
+            args: args
+                .iter()
+                .map(|a| freshen_above(lim, a, target, cache))
+                .collect(),
+        },
         // A channel domain minted inside the generalized definition
         // (level > lim) is *quantified* exactly like a variable — each
         // instantiation is its own channel. But a rigid name cannot be
@@ -276,7 +290,7 @@ pub fn freshen_above(
             // Snapshot bounds before recursing — the recursion may touch
             // other variables but must not see partially-mutated state.
             let (lows, ups) = {
-                let s = tv.bounds.borrow();
+                let s = tv.bounds();
                 (s.lower.clone(), s.upper.clone())
             };
             // Freshen the bound's type *and* its edge substitutions' discharge
@@ -301,7 +315,7 @@ pub fn freshen_above(
                 })
                 .collect();
             {
-                let mut s = v.bounds.borrow_mut();
+                let mut s = v.bounds_mut();
                 s.lower = new_lows;
                 s.upper = new_ups;
             }
@@ -410,7 +424,7 @@ fn seed_pairings_go(
     if let Type::Infer(dv) = peel(def_ty) {
         if seen.insert(dv.uid) {
             let (lows, ups) = {
-                let s = dv.bounds.borrow();
+                let s = dv.bounds();
                 (s.lower.clone(), s.upper.clone())
             };
             for b in lows.iter().chain(ups.iter()) {
@@ -422,7 +436,7 @@ fn seed_pairings_go(
     if let Type::Infer(uv) = peel(use_ty) {
         if seen.insert(uv.uid) {
             let (lows, ups) = {
-                let s = uv.bounds.borrow();
+                let s = uv.bounds();
                 (s.lower.clone(), s.upper.clone())
             };
             for b in lows.iter().chain(ups.iter()) {
@@ -489,6 +503,27 @@ fn seed_pairings_go(
         ) => {
             seed_pairings_go(uv, dv, lim, out, seen);
             seed_pairings_go(ud, dd, lim, out, seen);
+        }
+        // A type function's arguments are ordinary child types, so they pair
+        // argumentwise. Nothing reaches this today — an `App` is materialized
+        // away before a use type is resolved, and today's type functions take scalar
+        // arguments that could not hold a `ChanDom` anyway — but a compound-argument
+        // type function (`FieldOf`, `CollectionUnion`) could, and falling into the
+        // structural-disagreement arm below would silently leave a definition's
+        // channel unpaired.
+        (
+            Type::App {
+                fun: ufun,
+                args: ua,
+            },
+            Type::App {
+                fun: dfun,
+                args: da,
+            },
+        ) if ufun == dfun => {
+            for (u, d) in ua.iter().zip(da) {
+                seed_pairings_go(u, d, lim, out, seen);
+            }
         }
         // A feed handle reads through to its stream `Fun(domain, value)`
         // during coalescing (`dissolve_read_feeds`), so the use side may be

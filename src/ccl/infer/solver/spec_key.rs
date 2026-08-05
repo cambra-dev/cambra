@@ -93,7 +93,7 @@ use std::fmt;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::{FieldKey, HistoryKind, InferVarId, Refinement, Type};
+use crate::ccl::{FieldKey, HistoryKind, InferVarId, Refinement, Type, TypeFn};
 
 use super::compact::{AtomKey, KindMerge};
 
@@ -156,6 +156,15 @@ struct KeyView {
     /// handle at one position stay distinguishable rather than one shadowing the
     /// other. Each maps to `(value, domain)`.
     history: BTreeMap<HistoryKind, (Box<KeyView>, Box<KeyView>)>,
+    /// Unreduced type-function applications at this position, as
+    /// `(type function, argument keys)`.
+    ///
+    /// Keyed **structurally**, not by reducing the application. Reducing would be more
+    /// precise, and leaving it for later is safe because the imprecision runs the
+    /// right way: two uses whose arguments differ key apart even where the function
+    /// would reduce them alike, so this over-splits (a wasted clone) and never
+    /// under-splits (a clone shared with a use it is wrong for).
+    compute: Vec<(TypeFn, Vec<KeyView>)>,
 }
 
 /// Structural equality, with `refinements` compared as a set.
@@ -170,8 +179,58 @@ impl PartialEq for KeyView {
         fn same_refinements(a: &[Refinement], b: &[Refinement]) -> bool {
             a.len() == b.len() && a.iter().all(|w| b.contains(w))
         }
+        // Match each element of `a` to a *distinct* element of `b`. Equal lengths
+        // plus a greedy injection is multiset equality, and a plain `any` would not
+        // be: two elements of `a` that both match `b[0]` would pass while a genuinely
+        // different `b[1]` went unnoticed.
+        //
+        // `eq` is an equivalence here (`same_args` and `KeyView::eq` both are), so
+        // greedy matching cannot pick a partner that strands a later element — no
+        // backtracking is needed.
+        fn injects<T>(a: &[T], b: &[T], eq: impl Fn(&T, &T) -> bool) -> bool {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut taken = vec![false; b.len()];
+            a.iter().all(|x| {
+                match b
+                    .iter()
+                    .enumerate()
+                    .position(|(i, y)| !taken[i] && eq(x, y))
+                {
+                    Some(i) => {
+                        taken[i] = true;
+                        true
+                    }
+                    None => false,
+                }
+            })
+        }
+        // Two applications of one function match when their arguments do. For a
+        // function whose rule is symmetric ([`TypeFn::args_are_unordered`]) that is a
+        // multiset comparison, because the order the walk *recorded* them in is not
+        // information about the position — see [`KeyView::compute`].
+        fn same_args(fun: &TypeFn, a: &[KeyView], b: &[KeyView]) -> bool {
+            if !fun.args_are_unordered() {
+                return a == b;
+            }
+            injects(a, b, |x, y| x == y)
+        }
+        // Also a multiset match, and it has to be. `KeyView::union` dedupes with
+        // derived `==`, which compares a symmetric function's arguments
+        // *positionally* — so a position can legitimately hold both `CommonBase(Int,
+        // 1)` and `CommonBase(1, Int)`, two entries `same_args` considers equal. A
+        // containment test would let both match one entry on the other side and miss
+        // a third that differs, which is the under-split [`KeyView::compute`]'s doc
+        // says cannot happen.
+        fn same_compute(a: &[(TypeFn, Vec<KeyView>)], b: &[(TypeFn, Vec<KeyView>)]) -> bool {
+            injects(a, b, |(fun, args), (g, s)| {
+                g == fun && same_args(fun, args, s)
+            })
+        }
         self.atoms == other.atoms
             && same_refinements(&self.refinements, &other.refinements)
+            && same_compute(&self.compute, &other.compute)
             && self.fun == other.fun
             && self.rec == other.rec
             && self.var == other.var
@@ -202,6 +261,11 @@ impl KeyView {
                     d0.union(*domain);
                     c0.union(*codomain);
                 }
+            }
+        }
+        for c in other.compute {
+            if !self.compute.contains(&c) {
+                self.compute.push(c);
             }
         }
         union_map(&mut self.rec, other.rec);
@@ -259,6 +323,10 @@ impl fmt::Display for KeyView {
         if !self.var.is_empty() {
             let tags: Vec<String> = self.var.iter().map(|(k, v)| format!(".{k}: {v}")).collect();
             parts.push(format!("[{}]", tags.join(" | ")));
+        }
+        for (fun, args) in &self.compute {
+            let rendered: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parts.push(format!("{fun}({})", rendered.join(", ")));
         }
         for (kind, (value, domain)) in &self.history {
             let name = match kind {
@@ -358,6 +426,15 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // arm is for exhaustiveness, and "no information here" is the honest
         // reading if one ever did.
         Type::Hole => KeyView::default(),
+        Type::App { fun, args } => KeyView {
+            compute: vec![(
+                fun.clone(),
+                args.iter()
+                    .map(|a| key_go(a, pol, subst_acc, ctx))
+                    .collect(),
+            )],
+            ..Default::default()
+        },
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
         // dependent-application discharge lands in the key as the predicate the
@@ -458,7 +535,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 return KeyView::default();
             }
             let bounds = {
-                let b = state.bounds.borrow();
+                let b = state.bounds();
                 if pol {
                     b.lower.clone()
                 } else {
@@ -625,7 +702,7 @@ mod tests {
             let Type::Infer(v) = var else {
                 unreachable!("fresh_var yields Type::Infer");
             };
-            v.bounds.borrow_mut().lower.push(Bound::conc(ty));
+            v.bounds_mut().lower.push(Bound::conc(ty));
         }
         let a = fresh_var(0);
         let b = fresh_var(0);
@@ -654,6 +731,87 @@ mod tests {
 
         // And the whole key is independent of the order the walk meets them.
         assert_eq!(both, spec_key(&Type::Tuple(vec![b, a])));
+    }
+
+    /// A function whose rule is symmetric contributes the same key whichever order
+    /// the walk recorded its arguments in.
+    ///
+    /// This is not a cosmetic normalization — it is what keeps a *contentless*
+    /// difference from splitting a specialization. An operand requirement is a
+    /// self-referential bound (`α <: CommonBase(α, β)`), so a walk that reaches it
+    /// from `α` truncates `α` and expands `β`, and one that reaches it from `β` does
+    /// the reverse. Both describe the one requirement; recorded positionally, they
+    /// describe two. Two uses landing in the two operand slots of a single `+` are
+    /// exactly that pair, and they were minted as two clones of identical code.
+    ///
+    /// A function whose rule *reads* its arguments positionally keeps a positional
+    /// comparison, which is why this asks [`TypeFn::args_are_unordered`] rather than
+    /// sorting everything.
+    #[test]
+    fn a_symmetric_type_functions_argument_order_is_not_information() {
+        let app = |fun, args| Type::App { fun, args };
+        let unordered = |a, b| spec_key(&app(TypeFn::CommonBase, vec![a, b]));
+        assert_eq!(
+            unordered(int(), singleton(1)),
+            unordered(singleton(1), int()),
+            "`CommonBase` is the base its arguments share — a set operation"
+        );
+        // Different *contents* still split: the multiset is compared, not discarded.
+        assert_ne!(
+            unordered(int(), singleton(1)),
+            unordered(int(), singleton(2)),
+        );
+        // A function that is not declared symmetric keeps its argument order.
+        let add = |a, b| {
+            spec_key(&app(
+                TypeFn::Arithmetic(crate::ccl::ArithmeticKind::Add),
+                vec![a, b],
+            ))
+        };
+        assert_ne!(
+            add(int(), singleton(1)),
+            add(singleton(1), int()),
+            "a positional rule's argument order is information until it is not"
+        );
+    }
+
+    /// A position holding *several* applications compares them as a multiset, and
+    /// the two halves of that have to agree about what "the same application" means.
+    ///
+    /// [`KeyView::union`] dedupes with derived `==`, which compares a symmetric
+    /// function's arguments positionally, so `CommonBase(Int, 1)` and
+    /// `CommonBase(1, Int)` both survive into one position's list — while
+    /// `same_args` considers them equal. Under a containment test both would match
+    /// the single `CommonBase(Int, 1)` on the other side and the differing
+    /// `CommonBase(Int, 2)` would never be looked at: two positions that must
+    /// specialize apart sharing one clone, which is the under-split
+    /// [`KeyView::compute`]'s doc rules out.
+    #[test]
+    fn several_applications_at_one_position_compare_as_a_multiset() {
+        fn push_upper(var: &Type, ty: Type) {
+            let Type::Infer(v) = var else {
+                unreachable!("fresh_var yields Type::Infer");
+            };
+            v.bounds_mut().upper.push(Bound::conc(ty));
+        }
+        let app = |a, b| Type::App {
+            fun: TypeFn::CommonBase,
+            args: vec![a, b],
+        };
+
+        let a = fresh_var(0);
+        push_upper(&a, app(int(), singleton(1)));
+        push_upper(&a, app(singleton(1), int())); // same multiset, swapped
+
+        let b = fresh_var(0);
+        push_upper(&b, app(int(), singleton(1)));
+        push_upper(&b, app(int(), singleton(2))); // genuinely a different requirement
+
+        assert_ne!(
+            spec_key(&a),
+            spec_key(&b),
+            "a duplicate on one side must not cover for a difference on the other"
+        );
     }
 
     /// [`KeyView::union`]'s structural merges: two bounds contributing *different*

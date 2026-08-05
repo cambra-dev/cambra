@@ -59,7 +59,7 @@
 //!
 //! The [`OperatorSchemes`] registry additionally contains [`PolyScheme`](crate::ccl::infer::solver::PolyScheme)s for
 //! the handful of operator/projection cases that are inherently polymorphic
-//! (`Compare : ∀α. α → α → Bool`, `Max : ∀α γ. (α → γ) → γ`, etc.). Each scheme
+//! (`Compare : ∀α β. α → β → Greater(α, β)`, `Max : ∀α γ. (α → γ) → γ`, etc.). Each scheme
 //! is `instantiate`d at every use site, minting fresh vars per use.
 //!
 //! Most `Builtin` nodes are introduced post-inference by
@@ -91,7 +91,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use crate::ccl::FieldKey;
-use crate::ccl::infer::solver::{CoalesceError, ConstrainError, prim};
+use crate::ccl::infer::solver::{CoalesceError, ConstrainError, ReduceError, prim};
 use crate::ccl::{BaseType, BinOpKind, CompareKind, Lit, Refinement, Type, TypedExpr};
 
 use context::InferCtx;
@@ -231,6 +231,20 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
              does not cover)",
             ctx_label, details
         )),
+        // A reduction conflict is an ordinary type error about the operands, and it
+        // says so in its own words. Routing it through `IncompatibleBounds` — the
+        // shape the shared-variable scheme used to produce for `1 + "a"` — would
+        // reuse that variant's rendering along with its shape, and the rendering is
+        // a specific claim ("won't infer an untagged sum from a collision") that is
+        // not what happened here: each operand is well typed and nothing collided
+        // on a variable.
+        CoalesceError::Reduce(ReduceError::NoCommonBase { fun, bases }) => {
+            InferError::NoCommonBase {
+                fun,
+                bases,
+                at: ctx_label.to_string(),
+            }
+        }
     }
 }
 
@@ -341,6 +355,21 @@ pub(crate) fn run(
     // Emission is fail-fast, so there is at most one error; it already carries
     // the node whose rule raised it (`Typing::raise`).
     emit_node(expr, &mut sub_ctx).map_err(|e| vec![e])?;
+
+    // Emission's leftovers. An obligation whose two sides could not be compared
+    // during emission — one of them was an unreduced `Type::App`, and reducing it
+    // would have read a graph that was still being built — was parked instead of
+    // decided. This is the point the parking was for: every edge has been recorded,
+    // so reduction is meaningful and each side materializes to an `App`-free type.
+    //
+    // It runs *before* coalesce so that a violation is reported as an inference
+    // diagnostic rather than reaching the `check_pre_desugar` wall, where a plain
+    // user type error would be indistinguishable from a compiler bug and panic as
+    // one. See `InferCtx::check_parked_obligations`.
+    let parked_errors = sub_ctx.check_parked_obligations();
+    if !parked_errors.is_empty() {
+        return Err(parked_errors);
+    }
 
     // Pass 2: resolve each node's inference variables in place into expr.ty,
     // fill the binder slots that aren't any node's expr.ty (the `Let` binding

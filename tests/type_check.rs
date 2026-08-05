@@ -11,6 +11,7 @@
 //!   → Type          (test assertion here)
 //! ```
 
+use std::time::Duration;
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
@@ -792,6 +793,234 @@ f
 )]
 fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
     assert_eq!(infer_program(code), expected);
+}
+
+// Nested generic arithmetic that never resolves must still **finish**.
+//
+// An unapplied generic function leaves its operand types unresolved, which is an
+// ambiguous program and rejected downstream — but rejected, not hung on.
+//
+// The non-termination hazard these cases guard is specific. An operator states its
+// requirement on its operands as a bound on its own scheme variables, and that bound
+// is self-referential: arithmetic records `α <: CommonBase(α, β)` and
+// `β <: CommonBase(α, β)`. So resolving `α` reaches an application over `α` and `β`,
+// which resolves `β`, which reaches the same application and resolves `α` again
+// along a second path. Reduction deposits nothing (deliberately — that is what makes
+// it order-independent), so nothing is reused and the re-derivation branches at
+// every level. The memo in `compact.rs` (`RESOLVED_ARGS`, keyed by
+// `resolve_argument`) is what collapses the branching.
+//
+// `f(a, a)` is the case that did not terminate at all; the others were merely
+// exponential. The timeout is the assertion — the failure mode being guarded is
+// unbounded, not slow.
+//
+// What is **not** fixed, and what bounds how deep these cases can go: for chains
+// that never resolve, cost still grows exponentially with wrapper depth. That is
+// structural rather than a memoization gap — widening the memo's window further
+// takes a two-wrapper chain from "does not finish" to eight seconds, measured,
+// which is not a fix worth the staleness it would risk. A comparison shares that
+// profile because its result is `Compare(α, β)` over its operands; a scheme
+// declaring a bare `Bool` result would stop the walk, and would also never check
+// the operands (see `OperatorSchemes`, "An operand requirement must be reachable
+// from the result type"). Its entry here is therefore the minimal cycle rather
+// than a chain.
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+#[case::shared_operand("f = \\x, y -> x + y\ng = \\a -> f(a, a)\ng")]
+#[case::distinct_operands("f = \\x, y -> x + y\ng = \\a, b -> f(a, b)\ng")]
+#[case::self_addition("f = \\x -> x + x\ng = \\a -> f(a)\ng")]
+#[case::comparison("g = \\a -> a > a\ng")]
+fn test_unresolved_operand_chains_terminate(#[case] code: &str) {
+    // The type itself is uninteresting — it is residual `Infer`, which the strict
+    // wall rejects. Reaching this line is the property under test.
+    infer_program(code);
+}
+
+// A chain of generic wrappers that *does* resolve stays cheap, which is the
+// everyday half of the same property: each nesting level adds instantiations whose
+// operand bounds are self-referential, and resolving them must not compound.
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+#[case(2)]
+#[case(6)]
+fn test_applied_generic_chain_stays_cheap(#[case] depth: usize) {
+    let mut code = String::from("f0 = \\x, y -> x + y\n");
+    for i in 1..=depth {
+        code.push_str(&format!("f{i} = \\a, b -> f{}(a, b)\n", i - 1));
+    }
+    code.push_str(&format!("f{depth}(1, 2)"));
+    assert_eq!(infer_program(&code), int());
+}
+
+// Operands with no base in common are rejected, and say so in their own words.
+//
+// This is the reduction error channel's only user, and the diagnostic is the point:
+// routing it through `IncompatibleBounds` would borrow that variant's rendering
+// ("won't infer an untagged sum from a collision") along with its shape, and that
+// is not what happened — each operand is well typed and nothing collided on a
+// variable. The operator simply has no rule relating an `Int` to a `String`.
+//
+// The comparison cases are the ones that would regress silently. A comparison's
+// result is `Bool` no matter what its operands are, so a scheme that *said* `Bool`
+// left nothing to materialize its operand variables and the requirement relating
+// them was never read: `1 > "a"` type-checked and then panicked in the interpreter.
+// Stating the result as `Less(α, β)` — a rule constant on its domain, erroring off
+// it — is what puts the requirement on a path something walks. See
+// `OperatorSchemes`, "An operand requirement must be reachable from the result type".
+#[rstest]
+#[case::literals(r#"1 + "a""#, "Add")]
+#[case::through_bindings("y = \"a\"\nz = 1\ny + z", "Add")]
+#[case::through_a_udf("f = \\x -> x + 1\nf(\"a\")", "Add")]
+#[case::comparison(r#"1 > "a""#, "Greater")]
+#[case::comparison_through_bindings("y = 1\nz = \"a\"\ny < z", "Less")]
+#[case::comparison_through_a_udf("f = \\x -> x > 1\nf(\"a\")", "Greater")]
+fn test_operands_with_no_common_base_are_rejected(#[case] code: &str, #[case] expected_fn: &str) {
+    let errs = infer_program_err(code);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            InferError::NoCommonBase { fun, bases, .. }
+                if fun == expected_fn
+                    && bases.iter().any(|b| b == "Int")
+                    && bases.iter().any(|b| b == "String")
+        )),
+        "expected NoCommonBase({expected_fn}) over Int and String, got {errs:?}"
+    );
+}
+
+// The *other* direction: well-typed operands, but the result flows somewhere it
+// cannot go. `(1 + 2) and True` needs `Add(α, β) <: Bool`, and `sum(["a" + "b"])`
+// needs `Add(α, β) <: Int` with `α = β = String`.
+//
+// Neither is decidable while the constraint graph is being built — reducing the
+// application there would read a half-built graph — so `constrain_go` parks the
+// obligation and `check_parked_obligations` retries it once emission completes.
+// Without the park store the obligation was silently accepted, inference returned
+// `Ok`, and the conflict resurfaced at the `check_pre_desugar` wall, which panics
+// on anything that is not `UnresolvedInfer`: an ordinary user type error rendered
+// as a compiler bug.
+//
+// The assertion is therefore that inference *reports* rather than what it reports —
+// the failure mode being guarded is a panic, not a wrong message.
+#[rstest]
+#[case::result_into_bool("(1 + 2) and True")]
+#[case::result_into_an_aggregate(r#"sum(["a" + "b"])"#)]
+#[case::result_into_an_annotation("x: Bool = 1 + 2\nx")]
+fn test_an_operator_result_against_a_wrong_demand_is_a_diagnostic(#[case] code: &str) {
+    assert!(
+        !infer_program_err(code).is_empty(),
+        "expected a diagnostic, not a panic at the consistency wall"
+    );
+}
+
+// Every arithmetic operator has a scheme. The registry holds one per kind (the kind
+// is part of the result *type*, `TypeFn::Arithmetic`) and looks it up in a map, so
+// a kind added to `ArithmeticKind` without a matching `ArithmeticKind::ALL` entry
+// compiles and then panics at the lookup.
+#[rstest]
+#[case("7 + 2", 9)]
+#[case("7 - 2", 5)]
+#[case("7 * 2", 14)]
+#[case("7 // 2", 3)]
+fn every_arithmetic_kind_has_a_scheme(#[case] code: &str, #[case] _expected: i64) {
+    assert_eq!(infer_program(code), int());
+}
+
+// An arithmetic result is the operands' **base**, never one of their refinements.
+//
+// Arithmetic *computes* a new value rather than selecting one of its operands, so a
+// refinement either operand carries is a fact about a value that is no longer in play.
+//
+// The cases are chosen for the one shape that catches a scheme sharing a lattice
+// position between the operands and the result. A result position **intersects**
+// refinement sets, and distinct refinements intersect to none — so operands that
+// merely differ hide the bug. It takes two operands carrying the *same* refinement,
+// where intersecting a set with itself returns it: `y` and `z` are separate bindings
+// of the same literal, so both are `{Int | __elem == 1}` and a sharing scheme reports
+// the sum as `1`.
+//
+// `f(1) + f(1)` is that shape one level up, with the operand types variables rather
+// than literals. It is why the fix has to be `TypeFn::Arithmetic` reducing once the
+// arguments resolve, and not a syntactic refinement strip at emit: a strip covers the
+// literal case and cannot see through a variable.
+#[rstest]
+#[case("1 + 1")]
+#[case("y = 1\nz = 1\ny + z")]
+#[case("y = 2\ny + y")]
+#[case("f = \\a, b -> a\nf(1, 2) + f(1, 5)")]
+fn test_arithmetic_result_is_the_base(#[case] code: &str) {
+    assert_eq!(infer_program(code), int());
+}
+
+// The dual half: an operand must not inherit its *sibling's* refinement either.
+//
+// The two operand positions are function domains — negative positions, where
+// refinement sets union — so a shared variable turned one operand's refinement into a
+// *requirement* on the other, and `\x -> x + 1` inferred `x : {Int | __elem == 1}`,
+// demanding the parameter be the literal 1. What relates the operands now is a
+// `CommonBase` bound, which carries the base and nothing else. (`test_lambda_unapplied`
+// covers the same property for `+` and `>`; these are the cases where the *other*
+// operand is the refined one.)
+#[rstest]
+#[case("f = \\x -> 1 + x\nf")]
+#[case("f = \\x -> x - 7\nf")]
+fn test_operand_does_not_inherit_its_sibling_refinement(#[case] code: &str) {
+    let ty = infer_program(code);
+    let Type::Fun { domain, .. } = &ty else {
+        panic!("expected a function type, got {ty}");
+    };
+    assert_eq!(
+        **domain,
+        int(),
+        "the parameter must be the bare base, not the other operand's refinement"
+    );
+}
+
+// For every operator in the scheme registry: does its result inherit an input's
+// refinement, and *should* it?
+//
+// The distinction is what decides whether an operator needs a type function at all.
+// Sharing a lattice position between an input and the result is correct exactly when
+// the operator **selects** an existing value or **merges** several — the result *is*
+// one of those values, so a fact about it survives. It is wrong when the operator
+// **computes** a new value, which is what arithmetic did.
+//
+// So these cases are not all asserting "the refinement is gone": half of them assert
+// it is still there, because dropping it would be the bug in the other direction.
+#[rstest]
+// Computing: the result is a value none of the inputs is, so the base and nothing more.
+#[case::sum("sum([1, 1])", int())]
+#[case::neg("x = 1\n-x", int())]
+#[case::not("b = True\nnot b", bool_ty())]
+// `+` on strings is still the arithmetic scheme at inference time — the rewrite to
+// `Concat` happens in `lambda_elim` — so this exercises a non-`Int` reduction.
+#[case::string_addition(r#""a" + "b""#, string())]
+// Selecting: `max` returns one of the elements, so a fact every element establishes
+// is a fact about the result.
+#[case::max_of_identical("max([1, 1])", int_lit(1))]
+// And when the elements differ, the element join has already dropped them.
+#[case::max_of_differing("max([1, 2])", int())]
+// Selecting: a projection returns the field, refinement included.
+#[case::projection("(x=1, y=2).x", int_lit(1))]
+fn test_operator_result_inherits_a_refinement_only_when_it_selects(
+    #[case] code: &str,
+    #[case] expected: Type,
+) {
+    assert_eq!(infer_program(code), expected);
+}
+
+// Merging: a collection's element type is the *join* of its elements, so a refinement
+// survives only when every element establishes it. This is the rule the singleton made
+// load-bearing — a merge point is not one value, it is whichever the runtime supplies.
+#[rstest]
+#[case("[1, 1]", int_lit(1))]
+#[case("[1, 2]", int())]
+fn test_collection_element_type_is_the_join(#[case] code: &str, #[case] expected: Type) {
+    let ty = infer_program(code);
+    let Type::Fun { codomain, .. } = &ty else {
+        panic!("expected a collection (function) type, got {ty}");
+    };
+    assert_eq!(**codomain, expected);
 }
 
 #[test]

@@ -1197,6 +1197,12 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
             coalesce_type_predicates(value, level, ctx);
             coalesce_type_predicates(domain, level, ctx);
         }
+        // Arguments can carry refinements of their own; reach them.
+        Type::App { args, .. } => {
+            for a in args.iter_mut() {
+                coalesce_type_predicates(a, level, ctx);
+            }
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
