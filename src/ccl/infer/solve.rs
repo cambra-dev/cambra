@@ -873,12 +873,44 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // from it. CCL `let` is non-recursive, so the RHS coalesces
             // outside the binding's shadow.
             coalesce_node(bound_expr, level + 1, ctx);
-            // Binder slot: a monomorphic `let`'s binding type *is* its
-            // (now-coalesced) bound expression's type. The bottom-up
-            // `expr.ty` resolution doesn't reach this slot, so fill it
-            // explicitly — exactly as the `Lambda` / `Case` / `Loop`
-            // binder slots are filled.
-            binding.ty = bound_expr.ty.clone();
+            // Binder slot: resolve the type `emit_let` bound the variable at,
+            // in place. The bottom-up `expr.ty` resolution doesn't reach this
+            // slot, so it is handled explicitly — exactly as the `LetRec`
+            // binder slots are.
+            //
+            // Resolving the slot is not the same as copying the coalesced RHS
+            // type onto it, which is what this did before: the two agree for an
+            // unannotated `let` (the binder is bound at its initializer's type)
+            // and disagree for the annotated ones — a deref-copy binds at the
+            // value type where the RHS is a handle, and a register introduction
+            // binds at the handle where the RHS is a value.
+            match resolve_var_type(&binding.ty) {
+                Ok(ty) => binding.ty = ty,
+                Err(err) => {
+                    let label = format!("let binding `{}`", binding.name);
+                    ctx.push_error(map_coalesce_err(err, &label), label);
+                }
+            }
+            let binding_name = binding.name.clone();
+            with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
+        }
+        // A register introduction, resolved exactly like a monomorphic `let`: the
+        // seed one level deeper, the binder slot resolved in place (it holds the
+        // history `emit_mut_decl` bound it at), the body under the shadow. A
+        // register is never generalized, so there is no specialization arm.
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => {
+            coalesce_node(init, level + 1, ctx);
+            match resolve_var_type(&binding.ty) {
+                Ok(ty) => binding.ty = ty,
+                Err(err) => {
+                    let label = format!("mutable `{}`", binding.name);
+                    ctx.push_error(map_coalesce_err(err, &label), label);
+                }
+            }
             let binding_name = binding.name.clone();
             with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
         }

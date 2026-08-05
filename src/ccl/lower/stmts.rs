@@ -140,6 +140,21 @@ fn append_record_at_tail(
                 ..expr
             }
         }
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => {
+            let new_body = append_record_at_tail(*body, record, program_span, ctx);
+            Expr {
+                node: TypedExprNode::MutDecl {
+                    binding,
+                    init,
+                    body: Box::new(new_body),
+                },
+                ..expr
+            }
+        }
         TypedExprNode::ExprStmt { expr: effect, body } => {
             let new_body = append_record_at_tail(*body, record, program_span, ctx);
             Expr {
@@ -591,7 +606,7 @@ pub(super) fn lower_middle_stmt(
                 domain: Box::new(domain),
                 kind: crate::ccl::HistoryKind::Overwrite,
             };
-            Ok(ctx.tag_image(Expr::let_bind_annotated(name, val, body, mut_ty), stmt.span))
+            Ok(ctx.tag_image(Expr::mut_decl(name, mut_ty, val, body), stmt.span))
         }
         // Desugar `x op= e` → `MutWrite(x, x op e)`. `+=` is a mutable write: the
         // check requires `x` to be a mutable variable (never a shadowing rebind of
@@ -1171,7 +1186,7 @@ x := 0
 x += 1
 x",
         "\
-let x = 0
+x : Mut(_, _) := 0
 in x := x + 1; x"
     )]
     #[case(
@@ -1180,7 +1195,7 @@ x := 10
 x -= 3
 x",
         "\
-let x = 10
+x : Mut(_, _) := 10
 in x := x - 3; x"
     )]
     #[case(
@@ -1189,7 +1204,7 @@ x := 2
 x *= 5
 x",
         "\
-let x = 2
+x : Mut(_, _) := 2
 in x := x * 5; x"
     )]
     #[case(
@@ -1198,7 +1213,7 @@ x := 7
 x //= 2
 x",
         "\
-let x = 7
+x : Mut(_, _) := 7
 in x := x // 2; x"
     )]
     // Chained augmented assignments are a sequence of mutable writes.
@@ -1209,7 +1224,7 @@ x += 1
 x += 2
 x",
         "\
-let x = 0
+x : Mut(_, _) := 0
 in x := x + 1; x := x + 2; x"
     )]
     // defer() introduces a Defer node.

@@ -17,6 +17,8 @@
 //! - [`Lambda`](TypedExprNode::Lambda) — `param` scopes over `body`.
 //! - [`Let`](TypedExprNode::Let) — `binding` scopes over `body` **only**;
 //!   `bound_expr` sits outside it (CCL's `let` is non-recursive).
+//! - [`MutDecl`](TypedExprNode::MutDecl) — `binding` scopes over `body`; `init`
+//!   sits outside it (a register's seed cannot reference the register).
 //! - [`LetRec`](TypedExprNode::LetRec) — *every* group binder scopes over
 //!   *every* binding's definition and over `body` (mutual recursion).
 //! - [`For`](TypedExprNode::For) — `target` scopes over `body`; `iter` sits
@@ -262,6 +264,18 @@ where
             under(f, body, Binders::One(binding));
         }
 
+        // A register introduction scopes exactly like a `let`: `init` sits outside
+        // the binder — a seed cannot reference the register it seeds — and
+        // `binding` scopes over `body`, which is where its writes and reads live.
+        N::MutDecl {
+            binding,
+            init,
+            body,
+        } => {
+            open(f, init);
+            under(f, body, Binders::One(binding));
+        }
+
         // Mutual recursion: the whole group is in scope throughout the group.
         N::LetRec { bindings, body } => {
             let group = Binders::Group(bindings);
@@ -475,6 +489,7 @@ where
         | N::Begin { .. }
         | N::Lambda { .. }
         | N::Let { .. }
+        | N::MutDecl { .. }
         | N::LetRec { .. }
         | N::For { .. }
         | N::Case { .. } => {}
@@ -527,6 +542,16 @@ mod tests {
                 kind: crate::ccl::AggregateKind::Sum,
             }),
             TypedExpr::let_bind("l", var("bound"), var("l")),
+            TypedExpr::mut_decl(
+                "reg",
+                Type::History {
+                    value: Box::new(Type::Hole),
+                    domain: Box::new(Type::Hole),
+                    kind: crate::ccl::HistoryKind::Overwrite,
+                },
+                var("seed"),
+                var("reg"),
+            ),
             node(N::List(vec![var("e0"), var("e1")])),
             case_with_two_branches(),
             TypedExpr::variant_ctor("T", var("pl")),
@@ -631,6 +656,7 @@ mod tests {
         N::Lambda { .. } => "Lambda",
         N::Aggregate { .. } => "Aggregate",
         N::Let { .. } => "Let",
+        N::MutDecl { .. } => "MutDecl",
         N::List(_) => "List",
         N::Case { .. } => "Case",
         N::VariantCtor { .. } => "VariantCtor",
