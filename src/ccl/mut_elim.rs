@@ -437,10 +437,37 @@ fn collect_block_spine_ids(block: &Expr, out: &mut Vec<NodeId>) {
                 TypedExprNode::Case { branches, .. } => {
                     out.push(effect.node_id());
                     for br in branches {
+                        // Every guard is consumed, not preserved. Which arm
+                        // predicates survive is data-dependent — the trailing
+                        // `true` arm's is always discarded (it supplies only the
+                        // carry write set), and so is any arm whose write set
+                        // matches the carry — so a static consumed set cannot
+                        // track survival. Consuming all of them uniformly and
+                        // rebuilding each surviving predicate from a `Copy`
+                        // (see `transform_chain`'s `Case` arm) is what makes the
+                        // set data-independent.
+                        collect_all_ids(&br.guard, out);
                         collect_block_spine_ids(&br.body, out);
                     }
                 }
-                // MutWrite/Feed/Unit effect nodes drop (their value is preserved).
+                // A write's value is **inlined into the RYW environment**, not
+                // left on the spine, so the env slot is a *template* the reads
+                // instantiate rather than a subtree that reaches the output. The
+                // template itself never survives: `subst_env` freshens each
+                // instantiation's interior and carries the read site's id onto
+                // its root, and the terminal takes its own `fresh_copy`. So the
+                // value dies here along with the write node, and every surviving
+                // instance is an attributed `Copy` of it.
+                //
+                // (Under the older `let`-binding model the value *was* placed on
+                // the spine and only a `Var` was copied, which is why this used
+                // to be a preserve.)
+                TypedExprNode::MutWrite { value, .. } => {
+                    out.push(effect.node_id());
+                    collect_all_ids(value, out);
+                }
+                // Feed/Unit effect nodes drop; a feed's value is hoisted to a
+                // `FeedSite` and reaches the output intact, so it is preserved.
                 _ => out.push(effect.node_id()),
             }
             collect_block_spine_ids(body, out);
@@ -1254,8 +1281,13 @@ fn transform_chain(
                 // `br.guard` keeps its ids (the `Case` is consumed here, so that
                 // is a self-edge) and every negated echo becomes an attributed
                 // `Copy` under the open frame.
+                // Every guard the `Case` carries is consumed by this rewrite (see
+                // `collect_block_spine_ids`), so an arm predicate is built
+                // entirely from `Copy`s: the arm's own guard once, plus a
+                // freshened echo of each earlier guard for the `¬` conjuncts.
+                let own_guard = fresh_copy(br.guard.clone());
                 let prior_copies: Vec<Expr> = priors.iter().cloned().map(fresh_copy).collect();
-                let pi = subst_env(synthesize_arm_predicate(&br.guard, &prior_copies), env);
+                let pi = subst_env(synthesize_arm_predicate(&own_guard, &prior_copies), env);
                 priors.push(br.guard.clone());
                 // The post-`Case` remainder is spliced onto *every* path — each
                 // explicit branch and the trailing `true` carry arm — so it
@@ -1385,10 +1417,18 @@ fn transform_chain(
             // to_<feed>*}` — always-commit, the latest value of each
             // accumulator as the positional write set (one element even for a
             // single accumulator), and each captured feed value as a tap.
+            // The env slot is a template (see `collect_block_spine_ids`), and its
+            // own ids are consumed with the write that inlined it — so the
+            // terminal takes a `fresh_copy`, not a bare clone, and the write set
+            // carries an attributed `Copy` of the final value. A bare clone here
+            // would leave the last write's ids both consumed and live, which the
+            // fold reports as an over-consumption rather than a leak.
             let current = |acc: &Name| {
-                env.get(acc)
-                    .expect("letrec phase: accumulator missing from RYW environment")
-                    .clone()
+                fresh_copy(
+                    env.get(acc)
+                        .expect("letrec phase: accumulator missing from RYW environment")
+                        .clone(),
+                )
             };
             let mut writes = Expr::tuple(accs.iter().map(|(n, _)| current(n)).collect());
             writes.ty = writes_ty.clone();

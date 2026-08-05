@@ -1402,36 +1402,50 @@ mod tests {
     }
 
     /// RT-4c: the provenance-census ratchet. Pins the exact per-category node
-    /// counts for a corpus of representative programs at each retained stage. A
-    /// future pass that churns ids without recording shows up as `Synthetic` /
-    /// `unresolved` inflation and fails the matching row; a deliberate provenance
-    /// improvement (e.g. a desugar lift-preserve that turns a swept node into a
-    /// tracked one) *moves* a row, and that diff is itself the commit's
-    /// provenance-impact statement.
+    /// counts for a corpus of representative programs at each retained stage —
+    /// the *attribution* oracle, and the only one that reads
+    /// [`SourceAttribution`](crate::ccl::lineage::SourceAttribution) rather than
+    /// lineage fate. A pass that reattributes nodes moves a row, and that diff is
+    /// the commit's provenance-impact statement.
     ///
-    /// The txn/loop rows show the **fully-recorded** state: their post-desugar
-    /// trees are `Derived(Transact)`/`Derived(Letrec)`/`Derived(Desugar)` — the
-    /// commit `LetRec` scaffolding and the loop→`LetRec` rewrite are recorded as
-    /// real lineage steps (every node resolves through a recorded lineage
-    /// step). The lowering fold covers
-    /// every node, so `unresolved` is a hard zero at
-    /// every pane — asserted structurally in the loop below, on top of the
-    /// per-row pins. These counts are **structural** (nodes counted by tree
-    /// position); this test's job is the forward ratchet and pinning the
-    /// attribution shape.
+    /// # This test pins categories, not leaks
+    ///
+    /// **No leak of any class is tolerated anywhere**, so a census row can never
+    /// be a place one is blessed. `assert_leaks_clean` asserts *zero* of every
+    /// [`Leak`](crate::ccl::lineage::Leak) class at both pane boundaries, and
+    /// `unresolved` (a node the pane projection knows nothing about) is asserted a
+    /// hard zero at every pane in the loop below. Both gates run in this test,
+    /// since `materialize_panes` is what produces the projections it censuses.
+    ///
+    /// What the counts add on top is the one thing fate accounting cannot see:
+    /// *which* attribution a node carries. A node can be perfectly explained by a
+    /// recorded step — no leak — and still be attributed to the wrong pass or the
+    /// wrong nature, which is what a moved row reports.
+    ///
+    /// # A moving total is not a coverage signal
+    ///
+    /// Counts are **structural**: one entry per node *position* in the retained
+    /// tree. So a row's total tracks the size of the emitted tree, and any change
+    /// to what a pass emits moves it — including changes that originate upstream
+    /// of the lineage machinery entirely. A total that moves means "the tree has a
+    /// different number of nodes", never "provenance was lost"; the oracles for
+    /// loss are the two hard zeros above, which fire independently of any count.
+    /// Classify a moved total by diffing the *tree* (`symbolic`), not by reasoning
+    /// from the census.
     ///
     /// The `Source` / `Synthetic(Lower)` split follows the structural rule on
     /// `LoweringContext::tag_source`: `Source` marks a lowered *expression root*,
     /// so an image that is not a root — a callee `Var`, an interior comparison of
     /// a chain, a statement-level `Let` — counts as `Synthetic(Lower)` while still
-    /// carrying the `"lower.image"` label. A row that moves count between those
-    /// two categories with its **total unchanged** is a reclassification, not a
-    /// coverage change; a total that moves, or an `unresolved` appearing, is not.
+    /// carrying the `"lower.image"` label. Count moving between those two
+    /// categories is a reclassification.
     ///
     /// # Re-bless procedure
     /// Run `cargo test -q --lib census_ratchet -- --nocapture` (or read the assert
-    /// diff on failure), confirm the delta is an *intended* provenance change for
-    /// the commit in flight, then update the affected row's expected map here.
+    /// diff on failure) and classify **every** unit of drift into a named cause
+    /// before updating a row — separating reattribution (this commit's own
+    /// provenance change) from a tree-shape change (someone else's). Anything
+    /// unexplained is a STOP, not a re-bless.
     #[test]
     fn census_ratchet() {
         use std::collections::BTreeMap;
@@ -1598,6 +1612,69 @@ mod tests {
                     stages[i]
                 );
             }
+        }
+    }
+
+    /// Every conditional-induction shape reaches both pane boundaries clean.
+    ///
+    /// `assert_leaks_clean` and `assert_unique_node_ids` at the post-desugar
+    /// boundary only run under [`CompiledProgram::materialize_panes`], so the
+    /// compilation-pipeline suite — which compiles but never materializes —
+    /// cannot see a leak in a rewrite it otherwise exercises heavily. The
+    /// statement-`Case` arm of the letrec phase is exactly that blind spot: it
+    /// fans the post-`Case` remainder and the entering RYW env across every
+    /// branch, so each shape below stresses a different copy/consume pairing.
+    /// Materializing is the whole assertion — a leak or a duplicate id panics
+    /// inside, naming its class and boundary.
+    #[test]
+    fn conditional_induction_panes_are_leak_free() {
+        for (name, code) in [
+            // One conditional write: guard preserved into its own arm predicate,
+            // echoed (freshened) into the carry arm's.
+            (
+                "guard_only",
+                "x := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        x := x + i\nx\n",
+            ),
+            // Unconditional write *before* the `Case`: its inlined value sits in
+            // the RYW env slot every branch clones.
+            (
+                "uncond_before",
+                "x := 0\nfor i in [1, 2, 3]:\n    x := x + 1\n    if i > 1:\n        x := x + 10\nx\n",
+            ),
+            // Unconditional write *after* the `Case`: the remainder is spliced
+            // onto every path, including the trailing carry arm.
+            (
+                "uncond_after",
+                "x := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        x := x + 10\n    x := x + 1\nx\n",
+            ),
+            // `if`/`else` writing one accumulator on both arms.
+            (
+                "if_else",
+                "t := 0\nfor x in [1, 2, 3]:\n    if x > 2:\n        t := t + x\n    else:\n        t := t + 1\nt\n",
+            ),
+            // Two accumulators, one unconditional and one conditional — the
+            // shape where a branch's write set matches the carry for *some*
+            // accumulator but not all.
+            (
+                "two_accumulators",
+                "cnt := 0\ntotal := 0\nfor i in [1, 2, 3]:\n    cnt := cnt + 1\n    if i > 1:\n        total := total + i\ncnt * 10 + total\n",
+            ),
+            // Sibling `if`s (not `elif`) on one accumulator: two guard-Cases in
+            // one body, so the second one's remainder is itself a spliced copy.
+            (
+                "sibling_ifs",
+                "a := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        a := a + i\n    if i < 3:\n        a := a + 100\na\n",
+            ),
+        ] {
+            let compiled = compile_ok(code);
+            // The gates live inside; reaching the next iteration is the pass.
+            let panes = compiled.materialize_panes();
+            assert!(
+                !provenance_census(&compiled.post_desugar_ir, &panes.post_desugar)
+                    .contains_key("unresolved"),
+                "`{name}`: post-desugar census contains `unresolved` rows — a node \
+                 escaped the projection or a pass rewrote without recording"
+            );
         }
     }
 
@@ -2253,10 +2330,14 @@ x
             // `letrec.loop` Transform consuming the loop statement's spine.
             let prog = compile_ok(MUTATION_LOOP);
             let log = log_for(&prog, Pass::Letrec);
+            // Select the `Transform` explicitly: a frame's captured `Copy`s carry
+            // its label too, and those whose origin the frame consumes flush
+            // *ahead* of it (see `lineage`, "Flush order within a frame"), so the
+            // first `letrec.loop` record is not necessarily the Transform.
             let loop_step = log
                 .iter()
-                .find(|s| s.label == "letrec.loop")
-                .expect("a letrec.loop step");
+                .find(|s| s.label == "letrec.loop" && matches!(s.op, Op::Transform { .. }))
+                .expect("a letrec.loop Transform step");
             match &loop_step.op {
                 Op::Transform { consumed, produced } => {
                     assert!(
