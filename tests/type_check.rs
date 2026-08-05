@@ -1833,3 +1833,23 @@ fn a_single_type_fault_prints_no_demand() {
         "a single-type fault must not invent a demand, got: {missing}"
     );
 }
+
+/// A register mention in an operand position yields its **value type**, never the
+/// handle — and it does so because the emitting rule derefs, not because subtyping
+/// says a register is a subtype of its value.
+///
+/// `cnt + 1` is the case that pins the placement: `+` is `∀α. α → α → α`, so the
+/// operand meets a *fresh inference variable*. While the deref lived in the subtyping
+/// relation this worked only because that arm was ordered before the `Infer` arms — and
+/// that same ordering is what made a pass-by-reference argument indistinguishable from
+/// a read, since it too meets a fresh variable.
+#[test]
+fn a_register_read_yields_its_value_in_an_operand_position() {
+    assert_eq!(infer_program("x := 5\nx + 1\n"), int());
+    // The value still has to satisfy the operand's demand.
+    let errs = format!("{:?}", infer_program_err("x := 5\nx + \"s\"\n"));
+    assert!(
+        errs.contains("mismatch") || errs.contains("common"),
+        "a read's value type is still checked against the operator, got: {errs}"
+    );
+}
