@@ -348,6 +348,15 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
+    /// A [`Type::Below`] bounded-annotation marker survived past inference.
+    ///
+    /// Like [`InferError::UnresolvedHole`], a compiler bug rather than a
+    /// user-facing error: `normalize_annotation` erases every `Below` it is handed,
+    /// so a survivor means a slot inference never normalized.
+    UnresolvedBelow {
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
     /// An unresolved [`Type::Infer`] variable survived past inference.
     UnresolvedInfer {
         /// The unresolved variable's id.
@@ -667,6 +676,9 @@ impl std::fmt::Debug for InferError {
             }
             InferError::UnresolvedHole { at } => {
                 write!(f, "Unresolved type hole in expression: {at}")
+            }
+            InferError::UnresolvedBelow { at } => {
+                write!(f, "Unresolved bounded annotation `<:` in expression: {at}")
             }
             InferError::UnresolvedInfer { id, at } => {
                 write!(f, "Unresolved inference variable {id} in expression: {at}")
@@ -1031,6 +1043,12 @@ fn collect_type_errors(
         // `normalize_annotation` resolves both. A survivor means the annotation
         // never reached normalization, which is the same compiler bug either way.
         Type::Hole | Type::SharedHole(_) => errors.push(InferError::UnresolvedHole {
+            at: context_sym.to_string(),
+        }),
+        // A bounded annotation inference never normalized. Reported at every
+        // strictness, exactly like `Hole`: both are lowering markers whose whole
+        // contract is that inference consumes them.
+        Type::Below(_) => errors.push(InferError::UnresolvedBelow {
             at: context_sym.to_string(),
         }),
         Type::Infer(var) => {
@@ -2547,38 +2565,51 @@ mod tests {
     // AnnotationMismatch: user_annotation conflicts with inferred type
     // -----------------------------------------------------------------------
 
-    /// Constructs a `Lambda` with `user_annotation: Some(Int)` but a body that
-    /// constrains the param to `String`. Inference should return `AnnotationMismatch`.
+    /// A parameter annotation conflicting with the body's demand is caught, and
+    /// **which** error it is follows from the annotation's form.
     ///
-    /// This path is not yet reachable from the pipeline (lowering always sets
-    /// `user_annotation: None`), but the conflict must be exercised directly so the
-    /// annotation-binding rule does not bitrot.
+    /// `λ [x : Int] → x(λ s : String → s)`: the body uses `x` where a `String` is
+    /// expected, while the annotation says `Int`.
+    ///
+    /// Under the **exact** form the parameter *is* `Int` — a concrete type, not a
+    /// variable — so the body's demand fails immediately at the application, naming
+    /// both types. Under the **bounded** form the parameter is a variable carrying
+    /// `Int` as an upper bound, so `Int` and `String` accumulate on that one
+    /// variable and the conflict surfaces at coalesce as `IncompatibleBounds`.
+    /// Neither is more correct; the exact form simply localizes the blame to the
+    /// use, because there is no variable for the two demands to meet on.
     #[test]
-    fn test_infer_annotation_mismatch() {
-        let mut ctx = TypeInferenceContext::new();
-        // λ [x : annotated Int] → Apply(λ s : String → s, x)
-        // x starts as Infer(id); body inference applies x as an arg to a
-        // String-expecting function, constraining Infer(id) → String.
-        //
-        // The conflict surfaces at **coalesce**, as `Int` and `String` colliding on
-        // one variable, rather than eagerly as `AnnotationMismatch`. That is the
-        // consequence of `bind_annotation` being one-way (`inferred <: ann`): the
-        // reverse edge used to detect this immediately, at the cost of also
-        // rejecting sound widenings. What matters is that the conflict is caught.
-        let inner = Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s"));
-        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
-            param: TypedBinding {
-                name: "x".into(),
-                ty: Type::infer(),
-                user_annotation: Some(Type::Base(BaseType::Int)),
-            },
-            body: Box::new(Expr::apply(Expr::var("x"), inner)),
-        });
-        let errs = infer_bare(&mut expr, &mut ctx).expect_err("Int and String cannot meet");
+    fn test_infer_param_annotation_conflict() {
+        let param_annotation = |ann: Type| {
+            let mut ctx = TypeInferenceContext::new();
+            let inner = Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s"));
+            let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+                param: TypedBinding {
+                    name: "x".into(),
+                    ty: Type::infer(),
+                    user_annotation: Some(ann),
+                },
+                body: Box::new(Expr::apply(Expr::var("x"), inner)),
+            });
+            infer_bare(&mut expr, &mut ctx).expect_err("Int and String cannot meet")
+        };
+
+        let exact = param_annotation(Type::Base(BaseType::Int));
         assert!(
-            errs.iter()
+            exact
+                .iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. })),
+            "an exact param is the concrete type, so the body's demand fails at the \
+             use; got {exact:?}"
+        );
+
+        let bounded = param_annotation(Type::Below(Box::new(Type::Base(BaseType::Int))));
+        assert!(
+            bounded
+                .iter()
                 .any(|e| matches!(e, InferError::IncompatibleBounds { .. })),
-            "expected the Int/String collision, got {errs:?}"
+            "a bounded param is a variable, so the two demands collide on it at \
+             coalesce; got {bounded:?}"
         );
     }
 
@@ -2886,6 +2917,22 @@ mod tests {
         })
         .with_ty(Type::Base(BaseType::Int));
         assert_eq!(check_fully_typed(&expr), Ok(()));
+    }
+
+    /// A `Type::Below` surviving inference fails with `UnresolvedBelow`.
+    ///
+    /// A backstop, like `UnresolvedHole`: `normalize_annotation` erases every
+    /// `Below` it is handed, and a bounded annotation that somehow reaches the
+    /// solver un-normalized is rejected earlier (nothing can be constrained against
+    /// a `Below`, so it surfaces as an `AnnotationMismatch`). This pins the check
+    /// itself, which the pipeline therefore cannot reach.
+    #[test]
+    fn test_check_fully_typed_below_survivor() {
+        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Below(Box::new(Type::Base(BaseType::Int))));
+        assert_eq!(
+            check_fully_typed(&expr),
+            Err(vec![InferError::UnresolvedBelow { at: "1".into() }])
+        );
     }
 
     /// A `Type::Hole` on the root node fails with `UnresolvedHole`.

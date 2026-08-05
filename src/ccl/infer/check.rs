@@ -244,10 +244,13 @@ impl Typing for CheckCtx {
         }
     }
 
-    fn bind_annotation(&mut self, _inferred: &Type, _ann: &Type) -> Result<(), LocatedInferError> {
+    fn bind_annotation(&mut self, _inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
         // The annotation was already folded into the binder's type during
-        // inference; nothing to re-check here.
-        Ok(())
+        // inference; nothing to re-check here. Check's `normalize` is the
+        // identity, so handing the annotation straight back matches what Emit
+        // returns for an annotation with nothing left to normalize. (In practice
+        // Check never sees one: `infer` clears every annotation on success.)
+        Ok(ann.clone())
     }
 
     fn binding_slot(&mut self, slot: &mut Type) -> Type {

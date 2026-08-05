@@ -550,9 +550,11 @@ value: a single inhabitant of the unit type. (In the lowering, `None`
 becomes the CCL `Unit` literal.)
 
 A literal's **type is the literal itself**, not merely its base: `5` has type
-`{Int | 𝑒 == 5}`, printed `5`. So `x = 5` gives `x` the type `5`, and an
-annotation only has to *admit* the value — `x: Int = 5` leaves `x` at `5`,
-because widening is the annotation's business and not the value's. Any
+`{Int | 𝑒 == 5}`, printed `5`. So `x = 5` gives `x` the type `5`, and it keeps
+that unless a binder discards it: `x: Int = 5` binds `x` at `Int` (an exact
+annotation *is* the binder's type), while `x <: Int = 5` leaves `x` at `5` (a
+bounded annotation only has to admit the value) — see
+[Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded). Any
 operation that computes a *new* value drops it, since it is a fact about one
 value and not about the operation: `x + x` is an `Int`, and a mutable register
 never takes it (a register is the sequence its writes produce, so no one write's
@@ -993,8 +995,11 @@ def f(x: Int, y):
     return x + y
 ```
 
-Annotations are arbitrary expressions evaluated in the surrounding
-scope; they refine the inferred parameter type. Annotations on the
+Annotation types are arbitrary expressions evaluated in the surrounding
+scope. `p: T` fixes the parameter's type at `T`; `p <: T` leaves it
+inferred and bounded above by `T` (see
+[Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
+The two forms may be mixed across a parameter list. Annotations on the
 function's *return type* are not yet supported.
 
 A function whose body contains a `yield` expression anywhere is a
@@ -1399,8 +1404,9 @@ read-only.
 This section is a sketch. The authoritative type system lives in
 [`src/ccl/infer/`](../src/ccl/infer/) — see
 [src/ccl/design/type-inference.md](../src/ccl/design/type-inference.md).
-CHL types are inferred; user-written annotations refine the inferred
-type.
+CHL types are inferred; a user-written annotation either *fixes* the
+binder's type or *bounds* it — see
+[Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded).
 
 Built-in surface types. (The names below are this spec's vocabulary
 for talking about the checker; annotations are writable on `def`
@@ -1508,6 +1514,81 @@ type `{f: T}`, refinement `{x: T | p(x)}`.
 > contracts direction in §6), so a contract states its ontology once
 > instead of repeating asserts at every function; the declaration
 > syntax for that invariant is not yet settled.
+
+### Two annotation forms: exact and bounded
+
+An annotation at a binder answers one of two questions, and the two
+have different spellings because the answers differ.
+
+> **Note.** The *distinction* below is implemented and pinned by tests —
+> that a binder can either fix its type or bound it, and what each means
+> at every binder form. The **spelling** is **[Open]**: `:` versus `<:`
+> is not a syntax we are satisfied with, and it may change without the
+> semantics changing. Two things make it unsatisfying. `<:` reads as a
+> type operator but describes a *binder*, which is why it cannot be
+> written in a nested position — a restriction that falls out of the
+> implementation rather than out of anything a reader would expect from
+> the notation. And the more common intent is arguably the bounded one,
+> yet it carries the heavier spelling. Read the semantics as settled and
+> the two tokens as provisional; code written against them may need a
+> mechanical rename.
+
+`x: T` is **exact**: the binder's type *is* `T`. The initializer (or,
+at a parameter, the argument) must be a subtype of `T`, and nothing
+downstream of the binder sees more than `T`.
+
+`x <: T` is **bounded**: the binder's type is *inferred*, with `T` as
+an upper bound. The value's own type flows through; `T` only
+constrains what may reach the binder.
+
+Both forms are accepted wherever a binder is introduced — an
+assignment (`x: T = e`, `x <: T = e`), a mutable introduction
+(`x: Mut(V) := e`), and a `def` parameter — and mean the same thing in
+each. `<:` is **not** written in nested positions: it describes a
+binder, not a type, so `{a <: Int}` is not a type.
+
+The two coincide only when the value's type already **is** the
+annotation — when there is nothing for the annotation to discard. They
+differ whenever the value's type is a *strict* subtype of it, which is
+more often than it sounds, because a CHL type carries more than a base:
+
+- **Width.** `x: {a: Int} = (a=1, b=2)` binds `x` at `{a: Int}`, so
+  `x.b` is an error — the annotation is what discards the field.
+  `x <: {a: Int} = (a=1, b=2)` binds `x` at `{a: 1, b: 2}`, and `x.b`
+  is `2`.
+- **Literal singletons** (§3.1). `i: Int = 0` binds `i` at `Int`;
+  `i <: Int = 0` leaves it at `0`. Only the second still carries the
+  fact a totality proof needs, so an exact annotation on an index
+  discards the proof that a lookup is in range.
+
+Note that the second example annotates a bare `Int` and the two forms
+still differ. The annotation's own shape is not what decides it: `0` is
+a strict subtype of `Int`, so there is something to discard. What makes
+the forms coincide is the *value* knowing nothing beyond what the
+annotation says.
+
+A `_` position **declares nothing** and is completed from the
+initializer, so `x: _ = e` means exactly `x = e`. That holds nested
+too: `x: List(_) = [1, 2, 3]` binds `x` at `List(Int)`. Consequently
+`_` does not suppress the mutable-alias rule (§8.1): `b: _ = a` off a
+mutable `a` is the same error as a bare `b = a`.
+
+On a mutable introduction the mode applies to the **value type**, which
+is what the annotation names: `x <: Mut(V) := e` declares a mutable
+whose value type is inferred subject to `<: V`, and is the same
+declaration as `x <: V := e`. So `x <: Mut(Int) := 5` binds the value at
+`5` — as the unannotated `x := 5` does — while `x: Mut(Int) := 5` binds
+it at `Int`. The bound still constrains every contribution to the value:
+the seed and each write.
+
+> **Note.** An exact parameter annotation also fixes how many times
+> the function is compiled. A bounded or absent one leaves the
+> parameter's type open, so each call site's argument type — down to
+> *which literal* it is — can produce its own specialization; an exact
+> one gives every call site one shared definition. Recommended style
+> therefore annotates a top-level `def`'s parameters exactly and
+> reaches for `<:` where a caller's more precise type has to survive
+> the boundary.
 
 ### 6.2 Non-purity as type wrappers
 

@@ -344,7 +344,7 @@ fn lower_for_body_stmts(
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));
                 }
-                if mut_annotation_parts(annotation).is_some() {
+                if mut_annotation_parts(&annotation.ty).is_some() {
                     return Err(in_loop_register_error(stmt.span, &name));
                 }
                 let ann = lower_type_annotation(annotation)?;
@@ -865,7 +865,7 @@ fn lower_loop_body_chain(
                 value,
             } => {
                 let name = extract_name_target(target, "annotated assignment")?;
-                if mut_annotation_parts(annotation).is_some() {
+                if mut_annotation_parts(&annotation.ty).is_some() {
                     return Err(in_loop_register_error(stmt.span, &name));
                 }
                 let ann = lower_type_annotation(annotation)?;
