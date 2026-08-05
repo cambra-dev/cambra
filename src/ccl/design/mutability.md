@@ -748,6 +748,94 @@ request-indexed, but not commit-ordered. To gate or commit-order a reply, put it
 These features belong to the model above but are not yet built. Each is rejected at compile time
 today rather than silently mishandled.
 
+### Value-selecting `Case` and conditional induction writes (partially implemented)
+
+> **Status: value-selecting `Case`s compile; conditional induction writes are designed but not
+> yet implemented.**
+>
+> **Implemented** (value selection compiles via the literal union-of-restricts): scalar / compute
+> ternaries (the C-form), data-collection selection (the gate fan-out, reconciled to the Σ by
+> Σ-introduction), source-less conditional feeds, a **conditional element** in a
+> comprehension (`[a if g(x) else b for x in xs]`, fanned out over the source by the
+> element-dependent gate), and a comprehension **over a conditional collection** (`[f(x) for x in
+> (xs if c else ys)]`, the source `Case` floats out of the map). **Not yet implemented**:
+> conditional *induction writes* (`if 𝑝: total += x`, the per-leg writer sites + `DispatchRecurse`
+> below — still rejected at lowering); a conditional *between* standalone comprehensions
+> (`([…]) if c else ([…])` — a comprehension used as a value is compute-kinded, so its arms meet
+> rather than join; the deferred kind-inference work); and a per-element conditional at a site with
+> no visible iteration source (a UDF body, or a comprehension `if`-filter beside the element `Case`).
+
+The *filter* `Case` (`[𝑔 → action; true → unit]` → `Restrict`) and now the value-selecting `Case`
+compile; a conditional induction write (`if 𝑝: total += x`) is still rejected at lowering. The
+compilation is a **literal union of restricts** — the CCL algebra stays restricts + unions — and an
+**off-path arm is never evaluated**, so a guard-protected partial expression (`x // y if y != 0 else
+0`) never faults on the path its guard excludes. A **data-collection** fan-out is lazy structurally:
+an arm whose gate is false restricts to an empty extent, and an empty extent is never iterated. The
+**scalar** value-`Case` C-form gates a `Units(1)` driver and swaps in each arm's constant via
+`MapResultToConst`; when a false gate empties the driver (all rows deleted), `MapResultToConst` returns
+a terminal-empty tile *without* pulling the arm's constant — so the off-path value (a `//`, `%`, or
+index that the gate guards) is never computed. Every fan-out shares one first-match encoding,
+`πᵢ = 𝑔ᵢ ∧ ¬⋁ⱼ˂ᵢ 𝑔ⱼ` (`synthesize_arm_predicate` in `ccl_utils`, shared between channelize, the
+value fan-outs, and the transaction path walk):
+
+```
+target = ⧺ᵢ (source | 𝑝ᵢ ≫ (λ 𝑟 → 𝑣ᵢ))                                  -- channel: partial off-path
+total  = ⧺ᵢ (source | 𝑝ᵢ ≫ (λ 𝑟 → 𝑣ᵢ)) ⧺ (source | ¬⋁ᵢ𝑝ᵢ ≫ (λ 𝑟 → get_prev_seq(total, 𝑟, init)))
+```
+
+The presence or absence of the complement arm *is* the `Overwrite`/`Feed` distinction, and the union
+is **between letrec bindings, not inside one decision body**: a conditional mutable write emits one
+writer-site *leg per path* — the write leg over `{𝑟 : 𝐷 | π̂}` and the **carry-forward leg** over
+the complement `{𝑟 : 𝐷 | ¬̂π}` whose body passes the snapshot through — each guarded by
+`get_prev_seq` over the ⧺-union of all legs' per-key views (a shape the guardedness check already
+admits). Per-leg bindings let decision records differ per path, and a conditional feed on a path
+is **naturally partial**: `Feed(d, __legⱼ ≫ .to_k)` over the leg's restricted domain — no flag
+field. The phase walks the loop body as a *path enumeration* (a statement-position `Case` forks
+per branch plus the implicit complement; the rest of the chain clones into each path; guards
+resolve in the fork point's read-your-writes env), recognition generalizes the single-writer
+induction group to one `Transact` with one writer per leg, and op-conversion realizes the union by
+**ordered dispatch** (`DispatchRecurse`, see `../../interpreter/design-operators.md`): one
+iteration of the base extent, each position fed to exactly the leg whose predicate holds —
+faithful to the ⧺ because the leg predicates partition the domain, and position-aligned by
+construction.
+
+The value-`Case` positions ride the same union-of-restricts:
+
+- **Scalar / compute-typed selection** (a ternary, a per-key merge inside a decision body)
+  — *implemented* (`lambda_elim::build_value_case_cform`): restricts of gated one-shot lifts over
+  the `UIntRange(1)` driver, extracted by the rewrite itself —
+  `((unit | π̂₀ ≫ const 𝑒₀) ⧺ … ⧺ (unit | π̂ₙ ≫ const 𝑒ₙ), 𝑒ₙ) ▷ final_or_default` — exhaustive by
+  the trailing `true` arm, so the union has exactly one element and the outer type is unchanged.
+  The gate is constant in the driver element; the existing `Restrict` masks the extent by the
+  constant boolean directly (no new runtime capability).
+- **Data-typed selection** (`zs = xs if c else ys`) — *implemented*
+  (`lambda_elim::build_value_case_fanout`): each arm's whole collection restricted by a
+  constant-in-element gate, unioned; the union carries the Σ the type system gave the `Case` (see
+  `design/type-inference.md` §4.6), and the strict wall reconciles its structural `Variant`-domain
+  type against the Σ by **Σ-introduction** (the compiled gated partition realizes the whole sum —
+  the finite-Σ = gated-coproduct iso, legs' base domains set-equal to the candidates), or against
+  the same-domain collapse's plain data fun. `elif` chains flatten to one N-choice
+  partition first. A conditional collection is *consumed* (aggregate, program result) via the
+  `Σ <: Fun` subtyping rule, and *through a comprehension* by floating the source `Case` out of the
+  map (see the comprehension bullet below).
+- **Source-less conditional feeds** (`if c: o << 1 else: o << 2` outside any loop) — *implemented*
+  (`channelize`): each feeding arm becomes a gated one-shot lift `λ __unused : {Unit | π̂ᵢ} → 𝑣ᵢ`,
+  one channel per arm — replacing `PartialFeedCaseUnsupported` for guard-only `Case`s. A
+  scrutinee / pattern feed stays rejected; a no-else partial feed is still blocked earlier at
+  lowering (bare `if` as a value expression).
+- **Comprehension over / with a conditional** — *implemented* (`lower::comprehension`). Two shapes,
+  both fanning out the source (a value `Case` has no fixed driver, so it must gate the *iteration
+  source*, not a `Units(1)` one): a conditional **element** (`[a if g(x) else b for x in xs]`) fans
+  the source out by each arm's *element-dependent* gate — `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`, a union of
+  filtered maps (`fan_out_element_case`); a conditional **source** (`[e for x in (xs if c else ys)]`)
+  floats the source `Case` out of the map — `Case{gᵢ → [e for x in srcᵢ]}`, each arm a data-kinded
+  `Compose` so the arms `sigma_join` (`float_comp_source_case`). Both reduce to constructs already
+  compiled (the filter refinement, the gate fan-out); neither duplicates the loop, only the map.
+- **Bound-then-used values in a loop feed** (`x = 𝑒₁ if 𝑝 else 𝑒₂; o << f(x)`) — *deferred*
+  (case-float in the loop-body / feed path, distinct from the comprehension forms above):
+  `𝐶[Case{[𝑔ᵢ → 𝑒ᵢ]}] → Case{[𝑔ᵢ → 𝐶[𝑒ᵢ]]}` (sound by purity) then the channel fan-out generalized
+  from feed-arms to value-arms — only the fed context duplicates, never the loop.
+
 ### General in-transaction conditionals (and conditional writes)
 
 A `with begin():` block admits a single bare `if 𝑝:` **deny guard** — the transaction commits iff
@@ -761,23 +849,13 @@ of every mutable write and feed** (an empty taken path — including a missing `
 **each write key is a `Case` merged over the branch structure** (read-your-writes; a branch that does
 not write a key keeps its snapshot value). This is keyword-free, subsumes the current deny
 (`if 𝑝: x := 𝑒` → one write at path `𝑝` → `commit = 𝑝`), and admits value-selection, cross-key
-routing, `elif`, nesting (conjunction), and sequencing.
-
-The same path-condition fan-out is what a **conditional induction write** needs. A conditional feed
-(`if 𝑝: o << x`) is absent off-path; a conditional mutable write (`if 𝑝: total += x`) instead carries
-the previous value forward off-path — one extra **carry-forward** arm over the complement domain:
-
-```
-target = ⧺ᵢ (source | 𝑝ᵢ ≫ (λ 𝑟 → 𝑣ᵢ))                                  -- channel: partial off-path
-total  = ⧺ᵢ (source | 𝑝ᵢ ≫ (λ 𝑟 → 𝑣ᵢ)) ⧺ (source | ¬⋁ᵢ𝑝ᵢ ≫ (λ 𝑟 → get_prev_seq(total, 𝑟, init)))
-```
-
-The presence or absence of that carry-forward arm *is* the `Overwrite`/`Feed` distinction. **Blocker:**
-both need a *value-selecting* `Case` (`x = if 𝑝: 𝑒₁ else: 𝑒₂`) as a compiled construct, but only the
-*filter* `Case` (`[𝑔 → action; true → unit]` → `Restrict`) compiles today — a value `Case` errors at
-`lambda_elim`. The planned fix (refinement-based fan-out, lowering a value `Case` to a union of
-restricts `⧺ᵢ (source | pathᵢ ≫ 𝑒ᵢ)`) unblocks both the transaction conditionals and the same-shaped
-N-arm Case-with-feeds gap.
+routing, `elif`, nesting (conjunction), and sequencing. The per-key merges are value-selecting
+`Case`s over the snapshot, compiled by the scalar form above; the path walk itself is the next PR
+of the conditionals stack. One shape is settled by analysis: the block stays **one decision record
+per transaction** —
+per-path writer sites are unsound (a path predicate reads the snapshot, which exists only at the
+commit tick; one `begin()` is one serialization point; multi-key read-your-writes needs one
+snapshot and one write-set).
 
 ### `with t = begin():` transaction handle
 
