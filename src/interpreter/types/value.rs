@@ -7,6 +7,7 @@ use intervalsets::Side;
 use intervalsets::numeric::Domain;
 use smol_str::SmolStr;
 
+use crate::ccl::FieldKey;
 use crate::interpreter::{
     BinOpKind, UnaryOpKind, apply_binop_column, apply_unaryop_column, tuple_field,
 };
@@ -63,9 +64,16 @@ pub enum Value {
     /// A record value
     Record(HashMap<String, Value>),
     ComputableFunction(FunctionDef),
-    /// A tagged union value: `tag` identifies which variant, `inner` is the actual value.
+    /// A tagged union value: `tag` names which arm, `inner` is the payload.
+    ///
+    /// The tag is a [`FieldKey`], not a position, so a union value is
+    /// **self-describing**: its meaning does not depend on a static type that is
+    /// not attached to it. A positional tag makes equality, hashing and any
+    /// serialization of a union value only meaningful within one static type,
+    /// because the same position denotes different arms in a type and its
+    /// width-supertype.
     Union {
-        tag: usize,
+        tag: FieldKey,
         inner: Box<Value>,
     },
 }
@@ -200,7 +208,12 @@ impl std::fmt::Display for Value {
             }
             Value::Record(fields) => fmt_record(f, fields),
             Value::ComputableFunction(fun) => write!(f, "{fun}"),
-            Value::Union { tag, inner } => write!(f, "Union[{tag}]({inner})"),
+            // A variant value is what a constructor produced, so it renders as
+            // that constructor: `` `tag(payload) ``. The nullary one shows its
+            // payload too (`` `abort(()) ``, `Unit`'s own rendering) — a value
+            // always has one, unlike an arm's *type*, where storing nothing is
+            // the whole content and the arm is written bare.
+            Value::Union { tag, inner } => write!(f, "`{tag}({inner})"),
         }
     }
 }
@@ -306,6 +319,29 @@ mod tests {
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Bool(false).to_string(), "false");
         assert_eq!(Value::Unit.to_string(), "()");
+    }
+
+    /// A variant value renders as the constructor that produced it, so a value
+    /// read out of a tile and the term that built it read the same. The nullary
+    /// constructor still shows its payload — a *value* always has one.
+    #[test]
+    fn test_value_display_union_is_the_constructor() {
+        assert_eq!(
+            Value::Union {
+                tag: FieldKey::Name("commit".into()),
+                inner: Box::new(Value::Int(7)),
+            }
+            .to_string(),
+            "`commit(7)"
+        );
+        assert_eq!(
+            Value::Union {
+                tag: FieldKey::Name("abort".into()),
+                inner: Box::new(Value::Unit),
+            }
+            .to_string(),
+            "`abort(())"
+        );
     }
 
     #[test]

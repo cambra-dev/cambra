@@ -130,6 +130,8 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 - **Tuples / lists**: `(a, b)`, `[a, b, c]`.
 - **Records**: a record **value** renders with parens + colons — `(name: a, age: b)` (the renderer emits `(field: val, …)`, `src/ccl/symbolic.rs`); a record **type** renders with braces + colons — `{name: T, age: U}` (`Display for Type`, `src/ccl/mod.rs`). Braces are for types only; do not render a record value with braces.
 - **List mappings** (in lowered list literals): `[0 ↦ e0, 1 ↦ e1]`.
+- **Variant construction / destructuring**: `` `tag(payload) `` — a backtick introduces an arm, in a term as in a type. **Arm names are lowercase**: an arm is a constructor (a term), and `Caps` in CHL means a type. A `match` arm destructures with the same form: ``match d { `commit(w) → w + 1 ; `abort(a) → 0 }``. The payload is always written in a *term*, including the nullary constructor's (`` `abort(unit) ``), because the `Unit`-valued expression sitting there is a real node — unlike an arm's type, where "stores nothing" is the whole content.
+- **Variant project / wrap** (the point-free eliminator and constructor `lambda_elim` mints): ``variant_project(`commit)``, ``variant_wrap(`commit)`` — the tag keeps its backtick inside the builtin.
 
 Types (from `Display for Type` in `src/ccl/mod.rs`):
 
@@ -140,7 +142,8 @@ Types (from `Display for Type` in `src/ccl/mod.rs`):
 - **Hole**: `_`.
 - **Infer**: `?N` (where `N` is the variable id).
 - **DataSource**: `source(name)`.
-- **Union**: `T1 | T2`.
+- **Variant** (a tagged sum): ``{`arm1{T1} | `arm2{T2}}`` — braces around the arms, each arm introduced by a backtick with its stored type in braces. An arm that stores nothing is written bare (``{`commit{Int} | `abort}``, not `` `abort{Unit} ``), and a payload that is itself brace-delimited reuses those braces rather than doubling them (``{`pair{a: Int, b: Int}}``). A single-arm sum is just the general form with one arm: ``{`none}``, ``{`some{Int}}``.
+- **Union** (an *anonymous positional* sum, what `++` / `CollectionUnion` produces — not a tagged variant): `T1 | T2`. Its `Index` keys carry no user-meaningful information, so it renders as a flat join with no arm tags.
 - **Feed**: `Feed(T)` — a transient deferred-output type inference threads and `channelize` erases.
 - **Mut**: `Mut(value, domain)` — a transient mutable-variable type inference threads and the mutability-elimination phases (`mut_elim`) erase; the domain is an induction extent or `Txn`. Its `HistoryKind` is `Overwrite` (the last-write-wins merge law); the append-law sibling is `Feed`'s `Append` kind.
 - **Txn**: `Txn` — the (nullary) transaction-commit sequencing domain, the second slot of a `Mut(V, Txn)` register.
