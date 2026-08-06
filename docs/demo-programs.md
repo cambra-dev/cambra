@@ -161,7 +161,9 @@ when you go to add more.
   files whose diff is the upgrade, exercising version dispatch over persistent
   transactional state at the `t_new` branch point, and `hot_reload` carries the
   pair a running program is swapped between.  Replacing one version with another
-  is implemented ([hot-reload.md](../src/ccl/design/hot-reload.md)); what is
-  still open is running two at once, which is what the `Versioned` node shape
-  and its dispatch semantics are for, and long-term a v2 of *every* program (a
-  diffing dimension across the corpus); branch/merge is out of scope for now.
+  is implemented
+  ([program-evolution.md](../src/ccl/design/program-evolution.md#the-reload-lifecycle));
+  what is still open is running two at once, which is what the `Versioned` node
+  shape and its dispatch semantics are for, and long-term a v2 of *every*
+  program (a diffing dimension across the corpus); branch/merge is out of scope
+  for now.

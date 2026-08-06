@@ -713,11 +713,12 @@ pub(super) fn lower_middle_stmt(
                 ));
             }
             let annotation_ty = lower_type_annotation(annotation, ctx)?;
-            // The source names a variable of the *previous* version, so it is
-            // resolved against what that version held rather than against this
-            // scope — see `src/ccl/design/hot-reload.md`, "Seeding a variable
-            // from the value the predecessor held". It is a spelling here, not a
-            // reference, which is why it never goes through `lower_expr`.
+            // The source names a variable of the previous version, so it is
+            // resolved against what that version *declared* rather than against
+            // this scope, and not against what it currently holds a value for —
+            // see `src/ccl/design/program-evolution.md`, "Which variable a load
+            // site addresses". It is a spelling here, not a reference, which is
+            // why it never goes through `lower_expr`.
             let val = ctx.tag_image(Expr::load_from(source.node.as_str()), source.span);
             Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),

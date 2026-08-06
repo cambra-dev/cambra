@@ -45,10 +45,11 @@
 //!
 //! Steps 4–5 upgrade at a branch point, which is one of two things. Replacing
 //! V0 with V1 outright is implemented — the running program's state carries
-//! across the swap (`src/ccl/design/hot-reload.md`, "How a reload works"), which
-//! is what step 4 asks for and what `hot_reload` demonstrates. Serving both
-//! sides of `t_new` at once still needs the versioning surface (`Versioned`
-//! dispatch, branch/merge), which is open design.
+//! across the swap (`src/ccl/design/program-evolution.md`, "Where a rebuilt
+//! store picks up"), which is what step 4 asks for and what `hot_reload`
+//! demonstrates. Serving both sides of `t_new` at once still needs the
+//! versioning surface (`Versioned` dispatch, branch/merge), which is open
+//! design.
 //!
 //! ### Current limitations (what this test depends on)
 //!

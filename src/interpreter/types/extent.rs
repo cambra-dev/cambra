@@ -350,7 +350,8 @@ pub trait DataSourceDomainExtentImpl {
     ///
     /// Called when the endpoint behind the source is retired
     /// ([`SourceSinkRegistry::retire_routes_absent_from`](crate::ccl::context::SourceSinkRegistry))
-    /// — see `src/ccl/design/hot-reload.md`, "A route a version stops serving is retired".
+    /// — see `src/ccl/design/program-evolution.md`, "A route a version stops
+    /// serving is retired".
     /// A request that arrived before the retirement has no version left to
     /// compute its reply, and the source holding it is kept alive past the route
     /// by the handover a retired version's operators sit in, so nothing else ends

@@ -247,8 +247,8 @@ impl LiveProgram {
     /// The guard's tree is compiled separately from the one that gets built.
     /// `run_frontend` goes from source to a stop phase and nothing continues a
     /// stopped tree into operator conversion, so checking before tearing down
-    /// means compiling twice — see `src/ccl/design/hot-reload.md`, "Order of a
-    /// reload".
+    /// means compiling twice — see `src/ccl/design/program-evolution.md`,
+    /// "Order of a reload".
     ///
     /// # Panics
     ///

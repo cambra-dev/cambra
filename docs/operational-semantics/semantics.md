@@ -474,9 +474,10 @@ what must hold for the answer to be defined.
 
 The model is stated per term, so it presupposes a **correspondence**: a partial injection from the
 terms of `P₁` to the terms of `P₂` pairing terms that compute the same function.
-[hot-reload.md](/src/ccl/design/hot-reload.md) derives one structurally and specifies which of a
-program's terms it covers. A term of `P₂` with no correspondent starts at `⊥`, which property 4
-below qualifies: starting at `⊥` is not the same as starting with the whole input.
+[program-evolution.md](/src/ccl/design/program-evolution.md#the-agreed-region-is-the-region-a-structural-diff-pairs)
+derives one structurally and specifies which of a program's terms it covers. A term of `P₂` with no
+correspondent starts at `⊥`, which property 4 below qualifies: starting at `⊥` is not the same as
+starting with the whole input.
 
 ### What a reload computes
 
@@ -590,8 +591,11 @@ Two things about a reload are outside this model, and the mechanism decides both
 
 **Which terms correspond.** The correspondence is an input here. Two programs can agree on every
 tiling and still admit several injections between their terms, and the choice decides which tile
-each seed carries. [hot-reload.md](/src/ccl/design/hot-reload.md) specifies the one the compiler
-takes and what it refuses where the source does not determine it.
+each seed carries.
+[program-evolution.md](/src/ccl/design/program-evolution.md#the-agreed-region-is-the-region-a-structural-diff-pairs)
+specifies the one the compiler takes, and
+[Five refusals](/src/ccl/design/program-evolution.md#five-refusals) is what it refuses where the
+source does not determine it.
 
 **When the boundary is taken.** `y₁` is whatever the term held at the instant the swap ran.
 Nothing here constrains that instant, so a reload is reproducible only against a stated schedule of
