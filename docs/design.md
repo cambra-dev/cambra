@@ -171,7 +171,7 @@ CHL source
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators, then CCC-simplified)
   → plan_loops       (ccl/planning/loops.rs::plan_loops: AFTER lambda_elim, on the point-free normal form,
                       lower each causal LetRec group onto the domain-parameterized Transact carrier —
-                      induction domain → Recurse, Txn domain → commit operator. Anchors on the guard
+                      induction domain → InductionStore, Txn domain → commit operator. Anchors on the guard
                       builtins (which survive elimination), so one LetRec travels through channelize +
                       lambda_elim and is planned point-free — no pointful/point-free double
                       representation. Transact is loop planning's output carrier to op-conversion)

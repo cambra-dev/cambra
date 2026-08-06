@@ -6,8 +6,8 @@ use crate::interpreter::{Consumer, DataSourceDomainExtentImpl};
 ///
 /// The notification model is push-from-source: a source announces new data via
 /// [`Scheduler::check_for_notifications`], which the driver calls *between*
-/// pulls. But an operator that advances its own state one pull at a time — the
-/// mutation-loop [`Recurse`](crate::interpreter::tile_operators) cycle — has
+/// pulls. But an operator that advances its own state one pull at a time — a
+/// store recurrence closed through a cyclic feedback `FanOut` — has
 /// more to compute after a partial pull with **no external trigger pending**,
 /// and it cannot simply `notify()` from inside `get`: the notify graph is cyclic
 /// (the feedback `FanOut`), so a synchronous notification during a `get`

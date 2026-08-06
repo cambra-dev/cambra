@@ -28,7 +28,7 @@ use crate::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractLast, FanOut, Filter,
             FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
             MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo,
-            PermuteRecordDomain, Recurse, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
+            PermuteRecordDomain, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
             VariantWrap, fan_in, fan_in_named,
         },
         tuple_field,
@@ -165,8 +165,8 @@ pub enum ConversionError {
 /// compiled with `Some(input)` or not — and the [`TypedExprNode::Var`]
 /// arm only checks whether there *is* currently an input.  That collapses
 /// "aligned to which iteration" into a yes/no, which is fine for the
-/// current surface area (mutation-loop body has exactly one iteration
-/// depth via the `Recurse` cycle; multi-generator comprehensions flatten
+/// current surface area (a mutation-loop body has exactly one iteration
+/// depth — the changelog `InductionStore` drives it; multi-generator comprehensions flatten
 /// to a single domain via hash-join / loop-join before any nested lets
 /// appear) but breaks down once a binding made at one iteration depth is
 /// referenced at another.  Concretely:
@@ -227,12 +227,6 @@ enum StoreReadKind {
     /// A [`Type::Txn`] store: the fan wraps a [`CommitOperator`]; a read is a
     /// [`StoreValueStream`] over the commit-log map (keyed by `runtime_key`).
     Commit,
-    /// An induction-domain store (a `mut` loop): the fan wraps a [`Recurse`]
-    /// whose body stream is `D ⇀ {commit, writes}`; a read projects
-    /// `.writes.(index)` — the accumulator's history `D ⇀ V`, reduced to its
-    /// last value downstream. The retired dense realization, kept for the
-    /// ≥2-writer conditional path until recognition emits a single writer.
-    Induction,
     /// An induction store backed by an [`InductionStore`] over a [`Tile::Store`]
     /// changelog: a read is a [`StoreDenseRead`] folding the changelog at every
     /// position of the loop extent (`StoreReadInfo::induction_extent`) into the
@@ -1240,12 +1234,12 @@ fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, ConversionError> {
 /// read `__reg.k` ([`convert_store_read`]) branches the fan and projects it.
 ///
 /// Op-conversion dispatches on the store's sequencing `domain`: a concrete
-/// iteration extent → the sequential [`Recurse`] (an induction / `mut`-loop
-/// store, [`build_induction_store`]); [`Type::Txn`] → the concurrent
-/// [`CommitOperator`] (below). They are *not* interchangeable: the commit
-/// operator is built for an open commit clock (concurrent writers, serialize +
-/// retry), while `Recurse` is the loop recurrence (each position reads the
-/// previous and streams in order).
+/// iteration extent → the position-driven [`InductionStore`] changelog (an
+/// induction / `mut`-loop store, [`build_induction_store`]); [`Type::Txn`] → the
+/// concurrent [`CommitOperator`] (below). They are *not* interchangeable: the
+/// commit operator is built for an open commit clock (concurrent writers,
+/// serialize + retry), while the induction store is the loop recurrence (each
+/// position reads the previous accumulator and streams in order — no conflicts).
 fn build_transact_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
@@ -1422,166 +1416,44 @@ fn build_commit_store(
     })
 }
 
-/// Build an induction-domain store (a `mut` loop): one always-commit writer over
-/// the loop source, compiled to a [`Recurse`] (the loop recurrence) exactly as a
-/// `Loop` was. The writer body is `λ p → … → {commit: true, writes: (new₀, …)}`;
-/// we cycle on `.writes` (a single accumulator's value is the lone element,
-/// unwrapped; several accumulators ride the packed tuple). The returned
-/// [`StoreReadInfo`] is `Induction`-kind: each `__reg.kᵢ` read projects
-/// `.writes.(i)` off the body stream.
+/// Build an induction-domain store (a `mut` loop). Every induction store — plain,
+/// conditional, or feed-carrying, over a finite or async extent — is single-writer
+/// (recognition folds a conditional write to one carry-complete writer), so this
+/// delegates to the position-driven changelog [`build_induction_store_single`].
 fn build_induction_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
-    // Recognition folds a conditional induction write (`if p: total += x`) to a
-    // single carry-complete, commit-gated writer over the full source — the
-    // multi-leg `DispatchRecurse` realization is never born. So an induction
-    // store always has exactly one writer; reject any other count loudly rather
-    // than let a downstream `.next()` on a would-be multi-op list silently drop
-    // the extra writers in release (the `debug_assert` alone is compiled out).
-    if writers.len() != 1 {
-        return Err(ConversionError::TypeError(format!(
-            "induction store expects exactly one writer (recognition folds a \
-             conditional write to one commit-gated writer), got {}",
-            writers.len()
-        )));
-    }
     let n_accs = keys.len();
-    for w in writers {
-        debug_assert_eq!(
-            n_accs,
-            w.write_keys.len(),
-            "every induction leg writes every accumulator key"
-        );
-    }
     // At least one accumulator: an accumulator-free loop routes through
-    // `transform_feed_only_loop` in the phase and never reaches here. Make the
-    // precondition explicit — the `n_accs > 1` branches below `fan_in` the
-    // keys, and `fan_in(vec![])` (n_accs == 0) is an ill-formed record.
+    // `transform_feed_only_loop` in the phase and never reaches here.
     debug_assert!(
         n_accs >= 1,
         "an induction store has at least one accumulator"
     );
-
-    // The sole writer, with no reply taps, over a **static** (finite, non-async)
-    // extent — a plain `mut` loop, and (once recognition emits the `commit:
-    // guard` form) a conditional write — compiles to the position-driven
-    // `InductionStore` over the `Tile::Store` changelog, read densely via
-    // `StoreDenseRead`. Two cases stay on the dense `Recurse` path below: a
-    // reply tap (a feed riding the loop), and an **async data-source** extent
-    // (whose incremental sliding-window + source-release drive the `InductionStore`
-    // loop does not yet handle — a follow-up; the dense `Recurse` handles it).
-    if writers.len() == 1 && body_tap_fields(&writers[0].body.ty).is_empty() {
-        let raw_domain = writers[0].source.ty.domain().ok_or_else(|| {
-            ConversionError::TypeError(format!(
-                "induction-store writer source must have function type, got {}",
-                writers[0].source.ty
-            ))
-        })?;
-        let extent = ctx.extent_of(&crate::ccl::ccl_utils::strip_refinements(&raw_domain))?;
-        if extent_is_static(&extent) {
-            return build_induction_store_single(keys, &writers[0], ctx);
-        }
-    }
-
-    // Position-0 seed: one accumulator → its init op; several → a packed
-    // `_0.._{n-1}` record via `fan_in` (the `Recurse` codomain is one packed
-    // tile rather than N parallel cycles).
-    let init_op: Box<dyn TileOperator> = if n_accs == 1 {
-        convert_impl(&keys[0].init, None, ctx)?
-    } else {
-        let arms: Vec<Box<dyn TileOperator>> = keys
-            .iter()
-            .map(|k| convert_impl(&k.init, None, ctx))
-            .collect::<Result<_, _>>()?;
-        fan_in(arms)
+    // An induction store is **always single-writer**: recognition folds every
+    // conditional write to one carry-complete writer (`writes = Case[ĝ → w; true →
+    // snapshot]`), so no multi-leg realization is needed. That one
+    // writer — plain, conditional, or feed-carrying — compiles to the
+    // position-driven `InductionStore` over the `Tile::Store` changelog, read
+    // densely via `StoreDenseRead`. Finite (list) and async (`DataSource`) extents
+    // share it: the drive reads the source by absolute position and tolerates
+    // unordered/incremental arrival, so a finite loop is just the terminating
+    // instance of the same changelog.
+    let [w] = writers else {
+        return Err(ConversionError::Unsupported(format!(
+            "an induction store must have exactly one writer (recognition folds a \
+             conditional write to one), got {}",
+            writers.len()
+        )));
     };
-
-    // The iteration extent. The sole writer's source is the full `Fun(D, item)`
-    // over the whole extent `D` (a conditional write carries its guard in the
-    // decision `commit`, not a restricted source), so the recurrence iterates
-    // `D` directly.
-    let base_domain = writers[0].source.ty.domain().ok_or_else(|| {
-        ConversionError::TypeError(format!(
-            "induction-store writer source must have function type, got {}",
-            writers[0].source.ty
-        ))
-    })?;
-    let base_extent = ctx.extent_of(&base_domain)?;
-    let domain_op: Box<dyn TileOperator> = Box::new(IterateExtent::new(base_extent.clone()));
-    let recurse = Recurse::new(init_op, domain_op);
-    let set_recursive_input = recurse.recursive_input_setter();
-    let prev_acc_fan = Rc::new(FanOut::new_cyclic(Box::new(recurse)));
-
-    // The single decision body reads the shared prev-accumulator cycle (a fresh
-    // fan branch) and its own source. Body input `(acc₀, …, acc_{n-1}, item)`:
-    // the previous accumulator snapshot then the item — the shape the writer
-    // body's `let acc_i = p.i … let item = p.n` destructuring expects. Single
-    // accumulator → prev is the scalar; several → unpack the packed prev-acc
-    // record into its `_0.._{n-1}` fields.
-    let writer = &writers[0];
-    let source_op = convert_impl(&writer.source, None, ctx)?;
-    let body_input = if n_accs == 1 {
-        fan_in(vec![prev_acc_fan.branch(), source_op])
-    } else {
-        let mut arms: Vec<Box<dyn TileOperator>> = Vec::with_capacity(n_accs + 1);
-        for i in 0..n_accs {
-            arms.push(proj_field(prev_acc_fan.branch(), i)?);
-        }
-        arms.push(source_op);
-        fan_in(arms)
-    };
-    let merged = convert_impl(&writer.body, Some(body_input), ctx)?;
-    let body_fan = Rc::new(FanOut::new_cyclic(Box::new(Memo::new(merged))));
-    // Cycle on `.writes` — the proposed new accumulator(s). Single accumulator →
-    // unwrap the 1-tuple; several → the packed tuple itself (its `_0.._{n-1}`
-    // fields feed the body input).
-    let writes_branch = proj_named_field(body_fan.branch(), F_WRITES)?;
-    let cycle_branch: Box<dyn TileOperator> = if n_accs == 1 {
-        proj_field(writes_branch, 0)?
-    } else {
-        writes_branch
-    };
-    set_recursive_input(cycle_branch);
-
-    // Each `__reg.kᵢ` read projects `.writes.(i)` off the body stream.
-    let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(n_accs);
-    for (i, k) in keys.iter().enumerate() {
-        keys_map.insert(
-            k.name.field_key(),
-            KeyReadInfo {
-                runtime_key: Value::Unit,
-                value_extent: ctx.extent_of(&k.init.ty)?,
-                index: i,
-                carry_forward: true, // induction reads don't use StoreValueStream
-            },
-        );
-    }
-    Ok(StoreReadInfo {
-        fan: body_fan,
-        keys: keys_map,
-        kind: StoreReadKind::Induction,
-        induction_extent: None,
-    })
-}
-
-/// Whether an extent is *static* — a finite, non-async iteration domain that the
-/// [`InductionStore`] drive loop can sweep in one pass. False if a
-/// [`Extent::DataSourceDomain`] appears anywhere (an async source arrives over
-/// scheduler notifications as a sliding window, which the changelog drive loop
-/// does not yet handle — such loops stay on the dense `Recurse` path).
-fn extent_is_static(extent: &Extent) -> bool {
-    match extent {
-        Extent::DataSourceDomain(_) => false,
-        Extent::Base(_) | Extent::UIntRange(_) => true,
-        Extent::Function { domain, codomain } => {
-            extent_is_static(domain) && extent_is_static(codomain)
-        }
-        Extent::Record(fields) => fields.values().all(extent_is_static),
-        Extent::Union(variants) => variants.iter().all(extent_is_static),
-        Extent::Restricted { base, .. } => extent_is_static(base),
-    }
+    debug_assert_eq!(
+        n_accs,
+        w.write_keys.len(),
+        "the induction writer writes every accumulator key"
+    );
+    build_induction_store_single(keys, w, ctx)
 }
 
 /// Build a single-writer induction store as a position-driven [`InductionStore`]
@@ -1667,6 +1539,31 @@ fn build_induction_store_single(
     let body_input = BodyInputSource::new(buffer.clone(), read_extents, item_extent);
     let body_op = convert_impl(&w.body, Some(Box::new(body_input)), ctx)?;
 
+    // A reply (`out << e`) rides this loop body as `to_<defer>` decision taps —
+    // the same shape a commit writer carries (see `build_commit_store`). Each tap
+    // becomes a write-only changelog key (appended after the accumulator keys), so
+    // its per-position value rides the committing change and is read back densely.
+    // A tap is a per-position event, not a carried register (`carry_forward:
+    // false`): it appears only at the position that fired it. Under a conditional
+    // feed the decision also carries a `to_<defer>__fire` gate, which the producer
+    // reads to omit a non-fired tap from the delta.
+    let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
+    let mut tap_fields: Vec<String> = Vec::new();
+    for (field, tap_ty) in body_tap_fields(&w.body.ty) {
+        let tap_value_extent = ctx.extent_of(&tap_ty)?;
+        write_keys.push(Value::String(field.clone().into()));
+        keys_map.insert(
+            field.clone(),
+            KeyReadInfo {
+                runtime_key: Value::String(field.clone().into()),
+                value_extent: tap_value_extent,
+                index: 0,             // unused: dense reads fold by runtime_key
+                carry_forward: false, // a tap fires only at its own position
+            },
+        );
+        tap_fields.push(field);
+    }
+
     let value_extent = match value_extents.len() {
         0 => Extent::Base(BaseType::Unit),
         1 => value_extents.pop().expect("len == 1"),
@@ -1679,8 +1576,8 @@ fn build_induction_store_single(
         source_op,
         buffer,
         w.read_keys.iter().map(runtime_key).collect(),
-        w.write_keys.iter().map(runtime_key).collect(),
-        Vec::new(), // no reply taps on this path (checked by the caller's dispatch)
+        write_keys,
+        tap_fields,
         key_extent,
         value_extent,
     );
@@ -1814,14 +1711,20 @@ fn convert_store_read(
                 carry_forward,
             )))
         }
-        // An `InductionChangelog` accumulator: its dense history `D ⇀ V` is the
-        // changelog folded at every position of the loop extent via
-        // [`StoreDenseRead`] (an `IterateExtent(D)` trigger + the store branch).
-        // `recognize` wraps a scalar read in `final_or_default`, reduced to the
-        // final value via `ExtractLast`; a co-iterated read consumes the dense
-        // function directly. Leading carries fold to the tick-0 seed, so the reader
-        // needs no external default.
-        (StoreReadKind::InductionChangelog, Some((runtime_key, value_extent, _, _))) => {
+        // An `InductionChangelog` key read off the changelog, folded at every
+        // position of the loop extent via [`StoreDenseRead`] (an `IterateExtent(D)`
+        // trigger + the store branch). An **accumulator** (`carry_forward: true`)
+        // is dense `D ⇀ V` — every position folds the latest write ≤ it (leading
+        // carries fold to the tick-0 seed); `recognize` wraps a scalar read in
+        // `final_or_default` → `ExtractLast`, a co-iterated read consumes the dense
+        // function directly. A **reply tap** (`carry_forward: false`) is the feed's
+        // per-position value stream: only the positions where the tap fired
+        // (its value present in that position's changelog delta), keyed by loop
+        // position — the same `Fun(D, V)` the sink reads.
+        (
+            StoreReadKind::InductionChangelog,
+            Some((runtime_key, value_extent, _, carry_forward)),
+        ) => {
             let extent = induction_extent.ok_or_else(|| {
                 ConversionError::Unsupported(format!(
                     "induction-changelog store {store_name} has no loop extent"
@@ -1832,24 +1735,11 @@ fn convert_store_read(
                 fan.branch(),
                 runtime_key,
                 value_extent,
+                carry_forward,
             )))
         }
-        // An induction store key (a `mut` loop accumulator): its history `D ⇀ V`
-        // is `.writes.(index)` off the `Recurse` body stream `D ⇀ {commit,
-        // writes, …}`. `plan_loops` wraps the read in `final_or_default`, reduced
-        // to the final value via `ExtractLast`.
-        (StoreReadKind::Induction, Some((_, _, index, _))) => {
-            let writes = proj_named_field(fan.branch(), F_WRITES)?;
-            proj_field(writes, index)
-        }
-        // A `to_<defer>` virtual key (a feed riding the writer's per-position
-        // output): not a register, so it has no `keys` entry — project the field
-        // directly off the writer body fan (a sibling of `.writes`), yielding the
-        // per-position stream `Fun(domain, V)` the consumer/sink reads.
-        (StoreReadKind::Induction, None) => proj_named_field(fan.branch(), field),
-        // An `InductionChangelog` store exposes only its accumulator keys as dense
-        // reads; it carries no reply taps (the caller's dispatch routes tap-bearing
-        // loops to the dense `Induction` path), so an absent key is a bug.
+        // Every `InductionChangelog` read (accumulator *and* reply tap) is
+        // registered as a changelog key, so an absent key is a bug.
         (StoreReadKind::InductionChangelog, None) => Err(ConversionError::Unsupported(format!(
             "induction-changelog store {store_name} has no key {field}"
         ))),

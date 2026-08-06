@@ -36,7 +36,6 @@ mod fanout;
 mod helpers;
 mod iterate;
 mod map;
-mod recurse;
 mod reshape;
 mod scalar;
 mod union;
@@ -49,7 +48,6 @@ pub use fanout::*;
 pub use helpers::*;
 pub use iterate::*;
 pub use map::*;
-pub use recurse::*;
 pub use reshape::*;
 pub use scalar::*;
 pub use union::*;
@@ -282,8 +280,8 @@ pub trait TileProducer {
 }
 
 /// A producer that participates in a cyclic operator graph as an **append-only,
-/// position-stable sequencing source** — the `Recurse` feedback idiom and the
-/// commit operator both rely on this contract:
+/// position-stable sequencing source** — the commit operator's recurrence (and
+/// the changelog induction store) rely on this contract:
 ///
 /// 1. Its output tile is append-only along the sequencing domain: a value once
 ///    emitted at a position is never changed (only `release` shrinks the view).

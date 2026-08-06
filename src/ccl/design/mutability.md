@@ -258,7 +258,7 @@ runtime) a `Txn` register by the commit operator's timestamped merge — so mult
 already the semantics and aliasing is benign; that is why `Feed` deliberately stays first-class (it
 is returned in `http_serve`'s tuple). *Last-write-wins* mutability instead needs a **resolvable
 writer set** — but that requirement is fundamental only for an **induction** accumulator, which
-compiles to a single-writer `Recurse`. A `Txn` register already tolerates an open writer set (its
+compiles to a single-writer `InductionStore` changelog. A `Txn` register already tolerates an open writer set (its
 sites merge their commit streams by time), so applying the uniform second-class discipline to it is
 a conservative stopgap, not a necessity. (Future work splits the same way: the induction aliasing
 rule is a blunt approximation of **affine typing** — a use-at-most-once handle keeps the writer
@@ -548,7 +548,7 @@ remain open in the model.
 **Engine freedom, stated symmetrically.** The two loop engines sit at opposite ends, and the contrast
 is why dispatch on the sequencing domain is load-bearing (not an optimization):
 
-- **Induction (`Recurse`)** reads position `𝑖-1`, so it is a *strict total-order data-dependence
+- **Induction (`InductionStore`)** reads position `𝑖-1`, so it is a *strict total-order data-dependence
   chain*: necessarily sequential, independent iterations **not** reordered.
 - **`Txn` (commit operator)** has a *serial denotation* (a total commit order, each transaction reading
   the prefix strictly before its time) but a *concurrent engine* (optimistic concurrency), correct iff
@@ -583,17 +583,21 @@ causal matcher (`letrec::check_letrec_causal`).
 
 | Letrec pattern | Engine |
 |---|---|
-| a binding referenced only via `get_prev_seq(𝑏, …)`, over a finite/stream induction domain | `Recurse` — the sequential loop engine |
+| a binding referenced only via `get_prev_seq(𝑏, …)`, over a finite/stream induction domain | `InductionStore` — the position-driven changelog loop engine (read densely via `StoreDenseRead`) |
 | commit-record bindings + `begin_<site>` oracles + `Txn` histories read via `get_prev_txn` | the commit operator (`CommitOperator`, `TransactWriter`, cyclic `FanOut`, `StoreValueStream`) |
 | a `Txn` history read out of a read-only block (any reading loop — a live request stream, a finite loop, or a standalone singleton) | the as-of read (`AsOf`), latching the store's value as of the reading transaction's position, indexed by the outer reading loop |
 | a non-causal cycle, or a causal shape loop planning does not know | compile error (no silent fallback) |
 
 ### The runtime engines
 
-- **`Recurse`** — the induction loop. It emits the prev-accumulator stream `𝐷 ⇀ 𝑉` (`init` at
-  position 0, the body's output at `𝑖-1` for `𝑖 > 0`), internalizing the cycle in a cyclic `FanOut`
-  so the static operator graph stays acyclic. A single always-commit writer over a finite domain.
-- **The commit operator** — the concurrent generalization of `Recurse`, for the `Txn` domain. The
+- **`InductionStore` (+ `StoreDenseRead`)** — the induction loop. It drives the loop *sequentially
+  inside the producer* — folding each position's prev-accumulator from its own commit engine, so
+  there is no cyclic `FanOut` — and writes a `Tile::Store` changelog (`init` at position 0; a
+  `commit: false` position carries the prior value forward). `StoreDenseRead` then folds that
+  changelog over the loop domain to the dense `𝐷 ⇀ 𝑉` stream (serving both a scalar-final
+  `ExtractLast` and a co-iterated `fan_in`). A single always-commit or commit-gated writer over a
+  finite *or* async domain.
+- **The commit operator** — the concurrent generalization of the induction accumulator, for the `Txn` domain. The
   store is an MVCC commit log `Txn ⇀ (Key ⇀ Value)`. A writer reads a snapshot of its footprint,
   runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
   the current store (backward / optimistic concurrency) *before* allocating a timestamp — a valid
@@ -606,7 +610,7 @@ causal matcher (`letrec::check_letrec_causal`).
   *source* (the store), it latches, for each trigger position, the store's value as of the moment
   that position is first observed. The output is indexed by the **trigger** (the outer reading loop),
   not the commit clock — which is why a reply matches its reader by position and needs no explicit
-  correlation id. It is the dual of the commit `Recurse`: `Recurse` latches a private accumulator per
+  correlation id. It is the dual of the induction accumulator: the induction accumulator latches a private accumulator per
   source step; `AsOf` latches the store's current value per trigger step. It is a *sample at
   observation time* — an arbitrary as-of position, which is exactly the read a transaction gets: the
   store as of where it lands in the commit order. The only terminal/final register read is
@@ -625,7 +629,7 @@ causal matcher (`letrec::check_letrec_causal`).
   induction loop's final, broadcast into a commit decision).
 
 The two loop engines are **not interchangeable**: the commit operator is built for an open commit
-clock and mis-drives an incremental/live source, while `Recurse` is the ordered loop recurrence.
+clock and mis-drives an incremental/live source, while the induction accumulator is the ordered loop recurrence.
 Dispatch on the sequencing domain is load-bearing, not an optimization.
 
 ### Watermarks
@@ -674,7 +678,7 @@ A commit decision may read an induction accumulator at its request position
 phase folds the entangled induction loop (via `fold_induction_loop`, shared with `transform_loop`)
 into its own **outer** single-binding induction letrec wrapping the transaction letrec — dependency
 order, since `incr_commits` reads `𝑐𝑛𝑡` and `𝑐𝑛𝑡` is self-guarded — so `recognize` nests the two
-carriers (`Recurse` outer, commit engine inner) with **no** cross-domain group logic. The read itself
+carriers (`InductionStore` outer, commit engine inner) with **no** cross-domain group logic. The read itself
 rides the **writer source**: an accumulator the decision reads is zipped into the source,
 `source ↦ λ 𝑟 → (reqs(𝑟), 𝑐𝑛𝑡-view(𝑟)) : 𝐼 ⇒ (item, 𝑉)`, and the decision body reads it off the item
 tuple's slot. This keeps recognition's writer round-trip intact — `recover_writer` lifts the source
@@ -709,10 +713,10 @@ transaction. The phase distinguishes the two by the site's *enclosing-loop write
 a `Constant` broadcast (via `MapResultToConst`) over the transaction domain.
 
 The one engine subtlety is **driving** that broadcast to convergence. The final's `ExtractLast` is
-empty until the sibling loop's `Recurse` drains (one position per body pull), and nothing external
+empty until the sibling loop's `InductionStore` drains (one position per body pull), and nothing external
 re-pulls the writer: the store's own convergence loop stops once the commit frontier stalls, and the
 frontier cannot advance until this writer commits, which needs the value still converging. The writer
-resolves this the same way `Recurse` resolves its own one-step-per-pull convergence (see #291): when
+resolves this the same way the mutable writer resolves its own one-step-per-pull convergence (see #291): when
 its decision body is not ready, it re-arms itself on the scheduler's **deferred-wakeup queue**
 (`WakeupQueue::request`) and returns non-terminal, keeping its pending body-input row so a re-pull
 reuses it (a re-push would duplicate a buffer position against the body's `Memo`). Each demand-driven
@@ -777,8 +781,9 @@ today rather than silently mishandled.
 > compiles via the value-preserving `filter_values` union-of-restricts inside the writer lambda (see
 > below and `../../interpreter/design-operators.md`). That desugar also resolves the former residual —
 > a value-selecting `Case` inside a lambda with no visible iteration source (a UDF body, or a
-> comprehension `if`-filter beside the element `Case`). **Not yet implemented**: a conditional *feed*
-> on an induction path (naturally partial — a follow-up).
+> comprehension `if`-filter beside the element `Case`). A conditional *feed* on an induction path
+> (`if 𝑝: out << e`) is **implemented** — it rides the same decision as a `to_<defer>__fire`-gated tap
+> (below).
 
 The *filter* `Case` (`[𝑔 → action; true → unit]` → `Restrict`), the value-selecting `Case`, and the
 conditional induction write all compile. The value-`Case` compilation is a **literal union of
@@ -801,25 +806,23 @@ branches into **one uniform, carry-complete writer decision over the full loop s
 `writesᵢ = Case[π̂ⱼ → wⱼᵢ; …; true → snapshotᵢ]` — a per-accumulator value-`Case` whose trailing `true`
 arm is the **carry** (the entering accumulator). `commit: false` positions are dropped from the
 changelog store (`InductionStore`, see `../../interpreter/design-operators.md`) — sparse — and the
-carry arm makes the write value **total at every position** (so the dense `Recurse` path, which
-cycles on `.writes` for an async source, honors the guard by carrying rather than dropping it). So
-the `Overwrite`/`Feed` distinction and the carry-forward live *inside one decision on one writer* — no
-per-leg restricted source, no complement leg, and none of the cyclic-convergence hazard a
-restricted-source multi-leg realization carried. Recognition packages it as an ordinary single-writer
-`Transact`; op-conversion routes it to the changelog store, and reads fold the changelog densely
-(`StoreDenseRead`). The per-accumulator value-`Case` is value-selecting inside the writer lambda,
+carry arm makes the write value **total at every position**. So the `Overwrite`/`Feed` distinction and
+the carry-forward live *inside one decision on one writer* — no per-leg restricted source, no
+complement leg, and none of the cyclic-convergence hazard a restricted-source multi-leg realization
+carried. Recognition packages it as an ordinary single-writer `Transact`; op-conversion routes it to
+the changelog store, and reads fold the changelog densely (`StoreDenseRead`). The per-accumulator value-`Case` is value-selecting inside the writer lambda,
 compiled to the **value-preserving `filter_values` union-of-restricts** (`⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`;
 `Builtin::FilterValues` → the `Filter` tile op, flat-merged with `UnionOperator::new_flat`) — an
 off-path arm is never evaluated, so a **partial op** (`//`) in a written value never faults at a
 guard-rejected position. See `../../interpreter/design-operators.md`.
 
 Both a **finite** loop and an **async** (streaming) source drive an induction accumulator — the
-model treats a finite domain as a stream that terminates (§Liveness). At the realization level this
-is *one* concept but currently *two* operators: the changelog `InductionStore` for the finite
-single-writer case, a dense `Recurse` fallback for async/tap loops. Collapsing them onto the single
-changelog realization (so the finite/async distinction disappears from the code as it has from the
-model) is a mapped interpreter cleanup — see *Planned: one changelog realization for every loop* in
-`../../interpreter/design-operators.md`.
+model treats a finite domain as a stream that terminates (§Liveness) — and every induction accumulator
+uses *one* realization: the changelog `InductionStore`. Plain, conditional, and feed-carrying loops
+over finite or async extents all route through it. The
+drive reads its source by absolute domain position (async domains arrive unordered), reclaims the
+consumed prefix as it advances, and carries reply feeds as `__fire`-gated taps — see *Induction
+stores as a changelog* in `../../interpreter/design-operators.md`.
 
 The value-`Case` positions ride the same union-of-restricts:
 
