@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" width="760" role="img"
+     font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <title>Sinks under the fragment execution model</title>
+  <desc>Above, an undivergent sink is reached by the shared fragment and fires once, with no
+  mediator involved. Below, a divergent sink has one channel per arm; both channels reach the
+  sink mediator, which drains the owning arm's channel to the real endpoint and directs the
+  other to a sandbox.</desc>
+
+  <!-- ── undivergent sink ───────────────────────────────────────────────── -->
+  <text x="12" y="24" font-size="13" fill="#6B7A8A">undivergent sink</text>
+
+  <text x="48" y="54" font-size="12.5" fill="#6B7A8A">shared fragment</text>
+  <path d="M44 66 H470" stroke="#1C88A7" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <rect x="470" y="52" width="110" height="28" rx="6" stroke="#1C88A7" stroke-width="2" fill="none"/>
+  <text x="525" y="71" font-size="12" fill="#1C88A7" text-anchor="middle">endpoint</text>
+
+  <text x="44" y="98" font-size="11.5" fill="#6B7A8A">fires once · no mediator, nothing to reconcile</text>
+
+  <!-- ── divergent sink ─────────────────────────────────────────────────── -->
+  <text x="12" y="154" font-size="13" fill="#6B7A8A">divergent sink</text>
+
+  <path d="M44 246 H220" stroke="#1C88A7" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <path d="M220 246 H400" stroke="#1C88A7" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <path d="M220 246 C262 246, 268 198, 310 198 H400" stroke="#D75A2E" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <circle cx="220" cy="246" r="6.5" fill="#D75A2E"/>
+
+  <text x="248" y="265" font-size="11.5" fill="#1C88A7">v0 channel</text>
+  <text x="322" y="190" font-size="11.5" fill="#D75A2E">v1 channel</text>
+
+  <rect x="400" y="178" width="88" height="90" rx="8" stroke="#6B7A8A" stroke-width="2" fill="none"/>
+  <text x="444" y="227" font-size="12.5" fill="#6B7A8A" text-anchor="middle">mediator</text>
+
+  <path d="M488 246 H600" stroke="#1C88A7" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <path d="M488 198 H600" stroke="#D75A2E" stroke-width="4" fill="none" stroke-linecap="round" stroke-dasharray="7 6"/>
+
+  <text x="544" y="238" font-size="11" fill="#1C88A7" text-anchor="middle">drained</text>
+  <text x="544" y="190" font-size="11" fill="#D75A2E" text-anchor="middle">not drained</text>
+
+  <rect x="600" y="232" width="110" height="28" rx="6" stroke="#1C88A7" stroke-width="2" fill="none"/>
+  <text x="655" y="251" font-size="12" fill="#1C88A7" text-anchor="middle">endpoint</text>
+
+  <rect x="600" y="184" width="110" height="28" rx="6" stroke="#D75A2E" stroke-width="2" fill="none" stroke-dasharray="6 5"/>
+  <text x="655" y="203" font-size="12" fill="#D75A2E" text-anchor="middle">sandbox</text>
+
+  <text x="44" y="300" font-size="11.5" fill="#6B7A8A">every arm writes its own channel · the mediator drains the owner's</text>
+</svg>

@@ -425,7 +425,7 @@ deactivate v0
 deactivate v1
 ```
 
-What no sequence diagram can draw is the third program: v1-in-production, which would have sent 8.00 to the real processor and might have been **declined** where 10.00 was approved. The gap is between v1-sandboxed and v1-in-production, *not* between v1 and v0 — [branching.md, "Effects whose result re-enters the program"](branching.md#effects-whose-result-re-enters-the-program) argues the case, including why idempotency and the source cache both fail to rescue it, and [branching.md, "Sink annotations and the required stub"](branching.md#sink-annotations-and-the-required-stub) is why the stub is a required typed argument rather than something the runtime could invent.
+What no sequence diagram can draw is the third program: v1-in-production, which would have sent 8.00 to the real processor and might have been **declined** where 10.00 was approved. The gap is between v1-sandboxed and v1-in-production, *not* between v1 and v0 — [branching.md, "Divergent sinks"](branching.md#divergent-sinks) argues the case, including why idempotency and the source cache both fail to rescue it, and [branching.md, "Sink annotations and the required stub"](branching.md#sink-annotations-and-the-required-stub) is why the stub is a required typed argument rather than something the runtime could invent.
 
 Had the call been *undiverged*, both arms would issue the identical charge and v1 could consume v0's real reply — one effect proved twice, no stub, no gap.
 
