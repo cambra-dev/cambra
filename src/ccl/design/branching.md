@@ -1,12 +1,14 @@
 How to slice the design space of running two versions of a program at once: what an operator sets, what the compiler derives, and which familiar deployment patterns fall out. This is the model of record; [branching-sequence-diagrams.md](branching-sequence-diagrams.md) draws the configurations concretely.
 
-> **Status: [Decided] for internal state, [Sketched] for anything touching sources and sinks.** The axes, the two laws, the per-register history derivation, and the four well-formedness conditions are settled and carry the table below. Sections on the frontier carry their own banners; "Oracle" is **TODO**.
+> **Status: [Decided] for internal state, [Sketched] for anything touching sources and sinks.** The axes, the two laws, the per-register history derivation, and the four well-formedness conditions are settled and carry the table below. Sections on the frontier carry their own banners; "Promotion and its operations" and "Oracle" are **TODO**.
 
 ## Vocabulary
 
-- **Arm** — one version of the program. Two arms are one tree with the differing sites selected, so they share everything they have in common. Where the diagrams say **prod** and **test**, those are v0 and v1.
+- **Arm** — one version of the program. Two arms are one tree with the differing sites selected, so they share everything they have in common. Where the diagrams say **prod** and **test**, those are v0 and v1. Two arms are emphatically *not* two running programs, and "The execution model" below is what that costs and buys.
 - **Position** — where a unit of work sits in a domain the program already has: a commit on the transaction clock, or an element of an input stream. Every decision below is a function *from* a position.
 - **Divergence** — a site where the two arms differ. A register is **divergence-reachable** if any divergence is upstream of it in the dataflow graph; if none is, both arms provably write it identically.
+- **Partitionable** — a register or a sink that decomposes into independent per-position units. `balance[tenant]` is partitionable; `revenue_total`, a fold over every position into one cell, is not. One property, read against three things below: partitioned *evaluation* (a selector splits which arm runs), partitioned *ownership* (the mediator splits which arm answers), and promotion by pointwise selection.
+- **Flip** and **ramp** — the two ways an ownership arrow is taken. A **flip** moves ownership wholesale between two constant-valued settings; a **ramp** moves it fractionally, by an input-property function with a rising fraction. The devops vocabulary is the same: a blue/green cutover is a flip, and ramping a canary is a ramp.
 - **Internal and external state** — "state" throughout this doc means *internal* state: registers, which nothing outside the program mutates. **External state** is durable state reached only through sources and sinks. Almost everything settled below is a claim about internal state; the external side is the open frontier, and it is where "Effects at the boundary" starts.
 - **Effect** — something a program does at a source or a sink. A write to a register is dataflow, not an effect, and nothing below restricts which direction internal state may move. An effect's result is analysable when it re-enters the program at a site Cambra can see; out-of-band causality — an email provoking a later request — is outside this model by construction rather than by omission.
 - **Authoritative** — an arm's history is authoritative when it is the source of truth and that arm owns effects. **Promotion** and **rollback** are the forward and backward paths to making a history authoritative, and where a claim holds in both directions this doc says *made authoritative* rather than naming one direction.
@@ -14,6 +16,22 @@ How to slice the design space of running two versions of a program at once: what
 - **Sink mediator** — the runtime component that holds an external endpoint together with each arm's channel into it, and applies the ownership function to decide which arm's output becomes external truth. Every arm writes its own channel regardless of ownership; the mediator decides what leaves.
 
 Pattern names — shadow, canary, reverse shadow, and the rest — are ordinary devops vocabulary, glossed under "The configuration space" where the configurations that carry them are set out.
+
+## The execution model
+
+Everything below reads against one assumption, so it is worth stating before the axes rather than leaving it to be inferred: **a deployment is one program plus fragments derived by diffing the versions.** Where the versions agree there is a single fragment, and it is executed **once**. Splitting is introduced only where they differ — at a source node, or at any interior dataflow node — and only divergence-reachable fragments are instantiated per arm.
+
+So "both arms" is a claim about *denotation*, not about what runs. In the agreed region there are not two arms doing the same thing in parallel; there is one fragment, and the arms are two readings of a tree that mostly coincides.
+
+![The fragment execution model: a shared fragment splitting into per-arm fragments, in two subfigures — one where divergence reaches the boundary, one where it reconverges](img/execution-model.svg)
+
+**Reconvergence is a fragment-graph property.** Subfigure B closes the divergent span back into a shared fragment, and what licenses that is ordinary dataflow tracing: the span ends wherever nothing downstream is divergence-reachable. It is decided by the same analysis that derives history, so it costs no new machinery — and it is emphatically not a merge of the two arms' state. Merging parallel histories is an operation performed at *promotion* time, per "Promotion and its operations", and nothing in the branching model performs one.
+
+**What it costs.** Not 2×. One arm's worth of compute, plus the divergence-reachable subgraph for each additional arm — so the multiplier is set by the size of the *diff*, not by the number of versions. Two consequences follow, and both matter for the table below. A small change is nearly free to mirror, which is what makes *total* evaluation affordable at all. And many concurrent versions stay affordable, because what multiplies is the diff rather than the program: n arms cost one program plus n − 1 diffs. The 2× figure is the worst case, reached only when the divergence sits at the source and every register is therefore divergence-reachable — the limiting case named under "CoW applies to fragments, not programs".
+
+**What it buys structurally.** A divergent fragment has its own store by construction, so copy-on-write is a consequence of where the split sits rather than an overlay the runtime maintains and checks. The sandbox's *extent* is derived, not chosen — which is the claim "CoW applies to fragments, not programs" makes from the other direction.
+
+Whatever form the splitting operator takes, its semantics have to say where effect ownership sits, since the duplication it introduces is exactly the duplication the two laws constrain.
 
 ## The axes
 
@@ -25,7 +43,7 @@ A version attachment has to answer one question per side of the system — who r
 | **effect ownership** | which arm's effects are external truth at a position                                             | one arm, named by a constant, by the commit clock, or by a property of the input                                                                 |
 | *history* (derived, not set)  | per register: how many stores it needs, and whether any arm holds a world that could be restored | **agreed**, **mixed**, or **parallel** — derived below                                                                                           |
 
-**Mirroring** is the *total* setting seen from outside: both arms evaluate every input, rather than each input being handled by one arm. Mirrored arms both compute and both write; only one of them answers. **Source mirroring**, where the runtime forks a source's incoming elements to both arms, is an example mechanism.
+**Mirroring** is the *total* setting seen from outside: every arm's logic is exercised at every position, rather than each position being handled by one arm. Read against "The execution model" that is narrower than it sounds — the agreed prefix is evaluated once, and only the divergent fragments run per arm — but from outside the effect is the same: mirrored arms all compute and all write, and only one of them answers. **Source mirroring**, where the runtime forks a source's incoming elements, is the limiting case, with the split placed at the source.
 
 **Why these and not others.** Evaluation and ownership are independent, and mirroring is the proof: an arm can run without answering. The arm that answers is necessarily an arm that runs. Mirroring is what makes shadow, canary, and reverse shadow available at all.
 
@@ -42,7 +60,7 @@ Both evaluation and ownership are functions from a position to one or more arms,
 
 The second is what users will actually reach for, and it is safe under the **undiverged ownership predicate** condition rather than in general. That condition is a condition on the *predicate*, not on the program: a program may diverge as wildly as it likes and still segment ownership by a cohort lookup, provided the lookup itself is undiverged. Segmenting on a request id can be either kind, and the condition is why it does not matter which — envelope-defined ownership satisfies it trivially.
 
-**Program-defined *selection* is harder than program-defined *ownership*.** Under *total* evaluation an ownership predicate is ordinary agreed-region computation: both arms run regardless, so the predicate is evaluated by logic they share. An evaluation *selector* has a bootstrap problem — something must decide who runs before anything runs, so the predicate has to be evaluable by the runtime, or by an agreed prelude ahead of dispatch. This is the same shape as the argument under "Parallel histories require total evaluation" that mirroring buys its way out of generalized merging: another thing the 2× compute pays for.
+**Program-defined *selection* is harder than program-defined *ownership*.** Under *total* evaluation an ownership predicate is ordinary agreed-region computation: both arms run regardless, so the predicate is evaluated by logic they share. An evaluation *selector* has a bootstrap problem — something must decide who runs before anything runs, so the predicate has to be evaluable by the runtime, or by an agreed prelude ahead of dispatch. This is the same shape as the argument under "Parallel histories require total evaluation" that mirroring buys its way out of generalized merging: another thing the cost of mirroring pays for.
 
 ## History, per register
 
@@ -68,7 +86,7 @@ The second line of that derivation deserves its own argument, because a store-pe
 
 Snapshotting a slice before the cut does not rescue the second case. A snapshot stops tracking inputs the moment its arm stops evaluating them, and *current* is precisely what distinguishes a parallel store from a backup.
 
-So parallel history and total evaluation are the same claim from two sides, and this is why the mirrored rows are worth their compute. Generalizing *selected* evaluation to parallel state does not stop at one register: it would need **all** state to partition identically along the version lines, and rejoining the arms would then need a generalized merge over two diverged histories. Mirroring buys its way out of both — pay 2× compute, avoid generalized merging entirely, and get a fallback that is current rather than partial.
+So parallel history and total evaluation are the same claim from two sides, and this is why the mirrored rows are worth their compute. Generalizing *selected* evaluation to parallel state does not stop at one register: it would need **all** state to partition identically along the version lines, and rejoining the arms would then need a generalized merge over two diverged histories. Mirroring buys its way out of both — pay for the divergent fragments, avoid generalized merging entirely, and get a fallback that is current rather than partial. Per "The execution model" that price is the size of the diff rather than a second copy of the program, which is what makes the trade a good one rather than merely an available one.
 
 Whether the selector partitions still decides something, just not the history mode: it decides **when state compatibility bites**, per that condition.
 
@@ -83,6 +101,8 @@ The owner at a position must be an arm that evaluates at that position — you c
 ### One value per key per position
 
 Two arms may both write a key if and only if they provably agree — then it is one write proved twice, not two writes. They may disagree only with isolated stores (**parallel**, one store per arm). This is what makes things like a shared inventory safe under mirroring: both arms decrement it identically, so there is no double-selling.
+
+The law is denotational, and the execution model discharges it structurally. An agreed key is written by the shared fragment, so operationally there is one write, executed once, with nothing to reconcile at runtime — "proved twice" describes the reasoning, not the work.
 
 ### Undiverged ownership predicate
 
@@ -107,12 +127,12 @@ v0 writes {Name: "John", LastName: "OCallahan"}
 v1 writes {Name: "John", LastName: "oCallahan"}
 ```
 
-Whether the selector partitions the register's key space decides **when** this bites, which is the one thing partitioning still decides after "Parallel histories require total evaluation":
+Whether the selector partitions the register's key space decides **when** this bites, which is the one thing partitioning still decides after "Parallel histories require total evaluation". This is **partitioned evaluation** in the sense of "Vocabulary", and it takes two things: the register must be partitionable, and the selector must cut along its keys. The user-id hash above has the first and lacks the second; the tenant-id selector has both.
 
 - **It does not partition.** Reads cross arms while the deployment runs, so compatibility is a precondition of running at all. With per-user state and a random v0/v1 shard, every request must see the *real* per-user state, so under compatibility v1's state should deliberately **not** be sandboxed.
 - **It does partition.** No read ever crosses arms, so nothing is required to run. Compatibility becomes the precondition of *reverting* a slice: the migration that moves tenant A back to v0 has to produce records v0 can read.
 
-It is also the precondition any future merge of two parallel histories would need — the compiler can say the second case above is unsafe to merge before anyone tries. Note that CoW/sandboxed semantics are safe in *both* cases; compatibility is about rejoining, not about running.
+It is also the precondition a merge of two parallel histories needs, per "Promotion and its operations" — the compiler can say the second case above is unsafe to merge before anyone tries. Note that CoW/sandboxed semantics are safe in *both* cases; compatibility is about rejoining, not about running.
 
 ### Sandbox containment
 
@@ -158,10 +178,10 @@ Wherever *input property* appears, the predicate may be either **envelope-define
 What each pattern means in ordinary infrastructure terms:
 
 - **upgrade** — ship the new version, everyone gets it, the old one stops running. The store carries on across the boundary. No fallback.
-- **live experiment** — an A/B test on one database. Some users get v1's pricing; there is one inventory, and it is *real* for both arms, which is what makes the measurement meaningful. Not undoable, because the two arms' contributions to the shared store interleave. **A classic tenant-by-tenant rollout is this row** with a selector that partitions: how multi-tenant SaaS actually ships today, and reverting a tenant is a migration of that tenant's slice rather than a rollback. Cambra can run the same rollout as a **canary** instead, which is the safer form and is where the distinction is drawn. Both selected rows evaluate each input once regardless of how many arms are live, which is what makes them the affordable ones past a couple of versions — and paying once is exactly what costs them the fallback.
+- **live experiment** — an A/B test on one database. Some users get v1's pricing; there is one inventory, and it is *real* for both arms, which is what makes the measurement meaningful. Not undoable, because the two arms' contributions to the shared store interleave. **A classic tenant-by-tenant rollout is this row** with a selector that partitions: how multi-tenant SaaS actually ships today, and reverting a tenant is a migration of that tenant's slice rather than a rollback. Cambra can run the same rollout as a **canary** instead, which is the safer form and is where the distinction is drawn. Both selected rows evaluate each input's divergent work once regardless of how many arms are live — but per "The execution model" the mirrored rows already share everything the arms agree on, so what selection saves is n − 1 copies of the *diff*, not of the program. That is a far smaller saving than it looks, and it is bought at the price of the fallback. Selection is for the case where mirroring is *unavailable*, per "Not every path is open", rather than the case where it is merely expensive.
 - **shadow** (dark launch) — v1 processes real production traffic and answers nothing. Its state evolves so you can ask "what would v1 have done?" without exposing it.
-- **canary** — v1 answers a small fraction of traffic and is watched, with the fraction ramped up. Same machinery as shadow; the fraction *is* the ownership function. **Tenant-by-tenant belongs here too, and this is the safer way to run it**: make tenant id the *ownership* function rather than an evaluation selector, and both arms evaluate every tenant, so v0's store stays current for the tenants v1 owns. Reverting one is then a rollback rather than a migration, wrong only about what those tenants were told, per "Rollback fidelity". The 2× compute of *total* evaluation is what buys that, per "Parallel histories require total evaluation" — the same trade the classic form declines.
-- **reverse shadow** — ownership has swung to v1 wholesale, and v0 keeps evaluating everything so it stays current and can be swung back. This is the state people are usually pointing at when they say "blue/green", but blue/green is better used for the whole progression that ends here; see "Flows, not states".
+- **canary** — v1 answers a small fraction of traffic and is watched, with the fraction ramped up. Same machinery as shadow; the fraction *is* the ownership function. **Tenant-by-tenant belongs here too, and this is the safer way to run it**: make tenant id the *ownership* function rather than an evaluation selector, and both arms evaluate every tenant, so v0's store stays current for the tenants v1 owns. Reverting one is then a rollback rather than a migration, wrong only about what those tenants were told, per "Rollback fidelity". The cost of *total* evaluation — one shared fragment plus the divergent diff, per "The execution model" — is what buys that, and it is the trade the classic form declines.
+- **reverse shadow** — ownership has flipped to v1 wholesale, and v0 keeps evaluating everything so it stays current and can be flipped back. This is the state people are usually pointing at when they say "blue/green", but blue/green is better used for the whole progression that ends here; see "Flows, not states".
 
 ### Concretely: canary
 
@@ -258,7 +278,7 @@ stateDiagram-v2
 
 The two boxes are the derived history axis, so the picture carries the same claim the table does: *total* gives **parallel** and *selected* gives **mixed**, with nothing else to consult. The branch at the top is not an operator's preference — it is the precondition of [Not every path is open](#not-every-path-is-open) below, which decides which box a program can enter at all.
 
-The left-hand box is what "blue/green" ought to name: **shadow → canary → reverse shadow → retire v0**. Only the arrows to `retire v0` and out of the choice are one-way; the promotions within the box are all reversible, and they are drawn forward-only because the progression left to right is the thing worth reading. Each arrow moves *ownership only* — evaluation is *total* throughout, and no register changes its history mode along the way. That is why it is one deployment rather than three. Clock-valued ownership is how an arrow is taken; the states at either end of one are constant-valued.
+The left-hand box is what "blue/green" ought to name: **shadow → canary → reverse shadow → retire v0**. Only the arrows to `retire v0` and out of the choice are one-way; the promotions within the box are all reversible, and they are drawn forward-only because the progression left to right is the thing worth reading. Each arrow moves *ownership only* — evaluation is *total* throughout, and no register changes its history mode along the way. That is why it is one deployment rather than three. Clock-valued ownership is how a **flip** is taken, and the states at either end of one are constant-valued; the `canary → canary` self-loop is a **ramp**, an input-property function with a rising fraction.
 
 The right-hand box holds two unrelated one-shot flows rather than a progression. They share a box because they share a history mode, not because either leads to the other.
 
@@ -267,6 +287,32 @@ The right-hand box holds two unrelated one-shot flows rather than a progression.
 #### Not every path is open
 
 What closes a path is always an effect, never the internal state. Entering at shadow requires a source that can be mirrored for as long as the shadow runs: an unreplayable source is mirrorable only within its **source cache** window, so a program that outruns that window has no shadow available past it, and its only routes are upgrade and live experiment. That is the branch at the top of the diagram above, and it is why the two boxes are reachable under different conditions rather than being alternatives an operator picks between. Moving *along* the path requires promotable effects, per "What promotion requires".
+
+A second closer acts *within* the mirrored box rather than at its entrance. The `shadow → canary` arrow needs the mediator to apply ownership per position at every divergent sink, so a sink that is not partitionable — one nightly aggregate report, one actuator setpoint — closes that arrow and leaves only the flip to reverse shadow. What that costs is the subject of the next subsection.
+
+#### What canary is for
+
+Canary is not a station every deployment stops at. It is the intermediate ownership setting, and it is bought with a reality gap: while it runs, v0's history disagrees with what the world was told on the fraction v1 owned, per "Rollback fidelity". What that gap buys is **ground truth the shadow record could not give you** — so canary's value is inversely proportional to how far the shadow record can be trusted, and that is decided by the same promotability split read forwards.
+
+Where every divergent sink is promotable, its sandbox is a real instance of the same kind and answers truthfully, per "Sinks". The shadow record is then a faithful account of what v1 would have done, an oracle can reach a verdict while v1 owns nothing, and the **flip** straight to reverse shadow is available. By the error measure under "Rollback fidelity" it is also the *lower*-error path: error goes as fraction × duration × per-event delta, and a validated flip holds the fraction at zero for the whole validation window where a long ramp accrues gap the entire way up.
+
+Where a divergent, non-promotable sink's reply re-enters the computation, part of the shadow record rests on a stub, and no amount of shadowing turns a stub into a real reply — a real reply to a real request exists only once the arm owns the position. Ownership has to be ramped. The compiler's enumeration of fabricated-reply sites, per "Sink annotations and the required stub", is what distinguishes the two cases: an empty enumeration licenses the flip.
+
+Two independent properties of a sink decide this between them, and it is worth seeing that they are independent:
+
+| | promotable | non-promotable |
+| --- | --- | --- |
+| **partitionable** | per-tenant datastore rows; per-request output files; object-store writes keyed by request id | HTTP responses; per-user emails; per-order payment charges |
+| **whole-sink** | a nightly aggregate report; a rebuilt search index; a materialized rollup | an actuator setpoint; a broadcast webhook consumed as authoritative-and-total; an append-only log a downstream reads as one sequence |
+
+A nightly report is promotable — v1's file can be swapped in as truth — but no one can own half of it. A payment charge is partitionable, since ownership is per order, but nothing about it is recoverable after the fact. So the two axes move independently, and together they say which ownership-moves exist at a divergent sink:
+
+| | record faithful | record rests on stubs |
+| --- | --- | --- |
+| **partitionable** | flip, validated in advance — or ramp anyway, for graduated exposure | **ramp** — the only way to get ground truth |
+| **whole-sink** | flip, validated in advance | flip, unvalidated — reversible, but no evidence before the cut |
+
+The bottom-right cell is a real position rather than a failure, and it is worth saying why: evaluation is still *total*, so the history is still **parallel** and v0's store is still current. What is missing is the pre-cut verdict, not the fallback. That is strictly better than the **upgrade** row, which has a *mixed* history and no fallback world at all — and upgrade remains perfectly available to a program that wants it, per "Flows by increasing safety".
 
 #### Flows by increasing safety
 
@@ -278,13 +324,40 @@ What closes a path is always an effect, never the internal state. Entering at sh
 
 The forward direction. Promotion makes a non-owning arm's history authoritative, and three things gate it — all properties of the boundary rather than of internal state, which is why [Not every path is open](#not-every-path-is-open) above is always about effects.
 
-**The sinks must be promotable.** A sandbox is only worth keeping if it can become the source of truth, so a program whose sinks are all non-promotable can shadow indefinitely and never promote: there is nothing to make true. Non-promotable effects do not become promotable by waiting, either — a queued email is not sent at promotion time, because the moment it was due has passed. Such a sandbox is an observation record, permanently.
+**The sinks must be promotable.** A program whose sinks are all non-promotable can shadow indefinitely and never promote: there is nothing to make true. Non-promotable effects do not become promotable by waiting, either — a queued email is not sent at promotion time, because the moment it was due has passed. Such a sandbox is an observation record, permanently. That bounds the *flow* and not the value: observation is exactly what a shadow is for, per "Sinks", so shadowing and validating forever is a legitimate terminal configuration rather than a stuck one — it is what "Testing" and "Ad-hoc query, debugging, introspection" are.
 
 **Only input-derived registers travel.** A register recording an external effect its arm did not own asserts a falsehood, and promoting it writes that falsehood into the source of truth — "External-effect-recording registers" in its forward direction. It is what stops v1's `emails_sent` from promoting while v1's sandboxed datastore does.
 
-**Fabricated replies have to be weighed.** Where a diverged, non-promotable sink's reply re-entered v1's computation, part of v1's history rests on a stub — "Effects whose result re-enters the program". Nothing forbids promoting such a history, and the compiler's enumeration of those sites is what an operator has to read before doing it.
+**Fabricated replies have to be weighed.** Where a diverged, non-promotable sink's reply re-entered v1's computation, part of v1's history rests on a stub — "Divergent sinks". Nothing forbids promoting such a history, and the compiler's enumeration of those sites is what an operator has to read before doing it.
 
 What promotion notably does **not** require is that the promoted arm previously owned anything. Under *total* evaluation a shadow owns nothing at all, yet its input-derived state is complete and current — that is shadow's entire value proposition, and any reading of the conditions above that forbids it has over-generalized.
+
+### Promotion and its operations
+
+> **Status: TODO.** The operation is settled in outline; what is marked TBD at the end is not.
+
+The section above says what *gates* promotion. This one says what promotion *does*, which is a different question and until now an unstated one.
+
+Promotion is an operation on **stores**, not on the fragment graph. It is emphatically not the reconvergence of "The execution model": that is a static property of the dataflow, it holds continuously while the deployment runs, and it involves no state at all. Merging two arms' histories happens here and nowhere else.
+
+Which operation applies is decided by the same two sink properties that decide the flows, so the table under "What canary is for" does a second job:
+
+| | promotable | non-promotable |
+| --- | --- | --- |
+| **partitionable** | **merge** — pointwise selection | nothing to make authoritative |
+| **whole-sink** | **overwrite** — wholesale | nothing to make authoritative |
+
+**Merge needs no new law.** Under *total* evaluation both stores are current for every position, but each is only *authoritative* for the positions its arm owned. So the merge is the **ownership function applied pointwise over the parallel stores** — the object the model already defines, used at promotion time instead of at emission time. Where ownership cannot be applied per position there is nothing to select with, and the only available operation is to take the promoted arm's store wholesale.
+
+"State compatibility" is the precondition: the merged store has to be one the surviving program can read, and the compiler can say a case is unsafe to merge before anyone tries. "External-effect-recording registers" is the other constraint and it is orthogonal — it decides *which* registers may travel at all, independently of how the ones that travel are combined.
+
+**Cumulative registers are the hard case, and overwrite there is wrong rather than merely imprecise.** A cumulative register is not partitionable — it is a fold over every position into one cell — so pointwise selection has nothing to select against. Worse, under a ramp *neither* arm's fold is authoritative: with v0 owning 95% of orders, v0's `revenue_total` folds v0's prices over **all** orders and v1's folds v1's prices over all orders, while the true figure is v0's prices on the 95% it owned plus v1's on the 5% it did. No arm computed that. Recomputation is the only correct answer whenever the owned contributing set changed during the window.
+
+This is also the quantity "Rollback fidelity" measures without naming its cause: the error it reports for a cumulative register under a canary is exactly the fold's disagreement with the ownership assignment.
+
+The corollary is an asymmetry between the two moves of "Vocabulary". Under constant ownership across the whole divergent window the owner's fold *is* correct, so a **flip** is cumulative-safe where a **ramp** is not — a second argument for the flip wherever "What canary is for" makes it available, and one that is independent of validation cost.
+
+**TBD:** whether promotion is atomic across many sinks and registers at once, and what a partial promotion would mean; and whether promotion is itself a position on the commit clock, which it must be for a rollback to have a point to name.
 
 ### Rollback fidelity
 
@@ -327,38 +400,53 @@ Cambra can mirror both kinds. For an unreplayable source the mirrored window is 
 
 ### Sinks
 
-**Mirrored arms require idempotency, suppression, or sandboxing.** Two arms cannot generally drive one sink, so the non-owning arm's effects must either be indistinguishable when happening twice, be directed somewhere isolated, or — where the runtime holds the endpoint — never be emitted at all, which is "Applying ownership at the boundary" below. Which of the three is available is a property of the sink, not of the deployment.
+**A divergent sink needs suppression or sandboxing.** An undivergent sink is reached by the shared fragment and fires once: there is no non-owning arm to reconcile with, and no mediator involved at all, per "The execution model". A divergence-reachable sink is the different case — each arm's fragment writes its own channel, only one of them may reach the endpoint, and the rest must be directed somewhere isolated or, where the runtime holds the endpoint, never emitted, which is "Applying ownership at the boundary" below. Which of the two is available is a property of the sink, not of the deployment.
 
-**Promotable and non-promotable effects.** A sandboxed or suppressed effect is only useful if it can later be *made authoritative*, when a test arm becomes production:
+![Sinks under the fragment execution model: an undivergent sink fired once by the shared fragment, and a divergent sink whose per-arm channels meet at the mediator](img/divergent-sink.svg)
 
-- **Promotable** — output files, a durable datastore. The sandbox can become the new source of truth, which is what makes shadow → canary → reverse shadow a *progression* rather than three unrelated setups.
+**What a withheld effect is worth.** A suppressed or sandboxed effect is not waste, and reading it as waste is what makes a shadow look pointless. **Observation** is available for every one of them regardless of promotability, and it is what a shadow is *for*: an oracle reads the value the mediator declined to drain and reaches a verdict, per "Oracle".
+
+Suppression and sandboxing differ here, and not only in mechanism. A *suppressed* email yields the fact that it would have fired. A *sandboxed* email sink yields the rendered body, which an oracle can diff against v0's. Identical promotability — neither can be sent later — and very different validation value, which is a reason to prefer a sandbox wherever one can be stood up. What bounds the worth of either is stub fidelity, per "Sink annotations and the required stub".
+
+**Promotable and non-promotable effects.** The second use of a withheld effect is **promotion** — the sandbox becoming the source of truth when a test arm becomes production — and that one *is* gated:
+
+- **Promotable** — output files, a durable datastore. The sandbox can become the new source of truth.
 - **Non-promotable** — an HTTP response, an email. These can only be suppressed or *faked*. Nothing about them is recoverable after the fact.
 
-This split does a second job below: a promotable sink's sandbox is a real instance of the same kind, so it can answer truthfully, while a non-promotable sink's sandbox has nothing behind it and can only fabricate. It is also what "External-effect-recording registers" keys a register's adoptability to.
+This split does a second job below: a promotable sink's sandbox is a real instance of the same kind, so it can answer truthfully, while a non-promotable sink's sandbox has nothing behind it and can only fabricate. That is what decides whether a shadow record can be trusted, and so whether a deployment needs a ramp at all, per "What canary is for". It is also what "External-effect-recording registers" keys a register's adoptability to.
 
-### Effects whose result re-enters the program
+### Divergent sinks
 
-Some boundary operations both emit an effect and yield a value the arm immediately consumes: `outcome = payments.charge(...)` followed by a branch on the outcome, a datastore insert returning a server-assigned key, a compare-and-swap, a lease acquisition reporting whether it was granted. The decoupled form is the same situation — a divergent fragment writes a durable store and a downstream node reads it back. Both are analysable because the re-entry site is one Cambra can see; the limit is the out-of-band causality excluded under "Vocabulary".
+Two independent things go wrong when a divergence reaches a sink, and separating them is what keeps the analysis honest — a mechanism that handles one need not handle the other:
 
-Divergence reachability decides this, as it decides everything else here:
+- **The effect must not happen twice, or at all from a non-owner.** Sending an email consumes nothing on return, and it is still not something two arms may both do.
+- **The reply feeds the arm's computation.** `outcome = payments.charge(...)` followed by a branch on the outcome; a datastore insert returning a server-assigned key; a compare-and-swap; a lease acquisition reporting whether it was granted. The decoupled form is the same situation — a divergent fragment writes a durable store and a downstream node reads it back. Both are analysable because the re-entry site is one Cambra can see; the limit is the out-of-band causality excluded under "Vocabulary".
 
-- **The call is not divergence-reachable.** Both arms would issue an identical operation, so the non-owner can consume the owner's *real* reply. Law-abiding for the same reason a shared inventory is: one effect proved twice, not two effects. This is the **source cache** above, working from the sink side.
-- **The call is divergence-reachable.** v1 charges $8 where v0 charges $10. There is no reply to a request nobody sent, so a sandboxed v1 gets a **fabricated** one.
+The first is ownership's job and "Sinks" settles it. The second is the one with no clean answer, and it is the rest of this section.
 
-The gap that opens in the second case is easy to misname. It is *not* v1 against v0 — that difference is the entire purpose of the exercise. It is **v1-sandboxed against v1-in-production**: three programs, not two. The $8 charge might be declined where the $10 charge was not, by a fraud rule or a currency minimum, so v1's shadow history records a completed order where prod-v1 would record a cancelled one. The infidelity is the stub diverging from the external world, not v1 diverging from v0.
+**Idempotency is not a way out**, and it is worth saying why it fails twice over rather than once. Where the call is divergence-reachable the arms' calls differ, so there is no "same call" for idempotency to be a property of. Where it is not, "The execution model" has already disposed of the problem: the call sits in the shared fragment and is issued once, so there is no second call to excuse. It is not a weaker sibling of suppression and sandboxing — it is a non-participant.
 
-Two mechanisms look like they should rescue this and do not:
+**Nor does the source cache extend to cover it.** That mechanism works by handing over bytes that were genuinely fetched, and for a request nobody sent there are none. Its actual job is the read-side one: fanning a single real external interaction out to the divergent fragments at a split point, bounded by the window under "Sources".
 
-- **Idempotency does not apply.** It says the same call twice is harmless; here the two calls differ, so there is no "same call".
-- **The source cache does not extend.** It works by handing over bytes that were genuinely fetched, and for a request nobody sent there are none.
+So where the sink is divergence-reachable and non-promotable and its reply is consumed, v1 charges $8 where v0 charges $10 and a sandboxed v1 gets a **fabricated** reply. The gap that opens is easy to misname. It is *not* v1 against v0 — that difference is the entire purpose of the exercise. It is **v1-sandboxed against v1-in-production**: three programs, not two. The $8 charge might be declined where the $10 charge was not, by a fraud rule or a currency minimum, so v1's shadow history records a completed order where prod-v1 would record a cancelled one. The infidelity is the stub diverging from the external world, not v1 diverging from v0.
 
-By the correspondence under "Sinks", this gap exists exactly where the sink is non-promotable: a promotable sandbox is a real instance and answers truthfully, merely truthfully of a different world.
+#### Is the shadow record faithful?
+
+Three cases, and only the last is open:
+
+- **The call is not divergence-reachable.** It sits in the shared fragment and is issued once. There is no non-owning arm to serve and nothing to reconcile, so the question does not arise.
+- **The call is divergence-reachable and the sink is promotable.** The sandbox is a real instance of the same kind, per "Sinks", so it answers truthfully — truthfully of a *different world*, which is the thing under test rather than a defect in it.
+- **The call is divergence-reachable, the sink is non-promotable, and the reply is consumed.** **Irreducible.** There is no reply to a request nobody sent, and nothing in this model manufactures one. What is on offer is containment rather than closure, in three parts: the stub is a required, typed argument of the attachment, so no fabrication is silent; the compiler enumerates the sites where the arm's shadow state rests on one; and a fabricated reply reaching an **agreed** or **mixed** register is a hard error rather than a warning. Those are "Sink annotations and the required stub" and "Sandbox containment". Residual fidelity is the user's, on the same footing as the oracle.
+
+That is one axis, and it answers *can an oracle trust this record*. Whether the sink is partitionable is the other, and it answers *can ownership be ramped*. The two are independent, and it is their cross product rather than either alone that fixes which ownership-moves a deployment has — "What canary is for".
 
 ### Sink annotations and the required stub
 
 > **Status: [Sketched].** The properties are settled; their syntax, and how core libraries carry them, are not.
 
-Three static properties of a sink carry the weight, and core libraries should ship them rather than leaving every user to declare them: **does the call yield a value the program consumes**, **is it promotable/sandboxable**, and **is it idempotent**. `http.serve`'s response channel consumes nothing; a datastore insert yields a key; an email send yields nothing anyone reads.
+Three static properties of a sink carry the weight, and core libraries should ship them rather than leaving every user to declare them: **does the call yield a value the program consumes**, **is it promotable/sandboxable**, and **is it partitionable** — can the mediator apply ownership per position at this endpoint. `http.serve`'s response channel consumes nothing and partitions per request; a datastore insert yields a key; an email send yields nothing anyone reads; a nightly report is promotable and does not partition. Idempotency is deliberately not on the list, per "Divergent sinks".
+
+The third property is what "What canary is for" consults; the first two are what follows.
 
 What follows from the first two together is the useful part. For a **non-promotable sink whose reply is consumed**, the sandbox cannot be derived — someone has to supply the reply-generating function. So the annotation makes the **stub a required, typed argument of a sandboxed attachment**: you cannot shadow such a program without handing one over, and its type is dictated by the sink's declared reply type. That is the most that can be offered, since no generic stub for a payment processor exists. Its fidelity is the user's to own, on the same footing as the oracle.
 
@@ -382,7 +470,7 @@ for req in order_reqs:
 
 So a program has one response channel per request channel, and a response has nowhere else to go. What that does *not* establish is that nothing anywhere in the stack can direct one source's traffic to different sinks — it plainly can, and the rest of this subsection is how.
 
-**What is rightly inexpressible.** Not per-element ownership: that is canary, and canary is a settled row. What a program must not contain is **ad-hoc branching over sinks in application logic** — `if req.tagged_test: test_resps[...] else: order_resps[...]`. The objection is not aesthetic. Gating on a tag makes the arm under test different from the arm that would ship, so the dry run stops testing v1 and starts testing v1-plus-tagging.
+**What is rightly inexpressible.** Not per-element ownership: that is canary, and canary is a settled row. What a program must not contain is **ad-hoc branching over sinks in application logic** — `if req.tagged_test: test_resps[...] else: order_resps[...]`. The objection is not aesthetic, and under "The execution model" it is structural rather than a matter of degree. A tag branch **is a divergence**, so it introduces a split point the shipped program does not have. The dry run is therefore not merely testing v1-plus-tagging: it is exercising a different fragment graph, with a different agreed region, a different set of divergence-reachable registers, and so a different history mode on registers the real deployment would have shared.
 
 **What is expressible.** A **declared ownership function**, per "Who computes the ownership function". Because it lives in the agreed region it is *the same code in both arms*, so the arm under test is unchanged — precisely what tag-gating gives up. Per-element ownership is available; ad-hoc effect gating is what is excluded, and the undivergence condition is what separates them.
 
@@ -395,7 +483,7 @@ Two harness mistakes fall out, and they are one mistake in opposite directions: 
 
 So fidelity comes from harnessing the environment, not from a program selectively faking its own effects. The alternative — a real sink in an isolated environment, rather than a mediated sink in a real one — is "Ephemeral test environment" below.
 
-## Test Oracle
+## Oracle
 
 > **Status: TODO.** The role is settled; the mechanics are not.
 
@@ -484,5 +572,5 @@ The goal is increased durability or reliability, and the open question is which 
 
 Not part of the model; recorded here so that it is not mistaken for one.
 
-- **A mirror operator.** *Total* evaluation needs one input delivered to both arms. Inserting a generalized "mirror" operator at each divergence point, rather than at the source, keeps the agreed prefix shared: everything upstream of the divergence is evaluated once. Whatever form it takes, its semantics have to say where effect ownership sits, since the duplication it introduces is exactly the duplication the two laws constrain.
 - **Per-arm channels.** Divergent logic writes divergent sinks, so the program-internal picture is fully partitioned at the boundary and the mediator is the only place two arms meet. Whether that buys anything in parallel execution is unmeasured.
+- **Idempotency, on replay only.** It is a non-participant in the model, per "Divergent sinks", but it returns as an implementation concern wherever the runtime is forced to *re-execute* an agreed fragment — crash recovery, replay, or arms deployed as separate processes that do not in fact share the agreed execution. There the single call the model promises becomes two, and an idempotent sink is what makes that harmless. This is a property of the deployment mechanism, not of the branching semantics, which is exactly why it does not belong in "Sinks".
