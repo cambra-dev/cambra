@@ -34,6 +34,13 @@ CHL source
 | [provenance.md](provenance.md) | How a node keeps its link to the source the user wrote across the whole pipeline: the `NodeId`/`Phase` identity primitives, the `ProvenanceTable` model and its fold, the recorder, the always-on lowering projection release diagnostics read, and what the inspector consumes. |
 | [diffing.md](diffing.md) | Program diffing: α-invariant content addressing of CCL terms and the GumTree correspondence between two compiled programs. |
 | [hot-reload.md](hot-reload.md) | Replacing a running program with a new version: the endpoint set a version inherits, operator reuse keyed by the node a structural diff pairs each of the new version's nodes with, and the weak subscriptions that let one graph be swapped for another. |
+| [branching.md](branching.md) | The design space of running two versions of a program at once: the *evaluation* and *effect ownership* axes, the derived per-register *history* mode, the two laws and four well-formedness conditions, and the deployment patterns (upgrade, live experiment, shadow, canary, reverse shadow) that fall out. |
+| [branching-sequence-diagrams.md](branching-sequence-diagrams.md) | The configurations of [branching.md](branching.md) drawn as sequence diagrams: who evaluates each input, who answers it, and which store each write lands in. |
+
+The two branching docs describe a *model*, not a pass — nothing in the pipeline
+above implements them yet (`docs/design.md` marks program branching **[Open]**).
+They sit here because the analysis they turn on, divergence reachability, is a
+property of the CCL dataflow graph.
 
 Provenance is the one cross-cutting concern in the table: every pass above both
 preserves node identity and records what it rewrote, so
