@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use crate::ccl::AggregateKind;
+use crate::ccl::{AggregateKind, FieldKey};
 
 /// Primitive base types shared between the CCL type system and the interpreter.
 ///
@@ -221,7 +221,27 @@ pub enum UnaryOpKind {
 /// to lambda elimination, so type inference does not need to reason about
 /// them — types are stamped onto the surrounding
 /// [`TypedExpr`](crate::ccl::TypedExpr) at the point each built-in is emitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// # Typing
+///
+/// **Every variant below opens its doc comment with its type**, written
+/// `name : 𝑇`, so a built-in's signature is readable at the definition rather
+/// than reconstructed from its emitters. Two conventions in those signatures:
+///
+/// - A built-in that takes a *static* argument before the value it transforms
+///   (`restrict`, `permute_domain`, `flatten_domain`, `filter_values`, …) is
+///   emitted as `arg ▷ builtin`, so its type is curried and reads
+///   `Arg ⇒ (𝐴 ⇒ 𝐵)`. One that names its parameter *in the enum variant*
+///   (`variant_project(c)`, `variant_wrap(c)`) instead appears bare, and its
+///   type is the uncurried `𝐴 ⇒ 𝐵`.
+/// - The handful of built-ins that *are* visible to inference (the binary
+///   operators, the aggregations, `final_or_default`, `get_prev_seq`,
+///   `get_prev_txn`) additionally carry a polymorphic scheme in
+///   [`OperatorSchemes`](crate::ccl::infer::OperatorSchemes), which is the
+///   authority for those. The rest are minted post-inference: their type is
+///   stamped on the node at emission, and the post-phase CHECK-mode
+///   `typecheck` trusts the stamp.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Builtin {
     // Categorical combinators (introduced by lambda elimination).
     /// `id : A → A` — identity morphism.
@@ -284,13 +304,21 @@ pub enum Builtin {
     /// marks unrefined sites — op-conversion recognises it and emits
     /// just `IterateExtent` (no filter).
     Iterate,
-    /// `permute_domain` — reorder positions in a tuple-typed domain.
+    /// `permute_domain : [Int] ⇒ ((𝐴 ⇒ 𝑋) ⇒ (𝐵 ⇒ 𝑋))` — reorder positions in a
+    /// tuple-typed domain. Applied to its permutation list first
+    /// (`perm ▷ permute_domain`), yielding the morphism rewriter: `𝐴` and `𝐵`
+    /// are the same tuple type under two orderings, and `perm[j]` is where
+    /// canonical position `j` sits in `𝐴`.
     PermuteDomain,
-    /// `flatten_domain` — flatten selected nested-tuple positions in a domain.
+    /// `flatten_domain : [Int] ⇒ ((𝐴 ⇒ 𝑋) ⇒ (𝐵 ⇒ 𝑋))` — flatten selected
+    /// nested-tuple positions in a domain. Applied to its index list first, like
+    /// [`Self::PermuteDomain`]; `𝐵` is `𝐴` with the listed positions spliced open.
     FlattenDomain,
 
-    /// A binary scalar operation lifted to a function on a 2-tuple
-    /// (`(a, b) ▷ BinOp(op)`).
+    /// `binop(op) : (𝐴, 𝐵) ⇒ 𝐶` — a binary scalar operation lifted to a function
+    /// on a 2-tuple (`(a, b) ▷ BinOp(op)`). The concrete instance is the
+    /// operator's own scheme in [`crate::ccl::infer::OperatorSchemes`]
+    /// (`(Int, Int) ⇒ Int` for arithmetic, `(𝐴, 𝐴) ⇒ Bool` for comparison, …).
     ///
     /// Covers all arithmetic / string / comparison / boolean-logic operators;
     /// the inner [`BinOpKind`] is the single source of truth for which one.
@@ -318,9 +346,10 @@ pub enum Builtin {
     FilterValues,
 
     // Aggregations (codomain of a function-typed input → scalar).
-    /// `sum`.
+    /// `sum : ∀α. (α ⤇ Int) ⇒ Int` — fold a collection's `Int` codomain.
     Sum,
-    /// `max`.
+    /// `max : ∀α γ. (α ⤇ γ) ⇒ γ` — fold a collection's codomain to one of the
+    /// same type.
     Max,
     /// `final_or_default : Tuple(Fun(D, T), T) → T` — extract the
     /// codomain value at the final position of an iteration stream, or
@@ -442,6 +471,61 @@ pub enum Builtin {
     /// planning treats it as an iteration-bearing source (it stages the trigger
     /// inside its tuple rather than prepending an `iterate`).
     AsOf,
+
+    /// `variant_project(c) : Union({cᵢ: Pᵢ}) ⇒ P_c` — the elimination-side dual
+    /// of [`crate::ccl::TypedExprNode::VariantCtor`]/`VariantWrap`. Projects the
+    /// arm named `c` out of a tagged-union stream, **restricting to the sub-domain
+    /// of positions that carry tag `c`** and yielding that arm's inner payload
+    /// column.
+    ///
+    /// Minted by [`crate::ccl::lambda_elim`] when it compiles a scrutinee-`Case`
+    /// over a [`crate::ccl::Type::Variant`] to the union-of-tag-restricts
+    /// `⧺ᵢ (𝑑 ≫ variant_project(𝑐ᵢ) ≫ (λ 𝑤ᵢ → 𝑒ᵢ))` — a `≫`-chain, not an
+    /// application chain: `𝑑` is the eliminated scrutinee *morphism* out of the
+    /// enclosing binder, and both of the elements after it are functions of its
+    /// output. It is applied as a
+    /// compose element consuming the fed scrutinee stream (`input=Some`, like
+    /// [`Self::Restrict`]/[`Self::FilterValues`]), so op-conversion reads the
+    /// union extents off the fed input's tiling and builds the
+    /// [`crate::interpreter::tile_operators::VariantProject`] tile op. The
+    /// per-arm sub-streams are re-totaled by a **flat** `UnionOperator` (the
+    /// tags partition the domain exhaustively).
+    ///
+    /// **Restrict and project are one op** because [`crate::interpreter::ColumnValue::Union`]
+    /// stores each arm against the rows that carry it (see the tile-op docs), so
+    /// reading the arm *is* the restriction; there is no separate boolean
+    /// `Restrict` step and no tag-discriminating `Predicate`.
+    ///
+    /// **A tag the scrutinee does not carry is not an error** — it projects empty.
+    /// That is what makes a width-subtype scrutinee well-formed here.
+    ///
+    /// Minted after inference, so it carries no [`crate::ccl::infer::OperatorSchemes`]
+    /// scheme: its type `Union ⇒ P_c` is stamped on the node and the post-phase
+    /// CHECK-mode `typecheck` trusts it (like [`Self::BeginTxn`]).
+    VariantProject(FieldKey),
+
+    /// `variant_wrap(c) : P_c ⇒ Union({cᵢ: Pᵢ})` — the introduction-side dual of
+    /// [`Self::VariantProject`]: injects a payload at the arm named `c`,
+    /// producing a tagged union value. The **point-free** form of
+    /// [`crate::ccl::TypedExprNode::VariantCtor`].
+    ///
+    /// Minted by [`crate::ccl::lambda_elim`] when a `VariantCtor` appears inside
+    /// a lambda body (``λ p → `𝑐ᵢ(eᵢ(p))``): the constructor elaborates to
+    /// `eᵢ ≫ variant_wrap(𝑐ᵢ)`, a composable morphism `param_ty ⇒ Union` that can
+    /// sit as the RHS of a `≫` — e.g. a writer-decision arm
+    /// `filter_values(π̂ᵢ) ≫ eᵢ ≫ variant_wrap(Commit)`. (A genuinely scalar
+    /// `VariantCtor` outside any lambda keeps its own node + op-conversion arm.)
+    ///
+    /// Applied as a compose element consuming the fed payload stream
+    /// (`input=Some`, like [`Self::VariantProject`]); op-conversion reads the
+    /// union extents off the node's codomain and builds the **existing**
+    /// [`crate::interpreter::tile_operators::VariantWrap`] tile, which wraps the
+    /// payload stream element-wise (preserving the domain).
+    ///
+    /// Minted after inference, so it carries no [`crate::ccl::infer::OperatorSchemes`]
+    /// scheme: its type `P_c ⇒ Union` is stamped on the node and the post-phase
+    /// CHECK-mode `typecheck` trusts it (like [`Self::BeginTxn`]).
+    VariantWrap(FieldKey),
 }
 
 impl Builtin {
@@ -476,6 +560,10 @@ impl Builtin {
             Self::BeginTxn => "begin",
             Self::CollectionUnion => "collection_union",
             Self::AsOf => "as_of",
+            // The arm index is rendered by `symbolic` (a `&'static str` cannot
+            // carry it); this bare name is the fallback for other callers.
+            Self::VariantProject(_) => "variant_project",
+            Self::VariantWrap(_) => "variant_wrap",
         }
     }
 

@@ -67,6 +67,225 @@ impl fmt::Display for FieldKey {
     }
 }
 
+/// A set of [`FieldKey`]-keyed arms in canonical (key) order.
+///
+/// The carrier for the arms of a tagged sum wherever one is represented: the
+/// per-variant extents of a union, its per-variant predicates, and the payload
+/// columns of a union value. Those three have to agree about *which* arm is
+/// which, and keying them all on the tag is what makes that agreement structural
+/// rather than an ordering convention each site restates.
+///
+/// **Why keyed rather than positional.** A tag's position within a sum is
+/// relative to that sum's own key set, so it is *not* stable under width
+/// subtyping: `[b] <: [a, b]` is a legal instance of the variant width rule, but
+/// `b` sits at position 0 in the subtype and position 1 in the supertype. A
+/// positional encoding therefore has to renumber on subsumption — and since a
+/// sum's arm set is part of its runtime layout, "renumber" means rebuilding the
+/// value. Keying on the tag removes the renumbering entirely: an arm is found by
+/// name, and a key the map does not carry is simply absent, which is exactly what
+/// width subtyping means (that arm cannot occur).
+///
+/// **Canonical order is still maintained**, because the arms of a sum are also
+/// consumed positionally in places where that positional identity is load-bearing
+/// (per-variant release pairs a predicate arm with its source sub-extent). Sorted
+/// order makes structural equality agree with key-set equality and keeps the
+/// pairing well-defined; it just no longer decides *identity*.
+///
+/// [`FieldKey::Index`] keys make an anonymous positional sum (`a ++ b`, and the
+/// domain of the union-of-restricts fan-out) the degenerate case of the same
+/// structure, so named and positional sums share one representation — mirroring
+/// [`Type::Variant`], which already keys on [`FieldKey`] for both.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TagMap<T>(Vec<(FieldKey, T)>);
+
+impl<T> TagMap<T> {
+    /// An empty map — a sum with no arms.
+    pub fn new() -> Self {
+        TagMap(Vec::new())
+    }
+
+    /// Build an **anonymous positional sum**: arm `i` keyed [`FieldKey::Index`]`(i)`.
+    ///
+    /// The `a ++ b` / union-of-restricts case, where a tag *is* its position, so
+    /// this is the one place a positional vector legitimately becomes a `TagMap`.
+    /// `Index` keys sort numerically, so the canonical order matches the input.
+    pub fn from_positional(arms: Vec<T>) -> Self {
+        TagMap(
+            arms.into_iter()
+                .enumerate()
+                .map(|(i, v)| (FieldKey::Index(i), v))
+                .collect(),
+        )
+    }
+
+    /// The arms in canonical order, dropping their tags.
+    pub fn into_values(self) -> Vec<T> {
+        self.0.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Build from arms in any order, sorting into canonical order.
+    ///
+    /// # Panics
+    /// In debug builds, if a key repeats — an arm set with a duplicate tag has no
+    /// meaning (which of the two would a value with that tag belong to?).
+    pub fn from_arms(mut arms: Vec<(FieldKey, T)>) -> Self {
+        arms.sort_by(|(a, _), (b, _)| a.cmp(b));
+        debug_assert!(
+            arms.windows(2).all(|w| w[0].0 != w[1].0),
+            "TagMap: duplicate tag in arm set"
+        );
+        TagMap(arms)
+    }
+
+    /// The arm for `key`, or `None` when this sum carries no such arm.
+    ///
+    /// `None` is the width-subtyping case and is not an error: a producer of
+    /// fewer tags is a subtype, so a consumer asking for a tag it handles but the
+    /// producer never emits gets nothing, which is correct.
+    pub fn get(&self, key: &FieldKey) -> Option<&T> {
+        self.position(key).map(|i| &self.0[i].1)
+    }
+
+    /// Mutable access to the arm for `key`.
+    pub fn get_mut(&mut self, key: &FieldKey) -> Option<&mut T> {
+        self.position(key).map(|i| &mut self.0[i].1)
+    }
+
+    /// The arm for `key`, inserting `default()` first if this sum lacks it.
+    ///
+    /// The "widen by one tag" operation: merging two sums keyed on different tag
+    /// sets grows the result to their union, so a missing arm is created rather
+    /// than being an error.
+    pub fn get_or_insert_with(&mut self, key: FieldKey, default: impl FnOnce() -> T) -> &mut T {
+        let i = match self.0.binary_search_by(|(k, _)| k.cmp(&key)) {
+            Ok(i) => i,
+            Err(i) => {
+                self.0.insert(i, (key, default()));
+                i
+            }
+        };
+        &mut self.0[i].1
+    }
+
+    /// The canonical position of `key`'s arm.
+    ///
+    /// Positions are only meaningful *within this map*; never compare one against
+    /// a position taken from a different sum (that is the renumbering hazard the
+    /// keying exists to remove).
+    pub fn position(&self, key: &FieldKey) -> Option<usize> {
+        self.0.binary_search_by(|(k, _)| k.cmp(key)).ok()
+    }
+
+    /// Number of arms.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether this sum has no arms.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Arms in canonical order.
+    pub fn iter(&self) -> impl Iterator<Item = (&FieldKey, &T)> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+
+    /// Mutable arms in canonical order.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&FieldKey, &mut T)> {
+        self.0.iter_mut().map(|(k, v)| (&*k, v))
+    }
+
+    /// The tags, in canonical order.
+    pub fn keys(&self) -> impl Iterator<Item = &FieldKey> {
+        self.0.iter().map(|(k, _)| k)
+    }
+
+    /// The arms, in canonical order.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.0.iter().map(|(_, v)| v)
+    }
+
+    /// Whether both sums carry exactly the same tags.
+    pub fn same_tags<U>(&self, other: &TagMap<U>) -> bool {
+        self.len() == other.len() && self.keys().eq(other.keys())
+    }
+
+    /// Rebuild with each arm mapped, preserving tags (and so canonical order).
+    pub fn map<U>(&self, mut f: impl FnMut(&FieldKey, &T) -> U) -> TagMap<U> {
+        TagMap(self.0.iter().map(|(k, v)| (k.clone(), f(k, v))).collect())
+    }
+
+    /// Pair arms by tag with `other`, visiting only tags both carry.
+    ///
+    /// The tag-keyed replacement for zipping two arm vectors positionally: it
+    /// cannot silently mispair when the two sums carry different tag sets.
+    pub fn zip_matching<'a, U>(
+        &'a self,
+        other: &'a TagMap<U>,
+    ) -> impl Iterator<Item = (&'a FieldKey, &'a T, &'a U)> {
+        self.iter()
+            .filter_map(move |(k, v)| other.get(k).map(|u| (k, v, u)))
+    }
+
+    /// Combine arm-wise with `other`, which must carry the **same** tags.
+    ///
+    /// The *total* counterpart of [`zip_matching`](Self::zip_matching): where that
+    /// one visits the intersection and is happy to skip, this lifts a binary
+    /// operation pointwise over a fixed arm set, so every tag must be present on
+    /// both sides for the result to be defined at every tag. Differing tag sets are
+    /// a caller bug rather than a case to absorb — the two sums would be describing
+    /// different value spaces, and there is no arm to combine with.
+    ///
+    /// This is why a *query* over two sums ([`same_tags`](Self::same_tags) plus a
+    /// conservative answer, as `Predicate::subsumes` does) and a *combination* of
+    /// two sums are guarded differently: a query can answer "no" when the arm sets
+    /// disagree, and a combination has no such fallback to give.
+    ///
+    /// # Panics
+    /// If the two sums do not carry the same tags. `op` names the caller for the
+    /// message.
+    pub fn zip_same_tags<U, V>(
+        &self,
+        other: &TagMap<U>,
+        op: &str,
+        mut f: impl FnMut(&T, &U) -> V,
+    ) -> TagMap<V> {
+        assert!(
+            self.same_tags(other),
+            "{op}: arm sets differ ({:?} vs {:?}); a pointwise combination of two \
+             sums is defined only over one arm set",
+            self.keys().collect::<Vec<_>>(),
+            other.keys().collect::<Vec<_>>()
+        );
+        TagMap(
+            self.zip_matching(other)
+                .map(|(k, v, u)| (k.clone(), f(v, u)))
+                .collect(),
+        )
+    }
+}
+
+impl<T> Default for TagMap<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> FromIterator<(FieldKey, T)> for TagMap<T> {
+    fn from_iter<I: IntoIterator<Item = (FieldKey, T)>>(iter: I) -> Self {
+        Self::from_arms(iter.into_iter().collect())
+    }
+}
+
+impl<T> IntoIterator for TagMap<T> {
+    type Item = (FieldKey, T);
+    type IntoIter = std::vec::IntoIter<(FieldKey, T)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// Whether a [`Type::Fun`]'s domain is a **capability** or a **collection** — the
 /// compute-function vs data-function distinction.
 ///
@@ -532,17 +751,18 @@ impl fmt::Display for Type {
                     let parts: Vec<_> = payloads.iter().map(|t| t.to_string()).collect();
                     write!(f, "{}", parts.join(" | "))
                 } else {
-                    let parts: Vec<_> = tags
-                        .iter()
-                        .map(|(n, t)| {
-                            if matches!(t, Type::Base(BaseType::Unit)) {
-                                format!(".{n}")
-                            } else {
-                                format!(".{n}({t})")
-                            }
-                        })
-                        .collect();
-                    write!(f, "[{}]", parts.join(" | "))
+                    // CHL's surface spelling — see `fmt_variant_arms`. A `Unit`
+                    // payload is the nullary constructor and renders bare.
+                    crate::util::fmt_variant_arms(
+                        f,
+                        tags.iter().map(|(n, t)| {
+                            let payload = match t {
+                                Type::Base(BaseType::Unit) => None,
+                                _ => Some(t.to_string()),
+                            };
+                            (n.to_string(), payload)
+                        }),
+                    )
                 }
             }
             // A **singleton** prints as the literal it pins: `{Int | __elem == 5}` is
@@ -1292,5 +1512,162 @@ mod tests {
             Type::fun(Type::Txn, Type::Base(BaseType::Int)).to_string(),
             "(Txn ⇒ Int)"
         );
+    }
+
+    /// A tagged sum renders in CHL's surface syntax: braces around the arms,
+    /// each arm introduced by a backtick, its stored type in braces of its own.
+    ///
+    /// Three rules, all visible here. A `Unit` payload is the **nullary**
+    /// constructor and renders bare — "stores nothing" is the whole content, so
+    /// `` `abort{Unit} `` would spell an absence as a presence. A payload that
+    /// already renders brace-delimited **reuses** those braces, which is what
+    /// makes a record arm read `` `pair{a: Int, b: Int} ``. And a single-arm sum
+    /// is not special-cased: it is just the general form with one arm.
+    #[test]
+    fn variant_type_display_is_surface_syntax() {
+        let commit_abort = Type::Variant(vec![
+            (FieldKey::Name("commit".into()), Type::Base(BaseType::Int)),
+            (FieldKey::Name("abort".into()), Type::Base(BaseType::Unit)),
+        ]);
+        assert_eq!(commit_abort.to_string(), "{`commit{Int} | `abort}");
+
+        // Single arm, with and without a stored type.
+        assert_eq!(
+            Type::Variant(vec![(
+                FieldKey::Name("none".into()),
+                Type::Base(BaseType::Unit)
+            )])
+            .to_string(),
+            "{`none}"
+        );
+        assert_eq!(
+            Type::Variant(vec![(
+                FieldKey::Name("some".into()),
+                Type::Base(BaseType::Int)
+            )])
+            .to_string(),
+            "{`some{Int}}"
+        );
+
+        // A record payload's braces are the arm's braces.
+        let record = Type::Record(vec![
+            ("a".to_string(), Type::Base(BaseType::Int)),
+            ("b".to_string(), Type::Base(BaseType::Int)),
+        ]);
+        assert_eq!(
+            Type::Variant(vec![(FieldKey::Name("pair".into()), record)]).to_string(),
+            "{`pair{a: Int, b: Int}}"
+        );
+    }
+
+    /// An **anonymous positional** sum is not a tagged variant and keeps its own
+    /// rendering: `++`/`CollectionUnion` produces `Index` keys that carry no
+    /// user-meaningful information, so the arms print as a flat `A | B` join
+    /// rather than being dressed up as surface arms nobody wrote.
+    #[test]
+    fn anonymous_positional_sum_still_renders_as_a_flat_join() {
+        let anon = Type::Variant(vec![
+            (FieldKey::Index(0), Type::Base(BaseType::Int)),
+            (FieldKey::Index(1), Type::Base(BaseType::String)),
+        ]);
+        assert_eq!(anon.to_string(), "Int | String");
+    }
+
+    // ----- TagMap -----
+
+    fn name(s: &str) -> FieldKey {
+        FieldKey::Name(s.into())
+    }
+
+    /// Arms land in canonical key order regardless of insertion order, so
+    /// structural equality coincides with "same tags, same arms".
+    #[test]
+    fn tag_map_is_canonically_ordered() {
+        let a = TagMap::from_arms(vec![(name("some"), 1), (name("none"), 2)]);
+        let b = TagMap::from_arms(vec![(name("none"), 2), (name("some"), 1)]);
+        assert_eq!(a, b, "insertion order must not be observable");
+        assert_eq!(
+            a.keys().cloned().collect::<Vec<_>>(),
+            vec![name("none"), name("some")],
+            "keys iterate in canonical order"
+        );
+    }
+
+    /// Lookup is by tag, and an absent tag is `None` rather than an error —
+    /// that is the width-subtyping case (the producer never emits it).
+    #[test]
+    fn tag_map_absent_tag_is_none_not_an_error() {
+        let m = TagMap::from_arms(vec![(name("some"), 7)]);
+        assert_eq!(m.get(&name("some")), Some(&7));
+        assert_eq!(m.get(&name("none")), None);
+        assert_eq!(m.position(&name("none")), None);
+    }
+
+    /// A tag's position depends on its own map's key set — the reason positions
+    /// must never be compared across two sums.
+    #[test]
+    fn tag_map_position_is_relative_to_its_own_key_set() {
+        let narrow = TagMap::from_arms(vec![(name("b"), ())]);
+        let wide = TagMap::from_arms(vec![(name("a"), ()), (name("b"), ())]);
+        assert_eq!(narrow.position(&name("b")), Some(0));
+        assert_eq!(wide.position(&name("b")), Some(1));
+    }
+
+    /// Positional sums are the `Index`-keyed case of the same structure, and
+    /// their keys sort numerically rather than lexicographically.
+    #[test]
+    fn tag_map_indexed_keys_sort_numerically() {
+        let m = TagMap::from_arms((0..12).rev().map(|i| (FieldKey::Index(i), i)).collect());
+        assert_eq!(
+            m.keys().cloned().collect::<Vec<_>>(),
+            (0..12).map(FieldKey::Index).collect::<Vec<_>>()
+        );
+        assert_eq!(m.position(&FieldKey::Index(10)), Some(10));
+    }
+
+    /// `zip_matching` pairs by tag, so two sums with different tag sets cannot
+    /// be silently mispaired the way zipping two arm vectors would.
+    #[test]
+    fn tag_map_zip_matching_pairs_by_tag() {
+        let l = TagMap::from_arms(vec![(name("a"), 1), (name("b"), 2)]);
+        let r = TagMap::from_arms(vec![(name("b"), 20), (name("c"), 30)]);
+        let paired: Vec<_> = l
+            .zip_matching(&r)
+            .map(|(k, a, b)| (k.clone(), *a, *b))
+            .collect();
+        assert_eq!(paired, vec![(name("b"), 2, 20)], "only shared tags pair");
+        assert!(!l.same_tags(&r));
+        assert!(l.same_tags(&TagMap::from_arms(vec![(name("b"), ()), (name("a"), ())])));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate tag")]
+    fn tag_map_rejects_duplicate_tags() {
+        let _ = TagMap::from_arms(vec![(name("a"), 1), (name("a"), 2)]);
+    }
+
+    /// `zip_same_tags` lifts a binary operation pointwise, pairing by tag and not
+    /// by position — so it stays correct when the two maps' canonical orders would
+    /// have mispaired arms had they been zipped as vectors.
+    #[test]
+    fn tag_map_zip_same_tags_is_pointwise_by_tag() {
+        let l = TagMap::from_arms(vec![(name("a"), 1), (name("b"), 2)]);
+        let r = TagMap::from_arms(vec![(name("b"), 20), (name("a"), 10)]);
+        let combined = l.zip_same_tags(&r, "test", |x, y| x + y);
+        assert_eq!(
+            combined,
+            TagMap::from_arms(vec![(name("a"), 11), (name("b"), 22)])
+        );
+    }
+
+    /// A missing arm has nothing to combine with, so it is a caller bug rather than
+    /// a case to absorb — unlike [`TagMap::zip_matching`], which skips it, and
+    /// unlike a *query* over two sums, which can answer conservatively.
+    #[test]
+    #[should_panic(expected = "arm sets differ")]
+    fn tag_map_zip_same_tags_rejects_differing_arm_sets() {
+        let l = TagMap::from_arms(vec![(name("a"), 1), (name("b"), 2)]);
+        let r = TagMap::from_arms(vec![(name("a"), 10)]);
+        let _ = l.zip_same_tags(&r, "test", |x, y| x + y);
     }
 }
