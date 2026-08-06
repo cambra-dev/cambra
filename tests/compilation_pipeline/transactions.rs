@@ -47,40 +47,37 @@ fn check_compile_error(code: &str, needle: &str) {
     );
 }
 
-// NOTE — these batch programs are *ordering-undefined*, and pass by commutativity,
-// not by a pinned semantics. A transaction's meaning depends on the commit order,
-// but nothing in these programs pins it: a literal-list loop and the synthesized
+// NOTE — these batch programs are *ordering-undefined*, and every expected value
+// below is a **timing accident of the current single-threaded engine**, not a
+// pinned semantics. A transaction's meaning depends on the commit order, but
+// nothing in these programs pins it: a literal-list loop and the synthesized
 // standalone singleton leave the order to the engine's serialization
 // (`drain_start`), not the program. The only context that *pins* commit order is a
 // loop over a live external stream (a `DataSource`), where real arrival order is a
-// denotational anchor. So these are effectively **engine tests** — they pass only
-// because their bodies are commutative (subtraction/addition conserve the total
-// regardless of interleaving), and the engine has its own direct `CommitEngine`
-// unit tests. `multi_writer_grant_deny` looks order-independent only because it
-// asserts the final pool, not *which* writer succeeded. These blocks depend only
-// on program start (no source arrival, no cross-transaction data dependence), and
-// program start is a single event that imposes no order *among* the blocks it
-// triggers — so the event model *defines* their commit order as mutually unordered,
-// and the engine may serialize them any way, correct under all of them. That is the
-// contract, not a defect; see `src/ccl/design/mutability.md` "Ordering and
-// concurrency".
+// denotational anchor. These blocks depend only on program start (no source
+// arrival, no cross-transaction data dependence), and program start is a single
+// event that imposes no order *among* the blocks it triggers — so the event model
+// *defines* their commit order as mutually unordered, and the engine may serialize
+// them any way, correct under all of them. That is the contract, not a defect; see
+// `src/ccl/design/mutability.md` "Ordering and concurrency".
 //
-// TODO(await_final): these batch cases assert a *final* register value, but the
-// language has no term for one yet, so they read it with a trailing standalone
-// read-only transaction (`with begin(): out << pool`) — an arbitrary as-of sample
-// that observes the drained store only as a batch-scheduler coincidence, not a
-// promise. The designed `await_final(pool)` primitive is the real terminal read
-// (`src/ccl/design/mutability.md` "await_final"): once it exists, rewrite each
-// `out << <register>` trailing read here as `await_final(<register>)` so the
-// assertion pins the committed final by the semantics rather than by
-// commutativity.
+// So these are effectively **engine tests**: they assert what one particular
+// serialization produces. They would not survive a concurrent scheduler — reorder
+// the drain and a different admissible answer appears — and the engine has its own
+// direct `CommitEngine` unit tests besides. `multi_writer_grant_deny` looks
+// order-independent only because it asserts the final pool, not *which* writer
+// succeeded.
 //
-// The committed value
-// is read by a trailing standalone read-only transaction (`with begin(): out <<
-// pool`) and fed to `out` — an as-of read latched to the singleton trigger at the
-// read transaction's commit position, so `out` is the one-element stream at
-// position 0. Under the batch scheduler the read commits after the draws drain, so
-// it observes the drained value.
+// TODO(await_final): every trailing `with begin(): out << <register>` in this file
+// carries an inline `# TODO(await_final)` marking the same thing at the offending
+// line — it reads the register with an arbitrary as-of sample (latched to the
+// singleton trigger at that read's own commit position, so `out` is the one-element
+// stream at position 0) and observes the drained store only because the
+// single-threaded scheduler happens to run it last. The designed `await_final`
+// primitive is the real terminal read (`src/ccl/design/mutability.md`
+// "await_final"): once it exists, rewrite each of those reads as
+// `await_final(<register>)` and the assertions become semantic rather than
+// scheduling artifacts.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Single writer draws down a pool: 100 − 10 − 20 − 30 = 40.
@@ -91,6 +88,7 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in [10, 20, 30]:
             with begin():
                 pool := pool - r
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -109,6 +107,7 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in [40]:
             with begin():
                 pool := pool - r
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -131,6 +130,7 @@ fn check_compile_error(code: &str, needle: &str) {
                 fee = r // 10
                 if pool >= r + fee:
                     pool := pool - r - fee
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -146,6 +146,7 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in [60]:
             with begin():
                 pool := pool - r
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -164,6 +165,7 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in reqs:
             with begin():
                 pool := pool - r
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -178,6 +180,7 @@ fn check_compile_error(code: &str, needle: &str) {
         pool: Mut(Int, Txn) := 100
         with begin():
             pool := pool - 10
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -193,6 +196,7 @@ fn check_compile_error(code: &str, needle: &str) {
             pool := pool - 10
         with begin():
             pool := pool - 20
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -210,6 +214,7 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in [10, 20]:
             with begin():
                 pool := pool - r
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -229,6 +234,7 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in [5, 15]:
             with begin():
                 pool := pool - r
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -249,6 +255,7 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in [30]:
             with begin():
                 pool := pool - r
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -270,6 +277,7 @@ fn check_compile_error(code: &str, needle: &str) {
             with begin():
                 if pool >= r:
                     pool := pool - r
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << pool
         out
@@ -290,6 +298,7 @@ fn check_compile_error(code: &str, needle: &str) {
             x := x + 1
             if x > 1000:
                 x := x + 10
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << x
         out
@@ -319,6 +328,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
             with begin():
                 a := a + x
                 b := b + x * x
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << a * 100 + b
         out
@@ -336,6 +346,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
             with begin():
                 b := b + a
                 a := a + x
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << a * 100 + b
         out
@@ -353,6 +364,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
             with begin():
                 a := a + x
                 b := a
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << a * 100 + b
         out
@@ -369,6 +381,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
             with begin():
                 a := a + x
                 a := a + 1
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << a
         out
@@ -386,6 +399,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
             with begin():
                 if total + x <= limit:
                     total := total + x
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << total
         out
@@ -405,6 +419,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
         for y in [10, 20]:
             with begin():
                 b := b + y
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << a * 100 + b
         out
@@ -429,6 +444,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
             with begin():
                 b := b + y
                 c := c + y
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << a * 10000 + b * 100 + c
         out
@@ -449,6 +465,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
                 a := a + x
                 b := b + x * x
                 c := c + 1
+        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
         with begin():
             out << a * 10000 + b * 100 + c
         out
@@ -547,6 +564,7 @@ fn bool_valued_store() {
             for x in [1, 2]:
                 with begin():
                     flag := True
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << flag
             out
@@ -565,6 +583,7 @@ fn string_valued_store() {
             for x in [1, 2]:
                 with begin():
                     name := "bob"
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << name
             out
@@ -861,6 +880,9 @@ fn three_writers_single_defer_feed() {
 /// and the final pool is 30 or 50 — schedule-dependent but always a single
 /// valid, non-negative outcome. (A fixed declaration-order engine always gave
 /// 30; under round-robin fairness either serialization is admissible.)
+/// Like every trailing read in this file (see the `TODO(await_final)` inline),
+/// that the read sees *either* settled value rather than the seed is the
+/// single-threaded scheduler's doing, not a guarantee about relative order.
 #[test]
 fn grant_deny_two_writers_single_commit() {
     let tile = run_pipeline(indoc! {r#"
@@ -874,6 +896,7 @@ fn grant_deny_two_writers_single_commit() {
                 with begin():
                     if pool >= r:
                         pool := pool - r
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << pool
             out
@@ -1095,6 +1118,7 @@ fn tx_if_else_routes_across_keys() {
                         a := a + x
                     else:
                         b := b + x
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << a + b
             out
@@ -1124,6 +1148,7 @@ fn tx_if_else_absolute_writes_route_across_keys() {
                         a := 5
                     else:
                         b := 6
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << a + b
             out
@@ -1150,6 +1175,7 @@ fn tx_if_elif_first_match() {
                         a := a + x
                     elif x >= 2:
                         a := a + 1
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << a
             out
@@ -1176,6 +1202,7 @@ fn multiple_if_guards_route_independently() {
                         a := a + r
                     if r > 100:
                         b := b + r
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << a
             out
@@ -1370,6 +1397,7 @@ fn like_named_comprehension_var_does_not_panic() {
             for r in [10]:
                 with begin():
                     store := store - sum([store for store in [1, 2, 3]])
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << store
             out
@@ -1437,6 +1465,7 @@ fn mixed_txn_and_induction_store_accumulates() {
                 with begin():
                     store := store + r
                 cnt := cnt + 1
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << store
             out
@@ -1483,6 +1512,7 @@ fn mixed_txn_and_induction_write_inside_block_store_accumulates() {
                 with begin():
                     store := store + r
                     cnt := cnt + 1
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << store
             out
@@ -1508,6 +1538,7 @@ fn commit_decision_reads_induction_accumulator() {
                 cnt := cnt + 1
                 with begin():
                     store := store + cnt
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << store
             out
@@ -1846,6 +1877,7 @@ fn cross_function_transfer_conserves_total() {
             a: Mut(Int, Txn) := 100
             b: Mut(Int, Txn) := 0
             transfer(a, b, 30)
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << a + b
             out
@@ -1872,6 +1904,7 @@ fn heterogeneous_multi_key_store_reads_string_key() {
                 with begin():
                     count := count + x
                     label := "seen"
+            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
             with begin():
                 out << label
             out

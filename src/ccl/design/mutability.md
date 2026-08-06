@@ -861,9 +861,25 @@ The value-`Case` positions ride the same union-of-restricts:
 ### General in-transaction conditionals (and conditional writes)
 
 A `with begin():` block admits `if`/`elif`/`else` and multiple sibling `if` guards, compiled by a
-uniform **path-based** walk (`transact_phase::walk_block`/`walk_case`). Walking a block threads a
-path condition (a branch guard `𝑔` extends it to `path ∧ 𝑔`, first-match `π̂`), and the block denotes
-`snapshot ⇒ {commit, writes, to_<defer>*}` where:
+uniform **path-based** walk (`transact_phase::walk_block`/`walk_case`).
+
+A **path** is one straight-line route through the block's branch structure: the statements a single
+execution runs, given a choice of arm at every `if`/`elif`/`else` it passes through. Nested and
+sibling conditionals multiply, so a block with two independent `if`s has four paths. Each path
+carries a **path condition** — the conjunction of the guards it took, each `elif` guard first-match
+adjusted (`π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`). A path condition is a `Bool` expression over the
+transaction's *snapshot* alone — resolved through whatever the path has already written
+(read-your-writes), but never reading a later commit tick, which is what keeps the whole block one
+serialization point. The block's **spine** — the statements outside every
+`if` — is the path condition `true`; descending into an arm narrows it to `path ∧ π̂`. Paths are
+mutually exclusive and, taken together with the implicit empty arm of a guard that matches nothing,
+exhaustive: exactly one path runs per transaction.
+
+Paths are a *compile-time* enumeration, not a runtime branch: the walk visits every path and emits
+**one** decision record, whose `commit` and per-tap fire fields are path conditions and whose per-key
+writes are `Case`s over the local branch guards — so every path is evaluated in one straight-line
+writer body and one transaction is still one record. Walking a block threads `(path, env)`
+(read-your-writes) and the block denotes `snapshot ⇒ {commit, writes, to_<defer>*}` where:
 
 - **`commit` is the disjunction of the path-conditions of every mutable write and feed** (`or_commit`;
   an empty taken path — a position matching no guard, including a missing `else` — denies). A spine
