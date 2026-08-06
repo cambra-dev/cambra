@@ -1036,7 +1036,7 @@ pub(crate) fn register_value_tys<'a>(
 /// tree records reads at the deref'd value directly, as the phase's own
 /// hand-built test trees do. The written type then stands in, **stripped** — a
 /// register takes no refinement from any single contribution, and an unstripped
-/// one would be a witness acquired by erasure rather than by `cast`
+/// one would be a refinement acquired by erasure rather than by `cast`
 /// (`src/ccl/design/type-inference.md`, "Refinements on the lattice").
 fn collect_writes(expr: &Expr, reg_vtys: &HashMap<Name, Type>, out: &mut Vec<(Name, Type)>) {
     if let TypedExprNode::MutWrite { name, value } = &expr.node

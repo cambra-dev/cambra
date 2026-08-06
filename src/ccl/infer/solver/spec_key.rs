@@ -350,7 +350,13 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             AtomKey::from_type(ty).expect("every atomic type classifies as an AtomKey"),
         ),
         // A `Hole` contributes nothing — the same "no information here" the
-        // default key denotes.
+        // default key denotes, so a `Hole` keys identically to an
+        // under-determined `Infer`. That collision cannot merge two uses that
+        // actually differ, because emission normalizes every annotation
+        // (`normalize_annotation` turns a `Hole` into a fresh `Type::Infer`), so
+        // no `Hole` reaches a use's instantiation type in the first place. The
+        // arm is for exhaustiveness, and "no information here" is the honest
+        // reading if one ever did.
         Type::Hole => KeyView::default(),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended

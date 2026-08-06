@@ -445,11 +445,33 @@ struct SpecializeFrame {
     /// The binding's polymorphism level — the freshen cutoff: variables
     /// deeper than this are the quantified ones.
     cutoff: Level,
-    /// Specializations minted so far, scanned linearly (a binding has a handful).
+    /// Specializations minted so far, scanned linearly.
     /// A candidate use's [`SpecKey`] is compared against each entry's — both
     /// computed by the *same* procedure at the *same* point in the pin's lifecycle
     /// (from the use's live type, before its own pin), so the comparison is
-    /// self-consistent.
+    /// self-consistent. What it is *not* is instantaneous: an entry was keyed
+    /// before its **own** pin, a candidate after every intervening one, and a pin
+    /// can widen a key that is not its own. A consumer's pin is what makes the
+    /// demand on a nested use's result concrete, and that demand reaches the key
+    /// through the `codomain <: demand` channel the negative read follows by
+    /// design — so in `f(f(3))`, where the walk takes function before argument,
+    /// the inner use is keyed against a demand the outer use's pin deposited. Key
+    /// equality is therefore walk-order sensitive (observably so once a demand
+    /// carries structure a key records; where it resolves to a bare base the two
+    /// reads agree). The residue is over-splitting, which costs a clone rather
+    /// than sharing a wrong one. See `src/ccl/design/type-inference.md`,
+    /// "Keying a specialization".
+    ///
+    /// **What keeps the scan cheap, and what would stop.** Each comparison is a
+    /// deep structural [`SpecKey`] walk, so the cost is quadratic in a binding's
+    /// specialization count. The bound on that count is *not* "one per distinct
+    /// type": every literal carries its own singleton refinement, so the rule is
+    /// one specialization per distinct argument tuple, and a definition called
+    /// with a fresh literal tuple at every site grows `specs` with **call sites**.
+    /// What holds it down today is `inline`, which beta-reduces scalar UDFs — the
+    /// definitions that survive to be cloned are the collection-producing ones it
+    /// leaves cached. If that ever bites it is the scan that has to change, not
+    /// the key.
     ///
     /// **Both sides being one procedure is the load-bearing part.** Keying an entry
     /// on the clone's *coalesced* type instead is what made this table write-only:

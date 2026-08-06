@@ -300,6 +300,67 @@ definition whose clone type gains a refinement across the pin, no candidate key 
 ever equal a stored one, so the memo becomes write-only and even identical call
 sites clone per site.
 
+**A key is not instantaneous, and it is not a function of the post-emission
+graph.** "One point in the pin's lifecycle" is exact about each use's *own* pin,
+but the two keys in a comparison are not taken at the same instant: an entry's was
+taken before the pin of the use that minted it, a candidate's later, with every
+intervening pin already in the graph. The tempting strengthening — that a pin only
+*transports* use-specific information across polarity and never creates it, so no
+other use's pin can move a key — is **false**. A pin does not only transport; for a
+*nested* use it **deposits the consumer's demand**. In `f(f(3))`,
+`coalesce_node`'s `Apply` arm takes function before argument, so the outer use of
+`f` specializes first and its pin is what drives the outer clone's domain
+concrete. That domain *is* the demand on the inner call's result, so it reaches
+the inner use through the `codomain <: demand` edge — one of the two channels the
+negative read follows *by design*. The inner use is therefore keyed against a
+demand that did not exist at end of emission.
+
+Whether the deposit is *visible to the key* depends on how much structure the
+demand carries. Where the demand resolves to a bare base the two reads agree and
+nothing is observable, which is why a snapshot-and-compare check over the suite
+passes here. It stops passing as soon as a demand carries structure a key records:
+once an operator's effect on types is itself a type, the same `f = \x -> x * 2`,
+`f(f(3))` splits, the inner use's negative read gaining exactly the layer the
+outer pin deposited. The positive read does not move, and no key moves for any
+other reason.
+
+So key equality is walk-order sensitive, and the memo can compare keys read in two
+different graph states. The residue is **over-splitting** — a use keyed against a
+thinner demand does not match an entry keyed against a fatter one, and the cost is
+a redundant clone, the same direction as the known imprecision below. It is not
+symmetric with under-splitting: a thin key and a fat key are unequal, so a use
+carrying a real demand cannot be served by an entry that never saw one.
+
+**The key is only expressible in-walk — which is an argument *for* in-walk
+specialization, not a cost of it.** A monomorphizer that ran *after* coalesce
+would have no choice but to key on a resolved type, because by then a resolved
+type is all there is: `expr.ty` has been overwritten in place and the bound graph
+it was resolved from is gone. Specializing *inside* the coalesce walk is what
+leaves a use's instantiation still var-laden with its bounds still live at the
+moment the key is taken — so `SpecKey` is not merely a better key than the
+rendering, it is one only this architecture can express. The discriminating
+information is present the instant emission finishes; the pin transports it across
+polarity rather than discovering it.
+
+**Why other monomorphizers key on a finished value.** rustc keys an instance on
+its definition plus its generic arguments, C++ on the template-argument list,
+Swift on a substitution map, MLton on the type-argument list in a single
+post-inference pass. Every one of them keys on a *finished value*, and can,
+because their generic bodies are already typed and instantiation is substitution.
+Cambra has no `Type::ForAll` and never types a generic body at all — the
+definition's own subtree is never coalesced in place — so monomorphization here
+**is** the act of typing the body, not the duplication of already-typed code. That
+places it in C++'s category, the one mainstream compiler where instantiation
+genuinely re-runs semantic analysis, and it is the real reason the key has to be
+read off a live graph. A reader arriving from rustc would otherwise take that for
+an implementation choice. What is *not* the reason: poly-calls-poly on its own
+does not force the in-walk arrangement — discovering the *set* of instantiations
+is a reachability fixpoint in every monomorphizer, and recursing into each new
+specialization handles it. (Closest prior art: Lutze, Schuster & Brachthäuser,
+*The Simple Essence of Monomorphization*, OOPSLA 2025 — monomorphization as a flow
+analysis over an algebraic-subtyping system, including where it stops being
+possible, at the cyclic flow of polymorphic recursion.)
+
 **Specializing precisely is the correct rule, not a budget choice.** A refinement
 layer on an iterated domain is *compiled* — `planning::iterate` emits one
 `restrict(p)` filter per layer — so a refinement is code, and two clones pinned to
@@ -730,7 +791,13 @@ in the type recording that it happened.
 
 Nor is the join undefined. It is the dependent sum `Σ (𝑤 ∈ {𝐷ᵢ}). 𝑤 ⤇ 𝑉` over the
 candidate domains, whose witness `𝑤` is the runtime branch discriminant and which is
-eliminated by distributing the consumer over it. **That Σ is the least upper bound**
+eliminated by distributing the consumer over it. (*Witness* here is the standard
+sense — the inhabitant that picks which summand you are in — and is deliberately
+kept. It is unrelated to the retired sense of the word, which named a refinement in
+its role as a black box to the subtyping lattice; that reading is now spelled out
+as a property of the lattice instead, under
+[Refinements on the lattice](#refinements-on-the-lattice). A sweep for the retired
+term should leave this one alone.) **That Σ is the least upper bound**
 — data functions over distinct domains are incomparable, and their join is a
 different element of the lattice rather than one of them. So the lattice is
 *incomplete* without Σ, and the three rules here are one model:

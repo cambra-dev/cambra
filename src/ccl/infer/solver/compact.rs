@@ -537,6 +537,20 @@ struct CompactState {
 /// bound edge composes its own `subst` in (`then(edge_subst, subst_acc)`), and
 /// the composite is applied where a refinement predicate is reached — the
 /// coalesce-time forcing of suspended substitutions (design §3.6).
+///
+/// **Sibling walk — change the two together.** `key_go`
+/// (`src/ccl/infer/solver/spec_key.rs`) traverses `Type` in lockstep with this
+/// function: the same polarity flip on a `Fun` domain, the same no-flip on
+/// `History` children, the same `then(edge_subst, subst_acc)` composition at a
+/// bound edge, the same binder shadowing for a Pi codomain, the same
+/// `(uid, pol)` cycle guard. That agreement *is* the soundness argument for a
+/// specialization key: a bound the key cannot see is one the clone's own
+/// resolution cannot see either, because the clone resolves through this walk
+/// over the same edges from the same side. Nothing enforces it, so a new `Type`
+/// variant — or a change to how an edge substitution composes, or to where
+/// polarity flips — has to be mirrored there in the same change. A divergence is
+/// silent, and what it produces is a shared clone whose interior was resolved
+/// against a different use's argument.
 fn compact_go(
     ty: &Type,
     pol: bool,
