@@ -2,8 +2,9 @@ use log::trace;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TransactKey, Type,
-        TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
+        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
+        Type, TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate,
+        symbolic::symbolic,
     },
     interpreter::{
         ArithmeticKind,
@@ -29,7 +30,7 @@ use crate::{
             FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
             MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo,
             PermuteRecordDomain, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
-            VariantWrap, fan_in, fan_in_named,
+            VariantProject, VariantWrap, fan_in, fan_in_named,
         },
         tuple_field,
     },
@@ -433,12 +434,14 @@ impl OpConversionContext {
             // additional dispatch information here; payloads lower to an
             // `Extent::Union`. This covers both the anonymous positional
             // sums that `++`/CollectionUnion produces (all `Index` tags)
-            // and named source-level variants; the tags are stripped at
-            // this boundary.
+            // and named source-level variants. The tags carry through: they are
+            // the arm identities every union column and predicate is keyed by.
             Type::Variant(tags) => {
-                let extents: Result<Vec<_>, _> =
-                    tags.iter().map(|(_, t)| self.extent_of(t)).collect();
-                Ok(Extent::Union(extents?))
+                let mut arms = Vec::with_capacity(tags.len());
+                for (k, t) in tags {
+                    arms.push((k.clone(), self.extent_of(t)?));
+                }
+                Ok(Extent::Union(TagMap::from_arms(arms)))
             }
             // Leaf types — no refinements possible, handle inline.
             Type::Base(b) => Ok(Extent::Base(b.clone())),
@@ -1011,10 +1014,68 @@ fn convert_impl(
             match b {
                 Builtin::Id => Ok(input),
                 Builtin::MapDomain => Ok(Box::new(MapDomain::new(input))),
-                b if let Some(op) = builtin_to_binop(*b) => apply_binop(input, op),
-                b if let Some(op) = builtin_to_unaryop(*b) => apply_unaryop(input, op),
+                // `variant_project(c)` consumes the fed scrutinee stream and
+                // narrows it to that tag's restricted sub-domain, yielding the
+                // arm's inner payload column. The union extents come from the fed
+                // input's `Scalar(Union)` tiling, and the arms are keyed by tag all
+                // the way through — nothing is erased to a position here.
+                Builtin::VariantProject(tag) => {
+                    // The scrutinee is either a bare `Scalar(Union)` (the
+                    // `VariantCtor` shape) or a union *stream* `SealedFunction {
+                    // D ⇒ Scalar(Union) }` (a variant field of a record stream);
+                    // `VariantProject` derives its output domain from whichever.
+                    let ok = match input.tiling() {
+                        Tiling::Scalar(Extent::Union(_)) => true,
+                        Tiling::SealedFunction { codomain, .. } => {
+                            matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_)))
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        return Err(ConversionError::TypeError(format!(
+                            "variant_project({tag}) expects a (Sealed)Union scrutinee, got {}",
+                            input.tiling()
+                        )));
+                    }
+                    Ok(Box::new(VariantProject::new(input, tag.clone())))
+                }
+                // `variant_wrap(c)` — the point-free constructor. Consumes the fed
+                // payload stream and injects it at tag `c`. The union extents come
+                // from the node's codomain (`P_c ⇒ Union`); the
+                // existing `VariantWrap` tile wraps the payload stream element-wise
+                // (preserving its domain), so it composes as `payload ≫ variant_wrap`.
+                Builtin::VariantWrap(tag) => {
+                    let codomain = expr.ty.codomain().ok_or_else(|| {
+                        ConversionError::TypeError(format!(
+                            "variant_wrap({tag}) node must have a function type, got {}",
+                            expr.ty
+                        ))
+                    })?;
+                    let mut union_ty = &codomain;
+                    while let Type::Refinement(inner, _) = union_ty {
+                        union_ty = inner;
+                    }
+                    let Type::Variant(variants) = union_ty else {
+                        return Err(ConversionError::TypeError(format!(
+                            "variant_wrap({tag}) codomain must be a Variant, got {codomain}"
+                        )));
+                    };
+                    // Keep the tags: they are the arm identities the constructed
+                    // column is keyed by.
+                    let mut variant_extents = Vec::with_capacity(variants.len());
+                    for (k, t) in variants {
+                        variant_extents.push((k.clone(), ctx.extent_of(t)?));
+                    }
+                    Ok(Box::new(VariantWrap::new(
+                        input,
+                        tag.clone(),
+                        TagMap::from_arms(variant_extents),
+                    )))
+                }
+                b if let Some(op) = builtin_to_binop(b.clone()) => apply_binop(input, op),
+                b if let Some(op) = builtin_to_unaryop(b.clone()) => apply_unaryop(input, op),
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
-                b if let Some(kind) = builtin_to_aggregate(*b) => Ok(Box::new(
+                b if let Some(kind) = builtin_to_aggregate(b.clone()) => Ok(Box::new(
                     MapExtractAggregate::new(Box::new(MapAggregate::new(input, kind)), kind),
                 )),
                 _ => Err(ConversionError::Unsupported(format!(
@@ -1090,22 +1151,20 @@ fn convert_impl(
                     expr.ty
                 )));
             };
+            // No arm position to resolve: `VariantWrap` names the tag it injects,
+            // and the column it builds is keyed the same way.
             let tag_key = FieldKey::Name(tag.as_str().into());
-            let idx = variants
-                .iter()
-                .position(|(k, _)| *k == tag_key)
-                .ok_or_else(|| {
-                    ConversionError::TypeError(format!(
-                        "VariantCtor tag `{tag}` not present in its variant type {}",
-                        expr.ty
-                    ))
-                })?;
-            let variant_extents = variants
-                .iter()
-                .map(|(_, t)| ctx.extent_of(t))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut variant_extents = Vec::with_capacity(variants.len());
+            for (k, t) in variants {
+                variant_extents.push((k.clone(), ctx.extent_of(t)?));
+            }
+            let variant_extents = TagMap::from_arms(variant_extents);
             let payload_op = convert_impl(payload, None, ctx)?;
-            Ok(Box::new(VariantWrap::new(payload_op, idx, variant_extents)))
+            Ok(Box::new(VariantWrap::new(
+                payload_op,
+                tag_key,
+                variant_extents,
+            )))
         }
 
         // Data source: produces MapResultWithSource(IterateExtent(domain), source).
@@ -1327,7 +1386,7 @@ fn build_commit_store(
     let value_extent = match value_extents.len() {
         0 => Extent::Base(BaseType::Unit),
         1 => value_extents.pop().expect("len == 1"),
-        _ => Extent::Union(value_extents),
+        _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
     let commit = CommitOperator::with_init_ops(
         init_ops,
@@ -1567,7 +1626,7 @@ fn build_induction_store_single(
     let value_extent = match value_extents.len() {
         0 => Extent::Base(BaseType::Unit),
         1 => value_extents.pop().expect("len == 1"),
-        _ => Extent::Union(value_extents),
+        _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
 
     let store = InductionStore::new(
@@ -1886,7 +1945,7 @@ fn apply_aggregate(
 /// individual primitives.
 fn as_builtin(expr: &Expr) -> Option<Builtin> {
     if let TypedExprNode::Builtin(b) = &expr.node {
-        Some(*b)
+        Some(b.clone())
     } else {
         None
     }
@@ -2115,8 +2174,15 @@ fn convert_flatten_domain(
 mod variant_ctor_tests {
     use super::*;
     use crate::ccl::{BaseType as CclBase, Lit, Type, TypedExpr, TypedExprNode};
-    use crate::interpreter::tile_operators::Tile;
-    use crate::interpreter::{Scheduler, Value};
+    use crate::interpreter::UnionArm;
+    use crate::interpreter::tile_operators::{
+        ProducerBase, Tile, TileProducer, impl_producer_base,
+    };
+    use crate::interpreter::tiling::{Predicate, TileGuard};
+    use crate::interpreter::{ColumnValue, Consumer, Scheduler, Value};
+    use crate::pretty_graph::VizOptions;
+    use crate::pretty_tree::InspectNode;
+    use bit_set::BitSet;
 
     /// Build a fully-typed leaf `TypedExpr`.
     fn typed(node: TypedExprNode, ty: Type) -> TypedExpr {
@@ -2141,7 +2207,7 @@ mod variant_ctor_tests {
     }
 
     /// A scalar `.Commit(7)` op-converts to a `Scalar(Union)` tile whose single
-    /// row reads back as `Value::Union { tag: 0, inner: Int(7) }`. This exercises
+    /// row reads back as `Value::Union { tag: Name("Commit"), inner: Int(7) }`. This exercises
     /// the net-new `VariantCtor` op-conversion arm end-to-end (construct → read).
     #[test]
     fn variant_ctor_op_conversion_reads_back_union() {
@@ -2165,14 +2231,14 @@ mod variant_ctor_tests {
         assert_eq!(
             cv.index_at(0),
             Value::Union {
-                tag: 0,
+                tag: FieldKey::Name("Commit".into()),
                 inner: Box::new(Value::Int(7)),
             }
         );
     }
 
-    /// The `Abort` arm (a nullary unit payload at tag position 1) reads back as
-    /// `Value::Union { tag: 1, inner: Unit }`.
+    /// The `Abort` arm (a nullary unit payload) reads back as
+    /// `Value::Union { tag: Name("Abort"), inner: Unit }`.
     #[test]
     fn variant_ctor_abort_arm() {
         let payload = typed(TypedExprNode::Lit(Lit::Unit), Type::Base(CclBase::Unit));
@@ -2194,7 +2260,7 @@ mod variant_ctor_tests {
         assert_eq!(
             cv.index_at(0),
             Value::Union {
-                tag: 1,
+                tag: FieldKey::Name("Abort".into()),
                 inner: Box::new(Value::Unit),
             }
         );
@@ -2228,8 +2294,534 @@ mod variant_ctor_tests {
         assert_eq!(
             cv.index_at(0),
             Value::Union {
-                tag: 0,
+                tag: FieldKey::Name("Commit".into()),
                 inner: Box::new(Value::Int(3)),
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Variant *elimination* — scrutinee-`Case` → union of tag-restricts.
+    // -----------------------------------------------------------------------
+
+    use crate::ccl::{
+        ArithmeticKind, BinOpKind, Branch, CompareKind, FieldKey, Pattern, TypedBinding,
+    };
+
+    fn bool_true() -> TypedExpr {
+        typed(
+            TypedExprNode::Lit(Lit::Bool(true)),
+            Type::Base(CclBase::Bool),
+        )
+    }
+
+    fn binding(name: &str, ty: Type) -> TypedBinding {
+        TypedBinding {
+            name: name.into(),
+            ty,
+            user_annotation: None,
+        }
+    }
+
+    /// `λ x → match x { Commit(w) → w + 1 ; Abort(a) → 0 }`, fully typed —
+    /// the scrutinee-`Case` shape the elimination compiles.
+    fn two_arm_matcher() -> TypedExpr {
+        let int_ty = Type::Base(CclBase::Int);
+        let x_ty = commit_abort_ty(int_ty.clone());
+
+        let w_plus_1 = typed(
+            TypedExprNode::BinOp {
+                left: Box::new(typed(TypedExprNode::Var("w".into()), int_ty.clone())),
+                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
+                right: Box::new(typed(TypedExprNode::Lit(Lit::Int(1)), int_ty.clone())),
+            },
+            int_ty.clone(),
+        );
+        let commit_branch = Branch {
+            pattern: Some(Pattern {
+                tag: "Commit".into(),
+                binding: binding("w", int_ty.clone()),
+            }),
+            guard: bool_true(),
+            body: w_plus_1,
+        };
+        let abort_branch = Branch {
+            pattern: Some(Pattern {
+                tag: "Abort".into(),
+                binding: binding("a", Type::Base(CclBase::Unit)),
+            }),
+            guard: bool_true(),
+            body: typed(TypedExprNode::Lit(Lit::Int(0)), int_ty.clone()),
+        };
+        let case = typed(
+            TypedExprNode::Case {
+                scrutinee: Some(Box::new(typed(
+                    TypedExprNode::Var("x".into()),
+                    x_ty.clone(),
+                ))),
+                branches: vec![commit_branch, abort_branch],
+            },
+            int_ty.clone(),
+        );
+        typed(
+            TypedExprNode::Lambda {
+                param: binding("x", x_ty.clone()),
+                body: Box::new(case),
+            },
+            Type::fun(x_ty, int_ty),
+        )
+    }
+
+    /// Run `matcher(scrutinee)` through channelize → lambda_elim →
+    /// op-conversion, drive it once, and return the resulting tile.
+    fn drive_match(scrutinee: TypedExpr, matcher: TypedExpr) -> Tile {
+        let applied = typed(
+            TypedExprNode::Apply {
+                argument: Box::new(scrutinee),
+                function: Box::new(matcher),
+            },
+            Type::Base(CclBase::Int),
+        );
+        let channelized =
+            crate::ccl::channelize::run(applied, /* input_typed = */ true).expect("channelize");
+        let lowered = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
+        let mut ctx = OpConversionContext::new();
+        let op = convert_to_operators(&lowered, &mut ctx).expect("op-conversion");
+        drive(op)
+    }
+
+    /// The value at the single row of a driven eliminator's re-totaled
+    /// `SealedFunction` result.
+    fn single_row(tile: Tile) -> Value {
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("expected a SealedFunction (re-totaled fan-out), got {tile:?}");
+        };
+        assert_eq!(domain.len(), 1, "one-element scrutinee → one output row");
+        let Tile::Scalar(cv) = *codomain else {
+            panic!("expected a Scalar codomain");
+        };
+        cv.index_at(0)
+    }
+
+    /// Two-arm `match` on a `Commit(7)` scrutinee fires the `Commit(w) → w + 1`
+    /// arm end-to-end: variant_project(Commit) narrows to the tag-0 sub-domain,
+    /// binds `w = 7`, maps `w + 1`, and the flat union re-totals to `[0 ↦ 8]`.
+    #[test]
+    fn variant_elim_two_arm_commit_arm() {
+        let scrut = typed(
+            TypedExprNode::VariantCtor {
+                tag: "Commit".into(),
+                payload: Box::new(typed(
+                    TypedExprNode::Lit(Lit::Int(7)),
+                    Type::Base(CclBase::Int),
+                )),
+            },
+            commit_abort_ty(Type::Base(CclBase::Int)),
+        );
+        let out = drive_match(scrut, two_arm_matcher());
+        assert_eq!(single_row(out), Value::Int(8));
+    }
+
+    /// The same two-arm `match` on an `Abort` scrutinee fires the
+    /// `Abort(a) → 0` arm: variant_project(Abort) narrows to tag-1, the Commit
+    /// arm contributes nothing, and the union yields `[0 ↦ 0]`.
+    #[test]
+    fn variant_elim_two_arm_abort_arm() {
+        let scrut = typed(
+            TypedExprNode::VariantCtor {
+                tag: "Abort".into(),
+                payload: Box::new(typed(
+                    TypedExprNode::Lit(Lit::Unit),
+                    Type::Base(CclBase::Unit),
+                )),
+            },
+            commit_abort_ty(Type::Base(CclBase::Int)),
+        );
+        let out = drive_match(scrut, two_arm_matcher());
+        assert_eq!(single_row(out), Value::Int(0));
+    }
+
+    /// A **one-arm** `match { Commit(w) → w + 1 }` over a single-tag
+    /// `Variant([Commit: Int])` scrutinee — the read-side shape Phase B uses.
+    /// Exhaustiveness holds (the sole tag is covered), so the eliminator
+    /// collapses to a single `variant_project(Commit) ▷ (w → w + 1)` with no
+    /// union wrapper.
+    #[test]
+    fn variant_elim_one_arm() {
+        let int_ty = Type::Base(CclBase::Int);
+        let commit_only_ty = Type::Variant(vec![(FieldKey::Name("Commit".into()), int_ty.clone())]);
+
+        let w_plus_1 = typed(
+            TypedExprNode::BinOp {
+                left: Box::new(typed(TypedExprNode::Var("w".into()), int_ty.clone())),
+                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
+                right: Box::new(typed(TypedExprNode::Lit(Lit::Int(1)), int_ty.clone())),
+            },
+            int_ty.clone(),
+        );
+        let case = typed(
+            TypedExprNode::Case {
+                scrutinee: Some(Box::new(typed(
+                    TypedExprNode::Var("x".into()),
+                    commit_only_ty.clone(),
+                ))),
+                branches: vec![Branch {
+                    pattern: Some(Pattern {
+                        tag: "Commit".into(),
+                        binding: binding("w", int_ty.clone()),
+                    }),
+                    guard: bool_true(),
+                    body: w_plus_1,
+                }],
+            },
+            int_ty.clone(),
+        );
+        let matcher = typed(
+            TypedExprNode::Lambda {
+                param: binding("x", commit_only_ty.clone()),
+                body: Box::new(case),
+            },
+            Type::fun(commit_only_ty.clone(), int_ty.clone()),
+        );
+        let scrut = typed(
+            TypedExprNode::VariantCtor {
+                tag: "Commit".into(),
+                payload: Box::new(typed(TypedExprNode::Lit(Lit::Int(41)), int_ty)),
+            },
+            commit_only_ty,
+        );
+        let out = drive_match(scrut, matcher);
+        assert_eq!(single_row(out), Value::Int(42));
+    }
+
+    /// A test operator yielding one fixed tile, then empty after a universal
+    /// release — mirroring [`Constant`]'s release discipline so a `Memo` fanning
+    /// it (the zip's shared input) does not re-merge the tile into itself.
+    struct FixedStreamOp {
+        tile: Tile,
+        tiling: Tiling,
+    }
+
+    impl TileOperator for FixedStreamOp {
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            mut consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            consumer.notify();
+            Box::new(FixedStreamProducer {
+                base: ProducerBase::new(FixedStreamProducer::alloc_id(), &self.tiling),
+                tile: self.tile.clone(),
+                released: false,
+            })
+        }
+    }
+
+    struct FixedStreamProducer {
+        base: ProducerBase,
+        tile: Tile,
+        released: bool,
+    }
+
+    impl TileProducer for FixedStreamProducer {
+        impl_producer_base!();
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            if self.released {
+                self.tiling().empty_tile()
+            } else {
+                self.tile.clone()
+            }
+        }
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            if obsolete_guard.is_universal() {
+                self.released = true;
+            }
+        }
+    }
+
+    /// **Outer-binder arm, end-to-end.** A per-key-view shape — the arm reads
+    /// *both* the scrutinee record's sibling field (`__c.time`) and the Commit
+    /// payload (`w`):
+    ///
+    ///   `λ __c → match __c.decision { Commit(w) → {out_t: __c.time, out_w: w} }`
+    ///
+    /// lambda_elim compiles it to the zip form `⟨id, .decision ▷
+    /// variant_project(0)⟩ ▷ zip ≫ (λ (__c, w) → …)`; we drive that over a
+    /// two-row `{time, decision: Commit}` stream. The outer element and the
+    /// tag-restricted payload co-iterate by key through the `FanIn`, so each row
+    /// pairs its own `time` with its own Commit payload.
+    #[test]
+    fn variant_elim_outer_binder_zip() {
+        let int_ty = Type::Base(CclBase::Int);
+        let decision_ty = Type::Variant(vec![(FieldKey::Name("Commit".into()), int_ty.clone())]);
+        let rec_ty = Type::Record(vec![
+            ("time".into(), int_ty.clone()),
+            ("decision".into(), decision_ty.clone()),
+        ]);
+        let out_rec_ty = Type::Record(vec![
+            ("out_t".into(), int_ty.clone()),
+            ("out_w".into(), int_ty.clone()),
+        ]);
+
+        let c_decision = typed(
+            TypedExprNode::Apply {
+                argument: Box::new(typed(TypedExprNode::Var("__c".into()), rec_ty.clone())),
+                function: Box::new(
+                    TypedExpr::proj_field("decision")
+                        .with_ty(Type::fun(rec_ty.clone(), decision_ty.clone())),
+                ),
+            },
+            decision_ty.clone(),
+        );
+        let c_time = typed(
+            TypedExprNode::Apply {
+                argument: Box::new(typed(TypedExprNode::Var("__c".into()), rec_ty.clone())),
+                function: Box::new(
+                    TypedExpr::proj_field("time")
+                        .with_ty(Type::fun(rec_ty.clone(), int_ty.clone())),
+                ),
+            },
+            int_ty.clone(),
+        );
+        // {out_t: __c.time, out_w: w} — reads outer (__c.time) and payload (w).
+        let arm_body = typed(
+            TypedExprNode::Record(vec![
+                ("out_t".into(), c_time),
+                (
+                    "out_w".into(),
+                    typed(TypedExprNode::Var("w".into()), int_ty.clone()),
+                ),
+            ]),
+            out_rec_ty.clone(),
+        );
+        let case = typed(
+            TypedExprNode::Case {
+                scrutinee: Some(Box::new(c_decision)),
+                branches: vec![Branch {
+                    pattern: Some(Pattern {
+                        tag: "Commit".into(),
+                        binding: binding("w", int_ty.clone()),
+                    }),
+                    guard: bool_true(),
+                    body: arm_body,
+                }],
+            },
+            out_rec_ty.clone(),
+        );
+        let matcher = typed(
+            TypedExprNode::Lambda {
+                param: binding("__c", rec_ty.clone()),
+                body: Box::new(case),
+            },
+            Type::fun(rec_ty.clone(), out_rec_ty.clone()),
+        );
+
+        // Compile the matcher to a point-free transformer.
+        let channelized =
+            crate::ccl::channelize::run(matcher, /* input_typed = */ true).expect("channelize");
+        let transformer = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
+
+        // A two-row `{time, decision: Commit(_)}` stream: (time 10, Commit 1),
+        // (time 20, Commit 2). Built at the op boundary — a variant *record*
+        // stream is not expressible as pure CCL without planning (`VariantCtor`
+        // op-conversion is scalar-only), so we inject the stream as the fed input.
+        let stream_extent = Extent::Record(HashMap::from([
+            ("time".to_string(), Extent::Base(BaseType::Int)),
+            (
+                "decision".to_string(),
+                // Keyed by the tag the `decision_ty` above declares: a named sum's
+                // extent carries its names, and the projection looks `Commit` up by
+                // name.
+                Extent::Union(TagMap::from_arms(vec![(
+                    FieldKey::Name("Commit".into()),
+                    Extent::Base(BaseType::Int),
+                )])),
+            ),
+        ]));
+        let stream_tile = Tile::SealedFunction {
+            domain: ColumnValue::from_uints(vec![0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
+                ("time".to_string(), ColumnValue::Ints(vec![10, 20])),
+                (
+                    "decision".to_string(),
+                    // Both rows carry `Commit`, so the arm owns rows 0 and 1.
+                    ColumnValue::Union(TagMap::from_arms(vec![(
+                        FieldKey::Name("Commit".into()),
+                        UnionArm::new(vec![0, 1], ColumnValue::Ints(vec![1, 2])),
+                    )])),
+                ),
+            ])))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        };
+        let stream_tiling = Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(stream_extent)),
+        };
+        let stream_op: Box<dyn TileOperator> = Box::new(FixedStreamOp {
+            tile: stream_tile,
+            tiling: stream_tiling,
+        });
+
+        let mut ctx = OpConversionContext::new();
+        let op = convert_impl(&transformer, Some(stream_op), &mut ctx).expect("op-conversion");
+        let tile = drive(op);
+
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("expected SealedFunction, got {tile:?}");
+        };
+        assert_eq!(domain, ColumnValue::from_uints(vec![0, 1]));
+        let Tile::Record(fields) = *codomain else {
+            panic!("expected a Record codomain, got {codomain:?}");
+        };
+        // Each row keeps its own outer `time` (10, 20) paired with its own Commit
+        // payload (1, 2) — proving the by-key co-iteration.
+        assert_eq!(
+            fields["out_t"],
+            Tile::Scalar(ColumnValue::Ints(vec![10, 20]))
+        );
+        assert_eq!(fields["out_w"], Tile::Scalar(ColumnValue::Ints(vec![1, 2])));
+    }
+
+    /// **In-lambda `VariantCtor` composes** — the writer-decision shape. A
+    /// value-`Case` in a lambda whose arms *construct* variants:
+    ///
+    ///   `λ p → Case[ p == 0 → .Commit(p + 1) ; true → .Abort(unit) ]`
+    ///
+    /// The Phase-A probe rejected this (`Err(Unsupported … VariantCtor)`): the
+    /// value-`Case` fan-out `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)` needs each arm `eᵢ`
+    /// to elaborate to a point-free morphism `param_ty ⇒ Variant`, which the
+    /// `VariantCtor` had no arm for. With `variant_wrap` the Commit arm becomes
+    /// `(p + 1) ▷ variant_wrap(Commit)` and composes; the const Abort arm lifts
+    /// via `const(.Abort(unit))`. Driven over `[0, 1]`, position 0 (`p == 0`)
+    /// commits `p + 1 = 1`, position 1 aborts.
+    #[test]
+    fn variant_ctor_in_lambda_composes() {
+        let int_ty = Type::Base(CclBase::Int);
+        let variant_ty = commit_abort_ty(int_ty.clone());
+
+        let p_eq_0 = typed(
+            TypedExprNode::BinOp {
+                left: Box::new(typed(TypedExprNode::Var("p".into()), int_ty.clone())),
+                op: BinOpKind::Compare(CompareKind::Equals),
+                right: Box::new(typed(TypedExprNode::Lit(Lit::Int(0)), int_ty.clone())),
+            },
+            Type::Base(CclBase::Bool),
+        );
+        let p_plus_1 = typed(
+            TypedExprNode::BinOp {
+                left: Box::new(typed(TypedExprNode::Var("p".into()), int_ty.clone())),
+                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
+                right: Box::new(typed(TypedExprNode::Lit(Lit::Int(1)), int_ty.clone())),
+            },
+            int_ty.clone(),
+        );
+        let commit_body = typed(
+            TypedExprNode::VariantCtor {
+                tag: "Commit".into(),
+                payload: Box::new(p_plus_1),
+            },
+            variant_ty.clone(),
+        );
+        let abort_body = typed(
+            TypedExprNode::VariantCtor {
+                tag: "Abort".into(),
+                payload: Box::new(typed(
+                    TypedExprNode::Lit(Lit::Unit),
+                    Type::Base(CclBase::Unit),
+                )),
+            },
+            variant_ty.clone(),
+        );
+        let case = typed(
+            TypedExprNode::Case {
+                scrutinee: None,
+                branches: vec![
+                    Branch {
+                        pattern: None,
+                        guard: p_eq_0,
+                        body: commit_body,
+                    },
+                    Branch {
+                        pattern: None,
+                        guard: bool_true(),
+                        body: abort_body,
+                    },
+                ],
+            },
+            variant_ty.clone(),
+        );
+        let matcher = typed(
+            TypedExprNode::Lambda {
+                param: binding("p", int_ty.clone()),
+                body: Box::new(case),
+            },
+            Type::fun(int_ty.clone(), variant_ty),
+        );
+
+        // Elaborating the in-lambda VariantCtor arms must now succeed (the
+        // Phase-A probe returned Err here).
+        let channelized =
+            crate::ccl::channelize::run(matcher, /* input_typed = */ true).expect("channelize");
+        let transformer = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
+
+        // Drive over the value stream [0, 1] (injected at the op boundary).
+        let stream_op: Box<dyn TileOperator> = Box::new(FixedStreamOp {
+            tile: Tile::SealedFunction {
+                domain: ColumnValue::from_uints(vec![0, 1]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1]))),
+                domain_predicate: Predicate::True,
+                deleted: BitSet::new(),
+            },
+            tiling: Tiling::SealedFunction {
+                domain: Extent::Base(BaseType::UInt),
+                codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+            },
+        });
+
+        let mut ctx = OpConversionContext::new();
+        let op = convert_impl(&transformer, Some(stream_op), &mut ctx).expect("op-conversion");
+        let tile = drive(op);
+
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("expected SealedFunction, got {tile:?}");
+        };
+        assert_eq!(domain, ColumnValue::from_uints(vec![0, 1]));
+        let Tile::Scalar(cv) = *codomain else {
+            panic!("expected a Scalar(Union) codomain, got {codomain:?}");
+        };
+        // p == 0 → Commit(1); p == 1 → Abort(unit).
+        assert_eq!(
+            cv.index_at(0),
+            Value::Union {
+                tag: FieldKey::Name("Commit".into()),
+                inner: Box::new(Value::Int(1)),
+            }
+        );
+        assert_eq!(
+            cv.index_at(1),
+            Value::Union {
+                tag: FieldKey::Name("Abort".into()),
+                inner: Box::new(Value::Unit),
             }
         );
     }

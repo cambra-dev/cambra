@@ -558,9 +558,10 @@ fn max_released_tick(pred: &Predicate) -> Option<usize> {
                 _ => None,
             })
             .max(),
-        Predicate::Or(arms) | Predicate::Union(arms) => {
-            arms.iter().filter_map(max_released_tick).max()
-        }
+        Predicate::Or(arms) => arms.iter().filter_map(max_released_tick).max(),
+        // A union's arms are tag-keyed, so they are walked by value rather than
+        // sharing the `Or` arm's positional vector.
+        Predicate::Union(arms) => arms.values().filter_map(max_released_tick).max(),
         _ => None,
     }
 }
