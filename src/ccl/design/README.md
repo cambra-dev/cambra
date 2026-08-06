@@ -30,6 +30,13 @@ CHL source
 | [lowering.md](lowering.md) | CHL → CCL lowering: how comprehensions, lambdas, `def`s, and generators become CCL shapes, and the surface syntax of the deferred-collection operators. |
 | [optimization.md](optimization.md) | The optimization/compilation passes: inlining, lambda elimination, join/aggregate planning, algebraic simplification, and conversion to tile operators. |
 | [provenance.md](provenance.md) | How a node keeps its link to the source the user wrote across the whole pipeline: the `NodeId`/`Pass` identity primitives, the `RewriteStep` lineage model and its collapse, the recorder, the always-on lowering projection release diagnostics read, and what the inspector consumes. |
+| [branching.md](branching.md) | The design space of running two versions of a program at once: the *evaluation* and *effect ownership* axes, the derived per-register *history* mode, the two laws and four well-formedness conditions, and the deployment patterns (upgrade, live experiment, shadow, canary, reverse shadow) that fall out. |
+| [branching-sequence-diagrams.md](branching-sequence-diagrams.md) | The configurations of [branching.md](branching.md) drawn as sequence diagrams: who evaluates each input, who answers it, and which store each write lands in. |
+
+The two branching docs describe a *model*, not a pass — nothing in the pipeline
+above implements them yet (`docs/design.md` marks program branching **[Open]**).
+They sit here because the analysis they turn on, divergence reachability, is a
+property of the CCL dataflow graph.
 
 Provenance is the one cross-cutting concern in the table: every pass above both
 preserves node identity and records what it rewrote, so
