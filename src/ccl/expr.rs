@@ -14,6 +14,16 @@ pub const F_COMMIT: &str = "commit";
 /// tuple of proposed per-key new values (`writes.i` for `write_keys[i]`), one
 /// element even for a single-key write set.
 pub const F_WRITES: &str = "writes";
+/// Suffix of a **per-tap fire field** on a decision record. A reply tap
+/// `to_<defer>_k` fed under one arm of cross-key *routing* (its control-flow
+/// path is narrower than the transaction's overall `commit`) carries a companion
+/// `to_<defer>_k__fire : Bool` field — its own path condition. The commit engine
+/// appends the tap's value to the durable log only when the transaction commits
+/// **and** the tap's fire field holds, so a feed under one route does not
+/// over-fire on a sibling route's commit. Omitted when the tap's path *is* the
+/// commit (a single-guard or spine feed always fires with its transaction), so
+/// unconditional/single-guard programs keep their fire-field-free shape.
+pub const F_FIRE_SUFFIX: &str = "__fire";
 
 // Field names of a **commit-record** binding — the intermediate representation
 // [`crate::ccl::transact_phase`] emits and [`crate::ccl::planning::plan_loops`]

@@ -457,7 +457,7 @@ out entirely, block placement is *inert* for it — a bare in-block induction wr
 out-of-block form** (it fires once per iteration unconditionally, independent of whether the co-located
 transaction commits). A **guarded** in-block induction write (`if q: cnt += 1`) is a different matter:
 committing it only when the transaction commits needs commit-gated carry-forward (the value-`Case`
-machinery upstack), so today it is **rejected** (`check_no_guarded_induction_writes`) rather than
+machinery upstack), so today it is **rejected** (`check_no_guarded_induction_write_in_block`) rather than
 silently lifted with the wrong (unconditional) semantics. A commit *decision* that reads an induction accumulator
 (`balance += cnt`) **is also implemented** — the accumulator is threaded through the writer source and
 the commit engine co-iterates it (see [Reading an induction accumulator in a commit
@@ -860,24 +860,68 @@ The value-`Case` positions ride the same union-of-restricts:
 
 ### General in-transaction conditionals (and conditional writes)
 
-A `with begin():` block admits a single bare `if 𝑝:` **deny guard** — the transaction commits iff
-`𝑝` holds over its snapshot. An `elif` chain, an `else` that writes, or more than one `if` guard in a
-block is rejected at lowering.
+A `with begin():` block admits `if`/`elif`/`else` and multiple sibling `if` guards, compiled by a
+uniform **path-based** walk (`transact_phase::walk_block`/`walk_case`).
 
-The intended end state is a uniform *path-based* model. Walking a block threads a path condition (a
-branch guard `𝑔` extends it to `path ∧ 𝑔`); the block denotes
-`snapshot ⇒ {commit, writes, to_<defer>*}` where **`commit` is the disjunction of the path-conditions
-of every mutable write and feed** (an empty taken path — including a missing `else` — denies), and
-**each write key is a `Case` merged over the branch structure** (read-your-writes; a branch that does
-not write a key keeps its snapshot value). This is keyword-free, subsumes the current deny
-(`if 𝑝: x := 𝑒` → one write at path `𝑝` → `commit = 𝑝`), and admits value-selection, cross-key
-routing, `elif`, nesting (conjunction), and sequencing. The per-key merges are value-selecting
-`Case`s over the snapshot, compiled by the scalar form above; the path walk itself is the next PR
-of the conditionals stack. One shape is settled by analysis: the block stays **one decision record
-per transaction** —
-per-path writer sites are unsound (a path predicate reads the snapshot, which exists only at the
-commit tick; one `begin()` is one serialization point; multi-key read-your-writes needs one
-snapshot and one write-set).
+A **path** is one straight-line route through the block's branch structure: the statements a single
+execution runs, given a choice of arm at every `if`/`elif`/`else` it passes through. Nested and
+sibling conditionals multiply, so a block with two independent `if`s has four paths. Each path
+carries a **path condition** — the conjunction of the guards it took, each `elif` guard first-match
+adjusted (`π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`). A path condition is a `Bool` expression over the
+transaction's *snapshot* alone — resolved through whatever the path has already written
+(read-your-writes), but never reading a later commit tick, which is what keeps the whole block one
+serialization point. The block's **spine** — the statements outside every
+`if` — is the path condition `true`; descending into an arm narrows it to `path ∧ π̂`. Paths are
+mutually exclusive and, taken together with the implicit empty arm of a guard that matches nothing,
+exhaustive: exactly one path runs per transaction.
+
+Paths are a *compile-time* enumeration, not a runtime branch: the walk visits every path and emits
+**one** decision record, whose `commit` and per-tap fire fields are path conditions and whose per-key
+writes are `Case`s over the local branch guards — so every path is evaluated in one straight-line
+writer body and one transaction is still one record. Walking a block threads `(path, env)`
+(read-your-writes) and the block denotes `snapshot ⇒ {commit, writes, to_<defer>*}` where:
+
+- **`commit` is the disjunction of the path-conditions of every mutable write and feed** (`or_commit`;
+  an empty taken path — a position matching no guard, including a missing `else` — denies). A spine
+  write's path is `true`, so a write beside a guard commits unconditionally: **a guard scopes only
+  its own arm's writes**, not the whole transaction. (This subsumes the former single-deny:
+  `if 𝑝: x := 𝑒` → one write at path `𝑝` → `commit = 𝑝`, bit-identical.)
+- **each written key is rejoined as a carry-forward `Case`** over the branch structure
+  (read-your-writes; a branch that does not write a key contributes its snapshot value). An
+  unconditional write never enters a `Case` (it stays a bare write); cross-key routing
+  (`if 𝑝: a := … else: b := …`) routes each key per path.
+
+The per-key merges are value-selecting `Case`s over the snapshot inside the writer lambda, compiled
+to the same **value-preserving `filter_values` union-of-restricts** (`⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`) as
+every other writer-body value-`Case` (see `../../interpreter/design-operators.md`). The
+block stays **one decision record per transaction** — per-path writer sites are unsound (a path
+predicate reads the snapshot, which exists only at the commit tick; one `begin()` is one
+serialization point; multi-key read-your-writes needs one snapshot and one write-set).
+
+A conditional feed under genuine cross-key *routing* fires only on its own route. A feed under one
+arm would otherwise ride the transaction's (broader) commit and over-fire on a sibling route's
+commit, so each such tap carries a **per-tap fire field** — `to_<defer>_k__fire : Bool`, its own
+control-flow path (`F_FIRE_SUFFIX`) — that the commit engine (`body_decision_at`) checks: a committed
+transaction appends the tap only where its fire gate holds. A single-guard feed (`if 𝑝: w; out << 𝑒`,
+path == commit) and a spine feed omit the field and fire with their transaction — so unconditional
+programs keep their fire-field-free shape.
+
+A write key written *only* conditionally (an absolute `k := 𝑒` inside a `Case` arm, never read) is
+finalized into the *read* set by `collect_footprint`, so it has a snapshot to **carry** on the paths
+its arm does not fire; a read-modify-write already reads the key, and a purely spine (unconditional)
+write needs no carry and stays write-only.
+
+**Sharp edge — a leading deny at position 0.** A block that *denies* (matches no writing/feeding
+guard) at the first transaction is fragile: the register's as-of read has no prior committed value to
+latch, so a downstream read at position 0 sees the seed rather than a committed value. An `elif`
+chain whose first request falls through to a non-committing branch hits this. It is not yet handled
+generally; tests that exercise elif routing deliberately lead with a committing position. Treat a
+leading-deny elif chain as unsupported until the position-0 as-of latch is generalized.
+
+**Not yet implemented**: `with t = begin():` (the handle) is still rejected. (A *partial* op in a
+conditional write/merge value does **not** fault at a guard-rejected position — the writer-body
+value-`Case` compiles to the value-preserving `filter_values` union-of-restricts above, so an
+off-path arm's value is never evaluated.)
 
 ### `with t = begin():` transaction handle
 
@@ -912,4 +956,46 @@ existing gate; and the completeness read allowed to survive the live-read rewrit
 (`rewrite_live_reads` in `src/ccl/transact_phase.rs`) rather than being dropped as an unresolved
 `final_or_default` over a live history. **Not built today**: a program that names `await_final` does not
 compile.
+
+### Conditional transactions (a `with begin():` inside a conditional)
+
+Rejected at lowering today (`lower/loops.rs` — a `with begin():` under an `if` hits the "only
+assignments and function definitions" gate). This is the **dual** of the general in-transaction
+conditionals above: there, one transaction takes one snapshot and a path-based walk merges per key;
+here the *transaction itself* is conditional — `if 𝑝: with begin(): x := 𝑒` fires a transaction on
+some iterations and not others.
+
+**Mechanism — source-restriction fan-out (the value-`Case` machinery, reused).** A conditional
+transaction is a transaction over a *restricted source*: the site's iteration source (and its
+`begin_<site>` oracle domain) is refined to the sub-domain where the guard holds — `(reqs ↾ π̂) ≫
+⟨body⟩`, which is exactly `refine_source_domain` + `synthesize_arm_predicate` (the first-match
+`π̂ᵢ = 𝑔ᵢ ∧ ¬⋁ⱼ˂ᵢ 𝑔ⱼ` encoding) applied to a transaction site rather than a feed. The work is
+mostly *lowering*: stop rejecting the nested `with begin():`, let the branch structure reach the
+transaction phase, and have the phase refine a transaction site sitting under a path condition.
+Everything else in the branch (feeds, induction writes) rides the same `π̂` refinement, so it
+composes. `elif`/`else` land as disjoint sites over `reqs ↾ π̂` and `reqs ↾ ¬π̂`, merged into the
+shared store by the existing multi-writer commit-stream machinery. A standalone (non-loop)
+`if 𝑝: with begin(): …` refines the `Units(1)` one-shot driver, so the transaction fires
+zero-or-one times.
+
+**Why this is sound where per-path writer sites *inside* one block are not** (contrast the "one
+decision record per transaction" verdict above): the guard `𝑝` is a **source-domain** predicate —
+evaluated on the request element *before* the transaction, not on its snapshot — so it may
+legitimately restrict the source; each branch's block is a **distinct transaction** with its own
+`begin_<site>`, so distinct serialization points are correct rather than a violation; and atomicity
+is intact — still one snapshot, one commit, one write-set per transaction. The whole difference is
+"two transactions" vs. "one transaction, two paths".
+
+**Footgun — a register-reading guard is not an atomic check.** These are *not* equivalent:
+
+```text
+if balance > 0: with begin(): balance -= req      # (A) non-atomic pre-check
+with begin(): if balance > 0: balance -= req       # (B) atomic — checked in the snapshot
+```
+
+In (A) `balance > 0` is a **live/as-of read outside the transaction** — a TOCTOU pre-check that can
+go stale between the read and the commit. It is faithfully compilable (the guard becomes a gating
+live read deciding whether the transaction fires), but it is not an atomic guard, and a user who
+wrote (A) most likely meant (B), the in-block deny guard. This form should at least be documented,
+ideally linted (a register-reading guard on a conditional transaction) with a pointer at (B).
 

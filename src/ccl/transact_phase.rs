@@ -65,9 +65,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, F_COMMIT, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES,
-    FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::is_free_in_value,
+    BaseType, Builtin, Expr, F_COMMIT, F_DECISION, F_FIRE_SUFFIX, F_TIME, F_WRITE, F_WRITE_TARGETS,
+    F_WRITES, FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode,
+    WriterSite,
+    ccl_utils::{is_free_in_value, synthesize_arm_predicate},
     letrec::check_letrec_causal,
     mut_elim::{fold_induction_loop, hoist_feeds, register_value_tys},
 };
@@ -938,7 +939,7 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
 /// accumulator out of the atomic commit. A bare top-level spine induction write is
 /// therefore exactly the out-of-block form (block placement is inert for it). Only
 /// top-level spine writes are lifted; a *guarded* induction write is rejected
-/// up front by [`check_no_guarded_induction_writes`] (it would need commit-gated
+/// up front by [`check_no_guarded_induction_write_in_block`] (it would need commit-gated
 /// carry-forward), so it never reaches here.
 fn partition_block(block: Expr, txn_registers: &HashSet<Name>) -> (Expr, Vec<Expr>) {
     let mut lifted = Vec::new();
@@ -1081,60 +1082,70 @@ pub fn check_no_induction_only_transactions(
     result
 }
 
-/// Reject a **guarded in-block induction write**: an induction accumulator
-/// (`Mut(…)`, non-`Txn`) written inside an `if cond:` guard within a `with
-/// begin():` block. Only a *bare, top-level-spine* in-block induction write is
-/// supported — [`partition_block`] lifts it verbatim onto the enclosing loop, so it
-/// is exactly the out-of-block form (block placement is inert for it). A *guarded*
-/// induction write has no such lifting: it stays in the block and reaches
-/// [`walk_block`] as a `MutWrite` to a non-recorded key, whose write would be
-/// dropped from the commit decision. Committing it correctly needs commit-gated
-/// carry-forward (the value-`Case` machinery upstack); until then reject it here,
-/// cleanly, rather than let it slip past [`walk_block`]'s (release-silent when it
-/// was a `debug_assert!`) invariant check. A register write inside a guard (the
-/// normal deny path) is unaffected — only non-`Txn` targets are rejected.
-pub fn check_no_guarded_induction_writes(
+/// Reject a **guarded** induction write inside a `with begin():` block —
+/// `register := …; if p: cnt += 1`, where `cnt` is an induction accumulator, not a
+/// transactional register.
+///
+/// [`partition_spine`] lifts only *top-level spine* induction writes out onto the
+/// enclosing loop; a write nested inside a statement-`Case` (an `if`) stays in the
+/// block. There, `walk_case` has no `write_key` for it (`allowed_writes` holds
+/// only the transactional registers), so its value would be folded into the env and
+/// **silently dropped** from the decision record — the worst failure for a DB
+/// substrate, and one a `debug_assert` alone would let through in release. Catch
+/// it here as a user-facing error before the phase runs.
+pub fn check_no_guarded_induction_write_in_block(
     expr: &Expr,
     txn_registers: &HashSet<Name>,
 ) -> Result<(), String> {
     if let TypedExprNode::Begin { body } = &expr.node
-        && let Some(name) = guarded_induction_write(body, txn_registers)
+        && let Some(name) = guarded_non_txn_write(body, txn_registers, false)
     {
         return Err(format!(
-            "induction variable `{name}` is written inside an `if` guard in a `with begin():` \
-             block — a guarded in-block induction write is not supported (committing it would \
-             need commit-gated carry-forward). Move the write to the block's top level (a bare \
-             in-block induction write is exactly the out-of-block form), or if it should be \
-             committed atomically declare `{name}` as `Mut(…, Txn)`"
+            "`{name}` is written under an `if` inside a `with begin():` block. A guarded \
+             induction write in a transaction block is not supported — move the write outside \
+             the block, or (if it should be shared across the transaction) declare it \
+             `Mut(…, Txn)` and write it directly, not under a branch"
         ));
     }
     let mut result = Ok(());
     expr.walk_children(|c| {
         if result.is_ok() {
-            result = check_no_guarded_induction_writes(c, txn_registers);
+            result = check_no_guarded_induction_write_in_block(c, txn_registers);
         }
     });
     result
 }
 
-/// The first induction (non-`Txn`) `MutWrite` target found *inside a guard*
-/// (`Case`) within a block body, in first-occurrence order. A register write inside
-/// a guard (the deny path) is a `Txn` target, so it is never matched.
-fn guarded_induction_write(block: &Expr, txn_registers: &HashSet<Name>) -> Option<Name> {
-    if let TypedExprNode::Case {
-        scrutinee: None,
-        branches,
-    } = &block.node
-    {
-        // Any induction `MutWrite` anywhere under a guard is unsupported.
-        return branches
-            .iter()
-            .find_map(|b| first_non_txn_write(&b.body, txn_registers));
+/// The first non-txn `MutWrite` target that appears **inside a statement-`Case`**
+/// (an `if` arm) within `block` — a guarded induction write. `in_case` marks
+/// whether the walk is currently under such an arm; a guard is spine-evaluated,
+/// so only arm *bodies* set it.
+fn guarded_non_txn_write(
+    block: &Expr,
+    txn_registers: &HashSet<Name>,
+    in_case: bool,
+) -> Option<Name> {
+    match &block.node {
+        TypedExprNode::MutWrite { name, .. } if in_case && !txn_registers.contains(name) => {
+            return Some(name.clone());
+        }
+        TypedExprNode::Case {
+            scrutinee: None,
+            branches,
+        } => {
+            for b in branches {
+                if let Some(n) = guarded_non_txn_write(&b.body, txn_registers, true) {
+                    return Some(n);
+                }
+            }
+            return None;
+        }
+        _ => {}
     }
     let mut found = None;
     block.walk_children(|c| {
         if found.is_none() {
-            found = guarded_induction_write(c, txn_registers);
+            found = guarded_non_txn_write(c, txn_registers, in_case);
         }
     });
     found
@@ -1171,12 +1182,22 @@ fn block_writes_txn(block: &Expr, txn_registers: &HashSet<Name>) -> bool {
 /// The block's transactional footprint: register keys read (snapshot) and written,
 /// each in first-occurrence order. Reads are bare `Var`s of a transactional
 /// register; writes are `MutWrite` targets.
+///
+/// A key written **conditionally** — inside a statement-`Case` arm (`if p: k :=
+/// e`) — also joins the *read* set. On a control-flow path where that arm does
+/// not fire, `walk_case` rejoins `k` to its **carry** value (the previous
+/// committed value), which is only expressible as `k`'s read snapshot. A
+/// read-modify-write (`k := k + e`) already reads `k`, so this only adds the
+/// *absolute* conditional write (`k := e`) that would otherwise have no snapshot
+/// to carry. A purely spine (unconditional) write needs no carry, so it stays
+/// write-only — the peephole keeps unconditional programs snapshot-free.
 fn collect_footprint(block: &Expr, txn_registers: &HashSet<Name>) -> (Vec<Name>, Vec<Name>) {
     let mut reads = Vec::new();
     let mut writes = Vec::new();
     fn walk(
         e: &Expr,
         txn_registers: &HashSet<Name>,
+        in_case: bool,
         reads: &mut Vec<Name>,
         writes: &mut Vec<Name>,
     ) {
@@ -1191,17 +1212,46 @@ fn collect_footprint(block: &Expr, txn_registers: &HashSet<Name>) -> (Vec<Name>,
             TypedExprNode::MutWrite { name, value } => {
                 // The write's value is read first (its embedded register reads are
                 // snapshots), then the target joins the write set.
-                walk(value, txn_registers, reads, writes);
-                if txn_registers.contains(name) && !writes.contains(name) {
-                    writes.push(name.clone());
+                walk(value, txn_registers, in_case, reads, writes);
+                if txn_registers.contains(name) {
+                    if !writes.contains(name) {
+                        writes.push(name.clone());
+                    }
+                    // A conditional (in-`Case`) write needs its prior value to
+                    // carry on the paths its arm does not fire — record the read.
+                    // This is deliberately *over-conservative*: a bare-deny write
+                    // (`if p: a := 5`, an absolute value) never references its
+                    // snapshot at runtime (the engine skips a denied write-set
+                    // wholesale), and a spine-then-conditional key carries the
+                    // literal spine value — yet both land in the read set. The cost
+                    // is only a wider staleness footprint (more spurious
+                    // conflict-retries once several writers share a register), harmless
+                    // for a single writer; a precise footprint is a later refinement.
+                    if in_case && !reads.contains(name) {
+                        reads.push(name.clone());
+                    }
+                }
+                return;
+            }
+            // A statement-position `Case` (an `if`/`elif`/`else` routing writes):
+            // its arms' writes are conditional.
+            TypedExprNode::Case {
+                scrutinee: None,
+                branches,
+            } => {
+                for b in branches {
+                    // A guard is evaluated on the spine (its reads are unconditional
+                    // snapshots), but arm bodies are conditional.
+                    walk(&b.guard, txn_registers, in_case, reads, writes);
+                    walk(&b.body, txn_registers, true, reads, writes);
                 }
                 return;
             }
             _ => {}
         }
-        e.walk_children(|c| walk(c, txn_registers, reads, writes));
+        e.walk_children(|c| walk(c, txn_registers, in_case, reads, writes));
     }
-    walk(block, txn_registers, &mut reads, &mut writes);
+    walk(block, txn_registers, false, &mut reads, &mut writes);
     (reads, writes)
 }
 
@@ -1316,14 +1366,21 @@ fn build_writer(
         env.insert(acc.clone(), tvar(final_var, vty.clone()));
     }
 
-    let mut commit = {
+    // The path condition of the block's entry — the empty conjunction, `true`.
+    let true_path = {
         let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
         t.ty = Type::Base(BaseType::Bool);
         t
     };
+    // Each write/feed records the control-flow path it fires on; the transaction
+    // commits on their disjunction (`or_commit`). A spine write's path is `true`,
+    // so a write beside a guard commits unconditionally (the guard scopes only its
+    // own arm's writes) — the path-scoped deny semantics.
+    let mut commit_paths: Vec<Expr> = Vec::new();
     // In-block `<<` feeds, each resolved to its read-your-writes value at its
-    // position in the block. Collected as `(defer, to_<defer>_k field, value)`.
-    let mut collected_feeds: Vec<(Name, String, Expr)> = Vec::new();
+    // position in the block. Collected as `(defer, to_<defer>_k field, value,
+    // path)` — the control-flow path is the tap's fire condition.
+    let mut collected_feeds: Vec<(Name, String, Expr, Expr)> = Vec::new();
     // The legal `MutWrite` targets inside this block: exactly the site's write
     // keys (transactional registers `collect_footprint` recorded). `walk_block`
     // asserts every write it sees is one of these — see its `MutWrite` arm.
@@ -1331,11 +1388,13 @@ fn build_writer(
     walk_block(
         &site.block,
         &mut env,
-        &mut commit,
+        &true_path,
+        &mut commit_paths,
         &mut collected_feeds,
         feed_counter,
         &allowed_writes,
     );
+    let commit = or_commit(commit_paths);
 
     // The decision `writes` is a positional tuple over `write_keys`, matching
     // `emit_transact_writer` (a single write is a one-element tuple). A write key
@@ -1363,17 +1422,31 @@ fn build_writer(
         (F_WRITES.to_string(), Type::Tuple(write_tys)),
     ];
     let mut decision_fields: Vec<(String, Expr)> = vec![
-        (F_COMMIT.to_string(), commit),
+        (F_COMMIT.to_string(), commit.clone()),
         (F_WRITES.to_string(), writes),
     ];
+    let bool_ty = Type::Base(BaseType::Bool);
     let mut feed_sites: Vec<FeedSite> = Vec::with_capacity(collected_feeds.len());
-    for (defer, field, val) in collected_feeds {
+    for (defer, field, val, fpath) in collected_feeds {
         decision_field_tys.push((field.clone(), val.ty.clone()));
         feed_sites.push(FeedSite {
             defer,
             field: field.clone(),
             value_ty: val.ty.clone(),
         });
+        // A tap whose control-flow path is *narrower* than the transaction's
+        // overall commit carries a `__fire` field (its own path) so the engine
+        // appends the reply only on that route — not on a sibling route's commit.
+        // The test is purely *structural* (`fpath != commit`, no Boolean
+        // simplification): when the path is structurally the commit (a single-guard
+        // or spine feed) the field is omitted; a path that is *semantically* the
+        // commit but not structurally equal (e.g. duplicate feed paths making
+        // `commit = p ∨ p`) still carries a redundant — but always sound — gate.
+        if fpath != commit {
+            let fire_field = format!("{field}{F_FIRE_SUFFIX}");
+            decision_field_tys.push((fire_field.clone(), bool_ty.clone()));
+            decision_fields.push((fire_field, fpath));
+        }
         decision_fields.push((field, val));
     }
     let decision_ty = Type::Record(decision_field_tys);
@@ -1454,8 +1527,9 @@ fn build_zip_source(source: &Expr, item_ty: &Type, accs: &[(Name, Expr, Type)]) 
 fn walk_block(
     block: &Expr,
     env: &mut HashMap<Name, Expr>,
-    commit: &mut Expr,
-    feeds: &mut Vec<(Name, String, Expr)>,
+    path: &Expr,
+    commit_paths: &mut Vec<Expr>,
+    feeds: &mut Vec<(Name, String, Expr, Expr)>,
     feed_counter: &mut usize,
     allowed_writes: &HashSet<Name>,
 ) {
@@ -1468,25 +1542,30 @@ fn walk_block(
         } => {
             let bound = subst_env(bound_expr, env);
             env.insert(binding.name.clone(), bound);
-            walk_block(body, env, commit, feeds, feed_counter, allowed_writes);
+            walk_block(
+                body,
+                env,
+                path,
+                commit_paths,
+                feeds,
+                feed_counter,
+                allowed_writes,
+            );
         }
         TypedExprNode::ExprStmt { expr, body } => {
             match &expr.node {
                 TypedExprNode::MutWrite { name, value } => {
-                    // Every `MutWrite` reaching `walk_block` must target a
-                    // transactional register the site records as a write key.
-                    // `build_writer` only emits `write_keys` into the decision
-                    // `writes` tuple, so a write to any other name would be silently
-                    // folded into `env` and dropped — the worst failure for a DB
-                    // substrate. Two upstream gates keep the invariant: the lowering
-                    // gate (`transactions::write_or_let`) rejects a non-`Txn`
-                    // `:=`/`+=` outside the top-level spine, and
-                    // `check_no_guarded_induction_writes` rejects a guarded in-block
-                    // induction write (bare top-level induction writes are lifted by
-                    // `partition_spine` before this walk). This is an always-on
-                    // `assert!` (not `debug_assert!`) so a slip-through is a loud
-                    // panic in release, never a silent dropped write.
-                    assert!(
+                    // Every `MutWrite` in a stripped `with begin():` block must
+                    // target a transactional register the site records as a write
+                    // key. `build_writer` only emits `write_keys` into the
+                    // decision `writes` tuple, so a write to any other name would
+                    // be silently folded into `env` and dropped — the worst
+                    // failure for a DB substrate. A spine induction write is lifted
+                    // by `partition_spine`, and a *guarded* one is rejected before
+                    // the phase by `check_no_guarded_induction_write_in_block`, so
+                    // by here every write must be a recorded key; assert as a
+                    // backstop.
+                    debug_assert!(
                         allowed_writes.contains(name),
                         "transact_phase: `MutWrite` to `{name}` inside a `with begin():` \
                          block is not a recorded transactional write key — its write \
@@ -1494,11 +1573,22 @@ fn walk_block(
                     );
                     let val = subst_env(value, env);
                     env.insert(name.clone(), val);
+                    // This write commits on the current path (a spine write's path
+                    // is `true`); the disjunction over all writes is the commit.
+                    commit_paths.push(path.clone());
                 }
                 TypedExprNode::Case {
                     scrutinee: None,
                     branches,
-                } => apply_guard(branches, env, commit, feeds, feed_counter, allowed_writes),
+                } => walk_case(
+                    branches,
+                    env,
+                    path,
+                    commit_paths,
+                    feeds,
+                    feed_counter,
+                    allowed_writes,
+                ),
                 // `out << e` — a per-commit reply. Resolve `e` at this position
                 // (read-your-writes) and record it as a `to_<defer>_k` tap on the
                 // decision. NB the tap value is emitted for *every* commit record,
@@ -1509,76 +1599,199 @@ fn walk_block(
                 // `commit_operator`'s `Some((false, _))` deny arm). This
                 // cross-boundary reliance is the reason the tap rides the same
                 // decision record as the writes rather than a separate stream.
+                //
+                // The reply rides the transaction's commit: the engine appends the
+                // tap only for a committed decision. A feed under a *single* guard
+                // (`if p: w; out << e`) fires exactly when the transaction commits
+                // (its path == commit). A feed under one arm of genuine cross-key
+                // *routing* (path ⊊ commit) would over-fire on a sibling route's
+                // commit — so the feed records its own `path`, and the decision
+                // assembler emits a per-tap `__fire` field (this path) the engine
+                // checks, unless the path *is* the commit (then it always fires).
                 TypedExprNode::Feed { name, value } => {
                     let val = subst_env(value, env);
                     let field = format!("to_{}_{}", name.base(), *feed_counter);
                     *feed_counter += 1;
-                    feeds.push((name.clone(), field, val));
+                    feeds.push((name.clone(), field, val, path.clone()));
+                    // A read-only transaction commits to emit its reply.
+                    commit_paths.push(path.clone());
                 }
                 other => panic!(
                     "transact_phase: unexpected statement in `with begin():` block: {other:?}"
                 ),
             }
-            walk_block(body, env, commit, feeds, feed_counter, allowed_writes);
+            walk_block(
+                body,
+                env,
+                path,
+                commit_paths,
+                feeds,
+                feed_counter,
+                allowed_writes,
+            );
         }
         other => panic!("transact_phase: unexpected node in `with begin():` block: {other:?}"),
     }
 }
 
-/// Apply a single `if cond:` deny guard. The lowering shape is exactly two
-/// branches `[{guard → then}, {true → Unit}]`: conjoin `guard` into `commit` and
-/// apply the `then` branch's writes to `env`. The empty else contributes no
-/// writes (the deny path). Feeds inside the guarded branch ride the same
-/// `commit`, so a denied transaction replies nothing.
-fn apply_guard(
+/// Walk a statement-position `if`/`elif`/`else` `Case` inside a block: fork each
+/// branch under its first-match path condition, walking it against a *cloned*
+/// read-your-writes environment; then **rejoin** each written key as a
+/// carry-forward value-`Case` over the branches (an arm that didn't write a key
+/// contributes its snapshot). Guards resolve against the incoming env (RYW). The
+/// rejoined `Case`s are value-selecting inside the writer lambda, so `lambda_elim`
+/// compiles them to a value-preserving `filter_values` union-of-restricts;
+/// sequencing after the join reads the merged value (RYW across the join). Commit
+/// paths accumulate across the arms.
+#[allow(clippy::too_many_arguments)]
+fn walk_case(
     branches: &[crate::ccl::Branch],
     env: &mut HashMap<Name, Expr>,
-    commit: &mut Expr,
-    feeds: &mut Vec<(Name, String, Expr)>,
+    path: &Expr,
+    commit_paths: &mut Vec<Expr>,
+    feeds: &mut Vec<(Name, String, Expr, Expr)>,
     feed_counter: &mut usize,
     allowed_writes: &HashSet<Name>,
 ) {
-    assert_eq!(
-        branches.len(),
-        2,
-        "transact_phase: a `with begin():` guard is a bare `if cond:` (no `elif`/`else` writes) — \
-         two branches, the second an empty `true → unit` deny"
+    // The rejoin below carries an unwritten key via its snapshot on the *last*
+    // arm, so the merged `Case` is total only if the branch list ends in the
+    // unconditional `true → else|unit` complement lowering appends. Assert it at
+    // this boundary — a non-exhaustive block `Case` would leave a key with no
+    // carry on the uncovered path.
+    debug_assert!(
+        branches
+            .last()
+            .is_some_and(|b| matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))),
+        "a `with begin():` block `Case` must end in the `true` complement (totality)"
     );
-    let guard = subst_env(&branches[0].guard, env);
-    assert!(
-        matches!(&branches[1].body.node, TypedExprNode::Lit(Lit::Unit)),
-        "transact_phase: a `with begin():` `if` may not carry an `else` with writes yet"
-    );
-    *commit = and_commit(std::mem::replace(commit, unit_placeholder()), guard);
-    walk_block(
-        &branches[0].body,
-        env,
-        commit,
-        feeds,
-        feed_counter,
-        allowed_writes,
-    );
+    let snapshot = env.clone();
+    // Per branch: (resolved guard, resulting env). The guard is resolved in the
+    // snapshot env (its reads see the pre-`Case` values — RYW).
+    let mut arm_results: Vec<(Expr, HashMap<Name, Expr>)> = Vec::with_capacity(branches.len());
+    let mut priors: Vec<Expr> = Vec::new();
+    for br in branches {
+        let guard = subst_env(&br.guard, &snapshot);
+        let pi = synthesize_arm_predicate(&guard, &priors);
+        priors.push(guard.clone());
+        let arm_path = and_path(path, &pi);
+        let mut arm_env = snapshot.clone();
+        walk_block(
+            &br.body,
+            &mut arm_env,
+            &arm_path,
+            commit_paths,
+            feeds,
+            feed_counter,
+            allowed_writes,
+        );
+        arm_results.push((guard, arm_env));
+    }
+    // Rejoin every write key some arm changed: `env[k] = Case[gᵢ → arm_envᵢ[k]]`,
+    // first-match over the (raw, snapshot-resolved) branch guards. An arm that
+    // left `k` unchanged contributes its snapshot value (carry). Keys no arm
+    // touched keep their snapshot untouched.
+    for wk in allowed_writes {
+        let snap_v = snapshot.get(wk);
+        let changed = arm_results.iter().any(|(_, ae)| ae.get(wk) != snap_v);
+        if !changed {
+            continue;
+        }
+        // A key changed on some-but-not-all arms needs a snapshot to carry on the
+        // arms that leave it unchanged. `collect_footprint` finalizes every
+        // in-`Case` write into the read set, so `snap_v` is `Some` here unless
+        // every arm writes the key. Named so a footprint regression fails loudly
+        // rather than surfacing as the generic `.expect` below.
+        debug_assert!(
+            snap_v.is_some() || arm_results.iter().all(|(_, ae)| ae.get(wk).is_some()),
+            "rejoin: conditionally-written key {wk:?} has a carrying arm but no \
+             snapshot — collect_footprint must add in-`Case` writes to the read set"
+        );
+        let vty = snap_v
+            .map(|e| e.ty.clone())
+            .or_else(|| {
+                arm_results
+                    .iter()
+                    .find_map(|(_, ae)| ae.get(wk).map(|e| e.ty.clone()))
+            })
+            .expect("a changed write key has a value type");
+        let case_branches: Vec<crate::ccl::Branch> = arm_results
+            .iter()
+            .map(|(g, ae)| crate::ccl::Branch {
+                pattern: None,
+                guard: g.clone(),
+                body: ae
+                    .get(wk)
+                    .or(snap_v)
+                    .cloned()
+                    .expect("a rejoined write key has a per-arm or snapshot value"),
+            })
+            .collect();
+        let mut c = Expr::new(TypedExprNode::Case {
+            scrutinee: None,
+            branches: case_branches,
+        });
+        c.ty = vty;
+        env.insert(wk.clone(), c);
+    }
 }
 
-/// A throwaway used with [`std::mem::replace`] while rebuilding `commit`.
-fn unit_placeholder() -> Expr {
-    let mut e = Expr::new(TypedExprNode::Lit(Lit::Unit));
-    e.ty = Type::Base(BaseType::Unit);
-    e
+/// Whether `e` is the literal `true`.
+fn is_true_lit(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::Lit(Lit::Bool(true)))
 }
 
-/// `commit and guard`, collapsing the initial `true`.
-fn and_commit(commit: Expr, guard: Expr) -> Expr {
-    if matches!(commit.node, TypedExprNode::Lit(Lit::Bool(true))) {
-        return guard;
+/// `path ∧ guard`, collapsing a `true` path to just the guard.
+fn and_path(path: &Expr, guard: &Expr) -> Expr {
+    if is_true_lit(path) {
+        return guard.clone();
+    }
+    if is_true_lit(guard) {
+        return path.clone();
     }
     let mut e = Expr::binop(
-        commit,
+        path.clone(),
         crate::ccl::BinOpKind::BoolLogic(crate::ccl::LogicKind::And),
-        guard,
+        guard.clone(),
     );
     e.ty = Type::Base(BaseType::Bool);
     e
+}
+
+/// The transaction commit condition: the disjunction of the paths its writes and
+/// feeds fire on. A literal-`true` path (a spine write) short-circuits to `true`
+/// (the unconditional commit — bit-identical to the pre-conditionals emission);
+/// `false` paths drop out; no Boolean simplification otherwise (`p ∨ ¬p` stays
+/// symbolic, the engine evaluates one `Bool`). Empty (no write or feed) → `true`,
+/// a degenerate case lowering already rejects (an empty block).
+fn or_commit(paths: Vec<Expr>) -> Expr {
+    let bool_ty = Type::Base(BaseType::Bool);
+    let true_lit = || {
+        let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
+        t.ty = bool_ty.clone();
+        t
+    };
+    let mut acc: Option<Expr> = None;
+    for p in paths {
+        if is_true_lit(&p) {
+            return true_lit();
+        }
+        if matches!(p.node, TypedExprNode::Lit(Lit::Bool(false))) {
+            continue;
+        }
+        acc = Some(match acc {
+            None => p,
+            Some(a) => {
+                let mut e = Expr::binop(
+                    a,
+                    crate::ccl::BinOpKind::BoolLogic(crate::ccl::LogicKind::Or),
+                    p,
+                );
+                e.ty = bool_ty.clone();
+                e
+            }
+        });
+    }
+    acc.unwrap_or_else(true_lit)
 }
 
 /// Replace every free `Var(n)` with `n`'s current environment value. Names are
@@ -2166,7 +2379,7 @@ fn splice_letrec(
     };
     let mut inner = tail;
     for k in key_names.iter().rev() {
-        // The init's type is the register's value type `V` (the `Mut(V, Txn)` wrapper
+        // The init's type is the mutable variable's value type `V` (the `Mut(V, Txn)` wrapper
         // rode the binding/annotation, not the init RHS); `register_value_ty` peels
         // it defensively. `erase_mut` sweeps any surviving `Var(x)` reference type.
         let v = register_value_ty(&key_init[k].ty);

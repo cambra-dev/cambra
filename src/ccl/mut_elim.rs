@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use crate::ccl::{
     BaseType, Branch, Builtin, Expr, F_COMMIT, F_WRITES, HistoryKind, Lit, Name, Type,
     TypedBinding, TypedExprNode,
-    ccl_utils::{strip_refinements, synthesize_arm_predicate},
+    ccl_utils::{strip_refinements, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
     symbolic::symbolic,
 };
@@ -612,6 +612,32 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
         // a write nor a feed (a `for x: pure_call()` whose call didn't mutate) —
         // observationally a no-op; drop the loop and keep the continuation.
         if body_has_feed(&loop_body) {
+            // A **conditional** feed (`if p: out << e`, a statement-`Case`) is fanned
+            // out by `channelize` into one refined-source channel per feeding arm —
+            // the same path a non-transactional conditional feed takes. The
+            // plain-map hoist below (`transform_feed_only_loop`) only handles
+            // straight-line feeds, so re-emit a conditional-feed loop as a generator
+            // `iter ≫ (λ target → body)` `Compose` for `channelize` to fan out,
+            // rather than flattening it here. (A register read in the feed value stays
+            // in the arm value; `rewrite_live_reads` handles it post-channelize, as
+            // for the straight-line read-only reply.)
+            if body_has_statement_case(&loop_body) {
+                // Normalize away the block's trailing `; unit` terminals (a
+                // `with begin():` block lowers each arm as `Feed; unit` and the
+                // whole `Case` as `Case; unit`), so the `Case` matches the clean
+                // `{gᵢ → Feed; true → unit}` shape `channelize::try_extract_fanout_feed`
+                // recognizes — the same shape a non-transactional conditional feed
+                // lowers to directly.
+                let body = strip_trailing_unit(loop_body.clone());
+                let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), body);
+                lambda.ty = Type::fun(target.ty.clone(), loop_body.ty.clone());
+                let map = typed_compose(vec![iter, lambda]);
+                let cont = rewrite(cont);
+                let cont_ty = cont.ty.clone();
+                let mut stmt = Expr::expr_stmt(map, cont);
+                stmt.ty = cont_ty;
+                return stmt;
+            }
             return transform_feed_only_loop(target, iter, loop_body, cont);
         }
         return rewrite(cont);
@@ -1022,6 +1048,71 @@ fn collect_writes(expr: &Expr, reg_vtys: &HashMap<Name, Type>, out: &mut Vec<(Na
 /// check in [`transform_loop`]).
 fn body_has_feed(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Feed { .. }) || expr.any_child(body_has_feed)
+}
+
+/// Drop the trailing `; unit` terminals a `with begin():` block lowering leaves
+/// on a read-only feed body, recursively: `ExprStmt { effect, unit }` collapses to
+/// the normalized `effect`, and a statement-`Case`'s arm bodies are normalized in
+/// place. The result is the clean generator body (`Case { gᵢ → Feed; true → unit }`
+/// / a bare `Feed`) that `channelize`'s feed fan-out recognizes.
+fn strip_trailing_unit(expr: Expr) -> Expr {
+    // The rebuilt `Case` below is the *same* logical node with stripped branch
+    // bodies, so it carries its original `NodeId` — a pass that minted here would
+    // break the node's link to the source it came from
+    // (`src/ccl/design/provenance.md`, "The two identity primitives
+    // (`src/ccl/provenance.rs`)").
+    let node_id = expr.node_id();
+    match expr.node {
+        TypedExprNode::ExprStmt { expr: effect, body }
+            if matches!(body.node, TypedExprNode::Lit(Lit::Unit)) =>
+        {
+            strip_trailing_unit(*effect)
+        }
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            let branches = branches
+                .into_iter()
+                .map(|b| Branch {
+                    pattern: b.pattern,
+                    guard: b.guard,
+                    body: strip_trailing_unit(b.body),
+                })
+                .collect();
+            let mut rebuilt = Expr::preserve(
+                node_id,
+                TypedExprNode::Case {
+                    scrutinee,
+                    branches,
+                },
+            )
+            .with_ty(expr.ty);
+            rebuilt.user_annotation = expr.user_annotation;
+            rebuilt
+        }
+        _ => expr,
+    }
+}
+
+/// Whether a loop body contains a **statement-position** guard-`Case` (`if p: …`,
+/// lowered to `ExprStmt { effect: Case{scrutinee: None}, … }`) — a conditional
+/// feed/write. Distinguishes a conditional feed loop (fanned out by `channelize`)
+/// from a straight-line feed loop (hoisted by `transform_feed_only_loop`). Ignores
+/// *value*-position `Case`s (a ternary in a feed value is straight-line).
+fn body_has_statement_case(expr: &Expr) -> bool {
+    if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
+        && matches!(
+            &effect.node,
+            TypedExprNode::Case {
+                scrutinee: None,
+                ..
+            }
+        )
+    {
+        return true;
+    }
+    expr.any_child(body_has_statement_case)
 }
 
 /// Replace the terminal `Unit` of a statement chain with `tail` — splicing the

@@ -1216,7 +1216,11 @@ impl TileProducer for InductionStoreProducer {
             let body_tile = self
                 .body_producer
                 .get(self.body_producer.tiling().universal_guard());
-            let Some((commit, writes)) = body_decision_at(&body_tile, pos, &self.tap_fields) else {
+            // Induction taps are ungated (conditional feeds on an induction path
+            // are rejected at lowering), so `tap_fired` is all-`true` and unused.
+            let Some((commit, writes, _tap_fired)) =
+                body_decision_at(&body_tile, pos, &self.tap_fields)
+            else {
                 // The decision for a freshly-pushed row of a self-contained
                 // induction body is always ready on the pull. A `None` means the
                 // body has not converged at this position — for the loop shapes
@@ -2244,10 +2248,17 @@ impl TileProducer for BodyInputSourceProducer {
 ///
 /// The body returns a `{commit: Bool, writes: (new₀, …, new_{w-1})}` record (see
 /// [`F_COMMIT`] / [`F_WRITES`]) — the `writes` field is itself a record tile
-/// `{_0, …, _{w-1}}`. Returns `(commit, writes)`: `commit` gates grant (propose
-/// the write set) vs deny (skip); `writes[j]` is the new value proposed for the
-/// writer's `write_keys[j]`.
-fn body_decision_at(tile: &Tile, pos: usize, tap_fields: &[String]) -> Option<(bool, Vec<Value>)> {
+/// `{_0, …, _{w-1}}`. Returns `(commit, writes, tap_fired)`: `commit` gates grant
+/// (propose the write set) vs deny (skip); `writes[j]` is the new value proposed
+/// for `write_keys[j]` (register writes then tap values, in that order); and
+/// `tap_fired[t]` says whether tap `tap_fields[t]` fires at this position (its
+/// `__fire` gate, or `true` for an ungated tap). A committing decision applies a
+/// register write and a *fired* tap, but not a non-fired tap.
+fn body_decision_at(
+    tile: &Tile,
+    pos: usize,
+    tap_fields: &[String],
+) -> Option<(bool, Vec<Value>, Vec<bool>)> {
     let Tile::SealedFunction {
         domain, codomain, ..
     } = tile
@@ -2281,12 +2292,23 @@ fn body_decision_at(tile: &Tile, pos: usize, tap_fields: &[String]) -> Option<(b
         Tile::Scalar(_) => {}
         _ => return None,
     }
+    // Per tap, its value and whether it *fires* at this position. A tap with a
+    // companion `<tap>__fire` field (a feed under cross-key routing) fires only
+    // where that gate holds; a tap without one (a single-guard/spine feed) always
+    // fires with its committing transaction.
+    let mut tap_fired = Vec::with_capacity(tap_fields.len());
     for tap in tap_fields {
         // A reply tap may be fed a record (`out << {id, payload}`), so the field is
         // a `Tile::Record`, not a scalar column — assemble the record value.
         writes.push(field_value_at(fields.get(tap)?, row)?);
+        let fire_field = format!("{tap}{}", crate::ccl::F_FIRE_SUFFIX);
+        let fired = match fields.get(&fire_field) {
+            Some(Tile::Scalar(fire_col)) => matches!(fire_col.index_at(row), Value::Bool(true)),
+            _ => true,
+        };
+        tap_fired.push(fired);
     }
-    Some((commit, writes))
+    Some((commit, writes, tap_fired))
 }
 
 /// The value at position `row` of a decision-record field tile. A scalar field is
@@ -2744,7 +2766,7 @@ impl TileProducer for TransactWriterProducer {
                 // Grant: propose the write set; the operator decides whether it
                 // commits (release advances `current`) or is stale (retry). The
                 // read set omits never-written keys (append → empty read).
-                Some((true, new)) => {
+                Some((true, new, tap_fired)) => {
                     let reads: HashMap<Value, Value> = self
                         .read_keys
                         .iter()
@@ -2764,8 +2786,30 @@ impl TileProducer for TransactWriterProducer {
                         new.len(),
                         self.write_keys.len()
                     );
-                    let writes: HashMap<Value, Value> =
-                        self.write_keys.iter().cloned().zip(new).collect();
+                    // Register writes lead; taps follow (the layout `build_commit_store`
+                    // sets). A committed transaction applies every register write but
+                    // only the taps that *fired* on its route — a non-fired tap under
+                    // cross-key routing is omitted from the delta, so it does not
+                    // over-fire on a sibling route's commit.
+                    // Layout invariant: `write_keys` = register keys ++ tap keys, so
+                    // the subtraction never underflows. Assert it — a break would wrap
+                    // `n_reg` to a huge value in release and mis-index `tap_fired`.
+                    debug_assert!(
+                        self.write_keys.len() >= self.tap_fields.len(),
+                        "commit operator: tap fields ({}) exceed write keys ({})",
+                        self.tap_fields.len(),
+                        self.write_keys.len()
+                    );
+                    let n_reg = self.write_keys.len() - self.tap_fields.len();
+                    let writes: HashMap<Value, Value> = self
+                        .write_keys
+                        .iter()
+                        .cloned()
+                        .zip(new)
+                        .enumerate()
+                        .filter(|(i, _)| *i < n_reg || tap_fired[*i - n_reg])
+                        .map(|(_, kv)| kv)
+                        .collect();
                     // Re-proposing this item at a new frontier supersedes its
                     // prior stale proposal(s); drop them so the window stays O(1).
                     self.drop_superseded(self.current);
@@ -2781,7 +2825,7 @@ impl TileProducer for TransactWriterProducer {
                 // hand-written `TokenWriter`'s `pool < cost` branch. Drop any
                 // earlier grant-stale proposal for this item first (a grant→deny
                 // flip on retry) so it is not orphaned in the window.
-                Some((false, _)) => {
+                Some((false, _, _)) => {
                     self.drop_superseded(self.current);
                     self.current += 1;
                     self.pending = None;
