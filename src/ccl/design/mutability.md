@@ -817,9 +817,9 @@ off-path arm is never evaluated, so a **partial op** (`//`) in a written value n
 guard-rejected position. See `../../interpreter/design-operators.md`.
 
 Both a **finite** loop and an **async** (streaming) source drive an induction accumulator — the
-model treats a finite domain as a stream that terminates (§Liveness) — and every induction accumulator now
+model treats a finite domain as a stream that terminates (§Liveness) — and every induction accumulator
 uses *one* realization: the changelog `InductionStore`. Plain, conditional, and feed-carrying loops
-over finite or async extents all route through it; the dense `Recurse` fallback is fully retired. The
+over finite or async extents all route through it. The
 drive reads its source by absolute domain position (async domains arrive unordered), reclaims the
 consumed prefix as it advances, and carries reply feeds as `__fire`-gated taps — see *Induction
 stores as a changelog* in `../../interpreter/design-operators.md`.

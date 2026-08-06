@@ -1434,7 +1434,7 @@ fn build_induction_store(
     );
     // An induction store is **always single-writer**: recognition folds every
     // conditional write to one carry-complete writer (`writes = Case[ĝ → w; true →
-    // snapshot]`), so the former multi-leg `Recurse` realization is dead. That one
+    // snapshot]`), so no multi-leg realization is needed. That one
     // writer — plain, conditional, or feed-carrying — compiles to the
     // position-driven `InductionStore` over the `Tile::Store` changelog, read
     // densely via `StoreDenseRead`. Finite (list) and async (`DataSource`) extents

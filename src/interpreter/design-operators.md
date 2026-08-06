@@ -381,15 +381,14 @@ concurrent proposals. Op-conversion (`build_induction_store_single`) routes **ev
 induction store here — plain, conditional, or feed-carrying, over a finite (list) *or* an
 async (`DataSource`) extent. An induction store is always **single-writer**: recognition
 folds a conditional write to one carry-complete writer (`writes = Case[ĝ → w; true →
-snapshot]`), so there is no multi-writer group and no dense-`Recurse` fallback — the former
-second realization is fully retired.
+snapshot]`), so there is no multi-writer group and one realization serves every induction
+store.
 
-The finite/async split — the one place in the substrate that distinguished a finite source
-from a streaming one — is **gone**. Everywhere else the tiling protocol treats a finite
-source as a stream that happens to terminate (comprehensions, joins, aggregates all run over
-a literal list *and* a `DataSource` through one graph: monotonic tile growth +
-pull-until-the-frontier-stalls), and the changelog induction store now does too. What
-remains is only a memory bound on a never-terminating loop; see
+**Nothing in the substrate distinguishes a finite source from a streaming one.** The tiling
+protocol treats a finite source as a stream that happens to terminate — comprehensions,
+joins, aggregates and the changelog induction store all run over a literal list *and* a
+`DataSource` through one graph (monotonic tile growth + pull-until-the-frontier-stalls). The
+one thing the distinction would still buy is a memory bound on a never-terminating loop; see
 [*Remaining: the never-terminating bound*](#remaining-the-never-terminating-bound).
 
 **`InductionStore` — the position-driven producer.** It owns a `CommitEngine` seeded at
@@ -429,9 +428,8 @@ position (the final accumulator), not an arbitrary mid-loop value. (A **co-itera
 an accumulator threaded into another store, e.g. `for r in …: cnt += 1; with begin(): store
 := store + cnt` — aligns by domain *value* via `fan_in`, so ordering is immaterial there;
 sorting is correct for both.) One reader serves both shapes, and a downstream release of loop
-positions is forwarded to the trigger so the source is reclaimed. This replaces the dense
-`.writes.(index)` projection with a fold, unifying induction reads with commit-register
-reads.
+positions is forwarded to the trigger so the source is reclaimed. Reading by fold rather
+than by indexed projection is what unifies induction reads with commit-register reads.
 
 Folding by position keeps the read independent of the store's own length — the positions
 come from the trigger, the values from the fold. And the trailing-carry undercount that
