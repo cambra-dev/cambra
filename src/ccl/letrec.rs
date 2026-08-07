@@ -164,7 +164,7 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
         }
         // A **`zip` of causal slots** — `⟨causal, …⟩ ▷ zip` (a per-key commit
         // view combining several pointwise reads of the same commit stream, e.g.
-        // `⟨commits ≫ .time, commits ≫ .decision ≫ variant_project(Commit) ≫
+        // `⟨commits ≫ .time, commits ≫ .decision ≫ variant_project(`commit) ≫
         // .writes ≫ .i⟩ ▷ zip`). Each leg consults only strictly-earlier
         // positions; a `zip` combines them by position, so the whole slot is
         // causal exactly when every leg is.

@@ -241,7 +241,7 @@ enum StoreReadKind {
 /// expressed in the CCL, not here.
 struct KeyReadInfo {
     /// The runtime key the variable's value lives under in the commit store map
-    /// (`Commit` stores only; `Value::Unit` for induction stores).
+    /// (`commit` stores only; `Value::Unit` for induction stores).
     runtime_key: Value,
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
@@ -269,7 +269,7 @@ struct StoreReadInfo {
     /// Which engine backs the store (selects the read projection).
     kind: StoreReadKind,
     /// The loop extent `D` an [`InductionChangelog`](StoreReadKind::InductionChangelog)
-    /// read enumerates (its [`StoreDenseRead`] trigger). `None` for a `Commit` or
+    /// read enumerates (its [`StoreDenseRead`] trigger). `None` for a `commit` or
     /// dense `Induction` store.
     induction_extent: Option<Extent>,
 }
@@ -1324,8 +1324,8 @@ fn build_transact_store(
     build_commit_store(keys, writers, ctx)
 }
 
-/// The reply taps on a writer body's `[.Commit(⟨writes, to_<defer>*⟩) | .Abort]`
-/// decision — every field of the (dense) `Commit` payload record other than
+/// The reply taps on a writer body's `` {`commit{writes, to_<defer>*} | `abort} ``
+/// decision — every field of the (dense) `commit` payload record other than
 /// `writes`, with its per-commit value type. A tap is a reply (`out << e`) that
 /// desugar folded onto the writer body; for a commit store, op-conversion commits
 /// each tap as a write-only key so the reply rides the transaction's commit and is
@@ -1334,7 +1334,7 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
-    // Peel the `Commit` payload record out of the decision variant.
+    // Peel the `commit` payload record out of the decision variant.
     let Type::Variant(tags) = codom else {
         return Vec::new();
     };
@@ -1355,8 +1355,7 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 /// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`]
 /// wired in a cyclic [`FanOut`], one *fused* [`CommitWriter`] per writer (a
 /// branch of the shared store output). Each fused writer reads the cyclic store,
-/// runs its body — the `let k₀ = p.0 in … let item = p.r in [.Commit(⟨writes⟩) |
-/// .Abort]` decision, fed via a buffer the writer owns — and either grants (appends
+/// runs its body — the ``let k₀ = p.0 in … let item = p.r in {`commit{writes} | `abort}`` decision, fed via a buffer the writer owns — and either grants (appends
 /// a proposal) or denies. A single writer is the degenerate case (no conflicts →
 /// no retries); ≥2 writers serialize through the operator with conflict + retry.
 /// A *fused* writer (not fanned) is load-bearing: a stateful sequencing producer
@@ -1399,7 +1398,7 @@ fn build_commit_store(
             KeyReadInfo {
                 runtime_key,
                 value_extent: key_value_extent,
-                index: 0,            // unused for `Commit` reads (keyed by `runtime_key`)
+                index: 0,            // unused for `commit` reads (keyed by `runtime_key`)
                 carry_forward: true, // register: value persists across commits
             },
         );
@@ -1465,7 +1464,7 @@ fn build_commit_store(
                 KeyReadInfo {
                     runtime_key: Value::String(field.clone().into()),
                     value_extent: tap_value_extent,
-                    index: 0, // unused for `Commit` reads (keyed by `runtime_key`)
+                    index: 0, // unused for `commit` reads (keyed by `runtime_key`)
                     // A reply tap is a per-commit event, not a persistent value:
                     // emit it only at the tick that wrote it, so two writers'
                     // taps to one defer don't smear across the shared clock.
