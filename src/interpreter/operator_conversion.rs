@@ -26,7 +26,7 @@ use crate::{
             StoreDenseRead, StoreValueStream, TransactWriter as CommitWriter, WriterBuffer,
         },
         tile_operators::{
-            Aggregate, Constant, Converse, ExtractAggregate, ExtractLast, FanOut, Filter,
+            Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
             FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
             MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo,
             PermuteRecordDomain, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
@@ -237,7 +237,7 @@ enum StoreReadKind {
 }
 
 /// How to read one key (variable) of a transactional store. The scalar-read
-/// reduction to the current/final value (`final_or_default` → `ExtractLast`) is
+/// reduction to the current/final value (`final_or_default` → `ExtractFinal`) is
 /// expressed in the CCL, not here.
 struct KeyReadInfo {
     /// The runtime key the variable's value lives under in the commit store map
@@ -258,7 +258,7 @@ struct KeyReadInfo {
 
 /// A built transactional store, registered under its `__reg` binder so each
 /// per-variable read (`__reg.k`) can branch the shared fan and project key
-/// `k`. The scalar-read reduction (`final_or_default` → `ExtractLast`) is
+/// `k`. The scalar-read reduction (`final_or_default` → `ExtractFinal`) is
 /// expressed in the CCL, not here.
 struct StoreReadInfo {
     /// The cyclic store fan — a [`FanOut`] over the store body stream; every
@@ -901,7 +901,7 @@ fn convert_impl_inner(
         // codomain value at the final position of an iteration stream, falling
         // back to a default scalar when the stream is empty.  Argument is a
         // 2-element `Tuple([stream, default])`; compiles directly to the
-        // `ExtractLast` tile operator (which takes both ops).
+        // `ExtractFinal` tile operator (which takes both ops).
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::FinalOrDefault) =>
         {
@@ -920,7 +920,7 @@ fn convert_impl_inner(
             }
             let stream_op = convert_impl(&elts[0], None, ctx)?;
             let default_op = convert_impl(&elts[1], None, ctx)?;
-            Ok(Box::new(ExtractLast::new(stream_op, default_op)))
+            Ok(Box::new(ExtractFinal::new(stream_op, default_op)))
         }
 
         // `GetPrevSeq` is a letrec guard accessor, never compiled directly:
@@ -1541,7 +1541,7 @@ fn build_induction_store(
 /// feeds — but the store is driven by iteration position (no cyclic `Recurse`,
 /// no conflict/retry). Reads register as [`StoreReadKind::InductionChangelog`]:
 /// each `__reg.k` folds the changelog densely over the loop extent via
-/// [`StoreDenseRead`], serving both a scalar-final read (`ExtractLast` over it)
+/// [`StoreDenseRead`], serving both a scalar-final read (`ExtractFinal` over it)
 /// and a co-iterated read (the dense `Fun(D, V)` itself).
 fn build_induction_store_single(
     keys: &[TransactKey],
@@ -1750,7 +1750,7 @@ fn as_of_snapshot_fields(
 
 /// Compile a per-variable read `__reg.field` off a registered transactional
 /// store. `plan_loops` wraps a scalar accumulator read in `final_or_default(stream,
-/// init)`, so the current/final value (via [`ExtractLast`]) is selected
+/// init)`, so the current/final value (via [`ExtractFinal`]) is selected
 /// downstream, not here.
 fn convert_store_read(
     store_name: &Name,
@@ -1781,7 +1781,7 @@ fn convert_store_read(
         // [`StoreValueStream`] over the commit-log map, keyed by `runtime_key`.
         // A register carries forward; a reply tap emits only at its write tick.
         // `transact_phase` wraps a read in `final_or_default(stream, init)`, which
-        // the `LastOrDefault` arm compiles to `ExtractLast` — not special-cased here.
+        // the `FinalOrDefault` arm compiles to `ExtractFinal` — not special-cased here.
         (StoreReadKind::Commit, Some((runtime_key, value_extent, _, carry_forward))) => {
             Ok(Box::new(StoreValueStream::new(
                 fan.branch(),
@@ -1795,7 +1795,7 @@ fn convert_store_read(
         // trigger + the store branch). An **accumulator** (`carry_forward: true`)
         // is dense `D ⇀ V` — every position folds the latest write ≤ it (leading
         // carries fold to the tick-0 seed); `recognize` wraps a scalar read in
-        // `final_or_default` → `ExtractLast`, a co-iterated read consumes the dense
+        // `final_or_default` → `ExtractFinal`, a co-iterated read consumes the dense
         // function directly. A **reply tap** (`carry_forward: false`) is the feed's
         // per-position value stream: only the positions where the tap fired
         // (its value present in that position's changelog delta), keyed by loop

@@ -640,7 +640,7 @@ pub enum Type {
         /// transaction time, or a feed channel's collection domain).
         domain: Box<Type>,
         /// Whether this is a mutable variable or a feed channel — selects the read
-        /// mode (scalar-last vs whole-stream) and, in the unified phase, whether
+        /// mode (scalar-final vs whole-stream) and, in the unified phase, whether
         /// off-path positions carry forward.
         kind: HistoryKind,
     },

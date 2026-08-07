@@ -90,9 +90,9 @@ pub enum Tile {
     /// never by indexing a position directly, and the current value of a *live*
     /// store is
     /// [`store_current`](crate::interpreter::commit_operator::store_current) —
-    /// which, unlike `ExtractLast`, is defined without the stream ever
+    /// which, unlike `ExtractFinal`, is defined without the stream ever
     /// terminating. Encoding the step semantics in a distinct variant keeps
-    /// ordinary-function operations (direct indexing, `ExtractLast`) from
+    /// ordinary-function operations (direct indexing, `ExtractFinal`) from
     /// silently misreading a store. See `src/ccl/design/mutability.md`.
     Store {
         /// Commit ticks that carry a write (the change events), sorted ascending.
@@ -103,17 +103,17 @@ pub enum Tile {
         /// from a tick's delta was not written at that tick (its value holds).
         deltas: ColumnValue,
         /// The decided frontier: `LessThanEq(w)` means every tick `≤ w` is decided
-        /// — the watermark `w` counts trailing carries (positions past the last
+        /// — the watermark `w` counts trailing carries (positions past the latest
         /// *change*), because a store is a right-continuous step function over its
         /// whole decided prefix, not a list of change events. `False` while
         /// undecided (never stepped). **Not** `True`: terminality is the separate
         /// `terminal` axis so the numeric watermark is never discarded (a terminal
         /// store with trailing carries keeps `LessThanEq(w)`, so `len` and
-        /// `store_frontier` read `w` directly instead of undercounting to the last
+        /// `store_frontier` read `w` directly instead of undercounting to the latest
         /// change tick).
         frontier: Predicate,
         /// Whether the frontier is *closed* — no further commits will ever land, so
-        /// a *terminal* read (`ExtractLast` / `final_or_default`) resolves. Distinct
+        /// a *terminal* read (`ExtractFinal` / `final_or_default`) resolves. Distinct
         /// from the decided *extent* (`frontier`): a live store decided up to `w`
         /// has `terminal == false`; the same store, once its writers finish, flips
         /// `terminal` to `true` while keeping `frontier = LessThanEq(w)`.
@@ -152,7 +152,7 @@ impl Tile {
             // `changes.len()` (which counts only the ticks that carried a write).
             //
             // The watermark reads straight off `LessThanEq(w)`, which counts
-            // trailing carries (positions past the last change) because terminality
+            // trailing carries (positions past the latest change) because terminality
             // rides the separate `terminal` flag, not a `True` frontier that would
             // discard `w`. An undecided (`False`) frontier has no decided positions.
             Tile::Store { frontier, .. } => match frontier {
