@@ -75,7 +75,7 @@ pub fn type_level(ty: &Type) -> Level {
         } => type_level(d).max(type_level(c)),
         Type::Tuple(ts) => ts.iter().map(type_level).max().unwrap_or(0),
         Type::Record(fs) => fs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
-        Type::Variant(tags) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
+        Type::Variant(tags, _) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Refinement(inner, _) => type_level(inner),
         // Combine both children like `Fun` (domain + codomain): a later
         // increment's per-call-site domain generalization depends on the
@@ -164,7 +164,7 @@ pub(crate) mod test_helpers {
     /// Helper: build a `Type::Variant({tag: payload, ...})` with named
     /// (`FieldKey::Name`) tags.
     pub(crate) fn variant<const N: usize>(tags: [(&str, Type); N]) -> Type {
-        Type::Variant(
+        Type::variant(
             tags.into_iter()
                 .map(|(k, v)| (FieldKey::Name(SmolStr::from(k)), v))
                 .collect(),

@@ -25,7 +25,6 @@ use crate::ccl::{Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Ty
 
 use super::type_level;
 use crate::ccl::FieldKey;
-use crate::ccl::ccl_utils::strip_refinements;
 
 // ---------------------------------------------------------------------------
 // Constraint solver
@@ -325,28 +324,6 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
     );
 }
 
-/// Whether `union_dom` is a gated **partition** of the single domain `target`:
-/// a `Variant` with contiguous `Index(0..n)` tags (n ≥ 1) whose every payload,
-/// with its gate refinement stripped, is structurally `target` (also stripped).
-/// This is the shape lambda_elim's value-`Case` fan-out gives *same-domain* arms
-/// — the signature bridge rule 2 realizes as the plain data function
-/// `target ⤇ W`. Requiring the stripped payloads to equal `target` keeps a
-/// genuine heterogeneous `++` flowing into a fresh-var domain out of this rule
-/// (its legs differ, or the target is an unresolved var, so the ordinary
-/// contravariant arm applies).
-fn is_index_partition_of(union_dom: &Type, target: &Type) -> bool {
-    let Type::Variant(tags) = union_dom else {
-        return false;
-    };
-    if tags.is_empty() {
-        return false;
-    }
-    let base = strip_refinements(target);
-    tags.iter()
-        .enumerate()
-        .all(|(i, (k, payload))| *k == FieldKey::Index(i) && strip_refinements(payload) == base)
-}
-
 /// Constrain `lhs‹sl› <: rhs‹sr›` — each side under its own context morphism,
 /// both mapping into the constraint's shared ambient frame.
 ///
@@ -429,39 +406,6 @@ fn constrain_go_impl(
         // `Txn` is a nullary leaf: reflexively equal to itself, incomparable
         // to every other type (the catch-all `Mismatch` below).
         (Type::Txn, Type::Txn) => Ok(()),
-
-        // Bridge rule 2 (gated-partition `⧺` <: plain data function): the
-        // `Variant`-domain union `⧺ᵢ ({D | π̂ᵢ} ⤇ W)` that lambda_elim's
-        // value-`Case` fan-out produces for **same-domain** arms *is* the plain
-        // data function `D ⤇ W` — an exhaustive + disjoint partition of `D`
-        // (exhaustiveness guaranteed by the stamping phase, not proven here; see
-        // lambda_elim's `build_value_case_fanout` and `design/type-inference.md`
-        // §4.6). Each leg `{D | π̂ᵢ} <: D` by refinement width (covariant, not the
-        // function-domain contravariance below), codomain covariant. Fires only
-        // when every leg refines the *same concrete* target domain `D`, so a
-        // genuine heterogeneous `++` flowing into a fresh-var domain still takes
-        // the ordinary contravariant arm below (its domain var resolves to the
-        // `Variant`, iterating every leg).
-        (
-            Type::Fun {
-                kind: FunKind::Data,
-                domain: union_dom,
-                codomain: c0,
-                ..
-            },
-            Type::Fun {
-                domain: d1,
-                codomain: c1,
-                ..
-            },
-        ) if is_index_partition_of(union_dom, d1) => {
-            if let Type::Variant(tags) = union_dom.as_ref() {
-                for (_, payload) in tags {
-                    constrain_go(payload, d1, sl, sr, cache)?;
-                }
-            }
-            constrain_go(c0, c1, sl, sr, cache)
-        }
 
         // Function: contravariant on domain, covariant on codomain. The
         // codomain edge *derives* the binder correspondence — aligning the two
@@ -572,12 +516,32 @@ fn constrain_go_impl(
             Ok(())
         }
 
-        // Variant: width-subtyping is the dual. lhs's tags must all appear
-        // in rhs (with a payload subtype check). Payload depth is covariant.
-        (Type::Variant(a), Type::Variant(b)) => {
+        // Variant: width-subtyping is the dual of records — lhs's tags must all
+        // appear in rhs, each with a payload subtype check. Payload depth is
+        // covariant.
+        //
+        // The loop does **two** jobs, and they are separable only by rhs's
+        // [`Openness`]. Recursing into a shared tag is what carries the payload
+        // *into* rhs's slot — how a `match` arm's binder learns its type from the
+        // scrutinee. Rejecting an lhs tag that rhs lacks is the exhaustiveness
+        // check. An **open** rhs keeps the first and drops the second: it commits
+        // to the arms it lists and says nothing about the rest, which is what a
+        // `case _:` needs (the default arm handles the tags no arm names, so the
+        // scrutinee must stay free to carry them).
+        //
+        // Skipping — rather than returning early — is the whole point: `Ok(())` on
+        // a missing tag would abandon every *shared* tag ordered after it, so the
+        // payloads that do need constraining would be lost by tag order.
+        (Type::Variant(a, lhs_openness), Type::Variant(b, openness)) => {
+            debug_assert!(
+                !lhs_openness.permits_extra_tags(),
+                "an open arm set reached the left of a subtyping edge: openness is a \
+                 property of a demand, so only the right-hand side may be open"
+            );
             for (k, t0) in a {
                 match b.iter().find(|(bk, _)| bk == k) {
                     Some((_, t1)) => constrain_go(t0, t1, sl, sr, cache)?,
+                    None if openness.permits_extra_tags() => continue,
                     None => {
                         return Err(ConstrainError::ExtraTag {
                             tag: k.clone(),
@@ -816,7 +780,7 @@ fn constrain_go_impl(
             Type::ChanDom(..),
             Type::UIntRange(_)
             | Type::DataSource(_)
-            | Type::Variant(_)
+            | Type::Variant(..)
             | Type::Refinement(..)
             | Type::ChanDom(..)
             | Type::Hole,
@@ -824,7 +788,7 @@ fn constrain_go_impl(
         | (
             Type::UIntRange(_)
             | Type::DataSource(_)
-            | Type::Variant(_)
+            | Type::Variant(..)
             | Type::Refinement(..)
             | Type::Hole,
             Type::ChanDom(..),
@@ -972,11 +936,12 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 .map(|(n, t)| (n.clone(), extrude(t, pol, target_level, cache)))
                 .collect(),
         ),
-        Type::Variant(tags) => Type::Variant(
+        Type::Variant(tags, openness) => Type::Variant(
             tags.iter()
                 // Variant payloads are covariant — same polarity, no flip.
                 .map(|(k, t)| (k.clone(), extrude(t, pol, target_level, cache)))
                 .collect(),
+            *openness,
         ),
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(extrude(inner, pol, target_level, cache)),

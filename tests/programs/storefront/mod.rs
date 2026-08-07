@@ -76,16 +76,17 @@
 //! - Version dispatch across a branch point — no isolating program yet
 //!   (deferred with the still-open versioning surface).
 //!
-//! This pins the variant-tag lex failure on both files — the `` ` `` prefix on
-//! `` `some ``/`` `none `` (`docs/chl-spec.md`, "6.5 Variants") is not lexed,
-//! and it precedes the `match`-block indentation
-//! failure behind it.  When the tag lexes, the test goes red and the next
-//! blocker gets pinned.
+//! This pins the `match`-block indentation failure on both files.  The variant
+//! tags lex and parse now (`docs/chl-spec.md`, "3.15 Variant constructors"), so
+//! the first blocker is the one that was behind them: both handlers put a
+//! `match` inside a multi-line `if`/`else` expression, and the layout rules
+//! (§1.4) do not derive `INDENT`/`DEDENT` for its arms there — the lexer reports
+//! inconsistent indentation.  Behind it: everything listed above.
 
 use super::common::expect_compile_error;
 
 #[test]
 fn storefront_currently_blocked_at_lexing() {
-    expect_compile_error(include_str!("v0.cambra"), "invalid token");
-    expect_compile_error(include_str!("v1.cambra"), "invalid token");
+    expect_compile_error(include_str!("v0.cambra"), "inconsistent indentation");
+    expect_compile_error(include_str!("v1.cambra"), "inconsistent indentation");
 }

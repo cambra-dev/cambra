@@ -2190,7 +2190,7 @@ fn build_letrec(
                     let ty = tap.ty.clone();
                     (tap, ty)
                 } else {
-                    let dom = Type::Variant(
+                    let dom = Type::variant(
                         taps.iter()
                             .enumerate()
                             .map(|(i, tap)| {
@@ -2202,7 +2202,7 @@ fn build_letrec(
                             .collect(),
                     );
                     let ty = Type::fun(dom, view_rec_ty.clone());
-                    let mut union = Expr::collection_union(taps);
+                    let mut union = Expr::copair(taps);
                     union.ty = ty.clone();
                     (union, ty)
                 }

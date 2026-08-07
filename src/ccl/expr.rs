@@ -495,12 +495,12 @@ pub enum TypedExprNode {
     /// the domain union is never deduplicated, the codomain union is.
     ///
     /// Lowered from the CHL `++` operator.  The parser produces
-    /// pairwise nesting; [`TypedExpr::collection_union`] flattens at
-    /// construction time so every `CollectionUnion` node in the tree
+    /// pairwise nesting; [`TypedExpr::copair`] flattens at
+    /// construction time so every `Copair` node in the tree
     /// satisfies the invariant **"no operand is itself a
-    /// `CollectionUnion`"**.  Inference, lambda elimination, and
+    /// `Copair`"**.  Inference, lambda elimination, and
     /// operator conversion all rely on this — they never need to look
-    /// through nested `CollectionUnion` AST nodes.  (Type-level
+    /// through nested `Copair` AST nodes.  (Type-level
     /// nesting via `Var` references to let-bound unions is a separate
     /// concern, preserved by design: the runtime `UnionOperator` has
     /// one input per operand, so a `Var(y)` whose type is itself
@@ -513,11 +513,36 @@ pub enum TypedExprNode {
     /// position), as a program output, etc.  Inside a lambda body
     /// where the operands reference the surrounding parameter,
     /// [`crate::ccl::lambda_elim`] rewrites it to
-    /// `Apply(Tuple(ops), Builtin::CollectionUnion)` so the function
+    /// `Apply(Tuple(ops), Builtin::Copair)` so the function
     /// can be lifted out point-free.  After lambda elimination, both
     /// shapes (this node and the `Builtin` form) may appear and both
     /// compile to the same `UnionOperator`.
-    CollectionUnion(Vec<TypedExpr>),
+    Copair(Vec<TypedExpr>),
+
+    /// The **disjoint join** of collections that share one domain: `⊔ᵢ cᵢ`.
+    ///
+    /// A different operation from [`Self::Copair`], not a mode of it.
+    /// Copairing takes collections to one over their *coproduct* —
+    /// `(A ⤇ V) × (B ⤇ V) → (A + B) ⤇ V`, the universal property of the sum, always
+    /// defined because the tags keep the operands apart. What distinguishes the two
+    /// is the **result** domain, not whether the operand domains coincide: `x ++ x`
+    /// is a copairing onto `A + A`, which is not `A`. A disjoint join
+    /// takes collections that are *partial maps over the same* domain to one over
+    /// that domain — `(D ⇀ V) × (D ⇀ V) → (D ⇀ V)` — and is defined **only when
+    /// their domains are disjoint** (the join in the partial-function order, which
+    /// exists iff the operands are compatible; separation logic's `*` on heaps is
+    /// the same operation).
+    ///
+    /// So the two differ in signature, in result domain, and in definedness. The
+    /// disjointness precondition is the whole content of this one, and is checked at
+    /// the boundary that relies on it (`flat_merge`).
+    ///
+    /// Born **post-inference**, by the `Case` fan-outs in
+    /// [`crate::ccl::lambda_elim`]: the arms of one `Case` restrict the *same* fed
+    /// domain — by a first-match guard, or by tag — so their results must land back
+    /// on it rather than on a coproduct. A writer decision, for instance, has to
+    /// co-iterate with the sibling `commit` field of its own record.
+    DisjointJoin(Vec<TypedExpr>),
 
     /// A plan expression, followed by another statement
     ExprStmt {
@@ -603,7 +628,8 @@ impl TypedExprNode {
             TypedExprNode::Record(_) => "Record",
             TypedExprNode::Source(_) => "Source",
             TypedExprNode::Compose(_) => "Compose",
-            TypedExprNode::CollectionUnion { .. } => "CollectionUnion",
+            TypedExprNode::Copair(_) => "Copair",
+            TypedExprNode::DisjointJoin(_) => "DisjointJoin",
             TypedExprNode::ExprStmt { .. } => "ExprStmt",
             TypedExprNode::Feed { .. } => "Feed",
             TypedExprNode::Define { .. } => "Define",
@@ -1111,10 +1137,24 @@ impl TypedExpr {
         Self::new(TypedExprNode::Compose(exprs))
     }
 
-    /// Construct an n-ary [`TypedExprNode::CollectionUnion`] expression.
+    /// Construct an n-ary [`TypedExprNode::DisjointJoin`] expression.
+    ///
+    /// Unlike [`Self::copair`] this does **not** splice nested joins: a
+    /// join of joins is not automatically one flat join, because flattening would
+    /// silently merge two separately-established disjointness claims into one
+    /// unchecked claim over the whole set.
+    pub fn disjoint_join(operands: Vec<TypedExpr>) -> Self {
+        assert!(
+            !operands.is_empty(),
+            "DisjointJoin requires at least one operand"
+        );
+        Self::new(TypedExprNode::DisjointJoin(operands))
+    }
+
+    /// Construct an n-ary [`TypedExprNode::Copair`] expression.
     ///
     /// `operands` must contain at least two collections.  Any operand
-    /// that is itself a [`TypedExprNode::CollectionUnion`] is spliced
+    /// that is itself a [`TypedExprNode::Copair`] is spliced
     /// in-place — this is the **construction-time flattening**
     /// that makes `(a ++ b) ++ c` and `a ++ (b ++ c)` and `a ++ b ++ c`
     /// all produce the same flat 3-ary node, which inference and every
@@ -1127,19 +1167,19 @@ impl TypedExpr {
     /// invariant (lambda elimination doesn't introduce nesting; it
     /// either preserves a top-level node or rewrites the whole thing
     /// to the point-free `Apply(Tuple, Builtin)` form).
-    pub fn collection_union(operands: Vec<Self>) -> Self {
+    pub fn copair(operands: Vec<Self>) -> Self {
         let flat: Vec<Self> = operands
             .into_iter()
             .flat_map(|op| match op.node {
-                TypedExprNode::CollectionUnion(inner) => inner,
+                TypedExprNode::Copair(inner) => inner,
                 _ => vec![op],
             })
             .collect();
         debug_assert!(
             flat.len() >= 2,
-            "CollectionUnion requires at least two operands after flattening",
+            "Copair requires at least two operands after flattening",
         );
-        Self::new(TypedExprNode::CollectionUnion(flat))
+        Self::new(TypedExprNode::Copair(flat))
     }
 
     /// Construct a binary operation expression.
@@ -1276,7 +1316,12 @@ impl TypedExpr {
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
-            | TypedExprNode::CollectionUnion(elts) => elts.iter().for_each(f),
+            | TypedExprNode::Copair(elts)
+            | TypedExprNode::DisjointJoin(elts) => {
+                for e in elts {
+                    f(e);
+                }
+            }
             TypedExprNode::Case {
                 scrutinee,
                 branches,
@@ -1448,7 +1493,12 @@ impl TypedExpr {
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
-            | TypedExprNode::CollectionUnion(elts) => elts.iter_mut().for_each(f),
+            | TypedExprNode::Copair(elts)
+            | TypedExprNode::DisjointJoin(elts) => {
+                for e in elts {
+                    f(e);
+                }
+            }
             TypedExprNode::Case {
                 scrutinee,
                 branches,
@@ -1547,7 +1597,8 @@ impl TypedExpr {
             | TypedExprNode::Tuple(_)
             | TypedExprNode::Record(_)
             | TypedExprNode::Compose(_)
-            | TypedExprNode::CollectionUnion(_)
+            | TypedExprNode::Copair(_)
+            | TypedExprNode::DisjointJoin(_)
             | TypedExprNode::ExprStmt { .. }
             | TypedExprNode::Begin { .. }
             | TypedExprNode::Feed { .. }
@@ -1593,7 +1644,8 @@ impl TypedExpr {
             | TypedExprNode::Tuple(_)
             | TypedExprNode::Record(_)
             | TypedExprNode::Compose(_)
-            | TypedExprNode::CollectionUnion(_)
+            | TypedExprNode::Copair(_)
+            | TypedExprNode::DisjointJoin(_)
             | TypedExprNode::ExprStmt { .. }
             | TypedExprNode::Begin { .. }
             | TypedExprNode::Feed { .. }
@@ -1860,33 +1912,33 @@ mod tests {
         TypedExpr::var(name)
     }
 
-    /// `CollectionUnion([a, b])` with no nested operands is preserved as-is.
+    /// `Copair([a, b])` with no nested operands is preserved as-is.
     #[test]
-    fn collection_union_flat_input_is_unchanged() {
-        let result = TypedExpr::collection_union(vec![leaf("a"), leaf("b")]);
-        let TypedExprNode::CollectionUnion(ops) = result.node else {
-            panic!("expected CollectionUnion node");
+    fn copair_flat_input_is_unchanged() {
+        let result = TypedExpr::copair(vec![leaf("a"), leaf("b")]);
+        let TypedExprNode::Copair(ops) = result.node else {
+            panic!("expected Copair node");
         };
         assert_eq!(ops.len(), 2);
         assert!(
             !ops.iter()
-                .any(|e| matches!(&e.node, TypedExprNode::CollectionUnion(_))),
+                .any(|e| matches!(&e.node, TypedExprNode::Copair(_))),
             "operands must be flat"
         );
     }
 
     /// `((a ++ b) ++ c)` (left-nested) flattens to a flat 3-ary node.
     #[test]
-    fn collection_union_flattens_left_nested() {
-        let ab = TypedExpr::collection_union(vec![leaf("a"), leaf("b")]);
-        let abc = TypedExpr::collection_union(vec![ab, leaf("c")]);
-        let TypedExprNode::CollectionUnion(ops) = abc.node else {
-            panic!("expected CollectionUnion node");
+    fn copair_flattens_left_nested() {
+        let ab = TypedExpr::copair(vec![leaf("a"), leaf("b")]);
+        let abc = TypedExpr::copair(vec![ab, leaf("c")]);
+        let TypedExprNode::Copair(ops) = abc.node else {
+            panic!("expected Copair node");
         };
         assert_eq!(ops.len(), 3);
         assert!(
             !ops.iter()
-                .any(|e| matches!(&e.node, TypedExprNode::CollectionUnion(_))),
+                .any(|e| matches!(&e.node, TypedExprNode::Copair(_))),
             "operands must be flat"
         );
         let names: Vec<&str> = ops
@@ -1901,11 +1953,11 @@ mod tests {
 
     /// `(a ++ (b ++ c))` (right-nested) flattens to a flat 3-ary node.
     #[test]
-    fn collection_union_flattens_right_nested() {
-        let bc = TypedExpr::collection_union(vec![leaf("b"), leaf("c")]);
-        let abc = TypedExpr::collection_union(vec![leaf("a"), bc]);
-        let TypedExprNode::CollectionUnion(ops) = abc.node else {
-            panic!("expected CollectionUnion node");
+    fn copair_flattens_right_nested() {
+        let bc = TypedExpr::copair(vec![leaf("b"), leaf("c")]);
+        let abc = TypedExpr::copair(vec![leaf("a"), bc]);
+        let TypedExprNode::Copair(ops) = abc.node else {
+            panic!("expected Copair node");
         };
         assert_eq!(ops.len(), 3);
         let names: Vec<&str> = ops
@@ -1920,17 +1972,17 @@ mod tests {
 
     /// `(((a ++ b) ++ c) ++ d)` (two levels of left nesting) flattens to 4.
     #[test]
-    fn collection_union_flattens_double_nested() {
-        let ab = TypedExpr::collection_union(vec![leaf("a"), leaf("b")]);
-        let abc = TypedExpr::collection_union(vec![ab, leaf("c")]);
-        let abcd = TypedExpr::collection_union(vec![abc, leaf("d")]);
-        let TypedExprNode::CollectionUnion(ops) = abcd.node else {
-            panic!("expected CollectionUnion node");
+    fn copair_flattens_double_nested() {
+        let ab = TypedExpr::copair(vec![leaf("a"), leaf("b")]);
+        let abc = TypedExpr::copair(vec![ab, leaf("c")]);
+        let abcd = TypedExpr::copair(vec![abc, leaf("d")]);
+        let TypedExprNode::Copair(ops) = abcd.node else {
+            panic!("expected Copair node");
         };
         assert_eq!(ops.len(), 4);
         assert!(
             !ops.iter()
-                .any(|e| matches!(&e.node, TypedExprNode::CollectionUnion(_))),
+                .any(|e| matches!(&e.node, TypedExprNode::Copair(_))),
         );
     }
 

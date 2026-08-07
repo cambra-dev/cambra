@@ -433,10 +433,10 @@ impl OpConversionContext {
             // discriminates by tag position, so the tags carry no
             // additional dispatch information here; payloads lower to an
             // `Extent::Union`. This covers both the anonymous positional
-            // sums that `++`/CollectionUnion produces (all `Index` tags)
+            // sums that `++`/`Copair` produces (all `Index` tags)
             // and named source-level variants. The tags carry through: they are
             // the arm identities every union column and predicate is keyed by.
-            Type::Variant(tags) => {
+            Type::Variant(tags, _) => {
                 let mut arms = Vec::with_capacity(tags.len());
                 for (k, t) in tags {
                     arms.push((k.clone(), self.extent_of(t)?));
@@ -705,37 +705,50 @@ fn convert_impl_inner(
         // and preserved through lambda elimination (top-level path).
         // Compiles directly to a `UnionOperator` over the N operand
         // collections.
-        TypedExprNode::CollectionUnion(operands) => {
+        TypedExprNode::Copair(operands) => {
             if operands.len() < 2 {
                 return Err(ConversionError::Unsupported(format!(
-                    "collection_union expects at least 2 inputs, got {}",
+                    "copair expects at least 2 inputs, got {}",
                     operands.len()
                 )));
             }
-            union_operand_ops(operands, input, ctx)
+            union_operand_ops(operands, UnionShape::Copair, input, ctx)
         }
 
-        // `Apply(Tuple(ops), Builtin::CollectionUnion)` — the point-free
+        // A **disjoint join**: the operands are partial collections over one domain,
+        // so the result stays on that domain (`UnionOperator::new_flat`) rather than
+        // on a coproduct of their domains. The node says which operation this is, so
+        // nothing has to be re-derived here — see [`UnionShape`].
+        TypedExprNode::DisjointJoin(operands) => {
+            if operands.is_empty() {
+                return Err(ConversionError::Unsupported(
+                    "disjoint_join expects at least one operand".to_string(),
+                ));
+            }
+            union_operand_ops(operands, UnionShape::DisjointJoin, input, ctx)
+        }
+
+        // `Apply(Tuple(ops), Builtin::Copair)` — the point-free
         // function-form, produced by lambda elimination when a
-        // `CollectionUnion` appears inside a lambda body whose operands
+        // `Copair` appears inside a lambda body whose operands
         // reference the lambda parameter.  Same `UnionOperator` output as
         // the top-level node above.
         TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::CollectionUnion) =>
+            if as_builtin(function) == Some(Builtin::Copair) =>
         {
             let TypedExprNode::Tuple(elts) = &argument.node else {
                 return Err(ConversionError::Unsupported(format!(
-                    "collection_union expects a Tuple argument, got {:?}",
+                    "copair expects a Tuple argument, got {:?}",
                     argument.node
                 )));
             };
             if elts.len() < 2 {
                 return Err(ConversionError::Unsupported(format!(
-                    "collection_union expects at least 2 inputs, got {}",
+                    "copair expects at least 2 inputs, got {}",
                     elts.len()
                 )));
             }
-            union_operand_ops(elts, input, ctx)
+            union_operand_ops(elts, UnionShape::Copair, input, ctx)
         }
 
         // `as_of((trigger, source))` — the live cross-endpoint read. For each
@@ -898,29 +911,33 @@ fn convert_impl_inner(
         }
 
         // `FinalOrDefault` is the stream-to-scalar primitive that extracts the
-        // codomain value at the final position of an iteration stream, falling
-        // back to a default scalar when the stream is empty.  Argument is a
-        // 2-element `Tuple([stream, default])`; compiles directly to the
-        // `ExtractFinal` tile operator (which takes both ops).
+        // codomain value at the final position of an iteration stream. Compiles
+        // directly to the `ExtractFinal` tile operator.
+        //
+        // **Two argument shapes.** A 2-element `Tuple([stream, default])` falls back
+        // to `default` when the stream is empty — the guard-`Case` C-form, whose
+        // trailing `true` arm supplies it, and the mutation loop whose pre-loop
+        // accumulator does. A **bare stream** declares the source *total*: an
+        // exhaustive tag partition always covers exactly one position, so there is
+        // no empty case and no default value has to be invented.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::FinalOrDefault) =>
         {
             expect_no_input(input, "final_or_default")?;
-            let TypedExprNode::Tuple(elts) = &argument.node else {
-                return Err(ConversionError::Unsupported(format!(
-                    "FinalOrDefault expects a 2-element Tuple argument, got {:?}",
-                    argument.node
-                )));
-            };
-            if elts.len() != 2 {
-                return Err(ConversionError::Unsupported(format!(
-                    "FinalOrDefault expects a 2-element Tuple argument, got {} elements",
+            match &argument.node {
+                TypedExprNode::Tuple(elts) if elts.len() == 2 => {
+                    let stream_op = convert_impl(&elts[0], None, ctx)?;
+                    let default_op = convert_impl(&elts[1], None, ctx)?;
+                    Ok(Box::new(ExtractFinal::new(stream_op, default_op)))
+                }
+                TypedExprNode::Tuple(elts) => Err(ConversionError::Unsupported(format!(
+                    "FinalOrDefault with a Tuple argument expects 2 elements, got {}",
                     elts.len()
-                )));
+                ))),
+                _ => Ok(Box::new(ExtractFinal::without_default(convert_impl(
+                    argument, None, ctx,
+                )?))),
             }
-            let stream_op = convert_impl(&elts[0], None, ctx)?;
-            let default_op = convert_impl(&elts[1], None, ctx)?;
-            Ok(Box::new(ExtractFinal::new(stream_op, default_op)))
         }
 
         // `GetPrevSeq` is a letrec guard accessor, never compiled directly:
@@ -1050,7 +1067,21 @@ fn convert_impl_inner(
                             input.tiling()
                         )));
                     }
-                    Ok(Box::new(VariantProject::new(input, tag.clone())))
+                    // The projected arm's extent comes from this node's codomain:
+                    // the scrutinee may be a width-subtype that never carries the
+                    // tag, in which case its extent has no arm to read it from.
+                    let payload_ty = expr.ty.codomain().ok_or_else(|| {
+                        ConversionError::TypeError(format!(
+                            "variant_project({tag}) node must have a function type, got {}",
+                            expr.ty
+                        ))
+                    })?;
+                    let payload_extent = ctx.extent_of(&payload_ty)?;
+                    Ok(Box::new(VariantProject::new(
+                        input,
+                        tag.clone(),
+                        payload_extent,
+                    )))
                 }
                 // `variant_wrap(c)` — the point-free constructor. Consumes the fed
                 // payload stream and injects it at tag `c`. The union extents come
@@ -1068,7 +1099,7 @@ fn convert_impl_inner(
                     while let Type::Refinement(inner, _) = union_ty {
                         union_ty = inner;
                     }
-                    let Type::Variant(variants) = union_ty else {
+                    let Type::Variant(variants, _) = union_ty else {
                         return Err(ConversionError::TypeError(format!(
                             "variant_wrap({tag}) codomain must be a Variant, got {codomain}"
                         )));
@@ -1100,7 +1131,18 @@ fn convert_impl_inner(
 
         // List literal: materialise as SealedFunction(UIntRange(n), T).
         TypedExprNode::List(elts) => {
-            let fn_const = compile_list_fn(elts)?;
+            // The element extent comes from the list's own type — see
+            // `compile_list_fn` for why a value cannot supply it.
+            let elt_extent = match ctx.extent_of(&expr.ty)? {
+                Extent::Function { codomain, .. } => *codomain,
+                other => {
+                    return Err(ConversionError::TypeError(format!(
+                        "a list literal's type is a function from its index set to its \
+                         element type, got extent {other}"
+                    )));
+                }
+            };
+            let fn_const = compile_list_fn(elts, elt_extent)?;
             let index_stream = input.ok_or_else(|| {
                 ConversionError::Unsupported(
                     "list literal reached op-conversion without an input — planning \
@@ -1157,7 +1199,7 @@ fn convert_impl_inner(
             while let Type::Refinement(inner, _) = ty {
                 ty = inner;
             }
-            let Type::Variant(variants) = ty else {
+            let Type::Variant(variants, _) = ty else {
                 return Err(ConversionError::TypeError(format!(
                     "VariantCtor `{tag}` has non-variant type {}; inference should have \
                      width-subtyped it to a Type::Variant before op-conversion",
@@ -1236,15 +1278,28 @@ fn expect_no_input(
 }
 
 /// Compile a list literal to a [`Constant`] holding a `Value::Function` binding table.
-fn compile_list_fn(elts: &[Expr]) -> Result<Box<dyn TileOperator>, ConversionError> {
+///
+/// `elt_extent` is the element extent taken from the list's **declared type**, not
+/// re-derived from the element values. Two reasons it has to be:
+///
+/// - A value does not determine its own extent for a sum. [`Extent::for_value`]
+///   returns a `Value::Union`'s *payload* extent, dropping the tag, because a single
+///   value knows only the arm it occupies and not the arm set it belongs to. A list of
+///   variants needs the whole `Extent::Union` — the merged tag set — which only the
+///   type has.
+/// - The declared element type already *is* the join inference computed over the
+///   elements, so it covers a mixed-tag list correctly by construction. Deriving from
+///   the values instead means picking one element's extent and hoping it speaks for
+///   the rest.
+fn compile_list_fn(
+    elts: &[Expr],
+    elt_extent: Extent,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     let mut bindings = Vec::with_capacity(elts.len());
-    let mut elt_extent = Extent::Base(BaseType::Unit);
     for (i, elt) in elts.iter().enumerate() {
-        let value = expr_to_value(elt)?;
-        elt_extent = Extent::for_value(&value);
         bindings.push(FuncBinding {
             input: Value::UInt(i),
-            output: value,
+            output: expr_to_value(elt)?,
         });
     }
     let fn_value = Value::Function(bindings);
@@ -1257,7 +1312,9 @@ fn compile_list_fn(elts: &[Expr]) -> Result<Box<dyn TileOperator>, ConversionErr
 
 /// Evaluate a constant CCL expression to a [`Value`].
 ///
-/// Only [`TypedExprNode::Lit`] and constant [`TypedExprNode::Tuple`] are supported.
+/// The constant *value* formers, each recursing on its children so a constant
+/// nests: a literal, a tuple, a record, and a variant constructor. Anything else is
+/// a computation, which a list literal's element position cannot express.
 fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
     match &expr.node {
         TypedExprNode::Lit(lit) => Ok(match lit {
@@ -1281,8 +1338,19 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
                 .collect();
             Ok(Value::Record(map?))
         }
+        // A variant value is constant exactly when its payload is, so this recurses
+        // like the product formers above — `` `some(`none) `` is as constant as `1`.
+        // Without it, a list literal of variants (``[`a(1), `b(2)]``) is rejected even
+        // though `ColumnValue::from_values` builds a union column from a `Union`
+        // extent perfectly well.
+        TypedExprNode::VariantCtor { tag, payload } => Ok(Value::Union {
+            tag: FieldKey::Name(tag.as_str().into()),
+            inner: Box::new(expr_to_value(payload)?),
+        }),
         _ => Err(ConversionError::Unsupported(format!(
-            "only literals and constant tuples are supported in list elements, got: {expr:?}"
+            "a list element must be a constant — a literal, tuple, record or variant \
+             constructor — but this one is a computation: {}",
+            symbolic(expr)
         ))),
     }
 }
@@ -1335,7 +1403,7 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
         return Vec::new();
     };
     // Peel the `commit` payload record out of the decision variant.
-    let Type::Variant(tags) = codom else {
+    let Type::Variant(tags, _) = codom else {
         return Vec::new();
     };
     let Some((_, Type::Record(fields))) = tags
@@ -1891,18 +1959,22 @@ fn apply_binop(
     )))
 }
 
-/// Build the `UnionOperator` for a `CollectionUnion`. With no input (the top-level
-/// / comprehension union, or a Σ / C-form dispatch), each operand is a
-/// self-contained collection and the union is **tagged** (`UnionOperator::new`) —
-/// distinct-extent arms keep their `Extent::Union` domain, which `final_or_default`
-/// dispatches over. With a **fed input** — a value-`Case` fan-out inside a writer
-/// body (`⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)`) — fan the input to every operand (each
-/// filters its own branch of the same element stream) and **flat-merge**
-/// (`UnionOperator::new_flat`): the arms share one domain extent and disjoint
-/// positions, so the union stays on that extent and co-iterates with the sibling
-/// `commit` field of the decision record.
+/// Which of the two collection-combining operations a union node denotes.
+///
+/// Read off the node rather than inferred: `Copair` is a **copairing** (operands
+/// over distinct index sets, result on their coproduct) and `DisjointJoin` is a
+/// **join of partial maps over one domain** (result on that domain, defined only
+/// where the operands are disjoint). Input-presence does not distinguish them — it
+/// decides only *how* the operands are wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnionShape {
+    Copair,
+    DisjointJoin,
+}
+
 fn union_operand_ops(
     operands: &[Expr],
+    shape: UnionShape,
     input: Option<Box<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
@@ -1912,9 +1984,31 @@ fn union_operand_ops(
                 .iter()
                 .map(|e| convert_impl(e, None, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Box::new(UnionOperator::new(ops)))
+            Ok(match shape {
+                UnionShape::Copair => Box::new(UnionOperator::new(ops)) as Box<dyn TileOperator>,
+                UnionShape::DisjointJoin => Box::new(UnionOperator::new_flat(ops)),
+            })
         }
+        // A **fed** union: fan the input to every operand (each restricts its own
+        // branch of the same element stream) and flat-merge, so the result stays on
+        // that one extent and co-iterates with a sibling field — the writer-body
+        // fan-out `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)`, and the `match` fan-out.
+        //
+        // That is a **disjoint join**, and only a disjoint join: a flat merge
+        // reassembles one domain, which is not what a copairing denotes. A fed
+        // `Copair` would have to keep its arms tagged apart, and nothing builds one
+        // today — no program reaches here (`Builtin::Copair` requires a `++` inside a
+        // lambda over the parameter, which fails upstream at the post-elim
+        // typecheck). Rather than compile it as the operation it is not, say so.
         Some(inp) => {
+            if shape == UnionShape::Copair {
+                return Err(ConversionError::Unsupported(
+                    "a fed copairing: its arms are over distinct index sets, so they \
+                     cannot flat-merge back onto one domain, and no tagged fed form \
+                     is built yet"
+                        .to_string(),
+                ));
+            }
             // `Memo` the shared fed input so the fan's branches (one per arm) stay
             // consistent under a re-entrant / per-proposal driver.
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(inp))));
@@ -2212,7 +2306,7 @@ mod variant_ctor_tests {
     /// A `[commit(Int), abort(Unit)]` variant type — the shape the transaction
     /// decision will carry.
     fn commit_abort_ty(payload: Type) -> Type {
-        Type::Variant(vec![
+        Type::variant(vec![
             (FieldKey::Name("commit".into()), payload),
             (FieldKey::Name("abort".into()), Type::Base(CclBase::Unit)),
         ])
@@ -2472,7 +2566,7 @@ mod variant_ctor_tests {
     #[test]
     fn variant_elim_one_arm() {
         let int_ty = Type::Base(CclBase::Int);
-        let commit_only_ty = Type::Variant(vec![(FieldKey::Name("commit".into()), int_ty.clone())]);
+        let commit_only_ty = Type::variant(vec![(FieldKey::Name("commit".into()), int_ty.clone())]);
 
         let w_plus_1 = typed(
             TypedExprNode::BinOp {
@@ -2586,7 +2680,7 @@ mod variant_ctor_tests {
     #[test]
     fn variant_elim_outer_binder_zip() {
         let int_ty = Type::Base(CclBase::Int);
-        let decision_ty = Type::Variant(vec![(FieldKey::Name("commit".into()), int_ty.clone())]);
+        let decision_ty = Type::variant(vec![(FieldKey::Name("commit".into()), int_ty.clone())]);
         let rec_ty = Type::Record(vec![
             ("time".into(), int_ty.clone()),
             ("decision".into(), decision_ty.clone()),

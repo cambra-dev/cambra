@@ -515,17 +515,17 @@ fn test_source_list_comp_element_type() {
     );
 }
 
-/// `a ++ b` (CollectionUnion) infers its domain as
+/// `a ++ b` (`Copair`) infers its domain as
 /// `Type::Variant({_0: …, _1: …})` (the runtime genuinely
 /// discriminates by operand) and its codomain as the *join* of branch
 /// element types. For homogeneous unions the join collapses to the
 /// common element type so consumers like `Sum` can constrain it
 /// directly; heterogeneous unions surface `IncompatibleBounds` at
-/// coalesce time (see `test_collection_union_heterogeneous_rejected`).
+/// coalesce time (see `test_copair_heterogeneous_rejected`).
 /// Pretty-printing flattens the synthetic `_N` domain tags so the
 /// surface still reads as a bare union.
 #[test]
-fn test_collection_union_produces_variant_typed_domain() {
+fn test_copair_produces_variant_typed_domain() {
     let ty = infer_program_with_sources(
         "src1() ++ src2()",
         &[
@@ -542,7 +542,7 @@ fn test_collection_union_produces_variant_typed_domain() {
         panic!("expected Fun, got {ty}");
     };
     // Domain is a Variant with two anonymous positional (Index) tags.
-    if let Type::Variant(tags) = &**dom {
+    if let Type::Variant(tags, _) = &**dom {
         assert_eq!(tags.len(), 2, "expected 2-tag variant domain, got {ty}");
         assert!(
             tags.iter().all(|(k, _)| matches!(k, FieldKey::Index(_))),
@@ -559,14 +559,14 @@ fn test_collection_union_produces_variant_typed_domain() {
     );
 }
 
-/// Heterogeneous CollectionUnion (`Int ++ String`) leaves the codomain
+/// Heterogeneous `Copair` (`Int ++ String`) leaves the codomain
 /// join with two incompatible lower-bound atoms, which
 /// `coalesce_compact` rejects with `IncompatibleBounds`. Pinning this
 /// behavior makes the rule explicit: there is no trait machinery yet
 /// for "summable / joinable across distinct base types", so
 /// heterogeneous unions are not value-typeable.
 #[test]
-fn test_collection_union_heterogeneous_rejected() {
+fn test_copair_heterogeneous_rejected() {
     let errs = infer_program_with_sources_err(
         "src1() ++ src2()",
         &[
@@ -737,7 +737,7 @@ fn test_ternary(#[case] code: &str, #[case] expected: BaseType) {
 /// `IncompatibleBounds`. A `Case`'s type is the join of its arms (they flow
 /// one-way into one variable), so a collision surfaces at coalesce rather than
 /// eagerly at the arm relation — the same place a heterogeneous list literal or
-/// `CollectionUnion` reports it (see `test_collection_union_heterogeneous_rejected`).
+/// `Copair` reports it (see `test_copair_heterogeneous_rejected`).
 #[test]
 fn test_if_else_arm_type_mismatch() {
     let err = infer_program_err(

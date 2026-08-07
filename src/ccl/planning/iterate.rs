@@ -19,7 +19,7 @@ use super::*;
 /// "Iteration site" means any position where op-conversion would otherwise
 /// compile with `input=None` and the expression is function-typed —
 /// aggregate arguments, the stream side of `FinalOrDefault`, mutation-loop
-/// sources, value-position `Record` fields, `CollectionUnion` operands,
+/// sources, value-position `Record` fields, `Copair` operands,
 /// the program's top-level function-valued result, top-level let-bound
 /// function values, and a few other shapes enumerated by
 /// [`insert_iterate_recurse`].  At each site the pass dispatches via
@@ -51,7 +51,7 @@ use super::*;
 /// [`is_iteration_bearing`], which treats `Apply(_, Iterate)` at a head
 /// — and, on a refined site, the outer `restrict` filter
 /// `Apply(_, Apply(_, Restrict))` — plus the other iteration-
-/// internalising builtins (`MapDomain`, `Uncurry`, `CollectionUnion`,
+/// internalising builtins (`MapDomain`, `Uncurry`, `Copair`,
 /// `Converse`, the nested `PermuteDomain` / `FlattenDomain` shapes) as
 /// already providing iteration — avoiding the double-wrap that would
 /// otherwise feed those `input=None` arms an unwanted upstream stream
@@ -76,9 +76,9 @@ pub(crate) fn insert_iterate_markers(expr: &mut Expr) {
 ///
 /// - **Input-internalising** (`Sum`/`Max`/`FinalOrDefault`, `Converse`,
 ///   `MapDomain`, `Uncurry`, `FlattenDomain`, `PermuteDomain`,
-///   `CollectionUnion`, plus `Iterate` itself): these arms require
+///   `Copair`, plus `Iterate` itself): these arms require
 ///   `input=None` and compile their argument (or each operand, in
-///   `CollectionUnion`'s case) with `input=None`.  The argument is a
+///   `Copair`'s case) with `input=None`.  The argument is a
 ///   function-typed sub-expression that is iterated by the surrounding
 ///   tile operator, so it is an iteration site — its chain head must
 ///   be iteration-bearing (`Apply(_, Iterate)` in the default case; a
@@ -127,19 +127,24 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
 
     expr.walk_children_mut(insert_iterate_recurse);
     match &mut expr.node {
-        // `FinalOrDefault` takes `Tuple([stream, default])` — only `stream`
-        // is iterated; the `default` is a scalar consumed when the stream
-        // is empty.
+        // `FinalOrDefault`'s stream argument is the iteration site. Two argument
+        // shapes: `Tuple([stream, default])`, where only `stream` is iterated (the
+        // `default` is a scalar consumed when the stream is empty), and a **bare
+        // stream** for a source known total (an exhaustive tag partition), which is
+        // the whole argument.
         TypedExprNode::Apply { argument, function }
             if matches!(
                 &function.node,
                 TypedExprNode::Builtin(Builtin::FinalOrDefault)
             ) =>
         {
-            if let TypedExprNode::Tuple(elts) = &mut argument.node
-                && let Some(stream) = elts.first_mut()
-            {
-                wrap_with_iterate(stream);
+            match &mut argument.node {
+                TypedExprNode::Tuple(elts) => {
+                    if let Some(stream) = elts.first_mut() {
+                        wrap_with_iterate(stream);
+                    }
+                }
+                _ => wrap_with_iterate(argument),
             }
         }
         // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
@@ -158,14 +163,11 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
                 wrap_with_iterate(trigger);
             }
         }
-        // `CollectionUnion`'s function form: argument is `Tuple(ops...)`
+        // `Copair`'s function form: argument is `Tuple(ops...)`
         // and op-conversion compiles each operand with `input=None` — wrap
         // each.
         TypedExprNode::Apply { argument, function }
-            if matches!(
-                &function.node,
-                TypedExprNode::Builtin(Builtin::CollectionUnion)
-            ) =>
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::Copair)) =>
         {
             if let TypedExprNode::Tuple(elts) = &mut argument.node {
                 for elt in elts.iter_mut() {
@@ -173,9 +175,20 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
                 }
             }
         }
-        // `CollectionUnion`'s value form: each operand is compiled with
-        // `input=None`.
-        TypedExprNode::CollectionUnion(operands) => {
+        // The value forms of both collection merges: op-conversion compiles every
+        // operand with `input=None`, so each is its own iteration site.
+        //
+        // A disjoint join comes in two forms, and only this one is unfed. The fed
+        // form — the in-lambda `Case` fan-out — leads each arm with a **bare**
+        // restrictor builtin (`filter_values ≫ eᵢ`, ``variant_project(`c) ≫ eᵢ``),
+        // a morphism that op-conversion wires to the fanned-out input; the unfed
+        // form's arms are concrete collections. Wrapping a fed arm would hand
+        // `iterate` an input it rejects, so read the form off the arms.
+        TypedExprNode::Copair(operands) | TypedExprNode::DisjointJoin(operands)
+            if !operands
+                .iter()
+                .any(|o| matches!(head_of(o).node, TypedExprNode::Builtin(_))) =>
+        {
             for operand in operands.iter_mut() {
                 wrap_with_iterate(operand);
             }
@@ -438,6 +451,15 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     *expr = typed_compose(elts).with_ty(site_ty);
 }
 
+/// The morphism a `Compose` chain leads with, or the expression itself when it is
+/// not a chain — what decides whether a site is an iteration source.
+fn head_of(expr: &Expr) -> &Expr {
+    match &expr.node {
+        TypedExprNode::Compose(elts) if !elts.is_empty() => &elts[0],
+        _ => expr,
+    }
+}
+
 /// Returns `true` if `expr` (or the first element of `expr` if it's a
 /// `Compose`) already provides iteration — i.e. wrapping it with
 /// `iterate` would either be redundant or break op-conversion.
@@ -453,7 +475,7 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
 ///    unrefined `iterate`-led counterpart is.
 /// 2. Self-iterating builtins ([`Builtin::iterates_arg`]): the
 ///    iteration-internalising group — `MapDomain`, `Uncurry`,
-///    `Converse`, `CollectionUnion`, plus the nested `PermuteDomain` /
+///    `Converse`, `Copair`, plus the nested `PermuteDomain` /
 ///    `FlattenDomain` shapes.  (Sum / Max / FinalOrDefault are also in
 ///    `iterates_arg`, but they produce scalars; [`wrap_with_iterate`]'s
 ///    `expr.ty.domain()` check filters them out independently.)  Plus
@@ -465,14 +487,12 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
 ///    returns its bound op directly under `input=None`, and that bound
 ///    op was itself iterate-wrapped at its let-bind site.
 pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
-    let head = match &expr.node {
-        TypedExprNode::Compose(elts) if !elts.is_empty() => &elts[0],
-        _ => expr,
-    };
+    let head = head_of(expr);
     match &head.node {
-        TypedExprNode::CollectionUnion(_) | TypedExprNode::Tuple(_) | TypedExprNode::Record(_) => {
-            true
-        }
+        TypedExprNode::Copair(_)
+        | TypedExprNode::DisjointJoin(_)
+        | TypedExprNode::Tuple(_)
+        | TypedExprNode::Record(_) => true,
         TypedExprNode::Var(_) if matches!(&head.ty, Type::Fun { .. }) => true,
         TypedExprNode::Apply { function, .. } => match builtin_at_function_position(function) {
             // `Iterate` is the canonical head marker; `Restrict` heads a
@@ -1000,22 +1020,22 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_iterate_recurse_collection_union_wraps_operands() {
-        // The value-form `CollectionUnion(operands)` — op-conversion
+    fn test_insert_iterate_recurse_copair_wraps_operands() {
+        // The value-form `Copair(operands)` — op-conversion
         // compiles each operand with `input=None`, so each is an
         // iteration site.
         let int = int_ty();
-        let mut expr = Expr::new(TypedExprNode::CollectionUnion(vec![list_123(), list_123()]))
-            .with_ty(fun_ty(
-                Type::Variant(vec![
+        let mut expr =
+            Expr::new(TypedExprNode::Copair(vec![list_123(), list_123()])).with_ty(fun_ty(
+                Type::variant(vec![
                     (FieldKey::Index(0), Type::UIntRange(3)),
                     (FieldKey::Index(1), Type::UIntRange(3)),
                 ]),
                 int,
             ));
         insert_iterate_recurse(&mut expr);
-        let TypedExprNode::CollectionUnion(operands) = &expr.node else {
-            panic!("expected CollectionUnion, got: {}", symbolic(&expr));
+        let TypedExprNode::Copair(operands) = &expr.node else {
+            panic!("expected Copair, got: {}", symbolic(&expr));
         };
         for (i, operand) in operands.iter().enumerate() {
             assert!(
