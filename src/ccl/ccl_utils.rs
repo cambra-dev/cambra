@@ -298,7 +298,7 @@ pub fn is_trivially_true_predicate(expr: &Expr) -> bool {
 /// `D ⇒ D` with no refinement wrapper: the refinement would carry no
 /// information, and skipping it keeps program dumps and golden tests
 /// free of `{D | true ▷ const}` noise.  The refinement gets a freshly
-/// built predicate term — safe because witnesses match by structural
+/// built predicate term — safe because refinements match by structural
 /// predicate equality, while walkers key DAG dedup on the [`PredicateId`].
 ///
 /// Op-conversion compiles `Apply(p, Iterate)` to an `IterateExtent` tile
@@ -476,7 +476,7 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// `Fun(Refinement(_, _), _)` — a refinement on a function domain.  Inference
 /// no longer *requires* this (any `target` with `value_ty <: target` is a
 /// well-typed upcast), but it is the only shape lowering produces today and
-/// the one [`crate::ccl::lambda_elim`]'s groupby reconstruction reads a witness
+/// the one [`crate::ccl::lambda_elim`]'s groupby reconstruction reads a refinement
 /// off of, so this asserts the lowering contract: a non-conforming target is
 /// a construction-time bug, not a user error, so it panics rather than
 /// emitting a cast `lambda_elim` would mishandle.  See [`TypedExprNode::Cast`]
@@ -491,14 +491,14 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
     Expr::cast(value, target_ty)
 }
 
-/// Read the domain refinement off a cast target type — the refinement witness a
+/// Read the domain refinement off a cast target type — the refinement a
 /// [`make_cast`] target carries on its `Fun(Refinement(_, r), _)` shape.
 ///
 /// [`crate::ccl::lambda_elim`]'s cast-wrapped-lambda arm calls this on a
 /// [`TypedExprNode::Cast`]'s `target` to reattach the refinement to the
 /// reconstructed `groupby` lambda.  (Inference does not need it: it types the
 /// cast as the upcast `value_ty <: target` and lets the solver carry the
-/// witness.) The returned `Refinement` shares the predicate's `Rc<Expr>` with
+/// refinement.) The returned `Refinement` shares the predicate's `Rc<Expr>` with
 /// `target`.
 pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
     let Type::Fun { domain, .. } = target else {

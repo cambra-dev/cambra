@@ -1838,14 +1838,14 @@ fn collection_union_type(feeds: &[Expr]) -> Type {
                 match &cod {
                     None => cod = Some((**codomain).clone()),
                     // The channel's element type is the **join** of its
-                    // contributions, so a witness only survives if every one of them
+                    // contributions, so a refinement only survives if every one of them
                     // establishes it: `c << 1` and `c << 2` contribute
                     // `{Int | __elem == 1}` and `{Int | __elem == 2}` and the channel
                     // is a plain `Int`. This is the register law (`emit`'s `MutWrite`
                     // rule) for the append-kind history: a channel is not one value
                     // but the sequence its contributions produce.
                     Some(c) if c != &**codomain => {
-                        cod = Some(join_witnesses(c, codomain));
+                        cod = Some(join_refinements(c, codomain));
                     }
                     // Every `<<` contribution to one channel is constrained into
                     // the channel's shared `value` var at inference, so the
@@ -1880,16 +1880,16 @@ fn collection_union_type(feeds: &[Expr]) -> Type {
 }
 
 /// The join of two types that agree modulo refinements: their shared skeleton
-/// carrying only the witnesses **both** sides establish.
+/// carrying only the refinements **both** sides establish.
 ///
-/// Witnesses are compared structurally, as everywhere else (`Refinement`'s
+/// Refinements are compared structurally, as everywhere else (`Refinement`'s
 /// `PartialEq`), and the skeletons must already agree — the caller's
 /// `debug_assert` states that invariant.
-fn join_witnesses(a: &Type, b: &Type) -> Type {
+fn join_refinements(a: &Type, b: &Type) -> Type {
     let mut layers: Vec<Refinement> = Vec::new();
     let mut cur = a;
     while let Type::Refinement(inner, r) = cur {
-        if type_carries_witness(b, r) {
+        if type_carries_refinement(b, r) {
             layers.push(r.clone());
         }
         cur = inner;
@@ -1901,11 +1901,11 @@ fn join_witnesses(a: &Type, b: &Type) -> Type {
         .fold(cur.clone(), |acc, r| Type::Refinement(Box::new(acc), r))
 }
 
-/// Whether `ty`'s own refinement layers include `witness`.
-fn type_carries_witness(ty: &Type, witness: &Refinement) -> bool {
+/// Whether `ty`'s own refinement layers include `refinement`.
+fn type_carries_refinement(ty: &Type, refinement: &Refinement) -> bool {
     let mut cur = ty;
     while let Type::Refinement(inner, r) = cur {
-        if r == witness {
+        if r == refinement {
             return true;
         }
         cur = inner;

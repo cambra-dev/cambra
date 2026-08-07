@@ -10,16 +10,16 @@
 //!
 //! # Refinements
 //!
-//! Refinements ride the lattice natively as **witness sets**. A
+//! Refinements ride the lattice natively, as a **set** per position. A
 //! refined type `{T | S}` carries a set `S` of [`Refinement`](crate::ccl::Refinement)
-//! witnesses (matched by structural predicate equality — see
+//! refinements (matched by structural predicate equality — see
 //! [`Refinement`](crate::ccl::Refinement)'s
 //! `PartialEq` — but never by predicate implication). Subtyping is
-//! superset-on-witnesses, structurally identical to record width-subtyping
-//! (`{T | p, q} <: {T | p}`, and `{T | p} <: T`); a witness set therefore
+//! superset-on-refinements, structurally identical to record width-subtyping
+//! (`{T | p, q} <: {T | p}`, and `{T | p} <: T`); a refinement set therefore
 //! merges with the same polarity rule as `rec` (positive ⇒ intersect,
 //! negative ⇒ union) and is preserved verbatim through simplification
-//! (witnesses are positional, never folded into a variable's identity, so
+//! (refinements are positional, never folded into a variable's identity, so
 //! co-occurrence merging cannot move or drop them). A refinement is
 //! *required*, so `constrain_subtype` is strict in the other
 //! direction: an unrefined value does **not** flow into a refined position
@@ -28,7 +28,7 @@
 //! `Restrict`/`Filter` at the iteration boundary (the `Iterate`/`Restrict`
 //! arms of [`crate::interpreter::operator_conversion`], where `extent_of`
 //! strips the domain refinement into a `Restrict`); it is not modelled as
-//! subsumption here. The predicate `Expr` of each witness lives in
+//! subsumption here. The predicate `Expr` of each refinement lives in
 //! [`crate::ccl::Refinement`] and is inferred/coalesced like any other
 //! sub-tree.
 //!
@@ -45,6 +45,7 @@ pub mod compact;
 pub mod constrain;
 pub mod scheme;
 pub mod simplify_type;
+pub mod spec_key;
 
 // Re-export every symbol that external modules reach through the
 // `crate::ccl::infer::solver::…` path (chiefly the inference engine), so the
@@ -57,6 +58,7 @@ pub use scheme::{
     seed_chan_dom_pairings,
 };
 pub use simplify_type::simplify_type;
+pub use spec_key::{SpecKey, spec_key};
 
 /// The level of `ty` — the maximum scope level of any inference variable
 /// occurring inside it. Leaves and `Hole` are level 0; `Refinement` defers
@@ -143,7 +145,7 @@ pub(crate) mod test_helpers {
         }
     }
 
-    /// Build `{base | marker}` — a `Type::Refinement` whose witness's predicate
+    /// Build `{base | marker}` — a `Type::Refinement` whose refinement's predicate
     /// encodes `marker` (an `Int(marker)` literal). Refinements compare by
     /// structural predicate equality (see [`Refinement`]'s `PartialEq`), so
     /// equal markers match and distinct markers stay distinct.
