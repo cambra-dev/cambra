@@ -42,7 +42,7 @@ pub struct OperatorSchemes {
     /// to the input collection (function), folding its codomain γ to a
     /// result of the same type.
     aggregate_max: PolyScheme,
-    /// `∀α β. ((α → β), β) → β` — extract the last value from a
+    /// `∀α β. ((α → β), β) → β` — extract the final value from a
     /// function-typed stream, falling back to the default scalar when the
     /// stream's domain is empty. Polymorphic in both the stream domain
     /// (`α`) and the shared codomain/default type (`β`); inline construction

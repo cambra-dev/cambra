@@ -44,7 +44,7 @@
 //! `TransactWriter`s in a cyclic `FanOut`). A read fed *out* of a block is
 //! rewritten to an `AsOf` (an as-of read at an arbitrary commit position) by
 //! [`rewrite_live_reads`] below — every such read, regardless of the reading
-//! loop's domain; there is no terminal/"final" register read (`ExtractLast` is
+//! loop's domain; there is no terminal/"final" register read (`ExtractFinal` is
 //! used only for a terminating induction accumulator, not a `Txn` register). Each
 //! `to_<defer>` tap compiles to a per-commit value-stream (`body_tap_fields`).
 //! The in-block feed mirrors the induction phase's in-loop feeds
@@ -84,7 +84,7 @@ use crate::ccl::{
 /// order — so it folds to `AsOf` uniformly, whatever the reading loop's domain (a
 /// live request stream, a finite loop, or a standalone singleton). There is no
 /// finiteness or standalone-vs-loop split and no terminal/"final" alternative: a
-/// `Txn` register has no last-value term (a future `await_final` would be it). The
+/// `Txn` register has no final-value term (a future `await_final` would be it). The
 /// rewrite depends on how many registers `e` reads:
 ///
 /// - **one register** → `as_of((trigger, balance.f)) ≫ (λ k → e)`: the join latches
@@ -166,7 +166,7 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
     // in the commit order, indexed by the reading loop. This holds regardless of
     // whether the reading loop is a live request stream, a finite literal, or the
     // synthesized singleton of a standalone read: there is no "final"/terminal
-    // read (a program cannot request the register's last value — a future
+    // read (a program cannot request the register's final value — a future
     // `await_final` builtin would, but does not exist). So no finiteness or
     // standalone-vs-loop classification here; all such reads fold to `AsOf`.
     let TypedExprNode::Lambda {
@@ -294,7 +294,7 @@ fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
 /// derived finiteness classification: a transactional register's history is
 /// `Fun(Txn, V)` by construction, and only such a read folds to an as-of join.
 /// (An induction accumulator's history — over any iteration extent — is left for
-/// `mut_elim`'s `ExtractLast` path.)
+/// `mut_elim`'s `ExtractFinal` path.)
 fn live_register_read(bound_expr: &Expr) -> Option<(&Expr, String)> {
     let TypedExprNode::Apply {
         function: lod_fn,
@@ -1305,7 +1305,7 @@ fn build_writer(
     //    so the read is that accumulator's final value: bind the body's reference
     //    to the `final_or_default` `final_var` (in scope via `cross.reads`), a
     //    scalar op-conversion broadcasts (via `MapResultToConst`, which waits on
-    //    the sibling loop's `ExtractLast`) into every transaction.
+    //    the sibling loop's `ExtractFinal`) into every transaction.
     //
     // Both sorted for a deterministic layout (`acc_views` is a `HashMap`).
     let mut site_accs: Vec<(Name, Expr, Type)> = Vec::new();
@@ -1637,7 +1637,7 @@ fn walk_case(
     feed_counter: &mut usize,
     allowed_writes: &HashSet<Name>,
 ) {
-    // The rejoin below carries an unwritten key via its snapshot on the *last*
+    // The rejoin below carries an unwritten key via its snapshot on the *final*
     // arm, so the merged `Case` is total only if the branch list ends in the
     // unconditional `true → else|unit` complement lowering appends. Assert it at
     // this boundary — a non-exhaustive block `Case` would leave a key with no

@@ -6,10 +6,10 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
-// ExtractLast / ExtractLastProducer
+// ExtractFinal / ExtractFinalProducer
 // ---------------------------------------------------------------------------
 
-/// Extracts the last value from a changelog store's dense read (or any
+/// Extracts the final value from a changelog store's dense read (or any
 /// `SealedFunction`) output, converting the accumulated `SealedFunction` tiling
 /// back to a `Scalar` — the scalar-final read of a mutation loop's accumulator.
 ///
@@ -19,8 +19,8 @@ use crate::{
 /// accumulator always has a defined value, equal to the loop's initial
 /// value when the body never ran.
 ///
-/// Used as the terminal stage of a loop: `ExtractLast(body.step, init)`.
-pub struct ExtractLast {
+/// Used as the terminal stage of a loop: `ExtractFinal(body.step, init)`.
+pub struct ExtractFinal {
     /// Operator producing the `SealedFunction` tiling to extract from.
     source: Box<dyn TileOperator>,
     /// Fallback scalar operator, pulled when `source` is terminal and
@@ -32,8 +32,8 @@ pub struct ExtractLast {
     tiling: Tiling,
 }
 
-impl ExtractLast {
-    /// Construct a new `ExtractLast` wrapping `source`, with `default`
+impl ExtractFinal {
+    /// Construct a new `ExtractFinal` wrapping `source`, with `default`
     /// as the fallback for the empty-source case.
     ///
     /// `source` must have a `SealedFunction` tiling and `default` a `Scalar`
@@ -42,7 +42,7 @@ impl ExtractLast {
     pub fn new(source: Box<dyn TileOperator>, default: Box<dyn TileOperator>) -> Self {
         let tiling = match source.tiling() {
             Tiling::SealedFunction { codomain, .. } => *codomain.clone(),
-            other => panic!("ExtractLast source must have SealedFunction tiling, got {other}"),
+            other => panic!("ExtractFinal source must have SealedFunction tiling, got {other}"),
         };
         // The default has to be *representable* in the output value space — neither
         // identically tiled nor even the same extent. Two independent reasons, both
@@ -59,7 +59,7 @@ impl ExtractLast {
         //   narrower value fit.
         debug_assert!(
             tiling.extent().includes(&default.tiling().extent()),
-            "ExtractLast default must be representable in the source codomain: \
+            "ExtractFinal default must be representable in the source codomain: \
              default {} is not included in {tiling}",
             default.tiling(),
         );
@@ -71,7 +71,7 @@ impl ExtractLast {
     }
 }
 
-impl TileOperator for ExtractLast {
+impl TileOperator for ExtractFinal {
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -102,8 +102,8 @@ impl TileOperator for ExtractLast {
             Box::new(|| {}),
             scheduler,
         );
-        Box::new(ExtractLastProducer {
-            base: ProducerBase::new(ExtractLastProducer::alloc_id(), &self.tiling),
+        Box::new(ExtractFinalProducer {
+            base: ProducerBase::new(ExtractFinalProducer::alloc_id(), &self.tiling),
             source: source_producer,
             default: default_producer,
             final_value: None,
@@ -112,7 +112,7 @@ impl TileOperator for ExtractLast {
     }
 }
 
-struct ExtractLastProducer {
+struct ExtractFinalProducer {
     base: ProducerBase,
     source: Box<dyn TileProducer>,
     /// Default-value producer, pulled when `source` becomes terminal
@@ -124,7 +124,7 @@ struct ExtractLastProducer {
     /// this same value until the consumer releases us with a universal
     /// guard — which then sets [`Self::released`] and we go quiet.
     /// Same emit-until-released protocol as [`Constant`], so consumers
-    /// that pull repeatedly (e.g. sibling `Last` projections off a
+    /// that pull repeatedly (e.g. sibling `Final` projections off a
     /// shared multi-accumulator mutation-loop) see a stable value
     /// instead of an empty source after the first terminal pull.
     final_value: Option<Value>,
@@ -136,7 +136,7 @@ struct ExtractLastProducer {
     released: bool,
 }
 
-impl TileProducer for ExtractLastProducer {
+impl TileProducer for ExtractFinalProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
@@ -174,7 +174,7 @@ impl TileProducer for ExtractLastProducer {
             // directly without going through `Tiling::codomain` (which
             // would return `None` for a `Scalar`).
             //
-            // Incremental release: we only ever need the *last* (highest-domain)
+            // Incremental release: we only ever need the *final* (highest-domain)
             // value, so every position below the highest one seen so far is dead —
             // release it. This is a promise never to re-request those positions;
             // the source decides what upstream storage that frees (for a changelog
@@ -214,14 +214,14 @@ impl TileProducer for ExtractLastProducer {
             codomain, deleted, ..
         } = source_tile
         else {
-            panic!("ExtractLast source must be a SealedFunction tile");
+            panic!("ExtractFinal source must be a SealedFunction tile");
         };
         let cv = scalar_tile_to_column_value(*codomain);
         let n = cv.len();
-        // Try to extract the last non-deleted value from the source.
+        // Try to extract the final non-deleted value from the source.
         // TODO don't assume sorting; we need to sort by the domain value instead.
-        if let Some(last_idx) = (0..n).rev().find(|&i| !deleted.contains(i)) {
-            let value = cv.index_at(last_idx);
+        if let Some(final_idx) = (0..n).rev().find(|&i| !deleted.contains(i)) {
+            let value = cv.index_at(final_idx);
             self.final_value = Some(value.clone());
             return Tile::Scalar(ColumnValue::from_values(vec![value], &extent));
         }
@@ -263,7 +263,7 @@ mod tests {
 
     /// A non-terminal `SealedFunction` source with domain `[0, 1, 2]`, recording
     /// every domain-release watermark it receives. Never becomes terminal, so it
-    /// exercises `ExtractLast`'s incremental (pre-terminal) release path.
+    /// exercises `ExtractFinal`'s incremental (pre-terminal) release path.
     struct PartialSource {
         tiling: Tiling,
         releases: Rc<RefCell<Vec<usize>>>,
@@ -312,7 +312,7 @@ mod tests {
     }
 
     /// A **terminal** `SealedFunction` source carrying `codomain_tile` over
-    /// `domain`, used to drive `ExtractLast` to its extract / default paths.
+    /// `domain`, used to drive `ExtractFinal` to its extract / default paths.
     struct TerminalSource {
         tiling: Tiling,
         domain: ColumnValue,
@@ -408,7 +408,7 @@ mod tests {
             union_value("neg", Value::Int(0)),
             named_variant(&[("neg", Extent::Base(BaseType::Int))]),
         );
-        let mut op = ExtractLast::new(Box::new(source), Box::new(default));
+        let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
         let guard = op.tiling().universal_guard();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
         let tile = producer.get(producer.tiling().universal_guard());
@@ -444,7 +444,7 @@ mod tests {
             union_value("neg", Value::Int(7)),
             named_variant(&[("neg", Extent::Base(BaseType::Int))]),
         );
-        let mut op = ExtractLast::new(Box::new(source), Box::new(default));
+        let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
         let guard = op.tiling().universal_guard();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
         let tile = producer.get(producer.tiling().universal_guard());
@@ -459,12 +459,12 @@ mod tests {
         assert_eq!(cv.as_single(), Some(union_value("neg", Value::Int(7))));
     }
 
-    /// On a non-terminal pull, `ExtractLast` needs only the highest-domain value,
+    /// On a non-terminal pull, `ExtractFinal` needs only the highest-domain value,
     /// so it releases everything below it — `[0, max)`. Over a source with domain
     /// `[0, 1, 2]`, it forwards a release `≤ 1`, freeing the prefix that a
     /// never-terminating scalar-final loop would otherwise pin.
     #[test]
-    fn extract_last_releases_below_the_running_max() {
+    fn extract_final_releases_below_the_running_max() {
         let value_tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let releases = Rc::new(RefCell::new(Vec::<usize>::new()));
         let source = PartialSource {
@@ -475,11 +475,11 @@ mod tests {
             releases: releases.clone(),
         };
         let default = Constant::new(Value::Int(0), Extent::Base(BaseType::Int));
-        let mut op = ExtractLast::new(Box::new(source), Box::new(default));
+        let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
         let guard = op.tiling().universal_guard();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
 
-        // Non-terminal source → ExtractLast emits empty but releases `[0, max)`.
+        // Non-terminal source → ExtractFinal emits empty but releases `[0, max)`.
         let tile = producer.get(producer.tiling().universal_guard());
         assert!(
             !tile.is_terminal(),
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(
             releases.borrow().last().copied(),
             Some(1),
-            "ExtractLast must release below the running max (positions 0, 1), keeping position 2"
+            "ExtractFinal must release below the running max (positions 0, 1), keeping position 2"
         );
     }
 }

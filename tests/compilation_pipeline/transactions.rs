@@ -688,7 +688,7 @@ fn bool_valued_store() {
     );
 }
 
-/// A `str`-valued transactional register: the last commit sets `name = "bob"`.
+/// A `str`-valued transactional register: the final commit sets `name = "bob"`.
 #[test]
 fn string_valued_store() {
     check_tile(
@@ -1085,7 +1085,7 @@ fn bare_txn_read_outside_tx_rejected() {
     );
 }
 
-/// A *computed* live cross-endpoint read (`resp << last + 1`) compiles: the
+/// A *computed* live cross-endpoint read (`resp << latest + 1`) compiles: the
 /// pre-lambda-elim live-read rewrite turns it into `as_of(…) ≫ (λ x → x + 1)`,
 /// whose reply lambda the elim pass point-frees. Running the rewrite before
 /// lambda-elim is what keeps the reply a liftable lambda rather than a
@@ -1095,14 +1095,14 @@ fn computed_live_cross_endpoint_read_compiles() {
     let code = indoc! {r#"
         set_reqs, set_resps = http_serve("0", "POST", "/s")
         get_reqs, get_resps = http_serve("0", "GET", "/g")
-        last: Mut(Int, Txn) := 0
+        latest: Mut(Int, Txn) := 0
         for msg in set_reqs:
             with begin():
-                last := last + 1
+                latest := latest + 1
             set_resps << "ok"
         for req in get_reqs:
             with begin():
-                get_resps << last + 1
+                get_resps << latest + 1
 
     "#};
     let mut ctx = GlobalContext::default();
@@ -1677,7 +1677,7 @@ fn commit_decision_reads_induction_accumulator() {
 /// trailing read, which is an arbitrary as-of sample — so the committed values
 /// are deterministic: `pool` draws down `100 → 97 → 94` over commit ticks 1, 2.
 /// Exercises the writer's deferred-wakeup convergence: the broadcast `cnt`'s
-/// `ExtractLast` is empty until its loop's `Recurse` drains, so the writer
+/// `ExtractFinal` is empty until its loop's `Recurse` drains, so the writer
 /// re-arms itself on the wakeup queue each not-ready pull rather than deadlocking
 /// on the stalled commit frontier; the in-block reply demands each commit and
 /// drives that convergence.

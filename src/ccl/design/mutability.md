@@ -118,9 +118,9 @@ Two surface facts are load-bearing for the realization and worth restating here:
 > balance` after a loop whose first iteration *denies* may observe the register before the first commit
 > lands (its singleton read samples an early position). The only ways a `Txn` value interacts with
 > the world are: read/written **inside** a `with begin():` (rejected outside one — as a feed RHS or
-> anywhere else), or observed as a *definite* committed value through the **future `await_last`** —
+> anywhere else), or observed as a *definite* committed value through the **future `await_final`** —
 > the single sanctioned terminal read. Do **not** add inter-transaction ordering to "fix" the
-> early-read case; the unordering is the intended model, and `await_last` is where determinism comes
+> early-read case; the unordering is the intended model, and `await_final` is where determinism comes
 > from when a program needs it.
 
 ## CCL representation
@@ -324,7 +324,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⇒ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⇒ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
-| `final_or_default` | `(𝐷 ⇒ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractLast`). Applied to a `Txn` register only through the surface [`await_final`](#await_final) primitive (designed, not yet built); a bare fed-out register read never becomes one |
+| `final_or_default` | `(𝐷 ⇒ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractFinal`). Applied to a `Txn` register only through the surface [`await_final`](#await_final) primitive (designed, not yet built); a bare fed-out register read never becomes one |
 
 `begin()` never reaches CCL — lowering records the block structure, and the phase mints one
 `begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order (which is what
@@ -627,7 +627,7 @@ causal matcher (`letrec::check_letrec_causal`).
   there is no cyclic `FanOut` — and writes a `Tile::Store` changelog (`init` at position 0; a
   `commit: false` position carries the prior value forward). `StoreDenseRead` then folds that
   changelog over the loop domain to the dense `𝐷 ⇀ 𝑉` stream (serving both a scalar-final
-  `ExtractLast` and a co-iterated `fan_in`). A single always-commit or commit-gated writer over a
+  `ExtractFinal` and a co-iterated `fan_in`). A single always-commit or commit-gated writer over a
   finite *or* async domain.
 - **The commit operator** — the concurrent generalization of the induction accumulator, for the `Txn` domain. The
   store is an MVCC commit log `Txn ⇀ (Key ⇀ Value)`. A writer reads a snapshot of its footprint,
@@ -646,17 +646,17 @@ causal matcher (`letrec::check_letrec_causal`).
   source step; `AsOf` latches the store's current value per trigger step. It is a *sample at
   observation time* — an arbitrary as-of position, which is exactly the read a transaction gets: the
   store as of where it lands in the commit order. The only terminal/final register read is
-  [`await_final`](#await_final) (designed, not yet built): when implemented it is `ExtractLast` over the
+  [`await_final`](#await_final) (designed, not yet built): when implemented it is `ExtractFinal` over the
   key's `StoreValueStream` (the register-carry stream `StoreValueStream` already projects), folding the
-  completed commit-value stream to its last value — no new engine, the same `final_or_default →
-  ExtractLast` path the induction final uses, applied for the first time to a `Txn` history. Absent it,
+  completed commit-value stream to its final value — no new engine, the same `final_or_default →
+  ExtractFinal` path the induction final uses, applied for the first time to a `Txn` history. Absent it,
   a standalone read is just the singleton-trigger case of the same `AsOf`; under the batch scheduler it
   observes the drained store, but that coincidence is not part of the semantics.
 - **`StoreValueStream`** — projects one key's `CommitTs ⇀ V` commit-value stream by folding the
   store changelog. It backs the **in-block reply tap** (`out << e` inside a block — a per-commit,
   commit-tick-indexed event stream) and is the fold `AsOf` samples. It is *not* reduced by
-  `ExtractLast` for a register read — that path (a fold-to-completion "final register value") does
-  not exist. `ExtractLast` itself remains, but for the two genuinely-terminating histories that do
+  `ExtractFinal` for a register read — that path (a fold-to-completion "final register value") does
+  not exist. `ExtractFinal` itself remains, but for the two genuinely-terminating histories that do
   have a final: a post-loop **induction** accumulator, and the **broadcast source** (a sibling
   induction loop's final, broadcast into a commit decision).
 
@@ -744,7 +744,7 @@ transaction. The phase distinguishes the two by the site's *enclosing-loop write
 `final_or_default` final (`cross.reads`, in scope in the writer body), which op-conversion compiles to
 a `Constant` broadcast (via `MapResultToConst`) over the transaction domain.
 
-The one engine subtlety is **driving** that broadcast to convergence. The final's `ExtractLast` is
+The one engine subtlety is **driving** that broadcast to convergence. The final's `ExtractFinal` is
 empty until the sibling loop's `InductionStore` drains (one position per body pull), and nothing external
 re-pulls the writer: the store's own convergence loop stops once the commit frontier stalls, and the
 frontier cannot advance until this writer commits, which needs the value still converging. The writer
@@ -760,9 +760,9 @@ advances the sibling loop, exactly as an in-block reply drives the writer in the
 co-indexed and non-cross paths are untouched.
 
 (Note the asymmetry: the broadcast **source** — the sibling induction loop's accumulator — *does*
-have a final, read via `ExtractLast`, because an induction loop terminates and its last value is
+have a final, read via `ExtractFinal`, because an induction loop terminates and its final value is
 denotable. The result **register** does not: a `Txn` register has no final-value term, so reads of it
-are `AsOf`, never `ExtractLast`.)
+are `AsOf`, never `ExtractFinal`.)
 
 ## Replies: live cross-endpoint reads and commit-ordered taps
 
@@ -990,7 +990,7 @@ Designed — it binds `t` to the transaction's commit time (see the CHL spec,
 The **terminal read of a transactional register** — surface, semantics, and the unreferenceable-after
 rule are specified in the
 [CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final-decided): `await_final(𝑥)` reads a
-`Mut(𝑉, Txn)` register's last committed value once its whole commit history completes, and `𝑥` is
+`Mut(𝑉, Txn)` register's final committed value once its whole commit history completes, and `𝑥` is
 unreferenceable afterward so the completion event is well-defined. In the [ordering
 model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the register-domain analog of loop
 completion — a **completeness** edge on the `Txn` domain. Designed, not built. This section is the
@@ -999,10 +999,10 @@ intended realization.
 **Intended realization (no new engine).** `await_final(𝑥)` lowers to `final_or_default(𝑥.history, init)`
 — the *single* permitted application of `final_or_default` to a `Txn` history (a bare fed-out register
 read never becomes one; see the CHL spec, [reads](../../../docs/chl-spec.md#83-reads)). It compiles through the existing `final_or_default →
-ExtractLast` path, with `ExtractLast` folding the key's `StoreValueStream` — the register-carry
-(`carry_forward`) commit-value stream `StoreValueStream` already projects — to its last value. Contrast
+ExtractFinal` path, with `ExtractFinal` folding the key's `StoreValueStream` — the register-carry
+(`carry_forward`) commit-value stream `StoreValueStream` already projects — to its final value. Contrast
 the fed-out as-of read, which hands `AsOf` the raw store fan and samples an *arbitrary* position: same
-`StoreValueStream` source, different reducer (fold-to-last vs. sample-at-trigger). No new operator, no
+`StoreValueStream` source, different reducer (fold-to-final vs. sample-at-trigger). No new operator, no
 new runtime node — `await_final` is the first term to reduce a register stream to completion.
 
 **Build sketch** (for whoever implements it): a `"await_final"` arm in `lower_call`

@@ -842,14 +842,14 @@ fn trailing_hidden_writer_loop_compiles() {
 // `Scalar(Record)` in the changelog, while a tuple/record *literal* compiles to
 // a struct-of-arrays `Record` tiling. The two representations are reconciled at
 // the register boundaries (`read_initial_scalar` seeding, `flat_merge` decision
-// values, `ExtractLast` extent-match) via `scalar_tile_to_column_value` /
+// values, `ExtractFinal` extent-match) via `scalar_tile_to_column_value` /
 // `column_value_to_tile`. These pin that a compound induction accumulator folds,
 // reads-its-own-writes, and carries correctly.
 // ---------------------------------------------------------------------------
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-// Unconditional: the whole tuple is overwritten each step → last write (3, 3).
+// Unconditional: the whole tuple is overwritten each step → final write (3, 3).
 #[case(r"
 acc := (0, 0)
 for i in [1, 2, 3]:
@@ -861,7 +861,7 @@ acc := (0, 10)
 for i in [1, 2, 3]:
     acc := (acc[0] + i, acc[1] + i)
 acc", make_tuple(&[Value::Int(6), Value::Int(16)]))]
-// Single-arm conditional write to a tuple: fires at i>1 → last (3, 3).
+// Single-arm conditional write to a tuple: fires at i>1 → final (3, 3).
 #[case(r"
 acc := (0, 0)
 for i in [1, 2, 3]:
