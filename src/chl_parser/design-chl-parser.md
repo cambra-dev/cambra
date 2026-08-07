@@ -122,8 +122,8 @@ Key shape choices:
   values. Because braces are always a *product* in type position and never
   grouping, the brace parser captures the trailing comma rather than merely
   allowing it: `{T,}` is the one-element product and a comma-free `{T}` is a
-  parse error, while the empty `{}` is the zero-element product, which
-  lowering reads as `Unit` (see [docs/chl-spec.md](../../docs/chl-spec.md),
+  parse error, while the empty `{}` is the **unit type**, which lowering reads as
+  `Unit` (see [docs/chl-spec.md](../../docs/chl-spec.md),
   "6.6 The empty product is unit").
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`

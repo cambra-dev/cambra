@@ -133,11 +133,12 @@ for    in
 def    return yield
 with
 pass
+where
 ```
 
-`None` is **not** a keyword: the unit value is the empty product `()` (§3.1),
-so `None` is an ordinary identifier, free for a program to bind. Neither it nor
-`Unit` is reserved (§6.6).
+`where` is the refinement predicate separator (§6.4). It is lexed so the name is
+**reserved** — refinements are not parsed yet, so every use is a parse error
+today.
 
 `with` is a keyword: it introduces a transaction block, `with begin():`
 (§8.2). It does **not** carry Python's general context-manager meaning.
@@ -149,16 +150,17 @@ A lambda is written `\x -> body` (§3.10); `\` and `->` are punctuation
 reserved for future use.
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
-> `rec` (recursive binding — §4.3, **[Decided]**), `where` (the refinement
-> predicate separator — §6.4, **[Decided]**), `given`, `requires`,
+> `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
 > `summon` (the transactions-as-contextual-parameters layer — §8.7,
 > **[Decided]**), `import` (built-in modules — the `http` module surface,
 > **[Decided]**; general modules remain future work, §9), and `match` /
 > `case` (pattern matching, **[Tentative]** — it appears in the north-star
 > `txn_kv` program and inside refinement predicates (§6.4), but the block
 > syntax has no design writeup). Avoid taking these names for
-> other purposes. (`with` and `:=` are **already** lexed — they carry
-> today's transactions and mutation, §8 — so they are not in this list.)
+> other purposes. (`with`, `:=`, and `where` are **already** lexed — the first
+> two carry today's transactions and mutation, §8, and `where` is reserved ahead
+> of the refinement syntax that will use it, §6.4 — so they are not in this
+> list.)
 
 ### 1.7 Literals
 
@@ -170,10 +172,6 @@ reserved for future use.
 
 There are no floating-point literals — CHL has no `f64` type at the
 surface level.
-
-There is no **unit** literal either: the unit value is the empty product `()`
-(§3.1), which is two punctuation tokens and an [atom](#24-atoms), not a token of
-its own. Its type is `{}` (§6.6).
 
 ### 1.8 Operators and punctuation
 
@@ -365,7 +363,7 @@ expression ::= lambda_expr | yield_expr | feed_expr
 atom ::= literal
        | ident
        | "(" expression ")"                  -- parenthesised
-       | "(" ")"                              -- empty product: the unit value, typed `{}` (§3.1, §6.6)
+       | "(" ")"                              -- the unit value, typed `{}` (§3.1, §6.6)
        | "(" expression "," ")"              -- one-tuple
        | "(" expression ( "," expression )+ [ "," ] ")"   -- tuple
        | "(" record_field ( "," record_field )* [ "," ] ")"   -- record value
@@ -402,9 +400,9 @@ consequences, both enforced:
   parse error pointing at `{T,}`: with no grouping reading available there is
   nothing else for it to mean, and requiring the comma keeps one spelling per
   type.
-- An **empty** `{}` is the product of zero types, which is the **unit type**
-  (§6.6). It is not an empty tuple type and not an empty record type — those
-  are not types at all.
+- An **empty** `{}` is the **unit type** (§6.6). It is not an empty tuple type
+  and not an empty record type — those are not types at all; `{}` is simply how
+  unit is spelled.
 
 > **Direction — brace forms [Decided].** `{…}` acquires two more
 > structural-type forms, so what a brace group means becomes a
@@ -627,9 +625,9 @@ of the partiality disappears entirely.)
 ### 3.1 Literals
 
 `Int`, `String`, and `Bool` literals denote themselves. The **unit value** is
-the empty product `()` — a single inhabitant of the unit type, whose own
-spelling is `{}` (§6.6). It is an atom rather than a lexical literal (§2.4),
-and it lowers to the CCL `Unit` literal.
+written `()` — the single inhabitant of the unit type, whose own spelling is
+`{}` (§6.6). It is an atom rather than a lexical literal (§2.4), and it lowers to
+the CCL `Unit` literal.
 
 A literal's **type is the literal itself**, not merely its base: `5` has type
 `{Int | 𝑒 == 5}`, printed `5`. So `x = 5` gives `x` the type `5`, and an
@@ -936,9 +934,9 @@ and by name for a record (`r.x`); neither is subscripted.
 lowering error. Finite maps are a collection literal `[k -> v, …]` (§6.3,
 **[Decided]**), not a brace form.
 
-**Empty forms.** `()` is the empty product — the unit value, and equally the
-empty record (§3.1); its type is the unit type, written `{}` (§6.6).
-`[]` is the empty list.
+**Empty forms.** `()` is the unit value (§3.1) — there is no zero-field product
+distinct from it, so it is equally what an "empty record" would denote. Its type
+is the unit type, written `{}` (§6.6). `[]` is the empty list.
 
 > **Direction [Decided].** The literal forms migrate with the
 > delimiter split (§2.4) and the collections model (§6.3), form by
@@ -950,7 +948,7 @@ empty record (§3.1); its type is the unit type, written `{}` (§6.6).
 > | `(name=e, …)` — record | a record is a product with named fields (and a call's keyword arguments are exactly such a record — §3.8) |
 > | finite map | `[k -> v, …]` — a collection of entry pairs (§2.4); `[ … ]` is the collection delimiter |
 > | `[1, 2, 3]` — list | same spelling, but shared across collection types: the literal can denote an `Array`, `List`, or `Set`, disambiguated by annotation or usage, with `list([…])` / `set([…])` constructors for explicitness (**[Tentative]** — §6.3) |
-> | empty record / unit | the empty product `()`: records and tuples are both products (§3.8), so the empty record, the empty tuple, and the unit value coincide (§3.1) |
+> | empty record / unit | `()`, the unit value: with no fields there is nothing to tell a record from a tuple, so an empty record, an empty tuple, and unit coincide (§3.1, §6.6) |
 > | `[]` — empty list | same spelling; the empty-**map** spelling is **[Open]** (§2.4) |
 >
 > `{ … }` itself moves wholesale to the type level (§2.4, §6.1); no
@@ -1530,8 +1528,8 @@ marked one carries its status per "How to read this document".)
 - `Int` — signed 64-bit integer.
 - `Bool` — `True` or `False`.
 - `String` — UTF-8 string.
-- `{}` — unit type, one inhabitant: the empty product (§6.6), and its only
-  CHL spelling. Neither `Unit` nor `None` is a CHL name at all (§6.6).
+- `{}` — unit type, one inhabitant, and its only CHL spelling (§6.6). Neither
+  `Unit` nor `None` is a CHL name at all.
   There is no *empty* (uninhabited) type — §6.6.
 - `List(T)` — finite collection of `T`-values, indexed by `[0, n)`.
   The index → element mapping is part of the value (so `xs[i]` is
@@ -1722,7 +1720,8 @@ A refinement is written `{ 𝑇 where 𝑝 }` — the base type, the keyword
 {{a: Int} where _.a > 0}                # ... a single-field record; no comma
 ```
 
-Three pieces, none of them writable today:
+Three pieces. The form is not parsed today, though `where` is already lexed and
+reserved (§1.6):
 
 - **`{ … }`** because a refinement *is* a structural type (§2.4). The base
   type sits inside the braces in its own spelling, so refining a structural
@@ -1834,8 +1833,10 @@ lexed, and neither `match` nor a tag is parsed.
 
 ### 6.6 The empty product is unit
 
-**There is exactly one empty product, and it is the unit type.** Written `{}`
-in type position (§2.4), inhabited by the empty product term `()` (§3.11).
+**A product with no fields is not a type of its own — it is unit.** Unit is a
+base type, spelled `{}` in type position (§2.4) and inhabited by the value `()`
+(§3.11). Neither spelling is a product *expression* that happens to evaluate to
+unit; they are simply how the type and its one value are written.
 
 An "empty tuple type" and an "empty record type" are therefore **not types**.
 They are not two degenerate products alongside unit — a product with no fields
@@ -1849,14 +1850,15 @@ post-inference wall catches any path that bypasses them.
 This is an invariant and not a convention because two spellings of one type do
 not merely look untidy — they fail to *reconcile*. Inference records a node's
 type and a later consistency check rebuilds it from the node's children, so if
-those two steps can reach the empty product by different routes they disagree
+those two steps can reach a zero-field product by different routes they disagree
 about a node that is perfectly well typed — and the disagreement is
-undiagnosable, since both spellings render `()`. One representation is what
-makes the empty product term `()` typecheck at all.
+undiagnosable, since both spellings render `()`. One representation is what makes
+the unit value `()` typecheck at all.
 
 **`{}` is the only CHL spelling, and the alternatives are not reserved.** One
-type, one way to write it — and `{}` says what the type *is*, the empty product,
-which is what makes `Set(K) = Map(K, {})` (§6.3) read as the set it encodes.
+type, one way to write it — and `{}` is structural, which is what makes
+`Set(K) = Map(K, {})` (§6.3) read as the set it encodes: a map whose values
+carry nothing.
 
 Neither `Unit` nor `None` is a CHL name:
 
@@ -2396,8 +2398,9 @@ with parser-level support that lowering rejects:
 - **Surface refinement type syntax** — refinement types (§6) are
   inferred today only via built-ins like `groupby`; the decided
   surface form is `{T where p(_)}` (**[Decided]**, §6.4), not yet in
-  the grammar. It needs the `where` keyword (§1.6) and `_` in term
-  position inside the predicate. Function contracts arrive as `assert`s
+  the grammar. `where` is already **lexed** and reserved (§1.6); what is
+  missing is the brace-form production and `_` in term position inside the
+  predicate. Function contracts arrive as `assert`s
   lifted to refinements (**[Decided]**, §6) — `assert` is likewise not yet
   a statement.
 - **Variants** — the tagged-sum surface, ``{ `some{Int} | `none }`` as a
