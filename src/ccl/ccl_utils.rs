@@ -6,9 +6,18 @@ use std::rc::Rc;
 
 use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 use crate::ccl::{
-    BaseType, BinOpKind, Branch, Builtin, Expr, F_COMMIT, F_FIRE_SUFFIX, F_WRITES, Lit, LogicKind,
-    Name, PredicateId, Refinement, Type, TypedExprNode, UnaryOpKind,
+    BaseType, BinOpKind, Branch, Builtin, Expr, F_FIRE_SUFFIX, F_WRITES, FieldKey, Lit, LogicKind,
+    Name, PredicateId, Refinement, Type, TypedExprNode, UnaryOpKind, V_ABORT, V_COMMIT,
 };
+
+/// The `commit` selector field of the **intermediate** decision record the two
+/// writer phases build (`{commit, writes, to_<defer>*}`) *before*
+/// [`wrap_decision_variant`] folds it into the `` {`commit{𝑃} | `abort} `` variant.
+/// The whole-transaction grant/deny is no longer a decision-codomain field — it
+/// is the variant *tag* — so this constant is phase-internal plumbing, not part
+/// of the observable decision protocol (hence it lives here, beside the wrapper,
+/// rather than among the AST field constants in `expr.rs`).
+pub(crate) const COMMIT_SELECTOR: &str = "commit";
 
 /// Disjoin control-flow `paths` into one boolean commit gate — the writer
 /// decision's `commit` field, true exactly where some path commits. Short-circuits
@@ -56,7 +65,7 @@ pub fn disjoin(paths: impl IntoIterator<Item = Expr>, empty: bool, bool_ty: &Typ
 /// `transact_phase`'s `commit_paths` and `letrec_phase`'s widen).
 pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(String, Expr, Expr)]) -> Expr {
     let mut fields: Vec<(String, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
-    fields.push((F_COMMIT.to_string(), commit.clone()));
+    fields.push((COMMIT_SELECTOR.to_string(), commit.clone()));
     fields.push((F_WRITES.to_string(), writes));
     for (field, value, fire) in feeds {
         // Gate iff the fire path is *narrower* than the commit — a structural test
@@ -76,6 +85,133 @@ pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(String, Expr
             .collect(),
     );
     Expr::new(TypedExprNode::Record(fields)).with_ty(ty)
+}
+
+/// The decision **variant** type `` {`commit{𝑃} | `abort} `` over a (dense) payload
+/// record type `𝑃` (`{writes, to_<defer>*}`). Tag order is `commit`=0, `abort`=1
+/// — the positions [`wrap_decision_variant`] injects and `body_decision_at`
+/// decodes.
+pub fn decision_variant_ty(payload_ty: Type) -> Type {
+    Type::Variant(vec![
+        (FieldKey::Name(V_COMMIT.into()), payload_ty),
+        (FieldKey::Name(V_ABORT.into()), Type::Base(BaseType::Unit)),
+    ])
+}
+
+/// The `commit` payload record type of a decision variant `` {`commit{𝑃} | `abort} ``
+/// (peeling outer refinements).
+pub fn commit_payload_ty(decision_ty: &Type) -> Type {
+    let mut t = decision_ty;
+    while let Type::Refinement(inner, _) = t {
+        t = inner;
+    }
+    match t {
+        Type::Variant(tags) => tags
+            .iter()
+            .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
+            .unwrap_or_else(|| panic!("decision variant lacks a `commit` tag: {decision_ty}"))
+            .1
+            .clone(),
+        other => panic!("expected a decision variant type, got {other}"),
+    }
+}
+
+/// The point-free one-arm eliminator ``variant_project(`commit) : 𝑑 ⇒ 𝑃`` reading a
+/// decision stream's `commit` payload — inserted before a `.writes`/`.to_<defer>`
+/// read so a `` Fun(D, {`commit{𝑃} | `abort}) `` history projects its committing
+/// payload. (`abort` positions carry no payload and drop out of the eliminated
+/// stream; a read is only meaningful at committing positions.)
+pub fn commit_project(decision_ty: &Type) -> Expr {
+    // The projection names the tag, so a decision variant materialized in any arm
+    // order reads the same — there is no position for the runtime decode to agree
+    // with, and `commit_payload_ty` below finds the payload by the same name.
+    Expr::builtin(Builtin::VariantProject(FieldKey::Name(V_COMMIT.into()))).with_ty(Type::fun(
+        decision_ty.clone(),
+        commit_payload_ty(decision_ty),
+    ))
+}
+
+/// Wrap a writer **decision record** `{commit, writes, to_<defer>*}` (the
+/// intermediate the two phases build via [`writer_decision_record`]) into the
+/// **decision variant** `Case[ commit → .commit(⟨writes, to_<defer>*⟩) ; true →
+/// `abort(unit) ]``. The `commit` field becomes the value-`Case` **selector** (its
+/// disjunction of path conditions) rather than a stored field; the remaining
+/// fields are the (dense) `commit` payload. This is the single site both the
+/// transaction writer and the induction writer funnel through, so the variant is
+/// built in exactly one place and `body_decision_at` decodes one shape.
+///
+/// The decision may sit under read-your-writes `let`s (the induction writer's
+/// `let __v = … in {commit, writes}`); descend through them and rebuild the
+/// variant at the record, preserving the `let` scope.
+pub fn wrap_decision_variant(decision: Expr) -> Expr {
+    match decision.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let new_body = wrap_decision_variant(*body);
+            let ty = new_body.ty.clone();
+            let mut e = Expr::new(TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body: Box::new(new_body),
+            });
+            e.ty = ty;
+            e
+        }
+        TypedExprNode::Record(fields) => {
+            let bool_ty = Type::Base(BaseType::Bool);
+            let unit_ty = Type::Base(BaseType::Unit);
+            // Split the `commit` selector out from the payload fields (everything
+            // else — `writes` and the `to_<defer>*` taps, in order).
+            let mut commit: Option<Expr> = None;
+            let mut payload_fields: Vec<(String, Expr)> = Vec::with_capacity(fields.len());
+            for (k, v) in fields {
+                if k == COMMIT_SELECTOR {
+                    commit = Some(v);
+                } else {
+                    payload_fields.push((k, v));
+                }
+            }
+            let commit = commit.expect("a writer decision record carries a `commit` selector");
+            let payload_ty = Type::Record(
+                payload_fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.ty.clone()))
+                    .collect(),
+            );
+            let payload =
+                Expr::new(TypedExprNode::Record(payload_fields)).with_ty(payload_ty.clone());
+            let variant_ty = decision_variant_ty(payload_ty);
+
+            let commit_ctor = Expr::variant_ctor(V_COMMIT, payload).with_ty(variant_ty.clone());
+            let unit = Expr::new(TypedExprNode::Lit(Lit::Unit)).with_ty(unit_ty.clone());
+            let abort_ctor = Expr::variant_ctor(V_ABORT, unit).with_ty(variant_ty.clone());
+            let true_lit = Expr::new(TypedExprNode::Lit(Lit::Bool(true))).with_ty(bool_ty.clone());
+
+            let mut case = Expr::new(TypedExprNode::Case {
+                scrutinee: None,
+                branches: vec![
+                    Branch {
+                        pattern: None,
+                        guard: commit,
+                        body: commit_ctor,
+                    },
+                    Branch {
+                        pattern: None,
+                        guard: true_lit,
+                        body: abort_ctor,
+                    },
+                ],
+            });
+            case.ty = variant_ty;
+            case
+        }
+        other => panic!(
+            "wrap_decision_variant: a writer decision is `let* in {{commit, writes, …}}`, got {other:?}"
+        ),
+    }
 }
 
 /// Returns `true` if `expr` directly references the given built-in primitive.
