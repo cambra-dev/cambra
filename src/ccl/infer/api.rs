@@ -121,8 +121,8 @@ impl Drop for InferArena {
         // edges, so the (otherwise cyclic) refcounts can all reach zero.
         for var in crate::ccl::arena_exit() {
             let mut bounds = var.bounds.borrow_mut();
-            bounds.lower.clear();
-            bounds.upper.clear();
+            bounds.lower_mut().clear();
+            bounds.upper_mut().clear();
         }
     }
 }

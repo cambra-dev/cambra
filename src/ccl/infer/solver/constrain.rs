@@ -622,11 +622,11 @@ fn constrain_go(
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
                 let mut s = lv.bounds.borrow_mut();
-                s.upper
+                s.upper_mut()
                     .push(Bound::edge(sl.clone(), rhs.clone(), sr.clone()));
                 s.lower.clone()
             };
-            for low in lows {
+            for low in lows.iter() {
                 let (tau_l, tau_u) = bridge_holder_gap(&low.self_subst, sl);
                 constrain_go(
                     &low.ty,
@@ -650,11 +650,11 @@ fn constrain_go(
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
                 let mut s = rv.bounds.borrow_mut();
-                s.lower
+                s.lower_mut()
                     .push(Bound::edge(sr.clone(), lhs.clone(), sl.clone()));
                 s.upper.clone()
             };
-            for up in ups {
+            for up in ups.iter() {
                 let (tau_l, tau_u) = bridge_holder_gap(sr, &up.self_subst);
                 constrain_go(
                     lhs,
@@ -994,7 +994,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 // lower bounds (extruded at the same polarity).
                 tv.bounds
                     .borrow_mut()
-                    .upper
+                    .upper_mut()
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_lows: Vec<_> = lows
                     .iter()
@@ -1004,14 +1004,14 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                         ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().lower = new_lows;
+                nvs.bounds.borrow_mut().lower = Rc::new(new_lows);
             } else {
                 // Negative: new var flows into original. Original gains
                 // `nvs` as a lower bound; new var inherits original's
                 // upper bounds.
                 tv.bounds
                     .borrow_mut()
-                    .lower
+                    .lower_mut()
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_ups: Vec<_> = ups
                     .iter()
@@ -1021,7 +1021,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                         ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().upper = new_ups;
+                nvs.bounds.borrow_mut().upper = Rc::new(new_ups);
             }
             Type::Infer(nvs)
         }
@@ -1106,7 +1106,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             if !has_pos_link {
                 tv.bounds
                     .borrow_mut()
-                    .upper
+                    .upper_mut()
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_lows: Vec<_> = lows
                     .iter()
@@ -1116,13 +1116,13 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                         ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().lower.extend(new_lows);
+                nvs.bounds.borrow_mut().lower_mut().extend(new_lows);
             }
             // Negative link: `proxy <: tv`; proxy inherits `tv`'s upper bounds.
             if !has_neg_link {
                 tv.bounds
                     .borrow_mut()
-                    .lower
+                    .lower_mut()
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_ups: Vec<_> = ups
                     .iter()
@@ -1132,7 +1132,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                         ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().upper.extend(new_ups);
+                nvs.bounds.borrow_mut().upper_mut().extend(new_ups);
             }
             Type::Infer(nvs)
         }
@@ -2000,10 +2000,14 @@ mod tests {
         let Type::Infer(gamma_var) = &gamma else {
             unreachable!()
         };
-        gamma_var.bounds.borrow_mut().lower.push(Bound::with_subst(
-            Type::Infer(Rc::clone(result_var)),
-            Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
-        ));
+        gamma_var
+            .bounds
+            .borrow_mut()
+            .lower_mut()
+            .push(Bound::with_subst(
+                Type::Infer(Rc::clone(result_var)),
+                Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
+            ));
 
         let app_ty = coalesce(&Type::Infer(Rc::clone(gamma_var)));
         // g(0) : {i | i > 0} ⇒ Int — both the correspondence rename and the
@@ -2053,10 +2057,14 @@ mod tests {
         let Type::Infer(gamma_var) = &gamma else {
             unreachable!()
         };
-        gamma_var.bounds.borrow_mut().lower.push(Bound::with_subst(
-            Type::Infer(Rc::clone(result_var)),
-            Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
-        ));
+        gamma_var
+            .bounds
+            .borrow_mut()
+            .lower_mut()
+            .push(Bound::with_subst(
+                Type::Infer(Rc::clone(result_var)),
+                Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
+            ));
 
         // The consumer edge first: g(0) flows into an argument slot.
         let consumer = fresh_var(0);
@@ -2100,7 +2108,7 @@ mod tests {
             let Type::Infer(av) = &app else {
                 unreachable!()
             };
-            av.bounds.borrow_mut().lower.push(Bound::with_subst(
+            av.bounds.borrow_mut().lower_mut().push(Bound::with_subst(
                 r.clone(),
                 Subst::discharge("k", TypedExpr::lit(Lit::Int(lit))),
             ));
