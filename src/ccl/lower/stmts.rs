@@ -6,7 +6,7 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
 use super::*;
 use crate::{
     ccl::{BaseType, Branch, Expr, Lit, Type, TypedExprNode},
-    chl_parser::ast::{AssignTarget, IfBranch, Lit as ChlLit, Span, Spanned, Stmt as ChlStmt},
+    chl_parser::ast::{AssignTarget, IfBranch, Span, Spanned, Stmt as ChlStmt},
     interpreter::{DataSink, HttpServerDataSource, http_server::SharedHttpServer},
 };
 
@@ -960,16 +960,8 @@ fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
 pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
         ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
-            LoweringError::unsupported(annotation.span, unknown_type_name_message(id.as_str()))
+            LoweringError::unsupported(annotation.span, format!("unknown type annotation: {id}"))
         }),
-        // `None` is the unit *value*; the unit *type* is the empty product `{}`
-        // (`docs/chl-spec.md`, "6.6 The empty product is unit"). A literal in
-        // type position is never a type — this arm exists only to say so with
-        // the spelling to use.
-        ChlExpr::Lit(ChlLit::None) => Err(LoweringError::unsupported(
-            annotation.span,
-            "the unit type is written `{}`; `None` is the unit *value*",
-        )),
         // Type application `List(T)`: a type constructor applied to argument
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
@@ -1017,12 +1009,14 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
 /// `docs/chl-spec.md`), or the
 /// inference wildcard `_`. Returns `None` for any other identifier.
 ///
-/// **`Unit` is deliberately not a CHL spelling.** The unit type is written
-/// structurally, as the empty product `{}` (`docs/chl-spec.md`, "6.6 The empty
-/// product is unit") — one spelling, and the one that says what the type *is*.
-/// So this is not simply [`BaseType::from_keyword`]: that reader is the CCL
-/// primitive-name round-trip (`Unit` included, since CCL still renders the type
-/// by that name), and the CHL annotation surface is a strict subset of it.
+/// **`Unit` is not a CHL type name**, and is not reserved as one either — it is
+/// simply undefined here, like any other unbound capitalized identifier. The
+/// unit type is written structurally, as the empty product `{}`
+/// (`docs/chl-spec.md`, "6.6 The empty product is unit").
+///
+/// So this is not simply [`BaseType::from_keyword`]. That reader is the CCL
+/// primitive-name round-trip, where `Unit` stays, since CCL renders the type by
+/// that name; the CHL annotation surface is a strict subset of it.
 fn name_type(id: &str) -> Option<Type> {
     if let Some(base) = BaseType::from_keyword(id) {
         // `Unit` round-trips as a CCL primitive name but is not writable here.
@@ -1037,18 +1031,6 @@ fn name_type(id: &str) -> Option<Type> {
         "_" => Some(Type::Hole),
         _ => None,
     }
-}
-
-/// The diagnostic for an identifier that is not a writable CHL type name.
-///
-/// `Unit` gets its own sentence because it is not merely unknown — it names the
-/// right type by a spelling CHL does not have, so the generic "unknown type
-/// annotation" would read as if unit were missing entirely.
-fn unknown_type_name_message(id: &str) -> String {
-    if BaseType::from_keyword(id) == Some(BaseType::Unit) {
-        return "the unit type is written `{}`, the empty product".to_string();
-    }
-    format!("unknown type annotation: {id}")
 }
 
 /// Extract the simple-name head of a type application (`List` in `List(T)`).

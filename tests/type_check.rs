@@ -164,7 +164,7 @@ fn bool_ty() -> Type {
 #[case::int("2", int_lit(2))]
 #[case::string(r#""hi""#, str_lit("hi"))]
 #[case::bool_lit("True", bool_lit(true))]
-#[case::none("None", Type::Base(BaseType::Unit))]
+#[case::unit("()", Type::Base(BaseType::Unit))]
 fn test_literal(#[case] code: &str, #[case] expected: Type) {
     assert_eq!(infer_program(code), expected);
 }
@@ -1231,7 +1231,7 @@ fn brace_type_annotations_project_by_their_keying() {
 #[test]
 fn the_empty_product_is_unit() {
     let unit = Type::Base(BaseType::Unit);
-    assert_eq!(infer_program("x: {} = None\nx"), unit);
+    assert_eq!(infer_program("x: {} = ()\nx"), unit);
     assert_eq!(infer_program("x = ()\nx"), unit);
     // `{}` really constrains: a non-unit value against it is an annotation error.
     assert!(
@@ -1242,20 +1242,24 @@ fn the_empty_product_is_unit() {
 
 /// `{}` is the *only* CHL spelling of the unit type.
 ///
-/// `Unit` names the right type by a name CHL does not have (CCL still renders
-/// it that way, but the surfaces are separate), and `None` is the unit *value*,
-/// not its type. Both are rejected with the spelling to use, rather than
-/// accepted as synonyms — one type, one way to write it.
+/// Neither `Unit` nor `None` is a CHL name at all — not a type spelling, and not
+/// reserved as one. `Unit` names the right type by a name CHL does not have (CCL
+/// renders it that way, but the surfaces are separate), and `None` is gone
+/// entirely, replaced by `()`. Both are therefore ordinary undefined
+/// identifiers, free for a program to bind.
 #[test]
 fn unit_has_one_chl_spelling() {
-    for src in ["x: Unit = None\nx", "x: None = None\nx"] {
+    for src in ["x: Unit = ()\nx", "x: None = ()\nx"] {
         let errs = lower_program_err(src);
         let msg = format!("{:?}", errs[0]);
         assert!(
-            msg.contains("`{}`"),
-            "the error for {src:?} should point at the `{{}}` spelling, got: {msg}"
+            msg.contains("unknown type annotation"),
+            "expected {src:?} to reject the name as undefined, got: {msg}"
         );
     }
+    // Not reserved: a program may bind either name like any other identifier.
+    assert_eq!(infer_program("Unit = 1\nUnit"), int_lit(1));
+    assert_eq!(infer_program("None = 2\nNone"), int_lit(2));
 }
 
 /// A projection whose target's type is still a *variable* where the projection is
