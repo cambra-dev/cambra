@@ -137,10 +137,12 @@ pub(crate) fn compose(f: Expr, g: Expr) -> Expr {
 
 /// Build a [`TypedExprNode::Tuple`] whose type is inferred from its elements.
 ///
-/// Sets the node's type to `Type::Tuple([e.ty for e in elts])`, using
-/// [`Type::Hole`] for any element whose type is not yet known.
+/// Sets the node's type to the product of the element types, using
+/// [`Type::Hole`] for any element whose type is not yet known. Via
+/// [`Type::tuple`], so a zero-element tuple takes the one empty-product type
+/// (`Unit`) rather than minting a second one.
 pub(crate) fn typed_tuple(elts: Vec<Expr>) -> Expr {
-    let ty = Type::Tuple(elts.iter().map(|e| e.ty.clone()).collect());
+    let ty = Type::tuple(elts.iter().map(|e| e.ty.clone()).collect());
     dbg_typecheck_mv(Expr::tuple(elts).with_ty(ty))
 }
 

@@ -24,7 +24,7 @@
 use std::fmt;
 
 use ariadne::{Color, Config, Label, Report, ReportKind, Source};
-use chumsky::error::{Rich, RichPattern};
+use chumsky::error::{Rich, RichPattern, RichReason};
 
 use crate::chl_parser::ast::Span;
 use crate::chl_parser::lexer::{LexError, Token};
@@ -56,6 +56,16 @@ impl From<LexError> for ParseError {
 pub struct ParseErrorInfo {
     /// Primary span — the source range where the parser failed.
     pub span: Span,
+    /// The message of a **custom** error — one a grammar rule raised itself
+    /// with `Rich::custom` from a `validate`, rather than one chumsky derived
+    /// from a failed token match. A rule raises one when the token sequence
+    /// parsed fine but says something the grammar rejects (`{T}` is a
+    /// well-formed brace group that is not a valid type), so the useful
+    /// diagnostic is the rule's own sentence, not "found X, expected Y".
+    /// Carrying it is load-bearing rather than cosmetic: `found`/`expected` are
+    /// both empty for a custom error, so without this the whole diagnostic
+    /// degrades to a bare "found end of input".
+    pub custom: Option<String>,
     /// Token actually found at the failure point, or `None` for EOF.
     pub found: Option<Token>,
     /// What the parser would have accepted at this position, post-collapse:
@@ -109,6 +119,14 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::Lex(e) => write!(f, "lex error: {e:?}"),
+            ParseError::Parse(info) if info.custom.is_some() => {
+                let msg = info.custom.as_deref().expect("guarded by the match arm");
+                f.write_str(msg)?;
+                for (label, span) in &info.context {
+                    write!(f, " (in {label} at {span})")?;
+                }
+                Ok(())
+            }
             ParseError::Parse(info) => {
                 match &info.found {
                     Some(t) => write!(f, "found '{t}'")?,
@@ -173,6 +191,7 @@ impl<T> ParseResult<T> {
             self.value.ok_or_else(|| {
                 vec![ParseError::Parse(ParseErrorInfo {
                     span: Span::new(0, 0),
+                    custom: None,
                     found: None,
                     expected: vec![],
                     context: vec![],
@@ -214,6 +233,20 @@ impl<T> ParseResult<T> {
     }
 }
 
+/// A byte range for an ariadne [`Label`], normalized so `start <= end`.
+///
+/// ariadne panics ("Label start is after its end") on an inverted range, and
+/// chumsky hands us one for the `.as_context()` spans of an error raised by
+/// `emitter.emit(…)` inside a `validate`: the context's start is recorded where
+/// the labelled parser opened, while the error's own offset has not advanced
+/// past it, so an outer context can come out as e.g. `3..2`. An inverted span
+/// carries no extent, only a position, so collapse it to an empty span at the
+/// context's start — that still points the "while parsing …" note at the right
+/// place instead of aborting the whole report.
+fn label_range(span: Span) -> std::ops::Range<usize> {
+    span.start..span.end.max(span.start)
+}
+
 impl ParseError {
     /// Build an ariadne [`Report`] with default (colour-on) configuration.
     pub fn to_report<'a>(
@@ -246,7 +279,7 @@ impl ParseError {
                     .with_config(config)
                     .with_message("lex error")
                     .with_label(
-                        Label::new((src_name, span.into()))
+                        Label::new((src_name, label_range(span)))
                             .with_message(msg)
                             .with_color(Color::Red),
                     )
@@ -257,7 +290,7 @@ impl ParseError {
                     .with_config(config)
                     .with_message("parse error")
                     .with_label(
-                        Label::new((src_name, info.span.into()))
+                        Label::new((src_name, label_range(info.span)))
                             .with_message(primary_label_message(info))
                             .with_color(Color::Red),
                     );
@@ -265,7 +298,7 @@ impl ParseError {
                 // unwinds; reverse so the report reads outside-in.
                 for (label, span) in info.context.iter().rev() {
                     report = report.with_label(
-                        Label::new((src_name, (*span).into()))
+                        Label::new((src_name, label_range(*span)))
                             .with_message(format!("while parsing {label}"))
                             .with_color(Color::Yellow),
                     );
@@ -277,6 +310,12 @@ impl ParseError {
 }
 
 fn primary_label_message(info: &ParseErrorInfo) -> String {
+    // A rule that rejected what it parsed already said why, in a sentence
+    // aimed at the construct; the derived found/expected pair would only
+    // restate the tokens it accepted.
+    if let Some(msg) = &info.custom {
+        return msg.clone();
+    }
     let mut s = String::new();
     match &info.found {
         Some(t) => s.push_str(&format!("found '{t}'")),
@@ -362,6 +401,10 @@ const CATEGORIES: &[(&str, &[Token])] = &[
 fn rich_to_info(err: Rich<'_, Token, Span>) -> ParseErrorInfo {
     let span = *err.span();
     let found = err.found().cloned();
+    let custom = match err.reason() {
+        RichReason::Custom(msg) => Some(msg.clone()),
+        _ => None,
+    };
 
     // Bucket each `RichPattern` entry.
     let mut tokens: Vec<Token> = Vec::new();
@@ -422,6 +465,7 @@ fn rich_to_info(err: Rich<'_, Token, Span>) -> ParseErrorInfo {
 
     ParseErrorInfo {
         span,
+        custom,
         found,
         expected,
         context,

@@ -368,11 +368,16 @@ pub enum Expr {
     /// [`crate::ccl::Type::Tuple`] in annotation position and rejects it in
     /// value position.
     ///
-    /// A **one-element** group is accepted here and lowered to a one-tuple
-    /// type, so `{T}` and `{T,}` mean the same thing. That is the one spelling
-    /// the decided brace-form rules change rather than extend: a one-tuple
-    /// type requires the comma, matching the term-level `(e,)`/`(e)` split.
-    /// See `docs/chl-spec.md`, "2.4 Atoms".
+    /// Braces in type position are always a *product*, never grouping, which
+    /// fixes both ends of the arity range (`docs/chl-spec.md`, "2.4 Atoms"):
+    ///
+    /// - **One element** carries the trailing comma, `{T,}`, matching the
+    ///   term-level `(e,)`/`(e)` split. A comma-free `{T}` is rejected by the
+    ///   parser, so it never reaches this variant.
+    /// - **Zero elements** — `{}` — is the product of zero types, i.e. `Unit`
+    ///   (`docs/chl-spec.md`, "6.6 The empty product is unit"). Lowering maps
+    ///   the empty group there; it does *not* build an empty
+    ///   [`crate::ccl::Type::Tuple`], which is not a valid type.
     BraceGroup(Vec<Spanned<Expr>>),
 
     /// Subscript: `target[index]` — **collection lookup only**. Projecting a product

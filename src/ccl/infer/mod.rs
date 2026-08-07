@@ -109,9 +109,15 @@ use solve::check_scope_valid;
 /// builds dense `Index` products from 0). For a *sparse* / open index
 /// position (an index projection's domain), the emitter pads to a dense
 /// `Tuple` explicitly rather than going through here — see `emit_proj`.
+///
+/// **No fields → [`BaseType::Unit`]**, via [`Type::tuple`] / [`Type::record`]:
+/// the product of zero types is the unit type, and it has exactly one
+/// representation (`docs/chl-spec.md`, "6.6 The empty product is unit").
 pub(super) fn product(fields: BTreeMap<FieldKey, Type>) -> Type {
     if fields.keys().all(|k| matches!(k, FieldKey::Name(_))) {
-        Type::Record(
+        // Empty is all-`Name` vacuously, so this arm also takes the no-field
+        // case; `Type::record` maps it to `Unit`.
+        Type::record(
             fields
                 .into_iter()
                 .map(|(k, t)| match k {
@@ -123,7 +129,7 @@ pub(super) fn product(fields: BTreeMap<FieldKey, Type>) -> Type {
     } else {
         // BTreeMap iterates in key order, so dense `Index` keys come out
         // in position order.
-        Type::Tuple(fields.into_values().collect())
+        Type::tuple(fields.into_values().collect())
     }
 }
 

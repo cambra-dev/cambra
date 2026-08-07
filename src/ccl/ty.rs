@@ -600,6 +600,41 @@ fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
 }
 
 impl Type {
+    /// The product of `elems` — a [`Type::Tuple`], or [`BaseType::Unit`] when
+    /// there are none.
+    ///
+    /// **There is exactly one empty product and it is `Unit`.** `Tuple([])` and
+    /// `Record([])` are not valid types (`docs/chl-spec.md`, "6.6 The empty
+    /// product is unit"), so any site building a tuple type from a
+    /// *variable-length* collection must come through here rather than naming
+    /// the variant. Sites with a literal two-or-more-element `vec![…]` can
+    /// construct `Type::Tuple` directly — the invariant is not in question
+    /// there.
+    ///
+    /// Two spellings for one type would not merely be untidy, they would fail
+    /// to *reconcile*: a product with no fields has no keys to distinguish
+    /// positional from named keying, so independent sites would each pick an
+    /// empty spelling arbitrarily, and the post-inference consistency wall
+    /// (which compares a node's recorded type against one rebuilt from its
+    /// children) would reject the node — reporting the self-contradictory
+    /// `expected (), found ()`, since both spellings render the same.
+    pub fn tuple(elems: Vec<Self>) -> Self {
+        if elems.is_empty() {
+            return Type::Base(BaseType::Unit);
+        }
+        Type::Tuple(elems)
+    }
+
+    /// The named product of `fields` — a [`Type::Record`], or
+    /// [`BaseType::Unit`] when there are none. See [`Type::tuple`] for why the
+    /// empty case collapses.
+    pub fn record(fields: Vec<(String, Self)>) -> Self {
+        if fields.is_empty() {
+            return Type::Base(BaseType::Unit);
+        }
+        Type::Record(fields)
+    }
+
     /// Helper for creating a non-dependent **compute** function type
     /// (`name: None`, `kind: Compute`).
     pub fn fun(domain: Self, codomain: Self) -> Self {
