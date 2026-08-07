@@ -374,9 +374,9 @@ pub enum Expr {
     /// - **One element** carries the trailing comma, `{T,}`, matching the
     ///   term-level `(e,)`/`(e)` split. A comma-free `{T}` is rejected by the
     ///   parser, so it never reaches this variant.
-    /// - **Zero elements** — `{}` — is the product of zero types, i.e. `Unit`
-    ///   (`docs/chl-spec.md`, "6.6 The empty product is unit"). Lowering maps
-    ///   the empty group there; it does *not* build an empty
+    /// - **Zero elements** — `{}` — is the **unit type**, not a zero-field
+    ///   product (`docs/chl-spec.md`, "6.6 The empty product is unit"). Lowering
+    ///   maps the empty group there; it does *not* build an empty
     ///   [`crate::ccl::Type::Tuple`], which is not a valid type.
     BraceGroup(Vec<Spanned<Expr>>),
 

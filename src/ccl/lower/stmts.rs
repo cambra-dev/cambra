@@ -956,7 +956,7 @@ fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
 ///   (`Expr::BraceGroup`), including the one-element `{T,}` — the trailing
 ///   comma is what makes it a product, and the parser rejects a comma-free
 ///   `{T}`.
-/// - The empty group `{}` — the product of zero types, i.e. `Unit`.
+/// - The empty group `{}` — the unit type, `Unit`.
 pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
         ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
@@ -982,8 +982,9 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
         }
         // Tuple type `{T, U}` — and `{T,}` for one element, the trailing comma
         // being what makes it a product (the parser rejects a comma-free
-        // `{T}`). The **empty** group `{}` is the product of zero types, which
-        // is unit: there is one empty product and `Tuple([])` is not it (see
+        // `{T}`). The **empty** group `{}` is the **unit type** — not a
+        // zero-field product, of which there is none: a product with no fields
+        // is unit, and `Tuple([])` is not a valid type (see
         // `docs/chl-spec.md`, "6.6 The empty product is unit").
         ChlExpr::BraceGroup(parts) if parts.is_empty() => Ok(Type::Base(BaseType::Unit)),
         ChlExpr::BraceGroup(parts) => Ok(Type::Tuple(
@@ -1011,7 +1012,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
 ///
 /// **`Unit` is not a CHL type name**, and is not reserved as one either — it is
 /// simply undefined here, like any other unbound capitalized identifier. The
-/// unit type is written structurally, as the empty product `{}`
+/// unit type is written structurally, as `{}`
 /// (`docs/chl-spec.md`, "6.6 The empty product is unit").
 ///
 /// So this is not simply [`BaseType::from_keyword`]. That reader is the CCL

@@ -315,7 +315,7 @@ where
         //     (`Expr::BraceRecord`)
         //   - no item has a value → colon-free brace group `{T, U}`
         //     (tuple type, `Expr::BraceGroup`); the empty group `{}` is the
-        //     product of zero types, i.e. unit
+        //     unit type
         //   - anything else (expression keys, mixed) → error: it is neither a
         //     record type nor a tuple type
         //
@@ -368,9 +368,8 @@ where
                     ));
                     Spanned::new(span, Expr::Error)
                 } else if with_value == 0 {
-                    // Tuple type `{T, U}` / one-tuple `{T,}` / unit `{}` — the
-                    // product of zero types (`lower_type_annotation` reads the
-                    // empty group as `Unit`).
+                    // Tuple type `{T, U}` / one-tuple `{T,}` / unit `{}`
+                    // (`lower_type_annotation` reads the empty group as `Unit`).
                     let elts = items.into_iter().map(|(k, _)| k).collect();
                     Spanned::new(span, Expr::BraceGroup(elts))
                 } else {
@@ -1274,7 +1273,7 @@ mod tests {
         assert_eq!(elts.len(), 2);
         // A one-element product needs its trailing comma to say so.
         assert!(matches!(parse_e("{Int,}").node, Expr::BraceGroup(v) if v.len() == 1));
-        // The empty group is the product of zero types — `Unit` after lowering.
+        // The empty group is the unit type — `Unit` after lowering.
         assert!(matches!(parse_e("{}").node, Expr::BraceGroup(v) if v.is_empty()));
     }
 

@@ -684,11 +684,10 @@ fn lower_expr_inner(
         ChlExpr::ListComp(comp) => lower_list_comp(comp, ctx),
         ChlExpr::GenExp(comp) => lower_list_comp(comp, ctx),
         ChlExpr::Call { func, args } => lower_call(func, args, ctx),
-        // `()` is the **unit value** — the empty product, and CHL's only
-        // spelling for it (`docs/chl-spec.md`, "6.6 The empty product is
-        // unit"). It lowers to the CCL unit literal rather than a zero-element
-        // `Tuple` node, so the one unit value has one term representation, just
-        // as it has one type. Collapsed here, at the surface boundary, rather
+        // `()` is the **unit value**, and CHL's only spelling for it
+        // (`docs/chl-spec.md`, "6.6 The empty product is unit"). It lowers to
+        // the CCL unit literal rather than a zero-element `Tuple` node, so the
+        // one unit value has one term representation, just as it has one type. Collapsed here, at the surface boundary, rather
         // than in `Expr::tuple`: internal passes build tuples from
         // variable-length collections and a silent arity-0 reinterpretation
         // there would reach code this decision is not about.

@@ -480,7 +480,7 @@ mod tests {
     #[case("2", "2")]
     #[case(r#""hi""#, r#""hi""#)]
     #[case("True", "true")]
-    // `()` is the unit value — the empty product, CHL's only spelling for it.
+    // `()` is the unit value — CHL's only spelling for it.
     #[case("()", "unit")]
     // Variable
     #[case("x", "x")]
