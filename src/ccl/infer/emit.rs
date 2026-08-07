@@ -1365,8 +1365,8 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 /// `writes`, read off the writer body's codomain — `(field, value_ty)`. Each
 /// becomes a virtual register-record key `to_<defer>: Fun(domain, value_ty)` (the
 /// per-position feed output stream). The decision codomain is the variant
-/// `[.Commit(𝑃) | .Abort]`; the taps live inside the (dense) `Commit` payload
-/// record `𝑃`, so peel `Commit` and drop the `writes` field.
+/// `` {`commit{𝑃} | `abort} ``; the taps live inside the (dense) `commit` payload
+/// record `𝑃`, so peel `commit` and drop the `writes` field.
 pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
@@ -1393,11 +1393,11 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 /// Type one transaction writer against the register's per-key value types.
 ///
 /// `key_types` maps each register key to the type of one committed value. The body
-/// is `Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), [.Commit(⟨writes:
-/// Tuple(new_{w₀}, …), to_<defer>*⟩) | .Abort])`, where snapshot position `i` is
+/// is ``Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {`commit{writes:
+/// Tuple(new_{w₀}, …), to_<defer>*} | `abort})``, where snapshot position `i` is
 /// `read_keys[i]`'s value type and each `writes` entry `new_j <: write_keys[j]`'s
-/// value type. The `.Commit`/`.Abort` tag is the whole-transaction grant/deny;
-/// any extra `to_<defer>` fields ride the `.Commit` payload as width-subtyped taps.
+/// value type. The `` `commit ``/`` `abort `` tag is the whole-transaction grant/deny;
+/// any extra `to_<defer>` fields ride the `` `commit `` payload as width-subtyped taps.
 fn emit_transact_writer<C: Typing>(
     writer: &mut WriterSite,
     key_types: &std::collections::HashMap<Name, Type>,
@@ -1433,10 +1433,10 @@ fn emit_transact_writer<C: Typing>(
         new_tys.push(new.clone());
         news.push((new, bound));
     }
-    // Decision codomain: the variant `[.Commit(𝑃) | .Abort]`. `𝑃` is the (dense)
+    // Decision codomain: the variant `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense)
     // payload record carrying at least `writes: Tuple(new_j…)` — the body's real
-    // `Commit` payload width-subtypes to it (its `to_<defer>` taps are extra
-    // fields). Tag order is `Commit`=0, `Abort`=1, matching
+    // `commit` payload width-subtypes to it (its `to_<defer>` taps are extra
+    // fields). Tag order is `commit`=0, `abort`=1, matching
     // `ccl_utils::decision_variant_ty` and the runtime `body_decision_at` decode;
     // variant subtyping matches tags by name, so the order is not load-bearing
     // for the constraint, only for the stamped index resolution downstream.

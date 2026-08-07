@@ -12,7 +12,7 @@ use crate::ccl::{
 
 /// The `commit` selector field of the **intermediate** decision record the two
 /// writer phases build (`{commit, writes, to_<defer>*}`) *before*
-/// [`wrap_decision_variant`] folds it into the `[.Commit(𝑃) | .Abort]` variant.
+/// [`wrap_decision_variant`] folds it into the `` {`commit{𝑃} | `abort} `` variant.
 /// The whole-transaction grant/deny is no longer a decision-codomain field — it
 /// is the variant *tag* — so this constant is phase-internal plumbing, not part
 /// of the observable decision protocol (hence it lives here, beside the wrapper,
@@ -87,8 +87,8 @@ pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(String, Expr
     Expr::new(TypedExprNode::Record(fields)).with_ty(ty)
 }
 
-/// The decision **variant** type `[.Commit(𝑃) | .Abort]` over a (dense) payload
-/// record type `𝑃` (`{writes, to_<defer>*}`). Tag order is `Commit`=0, `Abort`=1
+/// The decision **variant** type `` {`commit{𝑃} | `abort} `` over a (dense) payload
+/// record type `𝑃` (`{writes, to_<defer>*}`). Tag order is `commit`=0, `abort`=1
 /// — the positions [`wrap_decision_variant`] injects and `body_decision_at`
 /// decodes.
 pub fn decision_variant_ty(payload_ty: Type) -> Type {
@@ -98,7 +98,7 @@ pub fn decision_variant_ty(payload_ty: Type) -> Type {
     ])
 }
 
-/// The `Commit` payload record type of a decision variant `[.Commit(𝑃) | .Abort]`
+/// The `commit` payload record type of a decision variant `` {`commit{𝑃} | `abort} ``
 /// (peeling outer refinements).
 pub fn commit_payload_ty(decision_ty: &Type) -> Type {
     let mut t = decision_ty;
@@ -109,17 +109,17 @@ pub fn commit_payload_ty(decision_ty: &Type) -> Type {
         Type::Variant(tags) => tags
             .iter()
             .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
-            .unwrap_or_else(|| panic!("decision variant lacks a `Commit` tag: {decision_ty}"))
+            .unwrap_or_else(|| panic!("decision variant lacks a `commit` tag: {decision_ty}"))
             .1
             .clone(),
         other => panic!("expected a decision variant type, got {other}"),
     }
 }
 
-/// The point-free one-arm eliminator `variant_project(Commit) : 𝑑 ⇒ 𝑃` reading a
-/// decision stream's `Commit` payload — inserted before a `.writes`/`.to_<defer>`
-/// read so a `Fun(D, [.Commit(𝑃)|.Abort])` history projects its committing
-/// payload. (`Abort` positions carry no payload and drop out of the eliminated
+/// The point-free one-arm eliminator ``variant_project(`commit) : 𝑑 ⇒ 𝑃`` reading a
+/// decision stream's `commit` payload — inserted before a `.writes`/`.to_<defer>`
+/// read so a `` Fun(D, {`commit{𝑃} | `abort}) `` history projects its committing
+/// payload. (`abort` positions carry no payload and drop out of the eliminated
 /// stream; a read is only meaningful at committing positions.)
 pub fn commit_project(decision_ty: &Type) -> Expr {
     // The projection names the tag, so a decision variant materialized in any arm
@@ -133,10 +133,10 @@ pub fn commit_project(decision_ty: &Type) -> Expr {
 
 /// Wrap a writer **decision record** `{commit, writes, to_<defer>*}` (the
 /// intermediate the two phases build via [`writer_decision_record`]) into the
-/// **decision variant** `Case[ commit → .Commit(⟨writes, to_<defer>*⟩) ; true →
-/// .Abort(unit) ]`. The `commit` field becomes the value-`Case` **selector** (its
+/// **decision variant** `Case[ commit → .commit(⟨writes, to_<defer>*⟩) ; true →
+/// `abort(unit) ]``. The `commit` field becomes the value-`Case` **selector** (its
 /// disjunction of path conditions) rather than a stored field; the remaining
-/// fields are the (dense) `Commit` payload. This is the single site both the
+/// fields are the (dense) `commit` payload. This is the single site both the
 /// transaction writer and the induction writer funnel through, so the variant is
 /// built in exactly one place and `body_decision_at` decodes one shape.
 ///

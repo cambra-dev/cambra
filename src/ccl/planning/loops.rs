@@ -552,11 +552,11 @@ fn collapse_snapshot_sources(e: &mut Expr, reg: &Name, reg_ty: &Type) {
 /// `__hist ≫ .to_<feed>` taps) become register-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let (domain_ty, decision_ty) = fun_parts(&h.ty);
-    // The decision codomain is the variant `[.Commit(𝑃) | .Abort]`; the feed taps
-    // ride the (dense) `Commit` payload record `𝑃` alongside `writes`.
+    // The decision codomain is the variant `` {`commit{𝑃} | `abort} ``; the feed taps
+    // ride the (dense) `commit` payload record `𝑃` alongside `writes`.
     let payload_ty = commit_payload_ty(&decision_ty);
     let Type::Record(payload_field_tys) = &payload_ty else {
-        panic!("letrec recognition: Commit payload is not a record: {payload_ty}");
+        panic!("letrec recognition: commit payload is not a record: {payload_ty}");
     };
     let feed_fields: Vec<(String, Type)> = payload_field_tys
         .iter()
@@ -686,9 +686,9 @@ fn rewrite_hist_reads(
 ) {
     if let TypedExprNode::Compose(elts) = &e.node
         && matches!(elts.first().map(|x| &x.node), Some(TypedExprNode::Var(n)) if n == h)
-        // The phase now interposes a `variant_project(Commit)` step between the
+        // The phase now interposes a ``variant_project(`commit)`` step between the
         // history var and the `.writes`/`.to_<feed>` reads, eliminating the
-        // `[.Commit(𝑃) | .Abort]` decision to its dense payload. Skip it, then
+        // `` {`commit{𝑃} | `abort} `` decision to its dense payload. Skip it, then
         // match the payload-field prefix as before (`elts[2]`/`elts[3]`).
         && matches!(
             elts.get(1).map(|x| &x.node),
@@ -708,7 +708,7 @@ fn rewrite_hist_reads(
                     Some((reg_field_read(reg, reg_ty, field, field_ty), 4))
                 }
                 (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
-                    // A tap read `__hist ≫ variant_project(Commit) ≫ .to_<feed>`:
+                    // A tap read ``__hist ≫ variant_project(`commit) ≫ .to_<feed>``:
                     // its stream type is the register record\'s field type.
                     let field = f.clone();
                     let field_ty = reg_ty_field(reg_ty, &field);

@@ -554,9 +554,9 @@ this section states how the letrec model *delivers* them.
 - **Atomicity is representational**: one commit record per block. There is no partially visible
   commit because no term denotes one.
 - **Read-your-writes** within a block is `let` shadowing inside the record body.
-- **Deny** (`if` around a write, no path taken) is the decision's **`.Abort`** tag; `get_prev_txn`
+- **Deny** (`if` around a write, no path taken) is the decision's **`` `abort ``** tag; `get_prev_txn`
   skips it. A denied transaction contributes no visible write and no reply. A *committing*
-  transaction is **`.Commit(⟨writes, replies⟩)`** — the (dense) write/reply payload rides the tag, so
+  transaction is **`` `commit(⟨writes, replies⟩) ``** — the (dense) write/reply payload rides the tag, so
   an illegal "no-commit yet real writes" state is unrepresentable.
 - **Induction and transaction domains are independent.** In the worked example's model form `cnt`
   advances per request even though its write sits inside the block (a mix the current lowering
@@ -832,17 +832,17 @@ Every fan-out shares one first-match encoding, `πᵢ = 𝑔ᵢ ∧ ¬⋁ⱼ˂�
 `ccl_utils`, shared between channelize, the value fan-outs, and the transaction path walk).
 
 A **conditional induction write** takes a different, simpler route than the value fan-out: it rides
-the induction accumulator's own `[.Commit(⟨writes⟩) | .Abort]` **decision variant** rather than a union of
+the induction accumulator's own `` {`commit{writes} | `abort} `` **decision variant** rather than a union of
 restricted sources. `lower_loop_body_chain` lowers `if 𝑝: acc += e` to a statement-position `Case`
 (`[𝑝 → acc += e; true → unit]`), and `mut_elim::transform_chain`'s `Case` arm merges its
 branches into **one uniform, carry-complete writer decision over the full loop source**: a committing
-position is `.Commit(⟨writes⟩)` and a full-carry (non-writing) position is `.Abort`. The commit
+position is `` `commit(⟨writes⟩) `` and a full-carry (non-writing) position is `` `abort ``. The commit
 selector is `⋁ⱼ π̂ⱼ` (the disjunction of the writing branches' first-match guards — the value-`Case`
-guard that picks the `.Commit` arm; `ccl_utils::wrap_decision_variant` folds it into the tag), and
+guard that picks the `` `commit `` arm; `ccl_utils::wrap_decision_variant` folds it into the tag), and
 each accumulator's `writesᵢ = Case[π̂ⱼ → wⱼᵢ; …; true → snapshotᵢ]` — a per-accumulator value-`Case`
-whose trailing `true` arm is the **carry** (the entering accumulator). `.Abort` positions are dropped
+whose trailing `true` arm is the **carry** (the entering accumulator). `` `abort `` positions are dropped
 from the changelog store (`InductionStore`, see `../../interpreter/design-operators.md`) — sparse —
-and the carry arm keeps the `.Commit` payload **dense** (total at every committing position). So the `Overwrite`/`Feed` distinction and
+and the carry arm keeps the `` `commit `` payload **dense** (total at every committing position). So the `Overwrite`/`Feed` distinction and
 the carry-forward live *inside one decision on one writer* — no per-leg restricted source, no
 complement leg, and none of the cyclic-convergence hazard a restricted-source multi-leg realization
 carried. Recognition packages it as an ordinary single-writer `Transact`; op-conversion routes it to
@@ -915,18 +915,18 @@ mutually exclusive and, taken together with the implicit empty arm of a guard th
 exhaustive: exactly one path runs per transaction.
 
 Paths are a *compile-time* enumeration, not a runtime branch: the walk visits every path and emits
-**one** decision variant, whose `.Commit`/`.Abort` tag and per-tap fire fields are path conditions
+**one** decision variant, whose `` `commit ``/`` `abort `` tag and per-tap fire fields are path conditions
 and whose per-key writes are `Case`s over the local branch guards — so every path is evaluated in
 one straight-line writer body and one transaction is still one decision. Walking a block threads
 `(path, env)` (read-your-writes) and the block denotes
-`snapshot ⇒ [.Commit(⟨writes, to_<defer>*⟩) | .Abort]` — a decision **variant**
+`` snapshot ⇒ {`commit{writes, to_<defer>*} | `abort} `` — a decision **variant**
 (`ccl_utils::wrap_decision_variant`) where:
 
-- **the `.Commit`/`.Abort` tag is chosen by the disjunction of the path-conditions of every
+- **the `` `commit ``/`` `abort `` tag is chosen by the disjunction of the path-conditions of every
   mutable write and feed** (`or_commit`; an empty taken path — a position matching no guard, including a
-  missing `else` — is `.Abort`). A spine write's path is `true`, so a write beside a guard commits
+  missing `else` — is `` `abort ``). A spine write's path is `true`, so a write beside a guard commits
   unconditionally: **a guard scopes only its own arm's writes**, not the whole transaction. (This
-  subsumes the former single-deny: `if 𝑝: x := 𝑒` → one write at path `𝑝` → `.Commit` iff `𝑝`,
+  subsumes the former single-deny: `if 𝑝: x := 𝑒` → one write at path `𝑝` → `` `commit `` iff `𝑝`,
   observationally identical.) The whole-transaction grant/deny is the *tag*, not a `commit` field — an
   illegal "denied yet real writes" state is unrepresentable.
 - **each written key is rejoined as a carry-forward `Case`** over the branch structure
@@ -964,7 +964,7 @@ leading-deny elif chain as unsupported until the position-0 as-of latch is gener
 
 **Not yet implemented**: `with t = begin():` (the handle) is still rejected.
 
-**Future work (deferred optimizations).** The `.Commit` payload is currently **dense**:
+**Future work (deferred optimizations).** The `` `commit `` payload is currently **dense**:
 an unwritten key on a committing path carries its snapshot value (a no-op re-write), and a routed
 reply tap carries a `to_<defer>_k__fire : Bool` gate (`F_FIRE_SUFFIX`) the engine checks. Two deferred
 refinements, scoped by the review as "worth doing later, not now":
@@ -974,7 +974,7 @@ refinements, scoped by the review as "worth doing later, not now":
    snapshot. This needs a dense presence encoding: a naive sparse per-key column is silently dropped
    by the record `zip`'s inner-join (it deletes the committing positions where any conditionally-
    written key is absent), so it cannot be a bare non-exhaustive `Case`.
-2. **Folding `__fire` into payload presence** — a routed reply would be *present in the `.Commit`
+2. **Folding `__fire` into payload presence** — a routed reply would be *present in the `` `commit ``
    payload iff its route fired*, retiring the separate `to_<defer>_k__fire` gate. Same dense-presence
    requirement as (1).
 

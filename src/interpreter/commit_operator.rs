@@ -702,7 +702,7 @@ pub fn full_store_tiling(key_extent: &Extent, value_extent: &Extent) -> Tiling {
 }
 
 /// Field names of the proposal-stream codomain record. `F_WRITES` is shared with
-/// the CCL side: it names the writer decision's `Commit`-payload write tuple (the
+/// the CCL side: it names the writer decision's `commit`-payload write tuple (the
 /// contract between the letrec phase, inference, and this engine) and is reused
 /// here for the proposal's write-set map.
 const F_SNAP: &str = "snap";
@@ -1167,9 +1167,9 @@ fn source_value_at(codomain: &Tile, i: usize) -> Value {
 /// producer**: the driver holds the engine, folds the previous accumulator out of
 /// it ([`CommitEngine::read_as_of`], defaulting below the earliest change to the
 /// key's init), feeds the body `(prev…, item)` through a [`BodyInputBuffer`], reads
-/// the body's `[.Commit(⟨writes⟩) | .Abort]` decision ([`body_decision_at`] decodes
+/// the body's `` {`commit{writes} | `abort} `` decision ([`body_decision_at`] decodes
 /// the union tag), and [`step`](CommitEngine::step)s the engine — a `.Commit`
-/// position appends a change, an `.Abort` (a failed guard) is a **carry** (no
+/// position appends a change, an `` `abort `` (a failed guard) is a **carry** (no
 /// change; the value inherits).
 ///
 /// The key structural difference from the retired dense `Recurse` realization:
@@ -1177,15 +1177,15 @@ fn source_value_at(codomain: &Tile, i: usize) -> Value {
 /// cyclic `FanOut`** — the previous value is always available before the body
 /// needs it, and a conditional write's carry positions simply produce no change
 /// rather than having to synthesize a same-value "write" on a complement leg.
-/// A plain (unconditional) `mut` loop is the degenerate `.Commit`-everywhere
+/// A plain (unconditional) `mut` loop is the degenerate `` `commit ``-everywhere
 /// case (a dense changelog); a conditional write is sparse in position space
-/// (`.Abort` positions append nothing) while the frontier still tracks the whole extent.
+/// (`` `abort `` positions append nothing) while the frontier still tracks the whole extent.
 pub struct InductionStore {
     /// Per accumulator key, its runtime key and the acyclic operator producing
     /// its tick-0 fold default (the accumulator's init; read once at subscribe,
     /// like [`CommitOperator::with_init_ops`]). Written in `write_keys` order.
     init_ops: Vec<(Value, Box<dyn TileOperator>)>,
-    /// The writer body `λ (prev…, item) → [.Commit(⟨writes(, to_<defer>…)⟩) | .Abort]`,
+    /// The writer body `` λ (prev…, item) → {`commit{writes(, to_<defer>…)} | `abort} ``,
     /// compiled around a [`BodyInputSource`] over `buffer`.
     body_op: Box<dyn TileOperator>,
     /// The iteration source `Fun(D, item)` — the loop extent's items in order.
@@ -2604,7 +2604,7 @@ impl TileProducer for BodyInputSourceProducer {
     }
 }
 
-/// The `Commit` tag of the decision variant `[.Commit(𝑃) | .Abort]`. A union
+/// The `commit` tag of the decision variant `` {`commit{𝑃} | `abort} ``. A union
 /// column keys its arms by name, so the decode matches the tag the CCL side
 /// built and neither end depends on the variant's arm order.
 fn is_commit_tag(tag: &crate::ccl::FieldKey) -> bool {
@@ -2613,11 +2613,11 @@ fn is_commit_tag(tag: &crate::ccl::FieldKey) -> bool {
 
 /// Extract a writer body's grant/deny *decision* at buffer position `pos`.
 ///
-/// The body returns a **decision variant** `[.Commit(𝑃) | .Abort]` (see
+/// The body returns a **decision variant** `` {`commit{𝑃} | `abort} `` (see
 /// [`crate::ccl::V_COMMIT`]/[`crate::ccl::V_ABORT`]): the codomain is a
 /// `Scalar(Union)` column, one `Value::Union { tag, inner }` per position.
-/// `Abort` (any tag but `Commit` — see [`is_commit_tag`]) is a whole-transaction deny — no writes, no
-/// taps (carry / no proposal). `Commit` carries the dense payload record `𝑃 =
+/// `abort` (any tag but `commit` — see [`is_commit_tag`]) is a whole-transaction deny — no writes, no
+/// taps (carry / no proposal). `commit` carries the dense payload record `𝑃 =
 /// {writes: (new₀, …), to_<defer>*(, to_<defer>__fire)*}`.
 ///
 /// Returns `(commit, writes, tap_fired)`: `commit` gates grant vs deny; `writes[j]`
@@ -2645,11 +2645,11 @@ fn body_decision_at(
     let Value::Union { tag, inner } = union_col.index_at(row) else {
         return None;
     };
-    // `Abort` — a whole-transaction deny: no proposal, no taps (carry).
+    // `abort` — a whole-transaction deny: no proposal, no taps (carry).
     if !is_commit_tag(&tag) {
         return Some((false, Vec::new(), Vec::new()));
     }
-    // `Commit` — the payload record `{writes, to_<defer>*}`. The union column
+    // `commit` — the payload record `{writes, to_<defer>*}`. The union column
     // already carried the values materialized at this row, so they are read
     // straight off the record with no per-column extraction step.
     let Value::Record(payload) = *inner else {
@@ -3244,7 +3244,7 @@ impl TileProducer for TransactWriterProducer {
         self.render()
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // Commit-ack: advance past the item each released proposal was for, then
+        // commit-ack: advance past the item each released proposal was for, then
         // compact the released prefix out of the live window. Idempotent.
         self.debug_assert_position_invariant();
         let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard else {
@@ -3389,7 +3389,7 @@ mod tests {
         }
     }
 
-    /// The `Commit` payload extent for a single-key writer: `{writes: {_0: value}}`.
+    /// The `commit` payload extent for a single-key writer: `{writes: {_0: value}}`.
     fn commit_payload_extent() -> Extent {
         Extent::Record(HashMap::from([(
             F_WRITES.to_string(),
@@ -3397,7 +3397,7 @@ mod tests {
         )]))
     }
 
-    /// The decision variant extent `[.Commit(payload) | .Abort]`, keyed by tag —
+    /// The decision variant extent `` {`commit{payload} | `abort} ``, keyed by tag —
     /// so these fixtures name the same arms the CCL side builds, and the order they
     /// are listed in is immaterial.
     fn decision_union_extent(payload: Extent) -> Extent {
@@ -3407,7 +3407,7 @@ mod tests {
         ]))
     }
 
-    /// A `.Commit({writes: {_0, _1, …}})` decision value from its per-key write values.
+    /// A `` `commit({writes: {_0, _1, …}}) `` decision value from its per-key write values.
     fn commit_value(writes: Vec<Value>) -> Value {
         let writes_rec = Value::Record(
             writes
@@ -3425,7 +3425,7 @@ mod tests {
         }
     }
 
-    /// A `.Abort` decision value (a carry / no proposal).
+    /// A `` `abort `` decision value (a carry / no proposal).
     fn abort_value() -> Value {
         Value::Union {
             tag: FieldKey::Name(V_ABORT.into()),
@@ -3434,8 +3434,8 @@ mod tests {
     }
 
     /// A single-accumulator induction-write decision body: over its `(prev, item)`
-    /// input (a `BodyInputSource`), emits `.Commit({writes: {_0: prev + item}})`
-    /// where `guard(item)` holds, else `.Abort` (a carry — the accumulator holds).
+    /// input (a `BodyInputSource`), emits `` `commit({writes: {_0: prev + item}}) ``
+    /// where `guard(item)` holds, else `` `abort `` (a carry — the accumulator holds).
     /// Models the recognized body of `for i in xs: if guard(i): acc += i`.
     struct AddIfBody {
         input: Box<dyn TileOperator>,
@@ -3449,8 +3449,8 @@ mod tests {
         fn new(input: Box<dyn TileOperator>, threshold: i64) -> Self {
             let tiling = Tiling::SealedFunction {
                 domain: Extent::Base(BaseType::UInt),
-                // Decision variant `[.Commit({writes: {_0}}) | .Abort]` — a
-                // `Scalar(Union)` codomain (Commit=0, Abort=1).
+                // Decision variant `` {`commit{{writes: {_0}}} | `abort} `` — a
+                // `Scalar(Union)` codomain (commit=0, abort=1).
                 codomain: Box::new(Tiling::Scalar(decision_union_extent(
                     commit_payload_extent(),
                 ))),
@@ -3505,8 +3505,8 @@ mod tests {
             };
             let prev = record_field(&fields, &tuple_field(0));
             let item = record_field(&fields, &tuple_field(1));
-            // Per row: `item > threshold` → `.Commit({writes: {_0: prev + item}})`,
-            // else `.Abort` (a carry). Builds the decision `Scalar(Union)` column.
+            // Per row: `item > threshold` → `` `commit({writes: {_0: prev + item}}) ``,
+            // else `` `abort `` (a carry). Builds the decision `Scalar(Union)` column.
             let mut rows = Vec::with_capacity(domain.len());
             for j in 0..domain.len() {
                 let (Value::Int(p), Value::Int(i)) = (prev.index_at(j), item.index_at(j)) else {

@@ -1929,13 +1929,13 @@ fn heterogeneous_multi_key_store_reads_string_key() {
 }
 
 // ---------------------------------------------------------------------------
-// Commit|Abort decision variant: off-path partial op + interleaving
+// commit|abort decision variant: off-path partial op + interleaving
 // ---------------------------------------------------------------------------
 
 /// **Cost #1 — off-path partial op does not fault.** A guarded `//` in a
 /// conditional transaction write: `if d != 0: acc := acc // d`. The divisor `d`
 /// starts at 3 and is zeroed on the first commit, so the second request's guard
-/// (`d != 0`, read on the snapshot) is false — an `.Abort`. The write value `acc
+/// (`d != 0`, read on the snapshot) is false — an `` `abort ``. The write value `acc
 /// // d` rides the lazy `⧺ filter_values(d != 0) ≫ (acc // d)` arm the value-`Case`
 /// compiles to, so the division is evaluated only where its guard holds — never at
 /// the `d == 0` position. Were the partial op evaluated off-path it would panic on
@@ -1969,11 +1969,11 @@ fn txn_off_path_guarded_division_does_not_fault() {
     );
 }
 
-/// **Interleaved two-writer Commit/Abort through the store.** Two writer
+/// **Interleaved two-writer commit/abort through the store.** Two writer
 /// sites on the *same* register `pool` interleave committing and aborting
-/// decisions: `10`/`20` always fit (`.Commit`), `200`/`300` never do (`.Abort`).
+/// decisions: `10`/`20` always fit (`` `commit ``), `200`/`300` never do (`` `abort ``).
 /// The variant decision flows through the commit-`Store` codomain — each writer's
-/// `[.Commit(⟨writes⟩) | .Abort]` stream folds into the shared changelog — and the
+/// `` {`commit{writes} | `abort} `` stream folds into the shared changelog — and the
 /// trailing `get_prev_txn` read reads back the conserved value `100 - 10 - 20 =
 /// 70`. The *result* is order-independent by construction — the two commits always
 /// fit and the two aborts never do — but note this test exercises only the single
