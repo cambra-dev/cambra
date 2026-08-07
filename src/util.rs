@@ -52,9 +52,14 @@ pub fn fmt_record<V: std::fmt::Display>(
 /// compile/runtime boundary and must agree: a tag spelled two ways reads as two
 /// different things in a tiling-mismatch panic, which is where these strings are
 /// most often compared.
+/// `open` marks an arm set that commits only to the arms it lists — the demand a
+/// `match` with a default arm makes. It renders a trailing `| …` so a demand
+/// never reads as an exact sum. Only a *demand* is ever open; every producer of
+/// a sum is closed, and the runtime `Extent` cannot be open at all.
 pub fn fmt_variant_arms(
     f: &mut std::fmt::Formatter<'_>,
     arms: impl Iterator<Item = (String, Option<String>)>,
+    open: bool,
 ) -> std::fmt::Result {
     let parts: Vec<String> = arms
         .map(|(tag, payload)| match payload {
@@ -65,7 +70,8 @@ pub fn fmt_variant_arms(
             Some(p) => format!("`{tag}{{{p}}}"),
         })
         .collect();
-    write!(f, "{{{}}}", parts.join(" | "))
+    let ellipsis = if open { " | …" } else { "" };
+    write!(f, "{{{}{ellipsis}}}", parts.join(" | "))
 }
 
 /// A stack of named-binding scopes supporting lexical shadowing.

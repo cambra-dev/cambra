@@ -20,6 +20,7 @@
 // live in a single module.
 
 use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
@@ -28,7 +29,7 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
-use crate::ccl::{Expr, Level, Name, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{Expr, FieldKey, Level, Name, Type, TypedBinding, TypedExprNode};
 
 use super::context::should_generalize;
 use super::typing::peel_refinements_outer;
@@ -364,8 +365,13 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                     nx == ny && types_agree_modulo_unread(x, y, refinements)
                 })
         }
-        (Type::Variant(xs), Type::Variant(ys)) => {
-            xs.len() == ys.len()
+        // Openness is compared, not ignored: two variants differing only in it are
+        // different *demands*. Nothing should reach this check open at all — it runs
+        // on post-phase trees, and coalesce materializes closed — so a disagreement
+        // here is the signal that an `Open` escaped the solver.
+        (Type::Variant(xs, ox), Type::Variant(ys, oy)) => {
+            ox == oy
+                && xs.len() == ys.len()
                 && xs.iter().zip(ys).all(|((kx, x), (ky, y))| {
                     kx == ky && types_agree_modulo_unread(x, y, refinements)
                 })
@@ -853,7 +859,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         TypedExprNode::List(elts)
         | TypedExprNode::Tuple(elts)
-        | TypedExprNode::CollectionUnion(elts) => {
+        | TypedExprNode::Copair(elts)
+        | TypedExprNode::DisjointJoin(elts) => {
             for e in elts.iter_mut() {
                 coalesce_node(e, level, ctx);
             }
@@ -944,6 +951,17 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             if let Some(s) = scrutinee {
                 coalesce_node(s, level, ctx);
             }
+            // The scrutinee's *resolved* tag set, for the dead-arm check below. Taken
+            // after coalescing it, so the tags are concrete.
+            let scrut_tags: Option<Vec<FieldKey>> =
+                scrutinee
+                    .as_ref()
+                    .and_then(|s| match strip_refinements(&s.ty) {
+                        Type::Variant(tags, _) => {
+                            Some(tags.iter().map(|(k, _)| k.clone()).collect())
+                        }
+                        _ => None,
+                    });
             for b in branches.iter_mut() {
                 // A pattern's payload binding scopes the branch's guard and
                 // body, shadowing an outer generalized binding of its name.
@@ -958,7 +976,40 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // for `expr.ty` so it ends up concrete.
                 if let Some(p) = &mut b.pattern {
                     match resolve_var_type(&p.binding.ty) {
-                        Ok(ty) => p.binding.ty = ty,
+                        // An arm the scrutinee can never reach leaves its payload
+                        // variable with no bound at all, so it resolves to a bare
+                        // `Infer`. That is not an error: the arm is unreachable, so
+                        // its payload type is unobservable and any type will do.
+                        // `Unit` is the one that carries no information.
+                        //
+                        // Such arms are *kept*, not pruned. `variant_project` names
+                        // the tag it reads, and a tag the column does not carry
+                        // yields an empty restriction that contributes nothing to
+                        // the union — so a dead arm costs nothing and needs no
+                        // special handling downstream. (Pruning them here instead
+                        // would narrow the arm set relative to the enclosing
+                        // lambda's declared domain, which is what made `match` on a
+                        // function parameter miscompile.)
+                        Ok(ty) if !matches!(ty, Type::Infer(_)) => p.binding.ty = ty,
+                        Ok(_) => {
+                            // Unbound means *unreachable*, and that is checkable
+                            // rather than assumed: a **live** arm's binder takes its
+                            // bound from the scrutinee (`scrut.c <: αᵢ`, the width
+                            // rule with the scrutinee on the left), so an unbound
+                            // binder on a tag the scrutinee *does* carry would mean
+                            // that edge went missing — which is exactly the bug the
+                            // `Openness` marker exists to prevent recurring.
+                            debug_assert!(
+                                scrut_tags.as_ref().is_none_or(|tags| {
+                                    !tags.contains(&FieldKey::Name(p.tag.as_str().into()))
+                                }),
+                                "Case arm `.{}` has an unbound payload type, but the \
+                                 scrutinee carries that tag — the width rule should \
+                                 have constrained it from the scrutinee",
+                                p.tag
+                            );
+                            p.binding.ty = Type::Base(crate::ccl::BaseType::Unit);
+                        }
                         Err(err) => {
                             let label = format!("Case pattern `.{}` payload", p.tag);
                             ctx.push_error(map_coalesce_err(err, &label), label);
@@ -1190,7 +1241,7 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
         Type::Record(fs) => fs
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
-        Type::Variant(tags) => tags
+        Type::Variant(tags, _) => tags
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
         Type::History { value, domain, .. } => {

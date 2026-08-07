@@ -71,6 +71,13 @@ impl UnionOperator {
         // Where the arms genuinely have no join, the positional sum is right: for
         // a concatenation the arm a row came from is part of its identity.
         let codomain = if codomains.windows(2).all(|w| w[0] == w[1]) {
+            // Agreeing arms keep their shared tiling verbatim — including a non-`Scalar`
+            // one, which is the only way this operator ever declares a nested codomain.
+            // `UnionProducer` can build a `Scalar` codomain and nothing else, so a
+            // nested one would fail at its first `get`; it is admitted here only because
+            // agreement means no merge is being described, and rejecting it would refuse
+            // a shape no test reaches either way. If a nested codomain ever does arrive,
+            // the producer's own panic names it.
             codomains[0].clone()
         } else {
             // Differing arms are alternative values at one row, so merging them
@@ -198,9 +205,12 @@ fn flat_merge(tiles: Vec<Tile>, value_extent: &Extent) -> Tile {
     // column in the fed order — matching the sibling `commit` field's domain.
     pairs.sort_by_key(|(pos, _)| *pos);
     // Disjointness is a *precondition*, not something the merge can repair: two
-    // arms claiming one position put two values at one domain key, which is a
-    // monotonic-merge violation however it is resolved — and silently, since the
-    // sort just leaves them adjacent and the longer column flows on. Check it
+    // arms claiming one position put two values at one domain key, which the tile
+    // contract forbids ("known data inside a Tile is immutable" — see the
+    // interpreter's module docs) and which no type checks. It would fail
+    // *silently*: the sort just leaves the duplicates adjacent, and a column one
+    // row too long flows on downstream. The guard fan-out gets disjointness from
+    // first-match and the tag fan-out from the tags; neither is enforced. Check it
     // where the arms are actually side by side rather than trusting the caller: a
     // value-`Case` whose first-match gates overlap, and a tag fan-out that lost a
     // `variant_project` to const-reduction, both land here. The scan is free

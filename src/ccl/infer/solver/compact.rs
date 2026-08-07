@@ -642,7 +642,7 @@ fn compact_go(
                 ..Default::default()
             }
         }
-        Type::Variant(tags) => {
+        Type::Variant(tags, _) => {
             // Variant payloads are covariant — recurse at the same
             // polarity (no flip, unlike Fun's domain). The merge rule
             // for variants flips records' polarity behaviour, but

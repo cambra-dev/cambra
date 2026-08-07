@@ -71,7 +71,7 @@
 //!    they sit in (Compose/Apply/Loop/Case), producing a channel
 //!    expression for each `d_i`.
 //! 2. **Channel assembly.**  Combine multiple feeds per defer via
-//!    `++` ([`TypedExprNode::CollectionUnion`]); lift scalar feeds
+//!    `++` ([`TypedExprNode::Copair`]); lift scalar feeds
 //!    to `Fun(Unit, T)`; emit refined-source channels for filter-feed
 //!    Case shapes.
 //! 3. **Topological emission.**  Emit the cluster's `let d_i =
@@ -937,8 +937,13 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         TypedExprNode::Compose(elts) => {
             TypedExprNode::Compose(elts.into_iter().map(drop_expr_stmts).collect())
         }
-        TypedExprNode::CollectionUnion(elts) => {
-            TypedExprNode::CollectionUnion(elts.into_iter().map(drop_expr_stmts).collect())
+        TypedExprNode::Copair(elts) => {
+            TypedExprNode::Copair(elts.into_iter().map(drop_expr_stmts).collect())
+        }
+        // Kept distinct from the copairing above: this arm *rebuilds* the node, so
+        // sharing it would silently turn a disjoint join into a coproduct.
+        TypedExprNode::DisjointJoin(elts) => {
+            TypedExprNode::DisjointJoin(elts.into_iter().map(drop_expr_stmts).collect())
         }
         TypedExprNode::Record(fields) => TypedExprNode::Record(
             fields
@@ -1034,6 +1039,7 @@ fn contains_phase_marker(expr: &Expr) -> bool {
 fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
     match &expr.node {
         TypedExprNode::Defer => Err(DeferError::UnboundDeferHandle("<defer>".into())),
+        TypedExprNode::DisjointJoin(elts) => elts.iter().try_for_each(assert_no_defer_residue),
         TypedExprNode::Feed { name, .. } | TypedExprNode::Define { name, .. } => {
             Err(DeferError::UnboundDeferHandle(name.base().to_string()))
         }
@@ -1060,7 +1066,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
         TypedExprNode::Tuple(elts)
         | TypedExprNode::List(elts)
         | TypedExprNode::Compose(elts)
-        | TypedExprNode::CollectionUnion(elts) => elts.iter().try_for_each(assert_no_defer_residue),
+        | TypedExprNode::Copair(elts) => elts.iter().try_for_each(assert_no_defer_residue),
         TypedExprNode::Record(fields) => fields
             .iter()
             .try_for_each(|(_, e)| assert_no_defer_residue(e)),
@@ -1331,7 +1337,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
 ///
 /// Each defer's channel is built using the same rules as
 /// [`channelize_defer`]: a single feed passes through, multiple feeds
-/// union via [`TypedExprNode::CollectionUnion`], a `Define` value is
+/// union via [`TypedExprNode::Copair`], a `Define` value is
 /// used directly, and top-level scalar feeds are lifted to `Fun(Unit,
 /// T)` via the `λ __unused → V` wrap inside `extract_for_defer`.
 fn channelize_cluster(
@@ -1720,7 +1726,8 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             TypedExprNode::Tuple(elts)
             | TypedExprNode::List(elts)
             | TypedExprNode::Compose(elts)
-            | TypedExprNode::CollectionUnion(elts) => {
+            | TypedExprNode::Copair(elts)
+            | TypedExprNode::DisjointJoin(elts) => {
                 for e in elts {
                     rec(e, bound, out);
                 }
@@ -1802,12 +1809,12 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
 }
 
 /// A single feed value passes through unchanged.  Multiple feed values
-/// are merged via [`TypedExprNode::CollectionUnion`] — the dedicated
+/// are merged via [`TypedExprNode::Copair`] — the dedicated
 /// N-ary collection-union node — which compiles to a `UnionOperator`
 /// downstream.
 ///
 /// The union is stamped with its type at construction (mirroring
-/// `emit_collection_union`): one `FieldKey::Index(i)` domain tag per operand
+/// `emit_copair`): one `FieldKey::Index(i)` domain tag per operand
 /// `i`, over the shared element codomain. A defer-read operand contributes
 /// its handle's rigid `ChanDom` domain, closed by the final
 /// [`erase_chan_domains`] substitution.
@@ -1816,8 +1823,8 @@ fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
     if feeds.len() == 1 {
         return feeds.pop().unwrap();
     }
-    let ty = collection_union_type(&feeds);
-    Expr::collection_union(feeds).with_ty(ty)
+    let ty = copair_type(&feeds);
+    Expr::copair(feeds).with_ty(ty)
 }
 
 /// The type of an N-ary channel union: `Variant[Index(i) ↦ domainᵢ] ⇒ cod`,
@@ -1826,7 +1833,7 @@ fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
 /// function-shaped type at all (the untyped-mode pipeline); a defer-read
 /// operand is function-shaped via its handle's stream view, so typed-mode
 /// unions are concrete-modulo-`ChanDom` at construction.
-fn collection_union_type(feeds: &[Expr]) -> Type {
+fn copair_type(feeds: &[Expr]) -> Type {
     let mut tags: Vec<(crate::ccl::FieldKey, Type)> = Vec::with_capacity(feeds.len());
     let mut cod: Option<Type> = None;
     for (i, f) in feeds.iter().enumerate() {
@@ -1864,7 +1871,7 @@ fn collection_union_type(feeds: &[Expr]) -> Type {
                     Some(c) => debug_assert_eq!(
                         crate::ccl::ccl_utils::strip_refinements(&c.without_pi_names()),
                         crate::ccl::ccl_utils::strip_refinements(&codomain.without_pi_names()),
-                        "collection_union_type: feed operands disagree on element \
+                        "copair_type: feed operands disagree on element \
                          type ({c} vs {codomain}); inference should have unified \
                          them into the channel's shared value var"
                     ),
@@ -1874,7 +1881,7 @@ fn collection_union_type(feeds: &[Expr]) -> Type {
         }
     }
     match cod {
-        Some(c) => Type::fun(Type::Variant(tags), c),
+        Some(c) => Type::fun(Type::variant(tags), c),
         None => Type::Hole,
     }
 }
@@ -2013,6 +2020,15 @@ fn extract_for_defer(
         // Pass through Feed/Define for *other* defers — they'll be processed
         // by a different `channelize_defer` call.
         node @ (TypedExprNode::Feed { .. } | TypedExprNode::Define { .. }) => node,
+        // Channelization runs *before* lambda elimination (see
+        // `design/lowering.md`, "The `channelize` step (feed channelization)"), and
+        // a disjoint join is born there — by the `Case` fan-outs — so one cannot
+        // reach this walk. Spelled out rather than folded into a child-walk arm
+        // because this match *rebuilds* nodes, and quietly rebuilding a disjoint
+        // join as something else is the failure worth preventing.
+        TypedExprNode::DisjointJoin(_) => {
+            unreachable!("DisjointJoin is born by lambda_elim, which runs after channelize")
+        }
         // Defensive: `transact_phase` strips every `Begin` before channelize, so
         // this is unreachable in the pipeline; recurse structurally if a stray
         // one survives (reaching the strict typecheck backstop).
@@ -2509,7 +2525,7 @@ fn extract_for_defer(
             }
             TypedExprNode::Compose(new_elts)
         }
-        TypedExprNode::CollectionUnion(elts) => TypedExprNode::CollectionUnion(
+        TypedExprNode::Copair(elts) => TypedExprNode::Copair(
             elts.into_iter()
                 .map(|e| extract_for_defer(e, defer_name, feeds, define, in_inner_scope, ctx))
                 .collect::<Result<_, _>>()?,
@@ -2838,9 +2854,9 @@ mod tests {
         assert_eq!(err, DeferError::NoFeedOrDefine("d".into()));
     }
 
-    /// Multiple feeds: union'd via collection_union.
+    /// Multiple feeds: copaired (distinct index sets, tagged apart).
     #[test]
-    fn run_multiple_feeds_use_collection_union() {
+    fn run_multiple_feeds_use_copair() {
         let body = Expr::expr_stmt(
             Expr::feed("d", lit(1)),
             Expr::expr_stmt(Expr::feed("d", lit(2)), var("d")),
