@@ -30,6 +30,8 @@ CHL source
 | [lowering.md](lowering.md) | CHL → CCL lowering: how comprehensions, lambdas, `def`s, and generators become CCL shapes, and the surface syntax of the deferred-collection operators. |
 | [optimization.md](optimization.md) | The optimization/compilation passes: inlining, lambda elimination, join/aggregate planning, algebraic simplification, and conversion to tile operators. |
 | [provenance.md](provenance.md) | How a node keeps its link to the source the user wrote across the whole pipeline: the `NodeId`/`Pass` identity primitives, the `RewriteStep` lineage model and its collapse, the recorder, the always-on lowering projection release diagnostics read, and what the inspector consumes. |
+| [diffing.md](diffing.md) | Program diffing: α-invariant content addressing of CCL terms and the GumTree correspondence between two compiled programs. |
+| [branching.md](branching.md) | Program branching: what the diff is built into. Upgrade and fork as settings of three knobs (arms, selector, state policy), why a branch is a guard on the sequencing domain rather than a new node, and why replaying derived state is what makes any of it necessary. |
 
 Provenance is the one cross-cutting concern in the table: every pass above both
 preserves node identity and records what it rewrote, so

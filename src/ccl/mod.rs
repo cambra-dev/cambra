@@ -8,7 +8,9 @@
 
 pub mod ccl_utils;
 pub mod channelize;
+pub mod content_hash;
 pub mod context;
+pub mod diff;
 pub mod infer;
 pub mod inline;
 pub mod lambda_elim;
