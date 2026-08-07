@@ -54,7 +54,7 @@ pub enum Token {
     #[token("False", priority = 3)]
     False,
     /// The refinement predicate separator, `{T where p(_)}` (`docs/chl-spec.md`,
-    /// "6.4 Direction: refinement syntax \[Decided\]").
+    /// "6.4 Refinement syntax").
     ///
     /// Lexed so the name is **reserved**: refinements are not parsed yet, so
     /// every use is a parse error today. That is the point — a program cannot
@@ -468,9 +468,9 @@ mod tests {
     }
 
     /// `where` is reserved ahead of the syntax that uses it: refinements are not
-    /// parsed yet (`docs/chl-spec.md`, "6.4 Direction: refinement syntax
-    /// \[Decided\]"), so the token exists only to keep the name from being bound
-    /// as an identifier and breaking when they land.
+    /// parsed yet (`docs/chl-spec.md`, "6.4 Refinement syntax"), so the token
+    /// exists only to keep the name from being bound as an identifier and
+    /// breaking when they land.
     #[test]
     fn where_is_reserved_not_an_ident() {
         assert_eq!(tokens("where"), vec![Token::Where, Token::Newline]);
