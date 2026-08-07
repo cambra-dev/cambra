@@ -126,7 +126,7 @@ regex).
 ### 1.6 Keywords
 
 ```
-True   False  None
+True   False
 and    or     not
 if     elif   else
 for    in
@@ -134,6 +134,10 @@ def    return yield
 with
 pass
 ```
+
+`None` is **not** a keyword: the unit value is the empty product `()` (§3.1),
+so `None` is an ordinary identifier, free for a program to bind. Neither it nor
+`Unit` is reserved (§6.6).
 
 `with` is a keyword: it introduces a transaction block, `with begin():`
 (§8.2). It does **not** carry Python's general context-manager meaning.
@@ -163,10 +167,13 @@ reserved for future use.
 | `0`, `42`, `1234` | `Int(i64)` | Decimal only; no `_` separators, no hex/bin/oct, no negation in the token (`-3` is `UnaryOp(Neg, 3)`). |
 | `"hello\n"`, `'world'` | `String` | Double- or single-quoted. Escapes: `\n \t \r \\ \" \' \0`. Unknown escapes are preserved verbatim (the `\` is kept). No multi-line `"""..."""`, no f-strings, no raw `r"..."`. |
 | `True`, `False` | `Bool` | |
-| `None` | `Unit` | CHL's unit **value** only — the unit *type* is written `{}` (§6.6), and `None` in type position is rejected. (Direction: the value becomes `()`, and lowercase `` `none `` is the `Option` tag — see §3.1.) |
 
 There are no floating-point literals — CHL has no `f64` type at the
 surface level.
+
+There is no **unit** literal either: the unit value is the empty product `()`
+(§3.1), which is two punctuation tokens and an [atom](#24-atoms), not a token of
+its own. Its type is `{}` (§6.6).
 
 ### 1.8 Operators and punctuation
 
@@ -619,11 +626,10 @@ of the partiality disappears entirely.)
 
 ### 3.1 Literals
 
-`Int`, `String`, `Bool`, `None` denote themselves. `None` is CHL's unit
-value: a single inhabitant of the unit type. (In the lowering, `None`
-becomes the CCL `Unit` literal.) It is a **value** and nothing else — the
-unit type it inhabits is written `{}`, and `None` in type position is
-rejected (§6.6).
+`Int`, `String`, and `Bool` literals denote themselves. The **unit value** is
+the empty product `()` — a single inhabitant of the unit type, whose own
+spelling is `{}` (§6.6). It is an atom rather than a lexical literal (§2.4),
+and it lowers to the CCL `Unit` literal.
 
 A literal's **type is the literal itself**, not merely its base: `5` has type
 `{Int | 𝑒 == 5}`, printed `5`. So `x = 5` gives `x` the type `5`, and an
@@ -632,8 +638,8 @@ because widening is the annotation's business and not the value's. Any
 operation that computes a *new* value drops it, since it is a fact about one
 value and not about the operation: `x + x` is an `Int`, and a mutable register
 never takes it (a register is the sequence its writes produce, so no one write's
-value describes it). `None` is the exception with nothing to say — unit has one
-inhabitant.
+value describes it). Unit is the exception with nothing to say — it has one
+inhabitant, so a singleton would add nothing to the base.
 
 A construct that *selects* or *collects* values rather than computing one keeps
 what **every** value it could yield establishes: `1 if c else 2` is an `Int`
@@ -646,20 +652,16 @@ The point of carrying it is proof: `arr[0]` is only a *total* lookup if `0`'s
 type says it is `0` and so lies inside `arr`'s index range (§3.9). Nothing else
 in the language observes it.
 
-> **Direction.** `None` is a Python spelling that collides with the
-> decided term/type capitalization rule (**[Decided]**, §6.1: lowercase
-> heads are terms; `Caps` means *type*, without exception). In the
-> target syntax the unit **value** is the empty product `()`, and
-> `` `none `` (a variant tag, hence a term — §6.5) is *not* unit:
-> it is the empty case of `Option(_)`, paired with `` `some(v) `` (§3.9).
-> At the type level, the empty structural product `{}` **is** the unit
-> type (as in `Set(K) = Map(K, {})`, §6.3) — implemented, §6.6.
-> `True`/`False`
-> sit under the same capitalization anomaly — presumably they become
-> `true`/`false`, matching the CCL symbolic rendering, but that
-> spelling is **[Open]**. The `()`-is-unit and `none`-is-`Option`
-> points are recorded here only (2026-07-07, no brainstorm writeup
-> yet).
+`()` is the unit value's only spelling, and `None` is not reserved (§1.6, §6.6):
+a product constructor says what the value *is*, where a borrowed `None` both
+collided with the term/type capitalization rule (§6.1 — lowercase heads are
+terms, `Caps` means *type*, without exception) and did double duty as the type.
+Distinct from unit: `` `none `` (a variant tag, hence a term — §6.5) is the empty
+case of `Option(_)`, paired with `` `some(v) `` (§3.9).
+
+> **Direction.** `True`/`False` sit under the same capitalization anomaly `None`
+> did — presumably they become `true`/`false`, matching the CCL symbolic
+> rendering, but that spelling is **[Open]**.
 
 ### 3.2 Names
 
@@ -754,7 +756,7 @@ target << value
 
 `<<` is the one expression-level **effect** in CHL. Evaluating
 `target << value` appends `value` to the stream that `target`
-denotes. The expression itself returns the unit value `None`; its
+denotes. The expression itself returns the unit value `()`; its
 purpose is the append.
 
 `target` must be a **deferred collection**: a value created by
@@ -1016,7 +1018,7 @@ collection is, like any CHL collection, an **unordered bag** (§3);
 the relative order of values from distinct `yield` evaluations
 (whether from different iterations of a `for`, or from sequential
 `yield`s in straight-line code) is unspecified unless a loop-carried
-accumulator forces sequencing. The expression itself returns `None`;
+accumulator forces sequencing. The expression itself returns `()`;
 its purpose is the contribution.
 
 `yield from`, `yield`-as-expression-with-value, async `yield`, etc., are
@@ -1442,7 +1444,7 @@ function body must yield a value.
 ### 4.8 `return`
 
 ```python
-return                -- equivalent to `return None`
+return                -- equivalent to `return ()`
 return expression
 ```
 
@@ -1529,7 +1531,7 @@ marked one carries its status per "How to read this document".)
 - `Bool` — `True` or `False`.
 - `String` — UTF-8 string.
 - `{}` — unit type, one inhabitant: the empty product (§6.6), and its only
-  CHL spelling. Neither `Unit` nor `None` is accepted in annotation position.
+  CHL spelling. Neither `Unit` nor `None` is a CHL name at all (§6.6).
   There is no *empty* (uninhabited) type — §6.6.
 - `List(T)` — finite collection of `T`-values, indexed by `[0, n)`.
   The index → element mapping is part of the value (so `xs[i]` is
@@ -1852,21 +1854,25 @@ about a node that is perfectly well typed — and the disagreement is
 undiagnosable, since both spellings render `()`. One representation is what
 makes the empty product term `()` typecheck at all.
 
-**`{}` is the only CHL spelling.** One type, one way to write it — so neither
-`Unit` nor `None` is accepted in annotation position:
-
-- `Unit` names the right type by a name CHL does not have. CCL still *renders*
-  the type as `Unit`, and that is fine: CCL's rendering is a separate surface
-  and not yet settled. The two readers therefore differ on purpose — the CCL
-  primitive-name round-trip accepts `Unit`, and the CHL annotation reader is a
-  strict subset of it.
-- `None` is the unit **value**, not its type (§3.1). A literal is not a type in
-  any other position either; the only thing that made this one look like one is
-  `None` having to stand in for both.
-
-Both are rejected with the spelling to use rather than accepted as synonyms.
-`{}` is also the spelling that says what the type *is* — the empty product —
+**`{}` is the only CHL spelling, and the alternatives are not reserved.** One
+type, one way to write it — and `{}` says what the type *is*, the empty product,
 which is what makes `Set(K) = Map(K, {})` (§6.3) read as the set it encodes.
+
+Neither `Unit` nor `None` is a CHL name:
+
+- `Unit` names the right type by a name CHL does not have, so it is an ordinary
+  undefined identifier in annotation position. CCL still *renders* the type as
+  `Unit`, and that is fine: CCL's rendering is a separate surface, not yet
+  settled. The two readers therefore differ on purpose — the CCL primitive-name
+  round-trip accepts `Unit`, and the CHL annotation reader is a strict subset of
+  it.
+- `None` is gone from the language entirely (§1.6, §3.1). It was the unit value
+  and, by accident of the same spelling, readable as the type; `()` is the value
+  now and `{}` the type.
+
+Both are therefore names a program may bind like any other identifier —
+`Unit = 1` is a legal binding. Nothing is reserved against a future use of
+either.
 
 There is **no empty type** (no uninhabited / void type) in CHL or CCL: the
 base types are `Int`, `UInt`, `String`, `Bool`, and `Unit`, and nothing else
@@ -2409,10 +2415,11 @@ with parser-level support that lowering rejects:
 - **Destructuring patterns** beyond tuples — record, variant, and
   wildcard patterns, and per-component annotations with `:` binding
   tighter than `,` (**[Decided]**, §4.3.1).
-- **The unit value's spelling** — the unit *type* is settled as `{}` (§6.6),
-  but its one inhabitant is still the Python-shaped `None`. The target is the
-  empty product `()` (**[Decided]**, §3.1); until it lands, `None` is a value
-  whose spelling no longer matches its type.
+- **Unit values do not run** — the type surface is settled (`{}` for the type,
+  `()` for the value, §6.6) and both typecheck, but a unit-valued program
+  output cannot be materialized by the interpreter: it has no column
+  representation, so `x = ()` compiles and then fails at runtime. This is a
+  runtime gap, not a surface one.
 - **The term-level delimiter migration** — record values are `(f=1, …)`, and
   `{…}` no longer denotes a term-level value (it is record-type / tuple-type /
   unit syntax, §2.4). Finite maps as `[k -> v, …]` remain **[Decided]**; earlier

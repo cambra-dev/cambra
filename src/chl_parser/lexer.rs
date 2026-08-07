@@ -53,8 +53,6 @@ pub enum Token {
     True,
     #[token("False", priority = 3)]
     False,
-    #[token("None", priority = 3)]
-    None,
     #[token("and", priority = 3)]
     And,
     #[token("or", priority = 3)]
@@ -202,7 +200,6 @@ impl fmt::Display for Token {
             // Keywords
             Token::True => "True",
             Token::False => "False",
-            Token::None => "None",
             Token::And => "and",
             Token::Or => "or",
             Token::Not => "not",
@@ -440,7 +437,7 @@ mod tests {
 
     #[test]
     fn keywords_beat_idents() {
-        let toks = tokens("if elif else for in def not and or True False None");
+        let toks = tokens("if elif else for in def not and or True False");
         assert_eq!(
             toks,
             vec![
@@ -455,7 +452,6 @@ mod tests {
                 Token::Or,
                 Token::True,
                 Token::False,
-                Token::None,
                 Token::Newline,
             ]
         );

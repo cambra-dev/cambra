@@ -450,8 +450,6 @@ pub enum Lit {
     /// String literal with escapes already processed.
     String(String),
     Bool(bool),
-    /// Python `None` — the CHL unit value.
-    None,
 }
 
 /// A named field: `name=value` in an [`Expr::Record`] value, or `name: T` in

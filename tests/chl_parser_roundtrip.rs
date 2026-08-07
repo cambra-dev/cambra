@@ -35,7 +35,7 @@ fn arithmetic_and_literals() {
         "2",
         r#""hello""#,
         "True",
-        "None",
+        "()",
         "2 + 3",
         "4 * 5",
         "7 // 2",

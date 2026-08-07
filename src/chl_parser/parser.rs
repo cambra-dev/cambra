@@ -172,7 +172,6 @@ where
             Token::String(s) => Expr::Lit(Lit::String(s)),
             Token::True => Expr::Lit(Lit::Bool(true)),
             Token::False => Expr::Lit(Lit::Bool(false)),
-            Token::None => Expr::Lit(Lit::None),
         }
         .map_with(|node, e| Spanned::new(e.span(), node));
 
