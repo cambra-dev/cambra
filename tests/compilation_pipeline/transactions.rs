@@ -495,6 +495,119 @@ fn commit_stream(ticks: &[usize], values: &[i64]) -> Tile {
     }
 }
 
+/// Drive a program whose result is a single trailing-commit read and return the
+/// committed `Value` at position 0. A compound (tuple/record) register reads back
+/// boxed (`Scalar(Record)`) or struct-of-arrays depending on the read path; both
+/// fold to the same `Value` through `scalar_tile_to_column_value`, so this asserts
+/// on the *value* rather than the (path-dependent) tile shape.
+fn trailing_commit_value(code: &str) -> Value {
+    use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
+    let Tile::SealedFunction {
+        domain, codomain, ..
+    } = run_pipeline(code)
+    else {
+        panic!("expected a commit stream");
+    };
+    assert_eq!(domain.len(), 1, "expected exactly one trailing commit");
+    scalar_tile_to_column_value(*codomain).index_at(0)
+}
+
+// ---------------------------------------------------------------------------
+// Compound (tuple / record) transactional registers
+//
+// A `Mut({Int, Int}, Txn)` / `Mut({x: Int}, Txn)` register holds one compound
+// `Value`; the commit-store path already threads it (it shares the induction
+// path's `read_initial_scalar` seeding and boxes/unboxes at the value-Case
+// decision merge). Enabling it needed only the tuple/record *type annotation*
+// forms in `lower_type_annotation`.
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Unconditional tuple register: (100,0) −10/+10 → (90,10) −20/+20 → (70,30).
+#[case(indoc! {r#"
+    out = defer()
+    p: Mut({Int, Int}, Txn) := (100, 0)
+    for r in [10, 20]:
+        with begin():
+            p := (p[0] - r, p[1] + r)
+    with begin():
+        out << p
+    out
+"#}, make_tuple(&[Value::Int(70), Value::Int(30)]))]
+// Conditional tuple write with a deny: r=60 commits (100≥60 → (40,60)); r=60 again
+// denies (40≥60 false) → stays (40,60).
+#[case(indoc! {r#"
+    out = defer()
+    p: Mut({Int, Int}, Txn) := (100, 0)
+    for r in [60, 60]:
+        with begin():
+            if p[0] >= r:
+                p := (p[0] - r, p[1] + r)
+    with begin():
+        out << p
+    out
+"#}, make_tuple(&[Value::Int(40), Value::Int(60)]))]
+// if/else both arms write a tuple: r=3 → r>2 arm → (3, 30).
+#[case(indoc! {r#"
+    out = defer()
+    p: Mut({Int, Int}, Txn) := (0, 0)
+    for r in [1, 2, 3]:
+        with begin():
+            if r > 2:
+                p := (r, r * 10)
+            else:
+                p := (r, r)
+    with begin():
+        out << p
+    out
+"#}, make_tuple(&[Value::Int(3), Value::Int(30)]))]
+// Named record register.
+#[case(r"
+out = defer()
+p: Mut({x: Int, y: Int}, Txn) := (x=100, y=0)
+for r in [10, 20]:
+    with begin():
+        p := (x=p.x - r, y=p.y + r)
+with begin():
+    out << p
+out", make_record(&[("x", Value::Int(70)), ("y", Value::Int(30))]))]
+// Mixed multi-key store: a scalar key `s` and a tuple key `p`, atomic per commit.
+// s = 10+20 = 30; p = (70, 30); trailing read `(s, p)`.
+#[case(indoc! {r#"
+    out = defer()
+    s: Mut(Int, Txn) := 0
+    p: Mut({Int, Int}, Txn) := (100, 0)
+    for r in [10, 20]:
+        with begin():
+            s := s + r
+            p := (p[0] - r, p[1] + r)
+    with begin():
+        out << (s, p)
+    out
+"#}, make_tuple(&[Value::Int(30), make_tuple(&[Value::Int(70), Value::Int(30)])]))]
+fn test_compound_txn_register(#[case] code: &str, #[case] expected: Value) {
+    assert_eq!(trailing_commit_value(code), expected);
+}
+
+/// A field projected off a tuple transactional register in the trailing read.
+#[test]
+fn test_compound_txn_register_field() {
+    assert_eq!(
+        trailing_commit_value(indoc! {r#"
+                out = defer()
+                p: Mut({Int, Int}, Txn) := (100, 0)
+                for r in [10, 20]:
+                    with begin():
+                        p := (p[0] - r, p[1] + r)
+                with begin():
+                    out << p[0]
+                out
+            "#}),
+        Value::Int(70),
+    );
+}
+
 /// `out << pool` *inside* the block reports each transaction's committed
 /// (read-your-writes) value: `pool - r` after the write — 90, 70, 40 over commit
 /// ticks 1, 2, 3. The feed rides the writer decision as a `to_out` tap,
