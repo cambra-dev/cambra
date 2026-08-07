@@ -33,6 +33,41 @@ pub fn fmt_record<V: std::fmt::Display>(
     }
 }
 
+/// Format the arms of a tagged sum in CHL's surface syntax:
+/// `` {`arm₀{P₀} | `arm₁{P₁}} ``.
+///
+/// `arms` supplies each tag with its payload **already rendered**, or `None`
+/// when the arm stores nothing — the nullary constructor, whose payload type is
+/// `Unit`. A nullary arm is written bare (`` `abort ``), matching the surface
+/// spelling `` {`arm} `` rather than an explicit `` `abort{Unit} ``.
+///
+/// A payload that already renders brace-delimited — a record, or a nested sum —
+/// **reuses those braces** instead of doubling them, which is the surface rule
+/// that a nested type inside an arm omits its own: `` `arm{a: Int, b: Int} ``,
+/// not `` `arm{{a: Int, b: Int}} ``. Nothing is lost to the collapse, because an
+/// arm always begins with a backtick — so a brace body that does not is a
+/// payload, never an arm list.
+///
+/// Shared by `Type` and `Extent`, which render the same sums either side of the
+/// compile/runtime boundary and must agree: a tag spelled two ways reads as two
+/// different things in a tiling-mismatch panic, which is where these strings are
+/// most often compared.
+pub fn fmt_variant_arms(
+    f: &mut std::fmt::Formatter<'_>,
+    arms: impl Iterator<Item = (String, Option<String>)>,
+) -> std::fmt::Result {
+    let parts: Vec<String> = arms
+        .map(|(tag, payload)| match payload {
+            None => format!("`{tag}"),
+            // Already `{…}` — a record or a nested sum — so the arm's braces and
+            // the payload's are the same pair.
+            Some(p) if p.starts_with('{') && p.ends_with('}') => format!("`{tag}{p}"),
+            Some(p) => format!("`{tag}{{{p}}}"),
+        })
+        .collect();
+    write!(f, "{{{}}}", parts.join(" | "))
+}
+
 /// A stack of named-binding scopes supporting lexical shadowing.
 ///
 /// Scopes are entered and exited exclusively through [`enter_scope`](Self::enter_scope),

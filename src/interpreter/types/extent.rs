@@ -6,6 +6,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use intervalsets::ops::Difference;
 use intervalsets::{Bounding, Interval, IntervalSet, MaybeEmpty};
 
+use crate::ccl::TagMap;
 use crate::interpreter::{Predicate, Tile};
 use crate::util::fmt_record;
 
@@ -25,7 +26,7 @@ pub enum Extent {
     /// A record type: map of field names to their extents
     Record(HashMap<String, Extent>),
     /// A union type: one of several possible extents
-    Union(Vec<Extent>),
+    Union(TagMap<Extent>),
     /// A finite set of unsigned integer indices, represented as an interval set.
     ///
     /// Created from a CCL `UIntRange(n)` type as the full set `[0, n)`, and
@@ -118,9 +119,9 @@ impl Extent {
             Extent::Restricted { base, .. } => base.subscribe_to_iteration_action(),
             // Union extents iterate each variant in turn; we are ready iff every
             // variant is ready, and we subscribe iff any variant requires it.
-            Extent::Union(variants) => variants
-                .iter()
-                .map(|variant| variant.subscribe_to_iteration_action())
+            Extent::Union(arms) => arms
+                .values()
+                .map(Extent::subscribe_to_iteration_action)
                 .fold(
                     NotifyOrSubscribeResult {
                         notify: true,
@@ -174,6 +175,65 @@ impl Extent {
         }
     }
 
+    /// The **join** of two extents describing *alternative values of one
+    /// result*: the smallest extent that [`includes`](Self::includes) both.
+    ///
+    /// This is the value-space counterpart of a `Case`'s arm join. Where the two
+    /// alternatives are variants, joining **merges their tag maps** — the result
+    /// is one arm or the other, so the space of both is the union of their tags,
+    /// with a tag they share joining its payloads. That merged sum is exactly the
+    /// column a merged variant stream carries: the inhabited arm holds the rows
+    /// that occurred and the other arms are present but empty.
+    ///
+    /// `None` means the two have no join, which is not automatically an error:
+    /// for a genuine concatenation the arm a row came from is part of its
+    /// identity, and the caller keeps them separate (an anonymous positional sum)
+    /// rather than merging.
+    ///
+    /// **Symmetric by construction.** A join has to be, or the caller's argument
+    /// order silently decides the answer. That is not free here: [`includes`] treats
+    /// a variant and a bare payload as *mutually* inclusive (a union includes any
+    /// value some arm admits, and a scalar includes a union whose every arm it
+    /// admits), so falling through to the inclusion cases with one variant and one
+    /// non-variant would return `self` — a different extent for each argument order,
+    /// and in the tagged direction a claim that an untagged value inhabits a tagged
+    /// space. A mixed pair therefore has **no** join rather than an arbitrary one.
+    ///
+    /// [`includes`]: Self::includes
+    pub fn join(&self, other: &Extent) -> Option<Extent> {
+        if self == other {
+            return Some(self.clone());
+        }
+        match (self, other) {
+            (Extent::Union(vs), Extent::Union(ws)) => {
+                let mut merged = vs.clone();
+                for (k, w) in ws.iter() {
+                    match merged.get(k) {
+                        // A shared tag's payloads must themselves join: the value
+                        // at that tag came from one arm or the other.
+                        Some(v) => *merged.get_mut(k)? = v.join(w)?,
+                        None => {
+                            merged.get_or_insert_with(k.clone(), || w.clone());
+                        }
+                    }
+                }
+                Some(Extent::Union(merged))
+            }
+            // Exactly one side is a sum: no join (see the symmetry note above).
+            // The caller keeps them apart, which for a concatenation is right
+            // anyway. Nothing reaches this today — `UnionOperator::new` joins
+            // codomains that came from one `Case`, so they are tagged together or
+            // not at all — and the arm exists so that a future caller gets `None`
+            // instead of an order-dependent answer.
+            (Extent::Union(_), _) | (_, Extent::Union(_)) => None,
+            // Non-variant alternatives join only when one already covers the
+            // other (a `UIntRange` inside a wider one, say).
+            _ if self.includes(other) => Some(self.clone()),
+            _ if other.includes(self) => Some(other.clone()),
+            _ => None,
+        }
+    }
+
     /// Whether this extent includes all of `other` (i.e. `self` is a supertype of `other`,
     /// or equivalently every value in `other` is also a value in `self`).
     pub fn includes(&self, other: &Extent) -> bool {
@@ -201,15 +261,22 @@ impl Extent {
                         .all(|(k, e1)| m2.get(k).is_some_and(|e2| e1.includes(e2)))
             }
 
-            // Union self vs union other: every variant of `other` must be covered by
-            // some variant of `self`.
-            (Extent::Union(vs), Extent::Union(ws)) => {
-                ws.iter().all(|w| vs.iter().any(|v| v.includes(w)))
-            }
-            // Union self vs scalar other: `other` must be covered by at least one variant.
-            (Extent::Union(variants), _) => variants.iter().any(|v| v.includes(other)),
-            // Scalar self vs union other: `self` must include every variant.
-            (_, Extent::Union(variants)) => variants.iter().all(|v| self.includes(v)),
+            // Union vs union — **this is variant width subtyping**, stated at the
+            // runtime boundary. `other` is included iff every tag it carries is a
+            // tag `self` carries, with an included payload. A tag `self` has and
+            // `other` lacks is fine (that arm simply cannot occur in `other`); a tag
+            // `other` has and `self` lacks is not (`self` could not represent it).
+            //
+            // Matching is by tag, not by position: a tag's position is relative to
+            // its own sum's key set, so pairing arms positionally would compare
+            // unrelated payloads whenever the two key sets differ.
+            (Extent::Union(vs), Extent::Union(ws)) => ws
+                .iter()
+                .all(|(k, w)| vs.get(k).is_some_and(|v| v.includes(w))),
+            // Union self vs scalar other: `other` must be covered by some arm.
+            (Extent::Union(arms), _) => arms.values().any(|v| v.includes(other)),
+            // Scalar self vs union other: `self` must include every arm.
+            (_, Extent::Union(arms)) => arms.values().all(|v| self.includes(v)),
 
             (Extent::Base(BaseType::UInt), Extent::UIntRange(..)) => true,
 
@@ -325,10 +392,19 @@ impl std::fmt::Display for Extent {
             Extent::Base(base) => write!(f, "{base}"),
             Extent::Function { domain, codomain } => write!(f, "({domain} -> {codomain})"),
             Extent::Record(fields) => fmt_record(f, fields),
-            Extent::Union(extents) => {
-                let extent_strs: Vec<String> = extents.iter().map(|e| format!("{e}")).collect();
-                write!(f, "({})", extent_strs.join(" | "))
-            }
+            // CHL's surface spelling, matching `Type::Variant` — see
+            // `fmt_variant_arms`. A `Unit` payload is the nullary constructor
+            // and renders bare.
+            Extent::Union(arms) => crate::util::fmt_variant_arms(
+                f,
+                arms.iter().map(|(tag, e)| {
+                    let payload = match e {
+                        Extent::Base(BaseType::Unit) => None,
+                        _ => Some(e.to_string()),
+                    };
+                    (tag.to_string(), payload)
+                }),
+            ),
             Extent::UIntRange(set) => write!(f, "{set}"),
             Extent::DataSourceDomain(source) => write!(f, "Source({})", source.borrow().get_id()),
             Extent::Restricted { base, .. } => write!(f, "Restricted({base})"),
@@ -446,6 +522,7 @@ pub use crate::ccl::BaseType;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::FieldKey;
     use std::collections::HashMap;
 
     // --- Display tests ---
@@ -465,13 +542,68 @@ mod tests {
         assert_eq!(e.to_string(), "(Int -> String)");
     }
 
+    /// A union renders in CHL's surface syntax, arms tagged: the tag is what
+    /// identifies an arm, so a rendering that dropped it could not distinguish
+    /// two unions with the same payload types under different tags.
+    ///
+    /// A `Unit` payload is the **nullary** constructor and renders bare
+    /// (`` `abort ``, not `` `abort{Unit} ``) — the same collapse `Type::Variant`
+    /// makes, so the two sides of the compile/runtime boundary spell one sum one
+    /// way. That matters most in a tiling-mismatch panic, which prints an
+    /// `Extent` beside the `Type` it was built from.
     #[test]
     fn test_extent_display_union() {
-        let e = Extent::Union(vec![
+        let positional = Extent::Union(TagMap::from_positional(vec![
             Extent::Base(BaseType::Int),
             Extent::Base(BaseType::Bool),
-        ]);
-        assert_eq!(e.to_string(), "(Int | Bool)");
+        ]));
+        assert_eq!(positional.to_string(), "{`0{Int} | `1{Bool}}");
+        let named = Extent::Union(TagMap::from_arms(vec![
+            (FieldKey::Name("commit".into()), Extent::Base(BaseType::Int)),
+            (FieldKey::Name("abort".into()), Extent::Base(BaseType::Unit)),
+        ]));
+        assert_eq!(named.to_string(), "{`abort | `commit{Int}}");
+    }
+
+    /// A payload that already renders brace-delimited reuses those braces rather
+    /// than doubling them — the surface rule that a nested type inside an arm
+    /// omits its own. A payload that does not (a base type, a tuple, a function)
+    /// gets the arm's braces around it.
+    #[test]
+    fn test_extent_display_union_collapses_a_braced_payload() {
+        let record = Extent::Record(
+            [
+                ("a".to_string(), Extent::Base(BaseType::Int)),
+                ("b".to_string(), Extent::Base(BaseType::Int)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let with_record = Extent::Union(TagMap::from_arms(vec![(
+            FieldKey::Name("pair".into()),
+            record,
+        )]));
+        assert_eq!(with_record.to_string(), "{`pair{a: Int, b: Int}}");
+
+        // A nested sum is brace-delimited too, so it collapses the same way.
+        let nested = Extent::Union(TagMap::from_arms(vec![(
+            FieldKey::Name("outer".into()),
+            Extent::Union(TagMap::from_arms(vec![
+                (FieldKey::Name("x".into()), Extent::Base(BaseType::Unit)),
+                (FieldKey::Name("y".into()), Extent::Base(BaseType::Int)),
+            ])),
+        )]));
+        assert_eq!(nested.to_string(), "{`outer{`x | `y{Int}}}");
+
+        // A function payload renders parenthesised, so the arm supplies braces.
+        let func = Extent::Union(TagMap::from_arms(vec![(
+            FieldKey::Name("f".into()),
+            Extent::Function {
+                domain: Box::new(Extent::Base(BaseType::Int)),
+                codomain: Box::new(Extent::Base(BaseType::Bool)),
+            },
+        )]));
+        assert_eq!(func.to_string(), "{`f{(Int -> Bool)}}");
     }
 
     #[test]
@@ -542,10 +674,10 @@ mod tests {
 
     #[test]
     fn test_includes_union_self_includes_member() {
-        let u = Extent::Union(vec![
+        let u = Extent::Union(TagMap::from_positional(vec![
             Extent::Base(BaseType::Int),
             Extent::Base(BaseType::Bool),
-        ]);
+        ]));
         assert!(u.includes(&Extent::Base(BaseType::Int)));
         assert!(u.includes(&Extent::Base(BaseType::Bool)));
         assert!(!u.includes(&Extent::Base(BaseType::String)));
@@ -553,14 +685,175 @@ mod tests {
 
     #[test]
     fn test_includes_union_vs_union() {
-        let u = Extent::Union(vec![
+        let u = Extent::Union(TagMap::from_positional(vec![
             Extent::Base(BaseType::Int),
             Extent::Base(BaseType::Bool),
-        ]);
+        ]));
         assert!(u.includes(&u));
-        let subset = Extent::Union(vec![Extent::Base(BaseType::Int)]);
+        let subset = Extent::Union(TagMap::from_positional(vec![Extent::Base(BaseType::Int)]));
         assert!(u.includes(&subset));
         assert!(!subset.includes(&u));
+    }
+
+    /// **Variant width subtyping is matched by tag, not by position** — the one
+    /// case a positional implementation gets wrong, and the reason `TagMap`
+    /// exists.
+    ///
+    /// ``{`b{Int}} <: {`a{String} | `b{Int}}`` is a legal instance of the width
+    /// rule, but `b` sits at position 0 in the subtype and position 1 in the
+    /// supertype. Pairing arms positionally would compare `b`'s `Int` against
+    /// `a`'s `String` and reject the inclusion (and, for a payload pair that
+    /// happened to agree, accept a *wrong* one). The positional cases already
+    /// covered above cannot see this: there the shared arms are a prefix, so
+    /// tag order and position order agree.
+    #[test]
+    fn includes_variant_width_subtyping_pairs_arms_by_tag_not_position() {
+        let wide = named(&[
+            ("a", Extent::Base(BaseType::String)),
+            ("b", Extent::Base(BaseType::Int)),
+        ]);
+        // `b` alone — at position 0 here, position 1 in `wide`.
+        let narrow = named(&[("b", Extent::Base(BaseType::Int))]);
+        assert!(
+            wide.includes(&narrow),
+            "a narrower tag set is included regardless of where its arms sit"
+        );
+        assert!(!narrow.includes(&wide), "and the converse does not hold");
+
+        // The same shape with the payloads swapped is *not* an inclusion: `b`
+        // pairs with `b`, so the mismatch is seen. A positional pairing would
+        // line `b: String` up against `a: String` and wrongly accept.
+        let mistagged = named(&[("b", Extent::Base(BaseType::String))]);
+        assert!(
+            !wide.includes(&mistagged),
+            "arm `b`'s payload must be included by arm `b`'s, not by whichever \
+             arm shares its position"
+        );
+    }
+
+    // --- join: alternative value spaces ---
+
+    fn named(arms: &[(&str, Extent)]) -> Extent {
+        Extent::Union(TagMap::from_arms(
+            arms.iter()
+                .map(|(t, e)| (FieldKey::Name((*t).into()), e.clone()))
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn join_of_equal_extents_is_that_extent() {
+        let int = Extent::Base(BaseType::Int);
+        assert_eq!(int.join(&int), Some(int.clone()));
+        let v = named(&[("some", int.clone())]);
+        assert_eq!(v.join(&v), Some(v));
+    }
+
+    /// The case a conditional with differently-tagged arms produces: the join is
+    /// the merged tag set, which is the column shape a merged variant stream has.
+    #[test]
+    fn join_of_disjoint_variants_merges_tags() {
+        let pos = named(&[("pos", Extent::Base(BaseType::Int))]);
+        let neg = named(&[("neg", Extent::Base(BaseType::Int))]);
+        let merged = named(&[
+            ("neg", Extent::Base(BaseType::Int)),
+            ("pos", Extent::Base(BaseType::Int)),
+        ]);
+        assert_eq!(pos.join(&neg), Some(merged.clone()));
+        // Joining is symmetric in the tags it produces.
+        assert_eq!(neg.join(&pos), Some(merged.clone()));
+        // And the join includes both inputs, which is what makes each arm's
+        // narrower column representable in it.
+        assert!(merged.includes(&pos));
+        assert!(merged.includes(&neg));
+    }
+
+    /// A `Unit` payload is the nullary constructor's, so ``{`some{Int}}`` joined
+    /// with ``{`none}`` is the two-tag sum — the ``x if c else `none`` shape.
+    #[test]
+    fn join_keeps_distinct_payloads_per_tag() {
+        let some = named(&[("some", Extent::Base(BaseType::Int))]);
+        let none = named(&[("none", Extent::Base(BaseType::Unit))]);
+        assert_eq!(
+            some.join(&none),
+            Some(named(&[
+                ("none", Extent::Base(BaseType::Unit)),
+                ("some", Extent::Base(BaseType::Int)),
+            ]))
+        );
+    }
+
+    /// A tag both sides carry joins its payloads, so an unjoinable payload makes
+    /// the whole join fail rather than silently picking one side.
+    #[test]
+    fn join_fails_on_conflicting_shared_payload() {
+        let a = named(&[("t", Extent::Base(BaseType::Int))]);
+        let b = named(&[("t", Extent::Base(BaseType::String))]);
+        assert_eq!(a.join(&b), None);
+    }
+
+    /// Unrelated value spaces have no join. The caller keeps them as an anonymous
+    /// positional sum, where which arm a row came from is part of its identity.
+    #[test]
+    fn join_of_unrelated_scalars_is_none() {
+        assert_eq!(
+            Extent::Base(BaseType::Int).join(&Extent::Base(BaseType::String)),
+            None
+        );
+    }
+
+    /// Non-variant alternatives join when one already covers the other.
+    #[test]
+    fn join_of_nested_ranges_is_the_wider() {
+        let wide = Extent::Base(BaseType::UInt);
+        let narrow = Extent::uint_range(3);
+        assert_eq!(wide.join(&narrow), Some(wide.clone()));
+        assert_eq!(narrow.join(&wide), Some(wide));
+    }
+
+    /// A variant and a **bare** payload have no join, in either order.
+    ///
+    /// This is the case that makes the join's symmetry non-trivial: `includes`
+    /// relates the two spaces *both* ways, so an inclusion-based join would answer
+    /// `self` and let the caller's argument order pick the result — and in one of
+    /// those orders it would claim an untagged `Int` inhabits ``{`some{Int}}``, which it
+    /// does not at runtime. `None` is the honest answer.
+    #[test]
+    fn join_of_variant_with_bare_payload_is_none_both_ways() {
+        let some_int = named(&[("some", Extent::Base(BaseType::Int))]);
+        let bare = Extent::Base(BaseType::Int);
+        assert_eq!(some_int.join(&bare), None);
+        assert_eq!(bare.join(&some_int), None);
+        // The mutual inclusion that would otherwise have decided it by argument
+        // order. (Both directions hold, which is itself why neither can be the join.)
+        assert!(some_int.includes(&bare));
+        assert!(bare.includes(&some_int));
+    }
+
+    /// Every join is symmetric, including the merge and failure paths — a join that
+    /// depended on argument order would make `UnionOperator::new`'s declared
+    /// codomain depend on arm order.
+    #[test]
+    fn join_is_symmetric() {
+        let cases: Vec<(Extent, Extent)> = vec![
+            (
+                named(&[("some", Extent::Base(BaseType::Int))]),
+                named(&[("none", Extent::Base(BaseType::Unit))]),
+            ),
+            (
+                named(&[("t", Extent::Base(BaseType::Int))]),
+                named(&[("t", Extent::Base(BaseType::String))]),
+            ),
+            (
+                named(&[("some", Extent::Base(BaseType::Int))]),
+                Extent::Base(BaseType::Int),
+            ),
+            (Extent::Base(BaseType::Int), Extent::Base(BaseType::String)),
+            (Extent::Base(BaseType::UInt), Extent::uint_range(3)),
+        ];
+        for (a, b) in cases {
+            assert_eq!(a.join(&b), b.join(&a), "join must be symmetric: {a} ⊔ {b}");
+        }
     }
 
     #[test]

@@ -100,7 +100,7 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
 /// group carries recurrent state. A guard-free group is a channel cluster.
 fn group_has_causal(bindings: &[(TypedBinding, Expr)]) -> bool {
     bindings.iter().any(|(_, def)| {
-        uses_builtin(def, Builtin::GetPrevSeq) || uses_builtin(def, Builtin::GetPrevTxn)
+        uses_builtin(def, &Builtin::GetPrevSeq) || uses_builtin(def, &Builtin::GetPrevTxn)
     })
 }
 
@@ -110,12 +110,12 @@ fn group_has_causal(bindings: &[(TypedBinding, Expr)]) -> bool {
 fn is_txn_group(bindings: &[(TypedBinding, Expr)]) -> bool {
     bindings
         .iter()
-        .any(|(_, def)| uses_builtin(def, Builtin::GetPrevTxn))
+        .any(|(_, def)| uses_builtin(def, &Builtin::GetPrevTxn))
 }
 
 /// Whether the subtree mentions builtin `b`.
-fn uses_builtin(e: &Expr, b: Builtin) -> bool {
-    if matches!(&e.node, TypedExprNode::Builtin(x) if *x == b) {
+fn uses_builtin(e: &Expr, b: &Builtin) -> bool {
+    if matches!(&e.node, TypedExprNode::Builtin(x) if x == b) {
         return true;
     }
     let mut found = false;

@@ -7,6 +7,8 @@ use bit_set::BitSet;
 use cambra::interpreter::{ColumnValue, Predicate, Tile, Value};
 use rstest_log::rstest;
 
+use cambra::ccl::TagMap;
+
 use crate::helpers::*;
 
 // ---------------------------------------------------------------------------
@@ -110,47 +112,38 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
 #[case(
     "[1, 2, 3] ++ [4, 5]",
     Tile::SealedFunction {
-        domain: ColumnValue::Union {
-            tags: vec![0, 0, 0, 1, 1],
-            variants: vec![
+        domain: ColumnValue::positional_union(&[0, 0, 0, 1, 1], vec![
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1]),
-            ],
-        },
+            ]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4, 5]))),
-        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        domain_predicate: Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])),
         deleted: BitSet::new(),
     })]
 #[case(
     "x = [1, 2]; x ++ x ++ x",
     Tile::SealedFunction {
-        domain: ColumnValue::Union {
-            tags: vec![0, 0, 1, 1, 2, 2],
-            variants: vec![
+        domain: ColumnValue::positional_union(&[0, 0, 1, 1, 2, 2], vec![
                 ColumnValue::UInts(vec![0, 1]),
                 ColumnValue::UInts(vec![0, 1]),
                 ColumnValue::UInts(vec![0, 1]),
 
-            ],
-        },
+            ]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2]))),
-        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+        domain_predicate: Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])),
         deleted: BitSet::new(),
     })]
 #[case(
     "x = [1, 2]; y = x ++ x ++ x; y",
     Tile::SealedFunction {
-        domain: ColumnValue::Union {
-            tags: vec![0, 0, 1, 1, 2, 2],
-            variants: vec![
+        domain: ColumnValue::positional_union(&[0, 0, 1, 1, 2, 2], vec![
                 ColumnValue::UInts(vec![0, 1]),
                 ColumnValue::UInts(vec![0, 1]),
                 ColumnValue::UInts(vec![0, 1]),
 
-            ],
-        },
+            ]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2]))),
-        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+        domain_predicate: Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])),
         deleted: BitSet::new(),
     })]
 #[case("sum([1] ++ [2])", Tile::Scalar(ColumnValue::Ints(vec![3])))]

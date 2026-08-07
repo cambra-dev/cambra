@@ -98,8 +98,12 @@ pub fn fmt_extent(extent: &Extent) -> String {
         }
         Extent::UIntRange(set) => format!("{set}"),
         Extent::DataSourceDomain(_) => "DataSource".to_string(),
-        Extent::Union(variants) => {
-            let parts: Vec<String> = variants.iter().map(fmt_extent).collect();
+        Extent::Union(arms) => {
+            // Render the tag, since a union's arms are identified by name.
+            let parts: Vec<String> = arms
+                .iter()
+                .map(|(tag, e)| format!(".{tag}({})", fmt_extent(e)))
+                .collect();
             parts.join(" | ")
         }
         Extent::Restricted { base, .. } => format!("Restricted({})", fmt_extent(base)),

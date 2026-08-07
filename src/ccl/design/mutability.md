@@ -343,6 +343,38 @@ searches the `⧺`-union of its writing sites' per-key views
 admits (pointwise maps and unions of causal streams change *what* is read per position, never
 *which* positions the accessor consults).
 
+### Tagged sums in a decision, and in a register
+
+A decision is a **choice**, and the two things it chooses between carry different data: a grant
+carries a write set, a denial carries nothing. Today that is encoded as a record with a `commit:
+Bool` beside a `writes` field that is meaningless when `commit` is false — a product standing in for
+a sum, so nothing stops a reader consulting `writes` on a denied decision. The direction is the sum
+itself, `` `commit(writes) `` / `` `abort(unit) ``, which makes the write set reachable *only* on the
+granting path.
+
+What exists today is the algebra that shape needs, in both directions:
+
+- **Introduction.** A writer decision is a value-`Case` inside the writer lambda, so a
+  variant-valued arm has to be a *composable morphism* `param_ty ⇒ Union` — the RHS of a `≫` in the
+  fan-out `⧺ᵢ (filter_values(π̂ᵢ) ≫ 𝑒ᵢ)`. That is `variant_wrap(𝑐ᵢ)`, and `lambda_elim` elaborates a
+  `VariantCtor` in a lambda to `𝑒ᵢ ≫ variant_wrap(𝑐ᵢ)` to produce it.
+- **Elimination.** Reading the decision back is a scrutinee-`Case`, compiled to the union of
+  tag-restricts `⧺ᵢ (𝑑 ≫ variant_project(𝑐ᵢ) ≫ (λ 𝑤ᵢ → 𝑒ᵢ))` — a `≫`-chain, since `𝑑` is the
+  eliminated scrutinee morphism and both elements after it are functions of its output. The per-key view is the shape that
+  needs the *outer-binder* form, because its arm reads both the record's sibling field and the
+  granted payload: ``λ 𝑐 → match 𝑐.decision { `commit(𝑤) → (time: 𝑐.time, write: 𝑤.𝑖) }``. There the
+  projection is zipped alongside the whole element so the two co-iterate by key.
+
+Both are specified in [design-operators.md](../../interpreter/design-operators.md#tile-operators) (the `VariantWrap` and `VariantProject` rows).
+
+**A variant-valued register** follows from the same law, and needs nothing register-specific. A
+register's seed and its writes are *alternatives at one position*, exactly as a conditional's arms
+are, so the register's value space is their **join**: a `` `none `` seed with `` `some `` writes is
+the two-tag sum `` {`none | `some{Int}} `` with the arm that did not occur left empty, and every
+emission is built at that declared space rather than at the width of whichever alternative occurred.
+``acc := `some(𝑖)`` under a `` `none `` seed, and a conditional write choosing between tags, are both
+just that.
+
 ## Compilation pipeline
 
 ```
@@ -751,7 +783,7 @@ Three shapes:
   snapshot. The `as_of` arm is a leaf that op-conversion's `zip` co-iterates with the request stream
   (the same `is_leaf_zip_arm` path as the commit-decision read above) — no new operator.
 
-**Commit-ordered / commit-gated reply (reply *inside* the writing block).** A `<<` inside the block
+**commit-ordered / commit-gated reply (reply *inside* the writing block).** A `<<` inside the block
 rides the writer decision as a `to_<defer>` tap, committed atomically with the register write and
 read back as a per-commit value-stream (commit-tick-indexed). So it is **sequenced after the commit**
 and **gated**: a denied transaction (`if 𝑝:` false) proposes no write and emits no tap, replying

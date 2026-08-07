@@ -145,6 +145,14 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 
         TypedExprNode::Var(name) => (Precedence::Atom, name.base().to_string()),
 
+        TypedExprNode::Builtin(Builtin::VariantProject(tag)) => {
+            (Precedence::Atom, format!("variant_project(`{tag})"))
+        }
+
+        TypedExprNode::Builtin(Builtin::VariantWrap(tag)) => {
+            (Precedence::Atom, format!("variant_wrap(`{tag})"))
+        }
+
         TypedExprNode::Builtin(b) => (Precedence::Atom, b.name().to_string()),
 
         TypedExprNode::BinOp { left, op, right } => {
@@ -284,7 +292,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
                      }| {
                         // A literal-`true` guard on a pattern branch is the
                         // "no secondary filter" sentinel; suppress it so a bare
-                        // `case .Tag(x):` doesn't render a spurious `if true`.
+                        // ``case `Tag(x):`` doesn't render a spurious `if true`.
                         let is_true_guard =
                             matches!(&guard.node, TypedExprNode::Lit(Lit::Bool(true)));
                         match pattern {
@@ -294,8 +302,9 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
                                 } else {
                                     format!(" if {}", fmt(guard, Precedence::Lowest, opts))
                                 };
+                                // Destructuring mirrors construction: `` `tag(binder) ``.
                                 format!(
-                                    ".{}({}){} → {}",
+                                    "`{}({}){} → {}",
                                     p.tag,
                                     p.binding.name,
                                     guard_str,
@@ -324,9 +333,14 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             }
         }
 
+        // Construction is CHL's `` `tag(payload) ``. The payload is always
+        // rendered, including the nullary constructor's `unit`: this is a term,
+        // and the `Unit`-valued expression sitting there is a real node — unlike
+        // an arm's *type*, where "stores nothing" is the whole content and the
+        // surface spells it `` `tag ``.
         TypedExprNode::VariantCtor { tag, payload } => (
             Precedence::Atom,
-            format!(".{tag}({})", fmt(payload, Precedence::Lowest, opts)),
+            format!("`{tag}({})", fmt(payload, Precedence::Lowest, opts)),
         ),
 
         // `transact (k = init, …) { [reads]⇒[writes] over <source> do <body>;
