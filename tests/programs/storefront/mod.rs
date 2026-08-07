@@ -4,7 +4,7 @@
 //! a shared refined store), a stream of committed order lines (the `orders`
 //! feed), and time-indexed analytics served over HTTP (`/stats`).  Two
 //! invariants live in the types instead of tests: the store refinement
-//! `{q: Int | q >= 0}` makes overselling ill-typed, and `quote`'s
+//! `{Int where _ >= 0}` makes overselling ill-typed, and `quote`'s
 //! postcondition assert makes selling below cost ill-typed — in every
 //! version.
 //!
@@ -46,10 +46,11 @@
 //! ### Current limitations (what this test depends on)
 //!
 //! **Blocked today**: the `\` lambda (the restrict predicates) now lexes; the
-//! next blocker is the `match` expression on the catalog lookup, which is not
-//! a keyword yet and derails the layout pass (an inconsistent-indentation lex
-//! error).  The full dependency list, each isolated by a smaller gallery
-//! program where one exists:
+//! next blocker is the `` ` `` prefix on the `` `some ``/`` `none `` variant
+//! tags, which the lexer rejects outright.  Behind it, the `match` expression
+//! on the catalog lookup is still not a keyword and derails the layout pass
+//! (an inconsistent-indentation lex error).  The full dependency list, each
+//! isolated by a smaller gallery program where one exists:
 //!
 //! - Boundary asserts lifted to refinement types — `discount_contract`.
 //! - Refined transactional store + guarded decrement — `nonneg_inventory`.
@@ -75,13 +76,16 @@
 //! - Version dispatch across a branch point — no isolating program yet
 //!   (deferred with the still-open versioning surface).
 //!
-//! This pins the `match`-block lex failure on both files; when `match` is
-//! supported, the test goes red and the next blocker gets pinned.
+//! This pins the variant-tag lex failure on both files — the `` ` `` prefix on
+//! `` `some ``/`` `none `` (`docs/chl-spec.md`, "6.5 Variants") is not lexed,
+//! and it precedes the `match`-block indentation
+//! failure behind it.  When the tag lexes, the test goes red and the next
+//! blocker gets pinned.
 
 use super::common::expect_compile_error;
 
 #[test]
 fn storefront_currently_blocked_at_lexing() {
-    expect_compile_error(include_str!("v0.cambra"), "inconsistent indentation");
-    expect_compile_error(include_str!("v1.cambra"), "inconsistent indentation");
+    expect_compile_error(include_str!("v0.cambra"), "invalid token");
+    expect_compile_error(include_str!("v1.cambra"), "invalid token");
 }

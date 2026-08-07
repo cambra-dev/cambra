@@ -119,7 +119,12 @@ Key shape choices:
   as `Expr::Record`; brace literals are type syntax — `{x: T}` is
   `Expr::BraceRecord`, `{T, U}` is `Expr::BraceGroup`, `{"name": v}` is
   `Expr::Dict`. Lowering reads the brace forms as types and rejects them as
-  values.
+  values. Because braces are always a *product* in type position and never
+  grouping, the brace parser captures the trailing comma rather than merely
+  allowing it: `{T,}` is the one-element product and a comma-free `{T}` is a
+  parse error, while the empty `{}` is the **unit type**, which lowering reads as
+  `Unit` (see [docs/chl-spec.md](../../docs/chl-spec.md),
+  "6.6 The empty product is unit").
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.
@@ -229,7 +234,7 @@ The handshake is:
 
 ### Error message quality
 
-Three layers, each independent and each pulling its weight:
+Four layers, each independent and each pulling its weight:
 
 **1. `Display` for `Token` and `Span`.** Defined in `lexer.rs` and `ast.rs`.
 `Token::LParen` displays as `(`, `Token::EqEq` as `==`,
@@ -274,6 +279,17 @@ expected binary operator, comparison operator, boolean operator,
 
 (seven items) instead of the 22-token list.
 
+**4. Rule-raised messages.** The three layers above all shape a *derived*
+expectation — "found X, expected Y" — which only says something when the
+failure was a token that didn't match. A rule that parses a well-formed token
+sequence and then rejects what it means has nothing to derive from: `{Int}` is
+a perfectly good brace group that is not a valid type. Those rules raise their
+own message with `Rich::custom` from a `validate`, it rides
+`ParseErrorInfo::custom`, and it *replaces* the derived text at both rendering
+sites. The field is load-bearing rather than cosmetic: `found`/`expected` are both
+empty for a custom error, so without it the whole diagnostic degrades to a bare
+`found end of input`.
+
 ### Rendering with `ariadne`
 
 `ParseResult<T>` exposes two output methods:
@@ -285,7 +301,18 @@ expected binary operator, comparison operator, boolean operator,
 
 Both build one `Report` per `ParseError`, with a red primary label at
 the failure span and one yellow secondary label per `.as_context()`
-entry. Lex errors get a single-label report. Example rendering:
+entry. Lex errors get a single-label report.
+
+Every label span goes through `label_range`, which clamps `end` up to `start`.
+ariadne panics on an inverted range, and chumsky produces one for the
+`.as_context()` spans of a custom error raised inside a `validate`: the context
+records where its labelled parser opened, while the error's own offset has not
+advanced past it, so an outer context can arrive as `3..2`. An inverted span
+carries a position but no extent, so collapsing it to empty keeps the
+"while parsing …" note pointing at the right place instead of aborting the
+report.
+
+Example rendering:
 
 ```
 Error: parse error

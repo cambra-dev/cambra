@@ -49,7 +49,7 @@
 //! The error-handling types themselves ([`ParseError`], [`ParseErrorInfo`],
 //! [`Expected`], [`ParseResult`], and the chumsky-`Rich` conversion) live in
 //! the [`error`] submodule and are re-exported here; see the design doc's
-//! "Error message quality" section for the three layers (`Display` for
+//! "Error message quality" section for the four layers (`Display` for
 //! tokens, targeted `.labelled(…)` annotations, and operator-category
 //! collapsing in [`collect_errors`]).
 
@@ -172,7 +172,6 @@ where
             Token::String(s) => Expr::Lit(Lit::String(s)),
             Token::True => Expr::Lit(Lit::Bool(true)),
             Token::False => Expr::Lit(Lit::Bool(false)),
-            Token::None => Expr::Lit(Lit::None),
         }
         .map_with(|node, e| Spanned::new(e.span(), node));
 
@@ -315,12 +314,19 @@ where
         //   - every item `field: T`, all bare-ident fields → record type
         //     (`Expr::BraceRecord`)
         //   - no item has a value → colon-free brace group `{T, U}`
-        //     (tuple type, `Expr::BraceGroup`)
-        //   - anything else (empty `{}`, expression keys, mixed) → error:
-        //     it is neither a record type nor a tuple type
+        //     (tuple type, `Expr::BraceGroup`); the empty group `{}` is the
+        //     unit type
+        //   - anything else (expression keys, mixed) → error: it is neither a
+        //     record type nor a tuple type
         //
         // Parsing items as `expr (":" expr)?` keeps a single committed brace
         // parser, so classification is a total function of what was matched.
+        //
+        // The trailing comma is captured rather than silently allowed, because
+        // it *distinguishes* a one-element tuple type: `{T,}` is the one-tuple
+        // and a comma-free `{T}` is an error, mirroring the term-level
+        // `(e,)`/`(e)` split. Braces are not grouping in type position, so
+        // there is no reading of `{T}` left over to accept.
         let brace_item = expr
             .clone()
             .then(just(Token::Colon).ignore_then(expr.clone()).or_not());
@@ -328,17 +334,18 @@ where
             .ignore_then(
                 brace_item
                     .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .collect::<Vec<_>>(),
+                    .collect::<Vec<_>>()
+                    .then(just(Token::Comma).or_not()),
             )
             .then_ignore(just(Token::RBrace))
-            .validate(|items, e, emitter| {
+            .validate(|(items, trailing_comma), e, emitter| {
                 let span = e.span();
                 let with_value = items.iter().filter(|(_, v)| v.is_some()).count();
                 let all_idents =
                     !items.is_empty() && items.iter().all(|(k, _)| matches!(k.node, Expr::Name(_)));
                 if !items.is_empty() && with_value == items.len() && all_idents {
-                    // Record type `{field: T, …}`.
+                    // Record type `{field: T, …}`. A one-field record needs no
+                    // trailing comma — `field: T` already marks the form.
                     let fields = items
                         .into_iter()
                         .map(|(k, v)| match k.node {
@@ -351,8 +358,18 @@ where
                         })
                         .collect();
                     Spanned::new(span, Expr::BraceRecord(fields))
-                } else if !items.is_empty() && with_value == 0 {
-                    // Tuple type `{T, U}` (colon-free brace group).
+                } else if items.len() == 1 && with_value == 0 && trailing_comma.is_none() {
+                    // `{T}` — a product of one type with no comma to say so.
+                    emitter.emit(Rich::custom(
+                        span,
+                        "a one-element tuple type is written `{T,}`, with the trailing \
+                         comma; `{…}` in type position is always a product, never \
+                         grouping",
+                    ));
+                    Spanned::new(span, Expr::Error)
+                } else if with_value == 0 {
+                    // Tuple type `{T, U}` / one-tuple `{T,}` / unit `{}`
+                    // (`lower_type_annotation` reads the empty group as `Unit`).
                     let elts = items.into_iter().map(|(k, _)| k).collect();
                     Spanned::new(span, Expr::BraceGroup(elts))
                 } else {
@@ -1254,9 +1271,26 @@ mod tests {
             );
         };
         assert_eq!(elts.len(), 2);
-        // Single element, with and without a trailing comma.
-        assert!(matches!(parse_e("{Int}").node, Expr::BraceGroup(v) if v.len() == 1));
+        // A one-element product needs its trailing comma to say so.
         assert!(matches!(parse_e("{Int,}").node, Expr::BraceGroup(v) if v.len() == 1));
+        // The empty group is the unit type — `Unit` after lowering.
+        assert!(matches!(parse_e("{}").node, Expr::BraceGroup(v) if v.is_empty()));
+    }
+
+    #[test]
+    fn comma_free_one_element_brace_is_an_error() {
+        // `{T}` has no reading left: braces in type position are always a
+        // product, never grouping, and a one-element product is `{T,}`.
+        let result = parse_expression("{Int}");
+        assert!(
+            !result.errors.is_empty(),
+            "expected `{{Int}}` to be rejected"
+        );
+        let rendered = result.errors[0].to_string();
+        assert!(
+            rendered.contains("{T,}"),
+            "the error should point at the trailing-comma spelling, got: {rendered}"
+        );
     }
 
     #[test]

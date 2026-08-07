@@ -875,12 +875,28 @@ fn collect_type_errors(
             collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
             collect_type_errors(codomain, context_sym, strictness, errors, seen_refinements);
         }
+        // A product with no fields is `Unit` — the one empty-product type
+        // (`docs/chl-spec.md`, "6.6 The empty product is unit"). `Type::tuple` /
+        // `Type::record` enforce that where products are built; catch a site
+        // that named the variant directly here, because the failure it causes
+        // downstream is a self-contradictory "expected (), found ()" when two
+        // passes pick different empty spellings for the same node.
         Type::Tuple(elems) => {
+            debug_assert!(
+                !elems.is_empty(),
+                "empty Tuple type at `{context_sym}`: the empty product is Unit \
+                 (build products with Type::tuple)"
+            );
             for elem in elems {
                 collect_type_errors(elem, context_sym, strictness, errors, seen_refinements);
             }
         }
         Type::Record(fields) => {
+            debug_assert!(
+                !fields.is_empty(),
+                "empty Record type at `{context_sym}`: the empty product is Unit \
+                 (build products with Type::record)"
+            );
             for (_, ty) in fields {
                 collect_type_errors(ty, context_sym, strictness, errors, seen_refinements);
             }
@@ -2578,15 +2594,31 @@ mod tests {
         );
     }
 
-    /// An empty record: the solver cannot distinguish an empty `Record` from an empty
-    /// `Tuple` at coalesce time (both compact to a `CompactType` with an empty field map)
-    /// and produces `Tuple([])`.
+    /// An empty product is `Unit`, whichever syntax built it. The solver cannot
+    /// distinguish an empty `Record` from an empty `Tuple` at coalesce time
+    /// (both compact to a `CompactType` with an empty field map) — and does not
+    /// have to, because they are the same type: `Tuple([])` and `Record([])` are
+    /// not valid types (`docs/chl-spec.md`, "6.6 The empty product is unit").
     #[test]
     fn test_infer_record_empty() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::new(TypedExprNode::Record(vec![]));
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert_eq!(ty, Type::Tuple(vec![]));
+        assert_eq!(ty, Type::Base(BaseType::Unit));
+    }
+
+    /// The empty *tuple* term reaches the same type by the same route. That the
+    /// two spellings agree is what lets `()` past the post-inference
+    /// consistency wall: the wall compares a node's recorded type against one
+    /// rebuilt from its children, so a `Record([])`/`Tuple([])` split here
+    /// would reject the node with the self-contradictory
+    /// "expected (), found ()".
+    #[test]
+    fn test_infer_tuple_empty_is_unit() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::new(TypedExprNode::Tuple(vec![]));
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(ty, Type::Base(BaseType::Unit));
     }
 
     // -----------------------------------------------------------------------

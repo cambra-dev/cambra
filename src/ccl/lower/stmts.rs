@@ -6,7 +6,7 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
 use super::*;
 use crate::{
     ccl::{BaseType, Branch, Expr, Lit, Type, TypedExprNode},
-    chl_parser::ast::{AssignTarget, IfBranch, Lit as ChlLit, Span, Spanned, Stmt as ChlStmt},
+    chl_parser::ast::{AssignTarget, IfBranch, Span, Spanned, Stmt as ChlStmt},
     interpreter::{DataSink, HttpServerDataSource, http_server::SharedHttpServer},
 };
 
@@ -953,13 +953,15 @@ fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
 ///   Application is parenthesised at both the term and type level
 ///   (`docs/chl-spec.md`).
 /// - A record type `{name: T, …}` and a tuple type `{T, U}`
-///   (`Expr::BraceGroup`).
+///   (`Expr::BraceGroup`), including the one-element `{T,}` — the trailing
+///   comma is what makes it a product, and the parser rejects a comma-free
+///   `{T}`.
+/// - The empty group `{}` — the unit type, `Unit`.
 pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
         ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
             LoweringError::unsupported(annotation.span, format!("unknown type annotation: {id}"))
         }),
-        ChlExpr::Lit(ChlLit::None) => Ok(Type::Base(BaseType::Unit)),
         // Type application `List(T)`: a type constructor applied to argument
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
@@ -978,7 +980,13 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
             }
             Ok(Type::Record(out))
         }
-        // Tuple type `{T, U}` (colon-free brace group).
+        // Tuple type `{T, U}` — and `{T,}` for one element, the trailing comma
+        // being what makes it a product (the parser rejects a comma-free
+        // `{T}`). The **empty** group `{}` is the **unit type** — not a
+        // zero-field product, of which there is none: a product with no fields
+        // is unit, and `Tuple([])` is not a valid type (see
+        // `docs/chl-spec.md`, "6.6 The empty product is unit").
+        ChlExpr::BraceGroup(parts) if parts.is_empty() => Ok(Type::Base(BaseType::Unit)),
         ChlExpr::BraceGroup(parts) => Ok(Type::Tuple(
             parts
                 .iter()
@@ -1001,8 +1009,21 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
 /// Resolve a capitalized primitive type name (`Caps` means type —
 /// `docs/chl-spec.md`), or the
 /// inference wildcard `_`. Returns `None` for any other identifier.
+///
+/// **`Unit` is not a CHL type name**, and is not reserved as one either — it is
+/// simply undefined here, like any other unbound capitalized identifier. The
+/// unit type is written structurally, as `{}`
+/// (`docs/chl-spec.md`, "6.6 The empty product is unit").
+///
+/// So this is not simply [`BaseType::from_keyword`]. That reader is the CCL
+/// primitive-name round-trip, where `Unit` stays, since CCL renders the type by
+/// that name; the CHL annotation surface is a strict subset of it.
 fn name_type(id: &str) -> Option<Type> {
     if let Some(base) = BaseType::from_keyword(id) {
+        // `Unit` round-trips as a CCL primitive name but is not writable here.
+        if matches!(base, BaseType::Unit) {
+            return None;
+        }
         return Some(Type::Base(base));
     }
     // `_` is the inference wildcard, not a primitive, so it is not a
