@@ -186,7 +186,23 @@ When you are using compact, focus on test output and code changes.
    1. `git fetch origin`
    2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
 
-### Commit descriptions are PR bodies — author them as Markdown
+### PR descriptions: summary first, then a review guide
+
+A PR body is a map for the reviewer, not a write-up of the investigation that produced the change.
+
+**Open with a summary that stands alone** — one paragraph, before the first heading: **why** (the problem, as a symptom the reader already cares about, not the internals producing it), **what** (the change as the new rule or invariant, not a list of edits), **so what** (what is now true, possible, or gone). A reader who stops there should be able to say what the PR does and why it exists; an opening that starts mid-mechanism fails that test.
+
+**Structure the rest as a review guide.** Each section is a stop on the reader's path: it names the file, symbol, or pass it covers, says what changes there, and says what to check. Order them the way the change should be read — the core mechanism, then one section per area that had to move (a file a reviewer would be surprised to see in the diff earns a sentence, not silence), then `## Tests` and `## Docs`.
+
+**No information may live only in the PR description.** A body is squash-merged into a commit message, so afterwards it is reachable through `git log` and nowhere else. Every durable claim — an invariant, a rejected alternative, a cost argument — must already exist in the code or a design doc; the body is a view onto that material, never the only copy. A paragraph with nowhere to point is a doc comment you have not written yet: write it, then point at it. A complicated change handled well leaves behind more design-doc text and a *shorter* body.
+
+**Where the body and a doc would say the same thing, cite and summarize in a sentence** rather than retelling it condensed — a retelling drifts from the doc by the next change, and then two places disagree. One sentence handing off to [type-inference.md](src/ccl/design/type-inference.md#keying-a-specialization) beats a section reconstructing the argument it already makes; a section that opens "worth reading the module docs for" and then restates them has broken this rule, not followed it. Use a repo-relative Markdown link, which GitHub resolves in a PR body; `./ci.sh doc_refs` does **not** check descriptions, so confirm the heading exists and the anchor spells it correctly before posting.
+
+**A section is one idea, about 150 words.** The limit is on the section, never the body: a change with ten moving parts earns ten short sections, while the same change as four 400-word walls is where a reviewer stops reading. A section that will not fit was two ideas.
+
+**Cut what neither motivates nor orients** — investigation narrative (wrong hypotheses, the order of discovery) and re-narration of what the diff already shows. Compression must not cost accuracy, though: re-check every name, count, and list that survives against the diff.
+
+### Author the body as Markdown
 
 PRs here are often created with `gh pr create --fill`, so the
 PR body is the commit description *verbatim*, the PR body squashes to become
