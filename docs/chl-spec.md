@@ -163,7 +163,7 @@ reserved for future use.
 | `0`, `42`, `1234` | `Int(i64)` | Decimal only; no `_` separators, no hex/bin/oct, no negation in the token (`-3` is `UnaryOp(Neg, 3)`). |
 | `"hello\n"`, `'world'` | `String` | Double- or single-quoted. Escapes: `\n \t \r \\ \" \' \0`. Unknown escapes are preserved verbatim (the `\` is kept). No multi-line `"""..."""`, no f-strings, no raw `r"..."`. |
 | `True`, `False` | `Bool` | |
-| `None` | `Unit` | CHL's unit value. (Direction: unit becomes `()`, and lowercase `none` is the `Option` constructor — see §3.1.) |
+| `None` | `Unit` | CHL's unit **value** only — the unit *type* is written `{}` (§6.6), and `None` in type position is rejected. (Direction: the value becomes `()`, and lowercase `` `none `` is the `Option` tag — see §3.1.) |
 
 There are no floating-point literals — CHL has no `f64` type at the
 surface level.
@@ -358,7 +358,7 @@ expression ::= lambda_expr | yield_expr | feed_expr
 atom ::= literal
        | ident
        | "(" expression ")"                  -- parenthesised
-       | "(" ")"                              -- empty product: the unit value, typed `Unit` (§3.1, §6.6)
+       | "(" ")"                              -- empty product: the unit value, typed `{}` (§3.1, §6.6)
        | "(" expression "," ")"              -- one-tuple
        | "(" expression ( "," expression )+ [ "," ] ")"   -- tuple
        | "(" record_field ( "," record_field )* [ "," ] ")"   -- record value
@@ -621,7 +621,9 @@ of the partiality disappears entirely.)
 
 `Int`, `String`, `Bool`, `None` denote themselves. `None` is CHL's unit
 value: a single inhabitant of the unit type. (In the lowering, `None`
-becomes the CCL `Unit` literal.)
+becomes the CCL `Unit` literal.) It is a **value** and nothing else — the
+unit type it inhabits is written `{}`, and `None` in type position is
+rejected (§6.6).
 
 A literal's **type is the literal itself**, not merely its base: `5` has type
 `{Int | 𝑒 == 5}`, printed `5`. So `x = 5` gives `x` the type `5`, and an
@@ -933,7 +935,7 @@ lowering error. Finite maps are a collection literal `[k -> v, …]` (§6.3,
 **[Decided]**), not a brace form.
 
 **Empty forms.** `()` is the empty product — the unit value, and equally the
-empty record (§3.1); its type is `Unit`, spelled `{}` in a brace type (§6.6).
+empty record (§3.1); its type is the unit type, written `{}` (§6.6).
 `[]` is the empty list.
 
 > **Direction [Decided].** The literal forms migrate with the
@@ -1526,17 +1528,17 @@ marked one carries its status per "How to read this document".)
 - `Int` — signed 64-bit integer.
 - `Bool` — `True` or `False`.
 - `String` — UTF-8 string.
-- `Unit` — unit type, one inhabitant. Also spelled `None` (the literal, in
-  type position) and `{}` (the empty product, §6.6); all three are accepted
-  and denote this type. There is no *empty* (uninhabited) type — §6.6.
+- `{}` — unit type, one inhabitant: the empty product (§6.6), and its only
+  CHL spelling. Neither `Unit` nor `None` is accepted in annotation position.
+  There is no *empty* (uninhabited) type — §6.6.
 - `List(T)` — finite collection of `T`-values, indexed by `[0, n)`.
   The index → element mapping is part of the value (so `xs[i]` is
   well-defined); iteration order, however, is unspecified (§3). Written
   `List(T)` or `List(_)`.
 - `{T₀, T₁, …}` — tuple type (structural `{…}` type syntax — §6.1). The
   one-element case is `{T,}`, with the comma required, and a comma-free
-  `{T}` is a parse error (§2.4, §3.11). The zero-element case is `{}`,
-  which is `Unit` (§6.6).
+  `{T}` is a parse error (§2.4, §3.11). The zero-element case is `{}`
+  itself — the unit type (§6.6).
 - `{name: T, …}` — record type. Two records are the same type iff they
   have the same field names with the same field types.
 - ``{ `tag₀{…} | `tag₁{…} | … }`` — variant type (**[Decided]**, §6.5).
@@ -1836,25 +1838,35 @@ in type position (§2.4), inhabited by the empty product term `()` (§3.11).
 An "empty tuple type" and an "empty record type" are therefore **not types**.
 They are not two degenerate products alongside unit — a product with no fields
 has nothing to distinguish positional keying from named keying, so both
-descriptions name the same one-inhabitant type, and that type is `Unit`. The
-compiler holds this as an invariant on the type representation: `Tuple([])`
-and `Record([])` are invalid, products are built through constructors that map
-the empty case to `Unit`, and a `debug_assert` at the post-inference wall
-catches any path that bypasses them.
+descriptions name the same one-inhabitant type. The compiler holds this as an
+invariant on the type representation — where the type is CCL's `Unit`:
+`Tuple([])` and `Record([])` are invalid, products are built through
+constructors that map the empty case to `Unit`, and a `debug_assert` at the
+post-inference wall catches any path that bypasses them.
 
 This is an invariant and not a convention because two spellings of one type do
 not merely look untidy — they fail to *reconcile*. Inference records a node's
-type and a later consistency check rebuilds it from the node's children; when
-the two arrived at the empty product by different routes they disagreed, and
-the disagreement surfaced as the self-contradictory diagnostic
-`expected (), found ()`. Collapsing the spellings is what makes `()`
-typecheck.
+type and a later consistency check rebuilds it from the node's children, so if
+those two steps can reach the empty product by different routes they disagree
+about a node that is perfectly well typed — and the disagreement is
+undiagnosable, since both spellings render `()`. One representation is what
+makes the empty product term `()` typecheck at all.
 
-`Unit` has three surface spellings — `Unit`, `None`, and `{}` — all accepted
-in annotation position and all denoting this type. Collapsing them is
-**[Open]**; the term/type capitalization direction (§6.1) already implies
-`None`'s days are numbered, since `None` is doing double duty as the type and
-its inhabitant.
+**`{}` is the only CHL spelling.** One type, one way to write it — so neither
+`Unit` nor `None` is accepted in annotation position:
+
+- `Unit` names the right type by a name CHL does not have. CCL still *renders*
+  the type as `Unit`, and that is fine: CCL's rendering is a separate surface
+  and not yet settled. The two readers therefore differ on purpose — the CCL
+  primitive-name round-trip accepts `Unit`, and the CHL annotation reader is a
+  strict subset of it.
+- `None` is the unit **value**, not its type (§3.1). A literal is not a type in
+  any other position either; the only thing that made this one look like one is
+  `None` having to stand in for both.
+
+Both are rejected with the spelling to use rather than accepted as synonyms.
+`{}` is also the spelling that says what the type *is* — the empty product —
+which is what makes `Set(K) = Map(K, {})` (§6.3) read as the set it encodes.
 
 There is **no empty type** (no uninhabited / void type) in CHL or CCL: the
 base types are `Int`, `UInt`, `String`, `Bool`, and `Unit`, and nothing else
@@ -2397,10 +2409,10 @@ with parser-level support that lowering rejects:
 - **Destructuring patterns** beyond tuples — record, variant, and
   wildcard patterns, and per-component annotations with `:` binding
   tighter than `,` (**[Decided]**, §4.3.1).
-- **Collapsing the `Unit` spellings** — `Unit`, `None`, and `{}` are all
-  accepted in annotation position for the one unit type (§6.6). Which
-  survives is **[Open]**, though the capitalization direction (§6.1)
-  already points at retiring `None`.
+- **The unit value's spelling** — the unit *type* is settled as `{}` (§6.6),
+  but its one inhabitant is still the Python-shaped `None`. The target is the
+  empty product `()` (**[Decided]**, §3.1); until it lands, `None` is a value
+  whose spelling no longer matches its type.
 - **The term-level delimiter migration** — record values are `(f=1, …)`, and
   `{…}` no longer denotes a term-level value (it is record-type / tuple-type /
   unit syntax, §2.4). Finite maps as `[k -> v, …]` remain **[Decided]**; earlier

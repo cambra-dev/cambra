@@ -19,7 +19,7 @@ use cambra::ccl::{
         InferError, LocatedInferError, TypeInferenceContext, check_pre_desugar, infer,
         lit_singleton,
     },
-    lower::{LoweringContext, lower_stmts},
+    lower::{LoweringContext, LoweringError, lower_stmts},
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
@@ -60,6 +60,17 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
         .into_result()
         .expect("lowering failed");
     infer(&mut expr, &mut ictx).expect("inference failed")
+}
+
+/// Like [`infer_program`] but expects **lowering** to fail and returns all
+/// errors. For rejections decided before inference runs — an annotation form
+/// CHL does not accept, say.
+fn lower_program_err(code: &str) -> Vec<LoweringError> {
+    let mut lctx = LoweringContext::default();
+    let stmts = parse_module(code);
+    lower_stmts(&stmts, &mut lctx)
+        .into_result()
+        .expect_err("expected lowering error")
 }
 
 /// Like [`infer_program`] but expects inference to fail and returns all errors.
@@ -1227,6 +1238,24 @@ fn the_empty_product_is_unit() {
         !infer_program_err("x: {} = 1\nx").is_empty(),
         "`{{}}` is the unit type, so an `Int` must not satisfy it"
     );
+}
+
+/// `{}` is the *only* CHL spelling of the unit type.
+///
+/// `Unit` names the right type by a name CHL does not have (CCL still renders
+/// it that way, but the surfaces are separate), and `None` is the unit *value*,
+/// not its type. Both are rejected with the spelling to use, rather than
+/// accepted as synonyms — one type, one way to write it.
+#[test]
+fn unit_has_one_chl_spelling() {
+    for src in ["x: Unit = None\nx", "x: None = None\nx"] {
+        let errs = lower_program_err(src);
+        let msg = format!("{:?}", errs[0]);
+        assert!(
+            msg.contains("`{}`"),
+            "the error for {src:?} should point at the `{{}}` spelling, got: {msg}"
+        );
+    }
 }
 
 /// A projection whose target's type is still a *variable* where the projection is
