@@ -437,7 +437,7 @@ fn test_tuple() {
 
 #[test]
 fn test_tuple_index() {
-    assert_eq!(infer_program(r#"(1, "a")[0]"#), int_lit(1));
+    assert_eq!(infer_program(r#"(1, "a").0"#), int_lit(1));
 }
 
 // ---------------------------------------------------------------------------
@@ -820,8 +820,8 @@ fn test_generic_identity() {
 /// heterogeneous tuple, exercising the partial-tuple / projection rule.
 #[test]
 fn test_tuple_index_heterogeneous() {
-    assert_eq!(infer_program(r#"(1, "a")[0]"#), int_lit(1));
-    assert_eq!(infer_program(r#"(1, "a")[1]"#), str_lit("a"));
+    assert_eq!(infer_program(r#"(1, "a").0"#), int_lit(1));
+    assert_eq!(infer_program(r#"(1, "a").1"#), str_lit("a"));
 }
 
 /// An unconstrained identity applied to a concrete value must resolve all
@@ -1158,6 +1158,97 @@ b = make("s")
     // element type is the literal that was fed to it.
     assert_eq!(*feed_value(&elems[0]), int_lit(1));
     assert_eq!(*feed_value(&elems[1]), str_lit("s"));
+}
+
+// ---------------------------------------------------------------------------
+// Projection (`.`) vs. lookup (`[…]`)
+// ---------------------------------------------------------------------------
+
+/// `.` projects a product and `[…]` looks up a collection. The spellings are disjoint,
+/// so lowering never has to guess which operation a bracket was — a guess it has no
+/// types to make, and the wrong one for `xs[0]`, the commonest subscript anyone writes
+/// (`docs/chl-spec.md`, "3.9 Subscript and attribute access").
+#[test]
+fn dot_projects_and_brackets_look_up() {
+    // Both keyings project, on the shapes that have them. Projection *selects* an
+    // element rather than computing one, so the element's own singleton survives.
+    assert_eq!(infer_program("t = (1, \"a\")\nt.0"), int_lit(1));
+    assert_eq!(infer_program("t = (1, \"a\")\nt.1"), str_lit("a"));
+    assert_eq!(infer_program("r = (a=1, b=2)\nr.b"), int_lit(2));
+
+    // A tuple is a heterogeneous product, not a finite function, so it has no domain to
+    // look up in — however the index is spelled, literal or not.
+    for program in ["t = (1, \"a\")\nt[0]", "t = (1, 2)\ni = 0\nt[i]"] {
+        let errs = infer_program_err(program);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::ExpectedFunction { .. })),
+            "a tuple has no domain to look up in: `{program}` gave {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| format!("{e:?}").contains("`.0`")),
+            "the rejection must name the projection spelling: {errs:?}"
+        );
+    }
+}
+
+/// The two keyings are one operation differing only in the key, so they compose freely
+/// in either order and to any depth.
+#[test]
+fn positional_and_named_projection_compose() {
+    assert_eq!(infer_program("r = (p=(1, \"a\"))\nr.p.1"), str_lit("a"));
+    assert_eq!(infer_program("t = ((a=1), 2)\nt.0.a"), int_lit(1));
+    assert_eq!(infer_program("t = ((1, 2), 3)\nt.0.1"), int_lit(2));
+}
+
+/// The brace *type* forms and `.` agree on keying: `{T, U}` is a tuple type, projected
+/// positionally; `{name: T}` is a record type, projected by name.
+#[test]
+fn brace_type_annotations_project_by_their_keying() {
+    assert_eq!(infer_program("t: {Int, Bool} = (1, True)\nt.0"), int_lit(1));
+    assert_eq!(infer_program("r: {a: Int} = (a=1)\nr.a"), int_lit(1));
+}
+
+/// A projection whose target's type is still a *variable* where the projection is
+/// emitted: the node states a requirement — "a product with this key" — rather than
+/// deciding a shape, so an inferred parameter recovers its shape from the call site, and
+/// an argument with no such key is rejected there.
+#[test]
+fn projection_through_an_inferred_parameter() {
+    assert_eq!(infer_program("def f(x):\n    x.1\nf((1, 2))"), int_lit(2));
+    assert_eq!(infer_program("def f(r):\n    r.a\nf((a=7))"), int_lit(7));
+    assert!(
+        !infer_program_err("def f(x):\n    x.0\nf(1)").is_empty(),
+        "an `Int` has no positions to project"
+    );
+}
+
+/// The diagnostics for a projection that cannot land say what the shape actually has.
+///
+/// Both failures otherwise report a shape the program never had, because a positional
+/// requirement is a *dense* tuple (`.99` demands 100 positions) and a named one is a
+/// one-field record — partial shapes that read as internal machinery next to the value's
+/// own type.
+#[test]
+fn projection_diagnostics_name_the_shape() {
+    // Past the end of a tuple: the position asked for, and the width there is.
+    let errs = infer_program_err("t = (1, 2, 3)\nt.99");
+    let msg = format!("{:?}", errs[0]);
+    assert!(
+        msg.contains("No position .99") && msg.contains("3 positions"),
+        "expected the requested position and the tuple's width, got: {msg}"
+    );
+
+    // Wrong keying: a record has names and a tuple has positions, which is the whole
+    // content of the failure and what the bare shapes do not say.
+    for program in ["r = (a=1)\nr.0", "t = (1, 2, 3)\nt.b"] {
+        let errs = infer_program_err(program);
+        assert!(
+            errs.iter()
+                .any(|e| format!("{e:?}").contains("keyed by field *name*")),
+            "expected the record/tuple keying hint for `{program}`, got {errs:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

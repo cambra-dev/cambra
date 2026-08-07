@@ -37,8 +37,8 @@ use smol_str::SmolStr;
 #[case("[x + '' for x in testsource1()]")]
 #[case("['' + x for x in testsource1()]")]
 #[case("y = ''; [y + x for x in testsource1()]")]
-#[case("[(x, 0)[0] for x in testsource1()]")]
-#[case("[(x, 0)[0] for x in testsource1() if True]")]
+#[case("[(x, 0).0 for x in testsource1()]")]
+#[case("[(x, 0).0 for x in testsource1() if True]")]
 fn test_test_source(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let data_source = Rc::new(RefCell::new(TestDataSource::new(
@@ -143,9 +143,9 @@ fn test_source_filter_nonterminal() {
 // 30s: the original flake site; one of the heaviest compiles, ~9.5s wall on a slow CI VM.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[case("[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0]]")]
+#[case("[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 == y.0]")]
 #[case(
-    "[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] <= y[0] and x[0] >= y[0]]"
+    "[(x.0, x.1, y.1) for x in testsource1() for y in testsource2() if x.0 <= y.0 and x.0 >= y.0]"
 )]
 fn test_inner_join(#[case] code: &str) {
     let mut ctx = GlobalContext::default();

@@ -369,13 +369,21 @@ pub enum Expr {
     /// value position.
     BraceGroup(Vec<Spanned<Expr>>),
 
-    /// Subscript: `target[index]`.
+    /// Subscript: `target[index]` — **collection lookup only**. Projecting a product
+    /// is a different operation and has its own spelling, [`Expr::Attribute`].
     Subscript {
         target: Box<Spanned<Expr>>,
         index: Box<Spanned<Expr>>,
     },
 
-    /// Attribute access: `target.attr`.
+    /// Attribute access: `target.attr` — a record field by **name** (`r.age`) or a
+    /// tuple position by **index** (`t.0`, whose digits are held here verbatim).
+    ///
+    /// One node for both because they are one operation, projecting a field; what
+    /// differs is only how the field is keyed, which
+    /// [`ProjKey`](crate::ccl::ProjKey) already models. Lowering resolves the key once,
+    /// so the distinction is stated where projection is built rather than a third time
+    /// here. An identifier cannot begin with a digit, so the forms never collide.
     Attribute {
         target: Box<Spanned<Expr>>,
         attr: SmolStr,

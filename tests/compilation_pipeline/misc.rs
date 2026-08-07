@@ -17,7 +17,7 @@ use crate::helpers::*;
 // Test that we don't have splits in the operator graph for simple binops
 #[rstest]
 #[case("[1 + x + 1 for x in [1,2,3]]")]
-#[case("[(x, x)[0] + 2 for x in [1,2,3]]")]
+#[case("[(x, x).0 + 2 for x in [1,2,3]]")]
 #[case("[(x, 0) for x in [1,2,3]]")]
 #[case("[x for x in [1,2,3] if x + 1 < 2]")]
 #[case("1 + 2 + 3")]

@@ -32,7 +32,7 @@ fn test_literals(#[case] code: &str, #[case] expected: Value) {
 // Record type `(name=T, …)`.
 #[case("p: {a: Int, b: Int} = (a=1, b=2)\np.a", Value::Int(1))]
 // Tuple type `{T, U}` (colon-free brace group).
-#[case("t: {Int, Bool} = (1, True)\nt[0]", Value::Int(1))]
+#[case("t: {Int, Bool} = (1, True)\nt.0", Value::Int(1))]
 fn test_type_annotation_forms(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -218,9 +218,12 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
     "('a', 1)",
     make_tuple(&[Value::String("a".into()), Value::Int(1)])
 )]
-#[case("('a', 1)[0]", Value::String("a".into()))]
-#[case("('a', 1)[1]", Value::Int(1))]
-#[case("x = ('a', 1); x[0]", Value::String("a".into()))]
+#[case("('a', 1).0", Value::String("a".into()))]
+#[case("('a', 1).1", Value::Int(1))]
+#[case("x = ('a', 1); x.0", Value::String("a".into()))]
+// A positional key and a named one are the same operation, so they compose freely.
+#[case("r = (p=('a', 1), q=2); r.p.1", Value::Int(1))]
+#[case("t = ((1, 2), 3); t.0.1", Value::Int(2))]
 fn test_tuples(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

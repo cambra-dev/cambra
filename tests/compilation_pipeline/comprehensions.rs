@@ -41,7 +41,7 @@ fn test_comprehensions(#[case] code: &str, #[case] expected: Tile) {
 #[timeout(Duration::from_secs(10))]
 #[case("y = 5; [x + y for x in [10, 20]]", make_int_list(&[15, 25]))]
 #[case("y = 1; z = [1,2,3]; [x + y for x in z]", make_int_list(&[2, 3, 4]))]
-#[case("y = 1; z = [(1, 'a'),(2, 'b'),(3, 'c')]; [x[0] + y for x in z]", make_int_list(&[2, 3, 4]))]
+#[case("y = 1; z = [(1, 'a'),(2, 'b'),(3, 'c')]; [x.0 + y for x in z]", make_int_list(&[2, 3, 4]))]
 fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
@@ -52,8 +52,8 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("[(y, y)[1] for y in [10, 20]]", make_int_list(&[10, 20]))]
-#[case("[y[0] for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
+#[case("[(y, y).1 for y in [10, 20]]", make_int_list(&[10, 20]))]
+#[case("[y.0 for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
     "[(y, 100) for y in [(10, 'a'), (20, 'b')]]",
     Tile::SealedFunction {

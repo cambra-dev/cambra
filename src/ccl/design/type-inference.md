@@ -1085,11 +1085,20 @@ A CHL record value is a parenthesised list of `name=value` fields:
 ```python
 r = (x=1, y="hello")   # Record([("x", 1), ("y", "hello")])
 r.x                        # Apply(r, Proj(ProjKey::Field("x"))) → 1
+t = (1, "hello")       # Tuple([1, "hello"])
+t.0                        # Apply(t, Proj(ProjKey::Index(0))) → 1
 ```
 
-**Lowering:**
+**Lowering:** the surface has one postfix form for both keyings — the parser holds the key
+verbatim in `Attribute { attr }`, and lowering resolves which `ProjKey` it is. The two are
+disjoint because an identifier cannot begin with a digit, so *leading digit* is the whole
+discriminator; nothing is inferred from context. `[…]` is collection lookup only, and
+lowers to the application it *is* (`c[k]` → `Apply(lower(k), lower(c))`), so a product —
+having no domain — is never reachable through it.
+
 - `(name=v, ...)` → `TypedExprNode::Record([(name, v), ...])`.
 - `expr.field` → `Apply(lower(expr), Proj(ProjKey::Field("field")))`.
+- `expr.n` → `Apply(lower(expr), Proj(ProjKey::Index(n)))`.
 
 **Type inference:** `Record([(k, e), ...])` infers to `Type::Record([(k, T), ...])` where each `T` is the inferred type of the corresponding value expression — identical in structure to `Tuple` inference.
 
@@ -1107,6 +1116,11 @@ A bare `Proj(key)` node — i.e. the projection morphism, not an application of 
 | `Proj(Field("x"))` | `Record([("x", ?a)]) ⇒ ?a` — a single-field record |
 
 The index domain is a `Type::Tuple` padded with fresh variables up to index `n`; the field domain is a single-field `Type::Record` (see `emit_proj`). Width-subtyping lets either unify with any concrete product carrying at least that field, constraining `?a` to the element type there.
+
+**What the padding costs the diagnostics.** `Type::Tuple` is dense, so "has position `𝑛`" is only expressible as "is `𝑛+1` wide" — a positional projection cannot state a *sparse* requirement the way the named one does. Two consequences the error path has to absorb, since both would otherwise report a shape the program never had:
+
+- A projection past the end fails as a **width** violation, and the first absent position is the value's own width rather than the one the user asked for. So the subtyping edge reports the *widest* position the requirement demands (`constrain_go`'s tuple arm), which for a projection is the only position genuinely demanded — `t.99` on a 3-tuple is missing `.99`, not `.3`. `InferError::MissingField` then states the requested position against the found width, rather than the padded 100-tuple.
+- Projecting with the *wrong keying* (`r.0`, `t.name`) is a `Record`-vs-`Tuple` constructor mismatch whose "required" side is the partial requirement (`(?31)`, `{name: ?31}`). A record/tuple mismatch is always a keying confusion, so the message carries that as a hint instead of leaving the partial shape to be read as a type.
 
 A projection's domain appears only at a negative position, so the one-way constraints leave it under-determined; its full structure (the value actually flowing in) is recovered structurally during the coalesce walk by monomorphizing the morphism to its input — see [Apply is one-way](#apply-is-one-way) and [Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass).
 

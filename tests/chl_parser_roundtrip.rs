@@ -119,6 +119,27 @@ fn tuples_and_subscript() {
     "#});
 }
 
+/// `.0` is an `Attribute`, not a subscript: a positional key and a named one are one
+/// postfix form, and the digits ride in the `attr` slot verbatim for lowering to resolve.
+/// (`.0` lexes as `Dot` then `Int` — there is no float token to swallow it, so `.0.1` is
+/// two projections rather than a decimal.)
+#[test]
+fn positional_attribute_access() {
+    for (src, attr) in [("t.0", "0"), ("t.10", "10"), ("t.0.1", "1"), ("t.a.0", "0")] {
+        match must_parse_expr(src).node {
+            Expr::Attribute { attr: got, .. } => assert_eq!(got.as_str(), attr, "for `{src}`"),
+            other => panic!("expected Attribute for `{src}`, got {other:?}"),
+        }
+    }
+    // A key that is neither spelling is rejected, and the label names both.
+    let r = parse_module("t.-1\n");
+    let msg = format!("{}", r.errors.first().expect("`.-1` must not parse"));
+    assert!(
+        msg.contains("field name or index"),
+        "expected the projection-key label, got: {msg}"
+    );
+}
+
 #[test]
 fn collection_union() {
     let _ = must_parse_expr("[1, 2, 3] ++ [4, 5]");

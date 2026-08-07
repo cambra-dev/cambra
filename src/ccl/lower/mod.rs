@@ -38,6 +38,8 @@
 //! | Regular functions `def f(x, y, ...): expr` | [`TypedExprNode::Let`] + single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
 //! | Record literals `{field: expr, ...}` (identifier keys only) | [`TypedExprNode::Record`] |
 //! | Field access `r.field` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Field`]`)` |
+//! | Positional access `t.0` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Index`]`)` |
+//! | Collection lookup `c[k]` | [`TypedExprNode::Apply`] — the same node as the call `c(k)` |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
@@ -82,9 +84,7 @@ use crate::{
         Branch, Expr, Lit, TypedExprNode,
         lineage::{Nature, RewriteLabel},
     },
-    chl_parser::ast::{
-        Expr as ChlExpr, Lit as ChlLit, RecordField, Span, Spanned, Stmt as ChlStmt,
-    },
+    chl_parser::ast::{Expr as ChlExpr, RecordField, Span, Spanned, Stmt as ChlStmt},
     interpreter::{DataSink, DataSourceDomainExtentImpl, http_server::SharedHttpServer},
 };
 
@@ -688,21 +688,7 @@ fn lower_expr_inner(
             let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
             Ok(Expr::tuple(items?))
         }
-        ChlExpr::Subscript { target, index } => match &index.node {
-            ChlExpr::Lit(ChlLit::Int(n)) => {
-                let idx: usize = (*n).try_into().map_err(|_| {
-                    LoweringError::unsupported(index.span, "tuple index must be non-negative")
-                })?;
-                // The `Proj` images the index token the user wrote.
-                let target_expr = lower_expr(target, ctx)?;
-                let proj = ctx.tag_image(Expr::proj_index(idx), index.span);
-                Ok(Expr::apply(target_expr, proj))
-            }
-            _ => Err(LoweringError::unsupported(
-                index.span,
-                "only integer subscripts are supported",
-            )),
-        },
+        ChlExpr::Subscript { target, index } => lower_subscript(target, index, ctx),
         // Record value `(name=expr, ...)`. Lowered to a `Record` constructor:
         // `(x=1, y="foo")` becomes `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
         ChlExpr::Record(fields) => {
@@ -740,11 +726,34 @@ fn lower_expr_inner(
             "`{…}` is type syntax (a record type `{name: T}`); \
              a record value is written `(name=value)`",
         )),
-        // Attribute access `r.field` → `Apply(r, Proj(Field("field")))`. The
-        // `Proj` images the `.field` access the user wrote.
-        ChlExpr::Attribute { target, attr, .. } => {
+        // Attribute access `target.attr` → `Apply(target, Proj(k))`. The `Proj` images
+        // the `.attr` access the user wrote.
+        //
+        // This is the one place a projection key's two spellings are resolved: digits
+        // are a tuple **position**, anything else a record field **name**. The two are
+        // disjoint because an identifier cannot begin with a digit, so `starts_with` a
+        // digit *is* the discriminator — no guessing and no ambiguity.
+        ChlExpr::Attribute {
+            target,
+            attr,
+            attr_span,
+        } => {
+            let key = if attr.starts_with(|c: char| c.is_ascii_digit()) {
+                // Only magnitude can fail here: the parser admits an integer literal,
+                // so the digits are a non-negative number, but not necessarily one a
+                // `usize` position can hold.
+                let index: usize = attr.parse().map_err(|_| {
+                    LoweringError::unsupported(
+                        *attr_span,
+                        format!("tuple position `.{attr}` is too large to be an index"),
+                    )
+                })?;
+                Expr::proj_index(index)
+            } else {
+                Expr::proj_field(attr.as_str())
+            };
             let target_expr = lower_expr(target, ctx)?;
-            let proj = ctx.tag_image(Expr::proj_field(attr.as_str()), expr.span);
+            let proj = ctx.tag_image(key, expr.span);
             Ok(Expr::apply(target_expr, proj))
         }
         ChlExpr::Lambda { params, body } => lower_lambda(expr.span, params, body, ctx),

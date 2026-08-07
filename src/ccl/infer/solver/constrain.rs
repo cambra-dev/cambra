@@ -50,7 +50,9 @@ pub enum ConstrainError {
     /// that lhs did not have. Width-subtyping says rhs's keys must be a
     /// subset of lhs's; this is the violation.
     MissingField {
-        /// The missing key.
+        /// The key rhs demands and lhs does not carry. For a **positional** key
+        /// this is the *widest* position demanded rather than the first absent one
+        /// — see the tuple arm of [`constrain_go`] for why.
         key: FieldKey,
         /// The lhs record/tuple that should have contained the key.
         in_type: Type,
@@ -524,8 +526,14 @@ fn constrain_go(
                 match a.get(i) {
                     Some(t0) => constrain_go(t0, t1, sl, sr, cache)?,
                     None => {
+                        // A `Tuple` is **dense**, so the failure here is one of *width*
+                        // and the widest position rhs demands is its sharpest witness —
+                        // report that rather than the first absent one, which is just
+                        // `lhs`'s own width restated. This is what makes a positional
+                        // projection diagnosable: `t.99` requires a 100-wide tuple, so
+                        // the demand a 3-tuple fails is `.99`, not `.3`.
                         return Err(ConstrainError::MissingField {
-                            key: FieldKey::Index(i),
+                            key: FieldKey::Index(b.len() - 1),
                             in_type: lhs.clone(),
                         });
                     }
