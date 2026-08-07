@@ -358,7 +358,7 @@ expression ::= lambda_expr | yield_expr | feed_expr
 atom ::= literal
        | ident
        | "(" expression ")"                  -- parenthesised
-       | "(" ")"                              -- empty tuple (target: the unit value, §3.1; [Open] whether it equals None today)
+       | "(" ")"                              -- empty product: the unit value, typed `Unit` (§3.1, §6.6)
        | "(" expression "," ")"              -- one-tuple
        | "(" expression ( "," expression )+ [ "," ] ")"   -- tuple
        | "(" record_field ( "," record_field )* [ "," ] ")"   -- record value
@@ -366,7 +366,9 @@ atom ::= literal
        | "[" expression comp_for ( comp_for | comp_if )* "]"  -- collection comprehension
        | "(" expression comp_for ( comp_for | comp_if )* ")"  -- collection comprehension (paren form)
        | "{" typed_ident ( "," typed_ident )* [ "," ] "}"   -- record type (§6.1)
+       | "{" expression "," "}"                           -- one-tuple type (§6.1)
        | "{" expression ( "," expression )+ [ "," ] "}"   -- tuple type (§6.1)
+       | "{" "}"                                          -- unit type (§6.6)
 
 record_field ::= ident "=" expression
 typed_ident  ::= ident ":" expression
@@ -385,20 +387,28 @@ list makes a tuple type (`{T, U}`). A `{...}` in value position is a lowering
 error pointing at the `(…)` form. (Finite maps are a collection, written
 `[k -> v, …]` — §6.3 — not a brace form.)
 
-A colon-free brace group of **one** element is accepted today and read as a
-one-element tuple type (`{Int}` lowers to the same type as `{Int,}`). The
-decided rule below retires that spelling: a one-tuple type, like a one-tuple
-term, requires the trailing comma.
+**Braces in type position are always a product, never grouping.** Two
+consequences, both enforced:
+
+- A **one-element** tuple type carries the trailing comma — `{T,}` — exactly
+  as the term-level one-tuple does (`(e,)`, §3.11). A comma-free `{T}` is a
+  parse error pointing at `{T,}`: with no grouping reading available there is
+  nothing else for it to mean, and requiring the comma keeps one spelling per
+  type.
+- An **empty** `{}` is the product of zero types, which is the **unit type**
+  (§6.6). It is not an empty tuple type and not an empty record type — those
+  are not types at all.
 
 > **Direction — brace forms [Decided].** `{…}` acquires two more
 > structural-type forms, so what a brace group means becomes a
-> classification over what it contains. None of the added forms is lexed
-> or parsed today:
+> classification over what it contains. Neither added form is lexed or
+> parsed today; the rest of the table is implemented:
 >
 > ```ebnf
 > brace_type  ::= "{" typed_ident ( "," typed_ident )* [ "," ] "}"  -- record type
 >              |  "{" type "," "}"                                   -- one-tuple type
 >              |  "{" type ( "," type )+ [ "," ] "}"                 -- tuple type
+>              |  "{" "}"                                            -- unit (§6.6)
 >              |  "{" tag_type ( "|" tag_type )* "}"                 -- variant type (§6.5)
 >              |  "{" type "where" expression "}"                    -- refinement (§6.4)
 >
@@ -408,7 +418,7 @@ term, requires the trailing comma.
 > tagname     ::= [a-z_] [A-Za-z0-9_]*
 > ```
 >
-> The five forms are told apart by their first distinguishing token, so
+> The forms are told apart by their first distinguishing token, so
 > classification never needs lookahead past one item:
 >
 > | Contains | Form | Example |
@@ -417,29 +427,19 @@ term, requires the trailing comma.
 > | `` ` ``-prefixed items | variant type (§6.5) | ``{ `some{Int} \| `none }`` |
 > | `ident : type` items | record type | `{x: Int, y: Int}` |
 > | types, ≥2 or 1-plus-comma | tuple type | `{Int, Bool}`, `{Int,}` |
-> | nothing | **[Open]** — see below | `{}` |
+> | nothing | unit (§6.6) | `{}` |
+> | one type, no comma | **error** — write `{T,}` | `{Int}` |
 >
 > A top-level `where` wins over every other reading and takes the rest of
 > the brace group as its predicate, so `{T where p | q}` refines `T` by
 > `p | q` (§3.3) rather than declaring a variant.
 >
-> Two spellings that look adjacent but are not:
->
-> - **A single-element tuple type needs its comma** — `{Int,}`, matching
->   the term-level `(e,)`/`(e)` split (§3.11). Whether a comma-free
->   `{T}` becomes an *error* or reads as a redundant **grouping** of `T`
->   (the reading that keeps the parallel with `(e)` exact) is **[Open]**.
->   Either way it stops meaning the one-tuple it means today.
-> - **A tag's field braces are not a nested type.** `` `some{Int} `` is
->   the tag `some` with one positional field of type `Int`; a tag's
->   `{…}` *is* its field list, so a record payload is
->   `` `some{a: Int} ``, never `` `some{{a: Int}} `` (§6.5).
->
-> **[Open]**: what an empty `{}` denotes. §6.3 uses it for the unit type
-> (the empty product, `Set(K) = Map(K, {})`), but under the variant form
-> it equally reads as the empty *sum* — the void type, with no
-> inhabitants. The two have different cardinalities, so one of them needs
-> another spelling. The parser rejects `{}` today.
+> One spelling that looks adjacent but is not: **a tag's field braces are
+> not a nested type.** `` `some{Int} `` is the tag `some` with one
+> positional field of type `Int`; a tag's `{…}` *is* its field list, so a
+> record payload is `` `some{a: Int} ``, never `` `some{{a: Int}} ``
+> (§6.5). In particular the one-tuple comma does not apply inside a tag —
+> a tag's field list is not a standalone product type.
 
 > **Direction — term-level delimiters [Decided].** The three
 > delimiters split by role
@@ -650,9 +650,9 @@ in the language observes it.
 > target syntax the unit **value** is the empty product `()`, and
 > `` `none `` (a variant tag, hence a term — §6.5) is *not* unit:
 > it is the empty case of `Option(_)`, paired with `` `some(v) `` (§3.9).
-> At the type level, the empty structural product `{}` plays the
-> unit-type role (as in `Set(K) = Map(K, {})`, §6.3 — though `{}` is
-> **[Open]** now that it also reads as the empty sum, §2.4). `True`/`False`
+> At the type level, the empty structural product `{}` **is** the unit
+> type (as in `Set(K) = Map(K, {})`, §6.3) — implemented, §6.6.
+> `True`/`False`
 > sit under the same capitalization anomaly — presumably they become
 > `true`/`false`, matching the CCL symbolic rendering, but that
 > spelling is **[Open]**. The `()`-is-unit and `none`-is-`Option`
@@ -915,13 +915,11 @@ body.
 A trailing comma is allowed in every form (and required to disambiguate
 `(e,)` from `(e)`).
 
-**One-element products carry the comma at both levels [Decided].** The same
-rule holds for the tuple *type*: `{T,}` is the one-element tuple type, and
-the comma is what distinguishes it (§2.4). Only *tuples* need it — a
-one-field record needs no comma at either level, since `name=value`
-(`(a=1)`) and `name: T` (`{a: Int}`) already mark the form. A one-element
-brace group without the comma is read as a one-tuple type today; that is
-the spelling the decision retires.
+**One-element products carry the comma at both levels.** The same rule holds
+for the tuple *type*: `{T,}` is the one-element tuple type, and the comma is
+what distinguishes it (§2.4) — a comma-free `{T}` is a parse error. Only
+*tuples* need it: a one-field record needs no comma at either level, since
+`name=value` (`(a=1)`) and `name: T` (`{a: Int}`) already mark the form.
 
 **Tuple vs. record.** Both use `( … )`: a comma-list of bare expressions is
 a tuple (`(1, 2)`), a comma-list of `name=value` fields is a record
@@ -935,7 +933,8 @@ lowering error. Finite maps are a collection literal `[k -> v, …]` (§6.3,
 **[Decided]**), not a brace form.
 
 **Empty forms.** `()` is the empty product — the unit value, and equally the
-empty record (§3.1). `[]` is the empty list.
+empty record (§3.1); its type is `Unit`, spelled `{}` in a brace type (§6.6).
+`[]` is the empty list.
 
 > **Direction [Decided].** The literal forms migrate with the
 > delimiter split (§2.4) and the collections model (§6.3), form by
@@ -1527,14 +1526,17 @@ marked one carries its status per "How to read this document".)
 - `Int` — signed 64-bit integer.
 - `Bool` — `True` or `False`.
 - `String` — UTF-8 string.
-- `None` — unit type, one inhabitant.
+- `Unit` — unit type, one inhabitant. Also spelled `None` (the literal, in
+  type position) and `{}` (the empty product, §6.6); all three are accepted
+  and denote this type. There is no *empty* (uninhabited) type — §6.6.
 - `List(T)` — finite collection of `T`-values, indexed by `[0, n)`.
   The index → element mapping is part of the value (so `xs[i]` is
   well-defined); iteration order, however, is unspecified (§3). Written
   `List(T)` or `List(_)`.
 - `{T₀, T₁, …}` — tuple type (structural `{…}` type syntax — §6.1). The
-  one-element case is `{T,}`, with the comma required (**[Decided]**,
-  §2.4, §3.11).
+  one-element case is `{T,}`, with the comma required, and a comma-free
+  `{T}` is a parse error (§2.4, §3.11). The zero-element case is `{}`,
+  which is `Unit` (§6.6).
 - `{name: T, …}` — record type. Two records are the same type iff they
   have the same field names with the same field types.
 - ``{ `tag₀{…} | `tag₁{…} | … }`` — variant type (**[Decided]**, §6.5).
@@ -1682,7 +1684,7 @@ details to change:
 - `List(T)` — `{len: Nat, data: Fin(len) ⇒ T}`: an array "boxed" with
   its length when the length isn't statically known; `lst[i]: Option(T)`.
 - `Set(K)` — `Map(K, {})`: the domain is the payload; membership via
-  `e in s` (§3.4). (The unit-type spelling `{}` is **[Open]** — §2.4.)
+  `e in s` (§3.4). `{}` is the unit type (§6.6).
 - `Map(K, V)` — `{is_key: K ⇒ Bool, data: {K where is_key(_)} ⇒ V}`;
   lookup `m[k]: Option(V)`, membership `k in m`.
 - `Collection(T)` — `{Dom: Type, data: Dom ⇒ T}`: the domain rides
@@ -1825,6 +1827,40 @@ CCL has the sum type already (`Type::Variant`, a tag→payload list keyed by
 name or by position) and renders it `[.some(Int) | .none]`; that internal
 notation is unchanged. Nothing in CHL constructs one today — no backtick is
 lexed, and neither `match` nor a tag is parsed.
+
+### 6.6 The empty product is unit
+
+**There is exactly one empty product, and it is the unit type.** Written `{}`
+in type position (§2.4), inhabited by the empty product term `()` (§3.11).
+
+An "empty tuple type" and an "empty record type" are therefore **not types**.
+They are not two degenerate products alongside unit — a product with no fields
+has nothing to distinguish positional keying from named keying, so both
+descriptions name the same one-inhabitant type, and that type is `Unit`. The
+compiler holds this as an invariant on the type representation: `Tuple([])`
+and `Record([])` are invalid, products are built through constructors that map
+the empty case to `Unit`, and a `debug_assert` at the post-inference wall
+catches any path that bypasses them.
+
+This is an invariant and not a convention because two spellings of one type do
+not merely look untidy — they fail to *reconcile*. Inference records a node's
+type and a later consistency check rebuilds it from the node's children; when
+the two arrived at the empty product by different routes they disagreed, and
+the disagreement surfaced as the self-contradictory diagnostic
+`expected (), found ()`. Collapsing the spellings is what makes `()`
+typecheck.
+
+`Unit` has three surface spellings — `Unit`, `None`, and `{}` — all accepted
+in annotation position and all denoting this type. Collapsing them is
+**[Open]**; the term/type capitalization direction (§6.1) already implies
+`None`'s days are numbered, since `None` is doing double duty as the type and
+its inhabitant.
+
+There is **no empty type** (no uninhabited / void type) in CHL or CCL: the
+base types are `Int`, `UInt`, `String`, `Bool`, and `Unit`, and nothing else
+is atomic. `{}` is unambiguous because of this — the empty *sum* would be the
+void type, and there is none to spell. Introducing one would be new design,
+not a re-reading of `{}`.
 
 ---
 
@@ -2361,15 +2397,13 @@ with parser-level support that lowering rejects:
 - **Destructuring patterns** beyond tuples — record, variant, and
   wildcard patterns, and per-component annotations with `:` binding
   tighter than `,` (**[Decided]**, §4.3.1).
-- **One-element product spellings** — a one-tuple *type* takes the
-  trailing comma, `{T,}` (**[Decided]**, §2.4, §3.11). Today a
-  comma-free `{T}` is accepted and read as that one-tuple; what it
-  should mean instead — a grouping of `T`, or an error — is **[Open]**.
-  Fixing this changes existing parser behaviour rather than adding to
-  it, the one place in this round of decisions that does.
+- **Collapsing the `Unit` spellings** — `Unit`, `None`, and `{}` are all
+  accepted in annotation position for the one unit type (§6.6). Which
+  survives is **[Open]**, though the capitalization direction (§6.1)
+  already points at retiring `None`.
 - **The term-level delimiter migration** — record values are `(f=1, …)`, and
-  `{…}` no longer denotes a term-level value (it is record-type / tuple-type
-  syntax, §2.4). Finite maps as `[k -> v, …]` remain **[Decided]**; earlier
+  `{…}` no longer denotes a term-level value (it is record-type / tuple-type /
+  unit syntax, §2.4). Finite maps as `[k -> v, …]` remain **[Decided]**; earlier
   plans to spell them `[k: v, …]`, `[k=v, …]`, or Unicode `[k ↦ v, …]` are
   superseded by the map-literal decision.
 - **Map comprehensions** — not in the grammar; the surface form

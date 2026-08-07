@@ -953,7 +953,10 @@ fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
 ///   Application is parenthesised at both the term and type level
 ///   (`docs/chl-spec.md`).
 /// - A record type `{name: T, …}` and a tuple type `{T, U}`
-///   (`Expr::BraceGroup`).
+///   (`Expr::BraceGroup`), including the one-element `{T,}` — the trailing
+///   comma is what makes it a product, and the parser rejects a comma-free
+///   `{T}`.
+/// - The empty group `{}` — the product of zero types, i.e. `Unit`.
 pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
         ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
@@ -978,7 +981,12 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
             }
             Ok(Type::Record(out))
         }
-        // Tuple type `{T, U}` (colon-free brace group).
+        // Tuple type `{T, U}` — and `{T,}` for one element, the trailing comma
+        // being what makes it a product (the parser rejects a comma-free
+        // `{T}`). The **empty** group `{}` is the product of zero types, which
+        // is unit: there is one empty product and `Tuple([])` is not it (see
+        // `docs/chl-spec.md`, "6.6 The empty product is unit").
+        ChlExpr::BraceGroup(parts) if parts.is_empty() => Ok(Type::Base(BaseType::Unit)),
         ChlExpr::BraceGroup(parts) => Ok(Type::Tuple(
             parts
                 .iter()
