@@ -546,10 +546,11 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
                 .map(|(n, t)| (n.clone(), strip_refinements(t)))
                 .collect(),
         ),
-        Type::Variant(tags) => Type::Variant(
+        Type::Variant(tags, openness) => Type::Variant(
             tags.iter()
                 .map(|(k, t)| (k.clone(), strip_refinements(t)))
                 .collect(),
+            *openness,
         ),
         Type::History {
             value,

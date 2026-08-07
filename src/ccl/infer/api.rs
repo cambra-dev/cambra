@@ -810,7 +810,7 @@ fn collect_type_errors(
                 collect_type_errors(ty, context_sym, strictness, errors, seen_refinements);
             }
         }
-        Type::Variant(tags) => {
+        Type::Variant(tags, _) => {
             for (_, payload) in tags {
                 collect_type_errors(payload, context_sym, strictness, errors, seen_refinements);
             }

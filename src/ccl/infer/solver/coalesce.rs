@@ -341,7 +341,7 @@ fn materialize_variant(
     for (k, v) in tags {
         out.push((k.clone(), coalesce_compact_go(v, polarity)?));
     }
-    Ok(Type::Variant(out))
+    Ok(Type::variant(out))
 }
 
 fn materialize_record(
@@ -813,7 +813,7 @@ mod tests {
         let scheme = simplify_type(compact_type(&v));
         let ty = coalesce_compact(&scheme).expect("coalesce ok");
         match ty {
-            Type::Variant(tags) => {
+            Type::Variant(tags, _) => {
                 let names: Vec<String> = tags.iter().map(|(n, _)| n.to_string()).collect();
                 // BTreeMap iteration order is by FieldKey key — Name tags
                 // sort lexicographically.

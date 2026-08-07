@@ -39,7 +39,7 @@ Programs are run on the Cambra engine, which compiles and executes CHL programs.
 
 ### Types: inference and refinement
 
-CHL supports full type inference, so all type annotations are optional. Its type system brings together **structural subtyping** ("if it has the right shape, it works") and **refinement types** ("a type such that its terms satisfy a given predicate"). The type checker is a constraint-based inference engine over the whole program — emission, solving, and coalescing are described in [src/ccl/design/type-inference.md](../src/ccl/design/type-inference.md). Base vocabulary: `Int`, `Bool`, `String`, unit, `List(T)`, tuples, records, variants (AKA "sum types" or "enums" — supported internally today; surface syntax pending), and functions.
+CHL supports full type inference, so all type annotations are optional. Its type system brings together **structural subtyping** ("if it has the right shape, it works") and **refinement types** ("a type such that its terms satisfy a given predicate"). The type checker is a constraint-based inference engine over the whole program — emission, solving, and coalescing are described in [src/ccl/design/type-inference.md](../src/ccl/design/type-inference.md). Base vocabulary: `Int`, `Bool`, `String`, unit, `List(T)`, tuples, records, variants (AKA "sum types" or "enums" — written `` {`some{Int} | `none} ``, constructed `` `tag(payload) ``), and functions.
 
 **Refinement types** look like this: `{𝑥: 𝑇 | 𝑝(𝑥)}` — a value of the base type for which a predicate holds. The machinery is implemented inside the checker today — basic refinement inference, constraint solving over refined subtyping, explicit refinement acquisition, and specialization of polymorphic call sites — and built-ins like `groupby` produce refined types internally. What does **not** exist yet is the surface syntax: writing `{x: T | p(x)}` in an annotation is **[Decided]** but not in the grammar, and verifiable, whole-application contracts expressed through refinements are the driving design direction rather than a current capability.
 
@@ -135,7 +135,7 @@ Self-referential *collection* definitions solve an equation as a least fixpoint 
 
 ### Pattern matching and conditionals
 
-`if`/`elif`/`else` (statement) and `e₁ if cond else e₂` (ternary) are implemented, with semantic non-strictness: a non-taken branch contributes nothing and need not be defined. A `match`/`case` form appears in the north-star programs but is **[Sketched]** — no design writeup yet.
+`if`/`elif`/`else` (statement) and `e₁ if cond else e₂` (ternary) are implemented, with semantic non-strictness: a non-taken branch contributes nothing and need not be defined. `match`/`case` tag dispatch over a variant is implemented too, and is the *same* first-match rule over the same IR node — an arm carries a tag pattern where an `if` carries a guard, which is why a tag test and a boolean guard will eventually sit on one arm with no new structure. Patterns are shallow: one tag per arm, no nesting, no literal patterns, no per-arm guard, and no expression form. Mechanism: [src/ccl/design/lowering.md](../src/ccl/design/lowering.md), "Variants and match".
 
 ### Currently omitted
 
@@ -220,7 +220,7 @@ The connections between the layers above and the capabilities Cambra claims:
 | Contextual parameters (`requires` / `given` / `summon`) | **[Decided]** |
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | Organizing idea decided; encodings **[Sketched]** |
-| `match` / `case` | **[Sketched]** |
+| `match` / `case` | Tag dispatch implemented; deeper patterns **[Tentative]** |
 | `while`, floats, imports, classes, exceptions | Absent (see the spec) |
 
 The [spec](chl-spec.md) carries the authoritative per-construct markers; [demo-programs.md](demo-programs.md) maps them to runnable programs and their blockers.

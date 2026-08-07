@@ -836,7 +836,7 @@ impl Subst {
             Type::Record(fs) => fs
                 .iter_mut()
                 .for_each(|(_, t)| self.rewrite_type_go(t, memo)),
-            Type::Variant(tags) => tags
+            Type::Variant(tags, _) => tags
                 .iter_mut()
                 .for_each(|(_, t)| self.rewrite_type_go(t, memo)),
         }
@@ -1022,10 +1022,11 @@ impl Subst {
                     .map(|(n, t)| (n.clone(), self.apply_type(t)))
                     .collect(),
             ),
-            Type::Variant(tags) => Type::Variant(
+            Type::Variant(tags, openness) => Type::Variant(
                 tags.iter()
                     .map(|(k, t)| (k.clone(), self.apply_type(t)))
                     .collect(),
+                *openness,
             ),
             Type::History {
                 value,
@@ -1099,7 +1100,7 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         }
         Type::Tuple(ts) => ts.iter().any(type_contains_infer),
         Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
-        Type::Variant(tags) => tags.iter().any(|(_, t)| type_contains_infer(t)),
+        Type::Variant(tags, _) => tags.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Refinement(base, _) => type_contains_infer(base),
     }
 }
@@ -1168,7 +1169,7 @@ fn collect_type_fv(
         Type::Record(fs) => fs
             .iter()
             .for_each(|(_, t)| collect_type_fv(t, bound, visited, out)),
-        Type::Variant(tags) => tags
+        Type::Variant(tags, _) => tags
             .iter()
             .for_each(|(_, t)| collect_type_fv(t, bound, visited, out)),
         Type::History { value, domain, .. } => {

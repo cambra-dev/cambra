@@ -486,7 +486,7 @@ fn test_conditional_between_comprehensions(#[case] code: &str, #[case] expected:
 // (`lower::comprehension::fan_out_element_case`): `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`.
 // Each arm is a filtered map (source restricted by the gate, mapped by the arm
 // value); the gates partition the source, so the `++`-union recombines the arms
-// by position into the fully-mapped collection. A `CollectionUnion`, so the
+// by position into the fully-mapped collection. A `Copair`, so the
 // compute-kinded per-arm maps do not need to join.
 // ---------------------------------------------------------------------------
 

@@ -129,7 +129,7 @@ pub(super) fn product(fields: BTreeMap<FieldKey, Type>) -> Type {
 
 /// Build a [`Type::Variant`] from a `FieldKey`-keyed tag map.
 pub(super) fn variant_type(tags: BTreeMap<FieldKey, Type>) -> Type {
-    Type::Variant(tags.into_iter().collect())
+    Type::variant(tags.into_iter().collect())
 }
 
 /// Resolve a (possibly variable-laden) [`Type`] to a concrete type for use

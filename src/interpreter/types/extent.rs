@@ -190,14 +190,10 @@ impl Extent {
     /// identity, and the caller keeps them separate (an anonymous positional sum)
     /// rather than merging.
     ///
-    /// **Symmetric by construction.** A join has to be, or the caller's argument
-    /// order silently decides the answer. That is not free here: [`includes`] treats
-    /// a variant and a bare payload as *mutually* inclusive (a union includes any
-    /// value some arm admits, and a scalar includes a union whose every arm it
-    /// admits), so falling through to the inclusion cases with one variant and one
-    /// non-variant would return `self` — a different extent for each argument order,
-    /// and in the tagged direction a claim that an untagged value inhabits a tagged
-    /// space. A mixed pair therefore has **no** join rather than an arbitrary one.
+    /// **Symmetric by construction**, which a join has to be or the caller's argument
+    /// order silently decides the answer. The inclusion cases below deliver that for a
+    /// mixed pair without a special case, because [`includes`] relates a sum and a
+    /// non-sum in *neither* direction: both fail, so the pair falls through to `None`.
     ///
     /// [`includes`]: Self::includes
     pub fn join(&self, other: &Extent) -> Option<Extent> {
@@ -219,13 +215,6 @@ impl Extent {
                 }
                 Some(Extent::Union(merged))
             }
-            // Exactly one side is a sum: no join (see the symmetry note above).
-            // The caller keeps them apart, which for a concatenation is right
-            // anyway. Nothing reaches this today — `UnionOperator::new` joins
-            // codomains that came from one `Case`, so they are tagged together or
-            // not at all — and the arm exists so that a future caller gets `None`
-            // instead of an order-dependent answer.
-            (Extent::Union(_), _) | (_, Extent::Union(_)) => None,
             // Non-variant alternatives join only when one already covers the
             // other (a `UIntRange` inside a wider one, say).
             _ if self.includes(other) => Some(self.clone()),
@@ -273,10 +262,23 @@ impl Extent {
             (Extent::Union(vs), Extent::Union(ws)) => ws
                 .iter()
                 .all(|(k, w)| vs.get(k).is_some_and(|v| v.includes(w))),
-            // Union self vs scalar other: `other` must be covered by some arm.
-            (Extent::Union(arms), _) => arms.values().any(|v| v.includes(other)),
-            // Scalar self vs union other: `self` must include every arm.
-            (_, Extent::Union(arms)) => arms.values().all(|v| self.includes(v)),
+            // A sum and a non-sum are **never** in an inclusion relation, in either
+            // direction. A tagged value carries its tag, so no untagged space contains
+            // one, and a tagged space contains no untagged value.
+            //
+            // Both directions previously said otherwise — a union "included" any value
+            // some arm included, and a scalar "included" a union whose every arm it
+            // included — which made a variant and its bare payload *mutually*
+            // inclusive. That is what forced `join` to special-case a mixed pair rather
+            // than reaching for inclusion: with both directions holding, an
+            // inclusion-based join would return whichever argument came first, and in
+            // one order claim an untagged value inhabits a tagged space.
+            //
+            // Nothing exercises this (no test reaches either arm), so it is stated
+            // rather than inferred: if a path does arrive here, being rejected at a
+            // conformance check is the signal, where the old permissiveness would have
+            // quietly agreed.
+            (Extent::Union(_), _) | (_, Extent::Union(_)) => false,
 
             (Extent::Base(BaseType::UInt), Extent::UIntRange(..)) => true,
 
@@ -404,6 +406,9 @@ impl std::fmt::Display for Extent {
                     };
                     (tag.to_string(), payload)
                 }),
+                // A runtime extent is never an open demand — openness lives only
+                // on the right of a subtyping edge and cannot reach here.
+                false,
             ),
             Extent::UIntRange(set) => write!(f, "{set}"),
             Extent::DataSourceDomain(source) => write!(f, "Source({})", source.borrow().get_id()),
@@ -672,15 +677,32 @@ mod tests {
         assert!(!narrow.includes(&wide));
     }
 
+    /// A sum does **not** include its arms' payload extents, and this holds for an
+    /// anonymous positional sum too.
+    ///
+    /// A positional sum is the all-`Index` case of the same tagged representation, not
+    /// an untagged union: a value in an `Int | Bool` column is `Union { tag: Index(i),
+    /// inner }`, never a bare `Int`. So the arm's payload space and the sum's value
+    /// space are different spaces, and inclusion relates them in neither direction —
+    /// which is what lets `join` stay symmetric without a special case.
     #[test]
-    fn test_includes_union_self_includes_member() {
+    fn test_union_does_not_include_its_arm_payloads() {
         let u = Extent::Union(TagMap::from_positional(vec![
             Extent::Base(BaseType::Int),
             Extent::Base(BaseType::Bool),
         ]));
-        assert!(u.includes(&Extent::Base(BaseType::Int)));
-        assert!(u.includes(&Extent::Base(BaseType::Bool)));
+        assert!(!u.includes(&Extent::Base(BaseType::Int)));
+        assert!(!u.includes(&Extent::Base(BaseType::Bool)));
         assert!(!u.includes(&Extent::Base(BaseType::String)));
+        // And the other direction: a payload space does not contain tagged values.
+        assert!(!Extent::Base(BaseType::Int).includes(&u));
+        // The sum does include itself, and a width-narrower sum.
+        assert!(u.includes(&u));
+        assert!(
+            u.includes(&Extent::Union(TagMap::from_positional(vec![Extent::Base(
+                BaseType::Int
+            )])))
+        );
     }
 
     #[test]
@@ -811,23 +833,22 @@ mod tests {
         assert_eq!(narrow.join(&wide), Some(wide));
     }
 
-    /// A variant and a **bare** payload have no join, in either order.
+    /// A variant and a **bare** payload have no join, in either order — and it falls
+    /// out of inclusion rather than needing a case of its own.
     ///
-    /// This is the case that makes the join's symmetry non-trivial: `includes`
-    /// relates the two spaces *both* ways, so an inclusion-based join would answer
-    /// `self` and let the caller's argument order pick the result — and in one of
-    /// those orders it would claim an untagged `Int` inhabits ``{`some{Int}}``, which it
-    /// does not at runtime. `None` is the honest answer.
+    /// A tagged space and an untagged one are unrelated by `includes` in both
+    /// directions, so both inclusion branches fail and the pair reaches `None`. That
+    /// is also what keeps `join` symmetric here: were the two mutually inclusive, an
+    /// inclusion-based join would answer `self` and let argument order pick.
     #[test]
     fn join_of_variant_with_bare_payload_is_none_both_ways() {
         let some_int = named(&[("some", Extent::Base(BaseType::Int))]);
         let bare = Extent::Base(BaseType::Int);
         assert_eq!(some_int.join(&bare), None);
         assert_eq!(bare.join(&some_int), None);
-        // The mutual inclusion that would otherwise have decided it by argument
-        // order. (Both directions hold, which is itself why neither can be the join.)
-        assert!(some_int.includes(&bare));
-        assert!(bare.includes(&some_int));
+        // Neither direction of inclusion holds, which is why neither can be the join.
+        assert!(!some_int.includes(&bare));
+        assert!(!bare.includes(&some_int));
     }
 
     /// Every join is symmetric, including the merge and failure paths — a join that
