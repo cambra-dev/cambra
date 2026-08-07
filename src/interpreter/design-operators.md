@@ -151,7 +151,7 @@ A **universal release is a promise never to request those positions again**, so 
 
 Two obligations follow, and operators are checked against both:
 
-- **Do not pull after releasing.** A producer that universally releases an input has to stop reading it and serve what it has: `Memo` serves its cache, and `UnionProducer` skips an arm it has fully released.
+- **Do not pull after releasing.** A producer that universally releases an input has to stop reading it and serve what it has: `Memo` serves its cache, `InductionStore` serves the accumulated store once it has released its iteration source, and `UnionProducer` skips an arm it has fully released.
 - **Do forward the universal release.** It is the final-consumer signal that frees upstream state, and it reaches a source only if every consumer on the way passes it on — `FanOut` forwards the *intersection* of its branches' guards, so one branch that swallows its release strands the upstream for all of them. Operators that re-read an operand on every pull (`ScalarFanIn`, `MapResult`'s `function`) forward exactly the universal case and nothing narrower: a scalar operand has no sub-region to free, and a narrower release would empty something the next pull still reads.
 
 ## Tile Operators
@@ -483,6 +483,14 @@ read never releases *at or above* its carry source, keep-latest GC never drops a
 source — so the existing keep-global-latest GC suffices; no per-frontier retention is needed.
 This bounds the changelog for *any* carry consumer (co-iterated or scalar-final) without the
 producer knowing which it is.
+
+The drive's own release runs the other way — outward, to the iteration source — and ends the
+drive when it goes universal. `InductionStore` reclaims the consumed prefix incrementally as
+`processed` advances, and once the source is complete and every arrived position decided it
+releases the source in full. That release is a promise never to request those positions again,
+so from then on the producer does not pull the source at all: it serves the accumulated store,
+which is already the whole answer. This is the promise the dense `Recurse` path kept on
+convergence, in the operator that replaced it.
 
 Keep-latest is also what makes the drive sound despite reading the changelog it writes:
 `read_as_of(processed)` folds to the latest write ≤ `processed`, which GC never drops, so the
