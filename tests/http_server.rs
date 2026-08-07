@@ -7,7 +7,7 @@
 
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -19,7 +19,7 @@ use cambra::{
         lower::{LoweringContext, LoweringError, lower_stmts},
     },
     chl_parser,
-    interpreter::Consumer,
+    interpreter::{Consumer, http_server::SharedHttpServer},
 };
 use rstest_log::rstest;
 use test_log::test;
@@ -27,16 +27,6 @@ use test_log::test;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Allocate a free TCP port by briefly binding to port 0 and reading the
-/// OS-assigned address.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// Send a raw HTTP/1.1 POST to `127.0.0.1:port` at `path` with the given
 /// `body`.  Returns the HTTP response body string.
@@ -101,20 +91,27 @@ fn http_get(port: u16, path: &str) -> String {
 /// HTTP response dispatch is handled automatically by [`SinkConsumer`] when
 /// the scheduler notifies it; this function only needs to keep the scheduler
 /// ticking.
+///
+/// `check_for_notifications` has no blocking form, so the scheduler has to be
+/// pumped on a timer; `recv_timeout` supplies that cadence while still returning
+/// the instant the response lands, rather than up to a tick later.
 fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: Duration) -> T {
+    const PUMP_INTERVAL: Duration = Duration::from_millis(10);
+
     let deadline = Instant::now() + timeout;
     loop {
         ctx.scheduler().check_for_notifications();
 
-        if let Ok(value) = rx.try_recv() {
-            return value;
+        match rx.recv_timeout(PUMP_INTERVAL) {
+            Ok(value) => return value,
+            Err(mpsc::RecvTimeoutError::Timeout) => assert!(
+                Instant::now() < deadline,
+                "timed out after {timeout:?} waiting for HTTP response"
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("request thread dropped the channel without sending a response")
+            }
         }
-
-        assert!(
-            Instant::now() < deadline,
-            "timed out after {timeout:?} waiting for HTTP response"
-        );
-        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -125,7 +122,7 @@ fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: Dura
 /// A CHL program echoes each POST body back with a "Received: " prefix.
 #[rstest]
 fn test_http_serve_echo() {
-    let port = free_port();
+    let port = SharedHttpServer::reserve_test_port();
     let code = format!(
         "requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
          for req in requests:\n\
@@ -136,9 +133,6 @@ fn test_http_serve_echo() {
 
     let mut ctx = GlobalContext::default();
     let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
-
-    // Give tiny_http a moment to bind the port before the client connects.
-    thread::sleep(Duration::from_millis(50));
 
     // Send one POST request from a background thread and collect the response.
     let (tx, rx) = mpsc::channel::<String>();
@@ -154,7 +148,7 @@ fn test_http_serve_echo() {
 
 #[rstest]
 fn test_http_serve_const() {
-    let port = free_port();
+    let port = SharedHttpServer::reserve_test_port();
     let code = format!(
         "requests, responses = http_serve(\"{port}\", \"GET\", \"/static\")\n\
          for req in requests:\n\
@@ -165,9 +159,6 @@ fn test_http_serve_const() {
 
     let mut ctx = GlobalContext::default();
     let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
-
-    // Give tiny_http a moment to bind the port before the client connects.
-    thread::sleep(Duration::from_millis(50));
 
     // Send one GET request from a background thread and collect the response.
     let (tx, rx) = mpsc::channel::<String>();
@@ -185,7 +176,7 @@ fn test_http_serve_const() {
 /// its own prefixed response.
 #[rstest]
 fn test_http_serve_two_sequential_requests() {
-    let port = free_port();
+    let port = SharedHttpServer::reserve_test_port();
     let code = format!(
         "requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
          for req in requests:\n\
@@ -196,8 +187,6 @@ fn test_http_serve_two_sequential_requests() {
 
     let mut ctx = GlobalContext::default();
     let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
-
-    thread::sleep(Duration::from_millis(50));
 
     // Send two requests sequentially; each blocks until the server responds.
     let (tx, rx) = mpsc::channel::<Vec<String>>();
@@ -219,7 +208,7 @@ fn test_http_serve_two_sequential_requests() {
 /// must fire and produce the expected responses.
 #[rstest]
 fn test_http_serve_two_paths() {
-    let port1 = free_port();
+    let port1 = SharedHttpServer::reserve_test_port();
     let code = format!(
         "reqs1, resps1 = http_serve(\"{port1}\", \"GET\", \"/greet\")\n\
          for req in reqs1:\n\
@@ -233,8 +222,6 @@ fn test_http_serve_two_paths() {
 
     let mut ctx = GlobalContext::default();
     let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
-
-    thread::sleep(Duration::from_millis(50));
 
     // Send requests sequentially: each http_post/http_get blocks until the
     // server responds, so the second request is only sent after the first
@@ -256,7 +243,7 @@ fn test_http_serve_two_paths() {
 /// inside both for-loop bodies after the trailing-Record lowering.
 #[rstest]
 fn test_http_serve_two_paths_shared_outer_let() {
-    let port = free_port();
+    let port = SharedHttpServer::reserve_test_port();
     let code = format!(
         "prefix = \"greeting: \"\n\
          reqs1, resps1 = http_serve(\"{port}\", \"POST\", \"/a\")\n\
@@ -271,8 +258,6 @@ fn test_http_serve_two_paths_shared_outer_let() {
 
     let mut ctx = GlobalContext::default();
     let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
-
-    thread::sleep(Duration::from_millis(50));
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {
@@ -290,7 +275,7 @@ fn test_http_serve_two_paths_shared_outer_let() {
 /// chained outer lets must remain visible to the for-loop body.
 #[rstest]
 fn test_http_serve_echo_with_outer_let() {
-    let port = free_port();
+    let port = SharedHttpServer::reserve_test_port();
     let code = format!(
         "prefix = \"Echo: \"\n\
          requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
@@ -302,8 +287,6 @@ fn test_http_serve_echo_with_outer_let() {
 
     let mut ctx = GlobalContext::default();
     let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
-
-    thread::sleep(Duration::from_millis(50));
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
@@ -318,7 +301,7 @@ fn test_http_serve_echo_with_outer_let() {
 /// `http_serve` inside an if/else branch is rejected at lowering time.
 #[test]
 fn test_http_serve_in_if_branch_is_error() {
-    let port = free_port();
+    let port = SharedHttpServer::reserve_test_port();
     let code = format!(
         "if True:\n\
          \trequests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
@@ -344,7 +327,7 @@ fn test_http_serve_in_if_branch_is_error() {
 /// `http_serve` inside a function body is rejected at lowering time.
 #[test]
 fn test_http_serve_in_function_body_is_error() {
-    let port = free_port();
+    let port = SharedHttpServer::reserve_test_port();
     let code = format!(
         "def handler():\n\
          \trequests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
@@ -371,7 +354,7 @@ fn test_http_serve_in_function_body_is_error() {
 /// Non-matching paths receive a 404 and do not produce a domain element.
 #[rstest]
 fn test_http_serve_wrong_path_gets_404() {
-    let port = free_port();
+    let port = SharedHttpServer::reserve_test_port();
     let code = format!(
         "requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
          for req in requests:\n\
@@ -382,8 +365,6 @@ fn test_http_serve_wrong_path_gets_404() {
 
     let mut ctx = GlobalContext::default();
     let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
-
-    thread::sleep(Duration::from_millis(50));
 
     // Send to a path that doesn't match — expect a 404 status line.
     let request = format!(

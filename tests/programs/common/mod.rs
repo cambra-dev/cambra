@@ -50,14 +50,13 @@
 //! Sink program (HTTP / long-lived):
 //!
 //! ```ignore
-//! use super::common::{compile_sink, drive_until, free_port, http_get, http_post, wait_for_bind};
+//! use super::common::{SharedHttpServer, compile_sink, drive_until, http_get, http_post};
 //!
 //! #[test]
 //! fn http_greeter() {
-//!     let port = free_port();
+//!     let port = SharedHttpServer::reserve_test_port();
 //!     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
 //!     let mut ctx = compile_sink(&source);
-//!     wait_for_bind();
 //!     // …send requests on a background thread, drive_until the responses arrive…
 //! }
 //! ```
@@ -66,12 +65,11 @@ use std::{
     any::Any,
     cell::RefCell,
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     panic::{self, AssertUnwindSafe},
     process::{Command, Stdio},
     rc::Rc,
     sync::mpsc,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -247,23 +245,11 @@ pub fn compile_sink(source: &str) -> GlobalContext {
     ctx
 }
 
-/// Allocate a free TCP port by briefly binding to port 0 and reading the
-/// OS-assigned address.  Used to populate the `{PORT}` placeholder in sink
-/// programs so tests don't fight over a hard-coded port.
-pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("failed to bind ephemeral port")
-        .local_addr()
-        .expect("failed to read local addr")
-        .port()
-}
-
-/// Sleep just long enough for `tiny_http` to have bound its listener after
-/// `compile_program` returns.  Without this, the first request can race the
-/// bind and ECONNREFUSED.
-pub fn wait_for_bind() {
-    thread::sleep(Duration::from_millis(50));
-}
+/// Port allocation for the `{PORT}` placeholder in sink programs.  Lives in the
+/// library, behind `test-helpers`, so this crate and `tests/http_server.rs`
+/// share one implementation — see [`SharedHttpServer::reserve_test_port`] for
+/// why the naive "bind `:0` and close" allocator is not safe here.
+pub use cambra::interpreter::http_server::SharedHttpServer;
 
 /// Send a raw HTTP/1.1 GET request and return the response body.  Uses a
 /// plain `TcpStream` so we don't need an HTTP-client crate as a dev
@@ -310,18 +296,26 @@ fn raw_http(port: u16, request: &str) -> String {
 /// HTTP sink dispatch is handled automatically by `SinkConsumer` when the
 /// scheduler notifies it; this function only needs to keep the scheduler
 /// ticking while the request-sending thread runs.
+///
+/// `check_for_notifications` has no blocking form, so the scheduler has to be
+/// pumped on a timer; `recv_timeout` supplies that cadence while still returning
+/// the instant the response lands, rather than up to a tick later.
 pub fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: Duration) -> T {
+    const PUMP_INTERVAL: Duration = Duration::from_millis(10);
+
     let deadline = Instant::now() + timeout;
     loop {
         ctx.scheduler().check_for_notifications();
-        if let Ok(value) = rx.try_recv() {
-            return value;
+        match rx.recv_timeout(PUMP_INTERVAL) {
+            Ok(value) => return value,
+            Err(mpsc::RecvTimeoutError::Timeout) => assert!(
+                Instant::now() < deadline,
+                "timed out after {timeout:?} waiting for sink response",
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("request thread dropped the channel without sending a response")
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out after {timeout:?} waiting for sink response",
-        );
-        thread::sleep(Duration::from_millis(10));
     }
 }
 
