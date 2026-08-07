@@ -367,6 +367,12 @@ pub enum Expr {
     /// `docs/chl-spec.md`): a tuple type `{T, U}`. Lowering interprets it as a
     /// [`crate::ccl::Type::Tuple`] in annotation position and rejects it in
     /// value position.
+    ///
+    /// A **one-element** group is accepted here and lowered to a one-tuple
+    /// type, so `{T}` and `{T,}` mean the same thing. That is the one spelling
+    /// the decided brace-form rules change rather than extend: a one-tuple
+    /// type requires the comma, matching the term-level `(e,)`/`(e)` split.
+    /// See `docs/chl-spec.md`, "2.4 Atoms".
     BraceGroup(Vec<Spanned<Expr>>),
 
     /// Subscript: `target[index]` — **collection lookup only**. Projecting a product

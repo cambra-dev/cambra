@@ -145,12 +145,14 @@ A lambda is written `\x -> body` (§3.10); `\` and `->` are punctuation
 reserved for future use.
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
-> `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
+> `rec` (recursive binding — §4.3, **[Decided]**), `where` (the refinement
+> predicate separator — §6.4, **[Decided]**), `given`, `requires`,
 > `summon` (the transactions-as-contextual-parameters layer — §8.7,
 > **[Decided]**), `import` (built-in modules — the `http` module surface,
 > **[Decided]**; general modules remain future work, §9), and `match` /
 > `case` (pattern matching, **[Tentative]** — it appears in the north-star
-> `txn_kv` program but has no design writeup). Avoid taking these names for
+> `txn_kv` program and inside refinement predicates (§6.4), but the block
+> syntax has no design writeup). Avoid taking these names for
 > other purposes. (`with` and `:=` are **already** lexed — they carry
 > today's transactions and mutation, §8 — so they are not in this list.)
 
@@ -198,6 +200,22 @@ parsing-then-erroring.
 > (`a -> b` for a two-tuple, `[k -> v, …]` for a map literal — §2.4,
 > **[Decided]**); the token is lexed today but that *use* is not yet
 > parsed.
+
+> **Direction — the backtick and `|` [Decided].** One new token and one
+> new role for an existing one, both carrying variants (§6.5):
+>
+> - **`` ` ``** (backtick) prefixes a **variant tag**, in every position —
+>   type, term, and pattern: `` `none ``, `` `some(1) ``,
+>   ``{ `some{Int} | `none }``. It is not lexed today. A tag is
+>   `` ` `` immediately followed by an identifier with no intervening
+>   whitespace; tag names are lowercase, since a tag builds a *value*
+>   and `Caps` means type (§6.1).
+> - **`|`** keeps its logical-or meaning in term position (§3.3) and
+>   additionally separates the tags of a variant **type** (§6.5). The two
+>   never meet: a variant type's alternatives are `` ` ``-tagged, and a
+>   refinement predicate — the one place a term appears inside `{…}` — is
+>   introduced by `where` (§6.4), which is exactly why the refinement
+>   separator moved off `|`.
 
 ### 1.9 Semicolons
 
@@ -367,6 +385,62 @@ list makes a tuple type (`{T, U}`). A `{...}` in value position is a lowering
 error pointing at the `(…)` form. (Finite maps are a collection, written
 `[k -> v, …]` — §6.3 — not a brace form.)
 
+A colon-free brace group of **one** element is accepted today and read as a
+one-element tuple type (`{Int}` lowers to the same type as `{Int,}`). The
+decided rule below retires that spelling: a one-tuple type, like a one-tuple
+term, requires the trailing comma.
+
+> **Direction — brace forms [Decided].** `{…}` acquires two more
+> structural-type forms, so what a brace group means becomes a
+> classification over what it contains. None of the added forms is lexed
+> or parsed today:
+>
+> ```ebnf
+> brace_type  ::= "{" typed_ident ( "," typed_ident )* [ "," ] "}"  -- record type
+>              |  "{" type "," "}"                                   -- one-tuple type
+>              |  "{" type ( "," type )+ [ "," ] "}"                 -- tuple type
+>              |  "{" tag_type ( "|" tag_type )* "}"                 -- variant type (§6.5)
+>              |  "{" type "where" expression "}"                    -- refinement (§6.4)
+>
+> tag_type    ::= "`" tagname [ "{" tag_fields "}" ]
+> tag_fields  ::= type ( "," type )* [ "," ]
+>              |  typed_ident ( "," typed_ident )* [ "," ]
+> tagname     ::= [a-z_] [A-Za-z0-9_]*
+> ```
+>
+> The five forms are told apart by their first distinguishing token, so
+> classification never needs lookahead past one item:
+>
+> | Contains | Form | Example |
+> | --- | --- | --- |
+> | a top-level `where` | refinement (§6.4) | `{Int where _ > 0}` |
+> | `` ` ``-prefixed items | variant type (§6.5) | ``{ `some{Int} \| `none }`` |
+> | `ident : type` items | record type | `{x: Int, y: Int}` |
+> | types, ≥2 or 1-plus-comma | tuple type | `{Int, Bool}`, `{Int,}` |
+> | nothing | **[Open]** — see below | `{}` |
+>
+> A top-level `where` wins over every other reading and takes the rest of
+> the brace group as its predicate, so `{T where p | q}` refines `T` by
+> `p | q` (§3.3) rather than declaring a variant.
+>
+> Two spellings that look adjacent but are not:
+>
+> - **A single-element tuple type needs its comma** — `{Int,}`, matching
+>   the term-level `(e,)`/`(e)` split (§3.11). Whether a comma-free
+>   `{T}` becomes an *error* or reads as a redundant **grouping** of `T`
+>   (the reading that keeps the parallel with `(e)` exact) is **[Open]**.
+>   Either way it stops meaning the one-tuple it means today.
+> - **A tag's field braces are not a nested type.** `` `some{Int} `` is
+>   the tag `some` with one positional field of type `Int`; a tag's
+>   `{…}` *is* its field list, so a record payload is
+>   `` `some{a: Int} ``, never `` `some{{a: Int}} `` (§6.5).
+>
+> **[Open]**: what an empty `{}` denotes. §6.3 uses it for the unit type
+> (the empty product, `Set(K) = Map(K, {})`), but under the variant form
+> it equally reads as the empty *sum* — the void type, with no
+> inhabitants. The two have different cardinalities, so one of them needs
+> another spelling. The parser rejects `{}` today.
+
 > **Direction — term-level delimiters [Decided].** The three
 > delimiters split by role
 > (2026-06-29 §1):
@@ -375,7 +449,7 @@ error pointing at the `(…)` form. (Finite maps are a collection, written
 > | --- | --- | --- |
 > | `( … )` | product **terms** | tuple `(1, 2, 3)`, record `(f1=1, f2=2)` |
 > | `[ … ]` | **collections** — definition *and* lookup | list `[1, 2, 3]`, map `[k -> v, …]`, indexing `counts[word]`, `xs[0]` |
-> | `{ … }` | structural **types** | tuple type `{T, U}`, record type `{f: T}`, refinement `{x: T \| p(x)}` |
+> | `{ … }` | structural **types** | tuple type `{T, U}`, record type `{f: T}`, variant type ``{ `some{T} \| `none }``, refinement `{T where _ > 0}` |
 >
 > Under that scheme `{…}` never appears at the term level: record values are
 > written `(name=e, …)`, and finite maps are collection literals
@@ -574,10 +648,11 @@ in the language observes it.
 > decided term/type capitalization rule (**[Decided]**, §6.1: lowercase
 > heads are terms; `Caps` means *type*, without exception). In the
 > target syntax the unit **value** is the empty product `()`, and
-> `none` (lowercase — a data constructor, hence a term) is *not* unit:
-> it is the empty case of `Option(_)`, paired with `some(v)` (§3.9).
+> `` `none `` (a variant tag, hence a term — §6.5) is *not* unit:
+> it is the empty case of `Option(_)`, paired with `` `some(v) `` (§3.9).
 > At the type level, the empty structural product `{}` plays the
-> unit-type role (as in `Set(K) = Map(K, {})`, §6.3). `True`/`False`
+> unit-type role (as in `Set(K) = Map(K, {})`, §6.3 — though `{}` is
+> **[Open]** now that it also reads as the empty sum, §2.4). `True`/`False`
 > sit under the same capitalization anomaly — presumably they become
 > `true`/`false`, matching the CCL symbolic rendering, but that
 > spelling is **[Open]**. The `()`-is-unit and `none`-is-`Option`
@@ -797,8 +872,8 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 > **Direction [Tentative].** The collections sketch
 > (2026-06-29 §2, §6.3
 > below) makes partial lookup total by returning an option: `lst[i]`
-> and `map[k]` have type `Option(T)` (matched with `some(v)` / `none`,
-> as in the north-star `txn_kv`), while `Array` lookup stays direct
+> and `map[k]` have type `Option(T)` (matched with `` `some(v) `` /
+> `` `none ``, §6.5, as in the north-star `txn_kv`), while `Array` lookup stays direct
 > (`arr[i]: T`) because its bounds are statically checked. That would
 > eliminate the not-defined lookup cases above (see *Partiality*, §3).
 
@@ -839,6 +914,14 @@ body.
 
 A trailing comma is allowed in every form (and required to disambiguate
 `(e,)` from `(e)`).
+
+**One-element products carry the comma at both levels [Decided].** The same
+rule holds for the tuple *type*: `{T,}` is the one-element tuple type, and
+the comma is what distinguishes it (§2.4). Only *tuples* need it — a
+one-field record needs no comma at either level, since `name=value`
+(`(a=1)`) and `name: T` (`{a: Int}`) already mark the form. A one-element
+brace group without the comma is read as a one-tuple type today; that is
+the spelling the decision retires.
 
 **Tuple vs. record.** Both use `( … )`: a comma-list of bare expressions is
 a tuple (`(1, 2)`), a comma-list of `name=value` fields is a record
@@ -1104,7 +1187,8 @@ is supported at any nesting depth.
 > appears — assignment and `for` binders alike — and `k -> v` pair
 > patterns (§2.4) join tuple patterns. Today's grammar special-cases
 > the `reqs, resps = http_serve(…)` statement form (§7.4); that is an
-> implementation restriction, not a design one.
+> implementation restriction, not a design one. The decided pattern
+> surface is §4.3.1.
 
 **No assignment-as-expression** — neither `=` nor `:=` is an expression
 (the mutation `:=` is a statement, §1.8). **No multi-target chained
@@ -1141,6 +1225,64 @@ values, and a write reveals one more position of it (§8.1, and
 > today per §5) survives once `=` reads as a timeless equation — two
 > equations for one name in one scope contradict the reading, but the
 > brainstorm doesn't address it.
+
+#### 4.3.1 Destructuring patterns [Decided]
+
+A binding LHS is a **pattern**: a shape that names the parts of the value
+being bound. Patterns appear in three positions — an assignment target
+(§4.3), a `for` binder (§4.6), and a `case` arm (§6.5) — and the same
+grammar serves all three.
+
+```ebnf
+pattern      ::= ident
+              |  pattern ":" type                              -- annotated
+              |  "(" pattern ( "," pattern )* [ "," ] ")"       -- tuple, parenthesised
+              |  pattern ( "," pattern )+ [ "," ]               -- tuple, bare
+              |  "(" field_pat ( "," field_pat )* [ "," ] ")"   -- record
+              |  "`" tagname [ "(" pattern ( "," pattern )* [ "," ] ")" ]  -- variant (§6.5)
+              |  "_"                                            -- wildcard
+
+field_pat    ::= ident "=" pattern
+```
+
+The forms mirror the term-level constructors exactly (§3.11): a pattern is
+written the way the value it matches is written, with binders where the
+value has sub-values. That includes the delimiters — patterns are terms, so
+they use `( … )` and never `{ … }`, and a variant pattern uses parens for
+its fields even though the variant *type* writes them in braces
+(`` case `some(x) `` against `` `some{Int} ``).
+
+**Annotations ride any node, and `:` binds tighter than `,`.** A pattern
+component may carry its own type, so the annotation sits wherever the
+type is worth stating:
+
+```python
+(x, y): {Int, Int} = z           # one annotation on the whole tuple pattern
+x: Int, y: Int = tuple           # one per component; no parens needed
+(x=x2, y=y2): {x: Int, y: Int} = r   # record fields rebound to x2, y2
+`some(x): {`some{Int}} = y       # variant pattern, single-tag variant type
+```
+
+Because `:` binds tighter than `,`, `x: Int, y: Int` above parses as the
+two-component tuple pattern `(x: Int), (y: Int)` rather than binding `x`
+to a type that swallows the comma. That is what makes the parens optional
+on an annotated bare tuple pattern, and it is the same precedence a
+`def` parameter list (§2.2) and a record type (§2.4) already read by.
+
+A **record** pattern's `field=binder` mirrors the record value's
+`field=value`: the left of `=` is the field being projected, the right is
+the pattern it is matched against. `(x=x2)` therefore binds field `x` to
+the name `x2`; `(x=x)` is the same-name case and has no shorthand.
+
+Patterns are still **static** — which names a binding introduces is
+decidable from the syntax alone (§2.2). A variant pattern is the one form
+that can *fail* to match, which is why it only appears in a `case` arm or
+against a single-tag variant type, where the match is exhaustive.
+
+Today's grammar accepts only the tuple forms, unannotated, with the
+annotation restricted to the whole target (`ann_assign_stmt`, §2.2);
+record, variant, wildcard, and per-component annotations are all
+unimplemented.
 
 ### 4.4 Define statement `<<=`
 
@@ -1390,9 +1532,15 @@ marked one carries its status per "How to read this document".)
   The index → element mapping is part of the value (so `xs[i]` is
   well-defined); iteration order, however, is unspecified (§3). Written
   `List(T)` or `List(_)`.
-- `{T₀, T₁, …}` — tuple type (structural `{…}` type syntax — §6.1).
+- `{T₀, T₁, …}` — tuple type (structural `{…}` type syntax — §6.1). The
+  one-element case is `{T,}`, with the comma required (**[Decided]**,
+  §2.4, §3.11).
 - `{name: T, …}` — record type. Two records are the same type iff they
   have the same field names with the same field types.
+- ``{ `tag₀{…} | `tag₁{…} | … }`` — variant type (**[Decided]**, §6.5).
+  Not writable yet.
+- `{T where p(_)}` — refinement type (**[Decided]**, §6.4). Not writable
+  yet.
 - `Mut(V)` / `Mut(V, Txn)` — mutable-variable / transactional-register
   type (§6.2, §8).
 - `Map(K, V)` — finite-map type. **[Planned]** — the map literal
@@ -1407,7 +1555,7 @@ marked one carries its status per "How to read this document".)
 CHL also supports **refinement types**: a value of the refined type is
 a value of the base type for which a predicate holds. Refinements are
 inferred internally by built-ins like `groupby` (§7.2); the decided
-surface form is `{x: T | p(x)}` (§6.1), not writable yet.
+surface form is `{T where p(_)}` (§6.4), not writable yet.
 
 > **Direction [Decided] — function contracts are asserts.** There is
 > no refinement syntax at a function definition site: a function's
@@ -1415,7 +1563,9 @@ surface form is `{x: T | p(x)}` (§6.1), not writable yet.
 > refinement types in CCL. The two canonical shapes: precondition
 > asserts at the top of the body, referencing parameters, lift to
 > refinements on those parameters (`assert qty > 0` makes the domain
-> `{qty: Int | qty > 0}`); an assert on the result variable
+> `{qty: Int | qty > 0}` — the lift's results are shown here in CCL's
+> named-binder notation, since a dependent codomain has to name what it
+> closes over; the surface `where`/`_` form is §6.4); an assert on the result variable
 > immediately before it is returned lifts to a refinement on the
 > codomain, dependent on the parameters through `Type::Fun`'s named
 > binders (a trailing `assert p >= item.cost * qty` gives the codomain
@@ -1426,7 +1576,7 @@ surface form is `{x: T | p(x)}` (§6.1), not writable yet.
 > refinements, so preconditions propagate outward to trust boundaries
 > — in the north-star `storefront`, `reserve`'s `assert qty > 0` is
 > what forces the HTTP handler to validate `req.body.qty` before the
-> call typechecks. Type-position refinement syntax (§6.1) remains for
+> call typechecks. Type-position refinement syntax (§6.4) remains for
 > **data** — store value types, feed element types; both surfaces meet
 > in CCL as ordinary refinement types.
 >
@@ -1442,7 +1592,7 @@ surface form is `{x: T | p(x)}` (§6.1), not writable yet.
 > their own invariants (a `Price` whose `assert amount >= 0` rides the
 > type instead of being repeated per function) are the agreed
 > direction for factoring recurring contracts, with no syntax settled
-> yet (§6.1). Pinned by `discount_contract` (the mechanism in
+> yet (§6.1, §6.4). Pinned by `discount_contract` (the mechanism in
 > isolation), `nonneg_inventory` (data refinement plus guarded
 > discharge), and `storefront` (both combined).
 
@@ -1457,9 +1607,13 @@ treatment.
 
 **Capitalization distinguishes term from type.** Lowercase heads are
 terms; capitalized heads are types. Data *constructors* build values,
-so they are lowercase — `some`/`none`, `ok`/`err` — and only the type
-(`Option(T)`) is capitalized. `Caps` means *type*, without exception
-(unlike ML and Rust, which capitalize constructors).
+so they are lowercase — `` `some ``/`` `none ``, `` `ok ``/`` `err `` — and
+only the type (`Option(T)`) is capitalized. `Caps` means *type*, without
+exception (unlike ML and Rust, which capitalize constructors). Those
+constructors are **variant tags**, so they additionally carry the `` ` ``
+prefix in every position (**[Decided]**, §6.5); the capitalization rule is
+what fixes their case, and the backtick is what marks them as tags rather
+than ordinary names.
 
 **Application is shared across levels.** `f(args)` is application
 whether `f` is a value or a type constructor: `split(line)` and `ok(v)`
@@ -1469,8 +1623,9 @@ dependently typed, a type constructor can take a *term* argument —
 `Default(0, Nat)` — with no special bracket rule; in particular `[…]`
 is **not** generic-argument syntax (it belongs to collections, §2.4).
 
-**`{…}` is structural-type syntax** (§2.4): tuple type `{T, U}`, record
-type `{f: T}`, refinement `{x: T | p(x)}`.
+**`{…}` is structural-type syntax** (§2.4): tuple type `{T, U}` (one
+element `{T,}`), record type `{f: T}`, variant type
+``{ `some{T} | `none }`` (§6.5), refinement `{T where p(_)}` (§6.4).
 
 > **Direction [Tentative].** Named types come in two strengths. A
 > plain `=` binding to a capitalized name is a structural **alias** —
@@ -1527,9 +1682,9 @@ details to change:
 - `List(T)` — `{len: Nat, data: Fin(len) ⇒ T}`: an array "boxed" with
   its length when the length isn't statically known; `lst[i]: Option(T)`.
 - `Set(K)` — `Map(K, {})`: the domain is the payload; membership via
-  `e in s` (§3.4).
-- `Map(K, V)` — `{is_key: K ⇒ Bool, data: {K | is_key} ⇒ V}`; lookup
-  `m[k]: Option(V)`, membership `k in m`.
+  `e in s` (§3.4). (The unit-type spelling `{}` is **[Open]** — §2.4.)
+- `Map(K, V)` — `{is_key: K ⇒ Bool, data: {K where is_key(_)} ⇒ V}`;
+  lookup `m[k]: Option(V)`, membership `k in m`.
 - `Collection(T)` — `{Dom: Type, data: Dom ⇒ T}`: the domain rides
   along in the value.
 
@@ -1549,6 +1704,127 @@ Sketched at the same **[Tentative]** level:
   mutable collections.
 - Immutable collections as the encouraged default; mutable ones get
   the standard mutation operations.
+
+### 6.4 Direction: refinement syntax [Decided]
+
+A refinement is written `{ 𝑇 where 𝑝 }` — the base type, the keyword
+`where`, and a predicate over the value being refined:
+
+```python
+{Int where _ > 0}                       # a positive Int
+{{a: Int, b: Int} where _.a > 0}        # a record refined through a field
+{{a: Int} where _.a > 0}                # ... a single-field record; no comma
+```
+
+Three pieces, none of them writable today:
+
+- **`{ … }`** because a refinement *is* a structural type (§2.4). The base
+  type sits inside the braces in its own spelling, so refining a structural
+  type nests two brace pairs (`{{a: Int} where …}`) — the outer pair is the
+  refinement, the inner one is the record type. There is no elision.
+- **`where`** as the separator, replacing the earlier `|` (superseded).
+  Moving off `|` is what frees that token to separate variant tags
+  (§6.5, §1.8), and `where` reads as the clause it is.
+- **`_`** as the refined value. The predicate has no named binder: `_` *is*
+  the value, so a refinement is a closed expression about one anonymous
+  subject rather than a binder plus a scope. This is the same `_` that
+  means "infer this slot" in a type (§6.2), and the two do not collide
+  because they sit in different positions — `_` in *type* position is the
+  hole, `_` inside a `where` predicate is the value. Both appear at once in
+  `{_ where _ > 0}`: refine a to-be-inferred base type by a predicate on
+  its value.
+
+The predicate is an ordinary CHL expression of type `Bool`, and `where`
+binds looser than everything in it, extending to the closing brace (§2.4).
+A `match` over `_` is the idiomatic way to refine a variant:
+
+```python
+{ { `some{Int} | `none } where
+    match _:
+        case `some(x): x > 0
+        case `none: true
+}
+```
+
+> **[Open]** — the layout of that `match`. Newlines and indentation are
+> **ignored** inside brackets (§1.4), so a `match` written inside `{…}`
+> gets no `INDENT`/`DEDENT` to delimit its arms: the arms above are
+> readable to a human but invisible to the layout rules, and the parser
+> would have to delimit each arm by the next `case` or the closing brace
+> instead. That is parseable — neither token can continue an expression —
+> but it is a second, delimiter-derived block discipline for `match`
+> alongside the indentation-derived one. A **single-line `match`** form
+> would collapse the two; its spelling is undecided. Pattern matching's
+> block syntax is **[Tentative]** in any case (§1.6).
+
+Naming a refinement's subject is *not* how a function states a contract:
+a function's preconditions and postconditions are `assert` statements in
+its body, lifted to refinements over the parameter binders (the Direction
+note in §6). That lift needs the parameter's *name* in the predicate —
+`{qty: Int | qty > 0}`, in CCL's named-binder notation — which is exactly what
+the anonymous `_` cannot express, and exactly why the two surfaces are
+separate: `where`/`_` is for **data** types, `assert` is for **function**
+contracts.
+
+**This is CHL surface syntax only.** CCL renders a refinement
+`{𝑇 | 𝑝}` with an explicit binder, and that notation is unchanged — it
+has to name the binder, since a dependent codomain refinement closes over
+a `Type::Fun` Pi binder. The surface `_` lowers to CCL's element binder
+(`__elem`), so `{Int where _ > 0}` is the CCL type `{Int | __elem > 0}`.
+Expect to see the `|` form in compiler output, design docs, and the
+operational semantics.
+
+### 6.5 Direction: variants [Decided]
+
+A **variant** is a tagged sum: a value is one of a fixed set of tags, each
+carrying its own fields. Every tag is prefixed with a backtick, in every
+position, and tag names are lowercase (§1.8, §6.1):
+
+| Position | Delimiter | Example |
+| --- | --- | --- |
+| type | `{ … }`, tags separated by `\|` | ``{ `some{Int} \| `none }`` |
+| term | `( … )` | `` `some(1) ``, `` `none `` |
+| pattern | `( … )` | `` case `some(x) ``, `` case `none `` |
+
+```python
+`some(a=0) : { `some{a: Int} | `none }   # a tag with one named field
+`some(1)   : { `some{Int} | `none }      # ... one positional field
+`unit      : { `unit }                   # a nullary tag; a one-tag variant
+```
+
+The rules, and what each one is doing:
+
+- **`{…}` encloses the type, `|` separates the tags.** A variant type is a
+  structural type like any other (§2.4), and the alternation reads as the
+  sum it is. A single-tag variant still takes its braces —
+  ``{ `unit }`` — and needs no trailing comma, since the `` ` `` already
+  marks the form (unlike a one-*tuple* type, §3.11).
+- **A tag's fields are `{…}`-enclosed in the type** and follow the
+  record/tuple type spellings: positional (`` `some{Int, Bool} ``) or named
+  (`` `some{a: Int, b: Bool} ``). A **nullary** tag has no braces at all.
+- **Field braces are the tag's own field list**, not a nested type — which
+  is the elision: a record payload is `` `some{a: Int} ``, not
+  `` `some{{a: Int}} ``. Write the fields where the braces already are.
+- **Terms and patterns use `( … )`**, because they are terms, and `( … )`
+  is the product constructor at the term level (§2.4). So construction
+  reads like a call — `` `some(1) ``, `` `some(a=0) `` — matching the
+  functions-take-one-product-argument model (§3.8), and a pattern reads
+  like the construction it matches (§4.3.1).
+- **Tags are lowercase** because a tag builds a value, and `Caps` means
+  type without exception (§6.1).
+
+`Option(T)` is the canonical variant — ``{ `some{T} | `none }`` — and is
+what a partial lookup returns under the collections direction (§3.9,
+§6.3). `Result` is the same shape with `` `ok ``/`` `err ``.
+
+Variants are matched with `match`/`case` (**[Tentative]** as to block
+syntax — §1.6), or destructured directly against a single-tag variant type
+where the match cannot fail (§4.3.1).
+
+CCL has the sum type already (`Type::Variant`, a tag→payload list keyed by
+name or by position) and renders it `[.some(Int) | .none]`; that internal
+notation is unchanged. Nothing in CHL constructs one today — no backtick is
+lexed, and neither `match` nor a tag is parsed.
 
 ---
 
@@ -1659,7 +1935,7 @@ unique across the program.
 > decisions — closing any of them out means designing the HTTP
 > library. The sketch the north-star `storefront` handlers are
 > written against: a response is a record,
-> `{code: {c: Int | 100 <= c <= 599}, body: String}`, and the status
+> `{code: {Int where 100 <= _ <= 599}, body: String}`, and the status
 > constructors are ordinary library functions over it
 > (`def not_found(body): (code=404, body=body)`, likewise `ok` /
 > `bad_request` / `conflict`), with the record literal as the escape
@@ -1679,7 +1955,7 @@ unique across the program.
 > either element type (an instance riding §8's typeclass solver?),
 > the wire serialization of bare structured values, and whether an
 > endpoint's response type can carry a contract refinement
-> (`{r: Response | r.code < 500}`, "never answers 500") ride on the
+> (`{Response where _.code < 500}`, "never answers 500") ride on the
 > same library design. So does the typing of the response sink
 > itself: a *deferred keyed collection* — supporting both
 > `resps[req.id] = …` and a feed form `resps << …` — that needs CCL
@@ -2065,13 +2341,32 @@ with parser-level support that lowering rejects:
 - **String operations** beyond `+` concatenation.
 - **Surface refinement type syntax** — refinement types (§6) are
   inferred today only via built-ins like `groupby`; the decided
-  surface form is `{x: T | p(x)}` (**[Decided]**, §6.1), not yet in
-  the grammar. Function contracts arrive as `assert`s lifted to
-  refinements (**[Decided]**, §6) — `assert` is likewise not yet a
-  statement.
+  surface form is `{T where p(_)}` (**[Decided]**, §6.4), not yet in
+  the grammar. It needs the `where` keyword (§1.6) and `_` in term
+  position inside the predicate. Function contracts arrive as `assert`s
+  lifted to refinements (**[Decided]**, §6) — `assert` is likewise not yet
+  a statement.
+- **Variants** — the tagged-sum surface, ``{ `some{Int} | `none }`` as a
+  type and `` `some(1) `` as a term (**[Decided]**, §6.5). CCL has the
+  type (`Type::Variant`); CHL has none of the syntax. The backtick is not
+  lexed at all, so it is the *first* blocker in every north-star program
+  that matches an `Option` — `txn_kv`, `nonneg_inventory`, and both
+  `storefront` versions pin that lex failure today.
 - **Pattern matching** beyond tuple destructuring on assignment
-  targets — a `match`/`case` form appears in the north-star `txn_kv`
-  (**[Tentative]**, §1.6) but has no design writeup.
+  targets — a `match`/`case` form appears in the north-star `txn_kv` and
+  in refinement predicates (§6.4) (**[Tentative]**, §1.6) but its block
+  syntax has no design writeup; a single-line form is **[Open]**, and
+  the layout rules (§1.4) force the question for a `match` inside a
+  refinement.
+- **Destructuring patterns** beyond tuples — record, variant, and
+  wildcard patterns, and per-component annotations with `:` binding
+  tighter than `,` (**[Decided]**, §4.3.1).
+- **One-element product spellings** — a one-tuple *type* takes the
+  trailing comma, `{T,}` (**[Decided]**, §2.4, §3.11). Today a
+  comma-free `{T}` is accepted and read as that one-tuple; what it
+  should mean instead — a grouping of `T`, or an error — is **[Open]**.
+  Fixing this changes existing parser behaviour rather than adding to
+  it, the one place in this round of decisions that does.
 - **The term-level delimiter migration** — record values are `(f=1, …)`, and
   `{…}` no longer denotes a term-level value (it is record-type / tuple-type
   syntax, §2.4). Finite maps as `[k -> v, …]` remain **[Decided]**; earlier
@@ -2087,8 +2382,9 @@ with parser-level support that lowering rejects:
   application (`Mut(V, Txn)`, `List(T)`) and capitalized primitive names
   (`Int`, `Bool`, `String`), with record types `{name: T, …}` and tuple types
   `{T, U}` writable in annotation position (§6.1). The remaining **Direction**
-  notes are unimplemented: `rec` bindings (§4.3),
-  membership `in` (§3.4), the `->` pair/map-entry syntax (§2.4), the `Feed(_)`
+  notes are unimplemented: `rec` bindings (§4.3), destructuring patterns
+  (§4.3.1), membership `in` (§3.4), the `->` pair/map-entry syntax (§2.4),
+  refinements (§6.4), variants (§6.5), the `Feed(_)`
   forward-declaration surface (§3.7, §6.2), and
   transactions-as-contextual-parameters (§8.7). The north-star programs
   pin the target; the sequencing is tracked

@@ -29,7 +29,7 @@ catalog = [
     "poster"    -> (price=10, cost=9),   # low margin: the discount clamps here
 ]
 
-inventory: Mut(Map(String, {q: Int | q >= 0}), Txn) := [
+inventory: Mut(Map(String, {Int where _ >= 0}), Txn) := [
     "tee-black" -> 500,
     "hoodie"    -> 200,
     "poster"    -> 1000,
@@ -78,13 +78,13 @@ def quote(item: {price: Int, cost: Int}, qty: Int) => Int requires Transaction:
 def reserve(sku: String, qty: Int) => Bool requires Transaction:
     assert qty > 0
     match inventory[sku]:
-        case some(stock):
+        case `some(stock):
             if stock >= qty:
                 inventory[sku] := stock - qty
                 true
             else:
                 false
-        case none: false
+        case `none: false
 
 for req in order_reqs:
     # The qty > 0 preconditions on reserve/quote force validation at the
@@ -93,8 +93,8 @@ for req in order_reqs:
             http.bad_request("qty must be positive")
         else:
             match catalog[req.body.sku]:
-                case none: http.not_found("no such sku")
-                case some(item):
+                case `none: http.not_found("no such sku")
+                case `some(item):
                     with begin():
                         if reserve(req.body.sku, req.body.qty):
                             price = quote(item, req.body.qty)
@@ -113,10 +113,10 @@ for req in restock_reqs:
         else:
             with begin():
                 match inventory[req.body.sku]:
-                    case some(stock):
+                    case `some(stock):
                         inventory[req.body.sku] := stock + req.body.qty
                         http.ok("restocked")
-                    case none: http.not_found("no such sku")
+                    case `none: http.not_found("no such sku")
     restock_resps[req.id] = result
 
 # Revenue per SKU as a view at the request's own transaction time: restrict

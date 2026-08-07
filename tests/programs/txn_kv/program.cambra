@@ -30,16 +30,16 @@ for req in set_reqs:
         # two concurrent /set requests for the same key can't both observe it
         # missing and both insert — the read-modify-write is atomic.
         match store[req.body.key]:
-            case some(_): abort()
-            case none:    put(req.body.key, req.body.value)
+            case `some(_): abort()
+            case `none:    put(req.body.key, req.body.value)
     set_resps[req.id] = "ok\n"
 
 for req in get_reqs:
     with begin():
         result = store[req.query.key]
     get_resps[req.id] = match result:
-        case some(v): v
-        case none:    http.not_found("no such key\n")
+        case `some(v): v
+        case `none:    http.not_found("no such key\n")
 
 # Write count as a declarative aggregate over the /set request stream — a view,
 # not mutable state.  `set_reqs` fans out to both the writer loop above and
