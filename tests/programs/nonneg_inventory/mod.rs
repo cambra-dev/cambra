@@ -11,11 +11,11 @@
 //!
 //! **Currently blocked at lexing.**  The first unsupported construct is the
 //! `` ` `` prefix on the `` `some ``/`` `none `` variant tags
-//! (`docs/chl-spec.md`, "6.5 Direction: variants [Decided]"), which the lexer
+//! (`docs/chl-spec.md`, "6.5 Variants"), which the lexer
 //! rejects outright; because lexing is a whole-file pass it precedes the
 //! `->` map-entry pair in the store literal, which is the next blocker and
 //! is a parse-level one.  Behind those: the refinement braces (`where` /
-//! `_` — "6.4 Direction: refinement syntax [Decided]") and `Mut(..., Txn)`
+//! `_` — "6.4 Refinement syntax") and `Mut(..., Txn)`
 //! as annotation forms, map lookup, `match`/`case`, `requires Transaction`,
 //! `with begin():`, and record terms.  This pins the variant-tag lex
 //! failure.

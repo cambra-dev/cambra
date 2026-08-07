@@ -77,8 +77,8 @@
 //!   (deferred with the still-open versioning surface).
 //!
 //! This pins the variant-tag lex failure on both files — the `` ` `` prefix on
-//! `` `some ``/`` `none `` (`docs/chl-spec.md`, "6.5 Direction: variants
-//! [Decided]") is not lexed, and it precedes the `match`-block indentation
+//! `` `some ``/`` `none `` (`docs/chl-spec.md`, "6.5 Variants") is not lexed,
+//! and it precedes the `match`-block indentation
 //! failure behind it.  When the tag lexes, the test goes red and the next
 //! blocker gets pinned.
 

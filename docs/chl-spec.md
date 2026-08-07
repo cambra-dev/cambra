@@ -1227,7 +1227,10 @@ values, and a write reveals one more position of it (§8.1, and
 > equations for one name in one scope contradict the reading, but the
 > brainstorm doesn't address it.
 
-#### 4.3.1 Destructuring patterns [Decided]
+#### 4.3.1 Destructuring patterns
+
+**[Decided]** — the surface below is decided and not implemented; see the end of
+this section for what today's grammar accepts.
 
 A binding LHS is a **pattern**: a shape that names the parts of the value
 being bound. Patterns appear in three positions — an assignment target
@@ -1709,7 +1712,10 @@ Sketched at the same **[Tentative]** level:
 - Immutable collections as the encouraged default; mutable ones get
   the standard mutation operations.
 
-### 6.4 Direction: refinement syntax [Decided]
+### 6.4 Refinement syntax
+
+**[Decided]** — not implemented. `where` is lexed and reserved (§1.6); the brace
+form is not parsed.
 
 A refinement is written `{ 𝑇 where 𝑝 }` — the base type, the keyword
 `where`, and a predicate over the value being refined:
@@ -1779,7 +1785,10 @@ a `Type::Fun` Pi binder. The surface `_` lowers to CCL's element binder
 Expect to see the `|` form in compiler output, design docs, and the
 operational semantics.
 
-### 6.5 Direction: variants [Decided]
+### 6.5 Variants
+
+**[Decided]** — not implemented. CCL has the sum type; no part of the CHL surface
+below is lexed or parsed.
 
 A **variant** is a tagged sum: a value is one of a fixed set of tags, each
 carrying its own fields. Every tag is prefixed with a backtick, in every

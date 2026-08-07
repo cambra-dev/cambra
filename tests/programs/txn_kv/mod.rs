@@ -20,7 +20,7 @@
 //!
 //! **Currently blocked at lexing.**  The `\` lambda now lexes; the first
 //! unsupported construct is the `` ` `` prefix on the `` `some ``/`` `none ``
-//! variant tags (`docs/chl-spec.md`, "6.5 Direction: variants [Decided]"),
+//! variant tags (`docs/chl-spec.md`, "6.5 Variants"),
 //! which the lexer rejects outright — and lexing is a whole-file pass, so it
 //! precedes every parse-level blocker.  Behind it: `import http` (modules),
 //! the `requires Transaction` contextual-parameter clause, `with begin()` /
