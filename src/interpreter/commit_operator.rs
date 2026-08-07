@@ -1333,13 +1333,43 @@ struct InductionStoreProducer {
     /// Whether the whole source has been released (`True`) after the loop reached
     /// its terminal end-state — the finite loop's `get_released_predicate() == True`
     /// invariant; issued once.
+    ///
+    /// It also *ends the drive*: a universal release is a promise never to request
+    /// those positions again, so once it is issued this producer must not pull the
+    /// source — and has no reason to, since it is only issued when the source is
+    /// complete and every arrived position has been decided. Later pulls serve the
+    /// accumulated store (the same promise the dense `Recurse` path kept once its
+    /// recurrence converged).
     source_fully_released: bool,
+}
+
+impl InductionStoreProducer {
+    /// The engine's accumulated store as a tile, marked `terminal` once the
+    /// recurrence is final (the accumulator can no longer change, so a downstream
+    /// `ExtractLast` / `final_or_default` resolves).
+    fn render_store(&self, recurrence_final: bool) -> Tile {
+        let mut store = self.engine.render_full_store_tile();
+        if recurrence_final && let Tile::Store { terminal, .. } = &mut store {
+            *terminal = true;
+        }
+        debug_assert!(
+            store.check_from(&self.output_tiling),
+            "rendered induction store tile does not match the full-store tiling"
+        );
+        store
+    }
 }
 
 impl TileProducer for InductionStoreProducer {
     impl_producer_base!();
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        // The drive is over once the source has been universally released: pulling
+        // it again would break that release's promise, and every position is already
+        // decided, so the accumulated store is the whole answer.
+        if self.source_fully_released {
+            return self.render_store(true);
+        }
         let src = self
             .source_producer
             .get(self.source_producer.tiling().universal_guard());
@@ -1452,7 +1482,6 @@ impl TileProducer for InductionStoreProducer {
             self.engine.step(pos + 1, write_set);
             self.processed = pos + 1;
         }
-        let mut store = self.engine.render_full_store_tile();
         // Incrementally reclaim the processed prefix of the source. The drive only
         // ever pulls position `processed` forward and never re-reads a position
         // `< processed`, so `[0, processed)` is obsolete to *this* producer;
@@ -1482,9 +1511,6 @@ impl TileProducer for InductionStoreProducer {
         // decided — robust to the incremental prefix release above shrinking
         // `by_pos`.
         let done = self.source_complete && !by_pos.contains_key(&self.processed);
-        if done && let Tile::Store { terminal, .. } = &mut store {
-            *terminal = true;
-        }
         // Final reclamation: once terminal, release the *whole* source (`True`) so a
         // finite loop reaches the `get_released_predicate() == True` end-state (the
         // incremental prefix release above stops one short of a `True` predicate).
@@ -1493,11 +1519,7 @@ impl TileProducer for InductionStoreProducer {
                 .release(TileGuard::Function(FunctionGuard::Domain(Predicate::True)));
             self.source_fully_released = true;
         }
-        debug_assert!(
-            store.check_from(&self.output_tiling),
-            "rendered induction store tile does not match the full-store tiling"
-        );
-        store
+        self.render_store(done)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
