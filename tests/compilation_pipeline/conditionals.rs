@@ -577,9 +577,9 @@ total",
     103
 )]
 // Fire early, then an **all-carry tail**: x=3 (position 0) writes +3; x=1
-// (position 1) carries. The last *change* is at position 0, but the final
-// accumulator is at position 1 — so the scalar-final `ExtractLast` must read the
-// carried tail, not stop at the last change tick. Pins the terminality/watermark
+// (position 1) carries. The latest *change* is at position 0, but the final
+// accumulator is at position 1 — so the scalar-final `ExtractFinal` must read the
+// carried tail, not stop at the latest change tick. Pins the terminality/watermark
 // decoupling (a sparse writer whose tail carries reads its true final value).
 #[case(
     r"
@@ -591,8 +591,8 @@ total",
     3
 )]
 // **Trailing carries**: writes then a carrying tail (`x < 3` fires at 1,2; the
-// last three positions carry). The scalar-final read must fold to the last
-// *written* value (1+2 = 3), not undercount because the changelog's last change
+// final three positions carry). The scalar-final read must fold to the latest
+// *written* value (1+2 = 3), not undercount because the changelog's latest change
 // tick sits below the position watermark — the terminality-vs-watermark fix.
 #[case(
     r"

@@ -1,11 +1,11 @@
 //! A scalar transactional register shared *live* across endpoints: `POST /set`
-//! overwrites `last` (`Mut(String, Txn)`, latest-write-wins); `GET /get` reads its
-//! current value cross-endpoint. The GET reads `last` inside a read-only `with
+//! overwrites `latest` (`Mut(String, Txn)`, last-write-wins); `GET /get` reads its
+//! current value cross-endpoint. The GET reads `latest` inside a read-only `with
 //! begin():` block that feeds it out — a live as-of read (`Builtin::AsOf`)
 //! latched to the GET request loop (the outer index): each GET sees the store's
 //! latest committed value as of its arrival, indexed by request position (which
 //! is how the HTTP sink dispatches). The as-of join resolves over a *live* store,
-//! where the terminal `ExtractLast` read would never converge.
+//! where the terminal `ExtractFinal` read would never converge.
 //!
 //! The reply carries no id: replies ride the request loop (outer-indexed), so
 //! plain position-based HTTP dispatch on `String` values suffices — no
@@ -37,8 +37,8 @@ fn http_counter() {
     assert_eq!(got, "bob");
 }
 
-/// A *computed* live cross-endpoint read: `GET /get` replies `last + "!"`, where
-/// `last` is overwritten by `POST /set`. This exercises the `as_of ≫ (λ x → x +
+/// A *computed* live cross-endpoint read: `GET /get` replies `latest + "!"`, where
+/// `latest` is overwritten by `POST /set`. This exercises the `as_of ≫ (λ x → x +
 /// "!")` shape at runtime — the map layer over the as-of latch — confirming it
 /// resolves rather than hanging: the pre-lambda-elim rewrite makes the computed
 /// reply a real as-of read (a map over the latch), not a never-resolving
@@ -50,9 +50,9 @@ fn http_computed_live_read() {
     let source = format!(
         "set_reqs, set_resps = http_serve(\"{port}\", \"POST\", \"/set\")\n\
          get_reqs, get_resps = http_serve(\"{port}\", \"GET\", \"/get\")\n\
-         last: Mut(String, Txn) := \"(none)\"\n\
-         for msg in set_reqs:\n    with begin():\n        last := msg\n    set_resps << \"ok\\n\"\n\
-         for req in get_reqs:\n    with begin():\n        get_resps << last + \"!\"\n"
+         latest: Mut(String, Txn) := \"(none)\"\n\
+         for msg in set_reqs:\n    with begin():\n        latest := msg\n    set_resps << \"ok\\n\"\n\
+         for req in get_reqs:\n    with begin():\n        get_resps << latest + \"!\"\n"
     );
     let mut ctx = compile_sink(&source);
     wait_for_bind();

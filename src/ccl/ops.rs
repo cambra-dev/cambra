@@ -325,7 +325,7 @@ pub enum Builtin {
     /// `final_or_default : Tuple(Fun(D, T), T) → T` — extract the
     /// codomain value at the final position of an iteration stream, or
     /// fall back to the default scalar when the stream's domain is
-    /// empty.  Compiles directly to the `ExtractLast` tile operator
+    /// empty.  Compiles directly to the `ExtractFinal` tile operator
     /// (which receives both the stream and the default operator); not
     /// an aggregate fold (no identity element), so it does not
     /// participate in `AggregateKind`.
@@ -341,8 +341,8 @@ pub enum Builtin {
     /// TODO: Make the ordering requirement on this explicit.  Right now
     /// all of our types can be implicitly ordered, but that might not
     /// hold forever, and the implicit ordering might be wrong.  Tracked
-    /// jointly with the `.rev().find(…)` in `ExtractLastProducer` —
-    /// both assume the source's last position by emission order, not
+    /// jointly with the `.rev().find(…)` in `ExtractFinalProducer` —
+    /// both assume the source's final position by emission order, not
     /// by sorted domain value.
     FinalOrDefault,
 

@@ -1232,7 +1232,7 @@ requires:
 - Before the loop, the name has its outer value.
 - At each iteration, the body computes a new value from the
   previous-iteration's value and the current element.
-- After the loop, the name holds the value at the last iteration (or, if
+- After the loop, the name holds the value at the final iteration (or, if
   the source was empty, the outer pre-loop value).
 
 Loops are parallel by default (above); an accumulator is what serialises
@@ -1334,7 +1334,7 @@ CHL is **lexically scoped**. The scopes are:
 5. **`for`-loop scope** — the loop variable (`target` in
    `for target in iter:`) is in scope only inside the loop body. After
    the loop, the name is **not** in scope — there is no "value at the
-   last iteration" to bind it to, because iterations are unordered and
+   final iteration" to bind it to, because iterations are unordered and
    may run in parallel (§3, §4.6). This is a deliberate divergence from
    Python's leaky-loop-variable behaviour. Any value the loop needs to
    produce for downstream code must be carried out via a loop-carried
@@ -1879,7 +1879,7 @@ Consequences a program may rely on:
 compile today.
 
 `await_final(x)` is a builtin call on a transactional register
-`x: Mut(V, Txn)`, an expression of type `V`: the register's **last
+`x: Mut(V, Txn)`, an expression of type `V`: the register's **final
 committed value**, once its entire commit history is complete (every
 writer source drained), or the initializer if it was never committed. It
 is the register-domain counterpart of the trailing induction read (§8.3)
@@ -1891,7 +1891,7 @@ pool: Mut(Int, Txn) := 100
 for r in reqs:
     with begin():
         pool -= r
-final = await_final(pool)      # waits for every writer of `pool`, then the last commit
+final = await_final(pool)      # waits for every writer of `pool`, then the final commit
 ```
 
 **`x` is unreferenceable afterward.** After `await_final(x)`, `x` may not be

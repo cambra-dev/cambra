@@ -30,7 +30,7 @@ use crate::{
 
 mod aggregate;
 mod combinators;
-mod extract_last;
+mod extract_final;
 mod fan;
 mod fanout;
 mod helpers;
@@ -42,7 +42,7 @@ mod union;
 
 pub use aggregate::*;
 pub use combinators::*;
-pub use extract_last::*;
+pub use extract_final::*;
 pub use fan::*;
 pub use fanout::*;
 pub use helpers::*;
