@@ -185,30 +185,7 @@ When you are using compact, focus on test output and code changes.
 - When making changes, verify the freshness of the local repo by fetching and comparing the diff. The following commands do this, if there are differences, warn the user and ask the user whether they would like to pull or rebase.
    1. `git fetch origin`
    2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
-
-### Commit descriptions are PR bodies — author them as Markdown
-
-PRs here are often created with `gh pr create --fill`, so the
-PR body is the commit description *verbatim*, the PR body squashes to become
-the `main` commit message. GitHub renders that body as GitHub-Flavored Markdown,
-so write commit descriptions as Markdown,not as traditional column-wrapped git prose:
-
-- **Do not hard-wrap inside a paragraph.** Let each paragraph be one
-  soft-wrapped line and separate paragraphs with a blank line — otherwise every
-  wrap point renders as a ragged `<br>` on GitHub.
-- **Backtick every code construct** — type/identifier names, file paths,
-  field and flag names (`` `CompiledProgram` ``, `` `dead_code` ``,
-  `` `src/ccl/lineage.rs` ``).
-- Use real Markdown for structure where it helps: `-` bullet lists for
-  enumerations, blank lines between paragraphs.
-
-### Updating PR descriptions
-
-`gh pr edit --body` fails with exit code 1 due to a Projects (classic) deprecation warning, even when the body update would otherwise succeed. Use the REST API instead:
-
-```bash
-gh api repos/OWNER/REPO/pulls/PR_NUMBER --method PATCH --field body="..." --jq .number
-```
+- Writing a PR description — or a commit description, which `gh pr create --fill` copies into the body verbatim — is the `pr-description` skill's job (`.claude/skills/pr-description/SKILL.md`): summary first, then a review guide, sub-linear length, the Markdown mechanics, and the `gh api` workaround for editing a posted body. Load it rather than working from memory.
 
 ### Stack Management & Rebasing (jj vs git-spice)
 
