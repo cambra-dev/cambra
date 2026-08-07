@@ -51,6 +51,13 @@ jobs:
       - name: Doc references
         run: ./ci.sh doc_refs
 
+      # TODO: add a `Mermaid diagrams` step here, running `./ci.sh mermaid` (the
+      # rules and the tooling options are in the TODO above `ci_doc_refs` in
+      # `ci.sh`). It belongs in this same before-the-paths-filter position and for
+      # the same reason: the docs carrying diagrams are docs-only changes, which
+      # the filter below marks `code: false` and skips. Note that the syntax half
+      # wants Node, which no step here currently sets up.
+
       # 1. Detect if changes are only in ignored paths
       # Skip CI for changes that don't affect code
       - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
