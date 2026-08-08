@@ -219,7 +219,7 @@ where
         }
         // `target` is a type; its refinement predicate is reached by the
         // caller's type walk, not here (see the module docs).
-        N::Cast { value, .. } => open(f, value),
+        N::Cast { value, .. } | N::Realize(value) => open(f, value),
         N::BinOp { left, right, .. } => {
             open(f, left);
             open(f, right);
@@ -462,6 +462,7 @@ where
         | N::Error
         | N::Apply { .. }
         | N::Cast { .. }
+        | N::Realize(_)
         | N::BinOp { .. }
         | N::UnaryOp(..)
         | N::Aggregate { .. }
@@ -511,6 +512,7 @@ mod tests {
             var("x"),
             node(N::Builtin(Builtin::Id)),
             TypedExpr::apply(var("f"), var("a")),
+            node(N::Realize(Box::new(var("v")))),
             node(N::Cast {
                 value: Box::new(var("v")),
                 target: Type::Hole,
@@ -626,6 +628,7 @@ mod tests {
         N::Builtin(_) => "Builtin",
         N::Apply { .. } => "Apply",
         N::Cast { .. } => "Cast",
+        N::Realize(_) => "Realize",
         N::BinOp { .. } => "BinOp",
         N::UnaryOp(..) => "UnaryOp",
         N::Lambda { .. } => "Lambda",

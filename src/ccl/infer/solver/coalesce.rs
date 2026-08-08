@@ -38,6 +38,19 @@ pub enum CoalesceError {
         /// Pretty representation of the conflicting bounds.
         details: String,
     },
+    /// A variable carried a **kinding** constraint (`α :: 𝐾`) that its resolved type
+    /// does not satisfy: a computed collection annotated `List(𝑉)` whose domain turned
+    /// out to be a data source, say, so it cannot supply the length witness a `List`
+    /// ranges over.
+    ///
+    /// Raised here rather than at constraint emission because membership is a predicate
+    /// on a *shape*, and the shape is what a variable does not have until it resolves.
+    KindMismatch {
+        /// What the position resolved to.
+        resolved: Box<Type>,
+        /// The kind it was required to inhabit.
+        kind: crate::ccl::ty::TypeKind,
+    },
     /// A record-shaped variable still had open width at coalesce time —
     /// no closing equality constraint pinned its full set of fields.
     /// Mirrors today's `UnresolvedPartial` error so existing callers see
@@ -56,12 +69,11 @@ pub enum CoalesceError {
         /// Pretty representation of the cycle entry point.
         details: String,
     },
-    /// A data-function join whose domain alternatives survive materialization as
-    /// distinct domains, so no single domain holds every arm's rows. Raised either
-    /// by a `Data ⊔ Data` join (the common case) or by a multi-alternative slot
-    /// meeting a compute function, where collapsing to the ordinary meet would drop
-    /// domains. Reported loudly rather than silently losing rows. See
-    /// `src/ccl/design/type-inference.md`, "The domain join is a Σ".
+    /// A data function carrying >= 2 candidate domains (a conditional collection) met a compute
+    /// function at a positive join, so collapsing to the ordinary meet would
+    /// drop domains. Reported loudly rather than silently losing data (no
+    /// current program produces this shape). See `design/type-inference.md`,
+    /// "4.6 Data vs compute functions and conditional-collection domain joins".
     DomainJoinConflict {
         /// Pretty representation of the conflicting function shapes.
         details: String,
@@ -73,7 +85,8 @@ pub enum CoalesceError {
     /// [`super::constrain::ConstrainError::ComputeWhereDataRequired`] for the
     /// case where the violation only becomes provable once the kind variable's
     /// bounds and domain are resolved (e.g. summing a plain `Int ⇒ Int`
-    /// lambda). See `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions".
+    /// lambda). See `design/type-inference.md`, "4.6 Data vs compute functions
+    /// and conditional-collection domain joins".
     ComputeWhereDataRequired {
         /// Pretty representation of the offending capability.
         details: String,
@@ -94,6 +107,81 @@ pub enum PartialKind {
 // Coalesce: CompactGraph → ccl::Type
 // ---------------------------------------------------------------------------
 
+/// Drop the witness range index between programs — a growth bound, not a correctness
+/// requirement: [`crate::ccl::infer_var::WitnessBinderId`]s are globally unique.
+pub fn clear_witness_ctx() {
+    crate::ccl::ty::witness_ctx::clear();
+}
+
+/// Bind `ty` over every witness left free in it, once the consumer's result is finally
+/// known.
+///
+/// The **general** case. Compaction binds a consumer whose domain *is* one free witness as
+/// it re-pairs it into the `sigma` slot (`compact_go`), which is what makes a sum reached
+/// two ways meet in one carrier slot. What it cannot see is a domain that merely
+/// *mentions* witnesses — the index of a two-generator comprehension is the pair
+/// `(𝜎₁, 𝜎₂)`, no single one of which names the position — so those arrive here still
+/// free. Both bind by the witness's own binder; that is the invariant, not the number of
+/// places it is applied.
+///
+/// **A bare witness is left free.** A position that *is* the witness is an index into the
+/// collection, not the collection: binding it would fabricate `Σ 𝐷 ∈ 𝐾. 𝐷`, a type
+/// standing in for what is a variable, which this design rejects
+/// (`src/ccl/design/type-inference.md`, "Why a name, and not a type"). It stays a
+/// reference to the binder its enclosing collection introduces, exactly as a Pi binder's
+/// occurrences refer to the lambda that bound them.
+fn bind_free_witnesses(ty: Type) -> Type {
+    // **A type that *is* one witness stays open**, and this is the sum-in-a-domain rule rather
+    // than an exception to it. That position is an *index* into a collection, not a
+    // collection, so closing it would stand `Σ 𝐷 ∈ 𝐾. 𝐷` where a data function's domain
+    // belongs — the single position [`crate::ccl::ty::has_sum_in_domain_position`] rejects, and
+    // rejects positionally: the shape itself is legitimate elsewhere, being exactly what
+    // `box` introduces. Downstream reads a domain as a concrete index set, and "one of 𝐾"
+    // describes no index. The binder is bound by the enclosing collection, which is where a
+    // reference to it belongs, exactly as a Pi binder's occurrences refer to the lambda
+    // that bound them.
+    if matches!(ty, Type::WitnessRef(_)) {
+        return ty;
+    }
+    let mut free = Vec::new();
+    collect_free_witnesses(&ty, &mut Vec::new(), &mut free);
+    // Innermost-first by binder id, so the nesting is deterministic rather than
+    // dependent on where in the type each occurrence happened to be found.
+    free.sort_unstable();
+    free.dedup();
+    free.into_iter().rev().fold(ty, |body, binder| {
+        // The witness sits in **domain** position in the body being closed — it is the
+        // consumer's domain — so the sum this rebuilds is the factored one, and the
+        // factored view of the binder's arms is its kind.
+        let Some(kind) = crate::ccl::ty::witness_ctx::range(binder) else {
+            return body;
+        };
+        Type::Sigma(Box::new(crate::ccl::ty::SigmaType::bound(
+            crate::ccl::ty::Witness::bound_to(binder, kind),
+            body,
+        )))
+    })
+}
+
+fn collect_free_witnesses(
+    ty: &Type,
+    scope: &mut Vec<crate::ccl::infer_var::WitnessBinderId>,
+    out: &mut Vec<crate::ccl::infer_var::WitnessBinderId>,
+) {
+    match ty {
+        Type::WitnessRef(w) if !scope.contains(w) => out.push(*w),
+        Type::Sigma(s) => {
+            for t in s.witness.types() {
+                collect_free_witnesses(t, scope, out);
+            }
+            scope.push(s.binder());
+            collect_free_witnesses(&s.body, scope, out);
+            scope.pop();
+        }
+        _ => ty.walk_children(|c| collect_free_witnesses(c, scope, out)),
+    }
+}
+
 /// Materialize a CompactType into `ccl::Type`.
 ///
 /// Multiple atom contributions at the same position is an error
@@ -113,7 +201,12 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
             details: format!("{} recursive variable(s) in graph", graph.rec_vars.len()),
         });
     }
-    coalesce_compact_go(&graph.term, true)
+    let out = bind_free_witnesses(coalesce_compact_go(&graph.term, true)?);
+    debug_assert!(
+        !crate::ccl::ty::has_sum_in_domain_position(&out),
+        "a sum reached a domain position, where the design opens instead of packing: {out}"
+    );
+    Ok(out)
 }
 
 fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
@@ -131,6 +224,28 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     // type. With multiple distinct contributions, we would need
     // a Union/Intersection — we error instead.
     let mut atoms: Vec<Type> = ct.atoms.iter().map(|a| a.to_type()).collect();
+    // **A lone witness materializes as a reference, not as a sum.** The position is a
+    // consumed collection's domain and nothing else claimed it, so the answer is "whichever
+    // domain the witness picked" — and that is said by *naming* the witness, exactly as the
+    // open said it. Closing it into `Σ 𝐷 ∈ 𝐾. 𝐷` here would put a sum standing where a domain belongs where a
+    // domain belongs, which is the one position [`crate::ccl::ty::has_sum_in_domain_position`]
+    // forbids; the binder is bound by the enclosing collection instead.
+    //
+    // A witness alongside a *function* does not reach here — that is the ordinary close,
+    // which re-pairs `𝑤 ⤇ 𝑉` into the sum during compaction.
+    if let Some((w, _kind)) = &ct.witness
+        && ct.fun.is_none()
+    {
+        // The close needs the binder's range, and the index already has it: every witness
+        // in the carrier got there by being named at an elimination, and naming it is what
+        // records the range.
+        debug_assert!(
+            crate::ccl::ty::witness_ctx::range(*w).is_some(),
+            "a materialized witness must have a recorded range — it can only have reached \
+             the carrier by being named at an elimination, which records one"
+        );
+        atoms.push(Type::WitnessRef(*w));
+    }
     let mut shapes: Vec<Type> = Vec::new();
 
     if let Some(rec) = &ct.rec {
@@ -139,93 +254,141 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     if let Some(var) = &ct.var {
         shapes.push(materialize_variant(var, polarity)?);
     }
+    if let Some(sg) = &ct.sigma {
+        use super::compact::CompactWitnessKind;
+        // The witness kind and the body are independent positions, so each materializes
+        // on its own — there is no domain/codomain split to re-pair, because the witness
+        // is *in* the body (as an atom) wherever it occurs.
+        let kind = match &sg.kind {
+            CompactWitnessKind::Enumerated(cands) => {
+                let mut out: Vec<Type> = Vec::new();
+                for c in cands {
+                    let t = coalesce_compact_go(c, polarity)?;
+                    if !out.contains(&t) {
+                        out.push(t);
+                    }
+                }
+                crate::ccl::ty::TypeKind::Enumerated(out)
+            }
+            CompactWitnessKind::Described(k) => k.clone(),
+        };
+        // **The close names the witness.** The compact carrier is anonymous, so the body
+        // comes back with its occurrences unbound; this sum's fresh binder is what they
+        // point at from here on.
+        // The carrier kept this sum's binder, so materializing re-binds the anonymous
+        // compact occurrences to the *same* one: a type that merely passed through comes
+        // back equal to itself, not an α-variant.
+        let binder = sg.binder();
+        let body = crate::ccl::ty::bind_unbound_witnesses(
+            &coalesce_compact_go(&sg.body, polarity)?,
+            binder,
+        );
+        shapes.push(Type::Sigma(Box::new(crate::ccl::ty::SigmaType::bound(
+            crate::ccl::ty::Witness::bound_to(binder, kind),
+            body,
+        ))));
+    }
     if let Some(cf) = &ct.fun {
         use super::compact::KindMerge;
-        // Materialize the codomain once (covariant) and each domain alternative
-        // (contravariant), deduplicating at the `Type` level. This is where the
-        // "same domain or not?" question is actually decided: the compact-time
-        // `CompactType ==` dedup in `union_domains` cannot settle it, because a
-        // compact domain still carries variable identity that `simplify_type` may
-        // merge afterwards, so two identical domains can arrive as two alternatives.
+        // Materialize the codomain once (covariant), and each listed candidate
+        // domain (contravariant), deduplicating at the `Type` level — this catches
+        // var-level equalities that the compact-time `CompactType ==` dedup in
+        // `join_witness_kinds` missed (simplify may have merged uids after compaction).
         let c = coalesce_compact_go(&cf.codomain, polarity)?;
-        let mut doms: Vec<Type> = Vec::new();
-        for d in &cf.domains {
-            let dt = coalesce_compact_go(d, !polarity)?;
-            if !doms.contains(&dt) {
-                doms.push(dt);
-            }
-        }
-        // Strip the Pi binder unless the codomain's refinement predicates
-        // actually reference it (design §3.2 / O10): keeps ordinary functions
-        // `name: None` while a genuinely dependent codomain keeps its binder.
+        // The domain, materialized contravariantly. At a `Data` position the atoms are
+        // *alternatives* — one candidate each (see `denoted_domains`) — and a
+        // `DomainConflict` reads them the same way, since naming both is the whole content
+        // of its diagnostic. Everywhere else they are a collision, which
+        // `coalesce_compact_go` reports. Deduplicated at the
+        // `Type` level, which catches var-level equalities the compact-time `==` missed.
+        let candidates: Vec<Type> =
+            if matches!(cf.kind, KindMerge::Data | KindMerge::DomainConflict)
+                && let Some(ds) = super::compact::denoted_domains(&cf.domain)
+            {
+                let mut out: Vec<Type> = Vec::new();
+                for d in ds {
+                    if !out.contains(&d) {
+                        out.push(d);
+                    }
+                }
+                out
+            } else {
+                vec![coalesce_compact_go(&cf.domain, !polarity)?]
+            };
         let kept_name = cf
             .name
             .clone()
             .filter(|b| crate::ccl::subst::type_free_vars(&c).contains(b));
+        let kind = crate::ccl::ty::TypeKind::Enumerated(candidates);
         match cf.kind {
+            // Each conflict reports the fact it *is*. Deciding between them by asking
+            // whether the merged kind names more than one domain reads the shape of the
+            // answer rather than the reason for it, and mis-reported a domain conflict as
+            // a kind collision whenever the candidates deduplicated to one.
             KindMerge::Conflict => {
-                let doms_s = doms
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ⊔ ");
-                // A single surviving domain means one function slot whose kind
-                // resolved contradictorily: it was demanded as a data domain
-                // (`forced_data`) while being (or being fed as) a compute
-                // capability — the coalesce-time face of `Compute <: Data`.
-                // Two or more surviving domains mean a data function's domains
-                // would be dropped by collapsing to a compute meet (a genuine
-                // domain-join collision). See `src/ccl/design/type-inference.md`,
-                // "The domain join is a Σ".
-                if doms.len() <= 1 {
-                    return Err(CoalesceError::ComputeWhereDataRequired {
-                        details: format!("a compute function (capability) over {{{doms_s}}}"),
-                    });
-                }
+                debug_assert!(
+                    kind.listed().is_none_or(|ds| !ds.is_empty()),
+                    "a listing kind reaching materialization has at least one domain"
+                );
+                return Err(CoalesceError::ComputeWhereDataRequired {
+                    details: format!("a compute function (capability) over {kind}"),
+                });
+            }
+            KindMerge::DomainConflict => {
+                debug_assert!(
+                    kind.listed().is_none_or(|ds| !ds.is_empty()),
+                    "a listing kind reaching materialization has at least one domain"
+                );
                 return Err(CoalesceError::DomainJoinConflict {
-                    details: format!("a data function over {{{doms_s}}}"),
+                    details: format!("a collection over {kind}"),
                 });
             }
             KindMerge::Compute => {
-                debug_assert_eq!(doms.len(), 1, "compute fun accumulated domain alternatives");
+                // A compute function's domain is an ordinary parameter type. A
+                // *described* domain arises only from a sum's body, which is always
+                // `Data`, and `meet_witness_kinds` has no meet for one, so a compute slot never
+                // carries a sum's domain.
+                let Some([sole]) = kind.listed() else {
+                    unreachable!("a compute function slot carries a described domain kind")
+                };
                 shapes.push(Type::Fun {
                     name: kept_name,
                     kind: crate::ccl::ty::FunKind::Compute,
-                    domain: Box::new(doms.into_iter().next().expect("compute fun has one domain")),
+                    domain: Box::new(sole.clone()),
                     codomain: Box::new(c),
                 });
             }
             KindMerge::Data => {
-                // One surviving alternative: they reconciled, so the join loses
-                // nothing and this is a plain data function. `xs if c else xs` types
-                // as `xs`, and so does any join whose arms turn out to share an
-                // domain once their domains are materialized.
-                let [dom] = <[Type; 1]>::try_from(doms).map_err(|doms: Vec<Type>| {
-                    // Two or more: the arms hold different domains, and a
-                    // collection's domain *is* its data, so no single domain holds
-                    // both arms' rows. The contravariant meet the compute lattice
-                    // would take here drops whichever rows the narrower domain
-                    // lacks; refusing is what the `Data` kind buys. The lossless
-                    // answer — a dependent sum over the candidate domains — is the
-                    // collections work.
-                    let doms_s = doms
-                        .iter()
-                        .map(|t| t.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    CoalesceError::DomainJoinConflict {
-                        details: format!(
-                            "collections over the distinct domains {{{doms_s}}} join at none \
-                             of them without losing rows"
-                        ),
-                    }
-                })?;
-                shapes.push(Type::Fun {
-                    name: kept_name,
-                    kind: crate::ccl::ty::FunKind::Data,
-                    domain: Box::new(dom),
-                    codomain: Box::new(c),
-                });
+                // Materialization invariant: a **sum's** listed domains are ground. The Σ
+                // subtyping rules match them by value, and `compact_go`/`extrude` treat
+                // them contravariantly (at `!pol`); those agree only while a domain
+                // carries no inference variable, so an `Infer`-bearing candidate would
+                // record a bound at the wrong polarity. A plain data function's domain is
+                // under no such constraint — nothing matches it against a sibling — which
+                // is why this is gated on the same `needs_witness` test that decides which of
+                // the two `into_data_fun` builds.
+                debug_assert!(
+                    !kind.needs_witness()
+                        || !kind.listed().is_some_and(|ds| ds
+                            .iter()
+                            .any(crate::ccl::subst::type_contains_infer)),
+                    "sum materialized with an inference variable in a listed candidate domain"
+                );
+                // **A data function's domain is one domain.** A consumed sum *names* its
+                // witness rather than putting a sum where a domain belongs, and a join
+                // forms no sum at all — that is `box`'s job — so nothing puts several
+                // candidates here. This is the property that lets [`CompactFun::domain`]
+                // be one ordinary position rather than a candidate set, so it is asserted
+                // rather than assumed.
+                debug_assert!(
+                    !kind.needs_witness(),
+                    "a data function's domain kind lists several candidates: {kind}"
+                );
+                let __t = kind.into_data_fun(kept_name, c);
+                if let Type::Sigma(sg) = &__t {
+                    eprintln!("BUILD factored binder={:?}", sg.binder());
+                }
+                shapes.push(__t);
             }
         }
     }
@@ -239,7 +402,6 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             kind: *kind,
         });
     }
-
     let mut all = Vec::new();
     all.append(&mut atoms);
     all.append(&mut shapes);
@@ -262,7 +424,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             // needs strict scalar consumers (binops, …) to impose concrete
             // bounds so the union is rejected at *their* site; that is deferred
             // past the conditional-collection foundation. Collection arms still join losslessly — that happens in
-            // the `fun` slot above (`union_domains`), not through atoms.
+            // the `fun` slot above (`join_witness_kinds`), not through atoms.
             let pretty = all
                 .iter()
                 .map(|t| format!("{t}"))
@@ -285,6 +447,24 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         .refinements
         .iter()
         .fold(inner, |acc, r| Type::Refinement(Box::new(acc), r.clone()));
+    // Discharge the kinding constraints this position gathered. A variable's kinding
+    // constraint is the one thing about it that cannot be recorded as a bound, so it
+    // rode compaction in its own slot and is answered here, where the position has
+    // finally become a type — the same moment its bounds become one.
+    //
+    // Asked as a containment rather than a membership call, because that is the relation
+    // the Σ-width rule runs and the two must not diverge: the singleton listing is the
+    // **minimal kind containing** `out`, so `minimal(out) <: 𝐾` is exactly `out :: 𝐾`.
+    // Nothing may remain outstanding — post-coalesce there is no graph left to emit into,
+    // which is what `contains_ground` states.
+    for k in &ct.kinds {
+        if !crate::ccl::ty::TypeKind::Enumerated(vec![out.clone()]).contains_ground(k) {
+            return Err(CoalesceError::KindMismatch {
+                resolved: Box::new(out),
+                kind: k.clone(),
+            });
+        }
+    }
     Ok(out)
 }
 
@@ -320,7 +500,7 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
                 name: None,
                 // A feed's read view is a collection stream: a data function.
                 kind: super::compact::KindMerge::Data,
-                domains: vec![*domain],
+                domain,
                 codomain: value,
             }),
             ..Default::default()
@@ -443,6 +623,27 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_described_kind_sigma_round_trips() {
+        // A `List` Σ compacts into the `fun` slot with a *described* domain — the
+        // kind rides through verbatim, only the codomain compacts — so
+        // compact → coalesce re-forms the identical type. Contrast the
+        // conditional-collection Σ, whose candidates join the lattice.
+        let list_ty = Type::list_of(Type::Base(BaseType::Int));
+        let t = coalesce_compact(&compact_type(&list_ty)).unwrap();
+        assert_eq!(t, list_ty);
+    }
+
+    #[test]
+    fn coalesce_collection_sigma_round_trips() {
+        // A `Collection` (`TypeKind::Any`) Σ rides the same `Described` domain as the
+        // `List` Σ above — the kind inert, only the codomain compacted — so the ⊤ of
+        // the kind order needs no carrier of its own to survive the round trip.
+        let coll = Type::collection_of(Type::Base(BaseType::Int));
+        let t = coalesce_compact(&compact_type(&coll)).unwrap();
+        assert_eq!(t, coll);
+    }
+
+    #[test]
     fn coalesce_function_preserves_shape() {
         let s = fun(prim(BaseType::Int), prim(BaseType::Bool));
         let t = coalesce_compact(&compact_type(&s)).unwrap();
@@ -458,33 +659,6 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_two_data_domains_is_a_join_conflict() {
-        use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
-        // A `Data` fun slot whose two alternatives survive materialization as
-        // distinct domains has no lossless single domain, so it is rejected here
-        // rather than narrowed to a meet.
-        let graph = CompactGraph {
-            term: CompactType {
-                fun: Some(CompactFun {
-                    name: None,
-                    kind: KindMerge::Data,
-                    domains: vec![
-                        compact_type(&Type::UIntRange(2)).term,
-                        compact_type(&Type::UIntRange(3)).term,
-                    ],
-                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
-                }),
-                ..Default::default()
-            },
-            rec_vars: BTreeMap::new(),
-        };
-        assert!(matches!(
-            coalesce_compact(&graph),
-            Err(CoalesceError::DomainJoinConflict { .. })
-        ));
-    }
-
-    #[test]
     fn coalesce_single_data_domain_is_plain_data_fun() {
         use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
         // One surviving domain collapses to a plain `Data` fun (idempotence:
@@ -494,38 +668,7 @@ mod tests {
                 fun: Some(CompactFun {
                     name: None,
                     kind: KindMerge::Data,
-                    domains: vec![compact_type(&Type::UIntRange(2)).term],
-                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
-                }),
-                ..Default::default()
-            },
-            rec_vars: BTreeMap::new(),
-        };
-        assert_eq!(
-            coalesce_compact(&graph).unwrap(),
-            Type::Fun {
-                name: None,
-                kind: crate::ccl::ty::FunKind::Data,
-                domain: Box::new(Type::UIntRange(2)),
-                codomain: Box::new(Type::Base(BaseType::Int)),
-            }
-        );
-    }
-
-    #[test]
-    fn coalesce_duplicate_data_domains_dedup_to_plain_fun() {
-        use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
-        // Two structurally-equal domains dedup to one → a plain `Data` fun, not
-        // a spurious 2-choice conditional collection.
-        let graph = CompactGraph {
-            term: CompactType {
-                fun: Some(CompactFun {
-                    name: None,
-                    kind: KindMerge::Data,
-                    domains: vec![
-                        compact_type(&Type::UIntRange(2)).term,
-                        compact_type(&Type::UIntRange(2)).term,
-                    ],
+                    domain: Box::new(compact_type(&Type::UIntRange(2)).term),
                     codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
@@ -546,17 +689,23 @@ mod tests {
     #[test]
     fn coalesce_domain_join_conflict_errs() {
         use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
-        // A `Conflict` kind (a multi-domain data function met a compute function) is
-        // a loud coalesce error, never a silent domain drop.
+        // Two domains with no common answer is a loud coalesce error, never a silent
+        // domain drop — and it reports as a *domain* conflict, which is the fact it is.
+        // The kind collision (`KindMerge::Conflict`, a collection demanded of a compute
+        // capability) is a different fact, so it carries its own variant rather than
+        // being told apart from this one by the shape of the merged kind.
         let graph = CompactGraph {
             term: CompactType {
                 fun: Some(CompactFun {
                     name: None,
-                    kind: KindMerge::Conflict,
-                    domains: vec![
+                    kind: KindMerge::DomainConflict,
+                    // Two domains at one position: a `fun` slot holds one domain, so a
+                    // second one arriving there is the conflict.
+                    domain: Box::new(CompactType::merge(
+                        true,
                         compact_type(&Type::UIntRange(2)).term,
                         compact_type(&Type::UIntRange(3)).term,
-                    ],
+                    )),
                     codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
@@ -581,7 +730,7 @@ mod tests {
                 fun: Some(CompactFun {
                     name: None,
                     kind: KindMerge::Conflict,
-                    domains: vec![compact_type(&prim(BaseType::Int)).term],
+                    domain: Box::new(compact_type(&prim(BaseType::Int)).term),
                     codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
                 }),
                 ..Default::default()

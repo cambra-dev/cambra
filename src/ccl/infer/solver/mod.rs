@@ -50,7 +50,7 @@ pub mod spec_key;
 // Re-export every symbol that external modules reach through the
 // `crate::ccl::infer::solver::…` path (chiefly the inference engine), so the
 // directory split is path-transparent.
-pub use coalesce::{CoalesceError, coalesce_compact};
+pub use coalesce::{CoalesceError, clear_witness_ctx, coalesce_compact};
 pub use compact::{CompactGraph, CompactType, compact_type};
 pub use constrain::{ConstrainCache, ConstrainError, ExtrudeCache, constrain_subtype, extrude};
 pub use scheme::{
@@ -91,6 +91,18 @@ pub fn type_level(ty: &Type) -> Level {
         // instantiation), which reads it directly and is exempted from the
         // `type_level` short-circuit.
         Type::ChanDom(..) => 0,
+        // The witness's type children and the body carry the sum's inference
+        // vars; a witness reference is a leaf (level 0) — naming its binder gives it no
+        // solver content.
+        Type::Sigma(s) => s
+            .witness
+            .types()
+            .iter()
+            .map(type_level)
+            .max()
+            .unwrap_or(0)
+            .max(type_level(&s.body)),
+        Type::WitnessRef(_) => 0,
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => 0,
     }
 }

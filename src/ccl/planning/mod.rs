@@ -34,6 +34,7 @@ use crate::ccl::{
     symbolic::{symbolic, symbolic_typed},
 };
 
+mod conditionals;
 mod groupby;
 mod iterate;
 mod join;
@@ -93,6 +94,10 @@ pub fn run(mut expr: Expr) -> Expr {
     // The group-by recognizer runs first and matches the bare predicate
     // directly; the generic filter / hash-join paths compile the predicate
     // lazily at each iteration site (see `wrap_with_iterate`).
+    // Realize conditional collections first: the gated union it produces is an ordinary
+    // collection, so every later phase — recognizers, iteration-site materialisation,
+    // predicate compilation — sees one shape rather than needing a `Case` case.
+    conditionals::realize_conditional_collections(&mut expr);
     groupby::recognize_groupby_sites(&mut expr);
     let mut expr = simplify(expr);
     insert_iterate_markers(&mut expr);

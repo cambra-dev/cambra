@@ -44,7 +44,7 @@ use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
     apply_primitive, cast_target_refinement, flatten_trailing_value_case, is_free,
-    is_free_in_value, refine_with, strip_refinements, synthesize_arm_predicate, typed_compose,
+    is_free_in_value, peel_refinements, refine_with, synthesize_arm_predicate, typed_compose,
 };
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
@@ -241,6 +241,11 @@ pub(crate) fn fun_ty_or_hole(domain: &Type, codomain: &Type) -> Type {
 ///
 /// Returns [`Type::Hole`] if either argument does not have a concrete function
 /// type; inference will fill in the gaps in that case.
+///
+/// The arrow is rebuilt from `f` ([`Type::fun_like`]) rather than constructed: the
+/// domain is `f`'s, so the kind is `f`'s too. Zipping two collections over one domain
+/// is itself a collection, and stamping the rebuild `Compute` would make it a
+/// capability — the same silent kind loss a compose-chain rebuild has.
 pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr) -> Type {
     match (&f.ty, &g.ty) {
         (
@@ -254,7 +259,7 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr) -> Type {
                 codomain: c,
                 ..
             },
-        ) => Type::fun(*a.clone(), Type::Tuple(vec![*b.clone(), *c.clone()])),
+        ) => Type::fun_like(&f.ty, *a.clone(), Type::Tuple(vec![*b.clone(), *c.clone()])),
         _ => Type::Hole,
     }
 }
@@ -306,11 +311,11 @@ fn extract_filter_case(body: Expr) -> (Expr, Expr) {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if `ty` (peeling outer refinements) is a *collection* — a
-/// data or compute function. A value-selecting `Case` whose arms are collections
-/// takes the data-typed gate fan-out; a `Case` returning a scalar / compute value
-/// takes the C-form below.
+/// data/compute function or a conditional-collection Σ. A value-selecting `Case`
+/// whose arms are collections takes the data-typed gate fan-out; a `Case`
+/// returning a scalar / compute value takes the C-form below.
 fn is_collection_result(ty: &Type) -> bool {
-    matches!(strip_refinements(ty), Type::Fun { .. })
+    matches!(peel_refinements(ty), Type::Fun { .. } | Type::Sigma(_))
 }
 
 /// Compile a guard-based **value-selecting** `Case` (a ternary or `if`/`elif`/
@@ -410,96 +415,6 @@ fn build_value_case_cform(
     let tuple_ty = Type::Tuple(vec![union_ty, result_ty.clone()]);
     let arg = Expr::tuple(vec![union, default_body]).with_ty(tuple_ty);
     Ok(apply_primitive(arg, Builtin::FinalOrDefault, result_ty))
-}
-
-/// The element (codomain) type a collection-valued `Case` produces — the codomain
-/// of the arms' joined data function. The arms share one domain (a join at distinct
-/// domains is rejected at inference), so they share one codomain. Peels outer
-/// refinements first.
-fn collection_value_ty(ty: &Type) -> Type {
-    match strip_refinements(ty) {
-        Type::Fun { codomain, .. } => *codomain,
-        other => other,
-    }
-}
-
-/// Compile a guard-based **value-selecting** `Case` whose arms are *collections*
-/// (data-typed) to the **gate fan-out**: each arm's whole collection,
-/// restricted by its constant first-match gate, unioned.
-///
-/// ```text
-/// Case{scrutinee: None, [g₀ → xs₀; …; gₙ → xsₙ]}   ⟹   ⧺ᵢ (xsᵢ | π̂ᵢ)
-/// ```
-///
-/// where `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ` ([`synthesize_arm_predicate`]). Each gate is
-/// **constant in the element** (see the C-form above), so an arm's collection
-/// survives whole (gate holds) or is emptied (gate fails); the partition is
-/// exhaustive, so exactly one arm is non-empty and the union is that arm's
-/// collection. The union's type is the tagged `Variant`-domain data function —
-/// the same shape `emit_collection_union` gives a `++`, which the strict wall
-/// reconciles against the arms' joined data function by `is_index_partition_of`
-/// (`src/ccl/design/type-inference.md`, "The domain join is a Σ"). The arms all share
-/// one domain — a join at distinct domains is rejected at inference — so every leg's
-/// payload is that one domain under its own gate.
-fn build_value_case_fanout(
-    ctx: &mut ElimContext,
-    branches: Vec<Branch>,
-    result_ty: Type,
-) -> Result<Expr, LambdaElimError> {
-    // Exhaustiveness invariant (as in [`build_value_case_cform`]): a total value
-    // selection has a trailing `true` guard, so exactly one arm survives the
-    // first-match partition and the union is that arm's whole collection. A
-    // non-exhaustive `Case` here would leave the union empty on the uncovered
-    // path (e.g. `sum` = 0) — a silent miscompile, not a rejection.
-    debug_assert!(
-        branches
-            .last()
-            .is_some_and(|b| matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))),
-        "value-selecting Case (fan-out) must be exhaustive (trailing `true` guard)"
-    );
-    let bool_ty = Type::Base(BaseType::Bool);
-    let value_ty = collection_value_ty(&result_ty);
-
-    let mut prior_guards: Vec<Expr> = Vec::new();
-    let mut arms: Vec<Expr> = Vec::new();
-
-    for b in branches {
-        let guard = elim_lambdas(ctx, b.guard)?;
-        let coll = elim_lambdas(ctx, b.body)?;
-        let arm_dom = coll.ty.domain().ok_or_else(|| {
-            LambdaElimError::Unsupported(format!(
-                "value-selecting Case arm is not a plain collection (nested conditional \
-                 collections are not yet supported): {}",
-                coll.ty
-            ))
-        })?;
-        // First-match gate, lifted to a constant-in-element predicate over the
-        // arm's own domain, then attached as a domain refinement (planning
-        // materializes it as the arm's `restrict`).
-        let gate_value = elim_lambdas(ctx, synthesize_arm_predicate(&guard, &prior_guards))?;
-        prior_guards.push(guard);
-        let gate_fn = apply_primitive(
-            gate_value,
-            Builtin::Const,
-            Type::fun(arm_dom.clone(), bool_ty.clone()),
-        );
-        let refined_dom = refine_with(arm_dom, &gate_fn);
-        arms.push(coll.with_ty(Type::data_fun(refined_dom, value_ty.clone())));
-    }
-
-    // A one-branch collection `Case` denotes just that arm's collection — no union
-    // needed, and nothing for the partition rule to reconcile.
-    if arms.len() == 1 {
-        return Ok(arms.pop().unwrap());
-    }
-
-    // The node keeps the `Case`'s own type — the arms' joined data function `D ⤇ V`
-    // — so lambda_elim stays type-preserving. The strict `typecheck` then reconciles
-    // the union's structural `Variant([{D | π̂ᵢ}])` domain against that `D` via
-    // `is_index_partition_of` (`src/ccl/design/type-inference.md`, "The domain join
-    // is a Σ"). Op-conversion compiles the union straight to a `UnionOperator`
-    // from its operands, whose domains are concrete domains.
-    Ok(Expr::collection_union(arms).with_ty(result_ty))
 }
 
 // ---------------------------------------------------------------------------
@@ -992,8 +907,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         user_annotation,
         ..
     } = expr;
-    // Only the debug-build invariant asserts below read `original_ty`.
-    #[cfg(debug_assertions)]
+    // Read by the Σ re-close in the `Lambda` arm (every build) as well as the debug-build
+    // invariant asserts.
     let original_ty = ty.clone();
     let result = match node {
         // Lambda: eliminate then continue. (Domain refinements ride the type
@@ -1004,7 +919,19 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             // string (and its `*body` clone) feeds just the assert below.
             #[cfg(debug_assertions)]
             let original = symbolic(&Expr::lambda(&param.name, param.ty.clone(), *body.clone()));
-            let result = elim_lambda(ctx, &param.name, &param.ty, *body)?;
+            let mut result = elim_lambda(ctx, &param.name, &param.ty, *body)?;
+            // **Bind the sum back over the eliminated morphism.** A Σ-typed lambda *is* a
+            // collection over the witness; eliminating the lambda yields the sum's body — the
+            // point-free construction builds a plain arrow, having nothing at hand that
+            // says the morphism is a collection — and rebuilding against the original type
+            // is what puts the binder back. Without it the morphism keeps a witness domain
+            // with nothing binding it, which the free-witness check reports at the pass
+            // boundary and the assert below reports here.
+            if let (Type::Sigma(_), Some(dom), Some(cod)) =
+                (&original_ty, result.ty.domain(), result.ty.codomain())
+            {
+                result.ty = Type::fun_like(&original_ty, dom, cod);
+            }
             // Compare modulo Pi binder *presence*: the point-free
             // construction keeps a dependent morphism's own binder (same
             // `Name`, uid-preserved) but rebuilds combinator arrows with
@@ -1061,7 +988,14 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let source_codomain = target_elim.ty.codomain().unwrap();
             let refinement = Refinement::born(Rc::new(pred_on_source));
             let refined_domain = Type::Refinement(Box::new(source_domain), refinement);
-            let refined_source = target_elim.with_ty(Type::fun(refined_domain, source_codomain));
+            // `fun_like`, not `fun`: this rebuilds the *source collection*'s type to carry
+            // the filter's refinement, and `Type::fun` would stamp it `Compute` — flipping
+            // a data arrow at a rebuild, which is what `fun_like` exists to prevent.
+            let refined_source = target_elim.clone().with_ty(Type::fun_like(
+                &target_elim.ty,
+                refined_domain,
+                source_codomain,
+            ));
             let body_elim = elim_lambda(ctx, &param.name, &param.ty, true_body)?;
             let result = typed_compose(vec![refined_source, elim_lambdas(ctx, body_elim)?]);
             debug_typecheck(&result);
@@ -1136,12 +1070,29 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         } if branches.iter().all(|b| b.pattern.is_none()) => {
             // Flatten `elif` chains to one partition first, so a nested
             // conditional collection collapses into a single N-choice fan-out.
+            // A **collection**-result `Case` is left standing. Realizing it — gating
+            // each arm by its first-match path condition and unioning — is a
+            // logical-to-executable rewrite, which is `planning`'s job, not lambda
+            // elimination's; and performing it here would type the result as a tagged union
+            // while inference had given it a Σ, leaving this pass no longer
+            // type-preserving and the two forms to be reconciled by a subtyping rule that
+            // does not exist — relating a tagged union to a sum is introduction
+            // (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
+            //
+            // The scalar / compute C-form stays: it produces a *scalar*, so there is no
+            // collection type to disagree about, and nothing downstream would know to
+            // build it.
+            if is_collection_result(&ty) {
+                let mut expr = Expr::new(TypedExprNode::Case {
+                    scrutinee: None,
+                    branches,
+                })
+                .with_ty(ty);
+                expr.try_map_children(|child| elim_lambdas(ctx, child))?;
+                return Ok(dbg_typecheck_mv(expr));
+            }
             let branches = flatten_trailing_value_case(branches);
-            let result = if is_collection_result(&ty) {
-                build_value_case_fanout(ctx, branches, ty)?
-            } else {
-                build_value_case_cform(ctx, branches, ty)?
-            };
+            let result = build_value_case_cform(ctx, branches, ty)?;
             debug_typecheck(&result);
             Ok(result)
         }

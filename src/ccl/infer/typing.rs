@@ -123,10 +123,11 @@ pub(super) trait Typing {
     /// predicate equality.
     fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type;
 
-    /// Reconcile a binder's inferred type with its user annotation. In Emit
-    /// mode this two-way-constrains the two (eagerly surfacing
-    /// [`InferError::AnnotationMismatch`]); the annotation is the canonical
-    /// type, so both directions are recorded.
+    /// Reconcile a **value ascription** (`x: T = e`, `(e : T)`) with its user
+    /// annotation. In Emit mode this is the one-way `inferred <: T` — the value
+    /// flows up and must be usable where `T` is expected; a sound widening
+    /// (inferred type a strict subtype of `T`) is preserved rather than
+    /// rejected. Conflicts surface as [`InferError::AnnotationMismatch`].
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), LocatedInferError>;
 
     /// Obtain the type for a binder slot that lives on a

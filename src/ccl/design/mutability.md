@@ -55,7 +55,11 @@ of the domain, through one of two **causal accessor** builtins:
 Because every cycle in the group crosses a causal accessor, values at any position depend only on
 strictly earlier positions, and the group has a unique (well-founded) solution by induction along
 the domain order. (Only the *overwrite* law forms these cycles: an append feed carries no
-carry-forward, so channels never close a causal cycle — see [merge laws](#the-idea-in-one-line).)
+carry-forward, so channels never close a causal cycle — see [merge laws](#the-idea-in-one-line).
+The one exception is a *recursive keyed collection* — a `Set`/`Map` fed from a loop over itself,
+as in transitive closure — which closes a cycle well-founded by **monotone lattice convergence**
+rather than causal decrease; that is a distinct discipline under the same `LetRec` node, specified
+in [collections.md](collections.md#recursive-keyed-collections-fixpoint).)
 
 ### Sequencing domains
 
@@ -770,10 +774,10 @@ today rather than silently mishandled.
 > **Status: value-selecting `Case`s and conditional induction writes both compile.**
 >
 > **Implemented**: scalar / compute ternaries (the C-form), data-collection selection (the gate
-> fan-out, reconciled to the Σ by Σ-introduction), source-less conditional
+> fan-out, reconciled to the Σ by width), source-less conditional
 > feeds, a **conditional element** in a comprehension (`[a if g(x) else b for x in xs]`, fanned out
 > over the source by the element-dependent gate), a comprehension **over a conditional collection**
-> (`[f(x) for x in (xs if c else ys)]`, the source `Case` floats out of the map), a conditional
+> (`[f(x) for x in (xs if c else ys)]`, consumed by opening the sum like any other), a conditional
 > **between** standalone comprehensions (`([…]) if c else ([…])` — the maps carry `Data` after kind
 > inference, so their arms join into a Σ), a **conditional induction write** (`if 𝑝: total += x`
 > — one commit-gated writer over the changelog, below), and an **`if`/`else` that writes both arms**
@@ -836,26 +840,32 @@ The value-`Case` positions ride the same union-of-restricts:
 - **Data-typed selection** (`zs = xs if c else ys`) — *implemented*
   (`lambda_elim::build_value_case_fanout`): each arm's whole collection restricted by a
   constant-in-element gate, unioned; the union carries the Σ the type system gave the `Case` (see
-  `design/type-inference.md` §4.6), and the strict wall reconciles its structural `Variant`-domain
-  type against the Σ by **Σ-introduction** (the compiled gated partition realizes the whole sum —
-  the finite-Σ = gated-coproduct iso, legs' base domains set-equal to the candidates), or against
+  [type-inference.md §4.6](type-inference.md#46-data-vs-compute-functions-and-conditional-collection-domain-joins)), and the strict wall reconciles its structural `Variant`-domain
+  type against the Σ by **width** (the compiled gated partition realizes the whole sum —
+  the finite-Σ = gated-union iso, legs' base domains set-equal to the candidates), or against
   the same-domain collapse's plain data fun. `elif` chains flatten to one N-choice
-  partition first. A conditional collection is *consumed* (aggregate, program result) via the
-  `Σ <: Fun` subtyping rule, and *through a comprehension* by floating the source `Case` out of the
-  map (see the comprehension bullet below).
+  partition first. A conditional collection is *consumed* — aggregate, program result, or
+  comprehension — by one rule: the consumer names the sum's witness and its result is bound back
+  over that same witness (type-inference.md, "Consuming a sum: naming the witness").
 - **Source-less conditional feeds** (`if c: o << 1 else: o << 2` outside any loop) — *implemented*
   (`channelize`): each feeding arm becomes a gated one-shot lift `λ __unused : {Unit | π̂ᵢ} → 𝑣ᵢ`,
   one channel per arm — replacing `PartialFeedCaseUnsupported` for guard-only `Case`s. A
   scrutinee / pattern feed stays rejected; a no-else partial feed is still blocked earlier at
   lowering (bare `if` as a value expression).
-- **Comprehension over / with a conditional** — *implemented* (`lower::comprehension`). Two shapes,
-  both fanning out the source (a value `Case` has no fixed driver, so it must gate the *iteration
-  source*, not a `Units(1)` one): a conditional **element** (`[a if g(x) else b for x in xs]`) fans
-  the source out by each arm's *element-dependent* gate — `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`, a union of
-  filtered maps (`fan_out_element_case`); a conditional **source** (`[e for x in (xs if c else ys)]`)
-  floats the source `Case` out of the map — `Case{gᵢ → [e for x in srcᵢ]}`, each arm a data-kinded
-  `Compose` so the arms `sigma_join` (`float_comp_source_case`). Both reduce to constructs already
-  compiled (the filter refinement, the gate fan-out); neither duplicates the loop, only the map.
+- **Comprehension over / with a conditional** — *implemented*. A conditional **element**
+  (`[a if g(x) else b for x in xs]`) fans the source out by each arm's *element-dependent* gate —
+  `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`, a union of filtered maps (`fan_out_element_case` in
+  `lower::comprehension`), since a value `Case` has no fixed driver and must gate the iteration
+  source rather than a `Units(1)` one.
+
+  A conditional **source** (`[e for x in (xs if c else ys)]`) needs no lowering rule at all: it is
+  an ordinary consumption, and the comprehension's result is the sum bound back over the witness
+  it named. A syntactic rewrite that floated the source `Case` out of the map used to stand in for
+  this. It fired only on a literal `Case` source — a let-bound or UDF-parameter conditional fell
+  through — and it existed because the general path could not name the witness consistently across
+  the index term and its collection. With a witness carrying its own binder
+  (type-inference.md, "The origin discipline: a binder is inherited, never invented downstream")
+  that path works, and the rewrite is gone.
 - **Bound-then-used values in a loop feed** (`x = 𝑒₁ if 𝑝 else 𝑒₂; o << f(x)`) — *deferred*
   (case-float in the loop-body / feed path, distinct from the comprehension forms above):
   `𝐶[Case{[𝑔ᵢ → 𝑒ᵢ]}] → Case{[𝑔ᵢ → 𝐶[𝑒ᵢ]]}` (sound by purity) then the channel fan-out generalized

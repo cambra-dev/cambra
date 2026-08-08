@@ -203,6 +203,13 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // information and bloats nested-cast dumps quadratically.  Before
         // inference, `expr.ty` is still a `Hole`/`Infer` placeholder and
         // `target` is the only place the type is visible, so render it inline.
+        // `Realize` renders as `realize(value)`: born after inference, so its target is
+        // always `expr.ty` and inlining it would duplicate what callers already suffix.
+        TypedExprNode::Realize(value) => (
+            Precedence::Atom,
+            format!("realize({})", fmt(value, Precedence::Lowest, opts)),
+        ),
+
         TypedExprNode::Cast { value, target } => {
             let rendered_arg = fmt(value, Precedence::Lowest, opts);
             let text = match &expr.ty {
