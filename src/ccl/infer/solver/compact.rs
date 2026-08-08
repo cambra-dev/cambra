@@ -15,9 +15,9 @@ use crate::ccl::{BaseType, HistoryKind, InferVarId, Name, Refinement, Type, fres
 
 use crate::ccl::FieldKey;
 
-// Type-function arguments whose resolution is currently in flight, so a
-// self-referential application answers from its *other* arguments instead of
-// recursing forever.
+// Type-function arguments whose resolution is currently in flight, so an argument
+// that would re-enter the resolution already computing it is reported as
+// unavailable instead of recursing forever.
 //
 // Thread-local rather than threaded through `compact_go`'s state, and that is
 // forced: reducing an argument re-enters the whole compact → simplify → coalesce
@@ -25,40 +25,11 @@ use crate::ccl::FieldKey;
 // resolution that is already computing this argument. The set is keyed on the
 // argument's variable, which is what identifies the in-flight resolution.
 //
-// A scheme's operand requirement is self-referential *by construction*
-// (`α <: CommonBase(α, β)`), so this fires on ordinary programs, not just exotic
-// ones — see `super::reduce`'s module docs.
+// This is a **termination** device, not an optimization: without it, ordinary
+// programs overflow the stack (`x := 7; for i in []: x += 1; x` is enough).
 thread_local! {
     static ARGS_IN_FLIGHT: std::cell::RefCell<BTreeSet<InferVarId>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
-
-    // The **canonical** resolution of each variable — the answer it has when no
-    // other resolution is in flight — valid for as long as the bound graph has not
-    // moved. See [`reconcile_cache`] and [`resolve_argument`].
-    static RESOLVED_ARGS: std::cell::RefCell<HashMap<InferVarId, Option<Type>>> =
-        std::cell::RefCell::new(HashMap::new());
-    static CACHE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
-}
-
-/// Drop the resolution cache if the bound graph has moved since it was filled.
-///
-/// Reduction is demand-driven so that it reads the graph *now* rather than trusting
-/// something deposited earlier — which does not forbid remembering an answer, only
-/// remembering one across a change. The window is therefore "since the last
-/// mutation", not "this walk": `constrain_subtype` and the monomorphization pin are
-/// the only things that write bounds, and every write bumps
-/// [`graph_generation`](crate::ccl::infer_var::graph_generation) because
-/// `InferVar`'s bound lists are private and reachable only through `bounds_mut`.
-///
-/// Scoping it to one compaction instead costs a factor: an inference run compacts
-/// once per node, so the table would be rebuilt from scratch some eighty times over
-/// a program whose whole answer is a few hundred entries.
-fn reconcile_cache() {
-    let now = crate::ccl::infer_var::graph_generation();
-    if CACHE_GENERATION.with(|g| g.get()) != now {
-        RESOLVED_ARGS.with(|m| m.borrow_mut().clear());
-        CACHE_GENERATION.with(|g| g.set(now));
-    }
 }
 
 /// Marks `uid` as in flight for as long as it is held.
@@ -96,32 +67,16 @@ impl Drop for InFlight {
 /// argument, so it pulls whatever the graph knows at the moment the enclosing type
 /// is materialized — no bound is deposited and no walk order can change the answer.
 ///
-/// # The memo caches one answer per variable: its *canonical* one
+/// # Nothing is memoized, deliberately
 ///
-/// Resolution is re-entrant — an argument resolves through the ordinary pipeline,
-/// which reaches other applications, so chains of them nest — and it deposits
-/// nothing, so without a memo the same variable is re-derived along every path that
-/// reaches it.
-///
-/// What makes an answer reusable is subtle enough to state precisely. A resolution
-/// cut off by [`ARGS_IN_FLIGHT`] answers *without* the cut-off argument
-/// ([`super::reduce`]'s law 3), so its result depends on which resolutions were
-/// open — and an entry filed under one open set is wrong for a call made under a
-/// different one.
-///
-/// So the memo stores only the answer that does **not** depend on that: the one a
-/// variable has when nothing else is in flight. Such a call always starts from the
-/// same state and therefore always computes the same result for a given graph,
-/// which makes the variable alone a complete key. A call made *while* something is
-/// in flight neither reads nor writes the memo — it may be cut off differently, so
-/// its answer is nobody else's.
-///
-/// That covers essentially all of the traffic: measured across the whole suite,
-/// 97.6% of hits are canonical (14,290 of 14,637). The alternative — keying on the
-/// argument *and the in-flight resolutions it reaches*, so that cut-off answers are
-/// filed apart too — buys the remaining 2.4% at the cost of discovering reach sets
-/// by resolving, growing them monotonically, and invalidating the table whenever
-/// one grows.
+/// Resolution is re-entrant and deposits nothing, so the same variable is
+/// re-derived along every path that reaches it. A cache keyed on the variable was
+/// tried and removed: it bought 13–22% and cost a generation counter on
+/// [`InferVar`](crate::ccl::InferVar) that every future write to the bound graph
+/// would have had to keep correct. It did not change the *shape* of the cost — an
+/// applied chain of generic wrappers is exponential in depth with the cache or
+/// without it (37s vs 45s at depth 10), so the thing worth attacking is that, not
+/// the constant.
 fn resolve_argument(arg: &Type, subst_acc: &Subst) -> Option<Type> {
     // The argument rides the application through whatever substitutions the edges
     // walked so far composed; force them before resolving, exactly as the
@@ -143,28 +98,14 @@ fn resolve_argument(arg: &Type, subst_acc: &Subst) -> Option<Type> {
         return super::coalesce_compact(&super::simplify_type(compact_type(arg))).ok();
     };
     let uid = v.uid;
-    reconcile_cache();
     // This resolution is already running further up the stack: answering would
     // recurse forever, so report the argument as unavailable and let the rule
     // coarsen.
     if ARGS_IN_FLIGHT.with(|s| s.borrow().contains(&uid)) {
         return None;
     }
-    // Canonical exactly when nothing else is open — see the memo section above.
-    // Read before the mark below, which is what would make it non-canonical.
-    let canonical = ARGS_IN_FLIGHT.with(|s| s.borrow().is_empty());
-    if canonical && let Some(hit) = RESOLVED_ARGS.with(|m| m.borrow().get(&uid).cloned()) {
-        return hit;
-    }
-
     let _in_flight = InFlight::mark(uid);
-    let resolved = super::coalesce_compact(&super::simplify_type(compact_type(arg))).ok();
-    drop(_in_flight);
-
-    if canonical {
-        RESOLVED_ARGS.with(|m| m.borrow_mut().insert(uid, resolved.clone()));
-    }
-    resolved
+    super::coalesce_compact(&super::simplify_type(compact_type(arg))).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -675,27 +616,12 @@ pub struct CompactGraph {
 /// walking, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
 pub fn compact_type(ty: &Type) -> CompactGraph {
-    // The claim [`RESOLVED_ARGS`] rests on: materializing a type *reads* the bound
-    // graph and never writes it, so an answer remembered under one generation is
-    // still that variable's answer until something else writes. Asserted rather than
-    // argued, because a future write on this path would fail no test — it would
-    // quietly serve one node's answer to another. Checked after the walk rather than
-    // in a `Drop`, so an unwinding compaction skips it without a `panicking()` dance.
-    #[cfg(debug_assertions)]
-    let generation_on_entry = crate::ccl::infer_var::graph_generation();
     let mut st = CompactState {
         in_process: HashSet::new(),
         recursive: HashMap::new(),
         rec_vars: BTreeMap::new(),
     };
     let term = compact_go(ty, true, &Subst::id(), &BTreeSet::new(), &mut st);
-    #[cfg(debug_assertions)]
-    debug_assert_eq!(
-        generation_on_entry,
-        crate::ccl::infer_var::graph_generation(),
-        "compaction mutated the bound graph: resolution must be read-only, or the \
-         resolution memo outlives its subject"
-    );
     CompactGraph {
         term,
         rec_vars: st.rec_vars,
