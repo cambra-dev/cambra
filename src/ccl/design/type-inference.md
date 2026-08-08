@@ -1076,7 +1076,7 @@ A rule is a pure function of resolved argument types. Adding a `TypeFn` variant 
 |---|---|---|
 | 1. Pure | a function of `(fun, args)`: no inference context, no bound graph, no fresh variables, no recorded constraints | reduction may run at any point in any walk, so it can be demand-driven rather than scheduled |
 | 2. Monotone | `𝑎ᵢ <: 𝑏ᵢ` for all `𝑖` ⟹ `𝑓(𝑎⃗) <: 𝑓(𝑏⃗)` | an argument only gets more precise as the graph fills in, so a later reduction refines an earlier one rather than contradicting it |
-| 3. Total on a missing argument | a rule answers from the arguments it has rather than erroring — a `None` means *cyclic*, not *conflicting* | a register that reads itself in its own write still gets a type: `x += 1` types as `Add(value(x), 1)` where `value(x)` is what is being computed |
+| 3. Declares a `CycleTolerance` | whether the rule can answer while an argument is cyclic; `reduce` enforces it | a rule that cannot answer reports the cycle instead of guessing, and one that can is never asked to — see [Cycles are recurrences in the program](#cycles-are-recurrences-in-the-program) |
 | 4. Normalizing | the result contains no `App` | one reduction terminates without a fixpoint — the rule set is closed and no rule feeds itself |
 
 **There is deliberately no law about refinements.** Whether a rule may carry an argument's refinement into its result is not a property of reduction — it is a question about what the operator *means*, and [Which operators need one](#which-operators-need-one) is where it is decided: a rule that **selects** one of its arguments must carry it, one that **computes** a new value must not.
@@ -1102,6 +1102,27 @@ Every other scheme in the registry states its requirement **structurally**, insi
 `λ 𝑥 → 𝑥 + 1` does not infer `𝑥 : Int`. Its result resolves — the rule answers from the literal operand — but the parameter is determined by nothing, because nothing determines it: the operands are unrelated variables and only the result is checked.
 
 That is the honest type. The lambda works for any two things `+` accepts, so it is polymorphic in its parameter, and `Type` has no `∀` to say so; as a program value it is therefore an **ambiguous program**, rejected downstream exactly as `λ 𝑥 → [𝑥, 𝑥]` is. Inferring `Int` would read as precision, but it is really the one-numeric-type lattice showing through — and would be wrong the moment `Int + Float → Float` existed.
+
+### Cycles are recurrences in the program
+
+An argument is **cyclic** when resolving it would re-enter the resolution already computing it. That is not an edge case: a register that reads itself in its own write makes one, so `𝑥 += 1` gives
+
+```text
+value(𝑥)  =  join(seed, Add(value(𝑥), 1))
+```
+
+a fixpoint equation, because an accumulator *is* one. Measured, 1,910 cyclic arguments arise across the test suite, and a self-read is exactly what creates them — `x := 7; x` has none, `x := 7; x += 1; x` has ten. All of them reach arithmetic; a comparison can be cyclic too (`b := (b == True)`) but nothing in the suite writes one.
+
+`compact.rs`'s in-flight set cuts the recursion, and each rule declares a **`CycleTolerance`** saying whether that cut-off leaves it able to answer:
+
+| | Meaning | Today |
+|---|---|---|
+| `Any` | answers from what is known; a cycle costs precision, not the answer | `Compare` loses *nothing* (constant on its domain); arithmetic loses the agreement check but keeps a usable type — which is what lets an accumulator have one |
+| `AllKnown` | cannot answer at all without every argument, so the cycle is reported | none yet; `FieldOf(ρ, 𝑘)` is the first, since there is no field type to name without `ρ` |
+
+Deliberately **not per-argument**. Every rule's condition is about *how many* arguments are cyclic rather than which — arithmetic's operands are interchangeable to its rule, and a rule needing one argument needs it whichever position it occupies. A rule wanting "at least 𝑛 known" would generalize this to a count; none does.
+
+**Answering at a cycle is one step of a fixpoint iteration from ⊥**, exact only because the base sublattice is flat: `Add(⊥, Int)` is `Int`, and re-substituting gives `Int` again. A rule over a lattice with infinite ascending chains does not saturate in one step — the range-aware `Arithmetic` in [Known gaps](#known-gaps) walks `x := 0; x += 1` through `[0,0] → [0,1] → [0,2] → …` and needs **widening**. It cannot land on this machinery unchanged.
 
 ### Obligations that are not decidable yet are parked
 

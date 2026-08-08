@@ -541,6 +541,30 @@ pub enum TypeFn {
 }
 
 impl TypeFn {
+    /// Whether this rule can answer while some of its arguments are cyclic.
+    ///
+    /// A cycle is not exotic: a register that reads itself in its own write makes
+    /// one, so `x += 1` types as `Add(value(x), 1)` where `value(x)` is what is
+    /// being computed. Every rule has to have an answer to it, and the two possible
+    /// answers are different in kind — see
+    /// [`CycleTolerance`](crate::ccl::infer::solver::reduce::CycleTolerance).
+    ///
+    /// Both of today's rules are [`Any`](crate::ccl::infer::solver::reduce::CycleTolerance::Any),
+    /// for different reasons worth keeping straight. A comparison is *constant on
+    /// its domain*, so a cyclic operand costs nothing at all — the answer is `Bool`
+    /// either way. Arithmetic answers the shared base of whatever it can see, so a
+    /// cyclic operand costs the agreement **check** while keeping a usable type;
+    /// that is what lets an accumulator have one.
+    ///
+    /// `FieldOf(ρ, 𝑘)` will be the first `AllKnown` rule: there is no answer at all
+    /// without `ρ`, so guessing would invent a field type.
+    pub fn cycle_tolerance(&self) -> crate::ccl::infer::solver::reduce::CycleTolerance {
+        use crate::ccl::infer::solver::reduce::CycleTolerance;
+        match self {
+            TypeFn::Arithmetic(_) | TypeFn::Compare(_) => CycleTolerance::Any,
+        }
+    }
+
     /// The function's spelling, for [`Display`](fmt::Display) and diagnostics.
     pub fn name(&self) -> &'static str {
         match self {

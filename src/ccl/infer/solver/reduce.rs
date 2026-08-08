@@ -43,35 +43,49 @@
 //!    fills in, so a later reduction refines an earlier one rather than
 //!    contradicting it.
 //!
-//! 3. **Total on a missing argument.** A rule answers from the arguments it has
-//!    rather than erroring. A `None` means *cyclic*, not *conflicting*, so a rule
-//!    that errors there turns a cycle into a spurious type error. *Buys:* a
-//!    register that reads itself in its own write still gets a type — `x += 1`
-//!    types as `Add(value(x), 1)` where `value(x)` is what is being computed, and
-//!    thirteen accumulator tests fail the moment a rule refuses to answer.
+//! 3. **Declares a [`CycleTolerance`].** A rule states whether it can answer while
+//!    an argument is [`Arg::Cyclic`], and [`reduce`] enforces it. *Buys:* a rule
+//!    that cannot answer reports the cycle instead of guessing, and one that can is
+//!    never asked to. See "Cycles" below — this is a property of the *program*, not
+//!    an edge case.
 //!
 //! 4. **Normalizing.** The result contains no [`Type::App`]. *Buys:* one `reduce`
 //!    call terminates without a fixpoint, because the rule set is closed and no
 //!    rule feeds itself.
 //!
-//! # Missing arguments
+//! # Cycles
 //!
-//! An argument arrives as `None` when resolving it would re-enter the resolution
-//! *already computing it*. That is not a scheduling artifact — a cycle has no
-//! "later" at which more is known — and it is not rare: a **register that reads
-//! itself in its own write** is one.
+//! An argument arrives [`Cyclic`](Arg::Cyclic) when resolving it would re-enter the
+//! resolution *already computing it*. This is not an edge case and not a scheduling
+//! artifact — it is a **recurrence in the program**.
 //!
-//! `x += 1` makes the register's value type the join over its seed and its writes,
-//! and one write is `x + 1`, whose type is `Add(value(x), 1)`. Resolving `value(x)`
-//! therefore reaches an application whose own argument is `value(x)`.
-//! `compact.rs`'s in-flight set is what cuts that off — without it, `x := 7; for i
-//! in []: x += 1; x` overflows the stack — and law 3 is what makes the cut-off
-//! usable rather than an error, since `Add(⟨cyclic⟩, 1)` must still be `Int` for
-//! any accumulator to type.
+//! A register that reads itself in its own write makes one. `x += 1` gives the
+//! register's value type as the join over its seed and its writes, and one write is
+//! `x + 1`, typed `Add(value(x), 1)` — so `value(x)` satisfies
 //!
-//! The imprecision does not escape: the frame that materializes the node runs the
-//! same rule again with every argument available, which is where operands that
-//! genuinely disagree are caught.
+//! ```text
+//! value(x)  =  join(seed, Add(value(x), 1))
+//! ```
+//!
+//! a fixpoint equation, because an accumulator *is* one. Measured: 1,910 cyclic
+//! arguments across the test suite, and adding a self-read is exactly what creates
+//! them (`x := 7; x` has none, `x := 7; x += 1; x` has ten).
+//!
+//! [`compact.rs`](super::compact)'s in-flight set cuts the recursion — without it a
+//! program that small overflows the stack — and the [`CycleTolerance`] a rule
+//! declares is what decides whether the cut-off is usable or fatal *for that rule*.
+//!
+//! **Answering at a cycle is one step of a fixpoint iteration from ⊥**, and it is
+//! exact only because the base sublattice is flat: `Add(⊥, Int)` is `Int`, and
+//! re-substituting gives `Int` again, so one step saturates. A rule over a lattice
+//! with infinite ascending chains would not saturate — a range-aware `Arithmetic`
+//! on `x := 0; x += 1` walks `[0,0] → [0,1] → [0,2] → …` and needs *widening*, not
+//! one step. That rule cannot land on this machinery unchanged, which is worth
+//! knowing before writing it.
+//!
+//! For a tolerant rule the imprecision does not escape: the frame that materializes
+//! the node runs the same rule again with every argument known, which is where
+//! operands that genuinely disagree are caught.
 //!
 //! Every rule today satisfies law 3, so a missing argument is never itself a
 //! failure. A future function that cannot — `FieldOf(ρ, 𝑘)` has nothing to say
@@ -81,6 +95,59 @@
 
 use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::{Type, TypeFn};
+
+/// One resolved argument, or the fact that resolving it re-entered the resolution
+/// **already computing it**.
+///
+/// Named rather than an `Option` because the distinction a rule has to reason about
+/// is not "absent" but *cyclic*: the argument is not unknown-for-now, it is being
+/// defined in terms of this very application, and there is no later point at which
+/// more is known. See the module docs, "Cycles".
+#[derive(Debug, Clone)]
+pub enum Arg {
+    /// Resolved to a type.
+    Known(Type),
+    /// Resolving this argument would re-enter the resolution computing it.
+    Cyclic,
+}
+
+/// Whether a rule can answer while some of its arguments are [`Arg::Cyclic`].
+///
+/// Deliberately **not** per-position. Every rule's condition is a statement about
+/// *how many* arguments are cyclic, not which — arithmetic's operands are
+/// interchangeable to its rule, and a rule that needs one argument needs it whether
+/// it is written first or second. Today every rule sits at one extreme or the
+/// other; a rule that needed "at least `n` of them" would generalize this to a
+/// count, and nothing yet does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleTolerance {
+    /// Answers from whatever is known. A cyclic argument costs **precision**, never
+    /// the answer — and for a rule constant on its domain, not even that.
+    Any,
+    /// Cannot answer unless every argument is known, so a cyclic one is reported
+    /// rather than guessed.
+    AllKnown,
+}
+
+/// Reject a cyclic argument on behalf of a rule that cannot answer through one.
+///
+/// Checked here, once, rather than by each rule: the obligation belongs to the
+/// rules that *cannot* answer, and those are exactly the rules whose author is most
+/// likely to reach for a plausible guess instead. Declaring the tolerance and
+/// enforcing it centrally is what makes forgetting impossible rather than merely
+/// discouraged.
+fn check_cycle_tolerance(
+    tolerance: CycleTolerance,
+    args: &[Arg],
+    fun: &str,
+) -> Result<(), ReduceError> {
+    if tolerance == CycleTolerance::AllKnown && args.iter().any(|a| matches!(a, Arg::Cyclic)) {
+        return Err(ReduceError::CyclicArgument {
+            fun: fun.to_string(),
+        });
+    }
+    Ok(())
+}
 
 /// Why a reduction could not produce a type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +160,15 @@ pub enum ReduceError {
         /// The conflicting bases, rendered, in argument order.
         bases: Vec<String>,
     },
+    /// An argument of a [`CycleTolerance::AllKnown`] rule was [`Arg::Cyclic`].
+    ///
+    /// The program defined something in terms of itself in a way this rule cannot
+    /// answer through — a projection whose record is its own field type, say. Not a
+    /// conflict between types: a genuine cycle, reported rather than guessed at.
+    CyclicArgument {
+        /// The type function that could not answer, as it is spelled in a type.
+        fun: String,
+    },
 }
 
 /// Run `fun` on `args`, where `None` marks an argument whose resolution is already
@@ -100,8 +176,15 @@ pub enum ReduceError {
 ///
 /// Returns `Err` only for a real conflict, which the caller that materialized the
 /// type reports. A missing argument is not one: every rule today satisfies law 3.
-pub fn reduce(fun: &TypeFn, args: &[Option<Type>]) -> Result<Type, ReduceError> {
-    let available: Vec<&Type> = args.iter().flatten().collect();
+pub fn reduce(fun: &TypeFn, args: &[Arg]) -> Result<Type, ReduceError> {
+    check_cycle_tolerance(fun.cycle_tolerance(), args, fun.name())?;
+    let available: Vec<&Type> = args
+        .iter()
+        .filter_map(|a| match a {
+            Arg::Known(t) => Some(t),
+            Arg::Cyclic => None,
+        })
+        .collect();
     match fun {
         // Arithmetic's result *is* the operands' shared base today, so deciding
         // what is addable and computing the result are one step. The kind is kept
@@ -215,7 +298,7 @@ mod tests {
     #[test]
     fn arithmetic_on_identical_singletons_is_the_base() {
         let one = lit_singleton(&Lit::Int(1));
-        let out = reduce(&add(), &[Some(one.clone()), Some(one)]).expect("reduces");
+        let out = reduce(&add(), &[Arg::Known(one.clone()), Arg::Known(one)]).expect("reduces");
         assert_eq!(out, int());
     }
 
@@ -224,8 +307,8 @@ mod tests {
         let out = reduce(
             &add(),
             &[
-                Some(lit_singleton(&Lit::Int(1))),
-                Some(lit_singleton(&Lit::Int(5))),
+                Arg::Known(lit_singleton(&Lit::Int(1))),
+                Arg::Known(lit_singleton(&Lit::Int(5))),
             ],
         )
         .expect("reduces");
@@ -234,8 +317,11 @@ mod tests {
 
     #[test]
     fn conflicting_bases_are_an_error() {
-        let err = reduce(&add(), &[Some(int()), Some(Type::Base(BaseType::String))])
-            .expect_err("Int and String share no base");
+        let err = reduce(
+            &add(),
+            &[Arg::Known(int()), Arg::Known(Type::Base(BaseType::String))],
+        )
+        .expect_err("Int and String share no base");
         assert!(matches!(err, ReduceError::NoCommonBase { .. }), "{err:?}");
     }
 
@@ -244,7 +330,11 @@ mod tests {
     /// undetermined, and `\x -> x + 1` still has result type `Int`.
     #[test]
     fn a_missing_argument_answers_from_the_rest() {
-        let out = reduce(&add(), &[None, Some(lit_singleton(&Lit::Int(1)))]).expect("coarsens");
+        let out = reduce(
+            &add(),
+            &[Arg::Cyclic, Arg::Known(lit_singleton(&Lit::Int(1)))],
+        )
+        .expect("coarsens");
         assert_eq!(out, int());
     }
 
@@ -252,7 +342,53 @@ mod tests {
     /// enclosing resolution may still have another way to see the position.
     #[test]
     fn all_arguments_missing_is_the_empty_answer() {
-        let out = reduce(&add(), &[None, None]).expect("coarsens");
+        let out = reduce(&add(), &[Arg::Cyclic, Arg::Cyclic]).expect("coarsens");
         assert_eq!(out, Type::Hole);
+    }
+
+    /// The two tolerances are different in kind, and the dispatch between them is
+    /// checked directly — no rule reports `AllKnown` yet, so going through
+    /// [`reduce`] would only ever exercise one arm.
+    ///
+    /// [`CycleTolerance::Any`] is what lets an accumulator have a type at all: a
+    /// register that reads itself in its own write makes `Add(value(x), 1)` where
+    /// `value(x)` is what is being computed, and a rule that refused to answer
+    /// would reject every `x += 1`.
+    ///
+    /// [`CycleTolerance::AllKnown`] is the case `FieldOf(ρ, 𝑘)` will be: no answer
+    /// exists without `ρ`, so the cycle is reported rather than guessed at.
+    #[test]
+    fn a_rule_that_cannot_answer_through_a_cycle_reports_it() {
+        let cyclic = [Arg::Cyclic, Arg::Known(int())];
+        let known = [Arg::Known(int()), Arg::Known(int())];
+
+        assert!(check_cycle_tolerance(CycleTolerance::AllKnown, &cyclic, "FieldOf").is_err());
+        assert!(check_cycle_tolerance(CycleTolerance::AllKnown, &known, "FieldOf").is_ok());
+        assert!(check_cycle_tolerance(CycleTolerance::Any, &cyclic, "Add").is_ok());
+    }
+
+    /// Today's rules both tolerate a cycle, for reasons worth keeping apart: a
+    /// comparison is *constant on its domain* so a cyclic operand costs nothing,
+    /// while arithmetic answers from the operand it can see and loses only the
+    /// agreement check.
+    #[test]
+    fn todays_rules_tolerate_a_cycle() {
+        assert_eq!(add().cycle_tolerance(), CycleTolerance::Any);
+        assert_eq!(
+            TypeFn::Compare(crate::ccl::CompareKind::Equals).cycle_tolerance(),
+            CycleTolerance::Any
+        );
+        assert_eq!(
+            reduce(&add(), &[Arg::Cyclic, Arg::Known(int())]).expect("answers"),
+            int()
+        );
+        assert_eq!(
+            reduce(
+                &TypeFn::Compare(crate::ccl::CompareKind::Equals),
+                &[Arg::Cyclic, Arg::Cyclic]
+            )
+            .expect("constant on its domain"),
+            Type::Base(BaseType::Bool)
+        );
     }
 }
