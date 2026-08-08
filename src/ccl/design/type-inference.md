@@ -1070,42 +1070,50 @@ Reduction is **demand-driven**. Materializing an `App` (`compact_go`'s `App` arm
 
 ### What a reduction rule must satisfy
 
-A rule is a pure function of resolved argument types. Adding a `TypeFn` variant means writing one, and it is sound only if it obeys all four laws. Each is a property of the reduction *mechanism*, checkable by reading the rule, and each buys a specific guarantee; the normative statement and the `CommonBase` proof obligations live in `src/ccl/infer/solver/reduce.rs`, "The laws a rule must satisfy".
+A rule is a pure function of resolved argument types. Adding a `TypeFn` variant means writing one, and it is sound only if it obeys all four laws. Each is a property of the reduction *mechanism*, checkable by reading the rule, and each buys a specific guarantee; the normative statement lives in `src/ccl/infer/solver/reduce.rs`, "The laws a rule must satisfy".
 
 | Law | Statement | Guarantee |
 |---|---|---|
 | 1. Pure | a function of `(fun, args)`: no inference context, no bound graph, no fresh variables, no recorded constraints | reduction may run at any point in any walk, so it can be demand-driven rather than scheduled |
 | 2. Monotone | `𝑎ᵢ <: 𝑏ᵢ` for all `𝑖` ⟹ `𝑓(𝑎⃗) <: 𝑓(𝑏⃗)` | an argument only gets more precise as the graph fills in, so a later reduction refines an earlier one rather than contradicting it |
-| 3. Coarsening | dropping arguments only weakens the answer, and never errors | the self-referential operand bound below terminates |
+| 3. Coarsening | dropping arguments only weakens the answer, and never errors | a rule reached before its arguments resolve gives a usable answer instead of a wrong one — an unapplied `λ 𝑥 → 𝑥 > 1` still has result type `Bool` |
 | 4. Normalizing | the result contains no `App` | one reduction terminates without a fixpoint — the rule set is closed and no rule feeds itself |
 
 **There is deliberately no law about refinements.** Whether a rule may carry an argument's refinement into its result is not a property of reduction at all — it is a question about what the operator *means*, and the answer differs per operator. A rule that **selects** one of its arguments must carry it, because the result really is that value; a rule that **computes** a new one must not. That is the same distinction [Which operators need one](#which-operators-need-one) draws, and it is decidable only there.
 
 Stating it as a law would be wrong twice over. It would forbid the selecting rules outright — including `FieldOf(ρ, 𝑘)`, named below as a next client, whose whole job is to carry the field's refinement. And it would not catch the failure that actually threatens soundness: a rule that *invents* a claim its arguments do not support inherits nothing and is monotone, so it passes every law on the list. The real constraint on a rule's content is that it be correct about the values the operator produces, which is not a structural property and cannot be checked by inspection. `common_base`'s `debug_assert` is a **postcondition of that one function** — a join taken in the base sublattice lands in the base sublattice — not a rule the others obey.
 
-`CommonBase(𝑇₁ … 𝑇ₙ)` is `⊔ᵢ base(𝑇ᵢ)` — the join of the arguments' bases — defined only where that join is not `⊤`. The base sublattice is discrete today, so distinct bases have no join below `⊤`; answering `⊤` would silently accept `1 + "a"`, so the rule reports `NoCommonBase` instead of ascending. Nothing about that is essential: give the lattice an `Int <: Float` edge and `CommonBase(Int, Float)` becomes `Float` with no change to the rule beyond `base`'s join.
+`shared_base(𝑇₁ … 𝑇ₙ)` is `⊔ᵢ base(𝑇ᵢ)` — the join of the arguments' bases, defined only where that join is not `⊤`. It is a **rule body** that arithmetic and comparison share, not a type function of its own. The base sublattice is discrete today, so distinct bases have no join below `⊤`; answering `⊤` would silently accept `1 + "a"`, so the rule reports `NoCommonBase` instead of ascending. Nothing about that is essential — give the lattice an `Int <: Float` edge and the rule widens where it now errors.
 
-### Stating a requirement on the operands
+### Where an operand requirement lives
 
-Dropping the shared variable costs the **pull**. `𝑥 + 1` tells us `𝑥` is an `Int` because information reaches `𝑥` from the other operand, and two unrelated variables have no path between them.
-
-So an operator states its operand requirement as a **bound on its own scheme variables**: arithmetic's scheme records `α <: CommonBase(α, β)` and `β <: CommonBase(α, β)` when the registry builds it. Use sites stay completely ordinary (`left <: α`, `right <: β`), and the application only ever needs to be *materialized*, never received into. The pull then falls out of the existing negative-position read: `?𝑥`'s upper-bound chain reaches `CommonBase(α, β)`, which materializes to the shared base with refinements dropped.
-
-The bound is **self-referential** — `α` occurs in its own bound — and that is the mechanism rather than a wart to tolerate. Reached while resolving `α`, the function answers from `β`; that *is* the propagation, and law 3 is what makes it terminate with an answer instead of diverging. An argument is unavailable only when it is what the current resolution is computing, since resolution pulls and a cycle has no "later" at which more is known. A rule that *cannot* answer from the rest — `FieldOf(ρ, 𝑘)` has nothing to say without `ρ` — violates law 3 and must report the cycle instead; that error channel belongs with the first rule that needs it.
-
-The requirement survives instantiation for free: `freshen_above` copies a variable's bounds and freshens the bound types through the same cache, so each instantiation gets `α' <: CommonBase(α', β')` relating exactly its own operands.
+**In the result rule, and nowhere else.** An operator's operands are two *unrelated* scheme variables; nothing in the scheme relates them. What checks them is the rule that reduces the result, because the result is the one thing guaranteed to be looked at.
 
 #### An operand requirement must be reachable from the result type
 
-A bound is read when something **materializes** the variable it sits on, and a variable is materialized only when some node's type reaches it. A requirement recorded on a scheme's *own* operand variables sits on variables that are nobody's node type: a use site records `left <: α` and `right <: β`, so `α` and `β` are reachable *from* the operands, but nothing walks *from* them. The only thing that can reach them is the result, because the result is the node's type.
+A rule runs when something **materializes** the application it belongs to, and an application is materialized only when some node's type reaches it. A scheme's operand variables are nobody's node type: a use site records `left <: α` and `right <: β`, so `α` and `β` are reachable *from* the operands, but nothing walks *from* them. The only thing that can reach them is the result.
 
-Hence the rule: **a scheme that states a requirement on its operand variables must mention those variables in its result**, as an `App` over them.
+Hence: **a scheme that wants its operands checked must mention them in its result**, as an `App` over them.
 
-`1 + "a"` is rejected because the addition's result is `Add(α, β)`, so materializing the node reduces the application and finds the conflict. A comparison declaring its result as a bare `Bool` mentions neither operand variable, so nothing ever materializes them, the requirement relating them is never read, and `1 > "a"` types cleanly and then panics in the interpreter. A comparison's result is accordingly `Compare(kind, α, β)`, reducing to `Bool` for any operands that share a base and to an error for any that do not. A rule constant on its domain is still a rule — the whole of a comparison's content *is* its domain — and stating it as one is what makes the requirement load-bearing.
+`1 + "a"` is rejected because the addition's result is `Add(α, β)`, so materializing the node runs the rule and finds the conflict. A comparison declaring a bare `Bool` mentions neither operand, so nothing ever materializes them, the rule never runs, and `1 > "a"` types cleanly and then panics in the interpreter. A comparison's result is accordingly `Compare(kind, α, β)`, reducing to `Bool` for any operands that share a base and to an error for any that do not. A rule constant on its domain is still a rule — the whole of a comparison's content *is* its domain — and stating it as one is what gets the check to happen at all.
 
-The cost is that a comparison now has arithmetic's resolution profile: its operands must resolve for its result to, where a concrete `Bool` stopped the walk. Applied code is unaffected; what gets more expensive is the unapplied-generic chain that was already exponential (`test_unresolved_operand_chains_terminate`).
+Every other scheme in the registry states its requirement **structurally**, inside an operand's own shape — `Sum`'s `∀α. (α ⇒ Int) ⇒ Int` puts the `Int` in the argument's codomain position, so `constrain_go` records it on the argument expression's variable, which is a node's type and materializes like any other. Those need nothing.
 
-The rule bites only for requirements carried this way. Every other scheme in the registry states its requirement **structurally**, inside an operand's own shape — `Sum`'s `∀α. (α ⇒ Int) ⇒ Int` puts the `Int` in the argument's codomain position, so `constrain_go` records it on the argument expression's variable, which is a node's type and materializes like any other. The trap is specific to a requirement riding a scheme variable that appears nowhere else.
+#### Why not a bound on the operand variables
+
+The alternative is to state the requirement *beside* the result, as a self-referential bound on the scheme's own variables: `α <: CommonBase(α, β)` and `β <: CommonBase(α, β)`, where `CommonBase` is a type function computing the shared base. Resolving one operand then reaches an application over both and answers from the other, which buys a **pull** — `𝑥 + 1` gives `𝑥 : Int`, because information reaches `𝑥` from its sibling. It is the obvious way to recover the inference a shared variable used to provide, and it does not survive contact with three things:
+
+* **As a guard it is redundant.** The result rule already rejects `1 + "a"`, by the reachability argument above. The bound adds a second check of the same fact.
+* **As a claim it is wrong.** "The operands share a base" is an artifact of a lattice with one numeric type, not a fact about addition. Under an `Int + Float → Float` widening the bound rejects a legal program *and* names a result that is neither operand. Deciding what is addable belongs in `Arithmetic`'s rule, where it can change without touching anything else.
+* **As a pull it is a second implementation of inference.** Any operand type it recovers is one some other part of the program already determines and failed to deliver — a lowering that under-connects, or a specialization clone carrying an unfreshened variable. Recovering it here fixes the symptom at the cost of hiding the cause, and a fix elsewhere is not visible as an improvement because the pull was already covering.
+
+It is also expensive: being self-referential, it makes argument resolution re-enter, which is what the in-flight set in `compact.rs` breaks and the resolution memo keeps from branching at every level. Retiring the bound does **not** retire that machinery — argument resolution is still re-entrant and still deep without it (removing the memo overflows the stack on a program as small as `x := 7; for i in []: x += 1; x`), because a type function's arguments are resolved through the ordinary pipeline and that pipeline reaches other applications. The bound made the re-entrancy denser, not possible.
+
+#### What it genuinely cost: operands nothing else determines
+
+`λ 𝑥 → 𝑥 + 1` no longer infers `𝑥 : Int`. Its result still resolves — the rule answers from the literal operand — but the parameter is determined by nothing.
+
+That is the honest answer. The lambda works for any two things `+` accepts, so it is polymorphic in its parameter, and `Type` has no `∀` to say so. As a program value it is therefore an **ambiguous program**, rejected downstream exactly as `λ 𝑥 → [𝑥, 𝑥]` already was. Inferring `Int` there read as precision; it was the lattice's poverty showing through, and it would have become wrong the moment a second numeric type existed.
 
 ### Obligations that are not decidable yet are parked
 
@@ -1115,7 +1123,7 @@ So the obligation is **parked** rather than decided or dropped. `constrain_go` r
 
 Only **fully determined** obligations are checked, which is what keeps the retry from perturbing the graph it is reading. A side that still contains a variable after materialization is one the program never determined; re-constraining it would record a bound, and a graph mutation after emission would make a later resolution's answer depend on whether this pass ran. Skipping is not a hole — an undetermined operand is an ambiguous program, and coalesce reports it as `UnresolvedInfer`. With both sides variable-free the check cannot deposit anything.
 
-Parking is required in both directions even though only one direction needs it. The common traffic is an operand requirement being closed (`Int <: CommonBase(α, β)`, as a concrete operand flows into a bounded scheme variable), and dropping *that* would be sound — the requirement is re-checked when the result materializes, which the reachability rule above guarantees happens. The direction that matters is an application on the *lower* side against a concrete demand: `(1 + 2) and True` closes to `Add(α, β) <: Bool`, which nothing downstream re-derives. Accepting it silently turned an ordinary user type error into a panic at the `check_pre_desugar` wall, which cannot distinguish one from a compiler bug. Parking both is what makes the arm's rule "undecidable now" rather than a claim about which shapes happen to arrive.
+Both directions are parked, because the arm's rule is "undecidable now" rather than a claim about which shapes arrive. The direction that matters is an application on the *lower* side against a concrete demand: `(1 + 2) and True` closes to `Add(α, β) <: Bool`, which nothing downstream re-derives. Accepting it silently turned an ordinary user type error into a panic at the `check_pre_desugar` wall, which cannot distinguish one from a compiler bug.
 
 ### Which operators need one
 
@@ -1130,7 +1138,7 @@ Sharing a lattice position between an input and the result is right exactly when
 | `List` | element type across elements | *merges* — `[1, 1]` is a collection of `1`s, `[1, 2]` of `Int`s ✔ |
 | `CollectionUnion` | codomain across operands | *merges* on the codomain; its **domain** is a computation and is hand-rolled for that reason ✔ |
 | `Proj` | codomain with the projected field | *selects* the field, refinement included ✔ |
-| `Arithmetic`, `Compare` | operand *requirement* only, via `CommonBase` | *computes* — needs a type function ✔ |
+| `Arithmetic`, `Compare` | nothing — operands are unrelated variables | *computes*; the rule both checks the operands and builds the result ✔ |
 
 `Sum`'s concrete `Int` is a simplifying assumption of the current numeric tower, not a property of summation. When `Sum` becomes numeric-polymorphic its result stops being a constant and becomes a computation over the element type, at which point it moves to the last row and takes a rule of its own. Nothing about the design has to change for that: it is the same shape as `Compare`, whose rule is also constant on its domain today.
 
@@ -1148,7 +1156,8 @@ Two problems look like this one and are not:
 | Share a lattice variable between operands and result | Inherits every lattice dimension in both directions — see above. This is the shape being replaced. |
 | Reconstruct the result after coalesce | Needs a data-flow-respecting walk order that the coalesce walk deliberately does not have. |
 | Reduce at constraint emission | Reads a graph that is still being built; an answer could be superseded by the next edge. This is the reason obligations are parked instead. |
-| Named predicate constraints — `(SameBase α β) ⇒ …` | **Not rejected, deferred.** A predicate *states* the requirement rather than encoding it, and is the shape a user-facing schema language wants. But a predicate has to **propagate** — push `β`'s base onto `α` — and propagating is a deposit, which needs its own phase between emission and resolution to stay order-independent. A bound needs none, because the pull is read-only. The `App` representation is unchanged by the choice, so predicates remain a widening rather than a rewrite. |
+| A bound on the operand variables — `α <: CommonBase(α, β)` | Redundant as a guard, wrong as a claim about addability, and a second implementation of inference as a pull — see [Why not a bound on the operand variables](#why-not-a-bound-on-the-operand-variables). |
+| Named predicate constraints — `(SameBase α β) ⇒ …` | **Not rejected, deferred**, and only worth revisiting if an operand requirement turns out to be needed at all. A predicate *states* a requirement rather than encoding it, and is the shape a user-facing schema language wants; but it has to **propagate** — push `β`'s base onto `α` — and propagating is a deposit, needing its own phase between emission and resolution to stay order-independent. The `App` representation is unchanged by the choice, so it stays a widening rather than a rewrite. |
 | Open, user-declared rule set | The rule signature is already a pure function of resolved argument types, so a user-supplied rule fits without change. Keeping the set closed for now avoids the confluence and termination *conditions* an open set forces on the checker (see the prior work below); law 4 is checkable by inspection for a closed set and would have to become a side condition on user code. |
 
 ### Prior work
@@ -1180,9 +1189,9 @@ Two problems look like this one and are not:
 
 | Op kind | Operand constraint | Result type |
 |---|---|---|
-| `Arithmetic` | each operand `<: CommonBase(α, β)` — the shared *base*, not a shared variable | `Add(α, β)` and siblings, a [type function](#47-type-functions) |
+| `Arithmetic` | none — the result rule checks the operands | `Add(α, β)` and siblings, a [type function](#47-type-functions) |
 | `Concat` | both operands constrained to `String` | `String` |
-| `Compare` | each operand `<: CommonBase(α, β)` | `Greater(α, β)` and siblings — a type function reducing to `Bool`, so the operand requirement is reachable |
+| `Compare` | none — the result rule checks the operands | `Greater(α, β)` and siblings — a type function reducing to `Bool`, so the check is reachable |
 | `BoolLogic` | both operands constrained to `Bool` | `Bool` |
 
 **Note**: String + String → `Concat` rewriting is performed at **compile time** (in `lambda_elim.rs`), not at inference time. The inference pass only constrains both operands to `String` and returns `String` as the result type.

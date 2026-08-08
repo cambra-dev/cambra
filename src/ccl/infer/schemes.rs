@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
-use crate::ccl::infer_var::Bound;
 use crate::ccl::{
     AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Level, Type, TypeFn,
     UnaryOpKind,
@@ -30,80 +29,63 @@ use super::product;
 /// concrete result instead compiles, infers, and silently accepts programs the
 /// requirement was written to reject.
 ///
-/// The reason is the solver's, not the operator's. A bound is read when something
-/// **materializes** the variable it sits on, and a variable is materialized only
-/// when some node's type reaches it. A requirement recorded as a bound on the
-/// scheme's *own* operand variables — `α <: CommonBase(α, β)`, which is how
-/// [`binary_operands`] states one — sits on variables that are nobody's node type:
-/// a use site records `left <: α` and `right <: β`, so `α` and `β` are reachable
-/// from the operands, but nothing walks *from* them. The only thing that can reach
-/// them is the result, because the result is the node's type.
+/// The reason is the solver's, not the operator's. A rule runs when something
+/// **materializes** the application it belongs to, and an application is
+/// materialized only when some node's type reaches it. A scheme's operand
+/// variables are nobody's node type: a use site records `left <: α` and
+/// `right <: β`, so `α` and `β` are reachable *from* the operands, but nothing
+/// walks *from* them. The only thing that can reach them is the result, because
+/// the result is the node's type.
 ///
 /// So arithmetic's result is `Add(α, β)` and a comparison's is `Greater(α, β)`,
 /// reducing to `Bool` for any operands that share a base and to an error for any
 /// that do not. A bare `Bool` there would let `1 > "a"` type-check and then panic
-/// in the interpreter: the requirement is stated, and never read.
+/// in the interpreter — a rule that is never run rejects nothing.
 ///
-/// The rule bites *only* for requirements carried this way. Every other scheme here
-/// states its requirement **structurally**, in an operand's own shape — `Sum`'s
-/// `∀α. (α ⇒ Int) ⇒ Int` puts the `Int` in the argument's codomain position, so
-/// `constrain_go` records it on the argument expression's variable, which is a
-/// node's type and is materialized like any other. Those need nothing. The trap is
-/// specific to a requirement riding a scheme variable that appears nowhere else.
+/// This is also why an operand requirement stated *beside* the result rather than
+/// in it does not work, and [`binary_operands`] records what happened when one was.
+///
+/// Every other scheme here states its requirement **structurally**, in an operand's
+/// own shape — `Sum`'s `∀α. (α ⇒ Int) ⇒ Int` puts the `Int` in the argument's
+/// codomain position, so `constrain_go` records it on the argument expression's
+/// variable, which is a node's type and is materialized like any other. Those need
+/// nothing.
 pub struct OperatorSchemes {
-    /// One scheme per arithmetic operator: `∀α β. α → β → Add(α, β)` and
-    /// siblings, each carrying the operand requirement `α, β <: CommonBase(α, β)`
-    /// as a bound on its own variables.
+    /// One scheme per arithmetic operator: `∀α β. α → β → Add(α, β)` and siblings,
+    /// over two **unrelated** operand variables.
     ///
-    /// **Nothing here is shared between the operands and the result**, and that is
-    /// the point. A shared variable (`∀α. α → α → α`) states *equality*, which
-    /// drags the whole lattice along with the base, once per polarity: the operand
+    /// **Nothing is shared between the operands and the result**, and that is the
+    /// point. A shared variable (`∀α. α → α → α`) states *equality*, which drags
+    /// the whole lattice along with the base, once per polarity: the operand
     /// occurrences are negative positions where refinement sets union, so one
     /// operand's refinement becomes a *requirement* on the other (`\x -> x + 1`
-    /// demanding `x : {Int | __elem == 1}`), while the result occurrence is
-    /// positive where they intersect, so a refinement both operands carry survives
-    /// onto the result (`x + x` where `x` is `2` claiming the sum is `2`).
-    /// Arithmetic *computes* a new value, so it may inherit neither.
+    /// demanding `x : {Int | __elem == 1}`), while the result occurrence is positive
+    /// where they intersect, so a refinement both operands carry survives onto the
+    /// result (`x + x` where `x` is `2` claiming the sum is `2`). Arithmetic
+    /// *computes* a new value, so it may inherit neither.
     ///
-    /// The two halves are therefore stated separately:
-    ///
-    /// * The **result** is a type function: `Add(α, β)` reduces to the operands'
-    ///   common base once they resolve. It keeps the operator kind because a
-    ///   sharper rule needs it — `+` and `*` map operand ranges to different result
-    ///   ranges — so this is where `([0,2], [5,7]) ⇒ [5,9]` will live. One scheme
-    ///   per kind follows from the kind being part of the type.
-    /// * The **requirement** is a bound on the scheme's own variables:
-    ///   `α <: CommonBase(α, β)` and `β <: CommonBase(α, β)`. That keeps operand
-    ///   agreement (still only agreement — numeric-ness is the reduction rule's to
-    ///   enforce, and today it doesn't) *and* gives base inference through the
-    ///   existing negative read: `?x`'s upper-bound chain reaches
-    ///   `CommonBase(α, β)`, which materializes to the common base with refinements
-    ///   dropped, so `x + 1` still tells us `x : Int`.
-    ///
-    /// The requirement being **self-referential** — `α` occurring in its own bound —
-    /// is deliberate, and it is what makes the inference work rather than a trick to
-    /// tolerate. Reached while resolving `α`, the type function answers from `β`
-    /// with the common base of the rest; that *is* the propagation, and
-    /// [`reduce`](mod@crate::ccl::infer::solver::reduce)'s law 3 is what makes it
-    /// terminate. It survives instantiation for free: `freshen_above` copies a
-    /// variable's bounds and freshens the bound types through the same cache, so
-    /// each instantiation gets `α' <: CommonBase(α', β')` relating exactly its own
-    /// operands.
+    /// The result is a [`Type::App`] instead: `Add(α, β)`, whose rule reduces to the
+    /// operands' shared base once they resolve and rejects operands that have none.
+    /// Deciding what is addable is that rule's job, which is what the reachability
+    /// section above is for — the result *is* the node's type, so it is the one
+    /// thing guaranteed to be materialized. It keeps the operator kind because a
+    /// sharper rule needs it (`+` and `*` map operand ranges to different result
+    /// ranges, so `([0,2], [5,7]) ⇒ [5,9]` will live there), and one scheme per kind
+    /// follows from the kind being part of the type.
     arithmetic: BTreeMap<ArithmeticKind, PolyScheme>,
-    /// One scheme per comparison: `∀α β. α → β → Greater(α, β)` and siblings, with
-    /// the same `CommonBase` operand requirement as
-    /// [`arithmetic`](Self::arithmetic).
+    /// One scheme per comparison: `∀α β. α → β → Greater(α, β)` and siblings, over
+    /// two unrelated operand variables like [`arithmetic`](Self::arithmetic).
     ///
     /// A comparison is exposed to only the *operand* half of the shared-variable
-    /// problem — its result is `Bool` and so could never inherit a refinement — but
+    /// problem — its result is `Bool`, so it could never inherit a refinement — but
     /// that half is the same shared variable, so it takes the same treatment.
     ///
-    /// The result is a type function even though it reduces to a constant, and that
-    /// is the section above in miniature: `Bool` mentions neither operand, so
-    /// nothing would ever materialize `α` or `β` and the requirement relating them
-    /// would never be read. `Compare(kind, α, β)` reduces to `Bool` for operands
-    /// that share a base and to an error for operands that do not, which is both
-    /// what a comparison means and what makes the requirement load-bearing.
+    /// The result is an application even though it reduces to a constant, and that
+    /// is the reachability section in miniature: a bare `Bool` mentions neither
+    /// operand, so nothing would ever materialize them and the rule that checks them
+    /// would never run. `Compare(kind, α, β)` reduces to `Bool` for operands that
+    /// share a base and to an error for operands that do not, which is both what a
+    /// comparison means and what gets the check to happen at all.
     compare: BTreeMap<CompareKind, PolyScheme>,
     /// `Bool → Bool → Bool`.
     bool_logic: PolyScheme,
@@ -144,37 +126,33 @@ pub struct OperatorSchemes {
     get_prev_txn: PolyScheme,
 }
 
-/// Two fresh operand variables for a binary operator, each **bounded above by
-/// their common base**: `α <: CommonBase(α, β)` and `β <: CommonBase(α, β)`.
+/// Two fresh, **unrelated** operand variables for a binary operator.
 ///
-/// This is how an operator states a requirement on its operands now that they no
-/// longer share a variable. The bound does two jobs at once: it agrees the operands'
-/// bases, and it is the channel through which one operand's base reaches the other
-/// (`x + 1` giving `x : Int`) — reached while resolving `α`, the operator answers
-/// from `β`. Crucially it carries *only* the base, because that is what
-/// `CommonBase` computes; a shared variable would have carried the refinements too.
+/// Nothing here states a requirement between them, and nothing needs to: the
+/// operator's *result* is a [`Type::App`] over both, so materializing the node
+/// reduces it, and the rule decides whether the operands are acceptable. That is
+/// the whole content of "an operand requirement must be reachable from the result
+/// type" — the reachability is what makes the check happen, and the rule is where
+/// the check belongs.
 ///
-/// Recorded once here, at registry construction. `PolyScheme::instantiate`'s
-/// freshen copies a variable's bounds, so every use site gets its own copy of the
-/// requirement over its own variables.
+/// An earlier design bounded each operand by a `CommonBase(α, β)` over both, so
+/// that resolving one operand pulled the other's base (`x + 1` giving `x : Int`).
+/// That bound was doing two unrelated jobs. As a *guard* it was redundant — the
+/// result rule already rejects `1 + "a"` — and it hard-coded "the operands share a
+/// base", which is an artifact of a single-numeric-type lattice rather than a fact
+/// about addition: under an `Int + Float → Float` widening it is simply wrong. As a
+/// *pull* it was compensating for two defects elsewhere, both since fixed: a
+/// `groupby` lowering that never related its key parameter to its key function
+/// (now stated with a [`Type::SharedHole`]), and a freshening short-circuit that
+/// let an unfreshened predicate into a specialization clone.
+///
+/// What is genuinely lost is inference for an operand nothing else determines, so
+/// `\x -> x + 1` leaves its parameter undetermined. That lambda *is* polymorphic,
+/// and `Type` has no way to say so — which makes it an ambiguous program, exactly
+/// as `\x -> [x, x]` already was.
 fn binary_operands() -> (Type, Type) {
     const BODY_LEVEL: Level = 1;
-    let alpha = fresh_var(BODY_LEVEL);
-    let beta = fresh_var(BODY_LEVEL);
-    let common = Type::App {
-        fun: TypeFn::CommonBase,
-        args: vec![alpha.clone(), beta.clone()],
-    };
-    // Recorded directly rather than through `constrain_subtype`: these are the
-    // scheme's *declared* bounds, not a derived obligation, and routing them through
-    // the solver would try to close them against bounds that do not exist yet.
-    for v in [&alpha, &beta] {
-        let Type::Infer(var) = v else {
-            unreachable!("fresh_var yields Type::Infer");
-        };
-        var.bounds_mut().upper.push(Bound::conc(common.clone()));
-    }
-    (alpha, beta)
+    (fresh_var(BODY_LEVEL), fresh_var(BODY_LEVEL))
 }
 
 impl OperatorSchemes {

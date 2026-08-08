@@ -804,23 +804,44 @@ fn test_self_application_types() {
     );
 }
 
+// An operator constrains its operands through its **result**, so a lambda whose
+// parameter only feeds an operator is genuinely polymorphic in that parameter — and
+// `Type` has no way to say so.
+//
+// `\x -> x + 1` works for any two things `+` accepts. Under a single-numeric-type
+// lattice that happens to be `Int` alone, and inferring `Int ⇒ Int` reads as
+// precision; it is really the lattice's poverty showing through. Add an
+// `Int + Float → Float` widening and the honest domain stops being `Int`, with
+// nothing about the lambda having changed.
+//
+// So the result resolves and the parameter does not, the same shape
+// `self_application_types_without_a_recursive_type` asserts just above for
+// `\x -> x(x)`. As a program value that makes it an **ambiguous program**, rejected
+// downstream exactly as `\x -> [x, x]` already is
+// (`test_unexercised_generic_definition_is_an_error_not_a_panic`) — inference
+// tolerates the residue, the strict wall does not.
 #[rstest]
-#[case::comparison(
-    r"
-f = \x -> x > 1
-f
-",
-    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
-)]
-#[case::arithmetic(
-    r"
-f = \x -> x + 1
-f
-",
-    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(int()) }
-)]
-fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
-    assert_eq!(infer_program(code), expected);
+#[case::comparison("f = \\x -> x > 1\nf", bool_ty())]
+#[case::arithmetic("f = \\x -> x + 1\nf", int())]
+fn test_lambda_unapplied_is_polymorphic_in_its_operand(
+    #[case] code: &str,
+    #[case] expected_codomain: Type,
+) {
+    let ty = infer_program(code);
+    let Type::Fun {
+        domain, codomain, ..
+    } = &ty
+    else {
+        panic!("expected a function type, got {ty}");
+    };
+    assert!(
+        matches!(**domain, Type::Infer(_)),
+        "the parameter is determined by nothing, so it must stay a variable: {ty}"
+    );
+    assert_eq!(
+        **codomain, expected_codomain,
+        "the result is still determined — the rule answers from the literal operand"
+    );
 }
 
 // Nested generic arithmetic that never resolves must still **finish**.
@@ -828,30 +849,20 @@ fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
 // An unapplied generic function leaves its operand types unresolved, which is an
 // ambiguous program and rejected downstream — but rejected, not hung on.
 //
-// The non-termination hazard these cases guard is specific. An operator states its
-// requirement on its operands as a bound on its own scheme variables, and that bound
-// is self-referential: arithmetic records `α <: CommonBase(α, β)` and
-// `β <: CommonBase(α, β)`. So resolving `α` reaches an application over `α` and `β`,
-// which resolves `β`, which reaches the same application and resolves `α` again
-// along a second path. Reduction deposits nothing (deliberately — that is what makes
-// it order-independent), so nothing is reused and the re-derivation branches at
-// every level. The memo in `compact.rs` (`RESOLVED_ARGS`, keyed by
-// `resolve_argument`) is what collapses the branching.
+// These cases were once genuinely pathological: arithmetic bounded each operand by
+// a `CommonBase` application over *both* of them, so resolving one operand reached
+// an application whose own argument was that operand, resolved the other, and came
+// back around. Reduction deposits nothing, so nothing was reused and the
+// re-derivation branched at every level — `f(a, a)` did not terminate at all, and
+// the rest were exponential. An in-flight set broke the cycle and a memo collapsed
+// the branching.
 //
-// `f(a, a)` is the case that did not terminate at all; the others were merely
-// exponential. The timeout is the assertion — the failure mode being guarded is
-// unbounded, not slow.
-//
-// What is **not** fixed, and what bounds how deep these cases can go: for chains
-// that never resolve, cost still grows exponentially with wrapper depth. That is
-// structural rather than a memoization gap — widening the memo's window further
-// takes a two-wrapper chain from "does not finish" to eight seconds, measured,
-// which is not a fix worth the staleness it would risk. A comparison shares that
-// profile because its result is `Compare(α, β)` over its operands; a scheme
-// declaring a bare `Bool` result would stop the walk, and would also never check
-// the operands (see `OperatorSchemes`, "An operand requirement must be reachable
-// from the result type"). Its entry here is therefore the minimal cycle rather
-// than a chain.
+// No scheme bounds a variable by an application over itself any more, so the cycle
+// cannot form and the machinery is gone. They are kept as the regression net for
+// exactly that: a future type function whose *requirement* is stated as a
+// self-referential bound reintroduces the shape, and these are the programs that
+// would catch it. The timeout is the assertion — the failure mode is unbounded, not
+// slow — and the whole file now runs in a fraction of the time these alone took.
 #[rstest]
 #[timeout(Duration::from_secs(20))]
 #[case::shared_operand("f = \\x, y -> x + y\ng = \\a -> f(a, a)\ng")]
@@ -980,27 +991,28 @@ fn test_arithmetic_result_is_the_base(#[case] code: &str) {
     assert_eq!(infer_program(code), int());
 }
 
-// The dual half: an operand must not inherit its *sibling's* refinement either.
+// An operand does not inherit its *sibling's* refinement, because nothing relates
+// the two operands at all.
 //
-// The two operand positions are function domains — negative positions, where
-// refinement sets union — so a shared variable turned one operand's refinement into a
-// *requirement* on the other, and `\x -> x + 1` inferred `x : {Int | __elem == 1}`,
-// demanding the parameter be the literal 1. What relates the operands now is a
-// `CommonBase` bound, which carries the base and nothing else. (`test_lambda_unapplied`
-// covers the same property for `+` and `>`; these are the cases where the *other*
-// operand is the refined one.)
+// Under a shared-variable scheme they were one lattice position, and the operand
+// positions are function domains — negative, where refinement sets union — so
+// `\x -> 1 + x` inferred `x : {Int | __elem == 1}`, demanding the parameter *be*
+// the literal. The property now holds for a structural reason rather than a
+// careful one: the operands are two unrelated variables, so there is no channel
+// for a refinement to cross.
+//
+// What that costs is the parameter's type entirely, which is
+// `test_lambda_unapplied_is_polymorphic_in_its_operand`. What it must *not* cost is
+// the result: `1 + x` is an `Int` and not the sibling's singleton, which is what
+// these cases pin at the one place a type still lands.
 #[rstest]
-#[case("f = \\x -> 1 + x\nf")]
-#[case("f = \\x -> x - 7\nf")]
-fn test_operand_does_not_inherit_its_sibling_refinement(#[case] code: &str) {
-    let ty = infer_program(code);
-    let Type::Fun { domain, .. } = &ty else {
-        panic!("expected a function type, got {ty}");
-    };
+#[case("f = \\x -> 1 + x\nf(5)")]
+#[case("f = \\x -> x - 7\nf(5)")]
+fn test_an_operator_result_does_not_inherit_an_operand_refinement(#[case] code: &str) {
     assert_eq!(
-        **domain,
+        infer_program(code),
         int(),
-        "the parameter must be the bare base, not the other operand's refinement"
+        "the result is the base, not either operand's singleton"
     );
 }
 

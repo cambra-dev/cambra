@@ -44,26 +44,34 @@
 //!    contradicting it.
 //!
 //! 3. **Coarsening on a missing argument.** Dropping arguments only weakens the
-//!    answer — `f` over a subset is a supertype of `f` over all of them — and never
-//!    errors. *Buys:* the self-referential operand bound terminates (see below).
+//!    answer — never errors, and never claims more than the full argument list
+//!    would. *Buys:* a rule reached before its arguments are known gives a usable
+//!    answer instead of a wrong one; an unapplied `λ x → x > 1` still has result
+//!    type `Bool`.
 //!
 //! 4. **Normalizing.** The result contains no [`Type::App`]. *Buys:* one `reduce`
 //!    call terminates without a fixpoint, because the rule set is closed and no
 //!    rule feeds itself.
 //!
-//! # `CommonBase`, formally
+//! # What "the operands share a base" is, and is not
 //!
-//! `CommonBase(T₁ … Tₙ)` is the **join of the `Tᵢ` in the base sublattice** —
-//! `⊔ᵢ base(Tᵢ)`, where `base(·)` strips refinements — defined only where that join
-//! is not `⊤`.
+//! [`shared_base`] is `⊔ᵢ base(argᵢ)` — the join of the arguments' bases, defined
+//! only where that join is not `⊤`. It is a **rule body**, used by both arithmetic
+//! and comparison, and not a type function in its own right.
 //!
-//! The base sublattice is discrete today: distinct base types have no common upper
-//! bound below `⊤`. Answering `⊤` there would be useless *and* unsound in effect,
-//! since it would silently accept `1 + "a"`, so the rule reports
-//! [`ReduceError::NoCommonBase`] instead of ascending to the top. Nothing about
-//! that is essential to the rule — give the lattice an `Int <: Float` edge and
-//! `CommonBase(Int, Float)` becomes `Float` and stops erroring, with no change
-//! here beyond `base`'s join.
+//! It once was one, as a `CommonBase` bound each operand carried, so that resolving
+//! one operand pulled the other's base. That is gone. As a *guard* it duplicated
+//! what the result rule already does — a node's type is an `App` over both
+//! operands, so materializing it runs the rule and rejects `1 + "a"` — and as a
+//! *pull* it was compensating for defects elsewhere, since fixed.
+//!
+//! More importantly, "the operands share a base" is not what makes two values
+//! addable; it is an artifact of a lattice with one numeric type. Under an
+//! `Int + Float → Float` widening it is wrong in both directions: it rejects a
+//! legal addition, and it names a result that is neither operand. Keeping the
+//! decision *inside* [`TypeFn::Arithmetic`]'s rule is what lets it change without
+//! touching anything else — the base sublattice being discrete is the only reason
+//! a failed join is an error today rather than a widening.
 //!
 //! # Missing arguments
 //!
@@ -72,11 +80,17 @@
 //! pulls, so the only unavailable argument is a cyclic one, and a cycle has no
 //! "later" at which more is known.
 //!
-//! This is load-bearing rather than defensive. An operator scheme states its
-//! operand requirement as a bound on its own variables — `α <: CommonBase(α, β)` —
-//! so resolving `α` reaches an application whose first argument *is* `α`. Law 3 is
-//! what makes that terminate with an answer instead of diverging: answering from
-//! the remaining arguments is exactly how `x + 1` learns that `x` is an `Int`.
+//! Law 3 is what makes that a usable answer rather than a failure: reduced with an
+//! argument missing, a rule answers from the rest and cannot claim more than it
+//! would have with all of them. That is what keeps an unapplied `λ x → x > 1` at
+//! result type `Bool` even though its operand is undetermined.
+//!
+//! Resolution being re-entrant is not something the retired `CommonBase` bound
+//! introduced, and retiring it did not make the in-flight set idle: an argument is
+//! resolved through the ordinary pipeline, which reaches other applications, so a
+//! chain of them nests. `compact.rs`'s in-flight set and resolution memo are what
+//! keep that bounded — removing the memo overflows the stack on a program as small
+//! as `x := 7; for i in []: x += 1; x`.
 //!
 //! Every rule today satisfies law 3, so a missing argument is never itself a
 //! failure. A future function that cannot — `FieldOf(ρ, 𝑘)` has nothing to say
@@ -90,8 +104,8 @@ use crate::ccl::{Type, TypeFn};
 /// Why a reduction could not produce a type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReduceError {
-    /// The arguments' bases have no join below `⊤` — `Int` and `String` under
-    /// [`TypeFn::CommonBase`], say. A genuine type error in the program.
+    /// The arguments' bases have no join below `⊤` — `1 + "a"`. A genuine type
+    /// error in the program.
     NoCommonBase {
         /// The type function that could not reduce, as it is spelled in a type.
         fun: String,
@@ -108,35 +122,33 @@ pub enum ReduceError {
 pub fn reduce(fun: &TypeFn, args: &[Option<Type>]) -> Result<Type, ReduceError> {
     let available: Vec<&Type> = args.iter().flatten().collect();
     match fun {
-        // Both answer the same question — "the one base these types share" — and
-        // differ only in what they will grow into. `Arithmetic` keeps its kind
+        // Arithmetic's result *is* the operands' shared base today, so deciding
+        // what is addable and computing the result are one step. The kind is kept
         // because a range-aware rule needs it (`+` and `*` map operand ranges
-        // differently); `CommonBase` is the requirement side, which stays base-only
-        // by definition.
-        TypeFn::CommonBase | TypeFn::Arithmetic(_) => common_base(fun, &available),
+        // differently), which is also where the two stop coinciding.
+        TypeFn::Arithmetic(_) => shared_base(fun, &available),
         // A comparison **checks and then discards**: its result is `Bool` for any
         // operands that share a base and undefined for any that do not, so the rule
         // is constant on its domain and the whole of its content is the domain.
         //
         // That is not a rule contorted to force a check — it is what comparison
-        // means — but forcing the check is what it buys. A bare `Bool` result
-        // mentions neither operand variable, so nothing ever materializes them and
-        // the `CommonBase` bound relating them is never read. See
+        // means — but the check is the reason the result is `Compare(α, β)` rather
+        // than a bare `Bool`. A bare `Bool` mentions neither operand, so nothing
+        // would ever materialize them and nothing would ever run this rule; see
         // `OperatorSchemes`'s "An operand requirement must be reachable from the
         // result type".
         //
-        // Unavailable arguments do not weaken the answer, only the check: `Bool` is
-        // the result whether or not the operands have resolved, which is what keeps
-        // an unapplied `λ x → x > 1` at `Int ⇒ Bool`.
+        // Unavailable arguments weaken the check, not the answer: `Bool` is the
+        // result whether or not the operands have resolved.
         TypeFn::Compare(_) => {
-            common_base(fun, &available)?;
+            shared_base(fun, &available)?;
             Ok(Type::Base(crate::ccl::BaseType::Bool))
         }
     }
 }
 
 /// `⊔ᵢ base(argᵢ)` — the join of the arguments' bases, defined only where it is not
-/// `⊤` (see the module docs, "`CommonBase`, formally").
+/// `⊤` (see the module docs, "What \"the operands share a base\" is, and is not").
 ///
 /// Stripping refinements is not an approximation to be improved on — it is what
 /// makes this the *base* join. A refinement is a fact about a value, and neither
@@ -170,7 +182,7 @@ pub fn reduce(fun: &TypeFn, args: &[Option<Type>]) -> Result<Type, ReduceError> 
 /// skipped. A compound-argument type function — `FieldOf(ρ, 𝑘)` and
 /// `CollectionUnion` are the named next clients — must not reuse this test; it needs
 /// agreement *modulo* unresolved positions, the way the lattice itself compares.
-fn common_base(fun: &TypeFn, args: &[&Type]) -> Result<Type, ReduceError> {
+fn shared_base(fun: &TypeFn, args: &[&Type]) -> Result<Type, ReduceError> {
     let mut bases = args.iter().map(|t| strip_refinements(t));
     let Some(first) = bases.next() else {
         return Ok(Type::Hole);
@@ -246,16 +258,12 @@ mod tests {
         assert!(matches!(err, ReduceError::NoCommonBase { .. }), "{err:?}");
     }
 
-    /// The self-referential operand bound depends on this: reached while resolving
-    /// its own first argument, `CommonBase` answers from the second. That is what
-    /// makes `\x -> x + 1` infer `x : Int`.
+    /// Law 3: an argument the program has not determined weakens the check, not
+    /// the answer. `\x -> x > 1` still has result type `Bool` with its operand
+    /// undetermined, and `\x -> x + 1` still has result type `Int`.
     #[test]
     fn a_missing_argument_answers_from_the_rest() {
-        let out = reduce(
-            &TypeFn::CommonBase,
-            &[None, Some(lit_singleton(&Lit::Int(1)))],
-        )
-        .expect("coarsens");
+        let out = reduce(&add(), &[None, Some(lit_singleton(&Lit::Int(1)))]).expect("coarsens");
         assert_eq!(out, int());
     }
 
@@ -263,7 +271,7 @@ mod tests {
     /// enclosing resolution may still have another way to see the position.
     #[test]
     fn all_arguments_missing_is_the_empty_answer() {
-        let out = reduce(&TypeFn::CommonBase, &[None, None]).expect("coarsens");
+        let out = reduce(&add(), &[None, None]).expect("coarsens");
         assert_eq!(out, Type::Hole);
     }
 }
