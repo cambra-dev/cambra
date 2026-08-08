@@ -347,7 +347,7 @@ pub enum InferError {
     /// no rule relating an `Int` to a `String`, which is a statement about the
     /// operator.
     NoCommonBase {
-        /// The operator, as it is spelled in a type (`Add`, `CommonBase`).
+        /// The type function, as it is spelled in a type (`Add`, `Greater`).
         fun: String,
         /// The operand bases, rendered, in argument order.
         bases: Vec<String>,

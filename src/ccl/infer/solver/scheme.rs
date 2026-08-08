@@ -233,13 +233,10 @@ pub fn freshen_above(
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_) => ty.clone(),
-        // A type function freshens argumentwise. This is what carries a scheme's
-        // *internal* operand requirement to each instantiation: the requirement is
-        // a bound `α <: CommonBase(α, β)` on a quantified variable, and the bound
-        // walk below freshens a bound's type through this same cache — so the
-        // instantiated copy bounds the fresh `α'` by `CommonBase(α', β')`, still
-        // self-referential and still relating exactly this instantiation's
-        // operands.
+        // A type function freshens argumentwise, so an instantiation applies the
+        // same function to *its own* variables (`Add(α', β')`). A bound whose type
+        // is an application is freshened through this same cache, for the same
+        // reason.
         Type::App { fun, args } => Type::App {
             fun: fun.clone(),
             args: args

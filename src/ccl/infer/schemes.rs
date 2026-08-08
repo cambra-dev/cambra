@@ -135,21 +135,9 @@ pub struct OperatorSchemes {
 /// type" — the reachability is what makes the check happen, and the rule is where
 /// the check belongs.
 ///
-/// An earlier design bounded each operand by a `CommonBase(α, β)` over both, so
-/// that resolving one operand pulled the other's base (`x + 1` giving `x : Int`).
-/// That bound was doing two unrelated jobs. As a *guard* it was redundant — the
-/// result rule already rejects `1 + "a"` — and it hard-coded "the operands share a
-/// base", which is an artifact of a single-numeric-type lattice rather than a fact
-/// about addition: under an `Int + Float → Float` widening it is simply wrong. As a
-/// *pull* it was compensating for two defects elsewhere, both since fixed: a
-/// `groupby` lowering that never related its key parameter to its key function
-/// (now stated with a [`Type::SharedHole`]), and a freshening short-circuit that
-/// let an unfreshened predicate into a specialization clone.
-///
-/// What is genuinely lost is inference for an operand nothing else determines, so
-/// `\x -> x + 1` leaves its parameter undetermined. That lambda *is* polymorphic,
-/// and `Type` has no way to say so — which makes it an ambiguous program, exactly
-/// as `\x -> [x, x]` already was.
+/// An operand nothing else determines therefore stays undetermined — `\x -> x + 1`
+/// leaves its parameter open. That lambda *is* polymorphic and `Type` has no way to
+/// say so, which makes it an ambiguous program, exactly as `\x -> [x, x]` is.
 fn binary_operands() -> (Type, Type) {
     const BODY_LEVEL: Level = 1;
     (fresh_var(BODY_LEVEL), fresh_var(BODY_LEVEL))
