@@ -508,26 +508,12 @@ pub enum Type {
 /// must satisfy".
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeFn {
-    /// The join of the arguments' base types, `⊔ᵢ base(argᵢ)`, with every
-    /// value-level claim dropped — a refinement is a fact about *a value*, and
-    /// this answer is about the *type*. A join of `⊤` is an error rather than an
-    /// answer (see [`reduce`](mod@crate::ccl::infer::solver::reduce), "`CommonBase`,
-    /// formally").
-    ///
-    /// Used as the *requirement* an operator places on its operands: arithmetic's
-    /// scheme bounds each of its operand variables by `CommonBase` over all of
-    /// them, so an operand's own resolution pulls the base its siblings establish
-    /// (`x + 1` gives `x : Int`) without pulling their refinements.
-    ///
-    /// **Coarsens on a missing argument** (law 3), which is what makes that bound
-    /// work rather than diverge: reached while resolving one of its own arguments,
-    /// it answers from the others. The join over fewer types is a supertype of the
-    /// join over all of them, so there is always an answer to give.
-    CommonBase,
     /// The result of an arithmetic operator applied to operands of the given
     /// types.
     ///
-    /// Reduces to the operands' [`CommonBase`](TypeFn::CommonBase) today.
+    /// Reduces to the operands' shared base today, and rejects operands that have
+    /// none — deciding what is addable is *this rule's* job, which is what makes
+    /// the reachability rule above buy anything.
     /// Arithmetic *computes* a new value rather than selecting one of its
     /// operands, so it inherits none of their refinements — a fact about a value
     /// no longer in play. The `kind` is recorded because it is the function's
@@ -555,38 +541,9 @@ pub enum TypeFn {
 }
 
 impl TypeFn {
-    /// Whether the **rule** is symmetric in its arguments — reordering them
-    /// describes the same computed type.
-    ///
-    /// This is a property of the rule, not of the surface operator: `Sub` is not a
-    /// commutative operation, but its *type* rule is the operands' common base,
-    /// which is. Stating it that way is what keeps this honest when a sharper rule
-    /// lands — a range-aware `Arithmetic` (`([0,2], [5,7]) ⇒ [5,9]` for `+`,
-    /// something else for `-`) would make the arithmetic rules order-sensitive, and
-    /// this must be narrowed in the same change.
-    ///
-    /// Only [`SpecKey`](crate::ccl::infer::solver::SpecKey) reads it, to decide
-    /// whether two argument orders at one position are the same contribution. It is
-    /// deliberately not consulted by [`reduce`](crate::ccl::infer::solver) — a rule
-    /// that is symmetric does not need to be told so.
-    pub fn args_are_unordered(&self) -> bool {
-        match self {
-            // The base every argument shares: a set operation.
-            TypeFn::CommonBase => true,
-            // Both reduce to the operands' common base today, which is symmetric —
-            // but saying so here would be claiming it of the *type function*, and the
-            // sharper rules each is waiting for read their arguments positionally
-            // (`-` and `<` are not symmetric). Nothing needs it: the asymmetry this
-            // exists to absorb comes from the operand *requirement*, which is
-            // `CommonBase`.
-            TypeFn::Arithmetic(_) | TypeFn::Compare(_) => false,
-        }
-    }
-
     /// The function's spelling, for [`Display`](fmt::Display) and diagnostics.
     pub fn name(&self) -> &'static str {
         match self {
-            TypeFn::CommonBase => "CommonBase",
             TypeFn::Arithmetic(k) => k.type_fn_name(),
             TypeFn::Compare(k) => k.type_fn_name(),
         }

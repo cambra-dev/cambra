@@ -415,10 +415,11 @@ fn emit_bare_predicate<C: Typing>(
 /// constrain_subtype. Returns the fresh result variable.
 ///
 /// Operand types enter **verbatim**. Keeping an operator's refinements from
-/// crossing to its other operand or to its result is the *scheme*'s business: the
-/// operands do not share a variable, the result is a type function, and the
-/// requirement relating them is a `CommonBase` bound that carries the base and
-/// nothing else (see [`OperatorSchemes::arithmetic`](super::schemes::OperatorSchemes)).
+/// crossing to its other operand or to its result is the *scheme*'s business, and
+/// it needs nothing here: the operands are two unrelated variables, so there is no
+/// channel between them, and the result is a type function whose rule computes a
+/// fresh answer rather than inheriting one (see
+/// [`OperatorSchemes::arithmetic`](super::schemes::OperatorSchemes)).
 ///
 /// The tempting shortcut here is `strip_refinements` on each operand type, and it
 /// is worth recording why it cannot work: it peels *syntactic* `Type::Refinement`
