@@ -853,16 +853,16 @@ fn test_lambda_unapplied_is_polymorphic_in_its_operand(
 // a `CommonBase` application over *both* of them, so resolving one operand reached
 // an application whose own argument was that operand, resolved the other, and came
 // back around. Reduction deposits nothing, so nothing was reused and the
-// re-derivation branched at every level — `f(a, a)` did not terminate at all, and
-// the rest were exponential. An in-flight set broke the cycle and a memo collapsed
-// the branching.
+// re-derivation branched at every level — `f(a, a)` did not terminate at all.
 //
-// No scheme bounds a variable by an application over itself any more, so the cycle
-// cannot form and the machinery is gone. They are kept as the regression net for
-// exactly that: a future type function whose *requirement* is stated as a
-// self-referential bound reintroduces the shape, and these are the programs that
-// would catch it. The timeout is the assertion — the failure mode is unbounded, not
-// slow — and the whole file now runs in a fraction of the time these alone took.
+// No scheme bounds a variable by an application over itself any more, so *that*
+// shape cannot form. Resolution is still re-entrant for the ordinary reason (an
+// argument resolves through the pipeline, which reaches other applications), and
+// `compact.rs`'s in-flight set is still what terminates it — these programs are the
+// regression net for both: the cut-off going away, and a future type function that
+// states its operand requirement as a self-referential bound and brings the density
+// back. The timeout is the assertion, since the failure mode is unbounded rather
+// than slow.
 #[rstest]
 #[timeout(Duration::from_secs(20))]
 #[case::shared_operand("f = \\x, y -> x + y\ng = \\a -> f(a, a)\ng")]
