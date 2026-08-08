@@ -527,7 +527,8 @@ fn test_mutability(#[case] code: &str, #[case] expected: Tile) {
 // `Mut` values are second-class (downward-only)"). A mutable value must stay
 // traceable to one introduction: it may only be a bare variable reference
 // (rule 1), never nested in a composite type or returned from a function
-// (rule 2), and an unannotated binding may not have `Mut` type (rule 3).
+// (rule 2). There is no rule about an unannotated binding holding a `Mut`: only
+// a `MutDecl` and a pass-by-reference param can bind one.
 // ---------------------------------------------------------------------------
 
 /// Compile `code`, expect failure, and assert the rendered errors contain
@@ -578,6 +579,23 @@ fn augmented_assignment_to_non_mutable_rejected() {
     expect_mut_discipline_error("x = 0\nx += 1\nx", "not a mutable variable");
 }
 
+/// The same rejection when the target's binder is **gone by the time the check runs**.
+///
+/// `def f(…)` binds a generalized `let`, and coalesce rebuilds a generalized `let` as the
+/// chain of its per-use specializations — an empty chain, and no binder at all, when the
+/// only mention of `f` is the write. The write survives naming a binder that no longer
+/// exists, so a check keyed on "the binder says it is not mutable" finds nothing to
+/// object to. A write target must *resolve to a mutable binder*, and an absent one
+/// satisfies that no better than an immutable one does.
+///
+/// The program has to leave `f` otherwise unread: a later `f + 1` is an ordinary type
+/// error against the function type, and inference reports that before the discipline
+/// check runs at all.
+#[test]
+fn a_write_to_a_binder_monomorphization_dropped_is_rejected() {
+    expect_mut_discipline_error("def f(v):\n    v + 1\nf := 10\n1", "not a mutable variable");
+}
+
 /// The other half: when the target *is* a register, the write is demanded against the
 /// register's real value type — the demand is not relaxed to buy diagnostic ordering.
 /// `Mut(Int)` genuinely demands `Int` of every write.
@@ -610,14 +628,30 @@ fn mut_annotation_with_non_txn_domain_rejected() {
     );
 }
 
-/// A `:=` accumulator *declared inside* a for-loop body (rather than before it)
-/// is rejected: the accumulator's recurrence spans the whole loop, so its
-/// declaration must precede the loop.
+/// A register *declared inside* a for-loop body (rather than before it) is
+/// rejected: its sequencing domain is the loop's own iteration extent, so the body
+/// would carry a nested recurrence the unified phase has no domain for.
+///
+/// Rejected at **every spelling**, because whether the introduction carries a type
+/// annotation says nothing about whether it introduces a register. Gating on the
+/// annotation instead accepted the bare `y := 0` — which then fell back to a
+/// per-iteration shadowing `let`, silently discarding each update at the iteration
+/// boundary, the very thing `:=` exists to avoid.
+#[rstest]
+#[case::annotated_mut("for i in [1, 2, 3]:\n    y: Mut(Int) := 0\n    y += i\ny")]
+#[case::annotated_value("for i in [1, 2, 3]:\n    y: Int := 0\n    y += i\ny")]
+#[case::bare("for i in [1, 2, 3]:\n    y := 0\n    y += i\ny")]
+fn register_declared_inside_loop_rejected(#[case] code: &str) {
+    expect_compile_error(code, "introduced inside a for-loop body");
+}
+
+/// The immutable counterpart still works, and is what the rejection above points
+/// at: a per-iteration value binds with `=`.
 #[test]
-fn accumulator_declared_inside_loop_rejected() {
-    expect_compile_error(
-        "for i in [1, 2, 3]:\n    y: Mut(Int) := 0\n    y += i\ny",
-        "accumulator declaration inside a for-loop body is not",
+fn per_iteration_value_binding_inside_a_loop_is_allowed() {
+    check_scalar(
+        "t := 0\nfor i in [1, 2, 3]:\n    y = i\n    t += y\nt",
+        cambra::interpreter::Value::Int(6),
     );
 }
 
@@ -649,12 +683,24 @@ fn cross_channel_cycle_is_rejected() {
     expect_compile_error(code, "mutually recursive cycle");
 }
 
-/// Rule 3: an unannotated copy of a mutable variable (`b = a`) aliases it — rejected, to
-/// force the author to disambiguate a value copy (`b: Int = a`) from seeding a
-/// new mutable variable (`b: Mut(Int) := a`).
+/// `b = a` off a mutable **reads** it — a value snapshot, exactly as `a + 1` or
+/// `f(a)` read it. There is no alias to reject, because a `Let` cannot bind a
+/// register: only `MutDecl` (`:=`) and a pass-by-reference `Mut` parameter can, so
+/// the copy is an ordinary value binding by construction.
 #[test]
-fn rule3_unannotated_mut_alias_is_rejected() {
-    expect_mut_discipline_error("a := 0\nb = a\nb", "not annotated `Mut`");
+fn plain_assignment_off_a_mutable_is_a_value_read() {
+    check_scalar(
+        "a := 0\na += 5\nb = a\nb",
+        cambra::interpreter::Value::Int(5),
+    );
+}
+
+/// And the copy is *not* mutable, so writing through it is rejected — which is
+/// what used to need rule 3, and now falls out of the write-target check. The
+/// error names the write (the actual mistake) rather than the binding.
+#[test]
+fn writing_through_a_value_copy_of_a_mutable_is_rejected() {
+    expect_mut_discipline_error("a := 0\nb = a\nb += 1\nb", "not a mutable variable");
 }
 
 /// Rule 2: a function may not return a `Mut` — the mutable-variable reference would
@@ -828,9 +874,20 @@ fn pass_by_ref_writer_with_intermediates_bare_statement_loop() {
         cambra::interpreter::Value::Int(33),
     );
 }
+/// A bare `_` declares nothing, so `b: _ = a` is exactly `b = a`: a value read,
+/// and writing through it is rejected the same way. This needed a special case
+/// while the deref-copy was keyed on the annotation; now the register-typed
+/// initializer derefs before any annotation is consulted, so `_` needs none.
 #[test]
-fn wildcard_annotated_mut_alias_rejected() {
-    expect_mut_discipline_error("a: Mut(Int) := 0\nb: _ = a\nb", "not annotated `Mut`");
+fn wildcard_annotated_copy_of_a_mutable_is_a_value_read() {
+    check_scalar(
+        "a: Mut(Int) := 0\na += 5\nb: _ = a\nb",
+        cambra::interpreter::Value::Int(5),
+    );
+    expect_mut_discipline_error(
+        "a: Mut(Int) := 0\nb: _ = a\nb += 1\nb",
+        "not a mutable variable",
+    );
 }
 #[test]
 fn typed_deref_copy_of_mut_still_works() {
@@ -991,5 +1048,33 @@ fn trailing_hidden_writer_loop_compiles() {
             .err()
             .map(|e| render_errors(&e, "<test>", code))
             .unwrap_or_default()
+    );
+}
+
+/// Nested `for` loops remain unsupported. The register machinery is why this
+/// matters: a fresh `:=` inside a loop body can only be a *sequential* register
+/// (the degenerate domain) precisely because there is no inner loop for it to
+/// accumulate over. If nested loops were ever admitted without also teaching the
+/// phase about a cross-iteration register declared inside a loop, that reasoning
+/// would silently stop holding — so the rejection is pinned here, next to what
+/// depends on it.
+#[test]
+fn nested_for_loops_stay_rejected() {
+    expect_compile_error(
+        "s := 0\nfor x in [1, 2]:\n    for y in [10, 20]:\n        s += y\ns",
+        "for-loop body",
+    );
+}
+
+/// A `Lambda` param may still bind a register — that is pass-by-reference, where
+/// the register genuinely crosses a function boundary. Pinned because `emit_let`
+/// now derefs a register-typed initializer, and widening that deref to argument
+/// positions would silently turn every `Mut` parameter into a value copy: the
+/// callee would write a snapshot and the caller would observe nothing.
+#[test]
+fn a_mut_param_still_binds_a_register() {
+    check_scalar(
+        "def bump(c: Mut(Int)):\n    c += 1\nx := 0\nbump(x)\nx",
+        cambra::interpreter::Value::Int(1),
     );
 }

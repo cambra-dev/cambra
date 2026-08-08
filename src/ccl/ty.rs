@@ -439,9 +439,19 @@ pub enum Type {
     ///   are absent (no carry-forward), and `channelize` resolves it to the
     ///   collected channel.
     ///
-    /// Either way it is **invariant** in both children (a history flowing
-    /// through a function parameter both reads and writes), and it is a
-    /// **transient** variant like `Hole` / `Infer`: it exists only between type
+    /// Either way it is **invariant** in both children, and the reason is
+    /// narrower than "a reference is both read and written". A register's writes
+    /// contribute *lower* bounds to its value type — the value type is the join
+    /// over the seed and every write, and the lattice already is that join (see
+    /// the `MutWrite` arm of `infer::emit::emit_node`) — so where that type is
+    /// *inferred*, nothing uses it contravariantly and covariance would be sound.
+    /// Invariance is what protects a **declared** value type, where the same
+    /// write edge reads as a demand *on* the writes rather than a contribution
+    /// *to* them: without it, passing a `Mut({a: Int, b: Int})` register to a
+    /// parameter declared `Mut({a: Int})` would let the callee's `r := (a=5)`
+    /// drop a field the caller's declaration requires.
+    ///
+    /// It is also a **transient** variant like `Hole` / `Infer`: it exists only between type
     /// inference (which stamps it on `:=` / `defer` introductions and every
     /// reference) and the passes that erase it — the unified phase
     /// (`transact_phase` / `mut_elim`) for `Overwrite` histories, `channelize`

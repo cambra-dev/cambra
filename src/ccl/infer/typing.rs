@@ -124,9 +124,10 @@ pub(super) trait Typing {
     fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type;
 
     /// Reconcile a binder's inferred type with its user annotation. In Emit
-    /// mode this two-way-constrains the two (eagerly surfacing
-    /// [`InferError::AnnotationMismatch`]); the annotation is the canonical
-    /// type, so both directions are recorded.
+    /// mode this records the **one-way** obligation `inferred <: ann` —
+    /// an annotation has to *admit* the value, not equal it — surfacing
+    /// [`InferError::AnnotationMismatch`] on conflict. See the implementation
+    /// for why the reverse direction is wrong.
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), LocatedInferError>;
 
     /// Obtain the type for a binder slot that lives on a

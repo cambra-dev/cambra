@@ -119,6 +119,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             body,
         } => emit_let(binding, bound_expr, body, ctx)?,
 
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => emit_mut_decl(binding, init, body, ctx)?,
+
         TypedExprNode::Tuple(elts) => emit_tuple(elts, ctx)?,
 
         TypedExprNode::Record(fs) => emit_record(fs, ctx)?,
@@ -637,10 +643,10 @@ pub(super) fn emit_apply<C: Typing>(
 /// but a function domain's root, so there is no composite to walk into.
 ///
 /// Reading the parameter's `Mut` syntactically is sound here, and it is the one place
-/// that is true of a `Mut`: the mutability discipline *requires* a pass-by-reference
-/// parameter to be annotated (`check_mut_discipline`'s rule 3 rejects an unannotated
-/// mut alias), so the domain is a `History` by construction at every call this needs to
-/// see.
+/// that is true of a `Mut`: a pass-by-reference parameter is *bound at* its `Mut(V, D)`
+/// by lowering (`lower::functions::uncurry_params`, the only thing that mints one), so
+/// the domain is a `History` by construction at every call this needs to see — no
+/// annotation is consulted, and none survives inference to consult.
 fn contribute_pbr_writes<C: Typing>(
     function: &Expr,
     fn_ty: &Type,
@@ -995,70 +1001,43 @@ pub(super) fn emit_let<C: Typing>(
     } else {
         bound_ty
     };
-    // The type the variable is bound at over the body.
+    // A register-typed initializer **reads**: `b = a` off a mutable `a` binds `b`
+    // at `a`'s *value*, a snapshot, exactly as `a + 1` or `f(a)` read it — the same
+    // rule [`deref_mut`] applies to a tuple element, a record field, and a feed
+    // payload. That is the whole reason a `Let` can never bind a register: the alias
+    // `b = a` would otherwise create is unrepresentable rather than merely
+    // forbidden, so no discipline rule has to reject it.
     //
-    // A `Mut` annotation (an induction accumulator introduction, e.g. `x: Mut(V) =
-    // init`) binds the *variable* at the mutable type `Mut(V, D)`, so its
-    // references carry `Mut` and reads deref to `V` (the coercion arms in
-    // `constrain.rs`). `normalize` mints the annotation's `Hole` value/domain
-    // as fresh vars in Emit — so `?V` receives the initializer and every write
-    // — and is the identity in Check. The initializer is the mutable variable's tick-0
-    // read, so it is constrained `init <: V`; the constraint is skipped when
-    // `V` is an inferred `Hole` (a `Mut(_)` value under Check's
-    // identity-normalize), which the already-resolved tree validates on its
-    // own. The binding *slot* is left to coalesce, which fills a monomorphic
-    // `let`'s slot from its bound expression (the mutable variable's value type `V`) —
-    // the mutability is carried by the *reference* types, not the slot. The
-    // unified phase (`mut_elim`) rewrites every read/write and erases the
-    // `Mut` before the strict wall. Every other annotation reconciles the RHS
-    // as before (`x: Int = expr`).
+    // `deref_mut` keys on `as_register` (an `Overwrite` history) and not `is_handle`,
+    // which is what a `Let` needs: a **feed** channel must stay a handle here
+    // (`let d = Defer in …`), and that is what the `Append` arm above just built.
+    //
+    // Applying it *before* the annotation arms is what leaves `_` needing no
+    // special case: `b: _ = a` completes its unspecified position from an already
+    // deref'd `bound_ty`, so it means what `b = a` means.
+    let bound_ty = deref_mut(&bound_ty);
+    // The type the variable is bound at over the body.
     let scheme_ty = match &binding.user_annotation {
-        // Only a *mutable* annotation (`x: Mut(V) = init`) binds the variable at
-        // the history type and constrains `init <: V`. A `Feed`-kind history
-        // annotation is deliberately excluded: it is not a mutable-variable introduction,
-        // so it falls through to the generic `Some(ann)` arm below (there is no
-        // `Feed(…)` initializer surface today, but gating on `Overwrite` keeps this
-        // arm honest rather than silently mis-typing a channel as a value).
-        Some(ann) if ann.as_register().is_some() => {
-            let hist_ty = ctx.normalize(ann);
-            if let Some(value) = hist_ty.as_register()
-                && !matches!(value, Type::Hole)
-            {
-                let value_ty = value.clone();
-                let label = binding.name.clone();
-                // The initializer is one contribution to the register's value type,
-                // not its definition (see the `MutWrite` arm), and it flows in
-                // verbatim: the join with the register's writes is what keeps `x := 0`
-                // from pinning the register to `{Int | __elem == 0}`. A register with
-                // *no* writes keeps its seed's refinement, and that is correct — it
-                // really does hold that value at every position.
-                ctx.require_sub(&bound_ty, &value_ty, &|| {
-                    format!("initializer of mutable `{label}`")
-                })?;
-            }
-            hist_ty
-        }
+        // The annotation reconciles the initializer as an ascription. The
+        // deref-copy case that used to be special here (`y: Int = x` off a
+        // register, bound at the annotation rather than at the mutable type) is
+        // gone: `bound_ty` was already deref'd above, so annotation and
+        // initializer agree and there is nothing to choose between.
         Some(ann) => {
             ctx.bind_annotation(&bound_ty, ann)?;
-            // A non-mutable annotation on a *mutable* bound expression is a
-            // **deref-copy** (`y: int = x`): bind `y` at the annotation's value
-            // type, not the mutable type. Binding it at the mutable type makes `y` an
-            // alias of `x` in the type system, so the second-class `Mut`
-            // discipline (which keys on the type) then misfires on a variable the
-            // user declared immutable — `z = y` is rejected as an unannotated
-            // `Mut` alias (rule 3), and `y += 1` is *accepted* as a mutable write.
-            // `bind_annotation` has already reconciled the two through the deref
-            // coercion, so returning the normalized annotation is sound; for a
-            // non-mutable bound expression annotation and inferred type agree, so
-            // this stays `bound_ty`.
-            if bound_ty.is_handle() && !ann.is_handle() {
-                ctx.normalize(ann)
-            } else {
-                bound_ty
-            }
+            bound_ty
         }
         None => bound_ty,
     };
+    // The binder slot records the type the variable is *bound at*, not its
+    // initializer's type — the two differ for exactly the annotated cases above
+    // (a deref-copy binds at the value type, a register introduction at the
+    // history). Writing it here, for coalesce to resolve in place, is the same
+    // binder-slot discipline `emit_lambda` uses for `param.ty` and `emit_letrec`
+    // for its declared types; `let` was the one binder whose slot was
+    // reconstructed from its RHS afterwards instead, which is what forced the
+    // mutability checks to read `user_annotation` as a proxy for it.
+    binding.ty = scheme_ty.clone();
     let generalize = ctx.is_generalizable(bound_expr);
     let body_ty = ctx.scoped_let(&binding.name, &scheme_ty, generalize, |ctx| {
         ctx.subexpr(body)
@@ -1135,6 +1114,61 @@ pub(super) fn emit_letrec<C: Typing>(
         }
         ctx.subexpr(body)
     })
+}
+
+/// Emit/check a [`TypedExprNode::MutDecl`] — a register introduction `x := init`.
+///
+/// The binder is bound at the history `Mut(V, D)`, so references to `x` carry
+/// `Mut` and reads deref to `V` (the coercion arms in `constrain.rs`). `normalize`
+/// mints the declared type's `Hole` value/domain as fresh variables in Emit — so
+/// `?V` receives the seed and every write — and is the identity in Check.
+///
+/// The seed is one **contribution** to `V`, not its definition, and flows in
+/// verbatim: the join with the register's writes is what keeps `x := 0` from
+/// pinning the register to `{Int | __elem == 0}`. A register with *no* writes keeps
+/// its seed's refinement, and that is correct — it really does hold that value at
+/// every position. The constraint is skipped when `V` is still a `Hole` (Check's
+/// identity-normalize), which the already-resolved tree validates on its own.
+///
+/// The node's own type is its body's: a register introduction scopes a register
+/// over `body` and yields whatever `body` yields, exactly as a `let` does.
+pub(super) fn emit_mut_decl<C: Typing>(
+    binding: &mut TypedBinding,
+    init: &mut Expr,
+    body: &mut Expr,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    let init_ty = ctx.in_let_rhs(|ctx| ctx.subexpr(init))?;
+    let history = ctx.normalize(&binding.ty);
+    debug_assert!(
+        history.as_register().is_some(),
+        "a MutDecl binder must be an Overwrite history, got {history}"
+    );
+    if let Some(value) = history.as_register()
+        && !matches!(value, Type::Hole)
+    {
+        let value_ty = value.clone();
+        let label = binding.name.clone();
+        ctx.require_sub(&init_ty, &value_ty, &|| {
+            format!("initializer of mutable `{label}`")
+        })?;
+    }
+    binding.ty = history.clone();
+    // Monomorphic, like every other non-`let` binder: a register is a single
+    // object with one writer set, so there is nothing to generalize and
+    // specializing it would duplicate the register.
+    let body_ty = ctx.scoped(&binding.name, &history, |ctx| ctx.subexpr(body))?;
+    // The body type is returned as-is, *not* through `close_let_type`. A `let`'s
+    // binder can be discharged into the lifted type because the binder simply *is*
+    // its bound expression; a register is not — its value is the join over the seed
+    // and every write, so `[x ↦ seed]` would assert that it never changed. There is
+    // no term to substitute, which is also why coalesce has no closing step for this
+    // node (`solve.rs`'s let-closing matches `Let` alone).
+    //
+    // A register free in a body type's refinement predicate therefore has nothing to
+    // close it, and is an unsupported shape rather than a silently wrong one: it fails
+    // downstream on the mutable type surviving the unified phase.
+    Ok(body_ty)
 }
 
 /// Emit/check a direct-mirror statement `for` loop ([`TypedExprNode::For`]):

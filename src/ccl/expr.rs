@@ -58,26 +58,39 @@ pub const F_WRITE: &str = "write";
 /// both the inferred type and any user-written annotation at each binding site.
 ///
 /// `ty` starts as [`Type::Hole`] (lowering placeholder) and is converted to a
-/// registered [`Type::Infer`] variable at inference entry, then filled in with
-/// the concrete type by [`crate::ccl::infer::infer`].
-/// `user_annotation` is set at construction time by lowering when the source
-/// Python carries an explicit type cast; the inference pass checks that the
-/// inferred type is compatible with it.
+/// registered [`Type::Infer`] variable at inference entry; inference then writes
+/// **the type the binder is bound at** into it. `user_annotation` is a
+/// *pre-inference input only* — lowering writes the source annotation there,
+/// inference reconciles it and clears the slot, and no pass downstream may
+/// observe one (`infer::api::debug_assert_annotations_cleared`). What survives the
+/// clearing is nothing: register-ness is answered by
+/// [`TypedExprNode::MutDecl`] being the node that binds one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedBinding {
     /// The bound variable name. Carries the binder's identity (`uid`) under
     /// the Barendregt convention; see [`Name`].
     pub name: Name,
-    /// The variable's type, filled in by type inference.
+    /// The type the binder is bound at.
     ///
     /// Starts as [`Type::Hole`] (lowering placeholder); converted to [`Type::Infer`]
     /// at inference entry and written to a concrete type by [`crate::ccl::infer::infer`].
-    pub ty: Type,
-    /// User-written type annotation, if any.
     ///
-    /// Set by lowering when the source Python carries an explicit type annotation
-    /// (e.g. `x: int = expr`). The inference pass checks that the inferred type is
-    /// compatible with it and raises [`crate::ccl::infer::InferError::AnnotationMismatch`] on conflict.
+    /// This is the type *references to the binder* have, which for an annotated
+    /// binder is not necessarily its initializer's type: a deref-copy
+    /// (`y: Int = x` off a register `x`) binds `y` at the value type, and a
+    /// register introduction (`x: Mut(V) := init`) binds `x` at the history.
+    /// Recording the initializer's type here instead is what forced the
+    /// mutability checks to consult `user_annotation` as a proxy.
+    pub ty: Type,
+    /// User-written type annotation, if any — **cleared at the end of inference**.
+    ///
+    /// Set by lowering when the source carries an explicit type annotation
+    /// (e.g. `x: Int = expr`). A `:=` introduction does *not* use this slot — its
+    /// history rides the binder's `ty`, because [`TypedExprNode::MutDecl`] is a
+    /// register introduction by construction. Inference reconciles the inferred type against it,
+    /// raising [`crate::ccl::infer::InferError::AnnotationMismatch`] on conflict,
+    /// then clears it — a retained annotation is a pre-inference marker that
+    /// later passes can only misread.
     pub user_annotation: Option<Type>,
 }
 
@@ -96,14 +109,19 @@ impl TypedBinding {
 
     /// Create an annotated binding with a [`Type::Hole`] placeholder and a user annotation.
     ///
-    /// Use this at lowering time when the source Python carries an explicit type annotation
-    /// (e.g. `x: int = expr`). `ty` is still [`Type::Hole`] — the inference pass fills it in.
+    /// Use this at lowering time when the source carries an explicit type annotation
+    /// (e.g. `x: Int = expr`). `ty` is still [`Type::Hole`] — the inference pass fills it in.
     pub fn new_annotated(name: impl Into<Name>, annotation: Type) -> Self {
         TypedBinding {
             name: name.into(),
             ty: Type::Hole,
             user_annotation: Some(annotation),
         }
+    }
+
+    /// Attach a user annotation to an already-constructed binding.
+    pub fn declare(&mut self, annotation: Type) {
+        self.user_annotation = Some(annotation);
     }
 }
 
@@ -422,6 +440,38 @@ pub enum TypedExprNode {
         body: Box<TypedExpr>,
     },
 
+    /// A mutable variable's **introduction**: `x := init` (or `x: Mut(V, D) := init`),
+    /// binding `x` as a register over `body`.
+    ///
+    /// The surface marker for the `:=` operator's *declaring* half, paired with
+    /// [`TypedExprNode::MutWrite`] for its *writing* half. Both are eliminated by
+    /// the unified phase (`transact_phase` / `mut_elim`), which turns the pair into
+    /// one `letrec` recurrence (a loop-carried accumulator) or a chain of shadowing
+    /// `Let`s (the degenerate sequential domain).
+    ///
+    /// **This is the only node that binds a register.** That is the point: it makes
+    /// "is this binder mutable?" a question about the *node* rather than about a
+    /// type that happened to survive inference. A [`TypedExprNode::Let`] cannot bind
+    /// one — a register-typed initializer *reads* there (derefs), exactly as a
+    /// register read does in any other value position — so no discipline rule is
+    /// needed to reject the alias `b = a` would otherwise create. Before this node
+    /// existed, an introduction was a `Let` carrying a `Mut` annotation, and every
+    /// pass that needed to recognize one consulted that annotation as a proxy for
+    /// the declaration.
+    ///
+    /// A `Lambda` param *can* still bind a register: that is pass-by-reference,
+    /// where the register genuinely crosses a function boundary.
+    MutDecl {
+        /// The register's binder. Its `ty` is the history `Mut(V, D)`.
+        binding: TypedBinding,
+        /// The seed — the register's value at the first position of its domain.
+        /// One *contribution* to `V`, not its definition: the value type is the
+        /// join over the seed and every write.
+        init: Box<TypedExpr>,
+        /// The expression over which `binding.name` is a live register.
+        body: Box<TypedExpr>,
+    },
+
     /// One write to a `Mut`-declared variable: `name = value` inside a
     /// [`TypedExprNode::For`] body. Value `Unit`.
     ///
@@ -582,6 +632,7 @@ impl TypedExprNode {
             TypedExprNode::Lambda { .. } => "Lambda",
             TypedExprNode::Aggregate { .. } => "Aggregate",
             TypedExprNode::Let { .. } => "Let",
+            TypedExprNode::MutDecl { .. } => "MutDecl",
             TypedExprNode::List(_) => "List",
             TypedExprNode::Case { .. } => "Case",
             TypedExprNode::VariantCtor { .. } => "VariantCtor",
@@ -1036,6 +1087,24 @@ impl TypedExpr {
         .with_ty(ty)
     }
 
+    /// Construct a [`TypedExprNode::MutDecl`] — a register introduction `x := init`.
+    ///
+    /// `history` is the binder's `Mut(V, D)` type: `V` the declared value type (a
+    /// [`Type::Hole`] when it is to be inferred) and `D` the sequencing domain
+    /// (`Txn` for a transactional register, a `Hole` for an induction accumulator
+    /// whose domain the unified phase resolves).
+    pub fn mut_decl(name: impl Into<Name>, history: Type, init: Self, body: Self) -> Self {
+        Self::new(TypedExprNode::MutDecl {
+            binding: TypedBinding {
+                name: name.into(),
+                ty: history,
+                user_annotation: None,
+            },
+            init: Box::new(init),
+            body: Box::new(body),
+        })
+    }
+
     /// Construct an annotated let binding expression.
     ///
     /// Like [`Self::let_bind`] but sets [`TypedBinding::user_annotation`] to `annotation`.
@@ -1264,6 +1333,10 @@ impl TypedExpr {
                 f(bound_expr.as_ref());
                 f(body.as_ref());
             }
+            TypedExprNode::MutDecl { init, body, .. } => {
+                f(init.as_ref());
+                f(body.as_ref());
+            }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
@@ -1436,6 +1509,10 @@ impl TypedExpr {
                 f(bound_expr.as_mut());
                 f(body.as_mut());
             }
+            TypedExprNode::MutDecl { init, body, .. } => {
+                f(init.as_mut());
+                f(body.as_mut());
+            }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
@@ -1509,6 +1586,7 @@ impl TypedExpr {
         match &self.node {
             TypedExprNode::Lambda { param, .. }
             | TypedExprNode::Let { binding: param, .. }
+            | TypedExprNode::MutDecl { binding: param, .. }
             | TypedExprNode::For { target: param, .. } => f(param),
             TypedExprNode::LetRec { bindings, .. } => {
                 bindings.iter().for_each(|(b, _)| f(b));
@@ -1554,6 +1632,7 @@ impl TypedExpr {
         match &mut self.node {
             TypedExprNode::Lambda { param, .. }
             | TypedExprNode::Let { binding: param, .. }
+            | TypedExprNode::MutDecl { binding: param, .. }
             | TypedExprNode::For { target: param, .. } => f(param),
             TypedExprNode::LetRec { bindings, .. } => {
                 bindings.iter_mut().for_each(|(b, _)| f(b));
@@ -1612,11 +1691,12 @@ impl TypedExpr {
     /// one place instead of every such pass, and a pass cannot acquire a blind
     /// spot by omission.
     ///
-    /// **A binder's annotation is a slot, not decoration.** Lowering writes a
-    /// mutable variable's `Mut(V, D)` history *there* rather than on `b.ty`
-    /// (`x := e` lowers via `let_bind_annotated`), and `infer::api::binder_is_mut`
-    /// reads it as authoritative over `b.ty`. A walk that visits only `b.ty` will
-    /// silently skip every mutable binder in the program.
+    /// **A binder's annotation is a slot, not decoration**, even though it is a
+    /// short-lived one: lowering writes the user's declared type there and
+    /// inference clears it ([`TypedBinding::user_annotation`]). Any pass that runs
+    /// *before* inference completes — and lowering's own rewrites — therefore has a
+    /// binder annotation to reach, and a walk that visits only `b.ty` misses every
+    /// predicate riding one.
     ///
     /// **Coverage is exact for every variant except
     /// [`TypedExprNode::Transact`]**, whose `domain` — the sequencing extent, or

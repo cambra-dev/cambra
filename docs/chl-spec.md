@@ -1266,8 +1266,27 @@ A plain `=` whose target is a **fresh** name (not introduced in an outer
 frame) is unaffected: an ordinary per-iteration binding, in scope for the
 rest of that iteration and gone at the next.
 
+The converse also holds: a mutable variable must be introduced **before**
+the loop that accumulates it. A `:=` inside a loop body whose target is not
+an already-declared accumulator is a lowering error, at every spelling —
+`y := 0`, `y: Int := 0`, and `y: Mut(Int) := 0` alike, since whether an
+introduction carries a type annotation says nothing about whether it
+introduces a mutable variable. A register scoped to one iteration would need
+the loop's own iteration extent as its sequencing domain, which is the
+nested-recurrence case below:
+
+> `Y is a mutable variable introduced inside a for-loop body, which is not
+> supported: declare it before the loop (`Y := …`) so its updates carry
+> across iterations, or bind a per-iteration value immutably with `Y = …``
+
+Falling back to a per-iteration binding is deliberately *not* what happens,
+for the reason a plain `=` to an outer name is rejected: it would silently
+discard every update at the iteration boundary, which is the one thing `:=`
+exists to rule out.
+
 *Currently unsupported* (see §12): nested for-loops with mutable
-variables, and `while` loops.
+variables, mutable variables introduced inside a loop body or a `with
+begin():` block, and `while` loops.
 
 ### 4.7 `pass`
 
@@ -1729,9 +1748,14 @@ balance: Mut(Int, Txn) := 0    # transactional register over the commit order
   (§6.2). It carries a **downward-only, no-aliasing** discipline: a `Mut`
   argument is always a bare variable (never a computed expression), `Mut`
   never appears inside a composite type (no tuple/record/list/`Feed` of
-  `Mut`, so it is never returned), and an unannotated `b = a` copy of a
-  mutable is rejected — to copy the current value demand the deref
-  (`b: Int = a`), to seed a *new* mutable use `:=` (`b: Mut(Int) := a`).
+  `Mut`, so it is never returned).
+
+  A plain `b = a` off a mutable **reads** it — a snapshot of its current
+  value, exactly as `a + 1` or `f(a)` read it. It is not an alias, and not
+  an error: only `:=` introduces a mutable, so `b` is an ordinary
+  immutable binding and writing through it (`b += 1`) is the type error
+  §8.1 already gives. To seed a *new* mutable from one, use `:=`
+  (`b := a`); no annotation is required.
 
 A name needs `:=` exactly when its history spans iterations or
 transactions; a value computed once and never rewritten stays a plain `=`.
@@ -2027,6 +2051,11 @@ with parser-level support that lowering rejects:
 - **Nested `for` loops with mutable variables** — a single-level
   for-loop accumulator works (§4.6), but mutation inside a nested loop
   is not yet lowered.
+- **A mutable variable introduced inside a loop body or a transaction
+  block** — a mutable variable must be declared before the loop that
+  accumulates it (§4.6), and a `with begin():` block may write registers
+  declared outside it but not introduce its own. Both would need a
+  sequencing domain nested inside the enclosing one.
 - **Generator body shapes** — a `def` containing any `yield` is a
   generator function semantically (§4.2), but today the compiler only
   accepts bodies that are exactly one top-level `for`. Top-level

@@ -399,19 +399,18 @@ fn project_reads(e: &mut Expr, used: &[&LiveRead], snap: &Name, snap_ty: &Type) 
 }
 
 /// Collect the α-unique [`Name`]s of every transactional register — a `Let`
-/// binding whose type or [`crate::ccl::TypedBinding::user_annotation`] is
-/// `Mut(_, Txn)`. The type classifies a binding as a register; the binder `Name`
-/// *is* its identity — this is the source of truth [`run`] keys on (replacing the
-/// lowering-time base-name registry).
+/// binding *bound at* `Mut(_, Txn)`. The type classifies a binding as a register;
+/// the binder `Name` *is* its identity — this is the source of truth [`run`] keys
+/// on (replacing the lowering-time base-name registry).
 ///
 /// Run on the **inlined, typed** tree: a cross-function writer
 /// (`def transfer(src: Mut(Int, Txn), …)`) has already been beta-reduced to its
 /// call site, so its writes name the caller's register binding (`a`/`b`), and the
 /// stores themselves are the caller's top-level `Mut(_, Txn)` `let`s — which
-/// this finds. A register's value slot (`binding.ty`) coalesces to the value
-/// type `V`, with the `Mut(_, Txn)` carried on the annotation and the
-/// references; either position is checked, so detection does not depend on which
-/// one holds the wrapper.
+/// this finds. The binder slot carries the wrapper because it records what the
+/// binder is *bound at*; while it recorded the initializer's type instead it
+/// coalesced to the bare value type `V`, and this had to check the annotation as
+/// a second candidate position.
 pub fn collect_txn_registers(expr: &Expr) -> HashSet<Name> {
     /// Whether `ty` is (a refinement of) `Mut(_, Txn)`.
     fn is_txn_register(ty: &Type) -> bool {
@@ -429,12 +428,8 @@ pub fn collect_txn_registers(expr: &Expr) -> HashSet<Name> {
         }
     }
     fn go(expr: &Expr, out: &mut HashSet<Name>) {
-        if let TypedExprNode::Let { binding, .. } = &expr.node
-            && (is_txn_register(&binding.ty)
-                || binding
-                    .user_annotation
-                    .as_ref()
-                    .is_some_and(is_txn_register))
+        if let TypedExprNode::MutDecl { binding, .. } = &expr.node
+            && is_txn_register(&binding.ty)
         {
             out.insert(binding.name.clone());
         }
@@ -568,7 +563,7 @@ pub fn run(expr: Expr, txn_registers: &HashSet<Name>) -> Expr {
         }
     }
 
-    // Each key's tick-0 `init`, located at its `let` binding (the value type is
+    // Each key's tick-0 `init`, located at its `MutDecl` (the value type is
     // the init's type — the snapshot/write element type of that register).
     let mut key_init: HashMap<Name, Expr> = HashMap::new();
     collect_key_inits(&stripped, &key_names, &mut key_init);
@@ -909,6 +904,16 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
                 node_id,
             }
         }
+        // A register introduced *inside* the block. Unreachable: lowering does not
+        // bind a `:=` introduction inside a `with begin():` block at all (the body
+        // reference reports `Unbound variable`), so no block spine contains one.
+        // When that gap closes this threads `rest` into the body exactly as the
+        // `Let` arm above does — written as a `todo!` rather than that one-liner so
+        // the first tree that reaches it is loud instead of silently plausible.
+        TypedExprNode::MutDecl { .. } => todo!(
+            "splice_block: a register declared inside a `with begin():` block — \
+             lowering cannot produce one yet"
+        ),
         // A read-only block is a `Let`/`ExprStmt`(feed) chain ending in `Unit`;
         // any other terminal is unexpected — sequence it defensively before rest.
         other => {
@@ -988,6 +993,14 @@ fn partition_spine(expr: Expr, txn_registers: &HashSet<Name>, lifted: &mut Vec<E
                 node_id,
             }
         }
+        // Unreachable for the same reason as in `splice_block`: this walks a
+        // *block's* spine, and a register cannot be declared inside a block.
+        // A top-level register introduction is not this spine — it is above the
+        // block, where `rebind_letrec` handles it.
+        TypedExprNode::MutDecl { .. } => todo!(
+            "partition_spine: a register declared inside a `with begin():` block — \
+             lowering cannot produce one yet"
+        ),
         node => Expr {
             node,
             ty,
@@ -1531,6 +1544,15 @@ fn walk_block(
                 allowed_writes,
             );
         }
+        // Unreachable, as in `splice_block` / `partition_spine`. The rule it would
+        // implement is known — the seed enters the read-your-writes environment
+        // exactly as a `Let`'s bound value does — but a block-local register also
+        // needs a decision this pass cannot make alone: whether its writes join the
+        // enclosing commit or are private to the block.
+        TypedExprNode::MutDecl { .. } => todo!(
+            "walk_block: a register declared inside a `with begin():` block — \
+             lowering cannot produce one yet"
+        ),
         TypedExprNode::ExprStmt { expr, body } => {
             match &expr.node {
                 TypedExprNode::MutWrite { name, value } => {
@@ -1753,15 +1775,11 @@ fn subst_env(e: &Expr, env: &HashMap<Name, Expr>) -> Expr {
 /// the outermost when a key is bound more than once). The `init` carries the
 /// key's value type (its `.ty`).
 fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, Expr>) {
-    if let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        ..
-    } = &expr.node
+    if let TypedExprNode::MutDecl { binding, init, .. } = &expr.node
         && keys.contains(&binding.name)
         && !out.contains_key(&binding.name)
     {
-        out.insert(binding.name.clone(), (**bound_expr).clone());
+        out.insert(binding.name.clone(), (**init).clone());
     }
     expr.walk_children(|c| collect_key_inits(c, keys, out));
 }
@@ -2246,33 +2264,49 @@ fn rebind_letrec(
         node_id,
     } = expr;
     match node {
-        TypedExprNode::Let {
+        // A register introduction. A *key* declaration is dropped (its seed was
+        // captured in `key_init`) and re-bound at the tail splice; a non-key
+        // register is an induction accumulator, whose seed must stay above its own
+        // history letrec, which reads it as the recurrence default.
+        TypedExprNode::MutDecl {
             binding,
-            bound_expr,
+            init,
             body,
         } => {
             if key_names.contains(&binding.name) {
-                // Register-key declaration: drop it (init captured in `key_init`),
-                // recurse into the body — the key is re-bound at the tail splice.
                 rebind_letrec(*body, key_names, hist, key_init, hoisted, bindings, cross)
             } else {
-                // A non-key `let` (a writer source, or an unrelated local): keep it
-                // *above* the splice so the letrec's writers can reference it. An
-                // induction accumulator's pre-loop init (`let cnt = 0`) is such a
-                // `let`, and stays above its `cnt` history letrec (spliced at the
-                // tail), which reads it as the recurrence default.
                 let inner =
                     rebind_letrec(*body, key_names, hist, key_init, hoisted, bindings, cross);
                 Expr {
-                    node: TypedExprNode::Let {
+                    node: TypedExprNode::MutDecl {
                         binding,
-                        bound_expr,
+                        init,
                         body: Box::new(inner),
                     },
                     ty,
                     user_annotation,
                     node_id,
                 }
+            }
+        }
+        // A `let` (a writer source, or an unrelated local): keep it *above* the
+        // splice so the letrec's writers can reference it.
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let inner = rebind_letrec(*body, key_names, hist, key_init, hoisted, bindings, cross);
+            Expr {
+                node: TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body: Box::new(inner),
+                },
+                ty,
+                user_annotation,
+                node_id,
             }
         }
         // The tail — below every source binding, above the trailing register reads.
@@ -2423,7 +2457,19 @@ mod tests {
         stmt.ty = Type::Base(BaseType::Unit);
         let mut init = Expr::new(TypedExprNode::Lit(Lit::Int(100)));
         init.ty = int;
-        let mut tree = Expr::let_bind(pool.clone(), init, stmt);
+        // The register introduction is a `MutDecl`, not a `let`: that is what makes
+        // it findable as a declaration (`collect_txn_registers`, `collect_key_inits`)
+        // without asking whether a `let` happens to carry a `Mut` annotation.
+        let mut tree = Expr::mut_decl(
+            pool.clone(),
+            Type::History {
+                value: Box::new(Type::Base(BaseType::Int)),
+                domain: Box::new(Type::Txn),
+                kind: HistoryKind::Overwrite,
+            },
+            init,
+            stmt,
+        );
         tree.ty = Type::Base(BaseType::Unit);
         (tree, pool)
     }
