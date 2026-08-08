@@ -92,6 +92,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Cast: an upcast re-viewing `value` at the supertype `target`. See
         // [`emit_cast`] (shared with `check_node`).
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
+        // Realization is a planning rewrite, so it is born after inference has finished:
+        // Emit only ever runs on a tree that has none. The post-inference check *does*
+        // meet them, and trusts the assertion ([`check_node_rule`]).
+        TypedExprNode::Realize(_) => {
+            unreachable!("Realize is born in planning, after inference")
+        }
 
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
@@ -337,10 +343,19 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), L
             emit_annotation_predicates(value, ctx)?;
             emit_annotation_predicates(domain, ctx)
         }
+        Type::Sigma(s) => {
+            for t in s.witness.types_mut() {
+                emit_annotation_predicates(t, ctx)?;
+            }
+            // A witness is a type, referenced anonymously in the body's domain
+            // position, so it introduces no term binder to scope the body under.
+            emit_annotation_predicates(&mut s.body, ctx)
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::WitnessRef(_)
         | Type::Txn
         | Type::Hole
         | Type::Infer(_) => Ok(()),
@@ -479,7 +494,12 @@ pub(super) fn emit_lambda<C: Typing>(
     let body_ty = ctx.scoped(&param.name, &param_simple, |ctx| ctx.subexpr(body))?;
 
     // Param user-annotation: reconcile the inferred param type with the
-    // annotation (two-way; see `bind_annotation`).
+    // annotation (two-way; see `bind_annotation`). An annotation is one *bound* on
+    // the param, not a replacement for it — which is why a caller's singleton
+    // survives `def g(a: Int): a` applied to `1`, and why a `List(𝑇)` annotation
+    // and a consumer's `𝐷 ⤇ 𝑉` demand land as two bounds on one variable. Meeting
+    // those two *is* the sum being consumed, and the single domain carrier is what makes
+    // the bound-meet able to perform it.
     if let Some(ann) = param.user_annotation.clone() {
         ctx.bind_annotation(&param_simple, &ann)?;
     }
@@ -1177,8 +1197,8 @@ pub(super) fn emit_list<C: Typing>(
     // Deref a bare mutable read to its value, as in `emit_tuple`: the list's
     // element (codomain) type takes the dereferenced element type so no `Mut`
     // appears in the list type. A list literal is a **data** function — its
-    // domain is the index set, so a join with another collection may not narrow
-    // it — see `src/ccl/design/type-inference.md`, "The domain join is a Σ".
+    // domain is the index set, so a join with another collection
+    // is lossless (forms a conditional-collection Sigma), never a lossy meet.
     Ok(Type::data_fun(Type::UIntRange(n), deref_mut(&first_ty)))
 }
 
@@ -1231,10 +1251,10 @@ pub(super) fn emit_case<C: Typing>(
     // domain rides the contravariant `Fun` domain — it demands `D <: {D | p}`,
     // rejecting two arms that are the same expression.
     //
-    // Data-collection arms with distinct domains are rejected at coalesce rather
-    // than met (`CoalesceError::DomainJoinConflict`). (Heterogeneous *scalar* arms
-    // remain a hard `IncompatibleBounds` error — the sound union relaxation for
-    // them is deferred; see `coalesce`.)
+    // Data-collection arms with distinct domains coalesce to a
+    // conditional-collection Sigma. (Heterogeneous *scalar* arms remain a hard
+    // `IncompatibleBounds` error — the sound union relaxation for them is
+    // deferred; see `coalesce`.)
     //
     // A `Mut` arm needs no special case: it derefs into the join like any other
     // read, so a `Case` over two registers types as their *value*. The

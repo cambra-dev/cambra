@@ -18,20 +18,25 @@ use crate::{
 /// unannotated parameter). Mirrors the `Mut(…)` stamping of an induction
 /// introduction (`lower/stmts.rs :: mut_annotation_parts`).
 ///
-/// The sequencing domain is left inferred (`D = Hole` → a fresh variable,
-/// generalized per call site) even for a `Txn` register param: the call-site
-/// argument's `Mut(_, Txn)` type pins `D = Txn` by the invariant `(Mut, Mut)`
-/// edge, and leaving it open lets one `def bump(c: Mut(Int))` serve both an
-/// induction accumulator and a register. The transactional flag *is* returned
-/// so the body's `with begin():` writes register as transactional at lowering
-/// time (the block-classification decision runs before inference).
+/// The sequencing domain is the one the annotation *declares*: `Txn` for a
+/// `Mut(V, Txn)` register (a transactional register param is transactional —
+/// that is its contract), and `Hole` → a fresh variable, generalized per call
+/// site, when the domain is omitted (`Mut(V)`), so one `def bump(c: Mut(Int))`
+/// still serves both an induction accumulator and a register (the call-site
+/// argument's `Mut(_, D)` type pins the open `D`). Under bidirectional checking
+/// mode `emit_lambda` binds the param *at* this type, so a declared `Txn` must
+/// be concrete here — otherwise the body's register machinery sees an
+/// unpinned domain var (nothing internal forces it to `Txn`) and faults.
+/// The transactional flag is also returned so the body's `with begin():` writes
+/// register as transactional at lowering time (block classification runs before
+/// inference).
 fn mut_param_history_type(param: &Param) -> Option<Result<(Type, bool), LoweringError>> {
     let annotation = param.annotation.as_ref()?;
     match mut_annotation_parts(annotation) {
         Some(Ok((value, is_txn))) => Some(Ok((
             Type::History {
                 value: Box::new(value),
-                domain: Box::new(Type::Hole),
+                domain: Box::new(if is_txn { Type::Txn } else { Type::Hole }),
                 kind: crate::ccl::HistoryKind::Overwrite,
             },
             is_txn,

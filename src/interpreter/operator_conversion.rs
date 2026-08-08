@@ -888,6 +888,12 @@ fn convert_impl_inner(
         // value-level inert.
         TypedExprNode::Cast { value, .. } => convert_impl(value, input, ctx),
 
+        // `realize` is likewise inert here, and for a sharper reason: its job was to let
+        // the *type* above it stay unchanged while the value below became the executable
+        // form. Op-conversion wants the executable form, so the wrapper is dropped and the
+        // value compiled — its own type, not the asserted one, is what extents read from.
+        TypedExprNode::Realize(value) => convert_impl(value, input, ctx),
+
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
         TypedExprNode::Apply { argument, function }
             if let Some(kind) = as_builtin(function).and_then(builtin_to_aggregate) =>

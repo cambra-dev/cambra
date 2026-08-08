@@ -225,6 +225,31 @@ impl Typing for CheckCtx {
                 value,
                 kind: HistoryKind::Append,
             } => Ok(((**domain).clone(), (**value).clone())),
+            // A collection **sum** in function position is consumed as a sum rather than
+            // by being a function: what the consumer sees is a named
+            // domain — "whichever domain the witness picked"
+            // — paired with the body's shared element type. That is exactly what the
+            // solver's `(Σ, Fun)` arm presents, so Check and Emit agree at the wall about
+            // what a consumed collection destructures to.
+            //
+            // A **witness-bodied** sum has no shared element type to give, so it is not
+            // destructured here and reaches the error below by name: consuming one is
+            // per-candidate, which this position cannot express.
+            Type::Sigma(s) if s.body_residue().is_some() => {
+                let (_, cod) = s.body_residue().expect("guarded by the arm");
+                // **Opened, exactly as Emit opens it.** The consumer's domain is a name for
+                // whichever domain the witness picked, carrying the kind it ranges over —
+                // not a sum `Σ 𝐷 ∈ 𝐾. 𝐷` standing where a domain belongs, which would reconstruct a function *on* the
+                // sum where the recorded type is the sum itself. Check and Emit have to
+                // agree at the wall about what a consumed collection destructures to, and
+                // the way to guarantee that is to run the same rule.
+                // Publish what the binder ranges over before handing out a bare reference
+                // to it: a `Type::WitnessRef` names a binder and nothing else, so every
+                // later reader finds the range through the index.
+                crate::ccl::ty::witness_ctx::note_range(s.binder(), s.kind());
+                let opened = Type::WitnessRef(s.binder());
+                Ok((opened, cod.clone()))
+            }
             _ => {
                 let located = self.raise(InferError::ExpectedFunction {
                     found: t.clone(),
@@ -341,6 +366,14 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, ctx)?,
 
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
+        // **The assertion is trusted**, which is the whole difference from `Cast`. The
+        // relation it claims — a gated tagged union realizing a sum — is one no typing rule
+        // can check, so re-deriving from the value would only rediscover that they differ.
+        // The child is still walked: it is an ordinary term and its own subtree must check.
+        TypedExprNode::Realize(value) => {
+            ctx.subexpr(value)?;
+            expr.ty.clone()
+        }
 
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
@@ -428,6 +461,21 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
     // case — eliminators that destructure return the function's own codomain,
     // constructors rebuild the same product), the subtype check is reflexive
     // and trivially holds, so skip the (deeper, allocating) `constrain_subtype`.
+    // **A Σ-typed node takes its recorded wrapper.** A rule reconstructs a node's type from
+    // its children, and no child carries the witness — a sum is a fact about the node
+    // alone. The lambda rule in particular always builds a *compute* Pi, because nothing at
+    // that node says its morphism is a collection. So on a Σ-typed node the reconstruction
+    // differs in the wrapper (the sum, and the arrow's kind) while agreeing on what it
+    // actually derived. Rebuild the wrapper from the recorded type and compare the rest:
+    // the domain and codomain still come from the reconstruction, so a genuine
+    // disagreement about either still fails below.
+    let ty = match (&expr.ty, &ty) {
+        (Type::Sigma(_), _) => match (ty.domain(), ty.codomain()) {
+            (Some(d), Some(c)) => Type::fun_like(&expr.ty, d, c),
+            _ => ty,
+        },
+        _ => ty,
+    };
     if ty != expr.ty {
         // Refinements included: this is the plain strict relation, like every other
         // check here. A rule that rebuilds a node's type from its children rebuilds

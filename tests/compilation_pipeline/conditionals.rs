@@ -187,78 +187,168 @@ fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] exp
 // Data-collection value selection — the gate fan-out
 //
 // `zs = xs if c else ys` compiles to `⧺ᵢ (xsᵢ | π̂ᵢ)`: each arm's whole
-// collection restricted by its constant gate, unioned. The result is the type the
+// collection restricted by its constant gate, unioned. The result is the Σ the
 // type system gave the `Case`; exactly one gated arm is non-empty, so consuming
 // the union (here via `sum`) sees just that arm's elements.
 //
-// The union's tagged-`Variant` domain reconciles against the arms' joined data
-// function by `is_index_partition_of`: every leg is that one domain under its own
-// gate. Arms at *distinct* domains have no join to subtype against and are rejected
-// at inference, so the fan-out is only built at one domain.
+// The union's tagged-`Variant` domain reconciles against the Σ by
+// Σ-width (distinct domains → the compiled partition realizes the whole
+// Σ; same-domain collapse → it subtypes the collapsed plain data fun).
 // ---------------------------------------------------------------------------
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-// Two arms at one domain.
+// Distinct-domain arms — the `Case` types as a Σ; `sum` consumes it via `Σ <: Fun`.
 #[case(
     r"
 c: Bool = True
-sum([1, 2] if c else [3, 4])",
+sum(box([1, 2]) if c else box([1, 2, 3]))",
     Value::Int(3)
 )]
 #[case(
     r"
 c: Bool = False
-sum([1, 2] if c else [3, 4])",
+sum(box([1, 2]) if c else box([1, 2, 3]))",
+    Value::Int(6)
+)]
+// Same-domain arms — the Σ collapses to a plain data function.
+#[case(
+    r"
+c: Bool = True
+sum(box([1, 2]) if c else box([3, 4]))",
+    Value::Int(3)
+)]
+#[case(
+    r"
+c: Bool = False
+sum(box([1, 2]) if c else box([3, 4]))",
     Value::Int(7)
 )]
 // Guard is a computed comparison.
 #[case(
     r"
 n: Int = 2
-sum([10, 20] if n == 1 else [1, 2])",
-    Value::Int(3)
+sum(box([10, 20]) if n == 1 else box([1, 2, 3, 4]))",
+    Value::Int(10)
+)]
+// `elif` over collections — first matching arm's collection wins.
+#[case(
+    r"
+n: Int = 2
+sum(box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))",
+    Value::Int(4)
 )]
 #[case(
     r"
-n: Int = 1
-sum([10, 20] if n == 1 else [1, 2])",
-    Value::Int(30)
+n: Int = 3
+sum(box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))",
+    Value::Int(9)
 )]
-// `elif` over collections — first matching arm's collection wins. **Three legs over
-// one fiber**: the three arms all have domain `[0, 1)`, so the fan-out is a
-// three-leg `Variant` whose payloads are all that one domain under different gates.
-// This is exactly what `is_index_partition_of` must accept — a positional
-// leg↔domain bijection would reject it — and what an `if`/`elif` accumulator write
-// produces.
+// **Repeated domain across branches.** `[1]` and `[2]` share domain `[0,1)`, so
+// the Σ has *two* candidates (`{[0,1), [0,2)}`) but the fan-out has *three*
+// legs. This is why leg↔candidate is a **surjection**: two legs realize the
+// shared `[0,1)` candidate, their gates partitioning "branch a or b was taken".
+// A rule demanding one leg per candidate would reject it.
 #[case(
     r"
 n: Int = 1
-sum([1] if n == 1 else [2] if n == 2 else [3])",
+sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))",
     Value::Int(1)
 )]
 #[case(
     r"
 n: Int = 2
-sum([1] if n == 1 else [2] if n == 2 else [3])",
+sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))",
     Value::Int(2)
 )]
 #[case(
     r"
 n: Int = 9
-sum([1] if n == 1 else [2] if n == 2 else [3])",
-    Value::Int(3)
+sum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))",
+    Value::Int(6)
 )]
 fn test_value_case_collection_sum(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-// A conditional collection as the program result: the tagged union tile carries
-// exactly the selected arm (the other legs are gated empty). This pins the tile
-// shape, which the `sum` cases above only exercise through an aggregate.
+/// Arms whose domains share a **base** but differ by a refinement: a filtered
+/// comprehension beside an unfiltered collection over the same range. The Σ is
+/// `Σ 𝐷 ∈ {{[0,2]|p}, [0,2]}. 𝐷` — two candidates, one base, distinguished by nothing
+/// but their refinements.
+///
+/// That is what makes these the cases where a *deep* refinement strip is
+/// indistinguishable from the right answer at the type level and catastrophic at the
+/// value level: both candidates strip to `[0,2]`, so realization still builds two legs
+/// over two apparently-fine domains — and the filtered leg silently iterates all three
+/// elements, because the filter it lost was the only thing that was going to become a
+/// `Restrict`. The wrong answer is the *unfiltered* sum, which is why the expected values
+/// here differ by exactly the elements a missing filter would readmit.
+///
+/// Both branch orders are pinned: with a shared base, an asymmetry between the two is the
+/// signature of a rule that reads the candidates positionally.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Filtered arm first (`c` true → the filtered arm, `[2, 3]`).
+#[case(
+    r"
+c: Bool = True
+sum(box([x for x in [1, 2, 3] if x > 1]) if c else box([1, 2, 3]))",
+    Value::Int(5)
+)]
+// The same program with the arms swapped (`c` true → the unfiltered arm).
+#[case(
+    r"
+c: Bool = True
+sum(box([1, 2, 3]) if c else box([x for x in [1, 2, 3] if x > 1]))",
+    Value::Int(6)
+)]
+// Off-path selection through the shared base: `c` false takes the second arm.
+#[case(
+    r"
+c: Bool = False
+sum(box([x for x in [1, 2, 3] if x > 1]) if c else box([1, 2, 3]))",
+    Value::Int(6)
+)]
+// Both arms filtered, by *different* predicates — two distinct refined
+// candidates over one base, so neither leg subtypes the other's candidate.
+#[case(
+    r"
+c: Bool = True
+sum(box([x for x in [1,2,3] if x > 1]) if c else box([y for y in [1,2,3] if y > 2]))",
+    Value::Int(5)
+)]
+fn test_value_case_arms_sharing_a_domain_base(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A conditional collection used directly as the program result: the tagged
+// union tile carries exactly the selected arm (the other variant is empty).
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_value_case_collection_result() {
+    // `True` arm: the surviving variant holds `[1, 2]`.
+    let result = run_pipeline(
+        r"
+c: Bool = True
+box([1, 2]) if c else box([1, 2, 3])",
+    );
+    assert_eq!(codomain_ints(&result), vec![1, 2]);
+    // `False` arm: the surviving variant holds `[1, 2, 3]`.
+    let result = run_pipeline(
+        r"
+c: Bool = False
+box([1, 2]) if c else box([1, 2, 3])",
+    );
+    assert_eq!(codomain_ints(&result), vec![1, 2, 3]);
+}
+
+// Same-domain arms as a program result: the Σ collapses to a plain data
+// function, not a Σ, but the runtime still selects the right arm. This pins the
+// tile shape of the collapse, which the `sum` cases above only exercise through
+// an aggregate.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_value_case_same_domain_collection_result() {
     let result = run_pipeline(
         r"
 c: Bool = True
@@ -400,8 +490,8 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 // `[f(x) for x in (xs if c else ys)]` floats the source `Case` out of the map
 // (`lower::comprehension`) — `Case{gᵢ → [f(x) for x in srcᵢ]}` — with each arm
 // built as a `Compose` (`src ≫ λx→body`) so it carries the source's *data* kind.
-// The arms then join as collections and compile via the gate fan-out, rather than
-// colliding as compute-kinded lambdas over their index domains.
+// The arms then `sigma_join` into the Σ and compile via the gate fan-out,
+// rather than colliding as compute-kinded lambdas over distinct index domains.
 // ---------------------------------------------------------------------------
 
 #[rstest]
@@ -410,68 +500,186 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 #[case(
     r"
 c: Bool = True
-sum([x for x in ([1, 2] if c else [3, 4])])",
+sum([x for x in (box([1, 2]) if c else box([1, 2, 3]))])",
     Value::Int(3)
 )]
 #[case(
     r"
 c: Bool = False
-sum([x for x in ([1, 2] if c else [3, 4])])",
-    Value::Int(7)
+sum([x for x in (box([1, 2]) if c else box([1, 2, 3]))])",
+    Value::Int(6)
 )]
 // Mapping comprehension over a conditional collection.
 #[case(
     r"
 c: Bool = True
-sum([x * 10 for x in ([1, 2] if c else [3, 4])])",
+sum([x * 10 for x in (box([1, 2]) if c else box([1, 2, 3]))])",
     Value::Int(30)
 )]
 #[case(
     r"
 c: Bool = False
-sum([x * 10 for x in ([1, 2] if c else [3, 4])])",
-    Value::Int(70)
+sum([x * 10 for x in (box([1, 2]) if c else box([1, 2, 3]))])",
+    Value::Int(60)
 )]
-// Nested conditional source (an `elif` in the iterable) floats per arm.
+// Nested conditional source: an `elif` in the iterable is one N-choice sum.
 #[case(
     r"
 n: Int = 2
-sum([x for x in ([1] if n == 1 else [2] if n == 2 else [3])])",
-    Value::Int(2)
+sum([x for x in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))])",
+    Value::Int(4)
 )]
 #[case(
     r"
 n: Int = 3
-sum([x for x in ([1] if n == 1 else [2] if n == 2 else [3])])",
-    Value::Int(3)
+sum([x for x in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))])",
+    Value::Int(9)
 )]
 fn test_comprehension_over_conditional(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+/// **The source need not be a literal `Case`.** Consuming a conditional collection goes
+/// through one rule, so what matters is the *type* at the generator, not the syntax that
+/// put it there — a binding, a parameter, or a filter in between are all the same rule.
+///
+/// Each case here is a shape the retired source-`Case` float could not reach: it pattern
+/// -matched a `Case` sitting literally in the generator, so a let-bound or parameter-passed
+/// conditional fell through to a path that could not name the witness consistently. They
+/// type-checked and failed to compile. Cases 1-2 of `test_comprehension_over_conditional`
+/// stay as the literal-source form, which the float *did* handle — keeping both is what
+/// shows the general path subsumes it rather than replacing one gap with another.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+// Let-bound: the conditional is named, then iterated.
+#[case(
+    r"
+c: Bool = True
+x = box([1, 2]) if c else box([1, 2, 3])
+sum([y for y in x])",
+    Value::Int(3)
+)]
+#[case(
+    r"
+c: Bool = False
+x = box([1, 2]) if c else box([1, 2, 3])
+sum([y * 10 for y in x])",
+    Value::Int(60)
+)]
+// Through a UDF parameter: the sum arrives at the call, not the definition.
+#[case(
+    r"
+def f(xs):
+    sum([y for y in xs])
+c: Bool = True
+f(box([1, 2]) if c else box([1, 2, 3]))",
+    Value::Int(3)
+)]
+// **One collection, two consumers.** Both comprehensions range over whichever domain the
+// same conditional took, so they share a witness — the half of witness identity that
+// `two_conditional_sources_keep_their_witnesses_apart` does not cover, since it is about
+// keeping *different* witnesses apart.
+#[case(
+    r"
+c: Bool = True
+x = box([1, 2]) if c else box([1, 2, 3])
+sum([y for y in x]) + sum([z for z in x])",
+    Value::Int(6)
+)]
+fn a_conditional_source_compiles_however_it_reaches_the_generator(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+/// **A comprehension filter over a conditional source has no restrict yet.** This program
+/// fails to compile — `extent_of` rejects the witness by name — where 5 is correct. It used
+/// to return 6, the unfiltered sum of the `else` arm, which is the worse failure of the two;
+/// `sum_wide_restriction` now keeps `planning::iterate` from skipping a site whose sum still
+/// owes a restriction, so the loss is loud.
+///
+/// Inference is *right*: the restriction distributes onto the candidates, exactly as
+/// `src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness" says it must, and
+/// the comprehension types as
+/// `Σ 𝜎 ∈ {{[0, 1] | 𝑝}, {[0, 2] | 𝑝}}. (𝜎 ⤇ Int)`.
+/// What is missing is downstream, and the site is
+/// `planning::iterate`'s undetermined-witness guard. The comprehension node is
+/// `cast(realize(…))`: `Realize` asserts the *pre*-realization type so nothing above it has
+/// to change, so this node still advertises the Σ even though the source underneath is
+/// already a realized tagged union. Reading `expr.ty.domain()` on a sum yields its **witness**,
+/// the guard sees a free witness and returns, and the restrict is never emitted — the
+/// filter lives on the *candidates*, which `domain()` does not look at.
+///
+/// Narrowing the guard to "unless the candidates are refined" does not work: an arm that is
+/// itself a filtered comprehension (`box([x for x in xs if p]) if c else …`) refines a
+/// candidate too, and there the restrict already exists inside the arm
+/// (`test_value_case_arms_sharing_a_domain_base` covers it, and breaks under that
+/// narrowing). `sum_wide_restriction` is the test that does work — a refinement on *every*
+/// candidate is one applied to the sum, the distributive law read backwards.
+///
+/// **Where it stands.** The site after realization is
+/// `cast(realize(iterate ▷ (𝑔₀ ▷ const ▷ restrict) ≫ [1, 2]  ⊎  iterate ▷ (𝑔₁ ▷ …) ≫ [1, 2, 3]))`,
+/// and the restriction has to reach the union's *operands*: each is already an iteration
+/// source over `{𝐷ᵢ | 𝑔ᵢ}`, so one more `restrict` per operand is the executable form of the
+/// distribution the type level performs.
+///
+/// The obstacle is the predicate's **source**. A filter's predicate reads the collection at
+/// the index (`__elem ▷ src ▷ 𝑓` — the plain case does this too), and here `src` is the
+/// whole conditional. Under operand `𝑖` the index ranges over `𝐷ᵢ`, so the predicate must
+/// read *that arm*, not the conditional: `__elem ▷ armᵢ ▷ 𝑓`. Sound, because operand `𝑖` is
+/// gated by `𝑔ᵢ` and `src ≡ armᵢ` there.
+///
+/// Realizing the predicate's source instead is **wrong**, and measurably so — it was tried.
+/// `realize(union)`'s domain is the tagged tagged union while `__elem` stays `𝐷ᵢ`, so applying
+/// one to the other desynchronizes the predicate from its own refinement base, and Σ-width's
+/// pairing discharge then rejects candidate lists that print identically.
+///
+/// So the open question is how to obtain the per-arm predicate: substitute `armᵢ` for the
+/// source inside the stored predicate term, or rebuild it from `armᵢ` and the element
+/// predicate `𝑓` — which needs `𝑓` recoverable from the composed `__elem ▷ src ▷ 𝑓` form.
+///
+/// **A wrong answer, not a failure**, which is the worse outcome of the two: before the
+/// source-`Case` float was retired this shape did not compile at all (the float declined a
+/// filtered comprehension, and the general path could not yet name the witness). Making the
+/// general path work turned a compile error into a quiet miscomputation. A guard that
+/// refuses rather than drops belongs here until the restrict is emitted.
+#[test]
+#[ignore = "planning emits no restrict from a sum's refined candidates; the witness \
+            reaches operator conversion, which has no extent for it"]
+fn a_filter_over_a_conditional_source_is_dropped() {
+    check_scalar(
+        r"
+c: Bool = False
+sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
+        Value::Int(5),
+    );
 }
 
 // A conditional *between* two standalone comprehensions
 // (`([x for x in xs]) if c else ([y for y in ys])`). This is the case
 // kind inference unblocks: a comprehension used as a
 // value is a lambda whose kind var resolves to `Data` from its collection domain, so
-// the two `Case` arms join as collections instead of colliding as compute meets.
+// the two `Case` arms `sigma_join` into the Σ instead of colliding as
+// compute meets. (`sum` consumes the Σ via `Σ <: Fun`.)
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
     r"
 c: Bool = True
-sum(([x for x in [1, 2]]) if c else ([y for y in [3, 4]]))",
+sum(box([x for x in [1, 2]]) if c else box([y for y in [1, 2, 3]]))",
     Value::Int(3)
 )]
 #[case(
     r"
 c: Bool = False
-sum(([x for x in [1, 2]]) if c else ([y for y in [3, 4]]))",
-    Value::Int(7)
+sum(box([x for x in [1, 2]]) if c else box([y for y in [1, 2, 3]]))",
+    Value::Int(6)
 )]
 #[case(
     r"
 c: Bool = True
-sum(([x * 10 for x in [1, 2]]) if c else ([y for y in [3, 4]]))",
+sum(box([x * 10 for x in [1, 2]]) if c else box([y for y in [1, 2, 3]]))",
     Value::Int(30)
 )]
 fn test_conditional_between_comprehensions(#[case] code: &str, #[case] expected: Value) {
@@ -731,4 +939,59 @@ total",
 )]
 fn test_conditional_induction_if_else_both_write(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
+}
+/// A `box`ed conditional collection, end to end.
+///
+/// Two arms only: a three-arm `elif` chain currently fails in *inference*, on literal
+/// singleton element types rather than on anything about sums
+/// (`expected 2, found {2 | __elem == 3}`), so it is a separate gap and not covered here. Both arms enter the sum explicitly, the
+/// join keeps both candidates, and `planning` realizes the Σ as the gated union — which
+/// happens after inference, so no subtyping rule ever relates the two.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    "c: Bool = True\nsum(box([1, 2]) if c else box([1, 2, 3]))",
+    Value::Int(3)
+)]
+#[case(
+    "c: Bool = False\nsum(box([1, 2]) if c else box([1, 2, 3]))",
+    Value::Int(6)
+)]
+#[case(
+    "n: Int = 2\nsum(box([1]) if n == 1 else box([2]) if n == 2 else box([3, 3]))",
+    Value::Int(2)
+)]
+fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// **Two witnesses live at once, end to end.** A comprehension over two conditional
+/// collections opens both sums while typing one body. It types correctly and keeps the
+/// witnesses apart (`two_conditional_sources_keep_their_witnesses_apart`, in
+/// `tests/type_check.rs`); what it does not yet do is compile.
+///
+/// The blocker is a **concrete domain meeting a bound witness**: `[0, 1] <: σ` reaches
+/// `constrain_go`'s witness arm, which is `unreachable!` because relating a candidate to a
+/// witness would be the `𝑒 = 𝑑` reading of Σ-width rather than the rule. Two witnesses in
+/// scope at once is what produces the edge — a pairing search has to try one source's
+/// candidate against the other's witness — and what the rule should say there is not yet
+/// settled.
+///
+/// It is **not** the copair/disjoint-join split, which this test was previously ignored
+/// for: that diagnosis predates the witness-identity work and does not survive it. The
+/// failure has moved three times under measurement (a sum in a domain position reaching `extent_of`,
+/// then a free witness on the index, then an unresolved variable), so the reason above is
+/// what a run says today and nothing more — re-measure before trusting it.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[ignore = "two generators index the result by a *pair* of witnesses, a body shape \
+            `SigmaType::body_residue` does not destructure"]
+fn two_conditional_sources_compile() {
+    check_scalar(
+        r"
+c: Bool = True
+d: Bool = False
+sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in (box([10, 20]) if d else box([10, 20, 30]))])",
+        Value::Int(3 + 60 + 3 * 60 - 60),
+    );
 }

@@ -119,6 +119,15 @@ pub struct SpecKey {
 struct KeyView {
     /// Leaf contributions (bases, ranges, sources, `Txn`, channel domains).
     atoms: BTreeSet<AtomKey>,
+    /// **Described** witness ranges reaching this position — a `List(𝑇)`'s `UIntRanges`,
+    /// a `Collection(𝑇)`'s `Any`. A *listed* range needs no slot: its candidates are
+    /// types, so they recurse like any other child and land in the fields above.
+    ///
+    /// A described one names no candidates to recurse into, so without this two sums
+    /// differing only in their range would key alike and share a clone — the
+    /// under-splitting direction, which is the unsound one. Compared as a set, like
+    /// [`refinements`](Self::refinements).
+    described_ranges: Vec<crate::ccl::ty::TypeKind>,
     /// Refinements at this position, deduplicated by [`Refinement`]'s
     /// type-blind structural equality. Order is insertion order, so equality
     /// compares these as a set.
@@ -170,7 +179,11 @@ impl PartialEq for KeyView {
         fn same_refinements(a: &[Refinement], b: &[Refinement]) -> bool {
             a.len() == b.len() && a.iter().all(|w| b.contains(w))
         }
+        fn same_ranges(a: &[crate::ccl::ty::TypeKind], b: &[crate::ccl::ty::TypeKind]) -> bool {
+            a.len() == b.len() && a.iter().all(|k| b.contains(k))
+        }
         self.atoms == other.atoms
+            && same_ranges(&self.described_ranges, &other.described_ranges)
             && same_refinements(&self.refinements, &other.refinements)
             && self.fun == other.fun
             && self.rec == other.rec
@@ -187,6 +200,11 @@ impl KeyView {
     /// on one side only passes through.
     fn union(&mut self, other: KeyView) {
         self.atoms.extend(other.atoms);
+        for k in other.described_ranges {
+            if !self.described_ranges.contains(&k) {
+                self.described_ranges.push(k);
+            }
+        }
         for w in other.refinements {
             if !self.refinements.contains(&w) {
                 self.refinements.push(w);
@@ -249,6 +267,7 @@ impl fmt::Display for KeyView {
                 KindMerge::Data => "⤇",
                 KindMerge::Compute => "⇒",
                 KindMerge::Conflict => "⇒!",
+                KindMerge::DomainConflict => "⤇!",
             };
             parts.push(format!("({d} {arrow} {c})"));
         }
@@ -358,6 +377,33 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // arm is for exhaustiveness, and "no information here" is the honest
         // reading if one ever did.
         Type::Hole => KeyView::default(),
+        // A sum contributes its body and its candidates, each at this polarity — the
+        // same no-flip `compact_go` uses on both, since neither is a domain.
+        //
+        // The **binder is not part of the key**, for the reason the `fun` slot does not
+        // key on a `FunKind` variable: `box`'s scheme α-converts its sum at every
+        // instantiation, so the binder id is fresh per use and keying on it would split
+        // every use while telling us nothing about what the clone compiles to.
+        Type::Sigma(sg) => {
+            let mut acc = key_go(&sg.body, pol, subst_acc, ctx);
+            match sg.kind().listed() {
+                Some(candidates) => {
+                    for c in candidates {
+                        acc.union(key_go(c, pol, subst_acc, ctx));
+                    }
+                }
+                None => acc.described_ranges.push(sg.kind().clone()),
+            }
+            acc
+        }
+        // A witness reference contributes an **anonymous** marker: enough to tell a
+        // position that is a witness from one that is an ordinary domain, without the
+        // binder id, which is fresh per instantiation for the reason above.
+        // [`WitnessBinderId::UNBOUND`] is that anonymity — the id an occurrence carries
+        // in the compact world before materialization gives it a real binder.
+        Type::WitnessRef(_) => KeyView::from_atom(AtomKey::Witness(
+            crate::ccl::infer_var::WitnessBinderId::UNBOUND,
+        )),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
         // dependent-application discharge lands in the key as the predicate the

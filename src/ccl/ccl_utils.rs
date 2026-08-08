@@ -396,7 +396,18 @@ pub fn flatten_trailing_value_case(mut branches: Vec<Branch>) -> Vec<Branch> {
 pub fn typed_compose(elts: Vec<Expr>) -> Expr {
     let d_ty = elts[0].ty.domain().unwrap().clone();
     let c_ty = elts[elts.len() - 1].ty.codomain().unwrap().clone();
-    Expr::compose(elts).with_ty(Type::fun(d_ty, c_ty))
+    // **The kind comes from the first element**, which is the one whose domain this
+    // composition's domain *is*. `f ≫ g` over a collection `f : 𝐷 ⤇ 𝐴` and an element map
+    // `g : 𝐴 ⇒ 𝐵` is the collection `𝐷 ⤇ 𝐵`: composing a mapping onto a collection does
+    // not stop it being one.
+    //
+    // `Type::fun` was used here, and it hardcodes `Compute` — so every point-free chain
+    // λ-elimination builds was stamped a capability regardless of what it composed, and
+    // the kind the solver inferred was discarded the moment a term went point-free. That
+    // is what [`Type::fun_like`] exists to prevent: "a downstream rebuild can never
+    // silently flip a data arrow to compute".
+    let ty = Type::fun_like(&elts[0].ty, d_ty, c_ty);
+    Expr::compose(elts).with_ty(ty)
 }
 
 /// Construct the trivially-true predicate `λ _ → true` over the given domain,
@@ -664,12 +675,33 @@ pub fn refined_data_fun(base_domain: Type, predicate: Expr, codomain: Type) -> T
     )
 }
 
+/// Peel the outer [`Type::Refinement`] wrappers off `ty`, exposing its head
+/// constructor and leaving everything nested inside untouched.
+///
+/// This is the peel to reach for when *dispatching* on a type's shape — asking
+/// "is this a function? a sum?" of a type that may be wrapped in refinements.
+/// [`strip_refinements`] is the wrong tool there and the difference is not
+/// cosmetic: it erases refinements at every depth, including a Σ's candidate
+/// domains, and a candidate's refinement is the program's filter. Reading a
+/// domain out of a deep-stripped copy silently drops that filter, and with it
+/// the `Restrict` it would have compiled to.
+pub(crate) fn peel_refinements(ty: &Type) -> &Type {
+    let mut t = ty;
+    while let Type::Refinement(inner, _) = t {
+        t = inner;
+    }
+    t
+}
+
 /// A structural copy of `ty` with every [`Type::Refinement`] layer removed,
 /// at any depth (inside tuples / records / function types).  Used to compare
 /// domains up to refinements (which are transparent to structural shape) —
 /// the two sides may carry the same predicate at different compilation stages
 /// (bare `__elem ▷ p` before vs after planning normalizes `p` to point-free),
 /// so refinements must not participate in the comparison at any depth.
+///
+/// Erasure at depth is what makes this a *comparison* tool and not a dispatch
+/// one; [`peel_refinements`] is the dispatch counterpart.
 pub(crate) fn strip_refinements(ty: &Type) -> Type {
     match ty {
         Type::Refinement(base, _) => strip_refinements(base),
@@ -696,12 +728,23 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             domain: Box::new(strip_refinements(domain)),
             kind: *kind,
         },
+        // The **witness kind is left alone.** A sum's candidates are domains, and the Σ
+        // rules match them by value, so two sums differing only in a candidate's
+        // refinement are different types — `Σ σ ∈ {{[0,2] | 𝑝}}. σ` is the filtered arm
+        // and `Σ σ ∈ {[0,2]}. σ` is not. Erasing there would make them compare equal,
+        // which is the opposite of what a comparison up to refinements is for: it drops a
+        // distinction rather than an incidental spelling.
+        Type::Sigma(s) => Type::Sigma(Box::new(crate::ccl::ty::SigmaType::bound(
+            s.witness.clone(),
+            strip_refinements(&s.body),
+        ))),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::WitnessRef(_)
         | Type::Txn => ty.clone(),
     }
 }
@@ -1273,4 +1316,70 @@ where
     }
     ty.walk_children_mut(|child| changed |= walk_refined_predicates_mut(child, memo, context, f));
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::ty::{SigmaType, TypeKind};
+
+    /// `{[0, 2] | __elem}` — a refined range. The predicate's content is irrelevant
+    /// here; only that the two sides carry *different* ones.
+    fn refined(base: Type, tag: &str) -> Type {
+        Type::Refinement(
+            Box::new(base),
+            Refinement::born(Rc::new(Expr::var(Name::from(tag)))),
+        )
+    }
+
+    /// A Σ's candidates are **domains**, matched by value, so two sums differing only
+    /// in a candidate's refinement are different types — one is the filtered arm and
+    /// the other is not. Erasing there would collapse that distinction, which is a
+    /// stronger claim than "these two spellings of one predicate are the same".
+    #[test]
+    fn strip_refinements_keeps_a_sum_s_candidates_distinct() {
+        let filtered = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            refined(Type::UIntRange(3), "p"),
+        ]))));
+        let bare = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            Type::UIntRange(3),
+        ]))));
+        assert_ne!(strip_refinements(&filtered), strip_refinements(&bare));
+        assert_eq!(strip_refinements(&filtered), filtered);
+    }
+
+    /// A composition's kind comes from the element whose domain it inherits — the first.
+    /// Composing an element map onto a collection does not stop it being one, and
+    /// `Type::fun`'s hardcoded `Compute` was discarding the kind at every point-free
+    /// rebuild, which is exactly what [`Type::fun_like`] exists to prevent.
+    #[test]
+    fn typed_compose_keeps_the_chain_s_kind() {
+        let int = Type::Base(BaseType::Int);
+        let coll =
+            Expr::var(Name::from("xs")).with_ty(Type::data_fun(Type::UIntRange(2), int.clone()));
+        let map = Expr::var(Name::from("f")).with_ty(Type::fun(int.clone(), int.clone()));
+        let composed = typed_compose(vec![coll, map]);
+        assert!(
+            matches!(
+                &composed.ty,
+                Type::Fun {
+                    kind: crate::ccl::ty::FunKind::Data,
+                    ..
+                }
+            ),
+            "a collection composed with an element map is still a collection, got {}",
+            composed.ty
+        );
+    }
+
+    /// The dispatch peel reaches the head and stops. Anything nested — a candidate's
+    /// filter above all — is what the caller is about to read, so it must survive.
+    #[test]
+    fn peel_refinements_stops_at_the_head() {
+        let inner = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            refined(Type::UIntRange(3), "p"),
+        ]))));
+        let wrapped = refined(refined(inner.clone(), "q"), "r");
+        assert_eq!(peel_refinements(&wrapped), &inner);
+    }
 }

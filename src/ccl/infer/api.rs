@@ -696,6 +696,74 @@ pub enum Strictness {
     PreDesugar,
 }
 
+/// Assert that no type slot in `expr` carries a **free** witness reference.
+///
+/// A pass that reaches into a sum for its body and forgets to close it leaves a type that
+/// is locally well-formed and globally meaningless: `WitnessRef` is a leaf, so every
+/// consumer downstream compares it against real domains and fails somewhere far from
+/// where it was made. This is the boundary that names the invariant instead.
+///
+/// **A node's binder slots are inside its own type's sum.** A Σ-typed lambda *is* a
+/// collection over the witness, so its parameter ranges over whichever domain the witness
+/// picked — the sum on `expr.ty` is what binds the `WitnessRef` in `param.ty`, even
+/// though the slot sits beside that type rather than inside it. Reading the slot in
+/// isolation would report the one form the binder is allowed to have.
+#[cfg(debug_assertions)]
+pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
+    fn check(t: &Type, scope: &[crate::ccl::infer_var::WitnessBinderId], e: &Expr, stage: &str) {
+        assert!(
+            !crate::ccl::ty::has_free_witness_ref(t, scope),
+            "{stage}: free witness reference in a type slot: {t} on {}",
+            symbolic(e)
+        );
+    }
+    if std::env::var("DBG_TREE").is_ok() {
+        eprintln!(
+            "TREE {stage}:\n{}",
+            crate::ccl::symbolic::symbolic_typed(expr)
+        );
+    }
+    fn go(e: &Expr, stage: &str, scope: &mut Vec<crate::ccl::infer_var::WitnessBinderId>) {
+        check(&e.ty, scope, e, stage);
+        if let Some(a) = &e.user_annotation {
+            check(a, scope, e, stage);
+        }
+        if let TypedExprNode::Cast { target, .. } = &e.node {
+            check(target, scope, e, stage);
+        }
+        // A node whose own type is a sum opens that binder over its binder slots and its
+        // whole subtree: the sum on `expr.ty` is what a decomposed term's scattered
+        // occurrences still name.
+        //
+        // **The whole chain, not just the head.** Consuming two conditional collections at
+        // once nests the closes — `Σ 𝜎₁ ∈ 𝐾₁. Σ 𝜎₂ ∈ 𝐾₂. (𝜎₁, 𝜎₂) ⤇ 𝑉` — and every binder
+        // in that chain scopes over the same subtree, so opening only the outermost
+        // reports the inner witness's occurrences as free.
+        let mut opened = 0;
+        let mut t = &e.ty;
+        while let Type::Sigma(s) = t {
+            scope.push(s.binder());
+            opened += 1;
+            t = &s.body;
+        }
+        e.walk_binders(|b| {
+            check(&b.ty, scope, e, stage);
+            if let Some(a) = &b.user_annotation {
+                check(a, scope, e, stage);
+            }
+        });
+        e.walk_children(|c| go(c, stage, scope));
+        scope.truncate(scope.len() - opened);
+    }
+    if std::env::var("DBG_TREE").is_ok() {
+        eprintln!(
+            "TREE {stage}:\n{}",
+            crate::ccl::symbolic::symbolic_typed(expr)
+        );
+    }
+    go(expr, stage, &mut Vec::new());
+}
+
 /// Check that every [`crate::ccl::TypedExpr::ty`] and [`crate::ccl::TypedBinding::ty`]
 /// in the tree is a fully concrete type — no [`Type::Hole`] or [`Type::Infer`] anywhere,
 /// including nested inside compound types like `Fun` or `Tuple` and inside refinements.
@@ -838,7 +906,7 @@ fn collect_type_errors(
         Type::Infer(var) => {
             // Pre-desugar, an induction accumulator's domain is still `Infer` (a
             // `Mut(V)` with no annotated domain — the unified phase resolves it
-            // to the writing loop's extent); the relaxation tolerates it (see
+            // to the writing loop's domain); the relaxation tolerates it (see
             // [`Strictness`]). Feed channel domains are the rigid `ChanDom`
             // handled below, not `Infer`.
             if strictness == Strictness::Strict {
@@ -943,6 +1011,16 @@ fn collect_type_errors(
             }
             collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
         }
+        Type::Sigma(s) => {
+            // Recurse for holes/infers in the witness's type children and the
+            // body; the anonymous type-witness reference (`Type::WitnessRef`) is
+            // bound by this Sigma, so it carries no error.
+            for t in s.witness.types() {
+                collect_type_errors(t, context_sym, strictness, errors, seen_refinements);
+            }
+            collect_type_errors(&s.body, context_sym, strictness, errors, seen_refinements);
+        }
+        Type::WitnessRef(_) => {}
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
     }
 }
@@ -1819,6 +1897,145 @@ mod tests {
         assert_eq!(ty, int_lit_ty(42));
     }
 
+    /// `λ (xs: List(Int)) → Sum(xs)` — *consuming* a List param. The Σ-typed
+    /// param flows into the aggregate's `α ⤇ β` consumer, so the sum is consumed:
+    /// the length-bounded index domain flows to the
+    /// consumer (Σ-witness length opened), the element type `int` to the
+    /// result. Sum's result is `int`.
+    #[test]
+    fn test_infer_list_param_consumed_by_aggregate() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
+        });
+        let ty = infer(&mut expr, &mut ctx).expect("consuming a List param type-checks");
+        let Type::Fun { codomain, .. } = &ty else {
+            panic!("expected a function type, got {ty}");
+        };
+        assert_eq!(
+            codomain.as_ref(),
+            &Type::Base(BaseType::Int),
+            "Sum over a List(Int) is Int, got {codomain}"
+        );
+    }
+
+    /// `λ (xs: List(Int)) → let ys: List(Int) = xs in ys` — a List-typed value
+    /// (the param) ascribed at another List. `xs`'s type is the List Σ, so the
+    /// ascription emits `List Σ <: List Σ` — the Σ **width** edge.
+    /// This is an ordinary pattern (re-binding, passing, returning a list), so
+    /// width must be wired.
+    #[test]
+    fn test_infer_list_to_list_ascription_width() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::let_bind_annotated(
+                "ys",
+                Expr::var("xs"),
+                Expr::var("ys"),
+                Type::list_of(Type::Base(BaseType::Int)),
+            )),
+        });
+        infer(&mut expr, &mut ctx).expect("list-to-list ascription type-checks via Σ-width");
+
+        // The codomain still flows: a List(Int) is not a List(Str).
+        let mut ctx = TypeInferenceContext::new();
+        let mut bad = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::let_bind_annotated(
+                "ys",
+                Expr::var("xs"),
+                Expr::var("ys"),
+                Type::list_of(Type::Base(BaseType::String)),
+            )),
+        });
+        assert!(
+            infer(&mut bad, &mut ctx).is_err(),
+            "List(Int) must not ascribe at List(Str) — width flows the codomain"
+        );
+    }
+
+    /// `λ (xs: List(Int)) → xs` — a **parameter** List annotation. The annotation
+    /// bounds `xs`, and with no other demand on it the bound *is* the param type: it
+    /// rides the lambda's domain and body type through the compact/coalesce
+    /// round-trip as a described-kind domain, re-forming the identical Σ.
+    #[test]
+    fn test_infer_list_param_annotation_round_trips() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::var("xs")),
+        });
+        let ty = infer(&mut expr, &mut ctx).expect("List(Int) param annotation round-trips");
+        // The lambda's domain and codomain both re-form the List Σ.
+        let Type::Fun {
+            domain, codomain, ..
+        } = &ty
+        else {
+            panic!("expected a function type, got {ty}");
+        };
+        assert!(
+            matches!(domain.as_ref(), Type::Sigma(_)),
+            "param domain should be the `List` Σ, got {domain}"
+        );
+        assert!(
+            matches!(codomain.as_ref(), Type::Sigma(_)),
+            "body (returns xs) should be the `List` Σ, got {codomain}"
+        );
+    }
+
+    /// `([1, 2, 3] : List(Int))` on a *node* annotation is **rejected**: entering a
+    /// collection type is `box`, not a subtyping edge, so the concrete `[0, 3) ⤇ Int`
+    /// does not inject into `Σ (D: UIntRanges). D ⤇ Int`
+    /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). This pins the
+    /// annotation path specifically, which is one-way (`inferred <: ann`) and reaches the
+    /// witness kind through `emit_annotation_predicates`. A conflicting element type is
+    /// rejected too, and for a different reason — the element types meet inside the body,
+    /// with no sum involved.
+    #[test]
+    fn test_infer_list_node_annotation_needs_box() {
+        let mut ctx = TypeInferenceContext::new();
+        let ints = vec![
+            Expr::lit(Lit::Int(1)),
+            Expr::lit(Lit::Int(2)),
+            Expr::lit(Lit::Int(3)),
+        ];
+        let mut expr = Expr::new(TypedExprNode::List(ints))
+            .with_user_annotation(Type::list_of(Type::Base(BaseType::Int)));
+        let err = infer(&mut expr, &mut ctx)
+            .expect_err("a bare list literal does not enter List(Int); that needs `box`");
+        assert!(
+            format!("{err:?}").contains("Annotation mismatch"),
+            "expected an annotation mismatch, got {err:?}"
+        );
+
+        // A `List(Str)` annotation over an int list is a conflict.
+        let mut ctx = TypeInferenceContext::new();
+        let mut bad = Expr::new(TypedExprNode::List(vec![Expr::lit(Lit::Int(1))]))
+            .with_user_annotation(Type::list_of(Type::Base(BaseType::String)));
+        assert!(
+            infer(&mut bad, &mut ctx).is_err(),
+            "List(Str) annotation over an int list must be rejected"
+        );
+    }
+
     #[test]
     fn test_infer_type_annotation_overrides_inferred() {
         let mut ctx = TypeInferenceContext::new();
@@ -2369,27 +2586,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AnnotationMismatch: user_annotation conflicts with inferred type
+    // Param annotation conflicts (caught at the use site)
     // -----------------------------------------------------------------------
 
-    /// Constructs a `Lambda` with `user_annotation: Some(Int)` but a body that
-    /// constrains the param to `String`. Inference should return `AnnotationMismatch`.
-    ///
-    /// This path is not yet reachable from the pipeline (lowering always sets
-    /// `user_annotation: None`), but the conflict must be exercised directly so the
-    /// annotation-binding rule does not bitrot.
+    /// A `Lambda` with `user_annotation: Some(Int)` whose body uses the param as
+    /// a `String`. The param binds at a variable the annotation merely *bounds*, so
+    /// the conflict surfaces at **coalesce**, as `Int` and `String` colliding on one
+    /// variable, rather than eagerly as an `AnnotationMismatch`. That is the
+    /// consequence of `bind_annotation` being one-way (`inferred <: ann`): the
+    /// reverse edge would detect this immediately, at the cost of also rejecting
+    /// sound widenings. What matters is that the conflict is caught.
     #[test]
-    fn test_infer_annotation_mismatch() {
+    fn test_infer_param_annotation_conflict_at_use() {
         let mut ctx = TypeInferenceContext::new();
-        // λ [x : annotated Int] → Apply(λ s : String → s, x)
-        // x starts as Infer(id); body inference applies x as an arg to a
-        // String-expecting function, constraining Infer(id) → String.
-        //
-        // The conflict surfaces at **coalesce**, as `Int` and `String` colliding on
-        // one variable, rather than eagerly as `AnnotationMismatch`. That is the
-        // consequence of `bind_annotation` being one-way (`inferred <: ann`): the
-        // reverse edge used to detect this immediately, at the cost of also
-        // rejecting sound widenings. What matters is that the conflict is caught.
+        // λ [x : annotated Int] → Apply(λ s : String → s, x)  (x fed to a String fn)
         let inner = Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s"));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {

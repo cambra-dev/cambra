@@ -116,6 +116,30 @@ pub(super) fn lower_call(
             let input = lower_expr(&args[0], ctx)?;
             Ok(Expr::aggregate(input, kind))
         }
+        // `box(x)` — the only way into a dependent sum
+        // (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). Subtyping has
+        // no `𝑇 <: Σ` rule, so this is what a program writes when two collections meet
+        // at a join and it wants both alternatives kept rather than one of them lost.
+        "box" => {
+            if args.len() != 1 {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    "`box` takes exactly one argument",
+                ));
+            }
+            let inner = lower_expr(&args[0], ctx)?;
+            // The `Apply` root is tagged by the caller; the operator node it applies is
+            // minted here, so this rule records it. An unrecorded mint is a lineage leak
+            // at the lowering boundary (`src/ccl/design/provenance.md`, "The recorder"),
+            // which is how a type-level-only `box` passed every test while failing to
+            // compile.
+            let op = ctx.tag_machinery(
+                Expr::builtin(crate::ccl::Builtin::Box),
+                func.span,
+                "lower.box",
+            );
+            Ok(Expr::apply(inner, op))
+        }
         "defer" => Ok(Expr::new(TypedExprNode::Defer)),
         name if ctx.sources.contains_key(name) => {
             Ok(Expr::new(TypedExprNode::Source(name.to_string())))

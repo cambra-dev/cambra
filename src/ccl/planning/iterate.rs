@@ -314,6 +314,35 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
         // Non-function expressions can't be iterated; leave them alone.
         return;
     };
+    // **An undetermined witness has no extent.** A sum *is* an arrow, so the domain read
+    // above is its witness — "whichever candidate was taken" — and that is not something
+    // `extent_of` can turn into an iteration source. Marking it for iteration would put a
+    // witness where a domain belongs, replacing op-conversion's named rejection of an
+    // unrealized sum (`src/ccl/design/collections.md`, "Future work") with a confusing one.
+    //
+    // **This also drops a restriction that is still outstanding, and that is a real gap.**
+    // A sum reaching here is *not* only one realization declined: `Realize` asserts the
+    // pre-realization type so nothing above it has to change, so every ancestor of a
+    // realized term still advertises a Σ. When the sum is the type of a *filtered*
+    // comprehension over a conditional collection, its candidates carry that filter — the
+    // restriction distributes onto them, as it must — and returning here means no restrict
+    // is ever emitted for it. The filter is silently lost;
+    // `a_filter_over_a_conditional_source_is_dropped` pins it.
+    //
+    // So skipping is right only when nothing is outstanding, and
+    // [`sum_wide_restriction`] is what decides that: a restriction applied to the *sum*
+    // distributes onto every candidate, so a refinement common to all of them is the sum's
+    // own and still needs an operator, while a per-candidate one belongs to that arm and
+    // was compiled inside it. Falling through with one outstanding hands the witness to
+    // `extent_of`, which rejects it by name — a compile error rather than a wrong answer,
+    // which is the correct failure until the restrict is emitted
+    // (`a_filter_over_a_conditional_source_is_dropped`).
+    if crate::ccl::ty::has_free_witness_ref(&domain_ty, &[])
+        && sum_wide_restriction(&expr.ty).is_none()
+    {
+        return;
+    }
+
     // Specialised iteration strategies come first: try the hash/loop-join
     // rewrite when the domain is a refined tuple whose **pointful** predicate
     // decomposes into equality join conditions (design §6.5 — the recognizer
@@ -438,6 +467,40 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     *expr = typed_compose(elts).with_ty(site_ty);
 }
 
+/// The restriction a **sum as a whole** carries, if any: the refinement present on *every*
+/// candidate.
+///
+/// The distributive law read backwards. `src/ccl/design/type-inference.md`, "Consuming a sum:
+/// naming the witness" has a restriction alongside a consumed sum distribute over the
+/// candidates rather than sit at the position — so a predicate on all of them is one applied to the sum,
+/// and a predicate on only some belongs to those candidates. That distinction is what
+/// separates a filter still owed an operator from one already compiled:
+///
+/// - `[y for y in (box(a) if c else box(b)) if p]` — a consumer's filter, distributed, so
+///   every candidate carries `p`. Nothing has emitted a restrict for it yet.
+/// - `box([x for x in xs if q]) if c else box(ys)` — `q` is the *arm's* own filter and rides
+///   one candidate. The arm's comprehension already compiled it.
+///
+/// Compares predicates structurally, as candidate deduplication does: each candidate's
+/// refinement is its own `Rc`, so pointer identity would report every sum as unrestricted.
+///
+/// `None` for a described kind (no candidates to compare) and for a one-candidate sum, where
+/// "common to all" would report an arm-local refinement as sum-wide.
+fn sum_wide_restriction(ty: &Type) -> Option<crate::ccl::Refinement> {
+    let Type::Sigma(sum) = ty else { return None };
+    let candidates = sum.kind().listed()?;
+    if candidates.len() < 2 {
+        return None;
+    }
+    let Type::Refinement(_, first) = candidates.first()? else {
+        return None;
+    };
+    candidates
+        .iter()
+        .all(|c| matches!(c, Type::Refinement(_, r) if r == first))
+        .then(|| first.clone())
+}
+
 /// Returns `true` if `expr` (or the first element of `expr` if it's a
 /// `Compose`) already provides iteration — i.e. wrapping it with
 /// `iterate` would either be redundant or break op-conversion.
@@ -505,6 +568,88 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
 }
 
 #[cfg(test)]
+mod sum_wide_restriction_tests {
+    use super::*;
+    use crate::ccl::ty::{SigmaType, TypeKind};
+    use crate::ccl::{BaseType, Refinement};
+
+    fn pred(name: &str) -> Refinement {
+        Refinement::born(std::rc::Rc::new(Expr::var(name)))
+    }
+
+    fn sum(candidates: Vec<Type>) -> Type {
+        Type::Sigma(Box::new(SigmaType::over(
+            TypeKind::Enumerated(candidates),
+            None,
+            Type::Base(BaseType::Int),
+        )))
+    }
+
+    fn refined(n: usize, r: &Refinement) -> Type {
+        Type::Refinement(Box::new(Type::UIntRange(n)), r.clone())
+    }
+
+    /// A consumer's filter distributes onto every candidate, so a refinement on all of them
+    /// is the sum's own — still owed an operator.
+    #[test]
+    fn a_refinement_on_every_candidate_is_the_sums_own() {
+        let p = pred("p");
+        let ty = sum(vec![refined(2, &p), refined(3, &p)]);
+        assert_eq!(sum_wide_restriction(&ty), Some(p));
+    }
+
+    /// Structurally equal predicates count even as distinct `Rc`s — each candidate carries
+    /// its own, so pointer identity would report every sum as unrestricted.
+    #[test]
+    fn equal_predicates_from_distinct_rcs_still_count() {
+        let ty = sum(vec![refined(2, &pred("p")), refined(3, &pred("p"))]);
+        assert!(sum_wide_restriction(&ty).is_some(), "{ty}");
+    }
+
+    /// An arm's own filter rides one candidate and was compiled inside that arm, so it is
+    /// not outstanding — the case that makes "are any candidates refined?" the wrong test.
+    #[test]
+    fn a_refinement_on_one_candidate_belongs_to_that_arm() {
+        let ty = sum(vec![refined(2, &pred("p")), Type::UIntRange(3)]);
+        assert_eq!(sum_wide_restriction(&ty), None, "{ty}");
+    }
+
+    /// Different predicates on every candidate are per-arm too, not one sum-wide filter.
+    #[test]
+    fn differing_refinements_are_not_sum_wide() {
+        let ty = sum(vec![refined(2, &pred("p")), refined(3, &pred("q"))]);
+        assert_eq!(sum_wide_restriction(&ty), None, "{ty}");
+    }
+
+    /// One candidate cannot distinguish "applied to the sum" from "applied to the arm",
+    /// so it reports nothing rather than guessing.
+    #[test]
+    fn a_single_candidate_is_not_evidence_of_a_sum_wide_filter() {
+        let ty = sum(vec![refined(2, &pred("p"))]);
+        assert_eq!(sum_wide_restriction(&ty), None, "{ty}");
+    }
+
+    /// A described kind lists no candidates to compare.
+    #[test]
+    fn a_described_kind_has_no_candidates_to_compare() {
+        let ty = Type::Sigma(Box::new(SigmaType::over(
+            TypeKind::UIntRanges,
+            None,
+            Type::Base(BaseType::Int),
+        )));
+        assert_eq!(sum_wide_restriction(&ty), None, "{ty}");
+    }
+
+    /// Not a sum at all — an ordinary refined collection carries its restriction where the
+    /// site already looks for it.
+    #[test]
+    fn a_plain_refined_collection_is_not_a_sum() {
+        let ty = Type::data_fun(refined(2, &pred("p")), Type::Base(BaseType::Int));
+        assert_eq!(sum_wide_restriction(&ty), None, "{ty}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
@@ -514,6 +659,50 @@ mod tests {
     // `super::*` also glob-imports `lambda_elim::compose`; name the test-helper
     // `compose` (`Expr::compose`) explicitly so it wins over the glob.
     use super::super::test_helpers::compose;
+
+    /// A **sum** is an arrow, so it reaches the iteration decision like any collection —
+    /// and must be declined there, because its domain is the witness rather than an
+    /// extent.
+    ///
+    /// The decline has to be deliberate. It used to happen by accident: `Type::domain`
+    /// answered `None` for a sum, so the site returned early under a comment reading
+    /// "non-function expressions can't be iterated" — about something that *is* a
+    /// function. Now the domain is answered and the witness is what says stop, so this
+    /// pins the reason rather than the symptom.
+    #[test]
+    fn an_undetermined_witness_is_not_an_iteration_source() {
+        let int = Type::Base(BaseType::Int);
+        let sum = Type::Sigma(Box::new(crate::ccl::ty::SigmaType::over(
+            crate::ccl::ty::TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]),
+            None,
+            int.clone(),
+        )));
+        // The sum *is* an arrow: it answers with a domain, unlike a scalar.
+        let Type::Sigma(sg) = &sum else {
+            unreachable!("built as a sum")
+        };
+        assert_eq!(
+            sum.domain(),
+            Some(Type::WitnessRef(sg.binder())),
+            "a sum's domain is its own binder's witness"
+        );
+        assert_eq!(
+            sum.codomain(),
+            Some(int),
+            "its codomain is witness-independent"
+        );
+        assert_eq!(Type::Base(BaseType::Int).domain(), None);
+
+        // And that domain is exactly what disqualifies it as an iteration source.
+        let mut expr = Expr::var(Name::from("xs")).with_ty(sum);
+        let before = symbolic(&expr);
+        insert_iterate_markers(&mut expr);
+        assert_eq!(
+            symbolic(&expr),
+            before,
+            "an undetermined witness must not be wrapped for iteration"
+        );
+    }
 
     // -----------------------------------------------------------------
     // is_iteration_bearing

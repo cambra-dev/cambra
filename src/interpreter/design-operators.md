@@ -297,7 +297,9 @@ non-`Iterate` arm reaching op-conversion with `input=None` fails an assertion �
 a planner bug, not a user error.  Similarly, `Restrict` reaching op-conversion
 with `input=None` is a planner bug.
 
-**Constant-in-element predicates.** The scalar value-`Case` C-form
+#### Constant-in-element predicates
+
+The scalar value-`Case` C-form
 (`(unit | π̂ ≫ const 𝑒) ⧺ …`) and the data-collection gate fan-out
 (`zs = xs if c else ys`) restrict a domain by a predicate that is *constant in
 the element* — the gate is the arm's first-match path condition, not a function

@@ -45,11 +45,69 @@ fn test_type_annotation_forms(#[case] code: &str, #[case] expected: Value) {
 #[case("[1, 2]", make_int_list(&[1, 2]))]
 // A `List(_)` annotation lowers the wildcard to a `Hole` element type
 // (inferred), so the annotation is accepted and unifies with the list literal.
-#[case("x: List(_) = [1, 2, 3]\nx", make_int_list(&[1, 2, 3]))]
+#[case("x: List(_) = box([1, 2, 3])\nx", make_int_list(&[1, 2, 3]))]
 // The element type can also be spelled concretely: `List(Int)`.
-#[case("x: List(Int) = [1, 2, 3]\nx", make_int_list(&[1, 2, 3]))]
+#[case("x: List(Int) = box([1, 2, 3])\nx", make_int_list(&[1, 2, 3]))]
+// `Array(n, T)` = `[0, n) ⤇ T`: a static index range, so the length rides the
+// domain (`UIntRange(3)`) rather than being inferred.
+#[case(r"
+x: Array(3, Int) = [1, 2, 3]
+x", make_int_list(&[1, 2, 3]))]
+// `Collection(T)` = `Σ (D: Any). D ⤇ T`, the whole-domain-witness sum — the ⊤ of the
+// kind order. The annotation is only the annotation: the value still runs as the
+// concrete list, because the witness is resolved statically before op-conversion.
+#[case(r"
+x: Collection(Int) = box([1, 2, 3])
+x", make_int_list(&[1, 2, 3]))]
+#[case(r"
+x: Collection(_) = box([1, 2, 3])
+x", make_int_list(&[1, 2, 3]))]
 fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
+}
+
+// A UDF parameter annotated as an abstract collection is a *consumer* of a whole
+// collection, not a per-element map body. At a concrete call site the UDF inlines and
+// beta-reduces, so the abstract witness resolves to the argument's concrete domain and
+// the body compiles. Without the `Type::Sigma` arm in `inline::is_iterable_domain` the
+// UDF is left un-inlined and the abstract Σ strands at op-conversion.
+//
+// That inlining is also why a *runtime* witness is not yet reachable from source: it is
+// what monomorphizes the parameter back to something op-conversion can iterate
+// (`src/ccl/design/collections.md`, "Future work").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    r"
+def f(c: Collection(Int)):
+    sum(c)
+f(box([1, 2, 3]))",
+    Value::Int(6)
+)]
+#[case(
+    r"
+def f(c: Collection(Int)):
+    sum(c)
+f(box([10, 20]))",
+    Value::Int(30)
+)]
+// A `List(Int)` param — the `UIntRanges` kind — resolves the same way.
+#[case(
+    r"
+def f(c: List(Int)):
+    sum(c)
+f(box([1, 2, 3]))",
+    Value::Int(6)
+)]
+#[case(
+    r"
+def f(c: List(Int)):
+    sum(c)
+f(box([10, 20, 30]))",
+    Value::Int(60)
+)]
+fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -221,30 +279,7 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-// ---------------------------------------------------------------------------
-// The domain-join rejection: the safety chokepoint
-// ---------------------------------------------------------------------------
-
-/// A control-flow join of two differently-sized collections has no domain that holds
-/// both branches' rows, so it is **rejected**. What this pins is that the rejection
-/// happens end-to-end and *cleanly* — a returned compile error, never a panic and
-/// never a silent miscompile that quietly compiles one branch's domain. The
-/// alternative to rejecting is the lossless join (a dependent sum over the candidate
-/// domains), which is the collections work; until it exists this is the contract, and
-/// it is the whole reason a data function's kind is tracked separately from a
-/// capability's.
-#[test]
-fn conditional_collection_rejected_cleanly() {
-    use cambra::ccl::context::{GlobalContext, compile_program};
-    use cambra::interpreter::Consumer;
-    let mut ctx = GlobalContext::default();
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let errs = compile_program(&mut ctx, "sum([1, 2] if True else [1, 2, 3])", consumer)
-        .err()
-        .expect("a domain-joining program must fail to compile, not miscompile or panic");
-    let rendered = format!("{errs:?}");
-    assert!(
-        rendered.contains("collection domain conflict"),
-        "expected the domain-join rejection, got:\n{rendered}"
-    );
-}
+// A conditional collection consumed by `sum` (`sum([1,2] if c else [1,2,3])`)
+// type-checks as a Σ (via the `Σ <: Fun` subtyping rule) and *compiles* via
+// value-`Case` fan-out — see `conditionals.rs` for the end-to-end
+// compile-and-run coverage.

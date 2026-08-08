@@ -195,11 +195,18 @@ impl InferCtx {
                 domain: Box::new(self.normalize_annotation(domain)),
                 kind: *kind,
             },
+            // Structural recursion: normalize the witness's type children and
+            // the body.
+            Type::Sigma(s) => Type::Sigma(Box::new(crate::ccl::ty::SigmaType::bound(
+                s.witness.map_types(|t| self.normalize_annotation(t)),
+                self.normalize_annotation(&s.body),
+            ))),
             // Leaves and existing inference vars pass through unchanged.
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
+            | Type::WitnessRef(_)
             | Type::Txn
             | Type::Infer(_) => ty.clone(),
         }
@@ -333,21 +340,29 @@ impl Typing for InferCtx {
     }
 
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), LocatedInferError> {
-        // Shared by *binder* annotations (trait call sites in the emit rules)
-        // and *node* annotations (`emit_node`'s `user_annotation` tail) — the
-        // reconciliation is identical: annotation wins on success, conflict
-        // surfaces as AnnotationMismatch.
+        // **Value ascription** (`x: T = e`, `(e : T)`): the value's inferred type
+        // flows *up*, so the sound and sufficient rule is the one-way
+        // `inferred <: T` (the value must be usable where `T` is expected). Two
+        // call sites are ascriptions: `emit_let`'s non-mutable annotation arm
+        // (RHS type flows up into the binding) and `emit_node`'s
+        // `user_annotation` tail (a node ascription).
         //
         // **One-way**: `inferred <: ann`. An ascription `x: T = e` needs exactly
         // that — the value must be usable where `T` is expected — and nothing more.
         //
-        // The reverse direction (`ann <: inferred`) additionally rejected a value
-        // whose inferred type is a *strict subtype* of its annotation, which is a
-        // sound widening, not an error: `x: Int = 1` with `1 : {Int | __elem == 1}`,
-        // or a variant inferred as `{A}` annotated at the wider `{A | B}`. It was
-        // kept for eager conflict detection, and was harmless only while every
-        // source annotation was a `Type::Base` leaf, where the two directions
-        // coincide. They no longer do.
+        // The reverse edge (`ann <: inferred`) additionally rejects a value whose
+        // inferred type is a *strict subtype* of its annotation, which is a sound
+        // widening, not an error: `x: Int = 1` with `1 : {Int | __elem == 1}`, a
+        // variant inferred as `{A}` annotated at the wider `{A | B}`, or `[0,3)⤇V`
+        // ascribed at `List(V)`. It was harmless only while every source annotation
+        // was a `Type::Base` leaf, where the two directions coincide; singleton
+        // literals and source-reachable collection/`UIntRange` annotations both make
+        // the over-restriction live. Worse for collections: a two-way `List`
+        // annotation would demand `Σ <: [0,3)⤇V` (consuming the sum *against the value*),
+        // a coercion with no sound denotation. One-way leaves a collection annotation
+        // to be met by Σ-*width*, which is the only edge into a sum — a bare `[0,3)⤇V`
+        // does not reach `List(V)` at all without a `box`
+        // (`src/ccl/design/collections.md`, "Subtyping").
         //
         // Information still flows *from* the annotation, so "annotation wins" is
         // preserved: against a `Hole`-based annotation (`channelize`'s filter-feed
@@ -355,6 +370,11 @@ impl Typing for InferCtx {
         // annotation's refinement of an inferred variable, and the refinement rule
         // flows that deficit onto it rather than rejecting. What changes is *when* a
         // genuine conflict surfaces: at coalesce rather than immediately.
+        //
+        // This is for *ascriptions* only. A lambda **parameter** annotation is
+        // not reconciled here at all: `emit_lambda` binds the param directly at
+        // its annotation (bidirectional checking mode), so a conflicting body use
+        // fails at the use site rather than through any annotation edge.
         let ann_simple = self.normalize_annotation(ann);
         // Snapshot the inferred type before the annotation bounds are added so
         // the error shows what was actually inferred, not the partially

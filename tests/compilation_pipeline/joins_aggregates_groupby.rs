@@ -292,7 +292,8 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     // typed the collection as a capability: lambda elimination and planning are
     // denotation-preserving but *not* kind-preserving — a reconstructed arrow is
     // canonicalized to `Compute` (`Type::without_pi_names`; see
-    // `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions"). So
+    // `src/ccl/design/type-inference.md`,
+    // "4.6 Data vs compute functions and conditional-collection domain joins"). So
     // the cases that keep `⤇` are the ones whose arrow rides through unrebuilt,
     // and the `⇒` cases below are all arrows planning restructured (the
     // `uncurry`/`map_domain` joins). Inference itself types every comprehension

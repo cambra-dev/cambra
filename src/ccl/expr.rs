@@ -210,6 +210,38 @@ pub enum TypedExprNode {
     /// targets.  Either generalize to the full `𝑈 ⇒ 𝑇` semantics or
     /// rename narrower (`Refine`, `AssertDomain`).  See
     /// `src/ccl/design/type-inference.md` for the migration plan.
+    /// Pure type-level assertion that `value` is the **executable realization** of a term
+    /// typed `target` — a re-view the type system cannot prove, and is not asked to.
+    ///
+    /// Distinct from [`Cast`](Self::Cast), and the distinction is the whole point. A cast
+    /// is an **upcast**: its typing rule is the subtype obligation `value_ty <: target`,
+    /// discharged by the ordinary rules. This asserts an **isomorphism the rules cannot
+    /// see**. Planning's realization of a conditional collection is the case: a `Case`
+    /// typed `Σ 𝐷 ∈ 𝐾. 𝐷 ⤇ 𝑉` becomes a gated union typed
+    /// `Variant({𝑖: {𝐷ᵢ | π̂ᵢ}}) ⤇ 𝑉`, and those are genuinely different types — the sum
+    /// picks one branch, the tagged union has rows from every leg. Only the gates make them
+    /// agree, and no typing rule can check a gate. Routing that through `Cast` would mean
+    /// claiming a subtype relation that does not hold.
+    ///
+    /// **Why it exists rather than rewriting the types above it.** Realization changes a
+    /// subterm's type, and every enclosing mention of that type would otherwise have to
+    /// follow — a chain that does not terminate, because the mentions are not all sums and
+    /// not all reachable by one rule. Asserting the *original* type here means nothing
+    /// above has to change at all.
+    ///
+    /// **What it does not cover.** A mention op-conversion *reads* — a comprehension's
+    /// binder domain, which becomes the iteration extent — needs the realized type for
+    /// real, not a re-view of the old one. This node is for mentions that are type-level
+    /// only.
+    ///
+    /// Born after the type system is done (planning), so nothing infers it, and it carries
+    /// **no target field**: the type it asserts is the node's own `ty`. A separate copy
+    /// would be a second thing to keep in sync, and planning normalizes predicates in
+    /// `ty` — a `Cast`'s `target` needs threading through exactly that walk, and this
+    /// sidesteps it by not having one. At runtime it is a no-op: op-conversion compiles
+    /// `value` and discards the wrapper.
+    Realize(Box<TypedExpr>),
+
     Cast {
         /// The value being re-viewed under `target`.
         value: Box<TypedExpr>,
@@ -586,6 +618,7 @@ impl TypedExprNode {
             TypedExprNode::Builtin(_) => "Builtin",
             TypedExprNode::Apply { .. } => "Apply",
             TypedExprNode::Cast { .. } => "Cast",
+            TypedExprNode::Realize(_) => "Realize",
             TypedExprNode::BinOp { .. } => "BinOp",
             TypedExprNode::UnaryOp { .. } => "UnaryOp",
             TypedExprNode::Lambda { .. } => "Lambda",
@@ -1259,7 +1292,7 @@ impl TypedExpr {
                 f(function.as_ref());
                 f(argument.as_ref());
             }
-            TypedExprNode::Cast { value, .. } => f(value.as_ref()),
+            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => f(value.as_ref()),
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left.as_ref());
                 f(right.as_ref());
@@ -1431,7 +1464,7 @@ impl TypedExpr {
             }
             // Only `value` is an expression child; `target` is a type (its
             // refinement predicate is reached via type walks, not here).
-            TypedExprNode::Cast { value, .. } => f(value.as_mut()),
+            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => f(value.as_mut()),
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left.as_mut());
                 f(right.as_mut());
@@ -1539,6 +1572,7 @@ impl TypedExpr {
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
+            | TypedExprNode::Realize(_)
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
@@ -1585,6 +1619,7 @@ impl TypedExpr {
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
+            | TypedExprNode::Realize(_)
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
