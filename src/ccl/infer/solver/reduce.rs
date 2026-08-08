@@ -75,23 +75,45 @@
 //! program that small overflows the stack — and the [`CycleTolerance`] a rule
 //! declares is what decides whether the cut-off is usable or fatal *for that rule*.
 //!
-//! **Answering at a cycle is one step of a fixpoint iteration from ⊥**, and it is
-//! exact only because the base sublattice is flat: `Add(⊥, Int)` is `Int`, and
-//! re-substituting gives `Int` again, so one step saturates. A rule over a lattice
-//! with infinite ascending chains would not saturate — a range-aware `Arithmetic`
-//! on `x := 0; x += 1` walks `[0,0] → [0,1] → [0,2] → …` and needs *widening*, not
-//! one step. That rule cannot land on this machinery unchanged, which is worth
-//! knowing before writing it.
+//! # What the cut actually is
 //!
-//! For a tolerant rule the imprecision does not escape: the frame that materializes
-//! the node runs the same rule again with every argument known, which is where
-//! operands that genuinely disagree are caught.
+//! The cut is a **bounded unrolling of the equation, not an iteration towards its
+//! fixpoint**. Nothing re-enters and re-answers until the answer stops changing; the
+//! depth is fixed by the shape of the program and the walk terminates there. Traced
+//! on `x := 0; x := x + 1; x`, one materialization reduces exactly
 //!
-//! Every rule today satisfies law 3, so a missing argument is never itself a
-//! failure. A future function that cannot — `FieldOf(ρ, 𝑘)` has nothing to say
-//! without `ρ` — is a rule that *violates* law 3 and must therefore report the
-//! cycle, as a new [`ReduceError`] variant introduced with it. It is deliberately
-//! not here yet: today nothing could construct it, so nothing could test it.
+//! ```text
+//! Add(⟨cyclic⟩, 1)  →  Int          the cut
+//! Add(Int, 1)       →  Int          the frame that asked for it
+//! ```
+//!
+//! and stops. `x + x` reaches three levels because each operand re-enters
+//! separately; a second write adds more. Always finite, and — in every shape
+//! measured — the **outermost** frame, the one whose answer becomes the node's type,
+//! sees every argument known. That is where operands which genuinely disagree are
+//! caught, so a tolerant rule's imprecision at the cut does not become the answer
+//! directly; it feeds the cyclic argument's own resolution.
+//!
+//! The consequence for a rule author is the part worth stating, because it is the
+//! opposite of the familiar one: since nothing iterates, **whatever a rule answers
+//! at a cut is what the unrolling carries** — there is no later pass that widens it.
+//! A rule must therefore already be sound at the cut rather than merely
+//! *improvable*. Both of today's rules are, for free and for different reasons:
+//! arithmetic drops to the shared base, which is the top of the chain the missing
+//! operand could have contributed to, and comparison is constant on its domain.
+//!
+//! A sharper rule that instead kept what it could see at the cut would return
+//! whatever a bounded unrolling happened to reach — sound only by accident of how
+//! far the program unrolled. That is the check to run when writing the range-aware
+//! `Arithmetic` that "Known gaps" promises, and *widening does not answer it*, since
+//! there is no iteration to widen. Either answer the base at a cut, or declare
+//! [`AllKnown`](CycleTolerance::AllKnown) and report.
+//!
+//! `FieldOf(ρ, 𝑘)` is the first rule expected to declare `AllKnown`: it has no field
+//! type to name without `ρ`, and it *selects* rather than computes, so it has no
+//! base to fall back to either. Nothing constructs it yet, which is why
+//! [`check_cycle_tolerance`] is factored out of [`reduce`] — reaching the `AllKnown`
+//! arm through `reduce` would need a rule that declares it.
 
 use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::{Type, TypeFn};
