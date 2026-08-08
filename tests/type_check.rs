@@ -593,10 +593,13 @@ fn test_collection_union_heterogeneous_rejected() {
 // `__gb_k`'s only occurrence in the lowered shape is as an operand of that
 // comparison, so without a stated relation its type can only arrive backwards
 // along the operand requirement that relates a comparison's two sides — making a
-// group-by's key inference depend on an operator's internals. A `SharedHole`
-// carried by both the key application and the parameter states it outright (see
-// `Type::SharedHole`); these cases pin that the key resolves to the key
-// function's result type and not to the collection's element type.
+// group-by's key inference depend on an operator's internals. One
+// `Type::SharedHole` states it, carried by the key application and by the domain of
+// the group-by's own `data_fun` annotation; these cases pin that the key resolves
+// to the key function's result type and not to the collection's element type.
+//
+// The relation is **not** visible in `test_lower_groupby`'s snapshots, because
+// `symbolic` does not render annotations. These are the tests that cover it.
 #[rstest]
 #[case("groupby([1, 2, 3], \\x -> x)", "Int key from an Int element")]
 #[case(
