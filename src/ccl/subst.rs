@@ -756,6 +756,7 @@ impl Subst {
 
     fn rewrite_type_go(&self, ty: &mut Type, memo: &PredMemo<Subst>) {
         match ty {
+            Type::Below(t) => self.rewrite_type_go(t, memo),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
@@ -983,6 +984,7 @@ impl Subst {
 
     fn apply_type_inner(&self, ty: &Type) -> Type {
         match ty {
+            Type::Below(t) => Type::Below(Box::new(self.apply_type_inner(t))),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
@@ -1123,6 +1125,10 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         // about lives, and it is what leaves the application unreduced in the first
         // place.
         Type::App { args, .. } => args.iter().any(type_contains_infer),
+        // Annotation position only, and normalized away before solving. Answering
+        // for the bounded type is the honest reading of the question; a `Below` that
+        // reaches here at all is reported as `UnresolvedBelow`, not by this test.
+        Type::Below(t) => type_contains_infer(t),
     }
 }
 
@@ -1153,6 +1159,10 @@ fn collect_type_fv(
     out: &mut BTreeSet<Binder>,
 ) {
     match ty {
+        // A bounded annotation binds nothing, so its bound's free variables are
+        // free in it — a name referenced only from inside an annotation is still
+        // referenced.
+        Type::Below(t) => collect_type_fv(t, bound, visited, out),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)

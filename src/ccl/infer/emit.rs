@@ -313,6 +313,10 @@ fn stamp_kind_from(target: &mut Type, reference: &Type) {
 /// place ([`emit_bare_predicate`]) so the typed term lands on the annotation.
 fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
     match ty {
+        // Runs *before* `normalize_annotation`, so a bounded annotation is still a
+        // `Below` here: recurse into the bound, or a predicate written inside one
+        // (`x <: {Int | p}`) never gets typed.
+        Type::Below(bound) => emit_annotation_predicates(bound, ctx),
         Type::Refinement(inner, r) => {
             // The annotation's refinement is bare over REFINEMENT_BINDER, just
             // like a cast target's — bind the element over the refined base and
@@ -479,18 +483,125 @@ fn apply_unary_scheme<C: Typing>(
     Ok(result)
 }
 
+/// Complete an **exact** annotation with the type inferred for its initializer:
+/// every unspecified position (`_`, a [`Type::Hole`]) takes the corresponding
+/// position of `inferred`.
+///
+/// `x: T = e` binds `x` at `T`, but an annotation may be only *partly* specified
+/// — `x: List(_) = […]`, or the `Feed(_)` bindings the corpus uses — and there a
+/// `Hole` means "infer this position", exactly as it does when it stands alone
+/// (`x: _ = e` is then equivalent to `x = e`).
+///
+/// This is a structural function rather than a constraint, and deliberately so:
+/// binding at a *normalized* annotation and relying on the one-way `inferred <:
+/// ann` edge to drive its fresh variables does not work — they are minted at the
+/// outer level, after the RHS's level has been popped, and escape inference
+/// unresolved.
+///
+/// Positions where the two shapes disagree keep the annotation's: a value that
+/// cannot flow into its annotation at all is already an `AnnotationMismatch`, so
+/// there is no second diagnosis to make here.
+fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
+    match (ann, inferred) {
+        (Type::Hole, _) => inferred.clone(),
+        // A refinement's base can be the unspecified part (`{_ | p}`); the
+        // refinement itself is the user's claim and is kept. `peel_refinements`
+        // on the inferred side because its own refinements describe the *value*,
+        // and this is filling in a *shape*.
+        (Type::Refinement(base, r), _) => Type::Refinement(
+            Box::new(complete_annotation(base, inferred.peel_refinements())),
+            r.clone(),
+        ),
+        // The arrow's binder and kind come from the *annotation*, per the rule
+        // above: a kind is something an annotation can state (`List(T)` is a data
+        // arrow by construction), so it is a claim to keep rather than a shape to
+        // fill in.
+        (
+            Type::Fun {
+                domain: ad,
+                codomain: ac,
+                ..
+            },
+            Type::Fun {
+                domain: id,
+                codomain: ic,
+                ..
+            },
+        ) => Type::fun_like(
+            ann,
+            complete_annotation(ad, id),
+            complete_annotation(ac, ic),
+        ),
+        (Type::Tuple(ats), Type::Tuple(its)) if ats.len() == its.len() => Type::Tuple(
+            ats.iter()
+                .zip(its)
+                .map(|(a, i)| complete_annotation(a, i))
+                .collect(),
+        ),
+        // Records match by *name*, not position, and width-subtyping means the
+        // inferred record may carry fields the annotation does not mention. Those
+        // are exactly what an exact annotation discards, so only the annotated
+        // fields are completed.
+        (Type::Record(afs), Type::Record(ifs)) => Type::Record(
+            afs.iter()
+                .map(|(n, a)| {
+                    let i = ifs.iter().find(|(m, _)| m == n).map(|(_, t)| t);
+                    (
+                        n.clone(),
+                        i.map_or_else(|| a.clone(), |i| complete_annotation(a, i)),
+                    )
+                })
+                .collect(),
+        ),
+        (
+            Type::History {
+                value: av,
+                domain: ad,
+                kind,
+            },
+            Type::History {
+                value: iv,
+                domain: id,
+                ..
+            },
+        ) => Type::History {
+            value: Box::new(complete_annotation(av, iv)),
+            domain: Box::new(complete_annotation(ad, id)),
+            kind: *kind,
+        },
+        _ => ann.clone(),
+    }
+}
+
 pub(super) fn emit_lambda<C: Typing>(
     param: &mut TypedBinding,
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // Param type: convert any explicit annotation/Hole/Infer into a
-    // the solver. A Hole turns into a fresh Var that will accumulate
-    // bounds from body usage and call sites. Link `param.ty` to that
-    // (shared) var so `coalesce_node` can resolve the binding slot in
-    // place. Domain refinements ride the type lattice (introduced by `cast`),
-    // not the lambda node, so the param binds under its bare type here.
-    let param_simple = ctx.normalize(&param.ty);
+    // The parameter binds at its **declared** type when there is one, and at its
+    // slot otherwise. Normalizing does the work of both annotation forms with no
+    // dispatch here:
+    //
+    // - exact `p: 𝑇` normalizes to `𝑇` itself, so the body sees exactly `𝑇` and
+    //   every call site owes `arg <: 𝑇`. A `Hole` position inside it becomes a
+    //   fresh variable resolved from the call sites — a parameter has no
+    //   initializer, so there is nothing to complete it from the way
+    //   `complete_annotation` completes a `let`'s.
+    // - bounded `p <: 𝑇` normalizes to a fresh variable carrying `𝑇` as an upper
+    //   bound, which *is* "inferred, and no wider than `𝑇`": body usage and call
+    //   sites add their own bounds, so the parameter lands on the meet.
+    //
+    // Reconciling the slot against the annotation afterwards — what this used to
+    // do — is what made an exact annotation behave as neither reading: it
+    // contributed one upper bound among several instead of being the type.
+    //
+    // A Hole (no annotation) turns into a fresh Var accumulating bounds from body
+    // usage and call sites. Either way `param.ty` is linked to that type so
+    // `coalesce_node` resolves the binding slot in place. Domain refinements ride
+    // the type lattice (introduced by `cast`), not the lambda node, so the param
+    // binds under its bare type here.
+    let declared = param.user_annotation.clone().unwrap_or(param.ty.clone());
+    let param_simple = ctx.normalize(&declared);
     param.ty = param_simple.clone();
     // The param is bound in scope under the *unrefined* `param_simple`, so
     // `Var(param)` body references stay bare; restriction refinements decorate only
@@ -509,12 +620,6 @@ pub(super) fn emit_lambda<C: Typing>(
         Some(_) => denoted_expr(body).ty.clone(),
         None => body_ty,
     };
-
-    // Param user-annotation: reconcile the inferred param type with the
-    // annotation (two-way; see `bind_annotation`).
-    if let Some(ann) = param.user_annotation.clone() {
-        ctx.bind_annotation(&param_simple, &ann)?;
-    }
 
     // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
     // predicate nested in `body_ty` that closes over the parameter (the
@@ -1052,21 +1157,35 @@ pub(super) fn emit_let<C: Typing>(
     let bound_ty = deref_mut(&bound_ty);
     // The type the variable is bound at over the body.
     let scheme_ty = match &binding.user_annotation {
-        // The annotation reconciles the initializer as an ascription. The
-        // deref-copy case that used to be special here (`y: Int = x` off a
-        // register, bound at the annotation rather than at the mutable type) is
-        // gone: `bound_ty` was already deref'd above, so annotation and
-        // initializer agree and there is nothing to choose between.
+        // Every other annotation: the variable binds at what the annotation
+        // *declares*, and the two forms differ only in what that is. An exact
+        // `x: 𝑇` is completed from the initializer at its unspecified positions
+        // and then declares that; a bounded `x <: 𝑇` declares a variable bounded
+        // above by `𝑇`, whose lower bound is the initializer — so it resolves to
+        // the initializer's type, and `𝑇` only has to admit it.
+        //
+        // One normalization serves both the reconcile and the binding, which is why
+        // `bind_annotation` hands it back: normalizing is not idempotent, and
+        // minting a second variable here would leave the one the binder is bound at
+        // unrelated to the one the initializer flowed into.
+        //
+        // There is no register arm and no deref-copy case. A register introduction
+        // is a `MutDecl` (see `emit_mut_decl`), and a register-typed initializer was
+        // already deref'd above — so `y: Int = x` off a register needs no special
+        // handling, and `y: _ = x` completes from the *value* rather than the
+        // history, which is what makes it mean exactly `y = x`.
         Some(ann) => {
-            ctx.bind_annotation(&bound_ty, ann)?;
-            bound_ty
+            let declared = match ann {
+                Type::Below(_) => ann.clone(),
+                _ => complete_annotation(ann, &bound_ty),
+            };
+            ctx.bind_annotation(&bound_ty, &declared)?
         }
         None => bound_ty,
     };
     // The binder slot records the type the variable is *bound at*, not its
-    // initializer's type — the two differ for exactly the annotated cases above
-    // (a deref-copy binds at the value type, a register introduction at the
-    // history). Writing it here, for coalesce to resolve in place, is the same
+    // initializer's type — an exact annotation binds at the annotation, not at
+    // what flowed in. Writing it here, for coalesce to resolve in place, is the same
     // binder-slot discipline `emit_lambda` uses for `param.ty` and `emit_letrec`
     // for its declared types; `let` was the one binder whose slot was
     // reconstructed from its RHS afterwards instead, which is what forced the

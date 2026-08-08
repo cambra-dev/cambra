@@ -157,6 +157,11 @@ fn resolve_structured_argument(arg: &Type) -> Option<Type> {
 /// higher-ranked and so cannot borrow `out`.
 fn collect_infer_vars(ty: &Type, out: &mut BTreeSet<InferVarId>) {
     match ty {
+        // Not a type — an annotation-position obligation, erased by
+        // `normalize_annotation` before any constraint is emitted (see `Type::Below`).
+        Type::Below(_) => {
+            unreachable!("Type::Below reached the solver; `normalize_annotation` must erase it")
+        }
         Type::Infer(v) => {
             out.insert(v.uid);
         }
@@ -750,6 +755,11 @@ fn compact_go(
     st: &mut CompactState,
 ) -> CompactType {
     match ty {
+        // Not a type — an annotation-position obligation, erased by
+        // `normalize_annotation` before any constraint is emitted (see `Type::Below`).
+        Type::Below(_) => {
+            unreachable!("Type::Below reached the solver; `normalize_annotation` must erase it")
+        }
         // Atomic types contribute a single atom. A term substitution never
         // touches an atom, so `subst_acc` is irrelevant here.
         Type::Base(_)

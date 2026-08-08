@@ -127,8 +127,15 @@ pub(super) trait Typing {
     /// mode this records the **one-way** obligation `inferred <: ann` —
     /// an annotation has to *admit* the value, not equal it — surfacing
     /// [`InferError::AnnotationMismatch`] on conflict. See the implementation
-    /// for why the reverse direction is wrong.
-    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), LocatedInferError>;
+    /// for why the reverse direction is wrong, and
+    /// `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded"
+    /// for the two forms this obligation serves.
+    ///
+    /// **Returns the normalized annotation**, because normalizing is not
+    /// idempotent: a `Hole` or a [`Type::Below`] mints a fresh variable each time,
+    /// so a caller that both reconciles against an annotation and binds at it must
+    /// use one normalization for both or it relates two unrelated variables.
+    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError>;
 
     /// Obtain the type for a binder slot that lives on a
     /// [`TypedBinding`](crate::ccl::TypedBinding) rather than an [`Expr`] (a
