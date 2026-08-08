@@ -1122,7 +1122,13 @@ a fixpoint equation, because an accumulator *is* one. Measured, 1,910 cyclic arg
 
 Deliberately **not per-argument**. Every rule's condition is about *how many* arguments are cyclic rather than which — arithmetic's operands are interchangeable to its rule, and a rule needing one argument needs it whichever position it occupies. A rule wanting "at least 𝑛 known" would generalize this to a count; none does.
 
-**Answering at a cycle is one step of a fixpoint iteration from ⊥**, exact only because the base sublattice is flat: `Add(⊥, Int)` is `Int`, and re-substituting gives `Int` again. A rule over a lattice with infinite ascending chains does not saturate in one step — the range-aware `Arithmetic` in [Known gaps](#known-gaps) walks `x := 0; x += 1` through `[0,0] → [0,1] → [0,2] → …` and needs **widening**. It cannot land on this machinery unchanged.
+#### The cut is an unrolling, not an iteration
+
+The cut does **not** iterate the equation towards its fixpoint. It unrolls it a number of times fixed by the shape of the program and stops. Traced on `x := 0; x := x + 1; x`, one materialization reduces `Add(⟨cyclic⟩, 1) → Int` and then `Add(Int, 1) → Int`, and ends; `x + x` reaches three levels because each operand re-enters separately. In every shape measured the **outermost** frame — the one whose answer becomes the node's type — sees every argument known, which is where operands that genuinely disagree are caught.
+
+The consequence for a rule author is the opposite of the familiar one. Because nothing iterates, whatever a rule answers at a cut is **what the unrolling carries**; there is no later pass that widens it. A rule must therefore be *sound* at the cut, not merely improvable. Both of today's rules are, for free: arithmetic drops to the shared base — the top of the chain the missing operand could have contributed to — and comparison is constant on its domain.
+
+A sharper rule that kept what it could see at the cut would instead return whatever a bounded unrolling happened to reach, sound only by accident of how far the program unrolled. That is the check to run when writing the range-aware `Arithmetic` in [Known gaps](#known-gaps), and **widening does not answer it**, because there is no iteration to widen: answer the base at a cut, or declare `AllKnown` and report.
 
 ### Obligations that are not decidable yet are parked
 
