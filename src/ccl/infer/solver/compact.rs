@@ -714,9 +714,12 @@ fn compact_go(
         // cyclic argument degrades to "no information at this position", which is
         // what lets the enclosing read fall back to its other bounds.
         Type::App { fun, args } => {
-            let resolved: Vec<Option<Type>> = args
+            let resolved: Vec<super::reduce::Arg> = args
                 .iter()
-                .map(|a| resolve_argument(a, subst_acc))
+                .map(|a| match resolve_argument(a, subst_acc) {
+                    Some(t) => super::reduce::Arg::Known(t),
+                    None => super::reduce::Arg::Cyclic,
+                })
                 .collect();
             match super::reduce::reduce(fun, &resolved) {
                 Ok(reduced) => compact_go(&reduced, pol, subst_acc, parents, st),

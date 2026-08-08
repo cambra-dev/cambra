@@ -245,6 +245,17 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
                 at: ctx_label.to_string(),
             }
         }
+        // A rule that cannot answer through a cycle. The program defined something
+        // in terms of itself in a way this rule has no answer for, which is a user
+        // error about the *program*, not a conflict between two types — so it is
+        // reported in its own words rather than as a mismatch.
+        CoalesceError::Reduce(ReduceError::CyclicArgument { fun }) => {
+            InferError::Unsupported(format!(
+                "{fun} cannot be computed at {ctx_label}: one of its arguments is \
+                 defined in terms of this very application, and {fun} has no answer \
+                 without it"
+            ))
+        }
     }
 }
 
