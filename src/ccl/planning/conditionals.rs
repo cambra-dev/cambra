@@ -121,10 +121,18 @@ fn realize_here(expr: &mut Expr) {
     // and only the gates reconcile them. A cast would be claiming an obligation that does
     // not hold; this asserts an isomorphism the rules cannot see, which is what it is for.
     //
-    // Only where the `Case` *was* a sum. A same-domain conditional types as a plain
-    // collection, so its realization changes no mention and needs no assertion.
+    // Only where the `Case` *mentioned a witness*. A same-domain conditional types as a
+    // plain collection, so its realization changes no mention and needs no assertion.
+    //
+    // A sum is the usual such type but not the only one: by the time a `Case` reaches here
+    // inside a **predicate** it has been lambda-eliminated to its arrow view `𝑤 ⤇ 𝑉` — the
+    // sum opened, the witness still named — and realizing that without an assertion shifts
+    // the enclosing composition's domain from the witness to the union. The condition is
+    // therefore about what the type *says*, not which constructor says it.
     let original = expr.ty.clone();
-    *expr = if matches!(peel_refinements(&original), Type::Sigma(_)) {
+    let mentions_witness = matches!(peel_refinements(&original), Type::Sigma(_))
+        || crate::ccl::ty::has_free_witness_ref(&original, &[]);
+    *expr = if mentions_witness {
         Expr::new(TypedExprNode::Realize(Box::new(realized))).with_ty(original)
     } else {
         realized
@@ -233,5 +241,71 @@ fn repair_unboxed_argument(expr: &mut Expr) {
         && matches!(**domain, Type::Sigma(_))
     {
         **domain = argument.ty.clone();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::infer_var::fresh_witness_binder_id;
+    use crate::ccl::{Branch, Lit, Name};
+
+    /// **Realization never changes a type that names the witness.** `Realize` asserts the
+    /// pre-realization type precisely so that nothing above a realized `Case` has to be
+    /// rewritten, and the mentions that would need rewriting are exactly the ones naming
+    /// the witness — whether the naming type is the sum itself or the arrow view
+    /// `𝑤 ⤇ 𝑉` a lambda-eliminated `Case` carries inside a predicate.
+    ///
+    /// Pinned as a unit test because the assertion is unobservable end-to-end today: the
+    /// arrow-view shape reaches realization from a *passing* program (the mapping
+    /// comprehension over a conditional), but nothing above it reads the type there yet.
+    /// The consumer that does is the filtered comprehension, and it is blocked on
+    /// per-leg restriction (`a_filter_over_a_conditional_source_is_dropped`). Without
+    /// this, that path silently shifts the enclosing composition's domain from the
+    /// witness to the realized union.
+    #[test]
+    fn realizing_an_arrow_view_case_keeps_the_witness_in_its_type() {
+        let int = Type::Base(BaseType::Int);
+        let w = fresh_witness_binder_id();
+        let witness = Type::WitnessRef(w);
+        // Two guarded arms, each a concrete collection — the shape a conditional
+        // collection has once `box` is gone and the sum has been opened.
+        let arm = |dom: usize| {
+            Expr::new(TypedExprNode::Var(Name::from("xs")))
+                .with_ty(Type::data_fun(Type::UIntRange(dom), int.clone()))
+        };
+        let guard = |b: bool| Expr::lit(Lit::Bool(b)).with_ty(Type::Base(BaseType::Bool));
+        let case = TypedExprNode::Case {
+            scrutinee: None,
+            branches: vec![
+                Branch {
+                    pattern: None,
+                    guard: guard(true),
+                    body: arm(2),
+                },
+                Branch {
+                    pattern: None,
+                    guard: guard(true),
+                    body: arm(3),
+                },
+            ],
+        };
+        // The **arrow view**: the sum opened, the witness still named. Not a `Type::Sigma`,
+        // which is the whole point — the old condition tested the constructor.
+        let arrow_view = Type::data_fun(witness.clone(), int.clone());
+        let mut expr = Expr::new(case).with_ty(arrow_view.clone());
+
+        realize_conditional_collections(&mut expr);
+
+        assert_eq!(
+            expr.ty, arrow_view,
+            "realization must assert the pre-realization type, not the union's: {}",
+            expr.ty
+        );
+        assert!(
+            matches!(expr.node, TypedExprNode::Realize(_)),
+            "the assertion is carried by a `Realize` node, got {:?}",
+            expr.node
+        );
     }
 }

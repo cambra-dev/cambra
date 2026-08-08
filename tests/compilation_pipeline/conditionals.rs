@@ -645,8 +645,8 @@ fn a_conditional_source_compiles_however_it_reaches_the_generator(
 /// general path work turned a compile error into a quiet miscomputation. A guard that
 /// refuses rather than drops belongs here until the restrict is emitted.
 #[test]
-#[ignore = "planning emits no restrict from a sum's refined candidates; the witness \
-            reaches operator conversion, which has no extent for it"]
+#[ignore = "the sum-wide restriction needs emitting as a gate *per realized leg*, not \
+            as one restrict over the union; measured 2026-08-08"]
 fn a_filter_over_a_conditional_source_is_dropped() {
     check_scalar(
         r"
@@ -984,8 +984,8 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
 /// what a run says today and nothing more — re-measure before trusting it.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[ignore = "two generators index the result by a *pair* of witnesses, a body shape \
-            `SigmaType::body_residue` does not destructure"]
+#[ignore = "two generators nest two sums; `body_residue`, Check's Σ-wrapper rebuild and \
+            `Proj` on a witness-typed tuple each assume one witness; measured 2026-08-08"]
 fn two_conditional_sources_compile() {
     check_scalar(
         r"
