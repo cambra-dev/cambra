@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
+use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{Expr, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode};
 use crate::util::ScopeStack;
@@ -660,9 +661,29 @@ pub fn infer(
 /// — whether this binder is a register — is answered by
 /// [`TypedExprNode::MutDecl`] being the node that binds one.
 fn clear_annotations(expr: &mut Expr) {
-    expr.user_annotation = None;
-    expr.walk_binders_mut(|b| b.user_annotation = None);
-    expr.walk_children_mut(clear_annotations);
+    clear_annotations_in(expr, &PredMemo::new());
+}
+
+/// Returns whether anything was cleared, which is what the predicate memo needs
+/// to decide between rebuilding a predicate term and reusing it — clearing a tree
+/// with no annotations left in it must not split the `Rc` sharing that downstream
+/// per-predicate memos dedup on.
+fn clear_annotations_in(expr: &mut Expr, predicates: &PredMemo<()>) -> bool {
+    let mut cleared = expr.user_annotation.take().is_some();
+    expr.walk_binders_mut(|b| cleared |= b.user_annotation.take().is_some());
+    // Annotations also ride expressions hanging off *type* slots — a refinement's
+    // predicate — and those nodes are outside `walk_children` entirely. Inference
+    // reads them there (`groupby` stamps the key relation that ties `__gb_k` to its
+    // key function on a node inside the cast target's predicate), so clearing has
+    // to follow the same route, or an annotation survives exactly where only a type
+    // walk can find it.
+    expr.walk_type_slots_mut(|ty| {
+        cleared |= walk_refined_predicates_mut(ty, predicates, &(), &mut |predicate, memo| {
+            clear_annotations_in(predicate, memo)
+        });
+    });
+    expr.walk_children_mut(|child| cleared |= clear_annotations_in(child, predicates));
+    cleared
 }
 
 /// Post-inference invariant: no `user_annotation` survives anywhere in the tree.
@@ -671,6 +692,16 @@ fn clear_annotations(expr: &mut Expr) {
 /// mode is silent — a stale annotation is only *read* by whichever pass thinks to
 /// look, so a leak surfaces as a wrong answer somewhere else entirely.
 pub(super) fn debug_assert_annotations_cleared(expr: &Expr) {
+    // The walk allocates, and every assertion inside it is compiled out in
+    // release — so skip it there rather than paying for a walk that can no
+    // longer report anything.
+    if cfg!(debug_assertions) {
+        let mut visited = HashSet::new();
+        assert_annotations_cleared(expr, &mut visited);
+    }
+}
+
+fn assert_annotations_cleared(expr: &Expr, visited: &mut HashSet<crate::ccl::PredicateId>) {
     debug_assert!(
         expr.user_annotation.is_none(),
         "annotation survived inference on node `{}`: annotations are a \
@@ -685,7 +716,17 @@ pub(super) fn debug_assert_annotations_cleared(expr: &Expr) {
             b.name
         );
     });
-    expr.walk_children(debug_assert_annotations_cleared);
+    // An expression also hangs off the *type* slots — a refinement's predicate —
+    // and those nodes are outside `walk_children` entirely. Inference reads
+    // annotations there (`groupby` stamps its key relation on a node inside the
+    // cast target's predicate), so a check that walked only children would
+    // declare the tree clean while a live annotation sat in a type.
+    expr.walk_type_slots(|ty| {
+        walk_refined_predicates(ty, visited, &mut |predicate, visited| {
+            assert_annotations_cleared(predicate, visited);
+        });
+    });
+    expr.walk_children(|child| assert_annotations_cleared(child, visited));
 }
 
 /// How the annotation checks treat inference-transient type variants.

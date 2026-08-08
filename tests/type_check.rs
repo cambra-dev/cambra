@@ -11,11 +11,13 @@
 //!   → Type          (test assertion here)
 //! ```
 
+use std::collections::HashSet;
 use std::time::Duration;
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
-    FieldKey, HistoryKind, Lit, Type,
+    FieldKey, HistoryKind, Lit, PredicateId, Type,
+    ccl_utils::walk_refined_predicates,
     infer::{
         InferError, LocatedInferError, TypeInferenceContext, check_pre_desugar, infer,
         lit_singleton,
@@ -1746,5 +1748,43 @@ mod binder_slot_records_the_bound_at_type {
                 b.user_annotation
             );
         }
+    }
+
+    /// Including annotations that ride a **type slot** rather than a child.
+    ///
+    /// `groupby` stamps the relation tying its key parameter to its key function
+    /// onto a node inside the cast target's refinement predicate — a position no
+    /// `walk_children` reaches. Clearing that walked only children left the
+    /// annotation live exactly where a type walk was the only way to find it, and
+    /// the post-inference wall, walking children too, called the tree clean.
+    #[test]
+    fn annotations_do_not_survive_inference_inside_a_refinement() {
+        fn surviving(expr: &Expr, visited: &mut HashSet<PredicateId>, out: &mut Vec<String>) {
+            if expr.user_annotation.is_some() {
+                out.push(cambra::ccl::symbolic::symbolic(expr));
+            }
+            expr.walk_binders(|b| {
+                if b.user_annotation.is_some() {
+                    out.push(b.name.to_string());
+                }
+            });
+            expr.walk_type_slots(|ty| {
+                walk_refined_predicates(ty, visited, &mut |predicate, visited| {
+                    surviving(predicate, visited, out);
+                });
+            });
+            expr.walk_children(|child| surviving(child, visited, out));
+        }
+
+        let mut lctx = LoweringContext::default();
+        let stmts = parse_module("[sum(g) for g in groupby([1, 1, 2], \\x -> x)]");
+        let mut expr = lower_stmts(&stmts, &mut lctx)
+            .into_result()
+            .expect("lowering failed");
+        infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
+
+        let mut out = Vec::new();
+        surviving(&expr, &mut HashSet::new(), &mut out);
+        assert!(out.is_empty(), "annotations survived inference: {out:?}");
     }
 }
