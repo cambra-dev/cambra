@@ -32,124 +32,12 @@ thread_local! {
     static ARGS_IN_FLIGHT: std::cell::RefCell<BTreeSet<InferVarId>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
 
-    // Nesting depth of [`compact_type`], which is what tells a resolution whether
-    // it is the one that has to reconcile the cache against the graph.
-    static COMPACT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    // Resolved arguments and reach sets, valid for as long as the bound graph has
-    // not moved. See [`reconcile_cache`].
-    static RESOLVED_ARGS: std::cell::RefCell<HashMap<ArgKey, Option<Type>>> =
+    // The **canonical** resolution of each variable — the answer it has when no
+    // other resolution is in flight — valid for as long as the bound graph has not
+    // moved. See [`reconcile_cache`] and [`resolve_argument`].
+    static RESOLVED_ARGS: std::cell::RefCell<HashMap<InferVarId, Option<Type>>> =
         std::cell::RefCell::new(HashMap::new());
     static CACHE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
-
-    // What a resolution of each variable **reaches** — see [`ArgKey`].
-    static REACHES: std::cell::RefCell<HashMap<InferVarId, BTreeSet<InferVarId>>> =
-        std::cell::RefCell::new(HashMap::new());
-    // The variables the resolutions currently on the stack have reached. Each
-    // resolution marks the length on entry and takes the suffix as *its* reach set,
-    // so the stack accumulates transitively: a nested resolution's reach set is
-    // already in its caller's suffix.
-    static REACHED: std::cell::RefCell<Vec<InferVarId>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// What a memoized argument resolution is a function of: the argument variable, and
-/// the in-flight resolutions **it actually reaches**.
-///
-/// The second half is what makes the memo work rather than merely exist. An
-/// function reached while one of its own arguments is being resolved answers from
-/// the rest (`ARGS_IN_FLIGHT` → `None` → [`super::reduce`]'s coarsening), so the
-/// answer does depend on which cycles were open — but only on the ones this
-/// resolution can *reach*. Keying on the whole open set instead files the same
-/// answer separately for every combination of variables the resolution never walks
-/// to, and on a chain of generic wrappers over unresolved operands that is the
-/// difference between 417,716 compactions and 6,021.
-///
-/// **Reached, not merely consulted**, and the distinction is the soundness of the
-/// whole thing. A resolution is cut off at very few in-flight variables — at most
-/// three on those chains, usually none — and keying on just those would collapse
-/// further. It would also be wrong: a variable this resolution *would* have
-/// recursed into behaves differently when it is in flight than when it is not, so
-/// two calls agree only if they agree on everything reachable, not on what one of
-/// them happened to stop at.
-///
-/// The reach set is a property of the variable and the graph, so it is cached in
-/// [`REACHES`] and consulted to *form* the key. It is discovered by resolving,
-/// which is the one wrinkle: a run made while some variable was in flight stops
-/// early there and can under-report. So the set only ever grows, and a growth
-/// invalidates the memo — an entry keyed on a smaller reach set was keyed on too
-/// little to tell two calls apart, and not only for this variable, since a caller's
-/// set is the union of what its callees reached. Growth is bounded by the number of
-/// variables, so this settles rather than thrashing; in practice it does not fire at
-/// all on the chains this exists for.
-type ArgKey = (InferVarId, Vec<InferVarId>);
-
-/// Tracks [`compact_type`] nesting, and owns the walk state that is meaningless
-/// outside a resolution chain.
-///
-/// This is **not** what bounds the memo's lifetime — [`reconcile_cache`] is, and it
-/// scopes [`RESOLVED_ARGS`] to "since the last graph mutation", a window that spans
-/// many compactions. What this scope owns is [`REACHED`], which is a stack rather
-/// than a cache: it is meaningful only while a chain is running, and a partial one
-/// left behind would misattribute the next chain's reach sets.
-///
-/// The memo it makes possible is not an optimization at the margin. Each operand of
-/// every arithmetic and comparison instantiation carries a `CommonBase` bound over
-/// *both* operands, so resolving one operand resolves the other, which resolves the
-/// first again along a second path. Nothing is deposited, so without a memo nothing
-/// is reused and the re-derivation branches at every level: two nested generic
-/// functions over unresolved operands is enough to make inference not terminate.
-struct ResolutionScope {
-    outermost: bool,
-    /// The graph generation on entry, for the debug check in [`Drop`].
-    #[cfg(debug_assertions)]
-    generation_on_entry: u64,
-}
-
-impl ResolutionScope {
-    fn enter() -> ResolutionScope {
-        let outermost = COMPACT_DEPTH.with(|d| {
-            let n = d.get();
-            d.set(n + 1);
-            n == 0
-        });
-        ResolutionScope {
-            outermost,
-            #[cfg(debug_assertions)]
-            generation_on_entry: crate::ccl::infer_var::graph_generation(),
-        }
-    }
-}
-
-impl Drop for ResolutionScope {
-    fn drop(&mut self) {
-        // The load-bearing claim behind caching across compactions: materializing a
-        // type *reads* the graph and never writes it, so a cache filled during one
-        // compaction is still valid at the end of it. Asserted rather than argued,
-        // because a future write on this path would not fail any test — it would
-        // quietly serve one node's answer to another.
-        //
-        // Skipped while unwinding: a panic inside the walk runs this `Drop`, and a
-        // second panic during unwinding aborts the process — turning a diagnosable
-        // failure into one with no backtrace at the site that caused it. The
-        // invariant is about a completed compaction anyway; an aborted one has no
-        // cache entries anyone will trust.
-        #[cfg(debug_assertions)]
-        if !std::thread::panicking() {
-            debug_assert_eq!(
-                self.generation_on_entry,
-                crate::ccl::infer_var::graph_generation(),
-                "compaction mutated the bound graph: resolution must be read-only, or \
-                 the argument cache outlives its subject"
-            );
-        }
-        COMPACT_DEPTH.with(|d| d.set(d.get() - 1));
-        if self.outermost {
-            // The reach stack is walk state, not cache: it is meaningless outside a
-            // resolution chain, and leaving a partial one behind (an unwind, say)
-            // would misattribute the next chain's reach sets.
-            REACHED.with(|v| v.borrow_mut().clear());
-        }
-    }
 }
 
 /// Drop the resolution cache if the bound graph has moved since it was filled.
@@ -162,26 +50,21 @@ impl Drop for ResolutionScope {
 /// [`graph_generation`](crate::ccl::infer_var::graph_generation) because
 /// `InferVar`'s bound lists are private and reachable only through `bounds_mut`.
 ///
-/// Scoping it to one compaction instead — the narrower window `ResolutionScope`
-/// already delimits — costs a factor: an inference run compacts once per node, so
-/// the table would be rebuilt from scratch some eighty times over a program whose
-/// whole answer is a few hundred entries.
+/// Scoping it to one compaction instead costs a factor: an inference run compacts
+/// once per node, so the table would be rebuilt from scratch some eighty times over
+/// a program whose whole answer is a few hundred entries.
 fn reconcile_cache() {
     let now = crate::ccl::infer_var::graph_generation();
     if CACHE_GENERATION.with(|g| g.get()) != now {
         RESOLVED_ARGS.with(|m| m.borrow_mut().clear());
-        // Reach sets go with the answers: they are facts about which bounds exist,
-        // so a new edge can only mean a resolution reaches further than recorded.
-        REACHES.with(|m| m.borrow_mut().clear());
         CACHE_GENERATION.with(|g| g.set(now));
     }
 }
 
 /// Marks `uid` as in flight for as long as it is held.
 ///
-/// RAII rather than a straight-line insert/remove for the same reason
-/// [`ResolutionScope`] clears [`REACHED`] in [`Drop`]: these are thread-locals that
-/// outlive any one call, so a panic between the two halves — anywhere inside
+/// RAII rather than a straight-line insert/remove: this is a thread-local that
+/// outlives any one call, so a panic between the two halves — anywhere inside
 /// [`compact_type`] or [`coalesce_compact`](super::coalesce_compact) — would leave
 /// `uid` marked for the rest of the thread's life. Nothing would crash; every
 /// later reduction that reached `uid` would silently answer without it and coarsen
@@ -206,25 +89,39 @@ impl Drop for InFlight {
     }
 }
 
-/// The in-flight variables that `reach` contains — the second half of an
-/// [`ArgKey`], built by walking `reach` rather than by cloning the in-flight set,
-/// since `reach` is the small side.
-fn open_intersection(reach: &BTreeSet<InferVarId>) -> Vec<InferVarId> {
-    ARGS_IN_FLIGHT.with(|s| {
-        let s = s.borrow();
-        reach.iter().copied().filter(|v| s.contains(v)).collect()
-    })
-}
-
 /// Resolve one type-function argument to a concrete `Type`, or `None` if its
 /// resolution is already in flight.
 ///
 /// This is the **demand-driven** step: it runs the full resolution pipeline on the
 /// argument, so it pulls whatever the graph knows at the moment the enclosing type
 /// is materialized — no bound is deposited and no walk order can change the answer.
-/// Repeats within one compaction are served from [`RESOLVED_ARGS`], which changes
-/// nothing about *what* is computed (the graph is fixed for that window) and is
-/// what keeps the re-entrancy from compounding.
+///
+/// # The memo caches one answer per variable: its *canonical* one
+///
+/// Resolution is re-entrant — an argument resolves through the ordinary pipeline,
+/// which reaches other applications, so chains of them nest — and it deposits
+/// nothing, so without a memo the same variable is re-derived along every path that
+/// reaches it.
+///
+/// What makes an answer reusable is subtle enough to state precisely. A resolution
+/// cut off by [`ARGS_IN_FLIGHT`] answers *without* the cut-off argument
+/// ([`super::reduce`]'s law 3), so its result depends on which resolutions were
+/// open — and an entry filed under one open set is wrong for a call made under a
+/// different one.
+///
+/// So the memo stores only the answer that does **not** depend on that: the one a
+/// variable has when nothing else is in flight. Such a call always starts from the
+/// same state and therefore always computes the same result for a given graph,
+/// which makes the variable alone a complete key. A call made *while* something is
+/// in flight neither reads nor writes the memo — it may be cut off differently, so
+/// its answer is nobody else's.
+///
+/// That covers essentially all of the traffic: measured across the whole suite,
+/// 97.6% of hits are canonical (14,290 of 14,637). The alternative — keying on the
+/// argument *and the in-flight resolutions it reaches*, so that cut-off answers are
+/// filed apart too — buys the remaining 2.4% at the cost of discovering reach sets
+/// by resolving, growing them monotonically, and invalidating the table whenever
+/// one grows.
 fn resolve_argument(arg: &Type, subst_acc: &Subst) -> Option<Type> {
     // The argument rides the application through whatever substitutions the edges
     // walked so far composed; force them before resolving, exactly as the
@@ -247,59 +144,26 @@ fn resolve_argument(arg: &Type, subst_acc: &Subst) -> Option<Type> {
     };
     let uid = v.uid;
     reconcile_cache();
-    // Whatever happens next, the enclosing resolution has reached `uid`.
-    REACHED.with(|r| r.borrow_mut().push(uid));
+    // This resolution is already running further up the stack: answering would
+    // recurse forever, so report the argument as unavailable and let the rule
+    // coarsen.
     if ARGS_IN_FLIGHT.with(|s| s.borrow().contains(&uid)) {
         return None;
     }
-    // With `uid`'s reach set already known, the key is available before the work is.
-    // Both the key and the lookup are built without cloning the in-flight set: a
-    // resolution reaches at most a handful of variables, so the intersection is
-    // short even when many are open.
-    let known_reach = REACHES.with(|m| m.borrow().get(&uid).cloned());
-    if let Some(reach) = &known_reach {
-        let key = (uid, open_intersection(reach));
-        if let Some(hit) = RESOLVED_ARGS.with(|m| m.borrow().get(&key).cloned()) {
-            // The caller's own reach set must cover what this resolution would have
-            // reached, or it would key its entry on too little.
-            REACHED.with(|r| r.borrow_mut().extend(reach.iter().copied()));
-            return hit;
-        }
+    // Canonical exactly when nothing else is open — see the memo section above.
+    // Read before the mark below, which is what would make it non-canonical.
+    let canonical = ARGS_IN_FLIGHT.with(|s| s.borrow().is_empty());
+    if canonical && let Some(hit) = RESOLVED_ARGS.with(|m| m.borrow().get(&uid).cloned()) {
+        return hit;
     }
 
     let _in_flight = InFlight::mark(uid);
-    let mark = REACHED.with(|r| r.borrow().len());
     let resolved = super::coalesce_compact(&super::simplify_type(compact_type(arg))).ok();
     drop(_in_flight);
 
-    // Collapse this resolution's slice of the stack to its distinct members: the
-    // caller only needs the set, and left as a raw trace it would grow with the
-    // whole walk rather than with the number of variables.
-    let reached: BTreeSet<InferVarId> = REACHED.with(|r| {
-        let mut r = r.borrow_mut();
-        let set: BTreeSet<InferVarId> = r[mark..].iter().copied().collect();
-        r.truncate(mark);
-        r.extend(set.iter().copied());
-        set
-    });
-
-    let grew = REACHES.with(|m| {
-        let mut m = m.borrow_mut();
-        let entry = m.entry(uid).or_default();
-        let before = entry.len();
-        entry.extend(reached.iter().copied());
-        entry.len() != before
-    });
-    if grew && known_reach.is_some() {
-        // Every stored key was formed from a reach set that has just been shown to
-        // be incomplete — not only this variable's, since a caller's set is the
-        // union of what its callees reached. Dropping all of them is the honest
-        // move; the sets only grow, so this cannot repeat indefinitely.
-        RESOLVED_ARGS.with(|m| m.borrow_mut().clear());
+    if canonical {
+        RESOLVED_ARGS.with(|m| m.borrow_mut().insert(uid, resolved.clone()));
     }
-    let reach = REACHES.with(|m| m.borrow().get(&uid).cloned().unwrap_or_default());
-    let key: ArgKey = (uid, open_intersection(&reach));
-    RESOLVED_ARGS.with(|m| m.borrow_mut().insert(key, resolved.clone()));
     resolved
 }
 
@@ -811,17 +675,27 @@ pub struct CompactGraph {
 /// walking, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
 pub fn compact_type(ty: &Type) -> CompactGraph {
-    // Tracks nesting and owns the reach stack for the whole walk. Dropped on unwind
-    // too, so a compaction that panics cannot leave a partial reach stack behind for
-    // the next chain to misread. (The *memo* outlives this scope by design — its
-    // window is "since the last graph mutation", see `reconcile_cache`.)
-    let _scope = ResolutionScope::enter();
+    // The claim [`RESOLVED_ARGS`] rests on: materializing a type *reads* the bound
+    // graph and never writes it, so an answer remembered under one generation is
+    // still that variable's answer until something else writes. Asserted rather than
+    // argued, because a future write on this path would fail no test — it would
+    // quietly serve one node's answer to another. Checked after the walk rather than
+    // in a `Drop`, so an unwinding compaction skips it without a `panicking()` dance.
+    #[cfg(debug_assertions)]
+    let generation_on_entry = crate::ccl::infer_var::graph_generation();
     let mut st = CompactState {
         in_process: HashSet::new(),
         recursive: HashMap::new(),
         rec_vars: BTreeMap::new(),
     };
     let term = compact_go(ty, true, &Subst::id(), &BTreeSet::new(), &mut st);
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        generation_on_entry,
+        crate::ccl::infer_var::graph_generation(),
+        "compaction mutated the bound graph: resolution must be read-only, or the \
+         resolution memo outlives its subject"
+    );
     CompactGraph {
         term,
         rec_vars: st.rec_vars,

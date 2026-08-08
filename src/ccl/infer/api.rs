@@ -344,7 +344,7 @@ pub enum InferError {
     /// itself and is reported as [`InferError::UnresolvedInfer`], which is the
     /// honest description — the arguments are undetermined, not the rule.
     UnreducedApp {
-        /// Display string of the unreduced operator application.
+        /// Display string of the unreduced type-function application.
         ty: String,
         /// Display label for the message (see the type docs — not the location).
         at: String,
@@ -2967,7 +2967,7 @@ mod tests {
     }
 
     /// Corrupting an operator's result type is caught by `typecheck`, for both
-    /// operators whose result is a [`Type::Compute`].
+    /// operators whose result is a [`Type::App`].
     ///
     /// The wall sees through the operator only because Check *resolves* a
     /// rule-derived variable before reconciling it: the rule hands back a fresh

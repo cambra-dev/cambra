@@ -429,8 +429,8 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
     // A rule that applies an operator scheme hands back a fresh variable whose only
     // content is the scheme's result, so comparing it directly to the recorded type
     // records an upper bound and discovers a disagreement only if the bound-closure
-    // reaches one — and a `Type::Compute` on the variable's lower bounds stops that
-    // walk, since an unreduced operator is opaque to the solver. Resolving first is
+    // reaches one — and a `Type::App` on the variable's lower bounds stops that
+    // walk, since an unreduced application is opaque to the solver. Resolving first is
     // what makes the operator reduce, which is the whole reason its result *is* an
     // operator (see `OperatorSchemes`, "An operand requirement must be reachable
     // from the result type"). Without this the wall cannot see a wrong `1 + 2 :
