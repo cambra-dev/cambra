@@ -130,6 +130,22 @@ fn is_iterable_domain(ty: &Type) -> bool {
         // There are infinitely many possible functions for any given function
         // type, so function-typed domains cannot be enumerated.
         Type::Fun { .. } => false,
+        // A dependent-sum (`Collection`/`List`) parameter domain is a collection
+        // *value* consumed as a whole (`λ c → sum(c)`), not an enumerable index set —
+        // so its UDF is a capability to inline, like a `Fun`-domain one. Without this
+        // arm it falls through to `_ => true`, the UDF is wrongly left un-inlined, and
+        // the abstract Σ strands at op-conversion with no concrete domain to iterate.
+        //
+        // That stranding is the *shape* of the gap a runtime witness closes. **Two**
+        // separate mechanisms keep it from being reachable today, and they are easy to
+        // mistake for one: a `Collection(𝑇)` annotation is currently a *bound*, so the
+        // parameter's type monomorphizes to whatever was passed; and inlining
+        // beta-reduces the UDF, so the operator graph is monomorphic regardless of the
+        // type. Exact annotations retire the first and not the second — the type stays
+        // abstract while the graph stays concrete — so a Σ will start reaching
+        // op-conversion around a concrete producer. Whether that strands depends on the
+        // path (`src/ccl/design/collections.md`, "Future work").
+        Type::Sigma(_) => false,
         // A history-typed domain has no enumerable domain — treat it
         // non-iterable like a function so a history-param UDF is inlined; the
         // `_ => true` fallthrough would otherwise strand it. Two cases reach

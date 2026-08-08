@@ -49,6 +49,11 @@ pub struct OperatorSchemes {
     /// is required because both vars are shared across positions, which
     /// `normalize_annotation` (one fresh var per `Hole`) can't express.
     final_or_default: PolyScheme,
+    /// `∀𝑎. 𝑎 ⇒ Σ σ ∈ {𝑎}. σ` — [`Builtin::Box`], the way into a sum. Inline-built
+    /// because `𝑎` is shared between the parameter and the sum's single candidate,
+    /// and because the candidate sits inside a [`TypeKind`] rather than in a type
+    /// position `normalize_annotation` would reach.
+    box_intro: PolyScheme,
     /// `∀ι ν. ((ι → ν), ι, ν) → ν` — the history value at the predecessor
     /// of the given position, or the default at the first position (the
     /// letrec guard accessor, [`Builtin::GetPrevSeq`]). Inline-built for
@@ -72,6 +77,20 @@ impl OperatorSchemes {
     pub fn new() -> Self {
         const SCHEME_LEVEL: Level = 0;
         const BODY_LEVEL: Level = 1;
+
+        // Box: ∀α. α ⇒ Σ σ ∈ {α}. σ — the sum over the one candidate α, body the bare
+        // witness. `α` occurs in the candidate list, which is an *invariant* position,
+        // so the argument's type is pinned exactly rather than widened on the way in.
+        let alpha = fresh_var(BODY_LEVEL);
+        let box_intro = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(
+                alpha.clone(),
+                Type::Sigma(Box::new(crate::ccl::ty::SigmaType::of(
+                    crate::ccl::ty::TypeKind::Enumerated(vec![alpha]),
+                ))),
+            ),
+        );
 
         // Arithmetic: ∀α. α → α → α
         let alpha = fresh_var(BODY_LEVEL);
@@ -173,6 +192,7 @@ impl OperatorSchemes {
         let get_prev_txn = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), nu));
 
         Self {
+            box_intro,
             arithmetic,
             compare,
             bool_logic,
@@ -217,6 +237,7 @@ impl OperatorSchemes {
     /// (or polymorphic only in independent vars).
     pub(super) fn builtin(&self, b: Builtin) -> Option<&PolyScheme> {
         match b {
+            Builtin::Box => Some(&self.box_intro),
             Builtin::FinalOrDefault => Some(&self.final_or_default),
             Builtin::GetPrevSeq => Some(&self.get_prev_seq),
             Builtin::GetPrevTxn => Some(&self.get_prev_txn),

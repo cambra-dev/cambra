@@ -827,6 +827,8 @@ pub fn compile_program(
             })
             .collect());
     }
+    #[cfg(debug_assertions)]
+    crate::ccl::infer::debug_assert_no_free_witness(&expr, "post-inference");
     debug!("Inferred:\n{}", symbolic(&expr));
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
     // Consistency wall between `infer` and `channelize`. It is the relaxed
@@ -976,6 +978,8 @@ pub fn compile_program(
     typecheck(&desugared).expect("live-read rewrite produced an ill-typed tree");
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;
+    #[cfg(debug_assertions)]
+    crate::ccl::infer::debug_assert_no_free_witness(&lambda_elim, "post-lambda-elim");
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
     debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
 

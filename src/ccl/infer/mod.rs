@@ -83,6 +83,8 @@ mod typing;
 // pass: feed reads type concretely via their rigid `ChanDom` channel domains,
 // which `crate::ccl::channelize` erases by substitution — no post-channelize
 // re-typing.)
+#[cfg(debug_assertions)]
+pub use api::debug_assert_no_free_witness;
 pub use api::*;
 pub use check::check;
 pub use schemes::OperatorSchemes;
@@ -193,8 +195,9 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             ctx: format!(
                 "collection domain conflict at {ctx_label} (a collection's domain is \
                  its data, so a join may not narrow it — two collections over distinct \
-                 domains have no common data-function type, and their lossless join is \
-                 a dependent sum over the candidate domains)"
+                 domains have no common type. Wrap each arm in `box` to keep both \
+                 domains: `box(…) if c else box(…)` has the dependent-sum type they \
+                 share, and consuming it distributes over the arms)"
             ),
             type_a: Box::new(coalesce_for_error(&lhs)),
             type_b: Box::new(coalesce_for_error(&rhs)),
@@ -216,6 +219,21 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             origin: ctx_label.to_string(),
             context: vec![],
         },
+        // A kinding failure *is* an annotation mismatch: the user wrote a collection
+        // kind and the value's domain does not inhabit it. Reported with the same
+        // `ctx` a constraint-time collection mismatch uses, because the two differ
+        // only in when the shape became known.
+        // `type_a` is what was expected, so the *kind* goes there: rendered as the sum
+        // it classifies, which is the form the annotation was written as.
+        CoalesceError::KindMismatch { resolved, kind } => InferError::TypeMismatch {
+            type_a: Box::new(Type::Sigma(Box::new(crate::ccl::ty::SigmaType::over(
+                kind,
+                None,
+                Type::Hole,
+            )))),
+            type_b: resolved,
+            ctx: "collection annotation".to_string(),
+        },
         CoalesceError::UnresolvedPartial { kind, details } => InferError::UnresolvedPartial {
             kind: format!("{:?} ({})", kind, details),
             at: ctx_label.to_string(),
@@ -226,7 +244,9 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
         )),
         CoalesceError::DomainJoinConflict { details } => InferError::Unsupported(format!(
             "collection domain conflict at {}: {} \
-             (a collection's domain is its data, so a join may not narrow it)",
+             (two constraints on this collection's domain have no common answer, and \
+             narrowing to one would drop rows. If these are the arms of a conditional, \
+             wrap each in `box` to keep both domains)",
             ctx_label, details
         )),
         CoalesceError::ComputeWhereDataRequired { details } => InferError::Unsupported(format!(
@@ -328,6 +348,8 @@ pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
 ) -> Result<Type, Vec<LocatedInferError>> {
+    // The witness range index's scope is one inference run: see `clear_witness_ctx`.
+    solver::clear_witness_ctx();
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
         let pre = InferCtx::new(HashMap::new(), expr.node_id());
@@ -384,6 +406,13 @@ pub(crate) fn run(
             return Err(scope_errors);
         }
     }
+    // The witness counterpart of the scope check above, and here rather than only at the
+    // pipeline's stage boundaries because *this* is where the close happens: a witness
+    // that materialization left with no binder is a defect of the pass that just ran, and
+    // a caller who only infers (a type-level test, a REPL) is exactly as entitled to catch
+    // it as one who goes on to compile.
+    #[cfg(debug_assertions)]
+    debug_assert_no_free_witness(expr, "post-inference");
     Ok(expr.ty.clone())
 }
 

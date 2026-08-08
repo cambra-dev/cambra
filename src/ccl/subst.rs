@@ -761,6 +761,9 @@ impl Subst {
             | Type::DataSource(_)
             | Type::Txn
             | Type::Hole
+            // A witness reference is a type-level binder occurrence, never a term
+            // binder the substitution acts on.
+            | Type::WitnessRef(_)
             | Type::Infer(_) => {}
 
             // a nominal channel domain names its defer
@@ -839,6 +842,17 @@ impl Subst {
             Type::Variant(tags) => tags
                 .iter_mut()
                 .for_each(|(_, t)| self.rewrite_type_go(t, memo)),
+
+            // A witness binder is a *type*-level binder, so a term substitution has no
+            // name here to map — only the witness's type children and the body need
+            // rewriting.
+            Type::Sigma(s) => {
+                s.witness
+                    .types_mut()
+                    .iter_mut()
+                    .for_each(|t| self.rewrite_type_go(t, memo));
+                self.rewrite_type_go(&mut s.body, memo);
+            }
         }
     }
 
@@ -979,6 +993,7 @@ impl Subst {
             | Type::DataSource(_)
             | Type::Txn
             | Type::Hole
+            | Type::WitnessRef(_)
             | Type::Infer(_) => ty.clone(),
 
             // rename the named defer binder, mirroring the
@@ -1036,6 +1051,14 @@ impl Subst {
                 domain: Box::new(self.apply_type(domain)),
                 kind: *kind,
             },
+
+            // A substitution rewrites *predicates*, so only the witness's type children
+            // and the body are touched; the sum's own binder is not a term name and is
+            // carried through unchanged.
+            Type::Sigma(s) => Type::Sigma(Box::new(crate::ccl::SigmaType::bound(
+                s.witness.map_types(|t| self.apply_type(t)),
+                self.apply_type(&s.body),
+            ))),
         }
     }
 
@@ -1089,6 +1112,7 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Txn
+        | Type::WitnessRef(_)
         | Type::Hole => false,
         Type::Infer(_) => true,
         Type::Fun {
@@ -1101,6 +1125,9 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Variant(tags) => tags.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Refinement(base, _) => type_contains_infer(base),
+        Type::Sigma(s) => {
+            s.witness.types().iter().any(type_contains_infer) || type_contains_infer(&s.body)
+        }
     }
 }
 
@@ -1137,6 +1164,8 @@ fn collect_type_fv(
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
+        // A witness reference is type-level, never a free term variable.
+        | Type::WitnessRef(_)
         | Type::Infer(_) => {}
         Type::Fun {
             name,
@@ -1174,6 +1203,15 @@ fn collect_type_fv(
         Type::History { value, domain, .. } => {
             collect_type_fv(value, bound, visited, out);
             collect_type_fv(domain, bound, visited, out);
+        }
+        // A witness binder binds no *term* variable, so the body's free
+        // term vars are collected under the *enclosing* binders, with nothing
+        // subtracted for the Σ itself.
+        Type::Sigma(s) => {
+            for t in s.witness.types() {
+                collect_type_fv(t, bound, visited, out);
+            }
+            collect_type_fv(&s.body, bound, visited, out);
         }
     }
 }
