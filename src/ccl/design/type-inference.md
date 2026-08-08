@@ -1045,6 +1045,153 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
   program's own value reaches the second).
 
 ---
+## 4.7 Type functions
+
+The constraint lattice can state that two positions are **equal** or **related by subtyping**. It cannot state that one position is **computed from** others. Every operator whose result type is a non-identity function of its operand types therefore has no scheme the lattice can express — arithmetic and comparison today, field projection and collection union next.
+
+A **type function** is that missing statement. `Type::App { fun, args }` is the type "whatever `fun` computes from `args`", carried unreduced until the arguments are known: `1 + x` types as `Add({Int | __elem == 1}, α)` instead of forcing both operands and the result onto one variable.
+
+### What a shared variable gets wrong
+
+The obvious encoding is to share a lattice position — arithmetic as `∀α. α → α → α`. It is wrong once per polarity, and how it fails is what a type function has to fix.
+
+* The operand occurrences are *domains* — negative positions, where refinement sets **union** — so one operand's refinement becomes a *requirement* on the other: `λ 𝑥 → 𝑥 + 1` infers `𝑥 : {Int | __elem == 1}`.
+* The result occurrence is positive, where refinement sets **intersect**, so a refinement *both* operands carry survives onto the result: `𝑥 + 𝑥` where `𝑥` is `2` claims the sum is `2`. Distinct refinements intersect to none, which is why this hides — it needs two operands carrying the *same* refinement, where intersecting a set with itself returns it.
+
+Reconstructing the result *after* coalesce instead needs a walk order that respects data flow, and the coalesce walk deliberately has none: `coalesce_node`'s `Apply` arm visits function before argument, for [monomorphization's ordering invariant](#keying-a-specialization), so a projection's codomain is read before an operand nested in the argument has been coalesced.
+
+### The representation
+
+An `App` **denotes** a type; it does not construct one. `Add(Int, Int)` *is* `Int`, written in a form that does not yet know it — so it adds no inhabitants and no subtyping edges, and **reduction is normalization** rather than an observable step. Nothing in the solver ever has to decide `Add(α, β) <: Add(γ, δ)` structurally; it decides the reduced types once the arguments are known.
+
+`App` is **transient** in the same sense as `Infer`: every `Type` that escapes inference is `App`-free. A survivor at the strict wall is a compiler bug, flagged as `UnreducedApp`. An application whose arguments the program never determined is a different thing — it reduces to the undetermined position itself and is reported as `UnresolvedInfer`, which is the honest description: the arguments are missing, not the rule.
+
+Reduction is **demand-driven**. Materializing an `App` (`compact_go`'s `App` arm) resolves each argument through the ordinary pipeline — pulling whatever the graph knows, wherever the walk happens to be — and then applies the rule. Nothing is deposited, so no phase ordering can make the answer wrong.
+
+### What a reduction rule must satisfy
+
+A rule is a pure function of resolved argument types. Adding a `TypeFn` variant means writing one, and it is sound only if it obeys all four laws. Each is a property of the reduction *mechanism*, checkable by reading the rule, and each buys a specific guarantee; the normative statement lives in `src/ccl/infer/solver/reduce.rs`, "The laws a rule must satisfy".
+
+| Law | Statement | Guarantee |
+|---|---|---|
+| 1. Pure | a function of `(fun, args)`: no inference context, no bound graph, no fresh variables, no recorded constraints | reduction may run at any point in any walk, so it can be demand-driven rather than scheduled |
+| 2. Monotone | `𝑎ᵢ <: 𝑏ᵢ` for all `𝑖` ⟹ `𝑓(𝑎⃗) <: 𝑓(𝑏⃗)` | an argument only gets more precise as the graph fills in, so a later reduction refines an earlier one rather than contradicting it |
+| 3. Declares a `CycleTolerance` | whether the rule can answer while an argument is cyclic; `reduce` enforces it | a rule that cannot answer reports the cycle instead of guessing, and one that can is never asked to — see [Cycles are recurrences in the program](#cycles-are-recurrences-in-the-program) |
+| 4. Normalizing | the result contains no `App` | one reduction terminates without a fixpoint — the rule set is closed and no rule feeds itself |
+
+**There is deliberately no law about refinements.** Whether a rule may carry an argument's refinement into its result is not a property of reduction — it is a question about what the operator *means*, and [Which operators need one](#which-operators-need-one) is where it is decided: a rule that **selects** one of its arguments must carry it, one that **computes** a new value must not.
+
+As a law it would be wrong twice: it would forbid the selecting rules outright, and it would still miss the failure that actually threatens soundness — a rule that *invents* a claim its arguments do not support inherits nothing and is monotone, so it passes all four. `shared_base`'s `debug_assert` is a postcondition of that one function, not a rule the others obey.
+
+### Where an operand requirement lives
+
+**In the result rule, and nowhere else.** An operator's operands are two *unrelated* scheme variables; nothing in the scheme relates them. What checks them is the rule that reduces the result, because the result is the one thing guaranteed to be looked at.
+
+#### An operand requirement must be reachable from the result type
+
+A rule runs when something **materializes** the application it belongs to, and an application is materialized only when some node's type reaches it. A scheme's operand variables are nobody's node type: a use site records `left <: α` and `right <: β`, so `α` and `β` are reachable *from* the operands, but nothing walks *from* them. The only thing that can reach them is the result.
+
+Hence: **a scheme that wants its operands checked must mention them in its result**, as an `App` over them.
+
+`1 + "a"` is rejected because the addition's result is `Add(α, β)`, so materializing the node runs the rule and finds the conflict. A comparison declaring a bare `Bool` mentions neither operand, so nothing ever materializes them, the rule never runs, and `1 > "a"` types cleanly and then panics in the interpreter. A comparison's result is accordingly `Compare(kind, α, β)`, reducing to `Bool` for any operands that share a base and to an error for any that do not. A rule constant on its domain is still a rule — the whole of a comparison's content *is* its domain — and stating it as one is what gets the check to happen at all.
+
+Every other scheme in the registry states its requirement **structurally**, inside an operand's own shape — `Sum`'s `∀α. (α ⇒ Int) ⇒ Int` puts the `Int` in the argument's codomain position, so `constrain_go` records it on the argument expression's variable, which is a node's type and materializes like any other. Those need nothing.
+
+#### An operand nothing else determines stays undetermined
+
+`λ 𝑥 → 𝑥 + 1` does not infer `𝑥 : Int`. Its result resolves — the rule answers from the literal operand — but the parameter is determined by nothing, because nothing determines it: the operands are unrelated variables and only the result is checked.
+
+That is the honest type. The lambda works for any two things `+` accepts, so it is polymorphic in its parameter, and `Type` has no `∀` to say so; as a program value it is therefore an **ambiguous program**, rejected downstream exactly as `λ 𝑥 → [𝑥, 𝑥]` is. Inferring `Int` would read as precision, but it is really the one-numeric-type lattice showing through — and would be wrong the moment `Int + Float → Float` existed.
+
+### Cycles are recurrences in the program
+
+An argument is **cyclic** when resolving it would re-enter the resolution already computing it. That is not an edge case: a register that reads itself in its own write makes one, so `𝑥 += 1` gives
+
+```text
+value(𝑥)  =  join(seed, Add(value(𝑥), 1))
+```
+
+a fixpoint equation, because an accumulator *is* one. Measured, 1,910 cyclic arguments arise across the test suite, and a self-read is exactly what creates them — `x := 7; x` has none, `x := 7; x += 1; x` has ten. All of them reach arithmetic; a comparison can be cyclic too (`b := (b == True)`) but nothing in the suite writes one.
+
+`compact.rs`'s in-flight set cuts the recursion, and each rule declares a **`CycleTolerance`** saying whether that cut-off leaves it able to answer:
+
+| | Meaning | Today |
+|---|---|---|
+| `Any` | answers from what is known; a cycle costs precision, not the answer | `Compare` loses *nothing* (constant on its domain); arithmetic loses the agreement check but keeps a usable type — which is what lets an accumulator have one |
+| `AllKnown` | cannot answer at all without every argument, so the cycle is reported | none yet; `FieldOf(ρ, 𝑘)` is the first, since there is no field type to name without `ρ` |
+
+Deliberately **not per-argument**. Every rule's condition is about *how many* arguments are cyclic rather than which — arithmetic's operands are interchangeable to its rule, and a rule needing one argument needs it whichever position it occupies. A rule wanting "at least 𝑛 known" would generalize this to a count; none does.
+
+#### The cut is an unrolling, not an iteration
+
+The cut does **not** iterate the equation towards its fixpoint. It unrolls it a number of times fixed by the shape of the program and stops. Traced on `x := 0; x := x + 1; x`, one materialization reduces `Add(⟨cyclic⟩, 1) → Int` and then `Add(Int, 1) → Int`, and ends; `x + x` reaches three levels because each operand re-enters separately. In every shape measured the **outermost** frame — the one whose answer becomes the node's type — sees every argument known, which is where operands that genuinely disagree are caught.
+
+The consequence for a rule author is the opposite of the familiar one. Because nothing iterates, whatever a rule answers at a cut is **what the unrolling carries**; there is no later pass that widens it. A rule must therefore be *sound* at the cut, not merely improvable. Both of today's rules are, for free: arithmetic drops to the shared base — the top of the chain the missing operand could have contributed to — and comparison is constant on its domain.
+
+A sharper rule that kept what it could see at the cut would instead return whatever a bounded unrolling happened to reach, sound only by accident of how far the program unrolled. That is the check to run when writing the range-aware `Arithmetic` in [Known gaps](#known-gaps), and **widening does not answer it**, because there is no iteration to widen: answer the base at a cut, or declare `AllKnown` and report.
+
+### Obligations that are not decidable yet are parked
+
+`constrain_go` cannot compare an unreduced `App` against anything: reduction resolves the application's arguments off the bound graph, and emission runs while that graph is still being built, so an answer read there could be superseded by an edge recorded a moment later. Reducing at emission is exactly the staleness the demand-driven design exists to rule out.
+
+So the obligation is **parked** rather than decided or dropped. `constrain_go` records it with the in-flight substitutions applied; `require_sub` tags it with the node to blame; `InferCtx::check_parked_obligations` retries it between emission and coalesce — the point at which every edge the program implies has been recorded and reduction is meaningful. Each side materializes to an `App`-free type and the obligation becomes an ordinary subtyping check.
+
+Only **fully determined** obligations are checked, which is what keeps the retry from perturbing the graph it is reading. A side that still contains a variable after materialization is one the program never determined; re-constraining it would record a bound, and a graph mutation after emission would make a later resolution's answer depend on whether this pass ran. Skipping is not a hole — an undetermined operand is an ambiguous program, and coalesce reports it as `UnresolvedInfer`. With both sides variable-free the check cannot deposit anything.
+
+Both directions are parked, because the arm's rule is "undecidable now" rather than a claim about which shapes arrive. The direction that matters is an application on the *lower* side against a concrete demand: `(1 + 2) and True` closes to `Add(α, β) <: Bool`, which nothing downstream re-derives. Accepting it silently turned an ordinary user type error into a panic at the `check_pre_desugar` wall, which cannot distinguish one from a compiler bug.
+
+### Which operators need one
+
+Sharing a lattice position between an input and the result is right exactly when the operator **selects** an existing value or **merges** several — the result then *is* one of those values, so a fact about it survives — and wrong when the operator **computes** a new one. `test_operator_result_inherits_a_refinement_only_when_it_selects` pins the table; half its cases assert a refinement is *still there*, since dropping it would be the same bug from the other side.
+
+| Operator | Shares | Verdict |
+|---|---|---|
+| `Sum` | nothing — result is a concrete `Int` | computes; inherits nothing ✔ |
+| `Neg`, `Not`, `Concat`, `BoolLogic` | nothing — monomorphic | nothing to inherit ✔ |
+| `Max` | element type with the result | *selects* an element — `max([1, 1])` really is `1` ✔ |
+| `final_or_default`, `get_prev_seq`, `get_prev_txn` | value type across stream, default, result | *merges* — the result is whichever the runtime supplies, so the refinement set intersects, which is the join rule ✔ |
+| `List` | element type across elements | *merges* — `[1, 1]` is a collection of `1`s, `[1, 2]` of `Int`s ✔ |
+| `CollectionUnion` | codomain across operands | *merges* on the codomain; its **domain** is a computation and is hand-rolled for that reason ✔ |
+| `Proj` | codomain with the projected field | *selects* the field, refinement included ✔ |
+| `Arithmetic`, `Compare` | nothing — operands are unrelated variables | *computes*; the rule both checks the operands and builds the result ✔ |
+
+`Sum`'s concrete `Int` is a simplifying assumption of the current numeric tower, not a property of summation. When `Sum` becomes numeric-polymorphic its result stops being a constant and becomes a computation over the element type, at which point it moves to the last row and takes a rule of its own. Nothing about the design has to change for that: it is the same shape as `Compare`, whose rule is also constant on its domain today.
+
+`CollectionUnion` is the instructive row, because it needs a join **and** a computation in one signature: its codomain is a real join (a fresh variable with each operand's codomain as a lower bound), while its domain is a real computation (`Variant({𝑖: dom_𝑖})` over the operands' domains). It is a hand-rolled `emit_node` rule precisely because no scheme can say the second half. Type functions therefore **coexist** with variable sharing rather than replacing it.
+
+Two problems look like this one and are not:
+
+* **A register's value type** (`MutWrite`, a mutable binding's initializer, a `Transact` key's seed) is the *join* over its seed and every write, so no single contribution's refinement may survive. Those three sites strip refinements at emit, and [A literal is refined by its own value](#a-literal-is-refined-by-its-own-value) already records that this over-approximates. It is not a computation, so a rule here would be re-implementing the lattice's own join; the fix is to make every writer's contribution a *lower* bound of the register's value variable, at which point the positive-position intersection *is* the rule.
+* **A projection's domain** resolving to its open-product *demand* rather than to the value flowing in. Replacing the codomain with a `FieldOf(ρ, 𝑘)` rule does not fix this, because the demand is load-bearing *inference*: `λ 𝑟 → 𝑟.x` infers `{x: ?} ⇒ ?` from that demand alone. See [Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass).
+
+### Alternatives considered
+
+| Alternative | Why not |
+|---|---|
+| Share a lattice variable between operands and result | Inherits every lattice dimension in both directions — see above. This is the shape being replaced. |
+| Reconstruct the result after coalesce | Needs a data-flow-respecting walk order that the coalesce walk deliberately does not have. |
+| Reduce at constraint emission | Reads a graph that is still being built; an answer could be superseded by the next edge. This is the reason obligations are parked instead. |
+| A bound on the operand variables relating them | Redundant: the result rule already checks the operands, by the reachability argument above. It also hard-codes *which* operands are acceptable outside the rule that should decide it, and, being self-referential, makes argument resolution re-enter on ordinary programs. |
+| Named predicate constraints — `(SameBase α β) ⇒ …` | **Not rejected, deferred**, and only worth revisiting if an operand requirement turns out to be needed at all. A predicate *states* a requirement rather than encoding it, and is the shape a user-facing schema language wants; but it has to **propagate** — push `β`'s base onto `α` — and propagating is a deposit, needing its own phase between emission and resolution to stay order-independent. The `App` representation is unchanged by the choice, so it stays a widening rather than a rewrite. |
+| Open, user-declared rule set | The rule signature is already a pure function of resolved argument types, so a user-supplied rule fits without change. Keeping the set closed for now avoids the confluence and termination *conditions* an open set forces on the checker (see the prior work below); law 4 is checkable by inspection for a closed set and would have to become a side condition on user code. |
+
+### Prior work
+
+**Type functions in the GHC sense** — [associated type synonyms](https://dl.acm.org/doi/10.1145/1090189.1086397) (Chakravarty, Keller & Peyton Jones, ICFP 2005) and [open type functions](https://dl.acm.org/doi/10.1145/1411204.1411215) (Schrijvers, Peyton Jones, Chakravarty & Sulzmann, ICFP 2008) — are the closest analogue, and the name here is deliberately theirs. The substantive difference is openness. GHC's families are user-declared and open, so the checker must decide entailment between *unreduced* applications (`F a ~ G b`) and the rule set needs confluence and termination side conditions to keep that decidable. Cambra's set is closed and every rule is normalizing (law 4), so there is never an equality to decide between two unreduced applications: reduce, then compare. That is what buys demand-driven reduction, and it is also what an open rule set would cost.
+
+**The lattice underneath** is MLsub ([Dolan & Mycroft, POPL 2017](https://dl.acm.org/doi/10.1145/3093333.3009882)) as presented by [Parreaux, ICFP 2020](https://dl.acm.org/doi/10.1145/3409006), which the whole engine is based on (§1). Neither has type-level computation; a `Type::App` that reduces to an ordinary lattice element is the delta, and it is deliberately small — because reduction is normalization, the lattice is unchanged.
+
+**Function application in dependent types.** A dependent type checker compares types up to **conversion**: it normalizes before comparing, rather than giving applications structural equality ([Coquand, *An algorithm for type-checking dependent types*, Science of Computer Programming 26, 1996](https://www.sciencedirect.com/science/article/pii/0167642395000216)). Reduction-at-materialization is that discipline restricted to a closed first-order rule set. What is *not* inherited is conversion checking on open terms, because law 4 makes every normal form `App`-free.
+
+**The interaction with inference** — a computation blocked on an unsolved metavariable — is Agda's **constraint postponement** (Norell, *Towards a practical programming language based on dependent type theory*, Chalmers, 2007): a constraint that cannot be decided because a meta blocks reduction is suspended and retried when the meta is solved. Parking is the same move at coarser granularity, retried once after emission rather than woken per-solution. The coarser version is sound here because emission is a single bounded phase with no solving after it; a system that solved incrementally would need the finer wake-up.
+
+**Refinements** are inferred elsewhere by predicate abstraction over a fixed qualifier set ([Rondon, Kawaguchi & Jhala, *Liquid Types*, PLDI 2008](https://dl.acm.org/doi/10.1145/1375581.1375602)). Law 5 is the dual discipline and deliberately weaker: a refinement is never *inferred* for a computed type, only *derived* by a rule that knows how. Range-aware arithmetic is where deriving would start.
+
+### Known gaps
+
+* **Compound arguments need a different agreement test.** `shared_base` decides agreement with `==`, which is correct only for leaf arguments: two bases differing solely in an unresolved position (`(?1, Int)` vs `(?2, Int)`) compare unequal, which is a claim about placeholder identity rather than about types. Nothing reaches it today, since every operand the runtime accepts for arithmetic or comparison is a scalar. `FieldOf(ρ, 𝑘)` and `CollectionUnion` — the named next clients — must not reuse it.
+* **`UIntRange` passes through untouched**, because it is an *atom* rather than a refinement, so `[0,2] + [0,2]` reports `[0,2]` — wrong for the same reason `2 + 2 ≠ 2`. `Arithmetic` records its kind precisely so the rule that fixes this has somewhere to live: `+` and `*` map operand ranges differently, and `([0,2], [5,7]) ⇒ [5,9]` is a claim *derived* from the operands rather than inherited from one, which is what a computing rule may do.
+* **A refined record's field does not inherit a projection of the record's refinement.** `Proj` carries the field's *own* refinement, which is the `selects` row above; a fact stated about the record as a whole (`{{i: Int, l: List(Int)} | _.i < len(_.l)}`) is not projected onto `x.i`. Recovering it needs the refinement predicate to be split along the projection — a `FieldOf`-style rule could carry the syntactic half, but a predicate relating *two* fields has no sound projection onto one, so this wants predicate-level machinery rather than a reduction rule.
 
 ## 5. CCL-specific inference rules
 
@@ -1058,9 +1205,9 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
 
 | Op kind | Operand constraint | Result type |
 |---|---|---|
-| `Arithmetic` | both operands constrained `<: α` (joined into a shared variable) | operand type |
+| `Arithmetic` | none — the result rule checks the operands | `Add(α, β)` and siblings, a [type function](#47-type-functions) |
 | `Concat` | both operands constrained to `String` | `String` |
-| `Compare` | both operands constrained `<: α` (joined into a shared variable) | `Bool` |
+| `Compare` | none — the result rule checks the operands | `Greater(α, β)` and siblings — a type function reducing to `Bool`, so the check is reachable |
 | `BoolLogic` | both operands constrained to `Bool` | `Bool` |
 
 **Note**: String + String → `Concat` rewriting is performed at **compile time** (in `lambda_elim.rs`), not at inference time. The inference pass only constrains both operands to `String` and returns `String` as the result type.

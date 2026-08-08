@@ -357,7 +357,25 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // no `Hole` reaches a use's instantiation type in the first place. The
         // arm is for exhaustiveness, and "no information here" is the honest
         // reading if one ever did.
-        Type::Hole => KeyView::default(),
+        Type::Hole | Type::SharedHole(_) => KeyView::default(),
+        // An unreduced application contributes **nothing**, and cannot: it has no
+        // discriminating power at all.
+        //
+        // Keys are only ever compared within one [`SpecializeFrame`], so both sides
+        // come from uses of one definition, whose body is fixed — every [`TypeFn`]
+        // at every position is therefore identical across them (`FieldOf(.a)` stays
+        // `FieldOf(.a)`), and function identity can never decide. Only the type
+        // arguments can differ, and each is either a variable that also appears
+        // elsewhere in the definition's type — where this walk already reads it, so
+        // recording it here says the same thing twice — or one that appears *only*
+        // inside the application, which no use site can bound (an obligation against
+        // an `App` is parked, not decomposed) and which therefore resolves alike for
+        // every use.
+        //
+        // Recording them was measured as well as argued: instrumenting
+        // `specialize_use` to choose a specialization with and without this
+        // contribution picks the same one every time, across the whole suite.
+        Type::App { .. } => KeyView::default(),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
         // dependent-application discharge lands in the key as the predicate the
@@ -458,7 +476,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 return KeyView::default();
             }
             let bounds = {
-                let b = state.bounds.borrow();
+                let b = state.bounds();
                 if pol {
                     b.lower.clone()
                 } else {
@@ -625,7 +643,7 @@ mod tests {
             let Type::Infer(v) = var else {
                 unreachable!("fresh_var yields Type::Infer");
             };
-            v.bounds.borrow_mut().lower.push(Bound::conc(ty));
+            v.bounds_mut().lower.push(Bound::conc(ty));
         }
         let a = fresh_var(0);
         let b = fresh_var(0);

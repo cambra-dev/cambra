@@ -15,6 +15,99 @@ use crate::ccl::{BaseType, HistoryKind, InferVarId, Name, Refinement, Type, fres
 
 use crate::ccl::FieldKey;
 
+// Type-function arguments whose resolution is currently in flight, so an argument
+// that would re-enter the resolution already computing it is reported as
+// unavailable instead of recursing forever.
+//
+// Thread-local rather than threaded through `compact_go`'s state, and that is
+// forced: reducing an argument re-enters the whole compact → simplify → coalesce
+// pipeline with a *fresh* `CompactState`, so a per-walk set could not see the outer
+// resolution that is already computing this argument. The set is keyed on the
+// argument's variable, which is what identifies the in-flight resolution.
+//
+// This is a **termination** device, not an optimization: without it, ordinary
+// programs overflow the stack (`x := 7; for i in []: x += 1; x` is enough).
+thread_local! {
+    static ARGS_IN_FLIGHT: std::cell::RefCell<BTreeSet<InferVarId>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
+}
+
+/// Marks `uid` as in flight for as long as it is held.
+///
+/// RAII rather than a straight-line insert/remove: this is a thread-local that
+/// outlives any one call, so a panic between the two halves — anywhere inside
+/// [`compact_type`] or [`coalesce_compact`](super::coalesce_compact) — would leave
+/// `uid` marked for the rest of the thread's life. Nothing would crash; every
+/// later reduction that reached `uid` would silently answer without it and coarsen
+/// (see [`super::reduce`]'s "Missing arguments"), which is wrong types rather than
+/// a failure.
+struct InFlight(InferVarId);
+
+impl InFlight {
+    fn mark(uid: InferVarId) -> InFlight {
+        ARGS_IN_FLIGHT.with(|s| {
+            s.borrow_mut().insert(uid);
+        });
+        InFlight(uid)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        ARGS_IN_FLIGHT.with(|s| {
+            s.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
+/// Resolve one type-function argument to a concrete `Type`, or `None` if its
+/// resolution is already in flight.
+///
+/// This is the **demand-driven** step: it runs the full resolution pipeline on the
+/// argument, so it pulls whatever the graph knows at the moment the enclosing type
+/// is materialized — no bound is deposited and no walk order can change the answer.
+///
+/// # Nothing is memoized, deliberately
+///
+/// Resolution is re-entrant and deposits nothing, so the same variable is
+/// re-derived along every path that reaches it. A cache keyed on the variable was
+/// tried and removed: it bought 13–22% and cost a generation counter on
+/// [`InferVar`](crate::ccl::InferVar) that every future write to the bound graph
+/// would have had to keep correct. It did not change the *shape* of the cost — an
+/// applied chain of generic wrappers is exponential in depth with the cache or
+/// without it (37s vs 45s at depth 10), so the thing worth attacking is that, not
+/// the constant.
+fn resolve_argument(arg: &Type, subst_acc: &Subst) -> Option<Type> {
+    // The argument rides the application through whatever substitutions the edges
+    // walked so far composed; force them before resolving, exactly as the
+    // refinement arm forces them on a predicate.
+    // `apply_type` rebuilds the whole type, and the overwhelmingly common case is a
+    // vacuous substitution on a bare variable — where rebuilding is a deep clone of
+    // something that comes back identical. Borrow instead, and only own a rewritten
+    // copy when there is a rewrite to do.
+    let owned;
+    let arg: &Type = if subst_acc.is_id() {
+        arg
+    } else {
+        owned = subst_acc.apply_type(arg);
+        &owned
+    };
+    // A concrete argument is neither cyclic nor memoizable: resolving it cannot
+    // re-enter *this* argument, and there is no variable to key an entry on.
+    let Type::Infer(v) = arg else {
+        return super::coalesce_compact(&super::simplify_type(compact_type(arg))).ok();
+    };
+    let uid = v.uid;
+    // This resolution is already running further up the stack: answering would
+    // recurse forever, so report the argument as unavailable and let the rule
+    // coarsen.
+    if ARGS_IN_FLIGHT.with(|s| s.borrow().contains(&uid)) {
+        return None;
+    }
+    let _in_flight = InFlight::mark(uid);
+    super::coalesce_compact(&super::simplify_type(compact_type(arg))).ok()
+}
+
 // ---------------------------------------------------------------------------
 // CompactType + compact_type: bound-graph flattening
 // ---------------------------------------------------------------------------
@@ -295,6 +388,18 @@ pub struct CompactType {
     /// onto each child's variables, and compaction only needs a deterministic
     /// materialization, not a second polarity analysis.
     pub history_slot: Option<(Box<CompactType>, Box<CompactType>, HistoryKind)>,
+    /// A [`ReduceError`](super::ReduceError) from a type function at this position.
+    ///
+    /// Compaction has no error channel — it returns a bag of contributions, not a
+    /// `Result` — but a failed reduction is a *real type error* (`1 + "a"` has no
+    /// common base) and must not degrade into "this position is unknown", which
+    /// would surface later as an unresolved variable with no blame. So the failure
+    /// rides the position it poisoned and [`coalesce_compact`](super::coalesce_compact)
+    /// raises it where the type is materialized — which is a node, with a span.
+    ///
+    /// Propagates through [`merge`](Self::merge): a poisoned side keeps its error,
+    /// since merging cannot un-fail a reduction.
+    pub reduce_error: Option<super::ReduceError>,
 }
 
 impl CompactType {
@@ -347,6 +452,14 @@ impl CompactType {
                 ))
             }
         };
+        // A poisoned side stays poisoned, at **both** polarities, and the positive
+        // one is the case worth being explicit about: there the merge is a join, so
+        // absorbing a failed operand looks like the sound direction. It is not.
+        // Merging cannot un-fail a reduction — the operands genuinely have no common
+        // base — and dropping the error would turn a real type error back into an
+        // unknown position, which resurfaces later as an unresolved variable with no
+        // span. Either side's error will do; the first is the one to report.
+        let reduce_error = lhs.reduce_error.or(rhs.reduce_error);
         CompactType {
             vars,
             atoms,
@@ -355,6 +468,7 @@ impl CompactType {
             fun,
             refinements,
             history_slot,
+            reduce_error,
         }
     }
 
@@ -585,7 +699,36 @@ fn compact_go(
         }
         // A bare `Hole` shouldn't reach the solver (emission turns it into a
         // fresh var), but treat it as no contribution for exhaustiveness.
-        Type::Hole => CompactType::empty(),
+        Type::Hole | Type::SharedHole(_) => CompactType::empty(),
+        // A type function **reduces here**, which is the whole point of putting the
+        // computation in the type: materialization is demand-driven, so by the time
+        // anything asks what this position is, resolving the arguments pulls
+        // whatever the graph knows. The reduced type then compacts at the current
+        // polarity like any other, so a type function's result participates in merging
+        // and subtyping as an ordinary type.
+        //
+        // A reduction failure contributes nothing rather than raising: this walk has
+        // no error channel, and the unreduced type surfaces at the strict wall as
+        // `UnreducedApp` (a real base conflict shows up there too, as the
+        // position it poisoned). Keeping the failure silent *here* also means a
+        // cyclic argument degrades to "no information at this position", which is
+        // what lets the enclosing read fall back to its other bounds.
+        Type::App { fun, args } => {
+            let resolved: Vec<super::reduce::Arg> = args
+                .iter()
+                .map(|a| match resolve_argument(a, subst_acc) {
+                    Some(t) => super::reduce::Arg::Known(t),
+                    None => super::reduce::Arg::Cyclic,
+                })
+                .collect();
+            match super::reduce::reduce(fun, &resolved) {
+                Ok(reduced) => compact_go(&reduced, pol, subst_acc, parents, st),
+                Err(e) => CompactType {
+                    reduce_error: Some(e),
+                    ..Default::default()
+                },
+            }
+        }
         Type::Fun {
             name,
             kind,
@@ -719,7 +862,7 @@ fn compact_go(
             // coalesces per-use *clones* pinned to one resolved use type);
             // only those clones and the per-use instantiations reach here,
             // each fixed by a single use site.
-            let s = state.bounds.borrow();
+            let s = state.bounds();
             let primary = if pol { &s.lower } else { &s.upper };
             // When the polarity-correct list is empty we fall back to the
             // opposite-polarity bounds (see the rationale above). Track which

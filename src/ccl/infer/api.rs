@@ -122,7 +122,7 @@ impl Drop for InferArena {
         // Take back every variable minted during the run and sever its bound
         // edges, so the (otherwise cyclic) refcounts can all reach zero.
         for var in crate::ccl::arena_exit() {
-            let mut bounds = var.bounds.borrow_mut();
+            let mut bounds = var.bounds_mut();
             bounds.lower.clear();
             bounds.upper.clear();
         }
@@ -334,6 +334,40 @@ pub enum InferError {
     UnresolvedInfer {
         /// The unresolved variable's id.
         id: InferVarId,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
+    /// A type function's operands have no base in common — `1 + "a"`.
+    ///
+    /// Distinct from [`InferError::IncompatibleBounds`], and the distinction is the
+    /// reason this is its own variant rather than that one reused. There, a
+    /// *variable* collected two bounds that cannot meet, and the rejection is about
+    /// what inference declines to invent (an untagged sum). Here each operand is
+    /// perfectly well typed and nothing was inferred badly — the operator simply has
+    /// no rule relating an `Int` to a `String`, which is a statement about the
+    /// operator.
+    NoCommonBase {
+        /// The type function, as it is spelled in a type (`Add`, `Greater`).
+        fun: String,
+        /// The operand bases, rendered, in argument order.
+        bases: Vec<String>,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
+    /// A [`Type::App`] survived inference without reducing — the strict wall's
+    /// guard on a transient type, like the [`Type::History`](crate::ccl::Type) and
+    /// [`Type::ChanDom`](crate::ccl::Type) checks beside it rather than a diagnosis
+    /// a program earns.
+    ///
+    /// Materialization always either reduces an operator or poisons the position it
+    /// sits at (`compact_go`'s `Compute` arm), and every stamped type is
+    /// materialized, so nothing should reach here. An operator whose arguments the
+    /// program never determined does *not*: it reduces to the unresolved position
+    /// itself and is reported as [`InferError::UnresolvedInfer`], which is the
+    /// honest description — the arguments are undetermined, not the rule.
+    UnreducedApp {
+        /// Display string of the unreduced type-function application.
+        ty: String,
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
@@ -571,6 +605,20 @@ impl std::fmt::Debug for InferError {
             }
             InferError::UnresolvedInfer { id, at } => {
                 write!(f, "Unresolved inference variable {id} in expression: {at}")
+            }
+            InferError::NoCommonBase { fun, bases, at } => {
+                write!(
+                    f,
+                    "Operands of {fun} have no base in common: {} in expression: {at}",
+                    bases.join(" vs ")
+                )
+            }
+            InferError::UnreducedApp { ty, at } => {
+                write!(
+                    f,
+                    "Type function {ty} never reduced in expression: {at} \
+                     (a compiler bug — materialization reduces or rejects)"
+                )
             }
             InferError::UnresolvedPartial { kind, at } => {
                 write!(f, "Unresolved partial {kind} in expression: {at}")
@@ -832,7 +880,17 @@ fn collect_type_errors(
     seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
     match ty {
-        Type::Hole => errors.push(InferError::UnresolvedHole {
+        // A `SharedHole` is a `Hole` with an identity, and just as transient:
+        // `normalize_annotation` resolves both. A survivor means the annotation
+        // never reached normalization, which is the same compiler bug either way.
+        Type::Hole | Type::SharedHole(_) => errors.push(InferError::UnresolvedHole {
+            at: context_sym.to_string(),
+        }),
+        // A type function that never reduced. Reported like an unresolved
+        // variable — it is the same failure (the program did not determine
+        // enough), one level up: the arguments are missing rather than the type.
+        Type::App { .. } => errors.push(InferError::UnreducedApp {
+            ty: ty.to_string(),
             at: context_sym.to_string(),
         }),
         Type::Infer(var) => {
@@ -2981,6 +3039,33 @@ mod tests {
             errs.iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. }))
         );
+    }
+
+    /// Corrupting an operator's result type is caught by `typecheck`, for both
+    /// operators whose result is a [`Type::App`].
+    ///
+    /// The wall sees through the operator only because Check *resolves* a
+    /// rule-derived variable before reconciling it: the rule hands back a fresh
+    /// variable whose lower bound is `Add(α, β)` / `Less(α, β)`, and an unreduced
+    /// operator is opaque to `constrain_subtype`, so without the resolve the
+    /// bound-closure walk stops there and the corruption goes unnoticed.
+    #[test]
+    fn test_typecheck_operator_wrong_result_type() {
+        for (op, corrupted) in [
+            (BinOpKind::Arithmetic(ArithmeticKind::Add), BaseType::String),
+            (BinOpKind::Compare(CompareKind::Less), BaseType::Int),
+        ] {
+            let mut ctx = TypeInferenceContext::new();
+            let mut expr = Expr::binop(Expr::lit(Lit::Int(1)), op, Expr::lit(Lit::Int(2)));
+            infer(&mut expr, &mut ctx).unwrap();
+            expr.ty = Type::Base(corrupted.clone());
+            let errs = typecheck(&expr).expect_err("a wrong result type must be caught for {op:?}");
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, InferError::TypeMismatch { .. })),
+                "expected a TypeMismatch for {op:?}, got {errs:?}"
+            );
+        }
     }
 
     /// Corrupting a `Compare` result type away from `Bool` is caught by `typecheck`.

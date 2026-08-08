@@ -73,6 +73,12 @@ fn test_function_def_polymorphic_used_at_two_types() {
 // to compile to the right answer, so this case pins the *result* while the
 // unit-level `SpecKey` tests pin the keying.
 #[case("f = \\x -> x + 1\nf(1) + f(2)", Value::Int(5))]
+// The same shape, but where the UDF *returns* its refined argument, so the
+// addition's two operands are both `{Int | __elem == 1}` — one refinement, reached
+// twice. That combination needed both fixes: the specialization key to stop the two
+// calls sharing a clone, and arithmetic's result to stop inheriting a refinement its
+// operands agreed on. It failed at the post-inference wall before either.
+#[case("h = \\a, b -> a\nh(1, 2) + h(1, 5)", Value::Int(2))]
 fn test_polymorphic_udf_calls_differing_only_in_a_literal(
     #[case] code: &str,
     #[case] expected: Value,

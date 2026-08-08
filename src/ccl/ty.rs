@@ -268,6 +268,7 @@ pub fn reset_kind_var_counter() {
 /// | `History` (`kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
 /// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 /// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its domain resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
+/// | `Compute { op, args }` | Type checker only | "The type `op` computes from `args`, not yet reduced" | Reduction, whenever the type is materialized (flagged as `UnreducedApp` by `collect_type_errors`; a survivor means either a cycle with no coarser answer or a program that never determined the arguments) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
@@ -336,6 +337,40 @@ pub enum Type {
     /// `UnresolvedHole` (treat as a compiler bug, not a user-facing error).
     /// Created exclusively by [`TypedExpr::new`] and [`crate::ccl::TypedBinding::new_unannotated`].
     Hole,
+    /// A [`Hole`](Type::Hole) with an **identity**: every occurrence carrying the
+    /// same id normalizes to the *same* inference variable.
+    ///
+    /// This is how lowering states a relation between two type positions it cannot
+    /// name. A plain `Hole` says "infer this", and each occurrence gets its own
+    /// fresh variable; `SharedHole(id)` says "infer this, and it is the same one as
+    /// that" — the weakest thing that lets a desugaring connect a binder to a type
+    /// only inference will learn.
+    ///
+    /// The motivating site is `groupby`, whose lowering binds a key parameter
+    /// whose only occurrence is inside a refinement predicate:
+    ///
+    /// ```text
+    /// λ __gb_k → cast({_ | __elem ▷ coll ▷ key_fn == __gb_k} ⤇ _, …)
+    /// ```
+    ///
+    /// The key's type *is* `key_fn`'s codomain, present in the same expression, but
+    /// nothing relates them — so the parameter's type could only ever arrive
+    /// backwards through the `==`, via the operand requirement that relates a
+    /// comparison's two sides. Stating the relation directly is what removes that
+    /// dependence.
+    ///
+    /// Lowering cannot mint a [`Type::Infer`] itself for three reasons: the
+    /// `InferArena` that owns every variable is created *inside* `infer`, so a
+    /// variable minted earlier would escape the `Drop` that breaks its `Rc` cycles;
+    /// `fresh_var` needs a polymorphism level, which is an inference-time notion;
+    /// and an annotation is contractually a *request* for a variable, not one
+    /// already made.
+    ///
+    /// **Transient, like `Hole`**: `normalize_annotation` resolves it, and a
+    /// survivor is a compiler bug (`UnresolvedHole`). Ids are minted per
+    /// [`LoweringContext`](crate::ccl::lower::LoweringContext) and are meaningless
+    /// outside the tree they were minted for.
+    SharedHole(u32),
     /// Unresolved type variable, identified by a unique [`crate::ccl::InferVarId`].
     ///
     /// Created during inference by the inference pass
@@ -425,8 +460,124 @@ pub enum Type {
         /// off-path positions carry forward.
         kind: HistoryKind,
     },
+    /// A [`TypeFn`] applied to type arguments, awaiting *reduction*: the type
+    /// "whatever `fun` computes from `args`".
+    ///
+    /// A lattice of type variables can state that two positions are *equal* or
+    /// *related by subtyping*. It cannot state that one is **computed from**
+    /// others, so an operator whose result type is a non-identity function of its
+    /// operand types has no scheme the lattice can express. `App` is that missing
+    /// statement: `1 + x` types as `Add({Int | __elem == 1}, α)`, which is the
+    /// answer, unreduced.
+    ///
+    /// An `App` **denotes** a type rather than constructing one — `Add(Int, Int)`
+    /// *is* `Int`, written in a form that does not yet know it — so it adds no
+    /// inhabitants and no subtyping edges to the lattice, and reduction is
+    /// normalization. It is **transient** in the same sense as [`Type::Infer`]:
+    /// every `Type` that escapes inference is `App`-free, and a survivor at the
+    /// strict wall is a compiler bug or an ambiguous program.
+    ///
+    /// **Reduction is demand-driven.** Materializing an `App` resolves each
+    /// argument through the ordinary pipeline — pulling whatever the graph knows,
+    /// wherever the walk happens to be — and then applies the function's rule.
+    /// Nothing is deposited, so no phase ordering can make the answer wrong. The
+    /// four laws a rule must obey are in
+    /// [`reduce`](mod@crate::ccl::infer::solver::reduce); the design is
+    /// `src/ccl/design/type-inference.md`, "4.7 Type functions".
+    App {
+        /// Which function. Carries its own non-type parameters (an
+        /// [`ArithmeticKind`](crate::ccl::ArithmeticKind), a field key, …).
+        fun: TypeFn,
+        /// The type arguments, in the function's declared parameter order.
+        args: Vec<Type>,
+    },
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
+}
+
+/// A function from types to a type: the computation a [`Type::App`] is waiting to
+/// run.
+///
+/// The set is closed and lives in the compiler. Keeping the function as *data*,
+/// and its rule a pure function of resolved argument types, is what leaves room
+/// for user-declared type schemas on UDFs later — a user-defined function becomes
+/// another variant whose rule is looked up rather than matched.
+///
+/// Adding a variant means writing a rule, and a rule is sound only if it obeys the
+/// four laws in [`reduce`](mod@crate::ccl::infer::solver::reduce), "The laws a rule
+/// must satisfy".
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TypeFn {
+    /// The result of an arithmetic operator applied to operands of the given
+    /// types.
+    ///
+    /// Reduces to the operands' shared base today, and rejects operands that have
+    /// none — deciding what is addable is *this rule's* job, which is what makes
+    /// the reachability rule above buy anything.
+    /// Arithmetic *computes* a new value rather than selecting one of its
+    /// operands, so it inherits none of their refinements — a fact about a value
+    /// no longer in play. The `kind` is recorded because it is the function's
+    /// *identity*, and a sharper rule needs it: `+` and `*` map operand ranges to
+    /// different result ranges, so this is where `([0,2], [5,7]) ⇒ [5,9]` will
+    /// live. That is a claim *derived* from the operands, which is exactly what a
+    /// computing rule may do and inheriting is not.
+    Arithmetic(crate::ccl::ArithmeticKind),
+    /// The result of a comparison applied to operands of the given types.
+    ///
+    /// Reduces to `Bool` — for *any* operands that share a base, and to an error
+    /// for any that do not. A rule constant on its domain is still a rule, and
+    /// stating it as one is what gets the operand requirement checked: the solver
+    /// reads a bound only when something materializes the variable it sits on, and
+    /// a comparison's operand variables are nobody's node type. A bare `Bool`
+    /// result leaves nothing to reach them, so `1 > "a"` types and then panics in
+    /// the interpreter. See `OperatorSchemes`'s "An operand requirement must be
+    /// reachable from the result type".
+    ///
+    /// The `kind` is recorded for the same reason as
+    /// [`Arithmetic`](TypeFn::Arithmetic)'s: it is the function's identity, and a
+    /// sharper rule needs it — comparing two singletons has a known answer, so
+    /// `(1, 2) ⇒ {Bool | __elem == true}` belongs here.
+    Compare(crate::ccl::CompareKind),
+}
+
+impl TypeFn {
+    /// Whether this rule can answer while some of its arguments are cyclic.
+    ///
+    /// A cycle is not exotic: a register that reads itself in its own write makes
+    /// one, so `x += 1` types as `Add(value(x), 1)` where `value(x)` is what is
+    /// being computed. Every rule has to have an answer to it, and the two possible
+    /// answers are different in kind — see
+    /// [`CycleTolerance`](crate::ccl::infer::solver::reduce::CycleTolerance).
+    ///
+    /// Both of today's rules are [`Any`](crate::ccl::infer::solver::reduce::CycleTolerance::Any),
+    /// for different reasons worth keeping straight. A comparison is *constant on
+    /// its domain*, so a cyclic operand costs nothing at all — the answer is `Bool`
+    /// either way. Arithmetic answers the shared base of whatever it can see, so a
+    /// cyclic operand costs the agreement **check** while keeping a usable type;
+    /// that is what lets an accumulator have one.
+    ///
+    /// `FieldOf(ρ, 𝑘)` will be the first `AllKnown` rule: there is no answer at all
+    /// without `ρ`, so guessing would invent a field type.
+    pub fn cycle_tolerance(&self) -> crate::ccl::infer::solver::reduce::CycleTolerance {
+        use crate::ccl::infer::solver::reduce::CycleTolerance;
+        match self {
+            TypeFn::Arithmetic(_) | TypeFn::Compare(_) => CycleTolerance::Any,
+        }
+    }
+
+    /// The function's spelling, for [`Display`](fmt::Display) and diagnostics.
+    pub fn name(&self) -> &'static str {
+        match self {
+            TypeFn::Arithmetic(k) => k.type_fn_name(),
+            TypeFn::Compare(k) => k.type_fn_name(),
+        }
+    }
+}
+
+impl fmt::Display for TypeFn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
 }
 
 /// Which flavour of [`Type::History`] a handle is — a mutable variable (`:=`) or a
@@ -554,10 +705,19 @@ impl fmt::Display for Type {
                 None => write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate)),
             },
             Type::Hole => write!(f, "_"),
+            // A hole with an identity renders as one: `_#0` and `_#1` are distinct
+            // requests, two `_#0`s are the same one.
+            Type::SharedHole(id) => write!(f, "_#{id}"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
             Type::ChanDom(name, _) => write!(f, "chan({name})"),
             Type::Txn => write!(f, "Txn"),
+            // `Add(Int, [0, 2])` — the function applied to its arguments, which is
+            // exactly what the type *is* until reduction runs.
+            Type::App { fun, args } => {
+                let rendered: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                write!(f, "{fun}({})", rendered.join(", "))
+            }
             Type::History {
                 value,
                 domain,
@@ -731,9 +891,14 @@ impl Type {
                 domain: Box::new(domain.without_pi_names()),
                 kind: *kind,
             },
+            Type::App { fun, args } => Type::App {
+                fun: fun.clone(),
+                args: args.iter().map(|a| a.without_pi_names()).collect(),
+            },
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -768,10 +933,19 @@ impl Type {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::Txn => {}
+            // A type function's arguments are ordinary child types: every
+            // structural walk reaches them, so a pass that rewrites types
+            // rewrites what the application will later reduce.
+            Type::App { args, .. } => {
+                for a in args {
+                    f(a);
+                }
+            }
             Type::Fun {
                 domain, codomain, ..
             } => {
@@ -809,10 +983,19 @@ impl Type {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::Txn => {}
+            // A type function's arguments are ordinary child types: every
+            // structural walk reaches them, so a pass that rewrites types
+            // rewrites what the application will later reduce.
+            Type::App { args, .. } => {
+                for a in args {
+                    f(a);
+                }
+            }
             Type::Fun {
                 domain, codomain, ..
             } => {

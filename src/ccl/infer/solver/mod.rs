@@ -43,6 +43,7 @@ use crate::ccl::{BaseType, InferVar, Level, Type};
 pub mod coalesce;
 pub mod compact;
 pub mod constrain;
+pub mod reduce;
 pub mod scheme;
 pub mod simplify_type;
 pub mod spec_key;
@@ -53,6 +54,7 @@ pub mod spec_key;
 pub use coalesce::{CoalesceError, coalesce_compact};
 pub use compact::{CompactGraph, CompactType, compact_type};
 pub use constrain::{ConstrainCache, ConstrainError, ExtrudeCache, constrain_subtype, extrude};
+pub use reduce::{ReduceError, reduce};
 pub use scheme::{
     FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots,
     seed_chan_dom_pairings,
@@ -91,7 +93,16 @@ pub fn type_level(ty: &Type) -> Level {
         // instantiation), which reads it directly and is exempted from the
         // `type_level` short-circuit.
         Type::ChanDom(..) => 0,
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => 0,
+        // A type function is as deep as its deepest argument: the operator itself
+        // introduces no variable, and generalization must see the arguments'
+        // levels or a scheme would quantify over a variable its own bound uses.
+        Type::App { args, .. } => args.iter().map(type_level).max().unwrap_or(0),
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::SharedHole(_) => 0,
     }
 }
 
@@ -181,7 +192,7 @@ mod tests {
     #[test]
     fn fresh_var_has_no_bounds() {
         let v = InferVar::fresh(0);
-        let s = v.bounds.borrow();
+        let s = v.bounds();
         assert!(s.lower.is_empty());
         assert!(s.upper.is_empty());
         assert_eq!(v.level, 0);

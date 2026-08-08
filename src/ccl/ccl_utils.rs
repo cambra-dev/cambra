@@ -560,9 +560,17 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             domain: Box::new(strip_refinements(domain)),
             kind: *kind,
         },
+        // Strip *inside* the arguments — a structural rewrite, not a reduction.
+        // Every operator's reduction already drops value-level claims, so this is
+        // belt-and-braces rather than the mechanism.
+        Type::App { fun, args } => Type::App {
+            fun: fun.clone(),
+            args: args.iter().map(strip_refinements).collect(),
+        },
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole
+        | Type::SharedHole(_)
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)

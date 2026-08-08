@@ -13,8 +13,6 @@ use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
 use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr};
 
-use super::type_level;
-
 // ---------------------------------------------------------------------------
 // Polymorphic schemes
 // ---------------------------------------------------------------------------
@@ -29,7 +27,7 @@ use super::type_level;
 /// # Usage
 ///
 /// Two sources of schemes: (1) operator/projection signatures that are
-/// inherently polymorphic (`Compare : ∀α. α → α → Bool`,
+/// inherently polymorphic (`Compare : ∀α β. α → β → Greater(α, β)`,
 /// `Proj(Index n) : ∀α. {n: α, …} → α`, etc.), built once in
 /// `OperatorSchemes`; and (2) let-generalization — a multi-use function
 /// binding is generalized into a `PolyScheme` at its binding level
@@ -165,27 +163,87 @@ fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKind
     f
 }
 
+/// The highest level of any inference variable **reachable** in `ty` — including
+/// the ones inside refinement predicates' own type slots.
+///
+/// This is deliberately *not* [`type_level`], and the difference is the whole
+/// point. The two answer different questions:
+///
+/// * [`type_level`] asks "does this participate in the lattice above `lim`?", for
+///   extrusion, bound-recording scope, and let-generalization. A refinement is
+///   lattice-blind, so it defers to its base and the predicate is correctly
+///   invisible; a `ChanDom` reports 0 so a rigid atom flows through bounds
+///   unchanged. Both are load-bearing there.
+/// * Freshening asks "does this contain a variable I must **copy**?" A predicate
+///   carries real type slots holding real quantified variables, so for *this*
+///   question they count.
+///
+/// Sharing one function between the two is what let an unfreshened predicate into
+/// a specialization clone: `type_level` reports the base's level for a nested
+/// refinement, so a type whose only above-`lim` content lives in a predicate
+/// short-circuits and is returned verbatim — still pointing at the definition's
+/// live inference variables, which `src/ccl/design/type-inference.md`
+/// ("3.1 Let-Polymorphism is Freshening (Instantiation)") states it must not.
+/// The symptom is a duplicate specialization: the clone reaches the same
+/// generalized `let` twice, once through freshened variables and once through
+/// the definition's own.
+fn freshen_level(ty: &Type) -> Level {
+    fn predicate_level(expr: &TypedExpr) -> Level {
+        let mut lvl = 0;
+        expr.walk_type_slots(|t| lvl = lvl.max(freshen_level(t)));
+        expr.walk_children(|c| lvl = lvl.max(predicate_level(c)));
+        lvl
+    }
+    // One walk, not `type_level` plus a second descent: `walk_children` already
+    // reaches every structural position, so the only thing to add is the
+    // predicate it documents itself as skipping. `ChanDom` needs no arm — it has
+    // no children and is not an `Infer`, so it contributes 0, which is the same
+    // answer `type_level` gives it and for the same reason.
+    let mut lvl = match ty {
+        Type::Infer(v) => v.level,
+        _ => 0,
+    };
+    if let Type::Refinement(_, r) = ty {
+        lvl = lvl.max(predicate_level(&r.predicate));
+    }
+    ty.walk_children(|c| lvl = lvl.max(freshen_level(c)));
+    lvl
+}
+
 pub fn freshen_above(
     lim: Level,
     ty: &Type,
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Type {
-    // A `Refinement`'s `type_level` reflects only its base, but its predicate
-    // term carries its own type slots (which may hold quantified variables a
-    // low base hides). So never short-circuit a refinement on `type_level`;
-    // descend and freshen the predicate slots too (each leaf slot still
-    // short-circuits on its own level). A `ChanDom` is likewise exempt: it
-    // deliberately reports `type_level` 0 (its level must not trigger
-    // extrusion — see `type_level`), so its quantification is decided by the
-    // arm below from its *stored* introduction level.
-    if !matches!(ty, Type::Refinement(..) | Type::ChanDom(..)) && type_level(ty) <= lim {
+    // The short-circuit asks [`freshen_level`], not `type_level`: a refinement's
+    // predicate holds type slots whose quantified variables a low base hides, and
+    // freshening has to copy them (see [`freshen_level`] for why the two levels
+    // are different questions). A `ChanDom` is exempt outright: it deliberately
+    // reports level 0 (its level must not trigger extrusion — see `type_level`),
+    // so its quantification is decided by the arm below from its *stored*
+    // introduction level.
+    if !matches!(ty, Type::ChanDom(..)) && freshen_level(ty) <= lim {
         return ty.clone();
     }
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => {
-            ty.clone()
-        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::SharedHole(_) => ty.clone(),
+        // A type function freshens argumentwise, so an instantiation applies the
+        // same function to *its own* variables (`Add(α', β')`). A bound whose type
+        // is an application is freshened through this same cache, for the same
+        // reason.
+        Type::App { fun, args } => Type::App {
+            fun: fun.clone(),
+            args: args
+                .iter()
+                .map(|a| freshen_above(lim, a, target, cache))
+                .collect(),
+        },
         // A channel domain minted inside the generalized definition
         // (level > lim) is *quantified* exactly like a variable — each
         // instantiation is its own channel. But a rigid name cannot be
@@ -276,7 +334,7 @@ pub fn freshen_above(
             // Snapshot bounds before recursing — the recursion may touch
             // other variables but must not see partially-mutated state.
             let (lows, ups) = {
-                let s = tv.bounds.borrow();
+                let s = tv.bounds();
                 (s.lower.clone(), s.upper.clone())
             };
             // Freshen the bound's type *and* its edge substitutions' discharge
@@ -301,7 +359,7 @@ pub fn freshen_above(
                 })
                 .collect();
             {
-                let mut s = v.bounds.borrow_mut();
+                let mut s = v.bounds_mut();
                 s.lower = new_lows;
                 s.upper = new_ups;
             }
@@ -410,7 +468,7 @@ fn seed_pairings_go(
     if let Type::Infer(dv) = peel(def_ty) {
         if seen.insert(dv.uid) {
             let (lows, ups) = {
-                let s = dv.bounds.borrow();
+                let s = dv.bounds();
                 (s.lower.clone(), s.upper.clone())
             };
             for b in lows.iter().chain(ups.iter()) {
@@ -422,7 +480,7 @@ fn seed_pairings_go(
     if let Type::Infer(uv) = peel(use_ty) {
         if seen.insert(uv.uid) {
             let (lows, ups) = {
-                let s = uv.bounds.borrow();
+                let s = uv.bounds();
                 (s.lower.clone(), s.upper.clone())
             };
             for b in lows.iter().chain(ups.iter()) {
@@ -490,6 +548,27 @@ fn seed_pairings_go(
             seed_pairings_go(uv, dv, lim, out, seen);
             seed_pairings_go(ud, dd, lim, out, seen);
         }
+        // A type function's arguments are ordinary child types, so they pair
+        // argumentwise. Nothing reaches this today — an `App` is materialized
+        // away before a use type is resolved, and today's type functions take scalar
+        // arguments that could not hold a `ChanDom` anyway — but a compound-argument
+        // type function (`FieldOf`, `CollectionUnion`) could, and falling into the
+        // structural-disagreement arm below would silently leave a definition's
+        // channel unpaired.
+        (
+            Type::App {
+                fun: ufun,
+                args: ua,
+            },
+            Type::App {
+                fun: dfun,
+                args: da,
+            },
+        ) if ufun == dfun => {
+            for (u, d) in ua.iter().zip(da) {
+                seed_pairings_go(u, d, lim, out, seen);
+            }
+        }
         // A feed handle reads through to its stream `Fun(domain, value)`
         // during coalescing (`dissolve_read_feeds`), so the use side may be
         // the dissolved `Fun` where the definition still carries the
@@ -544,6 +623,7 @@ fn freshen_subst_payloads(
 
 #[cfg(test)]
 mod tests {
+    use super::super::type_level;
     use super::*;
     use crate::ccl::ty::{FunKind, FunKindVar};
     use crate::ccl::{BaseType, InferVar};
@@ -586,6 +666,64 @@ mod tests {
         assert!(
             !kv.bounds.borrow().forced_compute,
             "the original var stays decoupled from this instantiation"
+        );
+    }
+
+    /// A quantified variable reachable *only* through a refinement predicate must
+    /// still be freshened.
+    ///
+    /// The shape is the one a comprehension produces: a `Fun` whose every
+    /// structural position is ground (`[0,2] ⇒ Int`), carrying a refinement whose
+    /// base is also ground — so `type_level` reports 0 for the whole thing — while
+    /// the predicate holds a level-5 variable. Short-circuiting on `type_level`
+    /// returns the type verbatim and the clone keeps pointing at the definition's
+    /// live variable, which shows up downstream as a *duplicate* specialization:
+    /// the clone reaches one generalized `let` through both the freshened variable
+    /// and the original.
+    ///
+    /// Guarding a top-level `Refinement` is not enough — one level of nesting is
+    /// what the real shape has, and what this pins.
+    #[test]
+    fn a_variable_reachable_only_through_a_predicate_is_freshened() {
+        let quantified = InferVar::fresh(5);
+        // A predicate term whose *type slot* holds the quantified variable.
+        let predicate = Rc::new(
+            TypedExpr::lit(crate::ccl::Lit::Bool(true))
+                .with_ty(Type::Infer(Rc::clone(&quantified))),
+        );
+        let refined_domain = Type::Refinement(
+            Box::new(Type::UIntRange(3)), // ground base: hides the predicate's level
+            Refinement::sharing(&predicate),
+        );
+        let ty = Type::Fun {
+            name: None,
+            kind: FunKind::Compute,
+            domain: Box::new(refined_domain),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
+        assert_eq!(
+            type_level(&ty),
+            0,
+            "precondition: `type_level` cannot see the predicate's variable"
+        );
+
+        let mut cache = FreshenCache::new();
+        let fresh = freshen_above(0, &ty, FreshenLevel::At(1), &mut cache);
+
+        let Type::Fun { domain, .. } = &fresh else {
+            panic!("expected a function type");
+        };
+        let Type::Refinement(_, r) = &**domain else {
+            panic!("expected the refinement to survive freshening");
+        };
+        let Type::Infer(v) = &r.predicate.ty else {
+            panic!("expected the predicate's type slot to stay a variable");
+        };
+        assert_ne!(
+            v.uid, quantified.uid,
+            "a quantified variable reachable only through a predicate must be \
+             freshened — sharing it with the definition mints a duplicate \
+             specialization"
         );
     }
 

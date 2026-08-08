@@ -38,6 +38,9 @@ pub enum CoalesceError {
         /// Pretty representation of the conflicting bounds.
         details: String,
     },
+    /// A type function could not reduce — its arguments have no common base, or a
+    /// strict type function's argument was cyclic. See [`ReduceError`](super::ReduceError).
+    Reduce(super::ReduceError),
     /// A record-shaped variable still had open width at coalesce time —
     /// no closing equality constraint pinned its full set of fields.
     /// Mirrors today's `UnresolvedPartial` error so existing callers see
@@ -117,6 +120,13 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
 }
 
 fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
+    // A type function at this position failed to reduce. Raise it here, where a
+    // `Type` is produced: this is the point the coalesce walk blames on a node, so
+    // `1 + "a"` reports "no common base" against the addition rather than
+    // resurfacing later as an unresolved variable with no span.
+    if let Some(e) = &ct.reduce_error {
+        return Err(CoalesceError::Reduce(e.clone()));
+    }
     // Transparent read at joins: a feed handle meeting *non-feed*
     // contributions at one position is being read — `x + 1` joins x's
     // payload with `Int` through a shared join variable, so the handle
@@ -725,7 +735,7 @@ mod tests {
         // the path is defensive.
         let v = fresh_var(0);
         if let Type::Infer(state) = &v {
-            state.bounds.borrow_mut().lower.push(Bound::conc(v.clone()));
+            state.bounds_mut().lower.push(Bound::conc(v.clone()));
         }
         match coalesce_compact(&compact_type(&v)).unwrap() {
             Type::Infer(_) => {}

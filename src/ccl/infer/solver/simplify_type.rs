@@ -344,6 +344,7 @@ fn simplify_reconstruct(
         fun: new_fun,
         refinements: ct.refinements,
         history_slot: new_history_slot,
+        reduce_error: ct.reduce_error,
     }
 }
 

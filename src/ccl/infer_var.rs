@@ -206,14 +206,34 @@ pub struct InferBounds {
 /// borrow-free and never inspects the bound graph — which is what lets
 /// [`Type`] keep deriving `PartialEq`/`Eq`/`Hash`/`Debug` even while a
 /// variable's bounds are cyclic (a recursive type, pre-rejection) or
-/// mutably borrowed mid-constraint. Only [`InferVar::bounds`] is mutable.
+/// mutably borrowed mid-constraint. Only the bound lists are mutable, and only
+/// through [`InferVar::bounds_mut`].
 pub struct InferVar {
     /// Stable, globally-unique identity.
     pub uid: InferVarId,
     /// Scope level at which the variable was minted.
     pub level: Level,
-    /// Mutable lower/upper bound lists.
-    pub bounds: RefCell<InferBounds>,
+    /// Mutable lower/upper bound lists. **Private on purpose** — see
+    /// [`InferVar::bounds_mut`].
+    bound_lists: RefCell<InferBounds>,
+}
+
+impl InferVar {
+    /// Read the bound lists.
+    pub fn bounds(&self) -> std::cell::Ref<'_, InferBounds> {
+        self.bound_lists.borrow()
+    }
+
+    /// Mutate the bound lists.
+    ///
+    /// Every write to the graph goes through here, `bound_lists` being private
+    /// rather than merely discouraged: the two accessors are what make "who writes
+    /// the bound graph" a question with a grep-able answer, and the answer is short
+    /// — `constrain_subtype`, the scheme registry's declared bounds, and the
+    /// monomorphization pin.
+    pub fn bounds_mut(&self) -> std::cell::RefMut<'_, InferBounds> {
+        self.bound_lists.borrow_mut()
+    }
 }
 
 thread_local! {
@@ -268,7 +288,7 @@ impl InferVar {
         let var = Rc::new(InferVar {
             uid: fresh_infer_var_id(),
             level,
-            bounds: RefCell::new(InferBounds::default()),
+            bound_lists: RefCell::new(InferBounds::default()),
         });
         ACTIVE_ARENA.with(|slot| {
             if let Some(vars) = slot.borrow_mut().as_mut() {
