@@ -93,7 +93,7 @@ use std::fmt;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::{FieldKey, HistoryKind, InferVarId, Refinement, Type, TypeFn};
+use crate::ccl::{FieldKey, HistoryKind, InferVarId, Refinement, Type};
 
 use super::compact::{AtomKey, KindMerge};
 
@@ -156,15 +156,6 @@ struct KeyView {
     /// handle at one position stay distinguishable rather than one shadowing the
     /// other. Each maps to `(value, domain)`.
     history: BTreeMap<HistoryKind, (Box<KeyView>, Box<KeyView>)>,
-    /// Unreduced type-function applications at this position, as
-    /// `(type function, argument keys)`.
-    ///
-    /// Keyed **structurally**, not by reducing the application. Reducing would be more
-    /// precise, and leaving it for later is safe because the imprecision runs the
-    /// right way: two uses whose arguments differ key apart even where the function
-    /// would reduce them alike, so this over-splits (a wasted clone) and never
-    /// under-splits (a clone shared with a use it is wrong for).
-    compute: Vec<(TypeFn, Vec<KeyView>)>,
 }
 
 /// Structural equality, with `refinements` compared as a set.
@@ -179,22 +170,8 @@ impl PartialEq for KeyView {
         fn same_refinements(a: &[Refinement], b: &[Refinement]) -> bool {
             a.len() == b.len() && a.iter().all(|w| b.contains(w))
         }
-        // Applications at one position, compared as a set.
-        //
-        // Equal lengths plus containment is set equality *given* that neither list
-        // holds two equal entries, which [`KeyView::union`] guarantees: it dedupes
-        // on insertion with the very same derived equality this test uses. The two
-        // must stay in step — a comparison coarser than `union`'s dedup would let a
-        // duplicate on one side cover for a difference on the other, which is the
-        // under-split [`KeyView::compute`]'s doc rules out. There is no such gap
-        // today because every [`TypeFn`] reads its arguments positionally, so
-        // derived equality *is* the finest relation available.
-        fn same_compute(a: &[(TypeFn, Vec<KeyView>)], b: &[(TypeFn, Vec<KeyView>)]) -> bool {
-            a.len() == b.len() && a.iter().all(|c| b.contains(c))
-        }
         self.atoms == other.atoms
             && same_refinements(&self.refinements, &other.refinements)
-            && same_compute(&self.compute, &other.compute)
             && self.fun == other.fun
             && self.rec == other.rec
             && self.var == other.var
@@ -225,11 +202,6 @@ impl KeyView {
                     d0.union(*domain);
                     c0.union(*codomain);
                 }
-            }
-        }
-        for c in other.compute {
-            if !self.compute.contains(&c) {
-                self.compute.push(c);
             }
         }
         union_map(&mut self.rec, other.rec);
@@ -287,10 +259,6 @@ impl fmt::Display for KeyView {
         if !self.var.is_empty() {
             let tags: Vec<String> = self.var.iter().map(|(k, v)| format!(".{k}: {v}")).collect();
             parts.push(format!("[{}]", tags.join(" | ")));
-        }
-        for (fun, args) in &self.compute {
-            let rendered: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            parts.push(format!("{fun}({})", rendered.join(", ")));
         }
         for (kind, (value, domain)) in &self.history {
             let name = match kind {
@@ -390,15 +358,24 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // arm is for exhaustiveness, and "no information here" is the honest
         // reading if one ever did.
         Type::Hole | Type::SharedHole(_) => KeyView::default(),
-        Type::App { fun, args } => KeyView {
-            compute: vec![(
-                fun.clone(),
-                args.iter()
-                    .map(|a| key_go(a, pol, subst_acc, ctx))
-                    .collect(),
-            )],
-            ..Default::default()
-        },
+        // An unreduced application contributes **nothing**, and cannot: it has no
+        // discriminating power at all.
+        //
+        // Keys are only ever compared within one [`SpecializeFrame`], so both sides
+        // come from uses of one definition, whose body is fixed — every [`TypeFn`]
+        // at every position is therefore identical across them (`FieldOf(.a)` stays
+        // `FieldOf(.a)`), and function identity can never decide. Only the type
+        // arguments can differ, and each is either a variable that also appears
+        // elsewhere in the definition's type — where this walk already reads it, so
+        // recording it here says the same thing twice — or one that appears *only*
+        // inside the application, which no use site can bound (an obligation against
+        // an `App` is parked, not decomposed) and which therefore resolves alike for
+        // every use.
+        //
+        // Recording them was measured as well as argued: instrumenting
+        // `specialize_use` to choose a specialization with and without this
+        // contribution picks the same one every time, across the whole suite.
+        Type::App { .. } => KeyView::default(),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
         // dependent-application discharge lands in the key as the predicate the
@@ -695,26 +672,6 @@ mod tests {
 
         // And the whole key is independent of the order the walk meets them.
         assert_eq!(both, spec_key(&Type::Tuple(vec![b, a])));
-    }
-
-    /// An application's arguments are compared **positionally**, because every
-    /// [`TypeFn`] reads them that way: `Sub` and `Less` are not symmetric, and the
-    /// sharper rules each is waiting for (`([0,2], [5,7]) ⇒ [5,9]`) read positions
-    /// too. Argument order is therefore information about the position.
-    ///
-    /// The one function that was genuinely symmetric — the `CommonBase` operand
-    /// requirement — is retired, and with it the declaration and the multiset
-    /// comparison it needed.
-    #[test]
-    fn an_applications_argument_order_is_information() {
-        let add = |a, b| {
-            spec_key(&Type::App {
-                fun: TypeFn::Arithmetic(crate::ccl::ArithmeticKind::Add),
-                args: vec![a, b],
-            })
-        };
-        assert_ne!(add(int(), singleton(1)), add(singleton(1), int()));
-        assert_eq!(add(int(), singleton(1)), add(int(), singleton(1)));
     }
 
     /// [`KeyView::union`]'s structural merges: two bounds contributing *different*
