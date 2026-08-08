@@ -97,7 +97,12 @@ pub fn type_level(ty: &Type) -> Level {
         // introduces no variable, and generalization must see the arguments'
         // levels or a scheme would quantify over a variable its own bound uses.
         Type::App { args, .. } => args.iter().map(type_level).max().unwrap_or(0),
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => 0,
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::SharedHole(_) => 0,
     }
 }
 

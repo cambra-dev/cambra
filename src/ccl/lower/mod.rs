@@ -79,7 +79,7 @@ use std::{
 
 use crate::{
     ccl::{
-        Branch, Expr, Lit, TypedExprNode,
+        Branch, Expr, Lit, Type, TypedExprNode,
         lineage::{Nature, RewriteLabel},
     },
     chl_parser::ast::{
@@ -327,9 +327,23 @@ pub struct LoweringContext {
     /// enclosing or sibling scope. Within a block, the *last* definition of a name
     /// wins (see [`pre_register_mut_param_fns`]).
     pub(super) mut_param_fns: HashSet<String>,
+
+    /// Counter behind [`fresh_shared_hole`](Self::fresh_shared_hole).
+    next_shared_hole: u32,
 }
 
 impl LoweringContext {
+    /// A fresh [`Type::SharedHole`] id, unique within this lowering.
+    ///
+    /// Use one id per *relation* a desugaring wants to state, and stamp it on
+    /// every position that relation covers: inference normalizes equal ids to one
+    /// variable, so two positions carrying the same id are held to the same type.
+    /// Ids are meaningless outside the tree they were minted for.
+    pub(super) fn fresh_shared_hole(&mut self) -> Type {
+        let id = self.next_shared_hole;
+        self.next_shared_hole += 1;
+        Type::SharedHole(id)
+    }
     /// Register a data source so that `name()` lowers to `Source(name)`.
     pub fn register_source(
         &mut self,

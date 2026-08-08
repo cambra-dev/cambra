@@ -227,9 +227,12 @@ pub fn freshen_above(
         return ty.clone();
     }
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => {
-            ty.clone()
-        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::SharedHole(_) => ty.clone(),
         // A type function freshens argumentwise. This is what carries a scheme's
         // *internal* operand requirement to each instantiation: the requirement is
         // a bound `α <: CommonBase(α, β)` on a quantified variable, and the bound

@@ -586,6 +586,34 @@ fn test_collection_union_heterogeneous_rejected() {
 // GroupBy + aggregate tests
 // ---------------------------------------------------------------------------
 
+// A group-by's key type is its key function's codomain, and the lowering says so
+// **directly** rather than leaving it to be recovered through the partition
+// predicate's `==`.
+//
+// `__gb_k`'s only occurrence in the lowered shape is as an operand of that
+// comparison, so without a stated relation its type can only arrive backwards
+// along the operand requirement that relates a comparison's two sides — making a
+// group-by's key inference depend on an operator's internals. A `SharedHole`
+// carried by both the key application and the parameter states it outright (see
+// `Type::SharedHole`); these cases pin that the key resolves to the key
+// function's result type and not to the collection's element type.
+#[rstest]
+#[case("groupby([1, 2, 3], \\x -> x)", "Int key from an Int element")]
+#[case(
+    "groupby([(a=1, b=\"w\"), (a=2, b=\"e\")], \\r -> r.b)",
+    "String key from a String field of a record element"
+)]
+fn test_groupby_key_type_comes_from_the_key_function(#[case] code: &str, #[case] why: &str) {
+    let ty = infer_program(code);
+    let Type::Fun { domain, .. } = &ty else {
+        panic!("a group-by is a function from key to partition, got {ty}");
+    };
+    assert!(
+        !matches!(**domain, Type::Infer(_) | Type::Hole),
+        "the key type must be determined ({why}), got {ty}"
+    );
+}
+
 #[test]
 fn test_groupby_aggregate() {
     // groups = groupby([1, 2, 3], \x -> x)
