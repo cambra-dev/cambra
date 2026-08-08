@@ -88,9 +88,9 @@
 //! Resolution being re-entrant is not something the retired `CommonBase` bound
 //! introduced, and retiring it did not make the in-flight set idle: an argument is
 //! resolved through the ordinary pipeline, which reaches other applications, so a
-//! chain of them nests. `compact.rs`'s in-flight set and resolution memo are what
-//! keep that bounded — removing the memo overflows the stack on a program as small
-//! as `x := 7; for i in []: x += 1; x`.
+//! chain of them nests. `compact.rs`'s in-flight set is what keeps that terminating
+//! — without the cut-off, a program as small as `x := 7; for i in []: x += 1; x`
+//! overflows the stack.
 //!
 //! Every rule today satisfies law 3, so a missing argument is never itself a
 //! failure. A future function that cannot — `FieldOf(ρ, 𝑘)` has nothing to say
