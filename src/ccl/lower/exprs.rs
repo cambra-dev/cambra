@@ -72,6 +72,14 @@ pub(super) fn lower_call(
             let collection = lower_expr(&args[0], ctx)?;
             let key_fn = lower_expr(&args[1], ctx)?;
 
+            // The key parameter's type **is** the key function's codomain, and
+            // nothing in the lowered shape says so: `__gb_k`'s only occurrence is
+            // as an operand of the `==` below, so its type could otherwise only
+            // arrive backwards through the comparison — via the requirement that
+            // relates a comparison's two operands. A `SharedHole` states the
+            // relation directly instead: the key application and the parameter
+            // carry one id, so inference normalizes them to one variable.
+            let key_ty = ctx.fresh_shared_hole();
             // `bare_pred` (and the `collection` clone inside it) lives in the
             // cast target's refinement predicate — a type slot outside the
             // `walk_children` domain — so its nodes are deliberately untagged.
@@ -79,7 +87,8 @@ pub(super) fn lower_call(
                 Expr::apply(
                     Expr::apply(Expr::var(Name::elem()), collection.clone()),
                     key_fn,
-                ),
+                )
+                .with_user_annotation(key_ty.clone()),
                 BinOpKind::Compare(CompareKind::Equals),
                 Expr::var("__gb_k"),
             );
@@ -99,7 +108,7 @@ pub(super) fn lower_call(
             // outer arrow `Data` by provenance (the `data_fun` annotation is a
             // concrete-kind stamp — see `emit_node`), so its kind is data-by-
             // construction rather than guessed from its (scalar key) domain.
-            Ok(Expr::lambda("__gb_k", Type::Hole, cast)
+            Ok(Expr::lambda("__gb_k", key_ty, cast)
                 .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)))
         }
         "sum" | "max" => {
@@ -605,22 +614,22 @@ mod tests {
     // Variable collection and inline key lambda
     #[case(
         "groupby(xs, \\x -> x)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k : _#0 → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], \\x -> x // 2)",
-        "λ __gb_k → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+        "λ __gb_k : _#0 → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k : _#0 → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
+        "λ __iter_record → __iter_record ▷ (λ __gb_k : _#0 → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

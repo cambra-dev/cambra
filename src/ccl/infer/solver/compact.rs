@@ -899,7 +899,7 @@ fn compact_go(
         }
         // A bare `Hole` shouldn't reach the solver (emission turns it into a
         // fresh var), but treat it as no contribution for exhaustiveness.
-        Type::Hole => CompactType::empty(),
+        Type::Hole | Type::SharedHole(_) => CompactType::empty(),
         // A type function **reduces here**, which is the whole point of putting the
         // computation in the type: materialization is demand-driven, so by the time
         // anything asks what this position is, resolving the arguments pulls

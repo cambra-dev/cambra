@@ -425,7 +425,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // no `Hole` reaches a use's instantiation type in the first place. The
         // arm is for exhaustiveness, and "no information here" is the honest
         // reading if one ever did.
-        Type::Hole => KeyView::default(),
+        Type::Hole | Type::SharedHole(_) => KeyView::default(),
         Type::App { fun, args } => KeyView {
             compute: vec![(
                 fun.clone(),

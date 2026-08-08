@@ -570,6 +570,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole
+        | Type::SharedHole(_)
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)

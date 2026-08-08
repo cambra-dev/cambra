@@ -2,6 +2,7 @@
 // InferCtx (Step 7c)
 // ---------------------------------------------------------------------------
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::TermMemo;
@@ -118,6 +119,20 @@ pub(super) struct InferCtx {
     /// [`check_parked_obligations`](Self::check_parked_obligations) once emission
     /// completes; see [`require_sub`](Self::require_sub).
     parked: Vec<ParkedObligation>,
+    /// The variable each [`Type::SharedHole`] id normalizes to, so every
+    /// occurrence of one id resolves to the *same* variable — which is the whole
+    /// content of the marker (see [`Type::SharedHole`]).
+    ///
+    /// A `RefCell` because [`normalize_annotation`](Self::normalize_annotation)
+    /// takes `&self` and is called from a dozen places; threading `&mut` through
+    /// all of them to memoize one map would be churn for no gain.
+    ///
+    /// **First occurrence fixes the level.** Ids are minted per lowered construct
+    /// and every occurrence of one id sits in the same expression, so the level is
+    /// the same at each — but nothing here enforces that, and a future desugaring
+    /// that shared an id across a `let` RHS boundary would silently take the first
+    /// level it saw.
+    shared_holes: RefCell<HashMap<u32, Type>>,
 }
 
 /// A subtyping obligation deferred out of constraint emission, with the blame it
@@ -148,6 +163,7 @@ impl InferCtx {
             lit_singletons: HashMap::new(),
             current_node_id: root,
             parked: Vec::new(),
+            shared_holes: RefCell::new(HashMap::new()),
         }
     }
 
@@ -172,6 +188,17 @@ impl InferCtx {
         match ty {
             // A `Hole` annotation means "infer this" → fresh variable.
             Type::Hole => fresh_var(self.level),
+            // A `SharedHole` means "infer this, and it is the same one as that":
+            // the *first* occurrence of an id mints the variable and every later
+            // one reuses it. That identity is the entire mechanism — it is how a
+            // desugaring relates two positions whose common type only inference
+            // will learn (see [`Type::SharedHole`]).
+            Type::SharedHole(id) => self
+                .shared_holes
+                .borrow_mut()
+                .entry(*id)
+                .or_insert_with(|| fresh_var(self.level))
+                .clone(),
             // Refinements ride the lattice: keep the wrapper, normalize the
             // inner (so a `Refinement(Hole, r)` source annotation becomes
             // `Refinement(?fresh, r)` rather than losing the refinement).
