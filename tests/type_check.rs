@@ -1042,6 +1042,67 @@ fn test_operator_result_inherits_a_refinement_only_when_it_selects(
     assert_eq!(infer_program(code), expected);
 }
 
+// The value type of a register, ignoring the sequencing domain — an `Infer` until the
+// mutability-elimination phases resolve it, so it cannot be asserted on here.
+fn register_value_type(code: &str) -> Type {
+    match infer_program(code) {
+        Type::History { value, .. } => *value,
+        other => panic!("expected a register type for `{code}`, got {other}"),
+    }
+}
+
+// A register that reads itself in its own write is a **cycle**: `value(x)` is defined
+// by an equation mentioning `value(x)`, so resolving the operand re-enters the
+// resolution computing it and the operand arrives `Arg::Cyclic`. Both rules today
+// declare `CycleTolerance::Any`, and these pin what that buys — every shape below is a
+// register whose type would be unknowable if a rule refused to answer through a cycle.
+//
+// The loop-carried accumulator (`for i in …: x := x + i`) is well covered end-to-end in
+// `compilation_pipeline::mutability`; what is pinned here is the *typing* of the harder
+// shapes, which no test reached: both operands cyclic at once, a cycle routed through a
+// user function, mutual recursion between two registers, and a non-`Int` base.
+#[rstest]
+// One cyclic operand, the shape every accumulator has.
+#[case::self_add("x := 0\nx := x + 1\nx", "Int")]
+// **Both** operands cyclic — the rule answers with no operand type at all to work from.
+#[case::self_multiply("x := 2\nx := x * x\nx", "Int")]
+#[case::self_subtract("x := 10\nx := x - x\nx", "Int")]
+// Nested, so an inner application's result is itself an operand of an outer one.
+#[case::nested("x := 0\nx := (x + 1) * (x + 2)\nx", "Int")]
+#[case::deeply_nested("x := 1\nx := ((x + x) * (x + x)) + ((x * x) + (x + x))\nx", "Int")]
+// Routed through user functions, so the cycle crosses a call boundary in both operands.
+#[case::through_functions(
+    "def f(a):\n    a + 1\ndef g(a):\n    a * 2\nx := 0\nx := f(x) + g(x)\nx",
+    "Int"
+)]
+#[case::through_nested_calls("def f(a):\n    a + 1\nx := 0\nx := f(f(x))\nx", "Int")]
+// Two registers each defined in terms of the other: the cycle spans two equations.
+#[case::mutual("x := 0\ny := 0\nx := y + 1\ny := x + 1\nx", "Int")]
+#[case::three_way("x := 0\ny := 0\nz := 0\nx := z + 1\ny := x + 1\nz := y + 1\nz", "Int")]
+// A non-`Int` base, so the answer is the operands' shared base and not a hardcoded `Int`.
+#[case::string_accumulator("s := \"a\"\ns := s + \"b\"\ns", "String")]
+// A **comparison** cycle. `Compare` is constant on its domain, so a cyclic operand costs
+// it nothing at all — unlike arithmetic, which loses the agreement check. Nothing else in
+// the suite writes one, which is why it is here: the tolerance is a claim about every
+// rule, not just the arithmetic ones.
+#[case::self_comparison("b := True\nb := (b == True)\nb", "Bool")]
+#[case::conditional("x := 0\nx := x + 1 if x == 0 else x - 1\nx", "Int")]
+fn test_a_register_that_reads_itself_still_gets_a_type(#[case] code: &str, #[case] base: &str) {
+    assert_eq!(register_value_type(code).to_string(), base);
+}
+
+// The cut-off costs the agreement **check**, not the answer — so a disagreement inside a
+// cycle must still be caught. It is: the outermost frame of the unrolling reduces with
+// every argument known (see `reduce.rs`, "What the cut actually is"), which is where
+// operands that genuinely conflict are rejected.
+#[test]
+fn test_a_cycle_does_not_hide_an_operand_conflict() {
+    assert!(
+        !infer_program_err("x := 0\nx := x + \"a\"\nx").is_empty(),
+        "a conflict reachable only through a cyclic operand must still be a diagnostic"
+    );
+}
+
 // Merging: a collection's element type is the *join* of its elements, so a refinement
 // survives only when every element establishes it. This is the rule the singleton made
 // load-bearing — a merge point is not one value, it is whichever the runtime supplies.
