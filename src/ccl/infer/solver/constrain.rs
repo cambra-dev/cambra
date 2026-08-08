@@ -905,19 +905,12 @@ fn constrain_go(
         // (`InferCtx::check_parked_obligations`). Two same-function applications of
         // equal arguments already short-circuited as trivially equal above.
         //
-        // Both directions are parked, and only one of them needs to be. The common
-        // traffic is an **operand requirement** being closed — `Int <: CommonBase(α,
-        // β)`, as a concrete operand flows into a scheme variable the registry already
-        // bounded by the function — and dropping *that* would be sound, because the
-        // requirement is re-checked when the function's result is materialized and the
-        // scheme rule guarantees something materializes it (see `OperatorSchemes`, "An
-        // operand requirement must be reachable from the result type"). The other
-        // direction is the real hole: an application on the *lower* side against a
-        // concrete demand, `Add(α, β) <: Bool`, which bound closure produces for
-        // `(1 + 2) and True`. Nothing downstream re-derives that one, so accepting it
-        // silently turned an ordinary type error into a panic at the
-        // `check_pre_desugar` wall. Parking both is what makes the arm's rule
-        // "undecidable now" rather than a claim about which shapes arrive.
+        // Both directions are parked, because the arm's rule is "undecidable now"
+        // rather than a claim about which shapes arrive. The one that matters is an
+        // application on the *lower* side against a concrete demand: `(1 + 2) and
+        // True` closes to `Add(α, β) <: Bool`, which nothing downstream re-derives,
+        // so accepting it silently turned an ordinary user type error into a panic
+        // at the `check_pre_desugar` wall.
         //
         // The substitutions in flight are applied on the way in: a parked obligation
         // outlives this frame, so it must not depend on morphisms the frame carries.

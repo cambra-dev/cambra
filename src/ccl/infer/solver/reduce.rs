@@ -43,54 +43,35 @@
 //!    fills in, so a later reduction refines an earlier one rather than
 //!    contradicting it.
 //!
-//! 3. **Coarsening on a missing argument.** Dropping arguments only weakens the
-//!    answer — never errors, and never claims more than the full argument list
-//!    would. *Buys:* a rule reached before its arguments are known gives a usable
-//!    answer instead of a wrong one; an unapplied `λ x → x > 1` still has result
-//!    type `Bool`.
+//! 3. **Total on a missing argument.** A rule answers from the arguments it has
+//!    rather than erroring. A `None` means *cyclic*, not *conflicting*, so a rule
+//!    that errors there turns a cycle into a spurious type error. *Buys:* a
+//!    register that reads itself in its own write still gets a type — `x += 1`
+//!    types as `Add(value(x), 1)` where `value(x)` is what is being computed, and
+//!    thirteen accumulator tests fail the moment a rule refuses to answer.
 //!
 //! 4. **Normalizing.** The result contains no [`Type::App`]. *Buys:* one `reduce`
 //!    call terminates without a fixpoint, because the rule set is closed and no
 //!    rule feeds itself.
 //!
-//! # What "the operands share a base" is, and is not
-//!
-//! [`shared_base`] is `⊔ᵢ base(argᵢ)` — the join of the arguments' bases, defined
-//! only where that join is not `⊤`. It is a **rule body**, used by both arithmetic
-//! and comparison, and not a type function in its own right.
-//!
-//! It once was one, as a `CommonBase` bound each operand carried, so that resolving
-//! one operand pulled the other's base. That is gone. As a *guard* it duplicated
-//! what the result rule already does — a node's type is an `App` over both
-//! operands, so materializing it runs the rule and rejects `1 + "a"` — and as a
-//! *pull* it was compensating for defects elsewhere, since fixed.
-//!
-//! More importantly, "the operands share a base" is not what makes two values
-//! addable; it is an artifact of a lattice with one numeric type. Under an
-//! `Int + Float → Float` widening it is wrong in both directions: it rejects a
-//! legal addition, and it names a result that is neither operand. Keeping the
-//! decision *inside* [`TypeFn::Arithmetic`]'s rule is what lets it change without
-//! touching anything else — the base sublattice being discrete is the only reason
-//! a failed join is an error today rather than a widening.
-//!
 //! # Missing arguments
 //!
 //! An argument arrives as `None` when resolving it would re-enter the resolution
-//! that is *already computing it*. That is not a scheduling artifact: resolution
-//! pulls, so the only unavailable argument is a cyclic one, and a cycle has no
-//! "later" at which more is known.
+//! *already computing it*. That is not a scheduling artifact — a cycle has no
+//! "later" at which more is known — and it is not rare: a **register that reads
+//! itself in its own write** is one.
 //!
-//! Law 3 is what makes that a usable answer rather than a failure: reduced with an
-//! argument missing, a rule answers from the rest and cannot claim more than it
-//! would have with all of them. That is what keeps an unapplied `λ x → x > 1` at
-//! result type `Bool` even though its operand is undetermined.
+//! `x += 1` makes the register's value type the join over its seed and its writes,
+//! and one write is `x + 1`, whose type is `Add(value(x), 1)`. Resolving `value(x)`
+//! therefore reaches an application whose own argument is `value(x)`.
+//! `compact.rs`'s in-flight set is what cuts that off — without it, `x := 7; for i
+//! in []: x += 1; x` overflows the stack — and law 3 is what makes the cut-off
+//! usable rather than an error, since `Add(⟨cyclic⟩, 1)` must still be `Int` for
+//! any accumulator to type.
 //!
-//! Resolution being re-entrant is not something the retired `CommonBase` bound
-//! introduced, and retiring it did not make the in-flight set idle: an argument is
-//! resolved through the ordinary pipeline, which reaches other applications, so a
-//! chain of them nests. `compact.rs`'s in-flight set is what keeps that terminating
-//! — without the cut-off, a program as small as `x := 7; for i in []: x += 1; x`
-//! overflows the stack.
+//! The imprecision does not escape: the frame that materializes the node runs the
+//! same rule again with every argument available, which is where operands that
+//! genuinely disagree are caught.
 //!
 //! Every rule today satisfies law 3, so a missing argument is never itself a
 //! failure. A future function that cannot — `FieldOf(ρ, 𝑘)` has nothing to say

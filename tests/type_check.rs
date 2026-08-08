@@ -849,20 +849,13 @@ fn test_lambda_unapplied_is_polymorphic_in_its_operand(
 // An unapplied generic function leaves its operand types unresolved, which is an
 // ambiguous program and rejected downstream — but rejected, not hung on.
 //
-// These cases were once genuinely pathological: arithmetic bounded each operand by
-// a `CommonBase` application over *both* of them, so resolving one operand reached
-// an application whose own argument was that operand, resolved the other, and came
-// back around. Reduction deposits nothing, so nothing was reused and the
-// re-derivation branched at every level — `f(a, a)` did not terminate at all.
+// Resolution is re-entrant: an argument resolves through the ordinary pipeline,
+// which reaches other applications, so a chain of them nests. `compact.rs`'s
+// in-flight set is what terminates that, and these are the programs that would
+// catch it going away — or a future type function whose operand requirement is a
+// self-referential bound, which makes the nesting dense enough to matter again.
 //
-// No scheme bounds a variable by an application over itself any more, so *that*
-// shape cannot form. Resolution is still re-entrant for the ordinary reason (an
-// argument resolves through the pipeline, which reaches other applications), and
-// `compact.rs`'s in-flight set is still what terminates it — these programs are the
-// regression net for both: the cut-off going away, and a future type function that
-// states its operand requirement as a self-referential bound and brings the density
-// back. The timeout is the assertion, since the failure mode is unbounded rather
-// than slow.
+// The timeout is the assertion, since the failure mode is unbounded rather than slow.
 #[rstest]
 #[timeout(Duration::from_secs(20))]
 #[case::shared_operand("f = \\x, y -> x + y\ng = \\a -> f(a, a)\ng")]

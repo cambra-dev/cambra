@@ -1076,14 +1076,12 @@ A rule is a pure function of resolved argument types. Adding a `TypeFn` variant 
 |---|---|---|
 | 1. Pure | a function of `(fun, args)`: no inference context, no bound graph, no fresh variables, no recorded constraints | reduction may run at any point in any walk, so it can be demand-driven rather than scheduled |
 | 2. Monotone | `𝑎ᵢ <: 𝑏ᵢ` for all `𝑖` ⟹ `𝑓(𝑎⃗) <: 𝑓(𝑏⃗)` | an argument only gets more precise as the graph fills in, so a later reduction refines an earlier one rather than contradicting it |
-| 3. Coarsening | dropping arguments only weakens the answer, and never errors | a rule reached before its arguments resolve gives a usable answer instead of a wrong one — an unapplied `λ 𝑥 → 𝑥 > 1` still has result type `Bool` |
+| 3. Total on a missing argument | a rule answers from the arguments it has rather than erroring — a `None` means *cyclic*, not *conflicting* | a register that reads itself in its own write still gets a type: `x += 1` types as `Add(value(x), 1)` where `value(x)` is what is being computed |
 | 4. Normalizing | the result contains no `App` | one reduction terminates without a fixpoint — the rule set is closed and no rule feeds itself |
 
 **There is deliberately no law about refinements.** Whether a rule may carry an argument's refinement into its result is not a property of reduction — it is a question about what the operator *means*, and [Which operators need one](#which-operators-need-one) is where it is decided: a rule that **selects** one of its arguments must carry it, one that **computes** a new value must not.
 
 As a law it would be wrong twice: it would forbid the selecting rules outright, and it would still miss the failure that actually threatens soundness — a rule that *invents* a claim its arguments do not support inherits nothing and is monotone, so it passes all four. `shared_base`'s `debug_assert` is a postcondition of that one function, not a rule the others obey.
-
-`shared_base(𝑇₁ … 𝑇ₙ)` is `⊔ᵢ base(𝑇ᵢ)` — the join of the arguments' bases, defined only where that join is not `⊤`. It is a **rule body** that arithmetic and comparison share, not a type function of its own. The base sublattice is discrete today, so distinct bases have no join below `⊤`; answering `⊤` would silently accept `1 + "a"`, so the rule reports `NoCommonBase` instead of ascending. Nothing about that is essential — give the lattice an `Int <: Float` edge and the rule widens where it now errors.
 
 ### Where an operand requirement lives
 
@@ -1099,21 +1097,11 @@ Hence: **a scheme that wants its operands checked must mention them in its resul
 
 Every other scheme in the registry states its requirement **structurally**, inside an operand's own shape — `Sum`'s `∀α. (α ⇒ Int) ⇒ Int` puts the `Int` in the argument's codomain position, so `constrain_go` records it on the argument expression's variable, which is a node's type and materializes like any other. Those need nothing.
 
-#### Why not a bound on the operand variables
-
-The alternative is to state the requirement *beside* the result, as a self-referential bound on the scheme's own variables: `α <: CommonBase(α, β)` and `β <: CommonBase(α, β)`, where `CommonBase` is a type function computing the shared base. Resolving one operand then reaches an application over both and answers from the other, which buys a **pull** — `𝑥 + 1` gives `𝑥 : Int`, because information reaches `𝑥` from its sibling. It is the obvious way to recover the inference a shared variable used to provide, and it does not survive contact with three things:
-
-* **As a guard it is redundant.** The result rule already rejects `1 + "a"`, by the reachability argument above. The bound adds a second check of the same fact.
-* **As a claim it is wrong.** "The operands share a base" is an artifact of a lattice with one numeric type, not a fact about addition. Under an `Int + Float → Float` widening the bound rejects a legal program *and* names a result that is neither operand. Deciding what is addable belongs in `Arithmetic`'s rule, where it can change without touching anything else.
-* **As a pull it is a second implementation of inference.** Any operand type it recovers is one some other part of the program already determines and failed to deliver — a lowering that under-connects, or a specialization clone carrying an unfreshened variable. Recovering it here fixes the symptom at the cost of hiding the cause, and a fix elsewhere is not visible as an improvement because the pull was already covering.
-
-It is also expensive: being self-referential, it makes argument resolution re-enter on ordinary programs rather than exotic ones. Retiring the bound does not make resolution non-re-entrant — an argument resolves through the ordinary pipeline, which reaches other applications — so `compact.rs`'s in-flight set stays, and it is what keeps a chain of them from recursing forever. What the bound added was density, and the machinery that existed to survive *that* (a memo keyed on which in-flight resolutions an argument reaches, and a graph-generation counter to invalidate it) went with it.
-
 #### An operand nothing else determines stays undetermined
 
-`λ 𝑥 → 𝑥 + 1` no longer infers `𝑥 : Int`. Its result still resolves — the rule answers from the literal operand — but the parameter is determined by nothing.
+`λ 𝑥 → 𝑥 + 1` does not infer `𝑥 : Int`. Its result resolves — the rule answers from the literal operand — but the parameter is determined by nothing, because nothing determines it: the operands are unrelated variables and only the result is checked.
 
-That is the honest answer. The lambda works for any two things `+` accepts, so it is polymorphic in its parameter, and `Type` has no `∀` to say so. As a program value it is therefore an **ambiguous program**, rejected downstream exactly as `λ 𝑥 → [𝑥, 𝑥]` already was. Inferring `Int` there read as precision; it was the lattice's poverty showing through, and it would have become wrong the moment a second numeric type existed.
+That is the honest type. The lambda works for any two things `+` accepts, so it is polymorphic in its parameter, and `Type` has no `∀` to say so; as a program value it is therefore an **ambiguous program**, rejected downstream exactly as `λ 𝑥 → [𝑥, 𝑥]` is. Inferring `Int` would read as precision, but it is really the one-numeric-type lattice showing through — and would be wrong the moment `Int + Float → Float` existed.
 
 ### Obligations that are not decidable yet are parked
 
@@ -1156,7 +1144,7 @@ Two problems look like this one and are not:
 | Share a lattice variable between operands and result | Inherits every lattice dimension in both directions — see above. This is the shape being replaced. |
 | Reconstruct the result after coalesce | Needs a data-flow-respecting walk order that the coalesce walk deliberately does not have. |
 | Reduce at constraint emission | Reads a graph that is still being built; an answer could be superseded by the next edge. This is the reason obligations are parked instead. |
-| A bound on the operand variables — `α <: CommonBase(α, β)` | Redundant as a guard, wrong as a claim about addability, and a second implementation of inference as a pull — see [Why not a bound on the operand variables](#why-not-a-bound-on-the-operand-variables). |
+| A bound on the operand variables relating them | Redundant: the result rule already checks the operands, by the reachability argument above. It also hard-codes *which* operands are acceptable outside the rule that should decide it, and, being self-referential, makes argument resolution re-enter on ordinary programs. |
 | Named predicate constraints — `(SameBase α β) ⇒ …` | **Not rejected, deferred**, and only worth revisiting if an operand requirement turns out to be needed at all. A predicate *states* a requirement rather than encoding it, and is the shape a user-facing schema language wants; but it has to **propagate** — push `β`'s base onto `α` — and propagating is a deposit, needing its own phase between emission and resolution to stay order-independent. The `App` representation is unchanged by the choice, so it stays a widening rather than a rewrite. |
 | Open, user-declared rule set | The rule signature is already a pure function of resolved argument types, so a user-supplied rule fits without change. Keeping the set closed for now avoids the confluence and termination *conditions* an open set forces on the checker (see the prior work below); law 4 is checkable by inspection for a closed set and would have to become a side condition on user code. |
 
