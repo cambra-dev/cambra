@@ -31,7 +31,6 @@ use crate::ccl::symbolic::symbolic;
 use crate::ccl::{Expr, Level, Name, Type, TypedBinding, TypedExprNode};
 
 use super::context::should_generalize;
-use super::typing::peel_refinements_outer;
 use super::{LocatedInferError, map_coalesce_err, map_constrain_err};
 
 /// Returns `true` for expression labels that are structurally significant
@@ -318,6 +317,18 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         }
         t
     }
+    // **Read through a history handle before counting layers.** A handle is
+    // transparent, and the value behind it may itself be refined, so peeling first
+    // would compare a refined value's layer count (`{Int | __elem == 0}`, one layer)
+    // against the handle's own (`Mut({Int | __elem == 0}, d)`, zero) and reject a pair
+    // that is in fact the same type. That is what made a register with a refined value
+    // look like drift. The test is [`Type::is_handle`] rather than a bare `matches!`
+    // for the same reason every other shape test peels: a refined handle is still a
+    // handle, and a *handle-versus-its-read-view* pair is exactly the asymmetry this
+    // arm exists to allow.
+    if read.is_handle() || now.is_handle() {
+        return histories_agree(read, now, refinements);
+    }
     let (mut read_layers, mut now_layers) = (0, 0);
     let read = peel(read, &mut read_layers);
     let now = peel(now, &mut now_layers);
@@ -370,22 +381,49 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                     kx == ky && types_agree_modulo_unread(x, y, refinements)
                 })
         }
-        // Two histories of *different* kinds never agree — an `Overwrite` and a
-        // `Feed` are distinct handles even if their read views coincidentally
-        // line up. Reject explicitly rather than letting the or-pattern below
-        // bind `kind` from whichever side matched first (which would compare one
-        // side's read view against the other's raw handle, an asymmetric and
-        // potentially-permissive result on a mis-kinded tree). Same-kind pairs
-        // fall through to the read-through arm.
-        (Type::History { kind: k0, .. }, Type::History { kind: k1, .. }) if k0 != k1 => false,
-        // A history reads through transparently (the solver's read-through
-        // rule, mirrored in `provide_function`): a read agrees with the
-        // handle's read view, and two handles agree iff their read views do.
-        // The read view is kind-specific — a `Feed` reads as its whole stream
-        // `domain ⇒ value`, an `Overwrite` derefs to its scalar `value`. A `Feed`
-        // channel domain is the rigid nominal `ChanDom(d)`, which `channelize`
-        // erases to the concrete channel domain by substitution; the `ChanDom`
-        // arm above agrees it by name.
+        _ => false,
+    }
+}
+
+/// The history half of [`types_agree_modulo_unread`], split out because it must run
+/// **before** the refinement-layer comparison (see the call site).
+///
+/// Two histories of *different* kinds never agree — an `Overwrite` and a `Feed` are
+/// distinct handles even if their read views coincidentally line up. Rejecting that
+/// explicitly is what keeps the read-through below from binding `kind` from whichever
+/// side matched first, which would compare one side's read view against the other's
+/// raw handle: an asymmetric and potentially-permissive result on a mis-kinded tree.
+///
+/// Otherwise a history reads through transparently (the solver's read-through rule,
+/// mirrored in `provide_function`): a read agrees with the handle's read view, and two
+/// handles agree iff their read views do. The read view is kind-specific — a `Feed`
+/// reads as its whole stream `domain ⇒ value`, an `Overwrite` derefs to its scalar
+/// `value`. A `Feed` channel domain is the rigid nominal `ChanDom(d)`, which
+/// `channelize` erases to the concrete channel domain by substitution; the `ChanDom`
+/// arm agrees it by name.
+///
+/// A **handle's own** outer refinement layers are peeled and not counted, unlike
+/// everywhere else in this comparison. They cannot be: the two sides here are legally a
+/// handle and its read view, which sit at different depths, so there is no layer count
+/// to compare. Only the handle side is peeled — the read view carries the value's own
+/// claims, and those are compared by the ordinary rule, layers and all.
+#[cfg(debug_assertions)]
+fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
+    use crate::ccl::HistoryKind;
+    fn peel_handle(t: &Type) -> &Type {
+        if t.is_handle() {
+            t.peel_refinements()
+        } else {
+            t
+        }
+    }
+    let (read, now) = (peel_handle(read), peel_handle(now));
+    if let (Type::History { kind: k0, .. }, Type::History { kind: k1, .. }) = (read, now)
+        && k0 != k1
+    {
+        return false;
+    }
+    let (value, domain, kind, other) = match (read, now) {
         (
             Type::History {
                 value,
@@ -401,24 +439,17 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 domain,
                 kind,
             },
-        ) => match kind {
-            // Used only in this `#[cfg(debug_assertions)]` helper, so qualify
-            // rather than adding a top-level import that is unused in release.
-            crate::ccl::HistoryKind::Append => {
-                let stream = Type::Fun {
-                    name: None,
-                    // A feed's read view is a collection stream: a data function.
-                    kind: crate::ccl::ty::FunKind::Data,
-                    domain: domain.clone(),
-                    codomain: value.clone(),
-                };
-                types_agree_modulo_unread(&stream, other, refinements)
-            }
-            crate::ccl::HistoryKind::Overwrite => {
-                types_agree_modulo_unread(value, other, refinements)
-            }
-        },
-        _ => false,
+        ) => (value, domain, kind, other),
+        _ => unreachable!("called only when at least one side peels to a History"),
+    };
+    match kind {
+        // A feed's read view is a collection stream: a data function.
+        HistoryKind::Append => types_agree_modulo_unread(
+            &Type::data_fun((**domain).clone(), (**value).clone()),
+            other,
+            refinements,
+        ),
+        HistoryKind::Overwrite => types_agree_modulo_unread(value, other, refinements),
     }
 }
 
@@ -798,11 +829,11 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // and comprehension lowering). The function's resolved type is
             // `Fun(Fun(expected_dom, _), _)`; that inner domain is the value
             // the lambda will be fed, so specialize the lambda to it.
-            if let Type::Fun { domain: param, .. } = peel_refinements_outer(&function.ty)
+            if let Type::Fun { domain: param, .. } = function.ty.peel_refinements()
                 && let Type::Fun {
                     domain: expected_dom,
                     ..
-                } = peel_refinements_outer(param)
+                } = param.peel_refinements()
             {
                 let expected_dom = (**expected_dom).clone();
                 specialize_lambda_domain(argument, &expected_dom);
@@ -880,15 +911,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // resolved — rather than via an emit-time reverse-adjacency bound
             // is what keeps it robust under let-polymorphism's monomorphization
             // (which re-mints var identities a recorded bound would not follow).
-            // A morphism's coalesced type may carry *outer* refinements
-            // it acquired during solving (`{Fun(d, c) | r}` — the same shape
-            // `CheckCtx::as_function` peels); the value flowing to the next
-            // morphism is still the bare codomain, so peel before
-            // destructuring rather than silently skipping the wrapped case.
+            // Destructuring looks through a morphism's outer refinements
+            // ([`Type::peel_refinements`]): a refined function is still a function,
+            // and the value flowing to the next morphism is its bare codomain.
             for i in 1..elts.len() {
                 let Type::Fun {
                     codomain: prev_cod, ..
-                } = peel_refinements_outer(&elts[i - 1].ty)
+                } = elts[i - 1].ty.peel_refinements()
                 else {
                     continue;
                 };
@@ -911,10 +940,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                         codomain: last_cod,
                         ..
                     },
-                ) = (
-                    peel_refinements_outer(&first.ty),
-                    peel_refinements_outer(&last.ty),
-                )
+                ) = (first.ty.peel_refinements(), last.ty.peel_refinements())
             {
                 // Keep a dependent *final* morphism's Pi binder on the rebuilt
                 // chain type, mirroring `emit_compose`: the chain's codomain is
@@ -1680,6 +1706,67 @@ mod tests {
             &plain,
             &Type::Base(BaseType::String),
             false
+        ));
+    }
+
+    /// A **handle reads through** before any layer is counted, and the two sides of
+    /// that read are legally at different depths: a register whose value is refined
+    /// agrees with the refined value itself. Counting first compares one layer against
+    /// the handle's own zero and calls the pair drift — which is what made a register
+    /// with a refined value look unsound.
+    ///
+    /// A refinement on the handle *itself* is looked through for the same reason every
+    /// other shape test looks through one: a refined register is still a register. The
+    /// value behind it is still compared layer for layer, so real drift there is caught.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_handle_agrees_with_its_read_view_through_refinements() {
+        use super::types_agree_modulo_unread;
+        use crate::ccl::{HistoryKind, Refinement};
+        let refined = refined_int(TypedExpr::lit(crate::ccl::Lit::Int(8)));
+        let register = |value: Type| Type::History {
+            value: Box::new(value),
+            domain: Box::new(Type::Txn),
+            kind: HistoryKind::Overwrite,
+        };
+        let claim = Refinement::born(std::rc::Rc::new(TypedExpr::lit(crate::ccl::Lit::Bool(
+            true,
+        ))));
+        let on_the_handle =
+            |t: Type| Type::Refinement(Box::new(t), Refinement::sharing(&claim.predicate));
+
+        for (read, now) in [
+            // handle vs its read view: the refined value sits one layer deeper.
+            (register(refined.clone()), refined.clone()),
+            (refined.clone(), register(refined.clone())),
+            // a claim on the handle is transparent, on either side.
+            (on_the_handle(register(refined.clone())), refined.clone()),
+            (
+                on_the_handle(register(refined.clone())),
+                register(refined.clone()),
+            ),
+        ] {
+            assert!(
+                types_agree_modulo_unread(&read, &now, true),
+                "a handle is transparent to the read it stands for ({read} vs {now})"
+            );
+        }
+
+        // Drift *behind* the handle is still drift, and the two kinds still never
+        // agree — reading through must not have relaxed either.
+        assert!(!types_agree_modulo_unread(
+            &register(refined.clone()),
+            &register(Type::Base(BaseType::Int)),
+            true
+        ));
+        assert!(!types_agree_modulo_unread(
+            &register(refined.clone()),
+            &Type::History {
+                value: Box::new(refined),
+                domain: Box::new(Type::Txn),
+                kind: HistoryKind::Append,
+            },
+            true
         ));
     }
 

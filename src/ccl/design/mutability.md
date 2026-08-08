@@ -228,6 +228,14 @@ Typing:
   parameter) receives the handle. After inlining, no `Mut`-expecting positions remain, so the
   phase's rewrite is purely structural — every surviving `Mut`-typed occurrence is a write target
   or a read, decided by context.
+- **A read derefs the constraint, not the node.** The deref decides what an operand is
+  *constrained against*; the operand's own type slot keeps `Mut(𝑉, 𝐷)`, because that stamp is
+  how the phase finds the read in the first place. So the parameter a register was passed to
+  holds 𝑉 while the argument node holds the handle, and a later pass comparing the two is
+  comparing types at different levels unless it reads through the handle itself. `inline`'s
+  refinement-entailment check is where that bites: an unwritten register's value type is still
+  its seed's singleton, so a parameter left to inference acquires a refinement — one the
+  argument does establish, but of the value it denotes rather than of the handle.
 - A parameter `Mut(Int)` means `Mut(Int, _)`; the domain instantiates per call site through the
   let-generalization of UDF bindings. Whether a write site requires `Txn` is the phase's structural
   check, post-inline — so one `bump` can serve an induction accumulator and a transactional
