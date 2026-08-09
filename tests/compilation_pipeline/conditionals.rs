@@ -593,67 +593,144 @@ fn a_conditional_source_compiles_however_it_reaches_the_generator(
     check_scalar(code, expected);
 }
 
-/// **A comprehension filter over a conditional source has no restrict yet.** This program
-/// fails to compile — `extent_of` rejects the witness by name — where 5 is correct. It used
-/// to return 6, the unfiltered sum of the `else` arm, which is the worse failure of the two;
-/// `sum_wide_restriction` now keeps `planning::iterate` from skipping a site whose sum still
-/// owes a restriction, so the loss is loud.
+/// **A comprehension filter over a conditional source is never emitted.**
 ///
-/// Inference is *right*: the restriction distributes onto the candidates, exactly as
-/// `src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness" says it must, and
-/// the comprehension types as
-/// `Σ 𝜎 ∈ {{[0, 1] | 𝑝}, {[0, 2] | 𝑝}}. (𝜎 ⤇ Int)`.
-/// What is missing is downstream, and the site is
-/// `planning::iterate`'s undetermined-witness guard. The comprehension node is
-/// `cast(realize(…))`: `Realize` asserts the *pre*-realization type so nothing above it has
-/// to change, so this node still advertises the Σ even though the source underneath is
-/// already a realized tagged union. Reading `expr.ty.domain()` on a sum yields its **witness**,
-/// the guard sees a free witness and returns, and the restrict is never emitted — the
-/// filter lives on the *candidates*, which `domain()` does not look at.
+/// The conditional is not what breaks. The same programs with a single `box` and no `Case`
+/// at all fail the same way (`sums.rs`, `a_filter_over_a_boxed_source_is_dropped`) — one
+/// candidate, one filter, dropped. What these cases add is the *multi-candidate* half: the
+/// filter must reach an iteration source that has since become a union of gated legs.
 ///
-/// Narrowing the guard to "unless the candidates are refined" does not work: an arm that is
-/// itself a filtered comprehension (`box([x for x in xs if p]) if c else …`) refines a
-/// candidate too, and there the restrict already exists inside the arm
-/// (`test_value_case_arms_sharing_a_domain_base` covers it, and breaks under that
-/// narrowing). `sum_wide_restriction` is the test that does work — a refinement on *every*
-/// candidate is one applied to the sum, the distributive law read backwards.
+/// Inference is *right* throughout. The restriction rides the witness, exactly as
+/// `src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness" says it must,
+/// so the comprehension types as
+/// `Σ 𝜎 ∈ {[0, 1], [0, 2]}. ({𝜎 | 𝑝} ⤇ Int)`.
+/// What is missing is downstream, in `planning::iterate::wrap_with_iterate`: the site's
+/// domain is a refined **witness**, and a witness has no extent, so the ordinary
+/// iterate-then-restricts chain has no source to build on. Planning refuses rather than
+/// dropping the restriction, so these fail to compile instead of computing the unfiltered
+/// answer.
 ///
-/// **Where it stands.** The site after realization is
-/// `cast(realize(iterate ▷ (𝑔₀ ▷ const ▷ restrict) ≫ [1, 2]  ⊎  iterate ▷ (𝑔₁ ▷ …) ≫ [1, 2, 3]))`,
-/// and the restriction has to reach the union's *operands*: each is already an iteration
-/// source over `{𝐷ᵢ | 𝑔ᵢ}`, so one more `restrict` per operand is the executable form of the
-/// distribution the type level performs.
+/// The site after realization is
+/// `cast(realize(iterate ▷ (𝑔₀ ▷ const ▷ restrict) ≫ [1, 2]  ⊎  iterate ▷ (𝑔₁ ▷ …) ≫ [1, 2, 3]))`
+/// — `Realize` asserts the *pre*-realization type so nothing above it has to change, which is
+/// why this node still advertises the Σ although the source beneath it is already a tagged
+/// union.
 ///
-/// The obstacle is the predicate's **source**. A filter's predicate reads the collection at
-/// the index (`__elem ▷ src ▷ 𝑓` — the plain case does this too), and here `src` is the
-/// whole conditional. Under operand `𝑖` the index ranges over `𝐷ᵢ`, so the predicate must
-/// read *that arm*, not the conditional: `__elem ▷ armᵢ ▷ 𝑓`. Sound, because operand `𝑖` is
-/// gated by `𝑔ᵢ` and `src ≡ armᵢ` there.
+/// **The obstacle is the predicate's source.** A filter's predicate reads the collection at
+/// the index (`__elem ▷ src ▷ 𝑓` — the plain case does this too), and here `src` is the whole
+/// conditional. Under leg `𝑖` the index ranges over `𝐷ᵢ`, so a per-leg restrict needs the
+/// predicate to read *that arm*: `__elem ▷ armᵢ ▷ 𝑓`. Realizing the predicate's source
+/// instead was tried and is wrong — `realize(union)`'s domain is the tagged union while
+/// `__elem` stays `𝐷ᵢ`, which desynchronizes the predicate from its own refinement base.
 ///
-/// Realizing the predicate's source instead is **wrong**, and measurably so — it was tried.
-/// `realize(union)`'s domain is the tagged tagged union while `__elem` stays `𝐷ᵢ`, so applying
-/// one to the other desynchronizes the predicate from its own refinement base, and Σ-width's
-/// pairing discharge then rejects candidate lists that print identically.
-///
-/// So the open question is how to obtain the per-arm predicate: substitute `armᵢ` for the
-/// source inside the stored predicate term, or rebuild it from `armᵢ` and the element
-/// predicate `𝑓` — which needs `𝑓` recoverable from the composed `__elem ▷ src ▷ 𝑓` form.
-///
-/// **A wrong answer, not a failure**, which is the worse outcome of the two: before the
-/// source-`Case` float was retired this shape did not compile at all (the float declined a
-/// filtered comprehension, and the general path could not yet name the witness). Making the
-/// general path work turned a compile error into a quiet miscomputation. A guard that
-/// refuses rather than drops belongs here until the restrict is emitted.
-#[test]
-#[ignore = "the sum-wide restriction needs emitting as a gate *per realized leg*, not \
-            as one restrict over the union; measured 2026-08-08"]
-fn a_filter_over_a_conditional_source_is_dropped() {
-    check_scalar(
-        r"
+/// **A wrong answer, not a failure**, in the cases that reach the runtime: the unfiltered sum
+/// of whichever arm was taken. A silent miscomputation is the worse of the two outcomes, and
+/// which one a program gets turns on nothing it can see (a let-bound source computes, an
+/// inline one fails at op-conversion).
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+// Both arms of the two-candidate sum. Only the `else` arm was pinned before, which cannot
+// distinguish a rule that reads the candidate list positionally.
+#[case(
+    r"
+c: Bool = True
+sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
+    Value::Int(2)
+)]
+#[case(
+    r"
 c: Bool = False
 sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
-        Value::Int(5),
-    );
+    Value::Int(5)
+)]
+// A mapping body: the identity comprehension simplifies to a bare `cast`, so it alone would
+// not exercise the composed form.
+#[case(
+    r"
+c: Bool = False
+sum([y * 10 for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
+    Value::Int(50)
+)]
+// How the conditional reaches the generator — the same three routes
+// `a_conditional_source_compiles_however_it_reaches_the_generator` pins unfiltered.
+#[case(
+    r"
+c: Bool = False
+x = box([1, 2]) if c else box([1, 2, 3])
+sum([y for y in x if y > 1])",
+    Value::Int(5)
+)]
+#[case(
+    r"
+def f(xs):
+    sum([y for y in xs if y > 1])
+c: Bool = False
+f(box([1, 2]) if c else box([1, 2, 3]))",
+    Value::Int(5)
+)]
+#[case(
+    r"
+c: Bool = False
+sum([y for y in (box([x for x in [1, 2]]) if c else box([x for x in [1, 2, 3]])) if y > 1])",
+    Value::Int(5)
+)]
+// Three arms: more legs than the two the union shape is usually reasoned about with.
+#[case(
+    r"
+n: Int = 2
+sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3])) if y > 1])",
+    Value::Int(4)
+)]
+#[case(
+    r"
+n: Int = 3
+sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3])) if y > 1])",
+    Value::Int(9)
+)]
+// ...including one whose selected arm the filter empties.
+#[case(
+    r"
+n: Int = 1
+sum([y for y in (box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3])) if y > 1])",
+    Value::Int(0)
+)]
+// **Same-domain arms**: two legs, but the sum collapses to *one* candidate, so this sits
+// between the single-`box` shape and the two-candidate one — a filter that must reach two
+// legs through a sum that no longer distinguishes them. Both predicates discriminate; an
+// unfiltered answer would be 6 and 7.
+#[case(
+    r"
+c: Bool = True
+sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 2])",
+    Value::Int(5)
+)]
+#[case(
+    r"
+c: Bool = False
+sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 3])",
+    Value::Int(4)
+)]
+// Two consumers of one conditional, each with its own filter: the restrictions belong to the
+// sites, not to the value they share.
+#[case(
+    r"
+c: Bool = False
+x = box([1, 2]) if c else box([1, 2, 3])
+sum([y for y in x if y > 1]) + sum([z for z in x if z > 2])",
+    Value::Int(8)
+)]
+// ...and a filtered consumer beside an unfiltered one, which compiles today.
+#[case(
+    r"
+c: Bool = False
+x = box([1, 2]) if c else box([1, 2, 3])
+sum([y for y in x]) + sum([z for z in x if z > 1])",
+    Value::Int(11)
+)]
+#[ignore = "a filter over a summed source is never emitted; the conditional adds legs to \
+            reach but is not the cause — see sums.rs; measured 2026-08-08"]
+fn a_filter_over_a_conditional_source_is_dropped(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
 
 // A conditional *between* two standalone comprehensions

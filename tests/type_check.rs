@@ -1905,27 +1905,34 @@ x = [1, 2] if c else [3, 4]
         .to_string(),
         "Σ σ ∈ {[0, 1], [0, 2], [0, 3]}. (σ ⤇ Int)"
     );
-    // A filtered comprehension is domain-preserving too. Its restriction applies to
-    // whichever arm the witness took, so it distributes onto **each candidate** rather than
-    // sitting on the sum — a refinement belongs to a candidate, never to the sum.
+    // A filtered comprehension is domain-preserving too, and its restriction rides the
+    // **witness**: the filter is a fact about the domain the witness names, whichever
+    // candidate that turns out to be. The candidates stay bare.
+    //
+    // Not on the candidates, which is where it used to land. An arm's *own* filter
+    // (`box([x for x in xs if q]) if c else …`) refines a candidate as well, and that one
+    // was already compiled inside the arm — so in that position the two are the same
+    // shape, and no consumer can tell a filter it still owes an operator from one already
+    // discharged. A single candidate can carry both at once, so comparing candidates
+    // cannot recover the distinction either. On the witness it is structural.
     let filtered = infer_program(&format!("{c}[y for y in x if y > 1]"));
     let Type::Sigma(s) = &filtered else {
         panic!("a filtered conditional collection is still a sum, got {filtered}");
     };
-    let candidates = s
-        .kind()
-        .listed()
-        .expect("an enumerated kind lists its domains");
-    assert_eq!(candidates.len(), 2, "expected both arms, got {filtered}");
-    for (candidate, base) in candidates
-        .iter()
-        .zip([Type::UIntRange(2), Type::UIntRange(3)])
-    {
-        assert!(
-            matches!(candidate, Type::Refinement(b, _) if **b == base),
-            "each candidate carries the restriction over its own domain, got {filtered}"
-        );
-    }
+    assert_eq!(
+        s.kind()
+            .listed()
+            .expect("an enumerated kind lists its domains"),
+        [Type::UIntRange(2), Type::UIntRange(3)],
+        "the candidates carry no restriction, got {filtered}"
+    );
+    let Type::Fun { domain, .. } = &*s.body else {
+        panic!("a consumed collection sum has a data-function body, got {filtered}");
+    };
+    assert!(
+        matches!(&**domain, Type::Refinement(b, _) if matches!(**b, Type::WitnessRef(_))),
+        "the restriction rides the witness, got {filtered}"
+    );
     // And a collapsing consumer wrapping a domain-preserving one collapses the sum.
     assert_eq!(infer_program(&format!("{c}sum([y + 1 for y in x])")), int());
 }

@@ -171,7 +171,7 @@ column names the branch that *will* land it.
 | `List` **entry** with an *inferred* domain, as a kinding constraint on the domain variable ([`InferBounds::kinds`]) | Implemented | `collections-design` |
 | the Σ-width **pairing search** `∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁` over ground candidates, codomain edge emitted once ([`KindObligations::pairing`]) | Implemented | `collections-design` |
 | a data-function join keeps its **candidates** — alternatives accumulate at either polarity, demands still narrow ([`CompactFun::merge`]) | Implemented — this is the *implicit* formation `box` replaces | `collections-design` |
-| Consuming a sum at a **domain-preserving** consumer, in any constraint order — a variable's collection-shaped lower bounds denote the sum, so the join is read when its outgoing edge is drawn; a restriction distributes over the candidates | Implemented | `collections-design` |
+| Consuming a sum at a **domain-preserving** consumer, in any constraint order — a variable's collection-shaped lower bounds denote the sum, so the join is read when its outgoing edge is drawn; a restriction rides the witness | Implemented | `collections-design` |
 | a sum's **candidates** as an invariant position (two-way extrusion proxies), so an arm whose domain is *inferred* — any comprehension arm — joins like a written one | Implemented | `collections-design` |
 | a use of a **lambda parameter** falling back to the parameter slot where the bare read has no answer, so a **UDF-call** arm joins through the bound graph | Implemented | `collections-design` |
 | `Collection(𝑇)` (`TypeKind::Any`): its own term, consumption, width-to-top from every *sum* kind (⊤ absorbs structurally; a bare `𝐷 ⤇ 𝑉` is not below it) | Planned | `collection-constructors` |

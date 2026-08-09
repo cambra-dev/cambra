@@ -1891,11 +1891,27 @@ the candidate list as a spurious extra candidate the next time that result was j
 isomorphism is performed where it is a *construction* — realization, in planning — and
 nothing at the consuming edge needs the tags.
 
-A **restriction** carried alongside a consumed sum distributes over the candidates rather than
-staying at the position: `[y for y in x if 𝑝]` over a conditional collection filters whichever
-arm the witness took, so the result is `Σ 𝐷 ∈ {{𝐷₀ | 𝑝}, {𝐷₁ | 𝑝}}. 𝐷 ⤇ 𝑊`. Left at the position it
-would read as a refined *sum type* standing as a domain, which is not a domain — and a
-refinement belongs to a candidate, never to the sum.
+A **restriction** carried alongside a consumed sum rides the **witness**, not the candidates:
+`[y for y in x if 𝑝]` over a conditional collection filters whichever arm the witness took, so
+the result is `Σ 𝐷 ∈ {𝐷₀, 𝐷₁}. {𝐷 | 𝑝} ⤇ 𝑊`. That is what the consuming rule above already
+gives — the consumer is typed under a name for the witness, and a filter maps `𝑤 ⤇ 𝑉` to
+`{𝑤 | 𝑝} ⤇ 𝑉` — so no separate step is needed to put it there.
+
+What it must *not* be is a refined **sum**, `{Σ 𝐷 ∈ 𝐾. 𝐷 | 𝑝}` standing where a domain
+belongs: a sum is not a domain. A refined *witness* is a different thing and is one, since
+naming the witness is exactly what supplies a domain to refine.
+
+Pushing it onto the candidates instead — `Σ 𝐷 ∈ {{𝐷₀ | 𝑝}, {𝐷₁ | 𝑝}}. 𝐷` — is sound as a type
+and destroys a distinction the consumer needs. An **arm's own** filter refines a candidate
+too (`box([x for x in xs if 𝑞]) if c else …`), and that one was already compiled inside the
+arm; landed in the same position the two are the same shape, and nothing downstream can tell
+a restriction still owed an operator from one already discharged. Nor can they be separated
+by comparing candidates afterwards, because a single candidate can carry both at once. On the
+witness the distinction is structural: candidates carry what the arms brought, the witness
+carries what the consumer imposed.
+
+The distributive law still holds — instantiating the witness at a candidate pushes `𝑝` inward
+— it is simply not the normal form.
 
 ### Consuming a sum: naming the witness
 

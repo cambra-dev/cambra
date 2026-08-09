@@ -1069,41 +1069,6 @@ fn free_witness_kind(
     }
 }
 
-/// `domain` with `restriction` pushed onto every candidate.
-///
-/// A restriction belongs on the candidates, not at the position: left where it was
-/// written it would read as a refined *sum type* standing as a domain, and a sum is not
-/// a domain (`src/ccl/design/type-inference.md`, "A variable's lower bounds are one
-/// value").
-fn restrict_candidates(
-    domain: &CompactWitnessKind,
-    restriction: &[Refinement],
-) -> CompactWitnessKind {
-    if restriction.is_empty() {
-        return domain.clone();
-    }
-    match domain {
-        CompactWitnessKind::Enumerated(candidates) => CompactWitnessKind::enumerated(
-            candidates
-                .iter()
-                .map(|c| {
-                    let mut c = c.clone();
-                    for r in restriction {
-                        if !c.refinements.contains(r) {
-                            c.refinements.push(r.clone());
-                        }
-                    }
-                    c
-                })
-                .collect(),
-        ),
-        // A described kind lists no candidates to restrict. Its domains are characterized
-        // rather than enumerated, so there is nothing here to attach the restriction to
-        // and it stays at the position.
-        CompactWitnessKind::Described(_) => domain.clone(),
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactType {
     /// Variable contributions from this position. Multiple variables
@@ -1788,12 +1753,29 @@ fn compact_go(
                     // one the consuming rule named.
                     sigma: Some(CompactSigma::closing(
                         binder,
-                        restrict_candidates(&kind, &restriction),
+                        kind,
                         CompactType {
                             fun: Some(CompactFun {
                                 name: name.clone(),
                                 kind: KindMerge::Data,
-                                domain: Box::new(CompactType::from_atom(AtomKey::Witness(binder))),
+                                // **The restriction rides the witness occurrence**, not the
+                                // candidates. A consumer's filter is a fact about the domain
+                                // the witness names — whichever candidate that turns out to
+                                // be — so `{𝑤 | 𝑝}` is where it belongs, and it stays an
+                                // ordinary refinement layer over an ordinary domain.
+                                //
+                                // Pushing it onto the candidates instead destroys the one
+                                // distinction a consumer of this type needs. An **arm's own**
+                                // filter refines a candidate too, and that one was already
+                                // compiled inside the arm; landed in the same position the two
+                                // become indistinguishable, and separating them again means
+                                // comparing candidates and guessing. That cannot work — one
+                                // candidate can carry both at once
+                                // (`tests/compilation_pipeline/sums.rs`).
+                                domain: Box::new(CompactType {
+                                    refinements: restriction,
+                                    ..CompactType::from_atom(AtomKey::Witness(binder))
+                                }),
                                 codomain: Box::new(cod),
                             }),
                             ..CompactType::default()
