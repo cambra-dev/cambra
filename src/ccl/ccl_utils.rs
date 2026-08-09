@@ -291,10 +291,38 @@ pub(crate) fn debug_assert_no_iteration_markers_in_type(ty: &Type) {
                 "iteration/restrict marker leaked into a refinement predicate: {}",
                 crate::ccl::symbolic::symbolic(&r.predicate)
             );
+            debug_assert!(
+                !expr_needs_iteration(&r.predicate),
+                "a source that must be *iterated* reached a refinement predicate: {}\n\
+                 A predicate looks its collection up at an index; it never sweeps one, and \
+                 it may carry no `iterate`/`restrict` to sweep with. Realizing a conditional \
+                 source inside a predicate produces exactly this — a gated union whose legs \
+                 need the markers the assertion above forbids — and op-conversion then \
+                 compiles one leg and silently answers from the wrong arm. The predicate has \
+                 to name a *plain* collection: under leg i the conditional is `arm i`, so \
+                 substitute it.",
+                crate::ccl::symbolic::symbolic(&r.predicate)
+            );
         }
         ty.walk_children(go);
     }
     go(ty);
+}
+
+/// Whether `e` contains a collection that op-conversion could only compile by **iterating**
+/// it — a realized conditional (`Realize`) or a union of collections.
+///
+/// The complement of [`debug_assert_no_iteration_markers_in_type`]'s own check, and the half
+/// it could not see. That one catches a marker that *leaked in*; this catches a term that
+/// would *need* one. Both say the same thing about a predicate — it is denotational — and
+/// only together do they close the gap, since a term needing iteration and carrying no
+/// marker passes the first check and miscompiles.
+#[cfg(debug_assertions)]
+fn expr_needs_iteration(e: &Expr) -> bool {
+    matches!(
+        e.node,
+        TypedExprNode::Realize(_) | TypedExprNode::CollectionUnion(_)
+    ) || e.fold_children(false, |acc, c| acc || expr_needs_iteration(c))
 }
 
 /// Whether `e` applies `b` as its function (`Apply { function: Builtin(b) }`).
@@ -1322,6 +1350,40 @@ where
 mod tests {
     use super::*;
     use crate::ccl::ty::{SigmaType, TypeKind};
+
+    /// **A realized conditional inside a predicate is caught at the planning wall.**
+    ///
+    /// A predicate looks its collection up at an index; it never sweeps one, and it may
+    /// carry no `iterate`/`restrict` to sweep with. Realizing a conditional source inside a
+    /// predicate produces exactly the forbidden thing — a gated union whose legs need those
+    /// markers — and the marker check alone cannot see it, because the union arrives with
+    /// *no* markers at all. Without this the failure is a wrong arm at runtime, four passes
+    /// downstream.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must be *iterated* reached a refinement predicate")]
+    fn a_source_needing_iteration_in_a_predicate_is_caught() {
+        let arm = |n| {
+            Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(Type::data_fun(
+                Type::UIntRange(n),
+                Type::Base(BaseType::Int),
+            ))
+        };
+        let realized = Expr::new(TypedExprNode::Realize(Box::new(
+            Expr::new(TypedExprNode::CollectionUnion(vec![arm(2), arm(3)])).with_ty(
+                Type::data_fun(Type::UIntRange(2), Type::Base(BaseType::Int)),
+            ),
+        )))
+        .with_ty(Type::data_fun(
+            Type::UIntRange(2),
+            Type::Base(BaseType::Int),
+        ));
+        let ty = Type::Refinement(
+            Box::new(Type::UIntRange(2)),
+            Refinement::born(Rc::new(realized)),
+        );
+        debug_assert_no_iteration_markers_in_type(&ty);
+    }
 
     /// `{[0, 2] | __elem}` — a refined range. The predicate's content is irrelevant
     /// here; only that the two sides carry *different* ones.
