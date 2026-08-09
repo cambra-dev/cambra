@@ -733,8 +733,9 @@ struct CompactState {
 /// (`src/ccl/infer/solver/spec_key.rs`) traverses `Type` in lockstep with this
 /// function: the same polarity flip on a `Fun` domain, the same no-flip on
 /// `History` children, the same `then(edge_subst, subst_acc)` composition at a
-/// bound edge, the same binder shadowing for a Pi codomain, the same
-/// `(uid, pol)` cycle guard. That agreement *is* the soundness argument for a
+/// bound edge, the same `(uid, pol)` cycle guard. (The Pi-binder canonicalization
+/// they also share is no longer duplicated — both call
+/// [`Subst::canonical_pi_binder`], which owns that rule.) That agreement *is* the soundness argument for a
 /// specialization key: a bound the key cannot see is one the clone's own
 /// resolution cannot see either, because the clone resolves through this walk
 /// over the same edges from the same side. Nothing enforces it, so a new `Type`
@@ -823,28 +824,11 @@ fn compact_go(
             // span only one variable's bound chain, not across
             // function boundaries.
             let dom = compact_go(d, !pol, subst_acc, &BTreeSet::new(), st, pi_depth);
-            // **Canonical Pi binders**: the binder is renamed to the reserved
-            // depth-indexed name (`Name::pi`), and the rename rides the
-            // accumulated substitution so every predicate reference inside
-            // the codomain is rewritten as it lands (the same force that
-            // discharges dependent applications). This is `__elem`'s move
-            // applied to arrows: one shared name per position means
-            // α-variant bounds compact to *identical* shapes — they merge,
-            // their refinement copies dedup instead of accumulating a
-            // dangling twin, and every identity built on the flattened form
-            // (`SpecKey`, equality walls, caches) is α-insensitive. The
-            // rename also shadows any outer mapping of the source binder,
-            // which is what the previous `shadow(b)` was for.
-            let (name, cod_acc) = match name {
-                Some(b) => {
-                    let canon = Name::pi(pi_depth);
-                    (
-                        Some(canon.clone()),
-                        subst_acc.extended_rename(b.clone(), canon),
-                    )
-                }
-                None => (None, subst_acc.clone()),
-            };
+            // Canonical Pi binders (`Subst::canonical_pi_binder`, which states
+            // the rule and why the three walks applying it must agree). The
+            // rename also shadows any outer mapping of the source binder, which
+            // is what the previous `shadow(b)` was for.
+            let (name, cod_acc) = subst_acc.canonical_pi_binder(name, pi_depth);
             let cod = compact_go(c, pol, &cod_acc, &BTreeSet::new(), st, pi_depth + 1);
             CompactType {
                 fun: Some(CompactFun {
