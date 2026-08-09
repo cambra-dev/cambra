@@ -184,7 +184,7 @@ fn edit(rng: &mut Rng, t: &Type) -> Type {
 
 /// `__elem == <name>` — the dependent-refinement predicate shape, aimed at
 /// a specific Pi binder.
-fn dep_pred(name: &str) -> Rc<TypedExpr> {
+pub(super) fn dep_pred(name: &str) -> Rc<TypedExpr> {
     Rc::new(TypedExpr::binop(
         TypedExpr::var(Name::elem()),
         BinOpKind::Compare(CompareKind::Equals),
