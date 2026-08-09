@@ -293,7 +293,7 @@ pub(super) fn lit_base(lit: &Lit) -> Type {
 /// literal takes [`lit_base`] — refining *it* too would not terminate.
 pub fn lit_singleton(lit: &Lit) -> Type {
     match singleton_predicate(lit) {
-        Some(predicate) => Type::Refinement(Box::new(lit_base(lit)), Refinement::born(predicate)),
+        Some(predicate) => Type::refined_one(lit_base(lit), Refinement::born(predicate)),
         None => lit_base(lit),
     }
 }
@@ -460,10 +460,7 @@ pub(crate) mod test_helpers {
             BinOpKind::Compare(CompareKind::Greater),
             rhs,
         );
-        Type::Refinement(
-            Box::new(Type::Base(BaseType::Int)),
-            Refinement::born(Rc::new(pred)),
-        )
+        Type::refined_one(Type::Base(BaseType::Int), Refinement::born(Rc::new(pred)))
     }
 
     /// Walk `expr`, counting `Let` bindings minted by specialization (their

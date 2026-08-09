@@ -244,7 +244,7 @@ impl InferCtx {
             // inner (so a `Refinement(Hole, r)` source annotation becomes
             // `Refinement(?fresh, r)` rather than losing the refinement).
             Type::Refinement(inner, r) => {
-                Type::Refinement(Box::new(self.normalize_annotation(inner)), r.clone())
+                Type::refined(self.normalize_annotation(inner), r.clone())
             }
             // Structural types are already solver-ready; recurse to
             // normalize any nested holes/refinements.
@@ -313,7 +313,7 @@ impl InferCtx {
             // `unit`: a singleton adds nothing to a one-inhabitant base.
             return base;
         };
-        Type::Refinement(Box::new(base), Refinement::sharing(&predicate))
+        Type::refined_one(base, Refinement::sharing(&predicate))
     }
 
     /// Record one emission-time subtyping obligation, claiming whatever the solver

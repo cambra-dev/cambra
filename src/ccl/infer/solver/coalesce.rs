@@ -287,15 +287,8 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         }
     };
 
-    // Re-wrap the refinements carried at this position. `extent_of`
-    // strips refinements at every depth and composes the resulting
-    // `Restrict`s, so the wrap order is semantically irrelevant;
-    // first-insertion order in the `Vec` makes it stable.
-    let out = ct
-        .refinements
-        .iter()
-        .fold(inner, |acc, r| Type::Refinement(Box::new(acc), r.clone()));
-    Ok(out)
+    // Re-attach the claims carried at this position.
+    Ok(Type::refined(inner, ct.refinements.clone()))
 }
 
 /// Dissolve a position's feed `history_slot` into its other contributions when

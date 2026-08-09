@@ -21,7 +21,9 @@ use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, FunKindVar};
-use crate::ccl::{Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
+use crate::ccl::{
+    Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, RefinementSet, Type,
+};
 
 use super::type_level;
 use crate::ccl::FieldKey;
@@ -358,37 +360,52 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
 /// literally-same-domain demands, so subsumption failed to be transitive
 /// (see `differential.rs :: bridge_normalization_composes`).
 ///
-/// **At most one** gate layer is peeled per leg: a leg is either `{𝐷 | π̂ᵢ}`
-/// or bare `𝐷` (post-elimination rebuilds carry the gate in the term — a
-/// `filter_values` restrict — with the leg type equal to the domain
-/// outright). The gates are per-leg by construction (first-match predicates
-/// are mutually exclusive), so any refinement genuinely part of the domain
-/// sits *under* the gate and survives into the normal form; a
-/// set-intersection reading of "common refinements" would instead
-/// misclassify a single-leg partition's lone gate as domain.
-fn partition_domain(union_dom: &Type) -> Option<&Type> {
+/// A leg's claims are its **gate** plus whatever the shared domain already
+/// claimed, and the two are told apart by *agreement*: the gates are per-leg by
+/// construction (first-match predicates, mutually exclusive), so a claim every
+/// leg carries belongs to the domain and a claim only some carry is a gate.
+/// Hence the common claims are the **intersection** across legs, which must
+/// survive into the normal form — dropping them would normalize
+/// `⧺ᵢ{{𝐸 | 𝑝} | π̂ᵢ}` to `𝐸`, claiming the gates cover all of `𝐸` when they
+/// cover only its `𝑝`-satisfying part, and would let the collapse accept a
+/// demand for the whole of `𝐸`.
+///
+/// When the legs **all claim the same thing** nothing distinguishes gate from
+/// domain — the intersection is every leg's whole set — and the claims are
+/// taken as gate and peeled. That covers the lone leg (an unconditional arm,
+/// the fan-out's `else`) and its degenerate multi-leg twin under one rule. A
+/// leg may also be bare: post-elimination rebuilds carry the gate in the
+/// *term* (a `filter_values` restrict) with the leg type equal to the domain
+/// outright.
+fn partition_domain(union_dom: &Type) -> Option<Type> {
     let Type::Variant(tags) = union_dom else {
         return None;
     };
-    if tags.is_empty() {
-        return None;
-    }
+    let (first, rest) = tags.split_first()?;
     let mut common: Option<&Type> = None;
     for (i, (k, payload)) in tags.iter().enumerate() {
         if *k != FieldKey::Index(i) {
             return None;
         }
-        let under = match payload {
-            Type::Refinement(u, _gate) => &**u,
-            other => other,
-        };
+        let under = payload.peel_refinements();
         match common {
             None => common = Some(under),
             Some(c) if *c == *under => {}
             Some(_) => return None,
         }
     }
-    common
+    let base = common?.clone();
+    if rest.iter().all(|(_, p)| p.claims() == first.1.claims()) {
+        return Some(base);
+    }
+    let shared: RefinementSet = first
+        .1
+        .claims()
+        .iter()
+        .filter(|r| rest.iter().all(|(_, p)| p.claims().contains(r)))
+        .cloned()
+        .collect();
+    Some(Type::refined(base, shared))
 }
 
 /// The plain form of a partition-domained function
@@ -414,7 +431,7 @@ fn normalized_partition_fun(f: &Type) -> Option<Type> {
     Some(Type::Fun {
         name: name.clone(),
         kind: kind.clone(),
-        domain: Box::new(dnorm.clone()),
+        domain: Box::new(dnorm),
         codomain: codomain.clone(),
     })
 }
@@ -913,8 +930,8 @@ fn constrain_go(
         // refinement on a concrete value is an explicit `Restrict`, not
         // subsumption.
         (Type::Refinement(..), _) | (_, Type::Refinement(..)) => {
-            let (lbase, lrefs) = peel_refinements(lhs);
-            let (rbase, rrefs) = peel_refinements(rhs);
+            let (lbase, lrefs) = (lhs.peel_refinements(), lhs.claims());
+            let (rbase, rrefs) = (rhs.peel_refinements(), rhs.claims());
             // The refinements rhs requires that no transported lhs layer
             // matches (by `Refinement`'s structural `PartialEq`). Each side's
             // refinements are forced through its own morphism into the ambient frame
@@ -923,10 +940,10 @@ fn constrain_go(
             // carries `sr` for them.
             let lrefs_in_ambient: Vec<Refinement> =
                 lrefs.iter().map(|l| sl.force_refinement(l)).collect();
-            let deficit: Vec<&Refinement> = rrefs
+            let deficit: RefinementSet = rrefs
                 .iter()
-                .copied()
                 .filter(|r| !lrefs_in_ambient.contains(&sr.force_refinement(r)))
+                .cloned()
                 .collect();
             if deficit.is_empty() {
                 // lhs's explicit layers already supply every refinement rhs requires.
@@ -935,7 +952,7 @@ fn constrain_go(
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
                 // resolves to a concrete base lacking those refinements.
-                let demanded = wrap_refinements(rbase, &deficit);
+                let demanded = Type::refined(rbase.clone(), deficit);
                 constrain_go(lbase, &demanded, sl, sr, cache)
             } else {
                 Err(ConstrainError::Mismatch {
@@ -975,30 +992,6 @@ fn constrain_go(
             rhs: rhs.clone(),
         }),
     }
-}
-
-/// Peel all outer [`Type::Refinement`] layers, returning the bare base type
-/// and the refinements carried by the peeled layers (outermost first).
-fn peel_refinements(ty: &Type) -> (&Type, Vec<&Refinement>) {
-    let mut refs = Vec::new();
-    let mut cur = ty;
-    while let Type::Refinement(inner, r) = cur {
-        refs.push(r);
-        cur = inner;
-    }
-    (cur, refs)
-}
-
-/// Re-wrap `base` in the given [`Type::Refinement`] layers (passed
-/// outermost-first), preserving their order.
-///
-/// Used by [`constrain_subtype`]'s refinement arm to rebuild the deficit
-/// refinement `{rbase | S₂ \ S₁}` from the rhs's own layers, so the kept refinements
-/// retain their real [`crate::ccl::Refinement`] payloads (predicate `Rc`s).
-fn wrap_refinements(base: &Type, refs: &[&Refinement]) -> Type {
-    refs.iter().rev().fold(base.clone(), |acc, r| {
-        Type::Refinement(Box::new(acc), (*r).clone())
-    })
 }
 
 /// Lift `ty` so that all its variables live at level ≤ `target_level`.
@@ -1069,10 +1062,9 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 .map(|a| extrude(a, pol, target_level, cache))
                 .collect(),
         },
-        Type::Refinement(inner, r) => Type::Refinement(
-            Box::new(extrude(inner, pol, target_level, cache)),
-            r.clone(),
-        ),
+        Type::Refinement(inner, r) => {
+            Type::refined(extrude(inner, pol, target_level, cache), r.clone())
+        }
         // Invariant payload: polarity is meaningless under invariance, so
         // both children are extruded with two-way proxies (a history is read
         // *and* written) instead of the polar one-way approximation below.
@@ -1304,8 +1296,8 @@ mod tests {
         // (`Refinement: PartialEq`).
         use crate::ccl::{Lit, TypedExpr};
         let mk = || {
-            Type::Refinement(
-                Box::new(prim(BaseType::Int)),
+            Type::refined_one(
+                prim(BaseType::Int),
                 Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
             )
         };
@@ -1324,8 +1316,8 @@ mod tests {
         // not one of them.
         use crate::ccl::{Lit, TypedExpr};
         let refined_dom = || {
-            Type::Refinement(
-                Box::new(Type::UIntRange(3)),
+            Type::refined_one(
+                Type::UIntRange(3),
                 Refinement {
                     predicate: Rc::new(TypedExpr::lit(Lit::Bool(true))),
                 },
@@ -1410,8 +1402,8 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mk = || {
-            Type::Refinement(
-                Box::new(prim(BaseType::Int)),
+            Type::refined_one(
+                prim(BaseType::Int),
                 Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
             )
         };
@@ -1438,8 +1430,8 @@ mod tests {
         );
 
         // A structurally *different* predicate must not collapse into it.
-        let c = Type::Refinement(
-            Box::new(prim(BaseType::Int)),
+        let c = Type::refined_one(
+            prim(BaseType::Int),
             Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(false)))),
         );
         assert_ne!(a, c, "distinct predicates must stay distinct");
@@ -2016,8 +2008,8 @@ mod tests {
         let Type::Fun { domain, .. } = ty else {
             panic!("expected fun, got {ty}");
         };
-        let Type::Refinement(_, r) = domain.as_ref() else {
-            panic!("expected refined domain, got {domain}");
+        let [r] = domain.claims() else {
+            panic!("expected a singly-refined domain, got {domain}");
         };
         crate::ccl::symbolic::symbolic(&r.predicate)
     }
@@ -2036,10 +2028,7 @@ mod tests {
             "k",
             prim(BaseType::Int),
             Type::fun(
-                Type::Refinement(
-                    Box::new(prim(BaseType::Int)),
-                    gt_refinement(TypedExpr::var("k")),
-                ),
+                Type::refined_one(prim(BaseType::Int), gt_refinement(TypedExpr::var("k"))),
                 prim(BaseType::Int),
             ),
         );
@@ -2070,10 +2059,7 @@ mod tests {
             "k",
             prim(BaseType::Int),
             Type::fun(
-                Type::Refinement(
-                    Box::new(prim(BaseType::Int)),
-                    gt_refinement(TypedExpr::var("k")),
-                ),
+                Type::refined_one(prim(BaseType::Int), gt_refinement(TypedExpr::var("k"))),
                 prim(BaseType::Int),
             ),
         );
@@ -2106,10 +2092,7 @@ mod tests {
             "k",
             prim(BaseType::Int),
             Type::fun(
-                Type::Refinement(
-                    Box::new(prim(BaseType::Int)),
-                    gt_refinement(TypedExpr::var("k")),
-                ),
+                Type::refined_one(prim(BaseType::Int), gt_refinement(TypedExpr::var("k"))),
                 prim(BaseType::Int),
             ),
         )

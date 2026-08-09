@@ -104,10 +104,7 @@ pub(super) fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
             // With a Pi binder present, bias the codomain toward a dependent
             // refinement so the binder correspondence actually fires.
             let codomain = if name.is_some() && rng.chance(1, 2) {
-                Type::Refinement(
-                    Box::new(gen_ty(rng, depth - 1)),
-                    Refinement::born(gen_pred(rng)),
-                )
+                Type::refined_one(gen_ty(rng, depth - 1), Refinement::born(gen_pred(rng)))
             } else {
                 gen_ty(rng, depth - 1)
             };
@@ -143,10 +140,7 @@ pub(super) fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
             }
             Type::Variant(tags)
         }
-        _ => Type::Refinement(
-            Box::new(gen_ty(rng, depth - 1)),
-            Refinement::born(gen_pred(rng)),
-        ),
+        _ => Type::refined_one(gen_ty(rng, depth - 1), Refinement::born(gen_pred(rng))),
     }
 }
 
@@ -155,7 +149,7 @@ pub(super) fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
 fn edit(rng: &mut Rng, t: &Type) -> Type {
     match rng.below(4) {
         // Add a refinement layer (rhs gains a demand / lhs gains a supply).
-        0 => Type::Refinement(Box::new(t.clone()), Refinement::born(gen_pred(rng))),
+        0 => Type::refined_one(t.clone(), Refinement::born(gen_pred(rng))),
         // Peel a refinement layer if there is one.
         1 => match t {
             Type::Refinement(base, _) => (**base).clone(),
@@ -239,11 +233,11 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
             // rename correspondence — unless we deliberately misaim one.
             if rng.chance(1, 2) {
                 if let Some(bl) = nl {
-                    cl = Type::Refinement(Box::new(cl), Refinement::born(dep_pred(bl)));
+                    cl = Type::refined_one(cl, Refinement::born(dep_pred(bl)));
                 }
                 if let Some(br) = nr {
                     let target = if rng.chance(1, 5) { "z" } else { br };
-                    cr = Type::Refinement(Box::new(cr), Refinement::born(dep_pred(target)));
+                    cr = Type::refined_one(cr, Refinement::born(dep_pred(target)));
                 }
             }
             let fun = |n: Option<&str>, k: FunKind, d: Type, c: Type| Type::Fun {
@@ -314,15 +308,15 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
             } else {
                 Rc::clone(&pl)
             };
-            let mut l = Type::Refinement(Box::new(bl), Refinement::born(pl));
-            let mut r = Type::Refinement(Box::new(br), Refinement::born(pr));
+            let mut l = Type::refined_one(bl, Refinement::born(pl));
+            let mut r = Type::refined_one(br, Refinement::born(pr));
             // Occasionally give one side an extra layer — width on the
             // refinement *set*.
             if rng.chance(1, 4) {
-                l = Type::Refinement(Box::new(l), Refinement::born(gen_pred(rng)));
+                l = Type::refined_one(l, Refinement::born(gen_pred(rng)));
             }
             if rng.chance(1, 6) {
-                r = Type::Refinement(Box::new(r), Refinement::born(gen_pred(rng)));
+                r = Type::refined_one(r, Refinement::born(gen_pred(rng)));
             }
             (l, r)
         }
@@ -341,7 +335,7 @@ fn gen_bridge_pair(rng: &mut Rng) -> (Type, Type) {
     for i in 0..legs {
         let mut leg = d1.clone();
         for _ in 0..rng.below(3) {
-            leg = Type::Refinement(Box::new(leg), Refinement::born(gen_pred(rng)));
+            leg = Type::refined_one(leg, Refinement::born(gen_pred(rng)));
         }
         // Near-misses: a shifted index or a structurally different payload.
         let index = if rng.chance(1, 8) { i + 1 } else { i } as usize;
@@ -366,10 +360,10 @@ fn gen_bridge_pair(rng: &mut Rng) -> (Type, Type) {
     // the Pi correspondence, so α-equivalent pairs are the sharp case.
     if rng.chance(1, 2) {
         if let Some(Name::Raw(b)) = &nl {
-            c0 = Type::Refinement(Box::new(c0), Refinement::born(dep_pred(b)));
+            c0 = Type::refined_one(c0, Refinement::born(dep_pred(b)));
         }
         if let Some(Name::Raw(b)) = &nr {
-            c1 = Type::Refinement(Box::new(c1), Refinement::born(dep_pred(b)));
+            c1 = Type::refined_one(c1, Refinement::born(dep_pred(b)));
         }
     }
     let kr = if rng.chance(1, 2) {
@@ -422,7 +416,7 @@ fn partner(rng: &mut Rng, t: &Type) -> Type {
                 for i in 0..legs {
                     let mut leg = (**domain).clone();
                     for _ in 0..rng.below(2) {
-                        leg = Type::Refinement(Box::new(leg), Refinement::born(gen_pred(rng)));
+                        leg = Type::refined_one(leg, Refinement::born(gen_pred(rng)));
                     }
                     tags.push((FieldKey::Index(i as usize), leg));
                 }
@@ -573,10 +567,18 @@ fn ty_json(t: &Type) -> Option<String> {
                 .collect();
             format!(r#"{{"k":"variant","tags":[{}]}}"#, ts?.join(","))
         }
-        Type::Refinement(base, r) => format!(
+        // The model's `refined` node carries **one** predicate, so a
+        // multi-claim set has no faithful encoding: serializing it as nested
+        // single-predicate layers reads correctly to the subtype relation
+        // (which peels layers into a set) but *not* to partition collapse,
+        // whose `legUnder` peels one layer where `partition_domain` now takes
+        // the claims common to every leg. Refuse rather than mis-serialize —
+        // the emitter's standing contract — until the model's grammar carries
+        // a claim set too.
+        Type::Refinement(base, claims) => format!(
             r#"{{"k":"refined","base":{},"pred":{}}}"#,
             ty_json(base)?,
-            pred_json(&r.predicate)?
+            pred_json(&claims.sole()?.predicate)?
         ),
         _ => return None,
     })
@@ -615,8 +617,8 @@ fn bridge_normalization_composes() {
         ("a".to_string(), Type::Base(BaseType::Int)),
         ("b".to_string(), Type::Base(BaseType::Bool)),
     ]);
-    let gate = Type::Refinement(
-        Box::new(rec_a.clone()),
+    let gate = Type::refined_one(
+        rec_a.clone(),
         Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
     );
     let fun = |kind: FunKind, domain: Type| Type::Fun {
@@ -662,14 +664,14 @@ fn bridge_normalization_carries_pi_correspondence() {
         name: Some(Name::raw(binder)),
         kind: FunKind::Data,
         domain: Box::new(domain),
-        codomain: Box::new(Type::Refinement(
-            Box::new(Type::Base(BaseType::Int)),
+        codomain: Box::new(Type::refined_one(
+            Type::Base(BaseType::Int),
             Refinement::born(dep_pred(binder)),
         )),
     };
     let d1 = Type::UIntRange(3);
-    let gate = Type::Refinement(
-        Box::new(d1.clone()),
+    let gate = Type::refined_one(
+        d1.clone(),
         Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
     );
     let partition = Type::Variant(vec![(FieldKey::Index(0), gate)]);
@@ -776,6 +778,7 @@ fn differential_ground_subtype_vs_lean_model() {
 
     let mut rng = Rng::new(seed);
     let mut cases = Vec::with_capacity(n);
+    let mut unencodable = 0usize;
     while cases.len() < n {
         let (lhs, rhs) = match rng.below(8) {
             0 => {
@@ -791,7 +794,11 @@ fn differential_ground_subtype_vs_lean_model() {
             _ => gen_pair(&mut rng, 3),
         };
         let (Some(lj), Some(rj)) = (ty_json(&lhs), ty_json(&rhs)) else {
-            panic!("generator produced a type outside the ground wire schema: {lhs:?} / {rhs:?}");
+            // The only shape the generator produces that the wire schema
+            // cannot carry is a multi-claim refinement (see `ty_json`).
+            // Counted and reported, never silently dropped.
+            unencodable += 1;
+            continue;
         };
         let mut cache = ConstrainCache::new();
         let rust = constrain_subtype(&lhs, &rhs, &mut cache).is_ok();
@@ -833,7 +840,8 @@ fn differential_ground_subtype_vs_lean_model() {
 
     let accepted = cases.iter().filter(|(_, rust)| *rust).count();
     eprintln!(
-        "differential: {} cases (seed {seed}), rust accepted {accepted}, rejected {}",
+        "differential: {} cases (seed {seed}), rust accepted {accepted}, rejected {}, \
+         {unencodable} skipped as multi-claim refinements the model cannot yet carry",
         cases.len(),
         cases.len() - accepted
     );

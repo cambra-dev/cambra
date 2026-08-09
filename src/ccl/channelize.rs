@@ -833,7 +833,7 @@ fn refine_source_domain(source: &mut Expr, refinement: Refinement) {
         domain, codomain, ..
     } = &source.ty
     {
-        let refined_domain = Type::Refinement(domain.clone(), refinement);
+        let refined_domain = Type::refined_one((**domain).clone(), refinement);
         let codomain = (**codomain).clone();
         source.ty = Type::fun_like(&source.ty, refined_domain, codomain);
         return;
@@ -1647,10 +1647,10 @@ fn collect_free_vars(expr: &Expr, out: &mut HashSet<Name>) {
 /// as "no references"; callers run between passes when no predicate
 /// is being walked elsewhere, so the under-count is safe in practice.
 fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<Name>) {
-    if let Type::Refinement(_, refinement) = ty {
-        // Refinement predicates are themselves CCL expressions; recurse into
-        // them through `collect_free_vars` so their own type-position
-        // predicates and shadowing are handled consistently.
+    // Refinement predicates are themselves CCL expressions; recurse into them
+    // through `collect_free_vars` so their own type-position predicates and
+    // shadowing are handled consistently.
+    for refinement in ty.claims() {
         collect_free_vars(&refinement.predicate, out);
     }
     ty.walk_children(|child| collect_free_vars_in_type(child, out));
@@ -1871,31 +1871,14 @@ fn collection_union_type(feeds: &[Expr]) -> Type {
 /// `PartialEq`), and the skeletons must already agree — the caller's
 /// `debug_assert` states that invariant.
 fn join_refinements(a: &Type, b: &Type) -> Type {
-    let mut layers: Vec<Refinement> = Vec::new();
-    let mut cur = a;
-    while let Type::Refinement(inner, r) = cur {
-        if type_carries_refinement(b, r) {
-            layers.push(r.clone());
-        }
-        cur = inner;
-    }
-    // Innermost-first, so the outermost layer of `a` ends up outermost again.
-    layers
-        .into_iter()
-        .rev()
-        .fold(cur.clone(), |acc, r| Type::Refinement(Box::new(acc), r))
-}
-
-/// Whether `ty`'s own refinement layers include `refinement`.
-fn type_carries_refinement(ty: &Type, refinement: &Refinement) -> bool {
-    let mut cur = ty;
-    while let Type::Refinement(inner, r) = cur {
-        if r == refinement {
-            return true;
-        }
-        cur = inner;
-    }
-    false
+    Type::refined(
+        a.peel_refinements().clone(),
+        a.claims()
+            .iter()
+            .filter(|r| b.claims().contains(r))
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Peel outer `Refinement` wrappers off a type, returning the underlying type.
@@ -2534,12 +2517,7 @@ fn extract_for_defer(
                     let refined = if matches!(&pred.node, TypedExprNode::Lit(Lit::Bool(true))) {
                         unit_ty.clone()
                     } else {
-                        Type::Refinement(
-                            Box::new(unit_ty.clone()),
-                            Refinement {
-                                predicate: Rc::new(pred),
-                            },
-                        )
+                        Type::refined_one(unit_ty.clone(), Refinement::born(Rc::new(pred)))
                     };
                     for v in branch_feeds {
                         feeds.push(Expr::lambda("__unused", refined.clone(), v.clone()));
@@ -2846,7 +2824,7 @@ mod tests {
         let pred = var("outer_n");
         let refinement = Refinement::born(Rc::new(pred));
         let annotated = Expr::var(Name::raw("__chan")).with_user_annotation(Type::fun(
-            Type::Refinement(Box::new(Type::Hole), refinement),
+            Type::refined_one(Type::Hole, refinement),
             Type::Hole,
         ));
 
@@ -2872,7 +2850,7 @@ mod tests {
         let typed = Expr::lit(Lit::Unit).with_ty(Type::Fun {
             name: None,
             kind: crate::ccl::ty::FunKind::Compute,
-            domain: Box::new(Type::Refinement(Box::new(Type::Hole), refinement)),
+            domain: Box::new(Type::refined_one(Type::Hole, refinement)),
             codomain: Box::new(Type::Hole),
         });
         let mut free: HashSet<Name> = HashSet::new();

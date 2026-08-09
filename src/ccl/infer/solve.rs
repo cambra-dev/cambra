@@ -1257,15 +1257,17 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
         Type::Below(_) => {
             unreachable!("Type::Below reached the solver; `normalize_annotation` must erase it")
         }
-        Type::Refinement(inner, r) => {
+        Type::Refinement(inner, claims) => {
             // A handle clone, so `ctx` stays freely borrowable for the rebuild —
             // which re-enters this same memo through `coalesce_node` →
             // `coalesce_type_predicates`.
             let memo = ctx.pred_memo.clone();
-            memo.rebuild(r, &(), |pred| {
-                coalesce_node(pred, level, ctx);
-                true
-            });
+            for r in claims.iter_mut() {
+                memo.rebuild(r, &(), |pred| {
+                    coalesce_node(pred, level, ctx);
+                    true
+                });
+            }
             coalesce_type_predicates(inner, level, ctx);
         }
         Type::Fun {
@@ -1705,7 +1707,7 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
         .into_iter()
         .rev()
         .filter(|r| !input_refinements.contains(&r))
-        .fold(input.clone(), |acc, r| Type::Refinement(Box::new(acc), r));
+        .fold(input.clone(), Type::refined);
     lambda.ty = fn_layers.into_iter().rev().fold(
         // Preserve the Pi binder: specialization rewrites only the domain
         // *shape*; a dependent codomain still refers to the same binder.
@@ -1715,7 +1717,7 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
             domain: Box::new(new_dom),
             codomain: cod,
         },
-        |acc, r| Type::Refinement(Box::new(acc), r),
+        Type::refined,
     );
     // The param slot was derived from the pre-specialization domain during the
     // lambda's own `coalesce_node`; re-derive it from the rewritten one.
@@ -1798,8 +1800,7 @@ mod tests {
         let claim = Refinement::born(std::rc::Rc::new(TypedExpr::lit(crate::ccl::Lit::Bool(
             true,
         ))));
-        let on_the_handle =
-            |t: Type| Type::Refinement(Box::new(t), Refinement::sharing(&claim.predicate));
+        let on_the_handle = |t: Type| Type::refined_one(t, Refinement::sharing(&claim.predicate));
 
         for (read, now) in [
             // handle vs its read view: the refined value sits one layer deeper.

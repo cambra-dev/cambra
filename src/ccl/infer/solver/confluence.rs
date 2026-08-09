@@ -60,7 +60,7 @@ fn run(nvars: usize, specs: &[Spec], order: &[usize]) -> String {
     let mut coalesced = Vec::with_capacity(nvars);
     for v in &vars {
         match coalesce_compact(&simplify_type(compact_type(v))) {
-            Ok(t) => coalesced.push(format!("{}", sort_refinement_chains(&t))),
+            Ok(t) => coalesced.push(format!("{t}")),
             Err(_) => rejected = true,
         }
     }
@@ -69,55 +69,6 @@ fn run(nvars: usize, specs: &[Spec], order: &[usize]) -> String {
     } else {
         canonicalize(&format!("{coalesced:?}"))
     }
-}
-
-/// Quarantine for the one **known** order-dependence
-/// (`refinement_layer_order_depends_on_arrival_order` below): refinement
-/// layers stack in arrival order, so before comparing outcomes each
-/// refinement *chain* is re-sorted into a canonical order. Subtyping treats
-/// the layers as a set, so this normalizes exactly the semantically-invisible
-/// difference — any *other* divergence still fails the fuzz.
-fn sort_refinement_chains(t: &Type) -> Type {
-    use crate::ccl::Refinement;
-    fn peel(t: &Type) -> (&Type, Vec<&Refinement>) {
-        let mut refs = Vec::new();
-        let mut cur = t;
-        while let Type::Refinement(base, r) = cur {
-            refs.push(r);
-            cur = base;
-        }
-        (cur, refs)
-    }
-    let (base, mut refs) = peel(t);
-    let base = match base {
-        Type::Fun {
-            name,
-            kind,
-            domain,
-            codomain,
-        } => Type::Fun {
-            name: name.clone(),
-            kind: kind.clone(),
-            domain: Box::new(sort_refinement_chains(domain)),
-            codomain: Box::new(sort_refinement_chains(codomain)),
-        },
-        Type::Tuple(ts) => Type::Tuple(ts.iter().map(sort_refinement_chains).collect()),
-        Type::Record(fs) => Type::Record(
-            fs.iter()
-                .map(|(n, t)| (n.clone(), sort_refinement_chains(t)))
-                .collect(),
-        ),
-        Type::Variant(tags) => Type::Variant(
-            tags.iter()
-                .map(|(k, t)| (k.clone(), sort_refinement_chains(t)))
-                .collect(),
-        ),
-        other => other.clone(),
-    };
-    refs.sort_by_key(|r| crate::ccl::symbolic::symbolic(&r.predicate));
-    refs.iter()
-        .rev()
-        .fold(base, |acc, r| Type::Refinement(Box::new(acc), (*r).clone()))
 }
 
 /// Rename `?N` (inference vars) and `κN` (kind vars) in first-occurrence
@@ -229,37 +180,27 @@ fn shuffle(rng: &mut Rng, n: usize) -> Vec<usize> {
     order
 }
 
-/// **Finding, pinned: a coalesced type's refinement layers stack in
-/// constraint arrival order.** Two refined upper bounds meeting at one
-/// variable coalesce to `{{𝑇 | 𝑞} | 𝑝}` or `{{𝑇 | 𝑝} | 𝑞}` depending on
-/// which bound arrived first. Subtyping is indifferent (layers compare as a
-/// set in the deficit machinery), but `Type`'s derived `PartialEq` is
-/// order-sensitive, and structural equality is load-bearing where types are
-/// *identities*: the trivial-equality short-circuit, cache keys, and the
-/// recorded-vs-recomputed walls. (`SpecKey` compares refinement sets as
-/// sets and is not exposed to layer order; its α-variance exposure is
-/// `spec_key_splits_on_alpha_variant_dependent_types` below.)
+/// **Finding, repaired: a coalesced type's refinement claims are
+/// arrival-order-independent.** Two refined upper bounds meeting at one
+/// variable used to stack as `{{𝑇 | 𝑞} | 𝑝}` or `{{𝑇 | 𝑝} | 𝑞}` depending on
+/// which arrived first. Subtyping was always indifferent (the deficit
+/// machinery compares claims as a set), but `Type`'s equality was not, and
+/// structural equality is load-bearing where types are *identities*: the
+/// trivial-equality short-circuit, cache keys, and the recorded-vs-recomputed
+/// walls.
 ///
-/// **The obvious fix is wrong, which is the deeper finding.** Canonically
-/// sorting `CompactType::refinements` (tried and reverted) breaks join
-/// planning: planning reads the refinement chain *positionally* — the
-/// outermost layer drives which cast/restrict it materializes — so
-/// reordering changed what planning built (`comprehensions::case_6` grew a
-/// spurious `cast(cast(..))`). One `Vec` currently serves three
-/// incompatible views: a *set* to subtyping, a *stack* to planning, an
-/// *identity* to `SpecKey`/caches. The repair needs planning to stop
-/// depending on layer order (or the representation to carry acquisition
-/// order separately) before the order can be canonicalized. If this test
-/// starts failing, that landed — remove the `sort_refinement_chains`
-/// quarantine from the fuzz above.
+/// With [`RefinementSet`](crate::ccl::RefinementSet) the layers are one
+/// unordered set, so the two orders build the *same* type rather than two
+/// types a canonical sort could reconcile — which is why this asserts plain
+/// equality and the fuzz above needs no normalization.
 #[test]
-fn refinement_layer_order_depends_on_arrival_order() {
+fn refinement_claims_are_arrival_order_independent() {
     use crate::ccl::{Lit, Refinement, TypedExpr};
     use std::rc::Rc;
 
     let refined = |marker: i64| {
-        Type::Refinement(
-            Box::new(Type::Base(crate::ccl::BaseType::Int)),
+        Type::refined_one(
+            Type::Base(crate::ccl::BaseType::Int),
             Refinement::born(Rc::new(TypedExpr::lit(Lit::Int(marker)))),
         )
     };
@@ -272,14 +213,68 @@ fn refinement_layer_order_depends_on_arrival_order() {
     let (p, q) = (refined(1), refined(2));
     let a = coalesce_with_order(&p, &q);
     let b = coalesce_with_order(&q, &p);
-    assert_ne!(
-        a, b,
-        "layer order became arrival-independent — canonicalization landed; \
-         remove the fuzz quarantine"
+    assert_eq!(a, b, "refinement claims must not depend on arrival order");
+    // Both claims survived — the meet of two refined upper bounds carries each
+    // side's restriction, so this is a two-member set, not one order winning.
+    assert_eq!(a.claims().len(), 2, "expected both claims, got {a}");
+    // Rendering is order-stable too, so a diagnostic cannot leak the order.
+    assert_eq!(format!("{a}"), format!("{b}"));
+}
+
+/// **Finding, open: claim *dedup* is order-sensitive, because refinement
+/// equality distinguishes vintages that rendering does not.**
+///
+/// [`RefinementSet`](crate::ccl::RefinementSet) removes order from the
+/// representation, but two claims can be `eq`-**unequal** while denoting the
+/// same restriction to every reader that does not look at embedded `Cast`
+/// targets — the predicate *vintages* a dependent-application discharge mints
+/// (`𝑝(xs)`, `𝑝(cast(xs))`, …). `eq_refinement_predicate` deliberately
+/// compares a cast's target predicate, so two vintages do not dedup; which
+/// vintage a position ends up holding still depends on which arrived first.
+///
+/// Running the suite under `CAMBRA_REFINEMENT_ORDER=reverse` exhibits it: a
+/// claim set grows a second copy of one restriction, and a recorded type and
+/// its recomputation disagree while *rendering identically*. That is the
+/// canonical-discharge question (are two vintages the same refinement?), not
+/// an ordering mechanism — see `formal/design.md`. This test pins the
+/// mechanism directly, so it is a reproducible exhibit rather than a claim in
+/// a comment: two claims that render the same compare unequal, hence dedup
+/// cannot collapse them.
+#[test]
+fn vintage_claims_render_alike_but_do_not_dedup() {
+    use crate::ccl::{BaseType, Refinement, Type, TypedExpr, ccl_utils::make_cast};
+    use std::rc::Rc;
+
+    // Two casts of one value, differing *only* in their targets' domain
+    // refinement — the shape a discharge mints at two comprehension depths.
+    let vintage = |marker: i64| {
+        let target = crate::ccl::ccl_utils::refined_data_fun(
+            Type::Base(BaseType::Int),
+            TypedExpr::lit(crate::ccl::Lit::Int(marker)),
+            Type::Base(BaseType::Int),
+        );
+        // A resolved `ty` is what makes the rendering elide the target — the
+        // post-inference form, where the two vintages become indistinguishable.
+        Refinement::born(Rc::new(
+            make_cast(TypedExpr::lit(crate::ccl::Lit::Int(0)), target)
+                .with_ty(Type::Base(BaseType::Int)),
+        ))
+    };
+    let (a, b) = (vintage(1), vintage(2));
+    assert_eq!(
+        crate::ccl::symbolic::symbolic(&a.predicate),
+        crate::ccl::symbolic::symbolic(&b.predicate),
+        "the two vintages must be indistinguishable in the rendering"
     );
-    // The difference is exactly the layer order: canonically sorted, the
-    // two coalesce results agree.
-    assert_eq!(sort_refinement_chains(&a), sort_refinement_chains(&b));
+    assert_ne!(a, b, "cast-target predicates distinguish the two vintages");
+
+    // So a set holds both, and which one an equal-rendering position ends up
+    // carrying depends on arrival — the residue the representation change does
+    // not reach.
+    let mut set = crate::ccl::RefinementSet::new();
+    set.insert(a.clone());
+    set.insert(b.clone());
+    assert_eq!(set.len(), 2, "vintages do not dedup: {set:?}");
 }
 
 #[test]
@@ -350,8 +345,8 @@ fn spec_key_shares_alpha_variant_dependent_types() {
         name: Some(Name::raw(binder)),
         kind: FunKind::Data,
         domain: Box::new(Type::UIntRange(3)),
-        codomain: Box::new(Type::Refinement(
-            Box::new(Type::Base(crate::ccl::BaseType::Int)),
+        codomain: Box::new(Type::refined_one(
+            Type::Base(crate::ccl::BaseType::Int),
             Refinement::born(dep_pred(binder)),
         )),
     };
@@ -388,8 +383,8 @@ fn alpha_variant_bound_merge_is_canonical() {
         name: Some(Name::raw(binder)),
         kind: FunKind::Data,
         domain: Box::new(Type::UIntRange(3)),
-        codomain: Box::new(Type::Refinement(
-            Box::new(Type::Base(crate::ccl::BaseType::Int)),
+        codomain: Box::new(Type::refined_one(
+            Type::Base(crate::ccl::BaseType::Int),
             Refinement::born(dep_pred(binder)),
         )),
     };

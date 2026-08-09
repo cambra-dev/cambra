@@ -171,7 +171,7 @@ pub(crate) mod test_helpers {
     pub(crate) fn refined(base: Type, marker: i64) -> Type {
         use crate::ccl::{Lit, TypedExpr};
         let r = Refinement::born(Rc::new(TypedExpr::lit(Lit::Int(marker))));
-        Type::Refinement(Box::new(base), r)
+        Type::refined_one(base, r)
     }
 
     /// Helper: build a `Type::Variant({tag: payload, ...})` with named

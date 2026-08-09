@@ -342,7 +342,7 @@ fn strip_value_claims(ty: &Type, covariant: bool) -> Type {
             if covariant {
                 inner
             } else {
-                Type::Refinement(Box::new(inner), r.clone())
+                Type::refined(inner, r.clone())
             }
         }
         // Stripping claims re-views the same arrow, so the binder and the kind are
@@ -516,8 +516,8 @@ mod tests {
         // collection the operator can no longer iterate.
         let filtered_collection = |elem: Type| {
             Type::data_fun(
-                Type::Refinement(
-                    Box::new(Type::UIntRange(3)),
+                Type::refined_one(
+                    Type::UIntRange(3),
                     Refinement::born(
                         singleton_predicate(&Lit::Int(2)).expect("Int has a singleton"),
                     ),

@@ -678,8 +678,8 @@ groups(0)
     let Type::Fun { domain: dom, .. } = &ty else {
         panic!("expected a partition function type, got {ty}");
     };
-    let Type::Refinement(_, r) = &**dom else {
-        panic!("expected a refined partition domain, got {ty}");
+    let [r] = dom.claims() else {
+        panic!("expected a singly-refined partition domain, got {ty}");
     };
     let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
     assert!(
@@ -718,8 +718,8 @@ apply0(groups)
     let Type::Fun { domain: dom, .. } = &ty else {
         panic!("expected a partition function type, got {ty}");
     };
-    let Type::Refinement(_, r) = &**dom else {
-        panic!("expected a refined partition domain, got {ty}");
+    let [r] = dom.claims() else {
+        panic!("expected a singly-refined partition domain, got {ty}");
     };
     let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
     assert!(
