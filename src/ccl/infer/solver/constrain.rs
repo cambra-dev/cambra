@@ -26,7 +26,6 @@ use crate::ccl::{BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Refi
 use super::traits::{Trait, link_watches, notify_lower};
 use super::type_level;
 use crate::ccl::FieldKey;
-use crate::ccl::ccl_utils::strip_refinements;
 
 // ---------------------------------------------------------------------------
 // Constraint solver
@@ -344,26 +343,81 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
     );
 }
 
-/// Whether `union_dom` is a gated **partition** of the single domain `target`:
-/// a `Variant` with contiguous `Index(0..n)` tags (n ≥ 1) whose every payload,
-/// with its gate refinement stripped, is structurally `target` (also stripped).
-/// This is the shape lambda_elim's value-`Case` fan-out gives *same-domain* arms
-/// — the signature bridge rule 2 realizes as the plain data function
-/// `target ⤇ W`. Requiring the stripped payloads to equal `target` keeps a
-/// genuine heterogeneous `++` flowing into a fresh-var domain out of this rule
-/// (its legs differ, or the target is an unresolved var, so the ordinary
-/// contravariant arm applies).
-fn is_index_partition_of(union_dom: &Type, target: &Type) -> bool {
+/// The domain a gated **partition** normalizes to: a `Variant` with
+/// contiguous `Index(0..n)` tags (n ≥ 1) whose every payload is exactly one
+/// gate refinement over one shared domain — the shape lambda_elim's
+/// value-`Case` fan-out mints (`build_value_case_fanout`: each arm gated by
+/// its first-match predicate over the arms' common domain). Returns that
+/// common domain; `None` for anything shaped differently (heterogeneous
+/// `++`, ungated legs, gate stacks), which then takes the ordinary arms.
+///
+/// Detection is **target-independent** (unlike the retired
+/// `is_index_partition_of`, which compared stripped legs against the
+/// demand's domain): the partition *is* its plain form regardless of what it
+/// meets, and normalizing before comparing is what makes the collapse
+/// compose — the target-relative arm only connected a partition to
+/// literally-same-domain demands, so subsumption failed to be transitive
+/// (see `differential.rs :: bridge_normalization_composes`).
+///
+/// **At most one** gate layer is peeled per leg: a leg is either `{𝐷 | π̂ᵢ}`
+/// or bare `𝐷` (post-elimination rebuilds carry the gate in the term — a
+/// `filter_values` restrict — with the leg type equal to the domain
+/// outright). The gates are per-leg by construction (first-match predicates
+/// are mutually exclusive), so any refinement genuinely part of the domain
+/// sits *under* the gate and survives into the normal form; a
+/// set-intersection reading of "common refinements" would instead
+/// misclassify a single-leg partition's lone gate as domain.
+fn partition_domain(union_dom: &Type) -> Option<&Type> {
     let Type::Variant(tags) = union_dom else {
-        return false;
+        return None;
     };
     if tags.is_empty() {
-        return false;
+        return None;
     }
-    let base = strip_refinements(target);
-    tags.iter()
-        .enumerate()
-        .all(|(i, (k, payload))| *k == FieldKey::Index(i) && strip_refinements(payload) == base)
+    let mut common: Option<&Type> = None;
+    for (i, (k, payload)) in tags.iter().enumerate() {
+        if *k != FieldKey::Index(i) {
+            return None;
+        }
+        let under = match payload {
+            Type::Refinement(u, _gate) => &**u,
+            other => other,
+        };
+        match common {
+            None => common = Some(under),
+            Some(c) if *c == *under => {}
+            Some(_) => return None,
+        }
+    }
+    common
+}
+
+/// The plain form of a partition-domained function
+/// (`⧺ᵢ({𝐷 | π̂ᵢ}) ⤇ W  ↦  𝐷 ⤇ W`, and likewise for `⇒`), or `None` when
+/// `f` is not one. The collapse is a fact about the *domain* — the gates
+/// cover `𝐷` as a set — so it applies at any kind: the fan-out type shows
+/// up on compute-kinded views of the same selection too, and normalizing
+/// only one kind would desynchronize two sides carrying the same partition.
+/// Kind, binder, and codomain ride along untouched, so the general `Fun`
+/// arm's machinery (kind edge, domain variance, Pi correspondence) applies
+/// to them on the re-entry.
+fn normalized_partition_fun(f: &Type) -> Option<Type> {
+    let Type::Fun {
+        name,
+        kind,
+        domain,
+        codomain,
+    } = f
+    else {
+        return None;
+    };
+    let dnorm = partition_domain(domain)?;
+    Some(Type::Fun {
+        name: name.clone(),
+        kind: kind.clone(),
+        domain: Box::new(dnorm.clone()),
+        codomain: codomain.clone(),
+    })
 }
 
 /// Constrain `lhs‹sl› <: rhs‹sr›` — each side under its own context morphism,
@@ -435,37 +489,34 @@ fn constrain_go(
         // to every other type (the catch-all `Mismatch` below).
         (Type::Txn, Type::Txn) => Ok(()),
 
-        // Bridge rule 2 (gated-partition `⧺` <: plain data function): the
-        // `Variant`-domain union `⧺ᵢ ({D | π̂ᵢ} ⤇ W)` that lambda_elim's
-        // value-`Case` fan-out produces for **same-domain** arms *is* the plain
-        // data function `D ⤇ W` — an exhaustive + disjoint partition of `D`
-        // (exhaustiveness guaranteed by the stamping phase, not proven here; see
-        // lambda_elim's `build_value_case_fanout` and `design/type-inference.md`
-        // §4.6). Each leg `{D | π̂ᵢ} <: D` by refinement width (covariant, not the
-        // function-domain contravariance below), codomain covariant. Fires only
-        // when every leg refines the *same concrete* target domain `D`, so a
-        // genuine heterogeneous `++` flowing into a fresh-var domain still takes
-        // the ordinary contravariant arm below (its domain var resolves to the
-        // `Variant`, iterating every leg).
-        (
-            Type::Fun {
-                kind: FunKind::Data,
-                domain: union_dom,
-                codomain: c0,
-                ..
-            },
-            Type::Fun {
-                domain: d1,
-                codomain: c1,
-                ..
-            },
-        ) if is_index_partition_of(union_dom, d1) => {
-            if let Type::Variant(tags) = union_dom.as_ref() {
-                for (_, payload) in tags {
-                    constrain_go(payload, d1, sl, sr, cache)?;
-                }
-            }
-            constrain_go(c0, c1, sl, sr, cache)
+        // Partition normalization (the retired "bridge rule 2", re-homed):
+        // the `Variant`-domain union `⧺ᵢ ({D | π̂ᵢ} ⤇ W)` that lambda_elim's
+        // value-`Case` fan-out produces for **same-domain** arms *is* the
+        // plain data function `D ⤇ W` — an exhaustive + disjoint partition
+        // of `D` (exhaustiveness guaranteed by the stamping phase, not
+        // proven here; see lambda_elim's `build_value_case_fanout` and
+        // `design/type-inference.md` §4.6). That identity is an *equation*,
+        // so it is realized as a rewrite: normalize the partitioned side(s)
+        // to the plain form and re-enter the ordinary arms — which then
+        // supply everything the former bespoke edge set skipped: the kind
+        // edge, domain variance (invariant data-data, contravariant against
+        // a compute demand — the latter is what makes the collapse
+        // *compose*; the old target-relative arm broke transitivity of
+        // subsumption), and the Pi correspondence on the codomain edge.
+        //
+        // Variable domains are excluded: a partition meeting a fresh-var
+        // domain records its actual (partition) type on the variable
+        // exactly as before — normalization is a comparison-time view, not
+        // a rewrite of what inference learns.
+        (Type::Fun { domain: ld, .. }, Type::Fun { domain: rd, .. })
+            if !matches!(**ld, Type::Infer(_))
+                && !matches!(**rd, Type::Infer(_))
+                && (normalized_partition_fun(lhs).is_some()
+                    || normalized_partition_fun(rhs).is_some()) =>
+        {
+            let l2 = normalized_partition_fun(lhs).unwrap_or_else(|| lhs.clone());
+            let r2 = normalized_partition_fun(rhs).unwrap_or_else(|| rhs.clone());
+            constrain_go(&l2, &r2, sl, sr, cache)
         }
 
         // Function: contravariant on domain, covariant on codomain. The
