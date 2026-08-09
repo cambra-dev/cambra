@@ -317,6 +317,38 @@ impl Subst {
         Subst(m)
     }
 
+    /// The **canonical Pi binder** rule, in one place.
+    ///
+    /// A function type's binder at codomain-depth `depth` is the reserved
+    /// [`Name::pi`] name for that depth, and the rename rides the accumulated
+    /// substitution so that every reference to the old binder inside the
+    /// codomain — a dependent refinement predicate, say — is rewritten as that
+    /// codomain is walked. Returns the canonical binder and the substitution to
+    /// walk the codomain under; the caller recurses at `depth + 1` (a domain
+    /// keeps `depth`, since only codomain arrows nest a binder's scope).
+    ///
+    /// This is `__elem`'s move applied to arrows: one shared name per position
+    /// means α-variant types flatten to *identical* shapes, so they merge, their
+    /// refinement copies dedup rather than accumulating a dangling twin, and
+    /// every identity built on the flattened form is α-insensitive.
+    ///
+    /// **Three walks apply it and must agree exactly**, which is why the rule
+    /// lives here rather than being spelled out in each: `compact_go` (the
+    /// flattened bound graph), `spec_key::key_go` (the specialization key), and
+    /// [`Type::alpha_normalized`](crate::ccl::Type::alpha_normalized) (the pure
+    /// function the recorded-vs-recomputed walls compare through). A divergence
+    /// between the first two is *silent* and yields a shared clone whose
+    /// interior was resolved against a different use's argument.
+    pub fn canonical_pi_binder(&self, name: &Option<Name>, depth: u8) -> (Option<Name>, Subst) {
+        match name {
+            Some(b) => {
+                let canon = Name::pi(depth);
+                (Some(canon.clone()), self.extended_rename(b.clone(), canon))
+            }
+            None => (None, self.clone()),
+        }
+    }
+
     /// Extend this substitution with a fresh binder correspondence `k ↦ x`
     /// (the Pi-vs-Pi binder alignment derived in the codomain edge). `k` is a
     /// newly-scoped binder, so this is an insert, not a composition.

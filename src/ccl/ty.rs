@@ -895,7 +895,6 @@ impl Type {
     /// independently-rebuilt types (source-named binders) can meet on one
     /// form. Two α-equivalent types have equal α-normal forms.
     pub fn alpha_normalized(&self) -> Type {
-        use crate::ccl::Name;
         use crate::ccl::subst::Subst;
         fn go(t: &Type, depth: u8, subst: &Subst) -> Type {
             match t {
@@ -906,13 +905,7 @@ impl Type {
                     codomain,
                 } => {
                     let dom = go(domain, depth, subst);
-                    let (name, cod_subst) = match name {
-                        Some(b) => {
-                            let canon = Name::pi(depth);
-                            (Some(canon.clone()), subst.extended_rename(b.clone(), canon))
-                        }
-                        None => (None, subst.clone()),
-                    };
+                    let (name, cod_subst) = subst.canonical_pi_binder(name, depth);
                     let cod = go(codomain, depth + 1, &cod_subst);
                     Type::Fun {
                         name,

@@ -93,7 +93,7 @@ use std::fmt;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
+use crate::ccl::{FieldKey, HistoryKind, InferVarId, Refinement, Type};
 
 use super::compact::{AtomKey, KindMerge};
 
@@ -388,16 +388,13 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx, pi_depth: u
             // The domain is contravariant — the flip that makes the dual read
             // follow an argument's *lower* bounds.
             let dom = key_go(domain, !pol, subst_acc, ctx, pi_depth);
-            // Canonical Pi binders, as in `compact_go`: the binder is renamed
-            // to the reserved depth-indexed name so a keyed predicate that
-            // references it does so α-insensitively — two uses whose
-            // instantiation types differ only in source binder names key
-            // together. (The binder *name* itself is still not part of the
-            // key — see `SpecKey::fun` — this rewrites the *references*.)
-            let cod_acc = match name {
-                Some(b) => subst_acc.extended_rename(b.clone(), Name::pi(pi_depth)),
-                None => subst_acc.clone(),
-            };
+            // Canonical Pi binders (`Subst::canonical_pi_binder`), so a keyed
+            // predicate referencing the binder does so α-insensitively: two uses
+            // whose instantiation types differ only in source binder names key
+            // together. The canonical *name* is discarded — it is not part of
+            // the key (see `SpecKey::fun`); what matters is that the
+            // *references* were rewritten.
+            let (_, cod_acc) = subst_acc.canonical_pi_binder(name, pi_depth);
             let cod = key_go(codomain, pol, &cod_acc, ctx, pi_depth + 1);
             // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
