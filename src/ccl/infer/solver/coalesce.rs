@@ -291,15 +291,8 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         }
     };
 
-    // Re-wrap the refinements carried at this position. `extent_of`
-    // strips refinements at every depth and composes the resulting
-    // `Restrict`s, so the wrap order is semantically irrelevant;
-    // first-insertion order in the `Vec` makes it stable.
-    let out = ct
-        .refinements
-        .iter()
-        .fold(inner, |acc, r| Type::Refinement(Box::new(acc), r.clone()));
-    Ok(out)
+    // Re-attach the refinements carried at this position.
+    Ok(Type::refined(inner, ct.refinements.clone()))
 }
 
 /// Dissolve a position's feed `history_slot` into its other contributions when
@@ -770,6 +763,42 @@ mod tests {
         ]);
         let out = coalesce_compact(&simplify_type(compact_type(&ty))).unwrap();
         assert_eq!(out, ty);
+    }
+
+    #[test]
+    fn refinements_meeting_at_one_variable_do_not_depend_on_arrival_order() {
+        // Two refined upper bounds meet at one variable. As nested layers the
+        // result was `{{Int | q} | p}` or `{{Int | p} | q}` by which arrived
+        // first; subtyping was indifferent either way (deficit matching compares
+        // refinements as a set), but `Type`'s equality was not, and structural
+        // equality is load-bearing where a type is an *identity*: the
+        // trivial-equality short-circuit, cache keys, and the
+        // recorded-vs-recomputed walls. One unordered set makes the two orders
+        // build the same type, so this asserts plain equality rather than
+        // equality after a canonical sort.
+        let coalesce_with_order = |first: &Type, second: &Type| {
+            let v = fresh_var(0);
+            constrain_subtype(&v, first, &mut ConstrainCache::new()).unwrap();
+            constrain_subtype(&v, second, &mut ConstrainCache::new()).unwrap();
+            coalesce_compact(&simplify_type(compact_type(&v))).unwrap()
+        };
+        let (p, q) = (
+            refined(prim(BaseType::Int), 1),
+            refined(prim(BaseType::Int), 2),
+        );
+        let a = coalesce_with_order(&p, &q);
+        let b = coalesce_with_order(&q, &p);
+        assert_eq!(a, b, "refinements must not depend on arrival order");
+        // Both survived: the meet of two refined upper bounds carries each
+        // side's restriction, so this is a two-member set and not one order
+        // winning.
+        assert_eq!(
+            a.refinements().len(),
+            2,
+            "expected both refinements, got {a}"
+        );
+        // Rendering is order-stable too, so a diagnostic cannot leak the order.
+        assert_eq!(format!("{a}"), format!("{b}"));
     }
 
     #[test]

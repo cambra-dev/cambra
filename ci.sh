@@ -39,6 +39,14 @@ ci_clippy_lib() { cargo clippy --lib -- -D warnings; }
 # `deep-typecheck` feature). The GitHub workflow sets it so automated runs keep
 # exercising that check; it stays off for a bare local `./ci.sh` because it is
 # superlinear on nested comprehensions (that cost is why it is gated).
+#
+# `CAMBRA_REFINEMENT_ORDER=reverse` (read at runtime, debug builds only) flips
+# the physical order of every refinement set. The workflow runs the suite
+# both ways: set semantics makes that order meaningless by contract, but a
+# consumer that lets it become observable — or a dedup keeping the
+# first-inserted of two `eq`-equal refinements — compiles clean either way. Same
+# argument as `ci_clippy_serde`: a configuration nothing runs is a
+# configuration that rots.
 ci_test() { cargo test -q ${DEEP_TYPECHECK:+--features deep-typecheck}; }
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \

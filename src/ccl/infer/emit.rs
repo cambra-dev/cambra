@@ -369,11 +369,11 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         // `BoundedHole` here: recurse into the bound, or a predicate written inside one
         // (`x <: {Int | p}`) never gets typed.
         Type::BoundedHole(bound) => emit_annotation_predicates(bound, ctx),
-        Type::Refinement(inner, r) => {
-            // The annotation's refinement is bare over REFINEMENT_BINDER, just
+        Type::Refinement(inner, refinements) => {
+            // The annotation's refinements are bare over REFINEMENT_BINDER, just
             // like a cast target's — bind the element over the refined base and
             // check `Bool`.
-            emit_bare_predicate(r, inner, ctx)?;
+            refinements.try_rewrite_each(|_, r| emit_bare_predicate(r, inner, ctx))?;
             emit_annotation_predicates(inner, ctx)
         }
         Type::Fun {
@@ -547,9 +547,9 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
         // refinement itself is the user's claim and is kept. `peel_refinements`
         // on the inferred side because its own refinements describe the *value*,
         // and this is filling in a *shape*.
-        (Type::Refinement(base, r), _) => Type::Refinement(
-            Box::new(complete_annotation(base, inferred.peel_refinements())),
-            r.clone(),
+        (Type::Refinement(base, refinements), _) => Type::refined(
+            complete_annotation(base, inferred.peel_refinements()),
+            refinements.clone(),
         ),
         // The binder and kind come from the *annotation*, per the rule
         // above: a kind is something an annotation can state (`List(T)` is a data
@@ -740,13 +740,12 @@ pub(super) fn emit_cast<C: Typing>(
     // it on the `target` slot is what carries the typed predicate onto the
     // syntactic node; the result domain below then clones the typed refinement.
     if let Type::Fun { domain, .. } = target
-        && let Type::Refinement(_, r) = domain.as_mut()
+        && let Type::Refinement(_, refinements) = domain.as_mut()
     {
-        emit_bare_predicate(r, &d, ctx)?;
+        refinements.try_rewrite_each(|_, r| emit_bare_predicate(r, &d, ctx))?;
     }
-    let refinement = cast_target_refinement(target);
-    let domain = match refinement {
-        Some(r) => Type::Refinement(Box::new(d), r),
+    let domain = match cast_target_refinement(target) {
+        Some(refinements) => Type::refined(d, refinements),
         None => d,
     };
     // A cast re-views the value *at* `target`, so the result carries `target`'s

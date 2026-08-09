@@ -696,8 +696,8 @@ mod tests {
         use crate::ccl::{Lit, Name, Refinement, TypedExpr, subst::Subst};
         use std::rc::Rc as StdRc;
         let dep = |referenced: &str| {
-            Type::Refinement(
-                Box::new(Type::Base(BaseType::Int)),
+            Type::refined_one(
+                Type::Base(BaseType::Int),
                 Refinement::born(StdRc::new(TypedExpr::binop(
                     TypedExpr::var(Name::elem()),
                     crate::ccl::BinOpKind::Compare(crate::ccl::CompareKind::Equals),
@@ -734,8 +734,8 @@ mod tests {
     fn recording_an_open_bound_is_an_internal_error() {
         use crate::ccl::{Name, Refinement, TypedExpr};
         use std::rc::Rc as StdRc;
-        let dep = Type::Refinement(
-            Box::new(Type::Base(BaseType::Int)),
+        let dep = Type::refined_one(
+            Type::Base(BaseType::Int),
             Refinement::born(StdRc::new(TypedExpr::var(Name::fresh("escaped")))),
         );
         let holder = InferVar::fresh(0);
@@ -758,8 +758,8 @@ mod tests {
     fn a_raw_gap_is_an_internal_error() {
         use crate::ccl::{Name, Refinement, TypedExpr};
         use std::rc::Rc as StdRc;
-        let dep = Type::Refinement(
-            Box::new(Type::Base(BaseType::Int)),
+        let dep = Type::refined_one(
+            Type::Base(BaseType::Int),
             Refinement::born(StdRc::new(TypedExpr::var(Name::raw("a")))),
         );
         let holder = InferVar::fresh(0);

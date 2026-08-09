@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 
 use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{
-    BaseType, HistoryKind, InferVarId, Name, Openness, Refinement, Type, fresh_infer_var_id,
+    BaseType, HistoryKind, InferVarId, Name, Openness, RefinementSet, Type, fresh_infer_var_id,
 };
 
 use crate::ccl::FieldKey;
@@ -289,15 +289,14 @@ pub struct CompactType {
     /// `Data ⊔ Data` join accumulated alternatives via [`union_domains`]), and the
     /// codomain. Recursively merged with polarity flip on the domain.
     pub fun: Option<CompactFun>,
-    /// Refinement contributions at this position. A set with `==`
-    /// membership (deduplicated by [`Refinement`]'s structural `PartialEq`),
-    /// stored as a `Vec` in first-insertion order. A refinement-set is
-    /// width-subtyped exactly like `rec`: more refinements ⇒ subtype
-    /// (`{T | p, q} <: {T | p}`), so at positive polarity the sets are
-    /// *intersected* and at negative *unioned* (see
-    /// [`CompactType::merge`]). The stored [`Refinement`] is the payload
-    /// carried to coalesce.
-    pub refinements: Vec<Refinement>,
+    /// Refinement contributions at this position — the same
+    /// [`RefinementSet`](crate::ccl::RefinementSet) the materialized `Type`
+    /// carries, so flattening and coalescing agree on what a refinement set *is*
+    /// rather than each keeping its own bag. A refinement set is width-subtyped
+    /// exactly like `rec`: more refinements ⇒ subtype (`{T | p, q} <: {T | p}`), so
+    /// at positive polarity the sets are *intersected* and at negative
+    /// *unioned* (see [`CompactType::merge`]).
+    pub refinements: RefinementSet,
     /// History-handle `(value, domain, kind)`, if a [`Type::History`]
     /// contributed here — a mutable variable (`kind: Overwrite`) or a feed channel
     /// (`kind: Feed`).
@@ -474,19 +473,13 @@ impl CompactType {
     /// position the value reliably carries only the refinements *both*
     /// sides guarantee; at a negative position a consumer that may
     /// impose either set imposes their union.
-    fn merge_refinements(pol: bool, lhs: Vec<Refinement>, rhs: Vec<Refinement>) -> Vec<Refinement> {
+    fn merge_refinements(pol: bool, lhs: RefinementSet, rhs: RefinementSet) -> RefinementSet {
         if pol {
             // The types are being unioned, so the refinements should be intersected.
-            lhs.into_iter().filter(|r| rhs.contains(r)).collect()
+            lhs.intersect(&rhs)
         } else {
             // The types are being intersected, so the refinements should be unioned.
-            let mut out = lhs;
-            for r in rhs {
-                if !out.contains(&r) {
-                    out.push(r);
-                }
-            }
-            out
+            lhs.union(&rhs)
         }
     }
 
@@ -778,14 +771,14 @@ fn compact_go(
         // application's argument) before the refinement lands in the position.
         // The predicate is an immutable term, so a non-vacuous force builds a
         // fresh predicate from the (freshened) bound's content directly.
-        Type::Refinement(inner, r) => {
+        Type::Refinement(inner, refinements) => {
             let mut ct = compact_go(inner, pol, subst_acc, parents, st);
-            let r = subst_acc.force_refinement(r);
-            // References to the walk's enclosing binders become indices
-            // before the refinement is compared or stored.
-            let r = st.scope.close(&r);
-            if !ct.refinements.contains(&r) {
-                ct.refinements.push(r);
+            for r in refinements {
+                let r = subst_acc.force_refinement(r);
+                // References to the walk's enclosing binders become indices
+                // before the refinement is compared or stored.
+                let r = st.scope.close(&r);
+                ct.refinements.insert(r);
             }
             ct
         }
@@ -1054,11 +1047,7 @@ fn compact_go(
                     // so both hold of it.
                     if let Some(primary) = bound.take() {
                         recovered.vars.extend(primary.vars);
-                        for r in primary.refinements {
-                            if !recovered.refinements.contains(&r) {
-                                recovered.refinements.push(r);
-                            }
-                        }
+                        recovered.refinements.extend(primary.refinements);
                     }
                     bound = Some(recovered);
                 }
@@ -1274,8 +1263,8 @@ mod refinement_closing_tests {
             name: Some(Name::raw(binder)),
             kind: FunKind::Data,
             domain: Box::new(Type::UIntRange(3)),
-            codomain: Box::new(Type::Refinement(
-                Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::refined_one(
+                Type::Base(BaseType::Int),
                 Refinement::born(dep_pred(binder)),
             )),
         }
@@ -1309,18 +1298,23 @@ mod refinement_closing_tests {
             b.without_pi_names(),
             "α-variant bound merge must be arrival-order-independent"
         );
-        // The α-copies collapsed: one refinement layer, spelled as the index,
-        // nothing dangling.
+        // The α-copies collapsed: one refinement, spelled as the index, nothing
+        // dangling.
         let Type::Fun { codomain, .. } = &a else {
             panic!("expected a function, got {a}");
         };
-        let Type::Refinement(base, r) = &**codomain else {
-            panic!("expected exactly one refinement layer, got {codomain}");
+        let Type::Refinement(base, refinements) = &**codomain else {
+            panic!("expected a refined codomain, got {codomain}");
         };
         assert!(
             !matches!(&**base, Type::Refinement(..)),
-            "the two α-copies of one constraint must dedup to one layer, got {codomain}"
+            "a refinement's base is never itself refined under `RefinementSet`, got {codomain}"
         );
+        let Some(r) = refinements.sole() else {
+            panic!(
+                "the two α-copies of one constraint must dedup to one refinement, got {codomain}"
+            );
+        };
         assert!(
             crate::ccl::subst::type_free_vars(&a).is_empty(),
             "no refinement may dangle on a free binder name: {a}"
@@ -1353,8 +1347,8 @@ mod refinement_closing_tests {
                 name: Some(Name::raw("y")),
                 kind: FunKind::Data,
                 domain: Box::new(Type::UIntRange(4)),
-                codomain: Box::new(Type::Refinement(
-                    Box::new(Type::Base(BaseType::Int)),
+                codomain: Box::new(Type::refined_one(
+                    Type::Base(BaseType::Int),
                     Refinement::born(dep_pred(referenced)),
                 )),
             }),

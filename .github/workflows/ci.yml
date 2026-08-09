@@ -158,6 +158,19 @@ jobs:
         # step, which is worth paying to keep the next one from doing the same.
         run: DEEP_TYPECHECK=1 CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
 
+      - name: Test (reversed refinement order)
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        # A refinement set is unordered by contract, but two classes of
+        # order-dependence survive a compile-clean rewrite and only running the
+        # suite both ways exercises them: a consumer that iterates the set and
+        # lets the order reach something observable, and a dedup that keeps the
+        # first-inserted of two `eq`-equal refinements whose predicate terms carry
+        # different embedded type slots. Nothing in the type system catches
+        # either, so an unrun knob would rot exactly as an uncompiled feature
+        # does. The env var is read at *runtime*, so this reuses the binaries
+        # the step above already built.
+        run: CAMBRA_REFINEMENT_ORDER=reverse ./ci.sh test
+
         # 4. Success Signal for noops
       - name: No-op for docs
         if: steps.filter.outputs.code == 'false'
