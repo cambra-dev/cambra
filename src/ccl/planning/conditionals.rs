@@ -30,9 +30,19 @@ use crate::ccl::{BaseType, Builtin, Expr, FieldKey, Type, TypedExprNode, lambda_
 
 /// Rewrite every collection-valued value-`Case` in `expr` into its gated union, and erase
 /// every sum whose witness is **determined** — from the types as well as the terms.
-pub(super) fn realize_conditional_collections(expr: &mut Expr) {
+pub(super) fn realize_conditional_collections(
+    expr: &mut Expr,
+) -> std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId> {
     let mut erased = std::collections::HashSet::new();
-    realize_and_unbox(expr, &mut erased, &PredMemo::new());
+    let mut discharged = std::collections::HashSet::new();
+    realize_and_unbox(
+        expr,
+        &mut erased,
+        &PredMemo::new(),
+        &mut std::collections::HashMap::new(),
+        false,
+        &mut discharged,
+    );
     // **The other half of the erasure.** `unbox` removed the introduction from the *term*;
     // every type still says `Σ`. A type asserting an indeterminacy the term no longer has
     // is not a harmless leftover: the domain it presents at a consuming site is a witness,
@@ -49,21 +59,48 @@ pub(super) fn realize_conditional_collections(expr: &mut Expr) {
     if !erased.is_empty() {
         instantiate_erased_witnesses(expr, &erased, &PredMemo::new());
     }
+    discharged
 }
 
+/// `owed` carries, per witness binder, the restriction a *consuming site above* placed on
+/// that witness — `Σ σ ∈ 𝐾. ({σ | 𝑝} ⤇ 𝑉)`, the shape a filtered comprehension over a
+/// conditional collection has. Realization is what materializes the witness, so it is what
+/// discharges the restriction: [`realize_here`] gates each leg by `𝑝` rewritten to read
+/// *that leg's arm*. Gathered on the way down, which is why the walk stays top-down.
+///
+/// `in_predicate` records that this subtree *is* a refinement predicate. A predicate may
+/// carry no realized collection (`debug_assert_no_iteration_markers_in_type`: a gated union
+/// needs the `iterate`/`restrict` a predicate is forbidden), so realization does not fire
+/// there — the `Case` stays, and the per-leg discharge above is what replaces it, with a
+/// plain arm rather than a union. Unboxing still runs: erasing a determined `box` adds
+/// nothing to iterate.
 fn realize_and_unbox(
     expr: &mut Expr,
     erased: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
     memo: &PredMemo<()>,
+    owed: &mut std::collections::HashMap<
+        crate::ccl::infer_var::WitnessBinderId,
+        crate::ccl::Refinement,
+    >,
+    in_predicate: bool,
+    discharged: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
 ) -> bool {
     let mut changed = false;
+    if let Some((binder, restriction)) = restriction_on_a_witness(&expr.ty) {
+        eprintln!("PROBE owed {binder:?} from {}", expr.ty);
+        owed.entry(binder).or_insert(restriction);
+    }
     // **Top-down.** An `elif` chain is a `Case` whose trailing arm is another `Case`, and
     // `flatten_trailing_value_case` collapses the chain into one N-choice partition —
     // which it can only do while the inner one is still a `Case`. Realizing children
     // first turns it into a union, the flatten silently no-ops, and the outer fan-out
     // ends up with a leg that is already a fan-out.
-    changed |= realize_here(expr);
-    expr.walk_children_mut(|child| changed |= realize_and_unbox(child, erased, memo));
+    if !in_predicate {
+        changed |= realize_here(expr, owed, discharged);
+    }
+    expr.walk_children_mut(|child| {
+        changed |= realize_and_unbox(child, erased, memo, owed, in_predicate, discharged)
+    });
     // **A refinement predicate is a term too, and it carries its own copy of the source.**
     // A filter looks the collection up at the index (`__elem ▷ src ▷ 𝑓`), so when `src` is
     // a `box` the introduction sits inside the predicate — somewhere the term walk above
@@ -71,7 +108,14 @@ fn realize_and_unbox(
     // op-conversion, which has no `box` arm and rejects it as a non-combinator.
     expr.walk_type_slots_mut(|ty| {
         changed |= walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
-            realize_and_unbox(pred, erased, memo)
+            realize_and_unbox(
+                pred,
+                erased,
+                memo,
+                &mut std::collections::HashMap::new(),
+                true,
+                &mut std::collections::HashSet::new(),
+            )
         });
     });
     // A `box` whose **witness is determined** is erased here, not only the ones a
@@ -134,12 +178,87 @@ fn instantiate_erased_in_type(
     }
 }
 
+/// The restriction a consuming site placed **on a witness**, with the binder it names.
+///
+/// `Σ σ ∈ 𝐾. ({σ | 𝑝} ⤇ 𝑉)` — a filtered comprehension over a conditional collection. The
+/// filter rides the witness rather than the candidates
+/// (`src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness"), so it is a
+/// fact about *whichever* domain the witness turns out to name, and nothing has compiled it
+/// yet: the site cannot, having no extent for a witness.
+fn restriction_on_a_witness(
+    ty: &Type,
+) -> Option<(
+    crate::ccl::infer_var::WitnessBinderId,
+    crate::ccl::Refinement,
+)> {
+    let Type::Sigma(sum) = peel_refinements(ty) else {
+        return None;
+    };
+    let Type::Refinement(base, restriction) = sum.body.domain()? else {
+        return None;
+    };
+    matches!(*base, Type::WitnessRef(w) if w == sum.binder())
+        .then(|| (sum.binder(), restriction.clone()))
+}
+
+/// `predicate` with the conditional it reads replaced by `arm`.
+///
+/// A filter's predicate looks its collection up at the index (`__elem ▷ src ▷ 𝑓`), and `src`
+/// is the whole conditional. Under leg `i` that conditional *is* `arm`, because the leg is
+/// gated by `π̂ᵢ` — so reading the arm directly is the same fact, said in a form a predicate
+/// may hold: a plain collection, needing no realization and therefore none of the
+/// `iterate`/`restrict` machinery a predicate is forbidden to carry.
+///
+/// Identified by **type**, not by shape: the source is whatever names this sum, which the
+/// witness binder says exactly. Matching structurally would have to guess which subterm is
+/// the collection.
+fn read_the_arm_instead(
+    predicate: &Expr,
+    binder: crate::ccl::infer_var::WitnessBinderId,
+    kind: &crate::ccl::ty::TypeKind,
+    arm: &Expr,
+) -> Expr {
+    // Two spellings name this sum, and inside a predicate it is usually the second: the
+    // sum itself, or — once lambda elimination has opened it — the **arrow view** `𝑤 ⤇ 𝑉`,
+    // which is a `Fun` whose domain is the witness. Matching only the constructor misses
+    // the case that actually occurs.
+    let names_this_sum = match peel_refinements(&predicate.ty) {
+        // **By candidate list, not by binder.** The predicate holds its *own copy* of the
+        // source, and that copy carries a **different** witness binder than the site's sum
+        // — measured. The two print identically (`σ` names no binder) and compare unequal,
+        // which is the α-invariance cost of naming the witness. Identity would be the
+        // better key if the copies shared one; they do not, and until they do the candidate
+        // list is what says "this is that sum".
+        Type::Sigma(s) => s.kind() == kind,
+        // Once lambda elimination has opened the sum, the source is its **arrow view**
+        // `𝑤 ⤇ 𝑉` — a `Fun` on the witness, with no candidate list left to compare, so the
+        // binder is all there is.
+        other => matches!(
+            other.domain().map(|d| peel_refinements(&d).clone()),
+            Some(Type::WitnessRef(w)) if w == binder
+        ),
+    };
+    if names_this_sum {
+        return arm.clone();
+    }
+    let mut out = predicate.clone();
+    out.walk_children_mut(|child| *child = read_the_arm_instead(child, binder, kind, arm));
+    out
+}
+
 /// Returns whether this node was realized — load-bearing, not bookkeeping: a `Case` inside
 /// a **refinement predicate** is rewritten through [`PredMemo::rebuild`], which *discards*
 /// the rewrite when the caller reports no change. A realization that forgot to report would
 /// be silently undone, leaving an unrealized `Case` in a predicate for op-conversion to
 /// reject.
-fn realize_here(expr: &mut Expr) -> bool {
+fn realize_here(
+    expr: &mut Expr,
+    owed: &std::collections::HashMap<
+        crate::ccl::infer_var::WitnessBinderId,
+        crate::ccl::Refinement,
+    >,
+    discharged: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+) -> bool {
     let TypedExprNode::Case {
         scrutinee: None,
         branches,
@@ -162,6 +281,14 @@ fn realize_here(expr: &mut Expr) -> bool {
     // fan-out rather than a union of unions.
     let branches = flatten_trailing_value_case(branches);
 
+    // Which sum this `Case` realizes, so the restriction owed on that witness can be found.
+    let (binder, kind) = match peel_refinements(&expr.ty) {
+        Type::Sigma(s) => (s.binder(), s.kind().clone()),
+        _ => (
+            crate::ccl::infer_var::WitnessBinderId::UNBOUND,
+            crate::ccl::ty::TypeKind::Enumerated(Vec::new()),
+        ),
+    };
     let bool_ty = Type::Base(BaseType::Bool);
     let mut prior_guards: Vec<Expr> = Vec::new();
     let mut arms: Vec<Expr> = Vec::new();
@@ -184,12 +311,28 @@ fn realize_here(expr: &mut Expr) -> bool {
             Type::fun(arm_dom.clone(), bool_ty.clone()),
         );
         let refined = refine_with(arm_dom, &gate_fn);
+        let arm = unbox(b.body, None).0;
+        // **Discharge the site's restriction into this leg.** Realization materializes the
+        // witness, so it owes what the consuming site placed on it — and the leg is the one
+        // place that restriction can be said *denotationally*, because here the conditional
+        // has become a single arm.
+        let refined = match owed.get(&binder) {
+            Some(restriction) => Type::Refinement(
+                Box::new(refined),
+                crate::ccl::Refinement::born(std::rc::Rc::new(read_the_arm_instead(
+                    &restriction.predicate,
+                    binder,
+                    &kind,
+                    &arm,
+                ))),
+            ),
+            None => refined,
+        };
+        if owed.contains_key(&binder) {
+            discharged.insert(binder);
+        }
         tags.push((FieldKey::Index(tags.len()), refined.clone()));
-        arms.push(
-            unbox(b.body, None)
-                .0
-                .with_ty(Type::data_fun(refined, value_ty.clone())),
-        );
+        arms.push(arm.with_ty(Type::data_fun(refined, value_ty.clone())));
     }
 
     // One branch denotes just that arm's collection — no union, and no witness left to
@@ -328,28 +471,40 @@ fn unbox(
 mod tests {
     use super::*;
     use crate::ccl::infer_var::fresh_witness_binder_id;
+    use crate::ccl::ty::{SigmaType, TypeKind, Witness};
     use crate::ccl::{Branch, Lit, Name};
 
-    /// **A `Case` inside a refinement predicate is realized, and the realization sticks.**
+    /// **A `box` inside a refinement predicate is erased, and the erasure sticks.**
     ///
-    /// A filter's predicate looks the collection up at the index (`__elem ▷ src ▷ 𝑓`), so
-    /// when `src` is a conditional the predicate carries a whole `Case` — a term riding a
-    /// *type* slot, which no term walk reaches. Both walks descend into predicates for
-    /// that reason, and predicates are rewritten through [`PredMemo::rebuild`], which
-    /// **discards** the rewrite unless the caller reports a change.
+    /// A filter's predicate looks its collection up at the index (`__elem ▷ src ▷ 𝑓`), so
+    /// when `src` is boxed the introduction sits inside the predicate — a term riding a
+    /// *type* slot, which no term walk reaches. Both walks descend into predicates for that
+    /// reason, and predicates are rewritten through [`PredMemo::rebuild`], which
+    /// **discards** the rewrite unless the caller reports a change. So the report is
+    /// load-bearing: erasing without reporting leaves the original predicate in place, and
+    /// a `box` reaches op-conversion, which has no arm for it.
     ///
-    /// So the report is load-bearing rather than bookkeeping: realizing without reporting
-    /// leaves the original predicate in place, and an unrealized `Case` reaches
-    /// op-conversion, which rejects it. Ablate [`realize_here`]'s `true` and this fails
-    /// while the whole end-to-end suite stays green — nothing consumes such a predicate
-    /// yet, which is exactly why it needs pinning here.
+    /// A `Case` in the same position is deliberately *not* realized — the gated union it
+    /// would become needs `iterate`/`restrict`, which a predicate may not carry
+    /// (`debug_assert_no_iteration_markers_in_type`). The per-leg discharge replaces it with
+    /// a plain arm instead. Both halves are asserted here, since they are one decision.
     #[test]
-    fn a_case_inside_a_refinement_predicate_is_realized() {
+    fn a_box_inside_a_refinement_predicate_is_erased_but_a_case_is_left_alone() {
         let int = Type::Base(BaseType::Int);
-        let arm = |dom: usize| {
-            Expr::new(TypedExprNode::Var(Name::from("xs")))
-                .with_ty(Type::data_fun(Type::UIntRange(dom), int.clone()))
+        let coll = Type::data_fun(Type::UIntRange(2), int.clone());
+        // `Σ σ ∈ {coll}. σ` — one candidate, so the witness is determined and erasable.
+        let w = fresh_witness_binder_id();
+        let sum = || {
+            Type::Sigma(Box::new(SigmaType::bound(
+                Witness::bound_to(w, TypeKind::Enumerated(vec![coll.clone()])),
+                Type::WitnessRef(w),
+            )))
         };
+        let boxed = Expr::apply(
+            Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(coll.clone()),
+            Expr::builtin(Builtin::Box).with_ty(Type::fun(coll.clone(), sum())),
+        )
+        .with_ty(sum());
         let guard = |b: bool| Expr::lit(Lit::Bool(b)).with_ty(Type::Base(BaseType::Bool));
         let case = Expr::new(TypedExprNode::Case {
             scrutinee: None,
@@ -357,24 +512,24 @@ mod tests {
                 Branch {
                     pattern: None,
                     guard: guard(true),
-                    body: arm(2),
+                    body: Expr::new(TypedExprNode::Var(Name::from("ys"))).with_ty(coll.clone()),
                 },
                 Branch {
                     pattern: None,
                     guard: guard(true),
-                    body: arm(3),
+                    body: Expr::new(TypedExprNode::Var(Name::from("zs"))).with_ty(coll.clone()),
                 },
             ],
         })
-        .with_ty(Type::data_fun(Type::UIntRange(2), int.clone()));
-
-        // A node whose *type* carries a refinement whose predicate embeds that `Case`.
-        let refined = Type::Refinement(
+        .with_ty(coll.clone());
+        // One predicate holding both.
+        let pred = Expr::new(TypedExprNode::Tuple(vec![boxed, case])).with_ty(int.clone());
+        let ty = Type::Refinement(
             Box::new(Type::UIntRange(2)),
-            crate::ccl::Refinement::born(std::rc::Rc::new(case)),
+            crate::ccl::Refinement::born(std::rc::Rc::new(pred)),
         );
         let mut expr =
-            Expr::new(TypedExprNode::Var(Name::from("site"))).with_ty(Type::data_fun(refined, int));
+            Expr::new(TypedExprNode::Var(Name::from("site"))).with_ty(Type::data_fun(ty, int));
 
         realize_conditional_collections(&mut expr);
 
@@ -384,10 +539,14 @@ mod tests {
         let Type::Refinement(_, refinement) = &**domain else {
             panic!("expected the refinement to survive, got {domain}");
         };
+        let rendered = crate::ccl::symbolic::symbolic(&refinement.predicate);
         assert!(
-            !matches!(refinement.predicate.node, TypedExprNode::Case { .. }),
-            "the predicate's `Case` was realized and then discarded: {}",
-            crate::ccl::symbolic::symbolic(&refinement.predicate)
+            !rendered.contains("box"),
+            "the predicate's `box` was erased and then discarded: {rendered}"
+        );
+        assert!(
+            rendered.contains('→'),
+            "the predicate's `Case` must be left for the per-leg discharge: {rendered}"
         );
     }
 

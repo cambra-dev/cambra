@@ -632,23 +632,8 @@ c: Bool = False
 sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
     Value::Int(5)
 )]
-// A mapping body: the identity comprehension simplifies to a bare `cast`, so it alone would
-// not exercise the composed form.
-#[case(
-    r"
-c: Bool = False
-sum([y * 10 for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
-    Value::Int(50)
-)]
 // How the conditional reaches the generator — the same three routes
 // `a_conditional_source_compiles_however_it_reaches_the_generator` pins unfiltered.
-#[case(
-    r"
-c: Bool = False
-x = box([1, 2]) if c else box([1, 2, 3])
-sum([y for y in x if y > 1])",
-    Value::Int(5)
-)]
 #[case(
     r"
 def f(xs):
@@ -699,8 +684,43 @@ c: Bool = False
 sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 3])",
     Value::Int(4)
 )]
-// Two consumers of one conditional, each with its own filter: the restrictions belong to the
-// sites, not to the value they share.
+fn a_filter_over_a_conditional_source_is_applied(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// The shapes the per-leg discharge does **not** reach yet. All fail loudly at the
+/// post-planning typecheck rather than computing an unfiltered answer.
+///
+/// Two causes, both about *where* the restriction is found rather than how it is discharged:
+///
+/// - a **let-bound** conditional puts the `Case` in the binding while the filter sits on the
+///   consuming site in the body. Realization walks top-down and reaches the binding first,
+///   so the restriction has not been seen yet when the legs are built. (A UDF parameter is
+///   *not* in this group — inlining puts the conditional back inline at the call, which is
+///   why that case passes.)
+/// - **two consumers** of one conditional owe two different restrictions, and only one set
+///   of legs exists to discharge into. The first one seen wins; the second is what fails.
+///
+/// The mapping-body case is a third, unexplained: it differs from the passing identity
+/// comprehension only in composing a map onto the site.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+// A mapping body, where the identity comprehension simplifies to a bare `cast`.
+#[case(
+    r"
+c: Bool = False
+sum([y * 10 for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
+    Value::Int(50)
+)]
+// Let-bound: the `Case` is realized before the site's restriction is in scope.
+#[case(
+    r"
+c: Bool = False
+x = box([1, 2]) if c else box([1, 2, 3])
+sum([y for y in x if y > 1])",
+    Value::Int(5)
+)]
+// Two consumers, each with its own filter — one set of legs, two restrictions.
 #[case(
     r"
 c: Bool = False
@@ -708,7 +728,6 @@ x = box([1, 2]) if c else box([1, 2, 3])
 sum([y for y in x if y > 1]) + sum([z for z in x if z > 2])",
     Value::Int(8)
 )]
-// ...and a filtered consumer beside an unfiltered one, which compiles today.
 #[case(
     r"
 c: Bool = False
@@ -716,9 +735,12 @@ x = box([1, 2]) if c else box([1, 2, 3])
 sum([y for y in x]) + sum([z for z in x if z > 1])",
     Value::Int(11)
 )]
-#[ignore = "an undetermined witness has no extent; realization already materialized one as \
-            the gated union below the site, and planning does not consult it; measured 2026-08-09"]
-fn a_filter_over_a_conditional_source_is_dropped(#[case] code: &str, #[case] expected: Value) {
+#[ignore = "the restriction is not in scope where the legs are built (let-bound), or two \
+            consumers owe two restrictions to one set of legs; measured 2026-08-09"]
+fn a_filter_over_a_conditional_source_the_legs_cannot_reach(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
     check_scalar(code, expected);
 }
 

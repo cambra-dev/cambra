@@ -62,11 +62,14 @@ use super::*;
 /// iteration without an upstream input is [`Builtin::Iterate`].  Any
 /// other input-less term reaching op-conversion (after this pass) is a
 /// planner bug.
-pub(crate) fn insert_iterate_markers(expr: &mut Expr) {
-    insert_iterate_recurse(expr);
+pub(crate) fn insert_iterate_markers(
+    expr: &mut Expr,
+    discharged: &std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+) {
+    insert_iterate_recurse(expr, discharged);
     // In addition to any deeper iteration sites materialised by the
     // recursion, the program root itself may also be an iteration site.
-    wrap_with_iterate(expr);
+    wrap_with_iterate(expr, discharged);
 }
 
 /// Recursively walks `expr` and materializes every iteration site that
@@ -96,7 +99,10 @@ pub(crate) fn insert_iterate_markers(expr: &mut Expr) {
 /// with the body composed onto it).  Structural recursion covers the
 /// rest of the tree — every iteration site reachable from the program
 /// root is reached.
-pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
+pub(super) fn insert_iterate_recurse(
+    expr: &mut Expr,
+    discharged: &std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+) {
     // Special-case `Apply(Tuple|Record, Zip)`: op-conversion's `Zip` arm
     // fans the outer input out to each tuple/record field, so each field
     // is compiled with `input=Some(fan_out_branch)`.  Field wrapping
@@ -111,21 +117,21 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         match &mut argument.node {
             TypedExprNode::Tuple(elts) => {
                 for elt in elts.iter_mut() {
-                    insert_iterate_recurse(elt);
+                    insert_iterate_recurse(elt, discharged);
                 }
             }
             TypedExprNode::Record(fields) => {
                 for (_, field) in fields.iter_mut() {
-                    insert_iterate_recurse(field);
+                    insert_iterate_recurse(field, discharged);
                 }
             }
-            _ => insert_iterate_recurse(argument),
+            _ => insert_iterate_recurse(argument, discharged),
         }
-        insert_iterate_recurse(function);
+        insert_iterate_recurse(function, discharged);
         return;
     }
 
-    expr.walk_children_mut(insert_iterate_recurse);
+    expr.walk_children_mut(|child| insert_iterate_recurse(child, discharged));
     match &mut expr.node {
         // `FinalOrDefault` takes `Tuple([stream, default])` — only `stream`
         // is iterated; the `default` is a scalar consumed when the stream
@@ -139,7 +145,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
             if let TypedExprNode::Tuple(elts) = &mut argument.node
                 && let Some(stream) = elts.first_mut()
             {
-                wrap_with_iterate(stream);
+                wrap_with_iterate(stream, discharged);
             }
         }
         // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
@@ -155,7 +161,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
             if let TypedExprNode::Tuple(elts) = &mut argument.node
                 && let Some(trigger) = elts.first_mut()
             {
-                wrap_with_iterate(trigger);
+                wrap_with_iterate(trigger, discharged);
             }
         }
         // `CollectionUnion`'s function form: argument is `Tuple(ops...)`
@@ -169,7 +175,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         {
             if let TypedExprNode::Tuple(elts) = &mut argument.node {
                 for elt in elts.iter_mut() {
-                    wrap_with_iterate(elt);
+                    wrap_with_iterate(elt, discharged);
                 }
             }
         }
@@ -177,7 +183,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         // `input=None`.
         TypedExprNode::CollectionUnion(operands) => {
             for operand in operands.iter_mut() {
-                wrap_with_iterate(operand);
+                wrap_with_iterate(operand, discharged);
             }
         }
         // The remaining input-internalising builtins all compile their
@@ -185,14 +191,14 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         TypedExprNode::Apply { argument, function }
             if is_internalising_builtin_function(function) =>
         {
-            wrap_with_iterate(argument);
+            wrap_with_iterate(argument, discharged);
         }
         // Each transaction writer's source is iterated internally by the
         // register engine (`Recurse` for an induction accumulator); op-conversion
         // compiles it with `input=None`, so wrap it like a loop source.
         TypedExprNode::Transact { writers, .. } => {
             for w in writers.iter_mut() {
-                wrap_with_iterate(&mut w.source);
+                wrap_with_iterate(&mut w.source, discharged);
             }
         }
         // Value-position `Record` literals (not the special-cased
@@ -205,7 +211,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         TypedExprNode::Record(fields) => {
             for (_, field) in fields.iter_mut() {
                 if matches!(&field.ty, Type::Fun { .. }) {
-                    wrap_with_iterate(field);
+                    wrap_with_iterate(field, discharged);
                 }
             }
         }
@@ -276,7 +282,10 @@ pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
 /// when the type structure permits.  In both cases the result is a chain
 /// whose head provides iteration, so the surrounding op-conversion arm
 /// can compile its argument with `input=None` without erroring.
-pub(super) fn wrap_with_iterate(expr: &mut Expr) {
+pub(super) fn wrap_with_iterate(
+    expr: &mut Expr,
+    discharged: &std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+) {
     // `Let` nodes pass input through to both children — op-conversion's
     // `Let` arm threads its `input` into bound_expr and body.  At a
     // top-level Let (the only context that calls into this function with
@@ -302,9 +311,9 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
         // for that eager compilation — #232 tracks making iteration
         // use-driven so a dead binding is dropped rather than wrapped.
         if matches!(&bound_expr.ty, Type::Fun { .. }) {
-            wrap_with_iterate(bound_expr);
+            wrap_with_iterate(bound_expr, discharged);
         }
-        wrap_with_iterate(body);
+        wrap_with_iterate(body, discharged);
         return;
     }
     if is_iteration_bearing(expr) {
@@ -333,10 +342,24 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     // is an extent for the witness — with one, the ordinary iterate-then-restricts chain
     // below runs unchanged. Pinned by `sums.rs`, `a_filter_over_a_boxed_source_is_dropped`,
     // and its conditional counterpart.
-    if crate::ccl::ty::has_free_witness_ref(&domain_ty, &[])
-        && !matches!(domain_ty, Type::Refinement(..))
-    {
-        return;
+    if crate::ccl::ty::has_free_witness_ref(&domain_ty, &[]) {
+        // **A realized sum owes nothing here.** Realization materializes the witness, and
+        // with it discharges the restriction the site placed on that witness — as a gate
+        // per leg, reading that leg's own arm (`planning::conditionals`). So a site sitting
+        // over a `Realize` is already both iterated and filtered, and the `{𝑤 | 𝑝}` its type
+        // still shows is the *pre*-realization view `Realize` deliberately asserts.
+        //
+        // Emitting a chain here would restrict a second time, over a witness with no
+        // extent.
+        if witness_of(&domain_ty).is_some_and(|w| discharged.contains(&w)) {
+            return;
+        }
+        // Otherwise nothing materialized this witness — a described kind, needing the
+        // runtime witness — and falling through hands it to `extent_of`, which rejects it
+        // by name rather than dropping the restriction silently.
+        if !matches!(domain_ty, Type::Refinement(..)) {
+            return;
+        }
     }
 
     // Specialised iteration strategies come first: try the hash/loop-join
@@ -463,6 +486,14 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     *expr = typed_compose(elts).with_ty(site_ty);
 }
 
+/// The witness a domain names, under whatever refinements the consumer imposed.
+fn witness_of(domain: &Type) -> Option<crate::ccl::infer_var::WitnessBinderId> {
+    match ccl_utils::peel_refinements(domain) {
+        Type::WitnessRef(w) => Some(*w),
+        _ => None,
+    }
+}
+
 /// Returns `true` if `expr` (or the first element of `expr` if it's a
 /// `Compose`) already provides iteration — i.e. wrapping it with
 /// `iterate` would either be redundant or break op-conversion.
@@ -576,7 +607,7 @@ mod tests {
         // And that domain is exactly what disqualifies it as an iteration source.
         let mut expr = Expr::var(Name::from("xs")).with_ty(sum);
         let before = symbolic(&expr);
-        insert_iterate_markers(&mut expr);
+        insert_iterate_markers(&mut expr, &Default::default());
         assert_eq!(
             symbolic(&expr),
             before,
@@ -775,7 +806,7 @@ mod tests {
     #[test]
     fn test_wrap_with_iterate_unrefined_list_prepends_trivial_iterate() {
         let mut expr = list_123();
-        wrap_with_iterate(&mut expr);
+        wrap_with_iterate(&mut expr, &Default::default());
         let head = chain_head(&expr);
         assert!(
             is_iterate_apply(head),
@@ -802,7 +833,7 @@ mod tests {
         let refined_domain = refined_ty(Type::UIntRange(3), pred.clone());
 
         let mut expr = list_123().with_ty(fun_ty(refined_domain, int));
-        wrap_with_iterate(&mut expr);
+        wrap_with_iterate(&mut expr, &Default::default());
 
         let TypedExprNode::Compose(elts) = &expr.node else {
             panic!("expected Compose, got: {}", symbolic(&expr));
@@ -854,7 +885,7 @@ mod tests {
         let outer_refined = refined_ty(inner_refined, outer_pred);
 
         let mut expr = list_123().with_ty(fun_ty(outer_refined, int));
-        wrap_with_iterate(&mut expr);
+        wrap_with_iterate(&mut expr, &Default::default());
 
         let TypedExprNode::Compose(elts) = &expr.node else {
             panic!("expected Compose, got: {}", symbolic(&expr));
@@ -888,7 +919,7 @@ mod tests {
         let pred = trivially_true_predicate(int_ty());
         let mut expr = make_iterate(pred);
         let before = symbolic(&expr);
-        wrap_with_iterate(&mut expr);
+        wrap_with_iterate(&mut expr, &Default::default());
         assert_eq!(
             symbolic(&expr),
             before,
@@ -913,7 +944,7 @@ mod tests {
         )
         .with_ty(list_ty);
 
-        wrap_with_iterate(&mut expr);
+        wrap_with_iterate(&mut expr, &Default::default());
 
         // Outer Let stays as a Let — no wrap inserted at the program root.
         let TypedExprNode::Let {
@@ -955,7 +986,7 @@ mod tests {
         ]));
 
         let before = symbolic(&expr);
-        wrap_with_iterate(&mut expr);
+        wrap_with_iterate(&mut expr, &Default::default());
         assert_eq!(
             symbolic(&expr),
             before,
@@ -970,7 +1001,7 @@ mod tests {
         // to iterate; the helper bails without modifying anything.
         let mut expr = Expr::lit(Lit::Int(5)).with_ty(int_ty());
         let before = symbolic(&expr);
-        wrap_with_iterate(&mut expr);
+        wrap_with_iterate(&mut expr, &Default::default());
         assert_eq!(symbolic(&expr), before);
     }
 
@@ -989,7 +1020,7 @@ mod tests {
             fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
             int,
         );
-        insert_iterate_recurse(&mut expr);
+        insert_iterate_recurse(&mut expr, &Default::default());
         let TypedExprNode::Apply { argument, .. } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -1014,7 +1045,7 @@ mod tests {
             ),
             fun_ty(int, fun_ty(Type::UIntRange(3), Type::UIntRange(3))),
         );
-        insert_iterate_recurse(&mut expr);
+        insert_iterate_recurse(&mut expr, &Default::default());
         let TypedExprNode::Apply { argument, .. } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -1060,7 +1091,7 @@ mod tests {
             ),
         );
         let before = symbolic(&expr);
-        insert_iterate_recurse(&mut expr);
+        insert_iterate_recurse(&mut expr, &Default::default());
         assert_eq!(
             symbolic(&expr),
             before,
@@ -1082,7 +1113,7 @@ mod tests {
                 ]),
                 int,
             ));
-        insert_iterate_recurse(&mut expr);
+        insert_iterate_recurse(&mut expr, &Default::default());
         let TypedExprNode::CollectionUnion(operands) = &expr.node else {
             panic!("expected CollectionUnion, got: {}", symbolic(&expr));
         };
@@ -1126,7 +1157,7 @@ mod tests {
         })
         .with_ty(reg_ty);
 
-        insert_iterate_recurse(&mut expr);
+        insert_iterate_recurse(&mut expr, &Default::default());
 
         let TypedExprNode::Transact { writers, .. } = &expr.node else {
             panic!("expected Transact, got: {}", symbolic(&expr));
@@ -1152,7 +1183,7 @@ mod tests {
             ("xs".to_string(), fun_ty(Type::UIntRange(3), int.clone())),
             ("n".to_string(), int),
         ]));
-        insert_iterate_recurse(&mut expr);
+        insert_iterate_recurse(&mut expr, &Default::default());
         let TypedExprNode::Record(fields) = &expr.node else {
             panic!("expected Record, got: {}", symbolic(&expr));
         };
