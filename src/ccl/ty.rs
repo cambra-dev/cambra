@@ -1684,7 +1684,7 @@ pub fn application_order<'a>(
     // order `Display` renders a claim set in. A cost model is free to replace
     // this key (cheapest filter first) without touching identity.
     let mut ordered: Vec<&Refinement> = claims.iter().collect();
-    ordered.sort_by_key(|r| crate::ccl::symbolic::symbolic(&r.predicate));
+    ordered.sort_by_key(|r| symbolic::symbolic(&r.predicate));
     let mut narrowed = RefinementSet::new();
     ordered.into_iter().map(move |r| {
         let elem_ty = Type::refined(base.clone(), narrowed.clone());
