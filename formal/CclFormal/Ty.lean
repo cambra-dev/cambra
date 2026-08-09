@@ -63,10 +63,10 @@ deriving Repr, DecidableEq
 `Type::Refinement(base, r)` — a multiply-refined type is nested `refined`
 layers, and the subtype relation peels them all at once.
 
-`BEq` is derived (the `DecidableEq` deriving handler does not support this
-nested inductive); the executable checker compares with it, the declarative
-relation uses propositional equality, and `beq ↔ eq` is part of the
-checker-equivalence milestone step. -/
+Equality is hand-written (`Ty.beq` — the `BEq`/`DecidableEq` deriving
+handlers do not support this nested inductive) and bridged to propositional
+equality by `Ty.beq_iff`, yielding lawful `BEq` and `DecidableEq`
+instances. -/
 inductive Ty where
   | base (b : BaseTy)
   | uintRange (n : Nat)
@@ -77,7 +77,114 @@ inductive Ty where
   | record (fields : List (String × Ty))
   | variant (tags : List (FieldKey × Ty))
   | refined (base : Ty) (p : Pred)
-deriving Repr, BEq
+deriving Repr
+
+mutual
+
+/-- Structural equality. -/
+def Ty.beq : Ty → Ty → Bool
+  | .base a, .base b => a == b
+  | .uintRange a, .uintRange b => a == b
+  | .dataSource a, .dataSource b => a == b
+  | .txn, .txn => true
+  | .fn n0 k0 d0 c0, .fn n1 k1 d1 c1 =>
+      n0 == n1 && k0 == k1 && Ty.beq d0 d1 && Ty.beq c0 c1
+  | .tuple a, .tuple b => Ty.beqSeq a b
+  | .record a, .record b => Ty.beqFields a b
+  | .variant a, .variant b => Ty.beqTags a b
+  | .refined b0 p0, .refined b1 p1 => Ty.beq b0 b1 && p0 == p1
+  | _, _ => false
+termination_by a b => sizeOf a + sizeOf b
+decreasing_by all_goals (simp_wf; omega)
+
+def Ty.beqSeq : List Ty → List Ty → Bool
+  | [], [] => true
+  | t0 :: a, t1 :: b => Ty.beq t0 t1 && Ty.beqSeq a b
+  | _, _ => false
+termination_by a b => sizeOf a + sizeOf b
+decreasing_by all_goals (simp_wf; omega)
+
+def Ty.beqFields : List (String × Ty) → List (String × Ty) → Bool
+  | [], [] => true
+  | (n0, t0) :: a, (n1, t1) :: b => n0 == n1 && Ty.beq t0 t1 && Ty.beqFields a b
+  | _, _ => false
+termination_by a b => sizeOf a + sizeOf b
+decreasing_by all_goals (simp_wf; omega)
+
+def Ty.beqTags : List (FieldKey × Ty) → List (FieldKey × Ty) → Bool
+  | [], [] => true
+  | (k0, t0) :: a, (k1, t1) :: b => k0 == k1 && Ty.beq t0 t1 && Ty.beqTags a b
+  | _, _ => false
+termination_by a b => sizeOf a + sizeOf b
+decreasing_by all_goals (simp_wf; omega)
+
+end
+
+instance : BEq Ty := ⟨Ty.beq⟩
+
+mutual
+
+theorem Ty.beq_iff : (a b : Ty) → (Ty.beq a b = true ↔ a = b)
+  | .base _, b => by cases b <;> simp [Ty.beq]
+  | .uintRange _, b => by cases b <;> simp [Ty.beq]
+  | .dataSource _, b => by cases b <;> simp [Ty.beq]
+  | .txn, b => by cases b <;> simp [Ty.beq]
+  | .fn n0 k0 d0 c0, b => by
+      cases b <;> simp [Ty.beq]
+      case fn n1 k1 d1 c1 =>
+        simp [Ty.beq_iff d0 d1, Ty.beq_iff c0 c1, and_assoc]
+  | .tuple ts, b => by
+      cases b <;> simp [Ty.beq]
+      case tuple bs => exact Ty.beqSeq_iff ts bs
+  | .record fs, b => by
+      cases b <;> simp [Ty.beq]
+      case record bs => exact Ty.beqFields_iff fs bs
+  | .variant tags, b => by
+      cases b <;> simp [Ty.beq]
+      case variant bs => exact Ty.beqTags_iff tags bs
+  | .refined b0 p0, b => by
+      cases b <;> simp [Ty.beq]
+      case refined b1 p1 => simp [Ty.beq_iff b0 b1]
+termination_by a b => sizeOf a + sizeOf b
+decreasing_by all_goals (simp_wf; omega)
+
+theorem Ty.beqSeq_iff : (a b : List Ty) → (Ty.beqSeq a b = true ↔ a = b)
+  | [], [] => by simp [Ty.beqSeq]
+  | [], _ :: _ => by simp [Ty.beqSeq]
+  | _ :: _, [] => by simp [Ty.beqSeq]
+  | t0 :: a, t1 :: b => by
+      simp [Ty.beqSeq, Ty.beq_iff t0 t1, Ty.beqSeq_iff a b]
+termination_by a b => sizeOf a + sizeOf b
+decreasing_by all_goals (simp_wf; omega)
+
+theorem Ty.beqFields_iff :
+    (a b : List (String × Ty)) → (Ty.beqFields a b = true ↔ a = b)
+  | [], [] => by simp [Ty.beqFields]
+  | [], _ :: _ => by simp [Ty.beqFields]
+  | _ :: _, [] => by simp [Ty.beqFields]
+  | (n0, t0) :: a, (n1, t1) :: b => by
+      simp [Ty.beqFields, Ty.beq_iff t0 t1, Ty.beqFields_iff a b]
+termination_by a b => sizeOf a + sizeOf b
+decreasing_by all_goals (simp_wf; omega)
+
+theorem Ty.beqTags_iff :
+    (a b : List (FieldKey × Ty)) → (Ty.beqTags a b = true ↔ a = b)
+  | [], [] => by simp [Ty.beqTags]
+  | [], _ :: _ => by simp [Ty.beqTags]
+  | _ :: _, [] => by simp [Ty.beqTags]
+  | (k0, t0) :: a, (k1, t1) :: b => by
+      simp [Ty.beqTags, Ty.beq_iff t0 t1, Ty.beqTags_iff a b]
+termination_by a b => sizeOf a + sizeOf b
+decreasing_by all_goals (simp_wf; omega)
+
+end
+
+instance : LawfulBEq Ty where
+  eq_of_beq h := (Ty.beq_iff _ _).mp h
+  rfl := (Ty.beq_iff _ _).mpr rfl
+
+/-- Propositional equality of ground types is decidable. -/
+instance : DecidableEq Ty := fun a b => decidable_of_iff _ (Ty.beq_iff a b)
 
 /-- Well-formedness the Rust builders maintain but the `Type` representation
 does not enforce: record fields and variant tags are keyed **uniquely**.
