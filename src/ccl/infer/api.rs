@@ -492,6 +492,66 @@ impl LocatedInferError {
 ///
 /// Both messages are facts about the *pair*, true whichever side the solver reports as
 /// "expected" — an application's domain can be raised from either side of its edge.
+/// Where two types that **render identically** actually differ.
+///
+/// `Display` is deliberately lossy: a refinement prints its predicate through `symbolic`,
+/// which shows terms without their types, so two refinements whose predicates differ only in
+/// their *internal* annotations print the same. A mismatch between them reads as
+/// "expected 𝑇, found 𝑇" — a message that states the types agree while reporting that they
+/// do not, which sends a reader looking for the bug anywhere but where it is.
+///
+/// So when the rendered forms agree, fall through to the structural form and quote the first
+/// place it diverges. Only ever computed on this path: `Debug` of a type carrying a compiled
+/// predicate runs to a hundred kilobytes, which is exactly why the excerpt is a window and
+/// not the whole thing.
+fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
+    if type_a.to_string() != type_b.to_string() {
+        return None;
+    }
+    let (a, b) = (format!("{type_a:?}"), format!("{type_b:?}"));
+    let Some(at) = a
+        .char_indices()
+        .zip(b.chars())
+        .find(|((_, x), y)| x != y)
+        .map(|((i, _), _)| i)
+    else {
+        // One structure is a *prefix* of the other, so no character disagrees and a window
+        // would quote the same text twice. The difference is depth: something wraps one
+        // side and not the other.
+        let (shorter, longer, which) = if a.len() < b.len() {
+            (a.len(), b.len(), "found")
+        } else {
+            (b.len(), a.len(), "expected")
+        };
+        return Some(format!(
+            "note: these render identically, and structurally one is a prefix of the other \
+             — `{which}` carries {} more characters of structure ({longer} vs {shorter}), so \
+             the two differ in *depth*: a wrapper on one side that the other lacks",
+            longer - shorter
+        ));
+    };
+    // A window wide enough to name the constructor that differs, narrow enough to read.
+    let window = |s: &str| {
+        let start = s[..at.min(s.len())]
+            .char_indices()
+            .rev()
+            .nth(60)
+            .map_or(0, |(i, _)| i);
+        let end = s
+            .char_indices()
+            .skip_while(|(i, _)| *i < at)
+            .nth(60)
+            .map_or(s.len(), |(i, _)| i);
+        s[start..end].to_string()
+    };
+    Some(format!(
+        "note: these render identically — they differ where `Display` does not look, \
+         most often a refinement predicate's own types. First structural difference:\n             expected: …{}…\n    found:    …{}…",
+        window(&a),
+        window(&b)
+    ))
+}
+
 fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     match (type_a, type_b) {
         (Type::Record(_), Type::Tuple(_)) | (Type::Tuple(_), Type::Record(_)) => Some(
@@ -518,6 +578,9 @@ impl std::fmt::Debug for InferError {
                     ctx, type_a, type_b
                 )?;
                 if let Some(hint) = product_keying_hint(type_a, type_b) {
+                    write!(f, "\n  {hint}")?;
+                }
+                if let Some(hint) = identical_rendering_hint(type_a, type_b) {
                     write!(f, "\n  {hint}")?;
                 }
                 Ok(())
@@ -3382,5 +3445,56 @@ mod tests {
         } else {
             panic!("expected Fun type for lambda");
         }
+    }
+
+    /// **A mismatch whose two sides render identically still says where they differ.**
+    ///
+    /// A sum prints its witness as `σ` whatever binder it names, so two sums built by
+    /// different derivations render identically while comparing unequal — the α-invariance
+    /// cost that naming the binder buys, recorded in
+    /// `src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness". A mismatch
+    /// between them reads as "expected 𝑇, found 𝑇": a message that states the two agree
+    /// while reporting that they do not, which sends a reader looking anywhere but at the
+    /// binder.
+    #[test]
+    fn a_mismatch_that_renders_identically_says_where_it_differs() {
+        use crate::ccl::infer_var::fresh_witness_binder_id;
+        use crate::ccl::ty::{SigmaType, Type, TypeKind, Witness};
+
+        let sum = || {
+            let binder = fresh_witness_binder_id();
+            Type::Sigma(Box::new(SigmaType::bound(
+                Witness::bound_to(binder, TypeKind::Enumerated(vec![Type::UIntRange(2)])),
+                Type::data_fun(Type::WitnessRef(binder), Type::Base(BaseType::Int)),
+            )))
+        };
+        let (a, b) = (sum(), sum());
+        assert_eq!(
+            a.to_string(),
+            b.to_string(),
+            "the premise: these must render identically"
+        );
+        assert_ne!(a, b, "the premise: these must actually differ");
+
+        let rendered = format!(
+            "{:?}",
+            InferError::TypeMismatch {
+                ctx: "type of x".to_string(),
+                type_a: Box::new(a),
+                type_b: Box::new(b),
+            }
+        );
+        assert!(
+            rendered.contains("render identically"),
+            "no hint that the rendering is lossy: {rendered}"
+        );
+        assert!(
+            rendered.contains("First structural difference"),
+            "no structural excerpt: {rendered}"
+        );
+        assert!(
+            rendered.contains("WitnessBinderId"),
+            "the excerpt does not show what differs: {rendered}"
+        );
     }
 }
