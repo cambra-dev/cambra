@@ -334,19 +334,14 @@ fn bound_order_permutation_fuzz() {
     );
 }
 
-/// **Finding, pinned: α-variant dependent types split `SpecKey`.** The key
-/// deliberately excludes the Pi binder *name* (`spec_key.rs :: fun` — keying
-/// on it "would split every use into its own key"), but the name survives
-/// through the *predicates* that reference it, which the key compares
-/// structurally. Two independently-derived, semantically-identical dependent
-/// instantiation types — `(𝑥: 𝐷) ⤇ {Int | __elem == 𝑥}` at one call site,
-/// the same under `𝑦` at another — therefore key apart, and uses that should
-/// share a specialization get one clone each (over-splitting: a wasted
-/// clone, not a miscompile, per `spec_key.rs`'s own taxonomy). Canonical Pi
-/// binder names (the `REFINEMENT_BINDER` treatment, positionally) would make
-/// α-variants structurally identical and this test flip.
+/// **Finding, repaired: α-variant dependent types key together.** Before
+/// canonical Pi binders (`key_go` renaming references to `Name::pi(depth)`
+/// as it walks), the binder name — deliberately excluded from the key —
+/// leaked back in through the *predicates* that reference it, so
+/// `(𝑥: 𝐷) ⤇ {Int | __elem == 𝑥}` at one call site and its `𝑦`-twin at
+/// another keyed apart and split a specialization that should be shared.
 #[test]
-fn spec_key_splits_on_alpha_variant_dependent_types() {
+fn spec_key_shares_alpha_variant_dependent_types() {
     use super::differential::dep_pred;
     use super::spec_key;
     use crate::ccl::{Name, Refinement};
@@ -368,27 +363,24 @@ fn spec_key_splits_on_alpha_variant_dependent_types() {
     assert!(constrain_subtype(&fx, &fy, &mut c).is_ok());
     let mut c = ConstrainCache::new();
     assert!(constrain_subtype(&fy, &fx, &mut c).is_ok());
-    // …but the specialization key does not.
-    assert_ne!(
+    // …and the specialization key now agrees.
+    assert_eq!(
         spec_key(&fx),
         spec_key(&fy),
-        "SpecKey became α-insensitive — canonical binders landed; \
-         revisit the α-identity finding set"
+        "α-variant dependent instantiation types must share a specialization"
     );
 }
 
-/// **Finding, pinned: merging α-variant dependent bounds is order-dependent
-/// and leaves a dangling binder reference.** Two α-variant upper bounds
-/// meeting at one variable merge into a fun shape that keeps the **first
-/// arrival's** binder name (`compact.rs`: `a.name.or_else(|| b.name)`) while
-/// the refinement sets *union* — so the coalesced type is
-/// `(𝑥: 𝐷) ⤇ {{Int | __elem == 𝑥} | __elem == 𝑦}`: order-dependent in the
-/// surviving binder, and carrying a predicate that references a binder the
-/// type no longer binds. The two predicates are α-copies of one constraint
-/// and should have collapsed to one; structural (α-sensitive) dedup cannot
-/// see that. Same repair direction as above.
+/// **Finding, repaired: merging α-variant dependent bounds is canonical.**
+/// Before canonical Pi binders, the merged fun shape kept the *first
+/// arrival's* binder while the refinement sets unioned both α-copies of one
+/// constraint, coalescing to the order-dependent — and dangling —
+/// `(𝑥: 𝐷) ⤇ {{Int | __elem == 𝑥} | __elem == 𝑦}`. With `compact_go`
+/// renaming binders and references to `Name::pi(depth)` as bounds flatten,
+/// α-variants compact identically: the copies dedup, the binder is
+/// arrival-independent, and nothing dangles.
 #[test]
-fn alpha_variant_bound_merge_is_order_dependent() {
+fn alpha_variant_bound_merge_is_canonical() {
     use super::differential::dep_pred;
     use crate::ccl::{Name, Refinement};
 
@@ -408,10 +400,22 @@ fn alpha_variant_bound_merge_is_order_dependent() {
         coalesce_compact(&simplify_type(compact_type(&v))).unwrap()
     };
     let (fx, fy) = (dep_fun("x"), dep_fun("y"));
-    assert_ne!(
-        coalesce_with_order(&fx, &fy),
-        coalesce_with_order(&fy, &fx),
-        "α-variant bound merge became order-independent — canonical binders \
-         (or α-aware dedup) landed; revisit the α-identity finding set"
+    let a = coalesce_with_order(&fx, &fy);
+    let b = coalesce_with_order(&fy, &fx);
+    assert_eq!(
+        a, b,
+        "α-variant bound merge must be arrival-order-independent"
+    );
+    // The α-copies collapsed: one binder, one predicate, nothing dangling.
+    let Type::Fun { name, codomain, .. } = &a else {
+        panic!("expected a function, got {a}");
+    };
+    assert_eq!(*name, Some(Name::pi(0)));
+    let Type::Refinement(base, _) = &**codomain else {
+        panic!("expected exactly one refinement layer, got {codomain}");
+    };
+    assert!(
+        !matches!(&**base, Type::Refinement(..)),
+        "the two α-copies of one constraint must dedup to one layer, got {codomain}"
     );
 }
