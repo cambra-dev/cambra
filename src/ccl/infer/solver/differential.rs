@@ -31,13 +31,13 @@ use crate::ccl::{
 };
 
 /// xorshift64* — deterministic, dependency-free.
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(super) fn new(seed: u64) -> Self {
         Rng(seed | 1)
     }
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -45,10 +45,10 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-    fn below(&mut self, n: u64) -> u64 {
+    pub(super) fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
-    fn chance(&mut self, num: u64, den: u64) -> bool {
+    pub(super) fn chance(&mut self, num: u64, den: u64) -> bool {
         self.below(den) < num
     }
 }
@@ -84,7 +84,7 @@ fn gen_leaf(rng: &mut Rng) -> Type {
     }
 }
 
-fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
+pub(super) fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
     if depth == 0 || rng.chance(1, 3) {
         return gen_leaf(rng);
     }
