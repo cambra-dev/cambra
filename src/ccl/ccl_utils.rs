@@ -7,7 +7,8 @@ use std::rc::Rc;
 use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 use crate::ccl::{
     BaseType, BinOpKind, Branch, Builtin, Expr, F_FIRE_SUFFIX, F_WRITES, FieldKey, Lit, LogicKind,
-    Name, PredicateId, Refinement, Type, TypedExprNode, UnaryOpKind, V_ABORT, V_COMMIT,
+    Name, PredicateId, Refinement, RefinementSet, Type, TypedExprNode, UnaryOpKind, V_ABORT,
+    V_COMMIT,
 };
 
 /// The `commit` selector field of the **intermediate** decision record the two
@@ -285,12 +286,14 @@ pub(crate) fn debug_assert_no_iteration_markers_in_type(ty: &Type) {
             || e.fold_children(false, |acc, c| acc || expr_has_marker(c))
     }
     fn go(ty: &Type) {
-        if let Type::Refinement(_, r) = ty {
-            debug_assert!(
-                !expr_has_marker(&r.predicate),
-                "iteration/restrict marker leaked into a refinement predicate: {}",
-                crate::ccl::symbolic::symbolic(&r.predicate)
-            );
+        if let Type::Refinement(_, refinements) = ty {
+            for r in refinements {
+                debug_assert!(
+                    !expr_has_marker(&r.predicate),
+                    "iteration/restrict marker leaked into a refinement predicate: {}",
+                    crate::ccl::symbolic::symbolic(&r.predicate)
+                );
+            }
         }
         ty.walk_children(go);
     }
@@ -532,12 +535,12 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
     // capability yields a capability.
     //
     // The refinement is built **without** `refine_with`'s trivially-true
-    // degeneracy: the caller emits one `restrict` per refinement layer the site
-    // declared, so dropping a layer here would leave the source producing a bare
-    // extent while the site — and the body's `cast` — still demand the refined
-    // one. A layer that is vacuous is the site's business, not this constructor's.
-    let refined_dom = Type::Refinement(
-        Box::new(domain.clone()),
+    // degeneracy: the caller emits one `restrict` per refinement the site declared,
+    // so dropping one here would leave the source producing a bare extent while the
+    // site — and the body's `cast` — still demand the refined one. A vacuous
+    // refinement is the site's business, not this constructor's.
+    let refined_dom = Type::refined_one(
+        domain.clone(),
         Refinement::born(Rc::new(bare_predicate_of_fn(&domain, predicate.clone()))),
     );
     let refined_stream = Type::fun_like(&upstream_ty, refined_dom, value_ty);
@@ -682,16 +685,21 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
 /// [`TypedExprNode::Cast`]'s `target` to reattach the refinement to the
 /// reconstructed `groupby` lambda.  (Inference does not need it: it types the
 /// cast as the upcast `value_ty <: target` and lets the solver carry the
-/// refinement.) The returned `Refinement` shares the predicate's `Rc<Expr>` with
+/// refinement.) The returned refinements share their predicates' `Rc<Expr>`s with
 /// `target`.
-pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
+///
+/// The whole [`RefinementSet`] is returned rather than a single refinement: a target
+/// is *built* carrying one predicate ([`refined_data_fun`]), but the domain it
+/// unifies against may contribute more, and a caller reattaching "the cast's
+/// refinement" wants all of what the target demands.
+pub fn cast_target_refinement(target: &Type) -> Option<RefinementSet> {
     let Type::Fun { domain, .. } = target else {
         return None;
     };
-    let Type::Refinement(_, refinement) = domain.as_ref() else {
+    let Type::Refinement(_, refinements) = domain.as_ref() else {
         return None;
     };
-    Some(refinement.clone())
+    Some(refinements.clone())
 }
 
 /// Build a function type whose domain is `base_domain` wrapped in a fresh
@@ -707,7 +715,7 @@ pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
 /// inference fills them in by unifying against the value being cast.
 pub fn refined_data_fun(base_domain: Type, predicate: Expr, codomain: Type) -> Type {
     Type::data_fun(
-        Type::Refinement(Box::new(base_domain), Refinement::born(Rc::new(predicate))),
+        Type::refined_one(base_domain, Refinement::born(Rc::new(predicate))),
         codomain,
     )
 }
@@ -815,7 +823,7 @@ pub fn sync_cast_targets(expr: &mut Expr) {
 /// Carry a re-typed node's [`FunKind`](crate::ccl::ty::FunKind) onto its `target`,
 /// when that node is a [`TypedExprNode::Cast`].
 ///
-/// A cast's `target` states the claims the cast asserts, and those are the cast's
+/// A cast's `target` states the refinements the cast asserts, and those are the cast's
 /// own — a rewrite must not overwrite them with a type derived from the
 /// surrounding term. The `FunKind` is different: nothing asserts it
 /// independently, `emit_cast` reads it off `target` to type the node, and so the
@@ -825,7 +833,7 @@ pub fn sync_cast_targets(expr: &mut Expr) {
 /// sub-expressions (`simplify`'s collapse rules). Such a rewrite writes the
 /// position's type onto the survivor, and where the survivor is a cast that
 /// re-kinds it — `⟨id, const 𝑥⟩ ≫ apply` collapsing to a `𝑥` that is a collection
-/// standing in a morphism position. Only the kind moves; the claims stay the
+/// standing in a morphism position. Only the kind moves; the refinements stay the
 /// cast's.
 pub(crate) fn sync_cast_target_kind(expr: &mut Expr) {
     if matches!(expr.node, TypedExprNode::Cast { .. }) {
@@ -845,7 +853,7 @@ pub(crate) fn refine_with(base: Type, predicate: &Expr) -> Type {
         return base;
     }
     let bare = bare_predicate_of_fn(&base, predicate.clone());
-    Type::Refinement(Box::new(base), Refinement::born(Rc::new(bare)))
+    Type::refined_one(base, Refinement::born(Rc::new(bare)))
 }
 
 /// Is `bare` the trivially-true predicate in **bare** form, `__elem ▷ (true ▷ const)`?
@@ -871,10 +879,7 @@ pub fn refine_with_bare(base: Type, bare_predicate: &Expr) -> Type {
     if is_trivially_true_bare_predicate(bare_predicate) {
         return base;
     }
-    Type::Refinement(
-        Box::new(base),
-        Refinement::born(Rc::new(bare_predicate.clone())),
-    )
+    Type::refined_one(base, Refinement::born(Rc::new(bare_predicate.clone())))
 }
 
 /// Count free occurrences of `name` in `expr`, including occurrences in
@@ -1171,10 +1176,12 @@ pub fn walk_refined_predicates<F>(ty: &Type, visited: &mut HashSet<PredicateId>,
 where
     F: FnMut(&Expr, &mut HashSet<PredicateId>),
 {
-    if let Type::Refinement(_, refinement) = ty
-        && visited.insert(refinement.predicate_id())
-    {
-        f(&refinement.predicate, visited);
+    if let Type::Refinement(_, refinements) = ty {
+        for refinement in refinements {
+            if visited.insert(refinement.predicate_id()) {
+                f(&refinement.predicate, visited);
+            }
+        }
     }
     ty.walk_children(|child| walk_refined_predicates(child, visited, f));
 }
@@ -1449,12 +1456,14 @@ impl TermMemo {
 /// refinement, i.e. whether sharing was split (see `tests/predicate_sharing.rs`).
 pub fn reachable_refinements(expr: &Expr) -> Vec<Refinement> {
     fn in_type(ty: &Type, out: &mut Vec<Refinement>, seen: &mut HashSet<PredicateId>) {
-        if let Type::Refinement(_, r) = ty
-            && seen.insert(r.predicate_id())
-        {
-            out.push(r.clone());
-            // A predicate's own subexpressions carry further refinements.
-            in_expr(&r.predicate, out, seen);
+        if let Type::Refinement(_, refinements) = ty {
+            for r in refinements {
+                if seen.insert(r.predicate_id()) {
+                    out.push(r.clone());
+                    // A predicate's own subexpressions carry further refinements.
+                    in_expr(&r.predicate, out, seen);
+                }
+            }
         }
         ty.walk_children(|c| in_type(c, out, seen));
     }
@@ -1511,8 +1520,10 @@ where
     F: FnMut(&mut Expr, &PredMemo<C>) -> bool,
 {
     let mut changed = false;
-    if let Type::Refinement(_, refinement) = ty {
-        changed |= memo.rebuild(refinement, context, |pred| f(pred, memo));
+    if let Type::Refinement(_, refinements) = ty {
+        refinements.rewrite_each(|_, refinement| {
+            changed |= memo.rebuild(refinement, context, |pred| f(pred, memo));
+        });
     }
     ty.walk_children_mut(|child| changed |= walk_refined_predicates_mut(child, memo, context, f));
     changed

@@ -155,8 +155,8 @@ fn filtered_join_nesting_stays_shared() {
 
 /// `{Int | true}` over a fresh predicate `Rc`.
 fn refined_int() -> Type {
-    Type::Refinement(
-        Box::new(Type::Base(BaseType::Int)),
+    Type::refined_one(
+        Type::Base(BaseType::Int),
         Refinement::born(Rc::new(Expr::lit(Lit::Bool(true)))),
     )
 }

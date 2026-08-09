@@ -932,7 +932,7 @@ impl Subst {
                 restricted.rewrite_type_go(codomain, memo);
             }
 
-            Type::Refinement(base, r) => {
+            Type::Refinement(base, refinements) => {
                 // The refinement implicitly binds REFINEMENT_BINDER in its bare
                 // predicate, so the substitution acts *under* that binder.
                 let restricted = self.shadow(&Name::elem());
@@ -942,25 +942,27 @@ impl Subst {
                 // served to an occurrence inside it (and a vacuous decision made
                 // inside is never served outside). That is what makes threading one
                 // memo across binder crossings correct — see `PredMemo`.
-                memo.rebuild(r, &restricted, |pred| {
-                    if !restricted.0.keys().any(|k| is_free(k, pred)) {
-                        // Vacuous: no substituted binder occurs free here, so report
-                        // no change and keep the origin `Rc` — a predicate this
-                        // substitution merely walks past stays shared with its other
-                        // occurrences (mirroring `force_refinement`'s transport
-                        // path). Memoizing the decision also makes this `is_free`
-                        // scan run once per distinct predicate, not per occurrence.
-                        return false;
-                    }
-                    restricted.rewrite_expr_go(pred, memo);
-                    // Keep the predicate marker-free: a substituted collection may
-                    // carry a term-tree `iterate` marker that must not leak into a
-                    // type (see `strip_iterate_markers` and the `force_refinement`
-                    // twin). Only the rewritten path needs it — a marker arrives
-                    // *through* the substitution, so the vacuous path above, which
-                    // rewrites nothing and keeps the origin `Rc`, has none to strip.
-                    *pred = strip_iterate_markers(pred);
-                    true
+                refinements.rewrite_each(|_, r| {
+                    memo.rebuild(r, &restricted, |pred| {
+                        if !restricted.0.keys().any(|k| is_free(k, pred)) {
+                            // Vacuous: no substituted binder occurs free here, so report
+                            // no change and keep the origin `Rc` — a predicate this
+                            // substitution merely walks past stays shared with its other
+                            // occurrences (mirroring `force_refinement`'s transport
+                            // path). Memoizing the decision also makes this `is_free`
+                            // scan run once per distinct predicate, not per occurrence.
+                            return false;
+                        }
+                        restricted.rewrite_expr_go(pred, memo);
+                        // Keep the predicate marker-free: a substituted collection may
+                        // carry a term-tree `iterate` marker that must not leak into a
+                        // type (see `strip_iterate_markers` and the `force_refinement`
+                        // twin). Only the rewritten path needs it — a marker arrives
+                        // *through* the substitution, so the vacuous path above, which
+                        // rewrites nothing and keeps the origin `Rc`, has none to strip.
+                        *pred = strip_iterate_markers(pred);
+                        true
+                    });
                 });
                 self.rewrite_type_go(base, memo);
             }
@@ -1143,12 +1145,18 @@ impl Subst {
                 }
             }
 
-            Type::Refinement(base, r) => {
+            Type::Refinement(base, refinements) => {
                 // The refinement implicitly binds REFINEMENT_BINDER in its bare
                 // predicate; `force_refinement` shadows it before rewriting.
                 // Substituting the predicate changes its meaning, so it builds a
                 // fresh predicate `Rc` rather than sharing the original's.
-                Type::Refinement(Box::new(self.apply_type(base)), self.force_refinement(r))
+                Type::refined(
+                    self.apply_type(base),
+                    refinements
+                        .iter()
+                        .map(|r| self.force_refinement(r))
+                        .collect(),
+                )
             }
 
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply_type(t)).collect()),
@@ -1296,15 +1304,17 @@ fn collect_type_fv(
                 collect_type_fv(codomain, bnd, visited, out)
             });
         }
-        Type::Refinement(base, r) => {
+        Type::Refinement(base, refinements) => {
             // Walk each predicate term at most once (a term shared by `Rc`
             // across occurrences is a DAG — dedup, not cycle-breaking). The
             // refinement binds the implicit REFINEMENT_BINDER over `base`, so it
             // is bound — not free — inside the predicate.
-            if visited.insert(r.predicate_id()) {
-                with_binders(bound, [Name::elem()], |bnd| {
-                    collect_expr_fv(&r.predicate, bnd, visited, out)
-                });
+            for r in refinements {
+                if visited.insert(r.predicate_id()) {
+                    with_binders(bound, [Name::elem()], |bnd| {
+                        collect_expr_fv(&r.predicate, bnd, visited, out)
+                    });
+                }
             }
             collect_type_fv(base, bound, visited, out);
         }
@@ -1524,9 +1534,9 @@ impl<'a> PiWalk<'a> {
                 self.ty(domain, depth);
                 self.ty(codomain, depth + 1);
             }
-            Type::Refinement(base, r) => {
+            Type::Refinement(base, refinements) => {
                 self.ty(base, depth);
-                self.refinement(r, depth);
+                refinements.rewrite_each(|_, r| self.refinement(r, depth));
             }
             Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
             Type::Record(fs) => fs.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
@@ -1651,10 +1661,11 @@ pub fn references_enclosing_function(ty: &Type) -> bool {
             // reached at two depths is two questions. Keying on identity alone
             // answers the second from the first and reports a dependent
             // codomain as independent — the index would then lose its binder.
-            Type::Refinement(base, r) => {
-                (visited.insert((r.predicate_id(), depth))
-                    && expr_scan(&r.predicate, depth, visited))
-                    || ty_scan(base, depth, visited)
+            Type::Refinement(base, refinements) => {
+                refinements.iter().any(|r| {
+                    visited.insert((r.predicate_id(), depth))
+                        && expr_scan(&r.predicate, depth, visited)
+                }) || ty_scan(base, depth, visited)
             }
             Type::Tuple(ts) => ts.iter().any(|t| ty_scan(t, depth, visited)),
             Type::Record(fs) => fs.iter().any(|(_, t)| ty_scan(t, depth, visited)),
@@ -1856,11 +1867,11 @@ mod tests {
         use std::rc::Rc;
         // y : {_ | k > 0} — `k` appears only in the type slot's predicate.
         let slot_ref = Refinement::born(Rc::new(gt(var("k"), int(0))));
-        let e = var("y").with_ty(Type::Refinement(Box::new(Type::Hole), slot_ref.clone()));
+        let e = var("y").with_ty(Type::refined_one(Type::Hole, slot_ref.clone()));
         let dis = Subst::discharge("k", int(5));
 
         let out = dis.apply_expr(&e);
-        let Type::Refinement(_, out_ref) = &out.ty else {
+        let [out_ref] = out.ty.refinements() else {
             panic!("type slot preserved");
         };
         assert_eq!(
@@ -1880,7 +1891,7 @@ mod tests {
         let forced = dis.force_refinement(&outer);
         assert!(!Rc::ptr_eq(&forced.predicate, &outer.predicate));
         let forced_pred = &*forced.predicate;
-        let Type::Refinement(_, nested) = &forced_pred.ty else {
+        let [nested] = forced_pred.ty.refinements() else {
             panic!("nested refinement preserved");
         };
         assert_eq!(*nested.predicate, gt(int(5), int(0)));
@@ -1916,7 +1927,7 @@ mod tests {
     #[test]
     fn scenario_f_context_check() {
         let pred = TypedExpr::lambda("y", Type::Hole, gt(var("y"), var("k")));
-        let bad = Type::Refinement(Box::new(Type::infer()), Refinement::born(Rc::new(pred)));
+        let bad = Type::refined_one(Type::infer(), Refinement::born(Rc::new(pred)));
         let only_x: BTreeSet<Binder> = [Name::raw("x")].into_iter().collect();
         let only_k: BTreeSet<Binder> = [Name::raw("k")].into_iter().collect();
         assert!(!well_formed(&bad, &only_x));
@@ -1960,12 +1971,12 @@ mod tests {
     #[test]
     fn apply_type_discharges_refinement_predicate() {
         let r = Refinement::born(Rc::new(gt(var("i"), var("k"))));
-        let ty = Type::fun(Type::Refinement(Box::new(Type::infer()), r), Type::infer());
+        let ty = Type::fun(Type::refined_one(Type::infer(), r), Type::infer());
         let out = Subst::discharge("k", int(5)).apply_type(&ty);
         let Type::Fun { domain, .. } = &out else {
             panic!("expected fun");
         };
-        let Type::Refinement(_, r2) = domain.as_ref() else {
+        let [r2] = domain.refinements() else {
             panic!("expected refinement domain");
         };
         assert_eq!(*r2.predicate, gt(var("i"), int(5)));
@@ -1980,7 +1991,7 @@ mod tests {
     fn apply_type_shadows_pi_binder() {
         let refined = |pred: TypedExpr| {
             Type::fun(
-                Type::Refinement(Box::new(Type::infer()), Refinement::born(Rc::new(pred))),
+                Type::refined_one(Type::infer(), Refinement::born(Rc::new(pred))),
                 Type::infer(),
             )
         };
@@ -1998,7 +2009,7 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            *r2.predicate,
+            *r2.sole().expect("one refinement").predicate,
             gt(var("i"), TypedExpr::var(Name::pi_bound_bare(0)))
         );
 
@@ -2017,9 +2028,7 @@ mod tests {
         let Type::Fun { domain, .. } = codomain.as_ref() else {
             panic!()
         };
-        let Type::Refinement(_, r2) = domain.as_ref() else {
-            panic!()
-        };
+        let [r2] = domain.refinements() else { panic!() };
         assert_eq!(*r2.predicate, gt(var("i"), var("k")));
     }
 
@@ -2178,8 +2187,8 @@ mod rewrite_tests {
         let shared = Rc::new(gt(var("k"), int(0)));
         // Two refinement occurrences sharing one predicate term, both inside a
         // single type (a function's domain and codomain).
-        let dom = Type::Refinement(Box::new(Type::Hole), Refinement::sharing(&shared));
-        let cod = Type::Refinement(Box::new(Type::Hole), Refinement::sharing(&shared));
+        let dom = Type::refined_one(Type::Hole, Refinement::sharing(&shared));
+        let cod = Type::refined_one(Type::Hole, Refinement::sharing(&shared));
         let mut e = var("y").with_ty(Type::fun(dom, cod));
 
         Subst::discharge("k", int(5)).rewrite_expr(&mut e);
@@ -2190,10 +2199,10 @@ mod rewrite_tests {
         else {
             panic!("function type preserved");
         };
-        let Type::Refinement(_, rd) = domain.as_ref() else {
+        let [rd] = domain.refinements() else {
             panic!("domain refinement preserved");
         };
-        let Type::Refinement(_, rc) = codomain.as_ref() else {
+        let [rc] = codomain.refinements() else {
             panic!("codomain refinement preserved");
         };
         assert_eq!(
@@ -2451,13 +2460,13 @@ mod locally_nameless_tests {
     /// `{Int | <pred>}` — the predicate need not be `Bool`-typed for these
     /// structural tests.
     fn refined(pred: TypedExpr) -> Type {
-        Type::Refinement(Box::new(int()), Refinement::born(Rc::new(pred)))
+        Type::refined_one(int(), Refinement::born(Rc::new(pred)))
     }
     fn predicate_of(ty: &Type) -> &TypedExpr {
-        let Type::Refinement(_, r) = ty else {
+        let Type::Refinement(_, refinements) = ty else {
             panic!("expected a refinement, got {ty}");
         };
-        &r.predicate
+        &refinements.sole().expect("one refinement").predicate
     }
     fn is_pi_bound(e: &TypedExpr, k: u32) -> bool {
         matches!(&e.node, TypedExprNode::Var(n) if n.pi_bound_index() == Some(k))
@@ -2585,17 +2594,17 @@ mod locally_nameless_tests {
         let k = Name::fresh("k");
         let shared = Rc::new(TypedExpr::var(k.clone()));
         let untouched = Rc::new(TypedExpr::lit(Lit::Int(1)));
-        let slot = |r: &Rc<TypedExpr>| Type::Refinement(Box::new(int()), Refinement::sharing(r));
+        let slot = |r: &Rc<TypedExpr>| Type::refined_one(int(), Refinement::sharing(r));
         let ty = Type::Tuple(vec![slot(&shared), slot(&shared), slot(&untouched)]);
         let closed = close_pi_binder(&k, &ty);
         let Type::Tuple(ts) = &closed else {
             panic!("closing preserves the tuple");
         };
         let pred_rc = |t: &Type| {
-            let Type::Refinement(_, r) = t else {
+            let Type::Refinement(_, refinements) = t else {
                 panic!("expected refinement");
             };
-            Rc::clone(&r.predicate)
+            Rc::clone(&refinements.sole().expect("one refinement").predicate)
         };
         assert!(
             Rc::ptr_eq(&pred_rc(&ts[0]), &pred_rc(&ts[1])),
@@ -2640,7 +2649,7 @@ mod locally_nameless_tests {
     #[test]
     fn the_dependence_test_is_per_position_not_per_predicate() {
         let shared = Rc::new(TypedExpr::var(Name::pi_bound_bare(0)));
-        let slot = || Type::Refinement(Box::new(int()), Refinement::sharing(&shared));
+        let slot = || Type::Refinement(Box::new(int()), Refinement::sharing(&shared).into());
         // Under a function the index is one crossing short of the enclosing
         // one, so that position does not reference it; beside the function it
         // does.

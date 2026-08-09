@@ -1670,8 +1670,8 @@ groups(0)
     let Type::Fun { domain: dom, .. } = &ty else {
         panic!("expected a partition function type, got {ty}");
     };
-    let Type::Refinement(_, r) = &**dom else {
-        panic!("expected a refined partition domain, got {ty}");
+    let [r] = dom.refinements() else {
+        panic!("expected a singly-refined partition domain, got {ty}");
     };
     let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
     assert!(
@@ -1710,8 +1710,8 @@ apply0(groups)
     let Type::Fun { domain: dom, .. } = &ty else {
         panic!("expected a partition function type, got {ty}");
     };
-    let Type::Refinement(_, r) = &**dom else {
-        panic!("expected a refined partition domain, got {ty}");
+    let [r] = dom.refinements() else {
+        panic!("expected a singly-refined partition domain, got {ty}");
     };
     let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
     assert!(
@@ -1744,8 +1744,8 @@ fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
     let Type::Fun { domain: dom, .. } = &**codomain else {
         panic!("expected the partition function inside the key function, got {ty}");
     };
-    let Type::Refinement(_, r) = &**dom else {
-        panic!("expected a refined partition domain, got {ty}");
+    let [r] = dom.refinements() else {
+        panic!("expected a singly-refined partition domain, got {ty}");
     };
     // Stored: the reference is a bound index, not a free name. Read off the
     // term, because the *rendering* deliberately spells it as the binder.

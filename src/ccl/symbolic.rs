@@ -935,9 +935,9 @@ in x"
     #[case(
         Expr::lambda(
             "x",
-            Type::Refinement(
-                Box::new(Type::Base(BaseType::Int)),
-                Refinement::born(Rc::new(Expr::lit(Lit::Bool(true)))),
+            Type::refined_one(
+                Type::Base(BaseType::Int),
+                Refinement::born(Rc::new(Expr::lit(Lit::Bool(true))))
             ),
             Expr::var("x"),
         ),

@@ -866,7 +866,7 @@ struct Place {
     reqs: Vec<(Rc<TraitObligation>, u8)>,
 }
 
-/// Strip every refinement layer, as [`offered`] does: `{𝑇 | 𝑝}` constrains a place
+/// Strip every refinement, as [`offered`] does: `{𝑇 | 𝑝}` constrains a place
 /// exactly as `𝑇` does, so structure underneath a refinement is still structure.
 fn peel_refinements(ty: &Type) -> &Type {
     let mut cur = ty;
@@ -1532,8 +1532,8 @@ mod tests {
     /// emission an operand is usually still a variable with nothing to strip.
     #[test]
     fn a_refinement_narrows_as_its_base() {
-        let refined = Type::Refinement(
-            Box::new(Type::Base(BaseType::String)),
+        let refined = Type::refined_one(
+            Type::Base(BaseType::String),
             crate::ccl::Refinement::born(Rc::new(crate::ccl::TypedExpr::lit(
                 crate::ccl::Lit::Bool(true),
             ))),

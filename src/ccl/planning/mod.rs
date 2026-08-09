@@ -68,10 +68,10 @@ pub(crate) use predicates::fn_of_bare_predicate;
 ///    join conditions.  Emitted as a `JoinPlan::Hash` / `JoinPlan::Loop`
 ///    tree compiled to a CCL chain whose leaves are iteration-bearing.
 /// 2. **Iterate-then-restricts chain** otherwise — build the source by
-///    *applying* one `restrict(p)` filter per refinement layer (innermost
-///    first) to a chain-head `Apply(true ▷ const, Iterate)`, then compose
-///    the value-producing body onto it: `(iterate ▷ (p_inner ▷ restrict)
-///    ▷ … ▷ (p_outer ▷ restrict)) ≫ body`.  Each `restrict` *applies* to
+///    *applying* one `restrict(p)` filter per refinement, in
+///    [`crate::ccl::application_order`], to a chain-head
+///    `Apply(true ▷ const, Iterate)`, then compose the value-producing body
+///    onto it: `(iterate ▷ (p₁ ▷ restrict) ▷ … ▷ (pₙ ▷ restrict)) ≫ body`.  Each `restrict` *applies* to
 ///    its upstream — it is a function transformer, not a morphism composed
 ///    with the source (its honest type makes the composed form ill-typed;
 ///    see [`make_restrict`]).  Unrefined sites get just the chain-head
@@ -298,7 +298,7 @@ pub(crate) mod test_helpers {
     /// predicate.  The predicate must have type `base ⇒ Bool` so the
     /// refinement is well-formed.
     pub(crate) fn refined_ty(base: Type, predicate: Expr) -> Type {
-        Type::Refinement(Box::new(base), Refinement::born(Rc::new(predicate)))
+        Type::refined_one(base, Refinement::born(Rc::new(predicate)))
     }
 
     /// Build an `Apply { argument, function: <builtin> }` whose function

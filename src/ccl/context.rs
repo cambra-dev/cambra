@@ -588,8 +588,12 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId>
     use crate::ccl::ty::Type;
 
     fn from_ty(t: &Type, acc: &mut std::collections::HashSet<NodeId>) {
-        if let Type::Refinement(_, r) = t {
-            from_expr(&r.predicate, acc);
+        if let Type::Refinement(_, refinements) = t {
+            // Every refinement's predicate rides the slot, so every one of them
+            // carries ids the projections must explain.
+            for r in refinements.iter() {
+                from_expr(&r.predicate, acc);
+            }
         }
         t.walk_children(|c| from_ty(c, acc));
     }

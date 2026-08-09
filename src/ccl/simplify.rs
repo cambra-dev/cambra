@@ -476,7 +476,7 @@ fn try_pairwise_in_compose(
     // A `Cast` states its `FunKind` twice — on the node and on `target`, which is
     // where its typing rule reads it — so writing the position's type above
     // without the second copy leaves the node contradicting itself. Only the kind
-    // is carried across: the `target`'s *claims* are the cast's own assertion, and
+    // is carried across: the `target`'s refinements are the cast's own assertion, and
     // a rewrite that overwrote them with a type derived from the surrounding term
     // would make the assertion track its own consumer.
     crate::ccl::ccl_utils::sync_cast_target_kind(expr);

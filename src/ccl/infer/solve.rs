@@ -300,7 +300,7 @@ fn assert_reads_stable(reads: &[ReadRecord]) {
 /// **bounds on inference variables**, so this checks the *structural skeleton* a
 /// bound determines — bases, ranges, sources, Pi binder names,
 /// function/product/variant shape, and, for a [`ReadPurpose::Stamp`] read, the
-/// *number* of refinement layers at each position. A refinement is lattice content
+/// *number* of refinements at each position. A refinement is lattice content
 /// like a record field, so a bound determines it as much as it determines the
 /// base: one appearing on — or vanishing from — a variable an earlier read
 /// consumed is exactly the staleness this guards, and with every literal
@@ -325,7 +325,7 @@ fn assert_reads_stable(reads: &[ReadRecord]) {
 ///   or leaving without depending on term identity, which legitimately churns.
 #[cfg(debug_assertions)]
 fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool {
-    // Peel refinement layers, counting them. The *base* under the refinements is
+    // Peel the refinements, counting them. The *base* under the refinements is
     // what recurses structurally; predicate content is out of scope (above).
     fn peel<'t>(mut t: &'t Type, layers: &mut usize) -> &'t Type {
         while let Type::Refinement(inner, _) = t {
@@ -410,7 +410,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
 }
 
 /// The history half of [`types_agree_modulo_unread`], split out because it must run
-/// **before** the refinement-layer comparison (see the call site).
+/// **before** the refinement-count comparison (see the call site).
 ///
 /// Two histories of *different* kinds never agree — an `Overwrite` and a `Feed` are
 /// distinct handles even if their read views coincidentally line up. Rejecting that
@@ -426,7 +426,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
 /// `channelize` erases to the concrete channel domain by substitution; the `ChanDom`
 /// arm agrees it by name.
 ///
-/// A **handle's own** outer refinement layers are peeled and not counted, unlike
+/// A **handle's own** outer refinements are peeled and not counted, unlike
 /// everywhere else in this comparison. They cannot be: the two sides here are legally a
 /// handle and its read view, which sit at different depths, so there is no layer count
 /// to compare. Only the handle side is peeled — the read view carries the value's own
@@ -1599,14 +1599,16 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
                 "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
             )
         }
-        Type::Refinement(inner, r) => {
+        Type::Refinement(inner, refinements) => {
             // A handle clone, so `ctx` stays freely borrowable for the rebuild —
             // which re-enters this same memo through `coalesce_node` →
             // `coalesce_type_predicates`.
             let memo = ctx.pred_memo.clone();
-            memo.rebuild(r, &(), |pred| {
-                coalesce_node(pred, level, ctx);
-                true
+            refinements.rewrite_each(|_, r| {
+                memo.rebuild(r, &(), |pred| {
+                    coalesce_node(pred, level, ctx);
+                    true
+                });
             });
             coalesce_type_predicates(inner, level, ctx);
         }
@@ -2141,7 +2143,7 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
         return;
     }
     // Split the coalesced function type into its outer (function-level)
-    // refinement layers and the `Fun` shape.
+    // refinements and the `Fun` shape.
     let mut fn_layers = Vec::new();
     let mut cur = lambda.ty.clone();
     while let Type::Refinement(inner, r) = cur {
@@ -2157,7 +2159,7 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
     else {
         return;
     };
-    // Peel the domain's refinement layers down to the base `input` replaces.
+    // Peel the domain's refinements down to the base `input` replaces.
     let mut dom_layers = Vec::new();
     let mut base = *dom;
     while let Type::Refinement(inner, r) = base {
@@ -2179,9 +2181,7 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
         .into_iter()
         .rev()
         .filter(|r| !input_refinements.contains(&r))
-        .fold(recovered_input(&base, input), |acc, r| {
-            Type::Refinement(Box::new(acc), r)
-        });
+        .fold(recovered_input(&base, input), Type::refined);
     lambda.ty = fn_layers.into_iter().rev().fold(
         // Preserve the Pi binder: specialization rewrites only the domain
         // *shape*; a dependent codomain still refers to the same binder.
@@ -2191,7 +2191,7 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
             domain: Box::new(new_dom),
             codomain: cod,
         },
-        |acc, r| Type::Refinement(Box::new(acc), r),
+        Type::refined,
     );
     // The param slot was derived from the pre-specialization domain during the
     // lambda's own `coalesce_node`; re-derive it from the rewritten one.
@@ -2244,9 +2244,9 @@ mod tests {
         // Refinements are built here rather than via `refined_int`, which is
         // `debug_assertions`-only: the rule under test is not.
         let refined = |inner: Type| {
-            Type::Refinement(
-                Box::new(inner),
-                Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true)))),
+            Type::refined(
+                inner,
+                Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true)))).into(),
             )
         };
         let int = Type::Base(BaseType::Int);
@@ -2326,7 +2326,7 @@ mod tests {
         };
         let refinement = Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true))));
         let on_the_handle =
-            |t: Type| Type::Refinement(Box::new(t), Refinement::sharing(&refinement.predicate));
+            |t: Type| Type::refined_one(t, Refinement::sharing(&refinement.predicate));
 
         for (read, now) in [
             // handle vs its read view: the refined value sits one layer deeper.
@@ -2454,7 +2454,7 @@ mod tests {
         // Three uses, three distinct instantiations. Every literal carries its own
         // singleton, so the two `Int` uses instantiate `f` at *different* refined
         // types and get a specialization each — and that is the intended rule, not
-        // a shortfall: a refinement layer on an iterated domain is compiled (one
+        // a shortfall: a refinement on an iterated domain is compiled (one
         // `restrict` filter per layer), so refinements are code and two clones
         // pinned to different ones are genuinely different code.
         let f = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
