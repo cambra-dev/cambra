@@ -23,20 +23,57 @@
 //! (`src/ccl/design/collections.md`, "Future work").
 
 use crate::ccl::ccl_utils::{
-    apply_primitive, flatten_trailing_value_case, peel_refinements, refine_with,
-    synthesize_arm_predicate,
+    PredMemo, apply_primitive, flatten_trailing_value_case, peel_refinements, refine_with,
+    synthesize_arm_predicate, walk_refined_predicates_mut,
 };
 use crate::ccl::{BaseType, Builtin, Expr, FieldKey, Type, TypedExprNode, lambda_elim};
 
-/// Rewrite every collection-valued value-`Case` in `expr` into its gated union.
+/// Rewrite every collection-valued value-`Case` in `expr` into its gated union, and erase
+/// every sum whose witness is **determined** — from the types as well as the terms.
 pub(super) fn realize_conditional_collections(expr: &mut Expr) {
+    let mut erased = std::collections::HashSet::new();
+    realize_and_unbox(expr, &mut erased, &PredMemo::new());
+    // **The other half of the erasure.** `unbox` removed the introduction from the *term*;
+    // every type still says `Σ`. A type asserting an indeterminacy the term no longer has
+    // is not a harmless leftover: the domain it presents at a consuming site is a witness,
+    // which has no extent, so `planning::iterate` cannot build an iteration source for it
+    // and drops the site's refinements with it (`tests/compilation_pipeline/sums.rs`).
+    //
+    // Safe under exactly the precondition `unbox` already checks — one candidate, so the
+    // witness stands for a domain that is *known* — and applied to exactly the binders it
+    // erased. That last part is what keeps a **realized** sum out of it: realization
+    // consumes its arms' boxes without recording them, because the union it built has a
+    // `Variant` domain and `Realize` asserts the sum over it deliberately. A same-domain
+    // conditional is the case that proves the distinction is needed — one candidate, two
+    // legs — and instantiating its assertion breaks it.
+    if !erased.is_empty() {
+        instantiate_erased_witnesses(expr, &erased, &PredMemo::new());
+    }
+}
+
+fn realize_and_unbox(
+    expr: &mut Expr,
+    erased: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+    memo: &PredMemo<()>,
+) -> bool {
+    let mut changed = false;
     // **Top-down.** An `elif` chain is a `Case` whose trailing arm is another `Case`, and
     // `flatten_trailing_value_case` collapses the chain into one N-choice partition —
     // which it can only do while the inner one is still a `Case`. Realizing children
     // first turns it into a union, the flatten silently no-ops, and the outer fan-out
     // ends up with a leg that is already a fan-out.
     realize_here(expr);
-    expr.walk_children_mut(realize_conditional_collections);
+    expr.walk_children_mut(|child| changed |= realize_and_unbox(child, erased, memo));
+    // **A refinement predicate is a term too, and it carries its own copy of the source.**
+    // A filter looks the collection up at the index (`__elem ▷ src ▷ 𝑓`), so when `src` is
+    // a `box` the introduction sits inside the predicate — somewhere the term walk above
+    // never reaches, since predicates ride *type* slots. Left there it survives to
+    // op-conversion, which has no `box` arm and rejects it as a non-combinator.
+    expr.walk_type_slots_mut(|ty| {
+        changed |= walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+            realize_and_unbox(pred, erased, memo)
+        });
+    });
     // A `box` whose **witness is determined** is erased here, not only the ones a
     // realized `Case` consumed. Left in place, the `Apply(_, Box)` hides its argument
     // from the rest of planning, so a `box`ed list literal never gets its `iterate`
@@ -50,8 +87,51 @@ pub(super) fn realize_conditional_collections(expr: &mut Expr) {
     // witness yet (`src/ccl/design/collections.md`, "Future work"), so it is left standing
     // to be rejected by name at op-conversion — which is the correct failure, and the
     // signal that the runtime witness is what the program needs.
-    *expr = unbox(std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)));
-    repair_unboxed_argument(expr);
+    let before = erased.len();
+    *expr = unbox(
+        std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)),
+        Some(erased),
+    );
+    changed |= erased.len() != before;
+    changed
+}
+
+/// Replace every sum on an **erased** binder by its single candidate, throughout `expr`'s
+/// types — the type-level half of [`unbox`].
+///
+/// Reaches refinement *predicates* too, via [`walk_refined_predicates_mut`]: a predicate is
+/// a term with type slots of its own, and a filter's predicate reads the very collection
+/// whose sum is being erased, so a witness left there outlives every other mention.
+fn instantiate_erased_witnesses(
+    expr: &mut Expr,
+    erased: &std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+    memo: &PredMemo<()>,
+) {
+    expr.walk_type_slots_mut(|ty| {
+        walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+            instantiate_erased_witnesses(pred, erased, memo);
+            true
+        });
+        instantiate_erased_in_type(ty, erased);
+    });
+    expr.walk_children_mut(|child| instantiate_erased_witnesses(child, erased, memo));
+}
+
+fn instantiate_erased_in_type(
+    ty: &mut Type,
+    erased: &std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+) {
+    ty.walk_children_mut(|child| instantiate_erased_in_type(child, erased));
+    if let Type::Sigma(sg) = ty
+        && erased.contains(&sg.binder())
+        && let Some([sole]) = sg.kind().listed()
+    {
+        // The candidate is this occurrence's own — the same sum is spelled both factored
+        // and unfactored, and each instantiates against what it lists.
+        let mut instantiated = sg.instantiate_body(sole);
+        instantiate_erased_in_type(&mut instantiated, erased);
+        *ty = instantiated;
+    }
 }
 
 fn realize_here(expr: &mut Expr) {
@@ -100,7 +180,7 @@ fn realize_here(expr: &mut Expr) {
         );
         let refined = refine_with(arm_dom, &gate_fn);
         tags.push((FieldKey::Index(tags.len()), refined.clone()));
-        arms.push(unbox(b.body).with_ty(Type::data_fun(refined, value_ty.clone())));
+        arms.push(unbox(b.body, None).with_ty(Type::data_fun(refined, value_ty.clone())));
     }
 
     // One branch denotes just that arm's collection — no union, and no witness left to
@@ -204,7 +284,16 @@ fn arm_domain(ty: &Type) -> Option<Type> {
 /// underlying collection. Leaving the `Apply(_, Box)` in place would leave a node whose
 /// own scheme still says `Σ`, disagreeing with the data-function type the realized arm
 /// carries.
-fn unbox(e: Expr) -> Expr {
+///
+/// `erased` records the binder whose sum this erased, so
+/// [`instantiate_erased_witnesses`] can finish the job in the types. Realization passes
+/// `None` for the arms it consumes: it materializes those witnesses itself, as the gated
+/// union, and `Realize` asserts the sum over a `Variant` domain on purpose — instantiating
+/// that assertion would contradict the term it is asserting over.
+fn unbox(
+    e: Expr,
+    erased: Option<&mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>>,
+) -> Expr {
     let TypedExprNode::Apply { function, argument } = &e.node else {
         return e;
     };
@@ -213,34 +302,13 @@ fn unbox(e: Expr) -> Expr {
     }
     // Only a determined witness — one candidate — is erasable.
     match peel_refinements(&e.ty) {
-        Type::Sigma(s) if matches!(s.kind().listed(), Some([_])) => (**argument).clone(),
+        Type::Sigma(s) if matches!(s.kind().listed(), Some([_])) => {
+            if let Some(erased) = erased {
+                erased.insert(s.binder());
+            }
+            (**argument).clone()
+        }
         _ => e,
-    }
-}
-
-/// Repair a consumer's parameter type after [`unbox`] erased its argument's `box`.
-///
-/// Only **unboxing** needs this, not realization: [`TypedExprNode::Realize`] keeps the
-/// pre-realization type on the node, so a realized `Case` changes no mention above it.
-/// Erasing a `box` does change one — the term drops from `Σ 𝑇 ∈ {𝑇ₓ}. 𝑇` to `𝑇ₓ` — and an
-/// `Apply` names its argument's type a second time, in the function's own domain. A
-/// consumer of a conditional collection is monomorphized at inference to *that*
-/// collection, so `sum` over one carries `(Σ 𝑇 ∈ {𝑇ₓ}. 𝑇) ⇒ 𝑉`; the parameter follows the
-/// argument or the tree stops type-checking.
-///
-/// Inert everywhere else: it fires only where the domain is still a sum and the argument
-/// is not.
-fn repair_unboxed_argument(expr: &mut Expr) {
-    let TypedExprNode::Apply { function, argument } = &mut expr.node else {
-        return;
-    };
-    if matches!(argument.ty, Type::Sigma(_)) {
-        return;
-    }
-    if let Type::Fun { domain, .. } = &mut function.ty
-        && matches!(**domain, Type::Sigma(_))
-    {
-        **domain = argument.ty.clone();
     }
 }
 

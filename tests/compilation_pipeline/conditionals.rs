@@ -593,40 +593,29 @@ fn a_conditional_source_compiles_however_it_reaches_the_generator(
     check_scalar(code, expected);
 }
 
-/// **A comprehension filter over a conditional source is never emitted.**
+/// **A comprehension filter over a conditional source is not emitted yet.**
 ///
-/// The conditional is not what breaks. The same programs with a single `box` and no `Case`
-/// at all fail the same way (`sums.rs`, `a_filter_over_a_boxed_source_is_dropped`) — one
-/// candidate, one filter, dropped. What these cases add is the *multi-candidate* half: the
-/// filter must reach an iteration source that has since become a union of gated legs.
+/// The conditional-free half of this now works (`sums.rs`,
+/// `a_filter_over_a_boxed_source_is_applied`): a **determined** witness — one candidate — is
+/// erased by `unbox` in the term and instantiated in the types, so the consuming site is left
+/// with an ordinary refined domain and the existing iterate-then-restricts chain compiles it.
 ///
-/// Inference is *right* throughout. The restriction rides the witness, exactly as
-/// `src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness" says it must,
-/// so the comprehension types as
-/// `Σ 𝜎 ∈ {[0, 1], [0, 2]}. ({𝜎 | 𝑝} ⤇ Int)`.
-/// What is missing is downstream, in `planning::iterate::wrap_with_iterate`: the site's
-/// domain is a refined **witness**, and a witness has no extent, so the ordinary
-/// iterate-then-restricts chain has no source to build on. Planning refuses rather than
-/// dropping the restriction, so these fail to compile instead of computing the unfiltered
-/// answer.
+/// These are the cases where the witness is *not* determined, so nothing erases it. The sum
+/// has two or more candidates (or one candidate over two realized legs — the same-domain
+/// pair below), and the site's domain stays `{𝜎 | 𝑝}` with 𝜎 a real witness. Inference is
+/// right throughout; the comprehension types as
+/// `Σ 𝜎 ∈ {[0, 1], [0, 2]}. ({𝜎 | 𝑝} ⤇ Int)`,
+/// the restriction on the witness exactly as
+/// `src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness" says.
 ///
-/// The site after realization is
-/// `cast(realize(iterate ▷ (𝑔₀ ▷ const ▷ restrict) ≫ [1, 2]  ⊎  iterate ▷ (𝑔₁ ▷ …) ≫ [1, 2, 3]))`
-/// — `Realize` asserts the *pre*-realization type so nothing above it has to change, which is
-/// why this node still advertises the Σ although the source beneath it is already a tagged
-/// union.
+/// **What is owed is an extent for that witness**, and it is right there: realization has
+/// already materialized this sum as the gated union below the site, whose extent *is* the
+/// selected domain because the unselected legs are empty. Planning does not consult it — it
+/// reads the domain off the type, finds a witness, and refuses.
 ///
-/// **The obstacle is the predicate's source.** A filter's predicate reads the collection at
-/// the index (`__elem ▷ src ▷ 𝑓` — the plain case does this too), and here `src` is the whole
-/// conditional. Under leg `𝑖` the index ranges over `𝐷ᵢ`, so a per-leg restrict needs the
-/// predicate to read *that arm*: `__elem ▷ armᵢ ▷ 𝑓`. Realizing the predicate's source
-/// instead was tried and is wrong — `realize(union)`'s domain is the tagged union while
-/// `__elem` stays `𝐷ᵢ`, which desynchronizes the predicate from its own refinement base.
-///
-/// **A wrong answer, not a failure**, in the cases that reach the runtime: the unfiltered sum
-/// of whichever arm was taken. A silent miscomputation is the worse of the two outcomes, and
-/// which one a program gets turns on nothing it can see (a let-bound source computes, an
-/// inline one fails at op-conversion).
+/// Planning refuses rather than dropping, so these fail to compile instead of computing the
+/// unfiltered answer. That distinction matters here: two of the cases below have filters that
+/// are no-ops on the arm they select, so a dropped filter would leave them *passing*.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 // Both arms of the two-candidate sum. Only the `else` arm was pinned before, which cannot
@@ -727,8 +716,8 @@ x = box([1, 2]) if c else box([1, 2, 3])
 sum([y for y in x]) + sum([z for z in x if z > 1])",
     Value::Int(11)
 )]
-#[ignore = "a filter over a summed source is never emitted; the conditional adds legs to \
-            reach but is not the cause — see sums.rs; measured 2026-08-08"]
+#[ignore = "an undetermined witness has no extent; realization already materialized one as \
+            the gated union below the site, and planning does not consult it; measured 2026-08-09"]
 fn a_filter_over_a_conditional_source_is_dropped(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

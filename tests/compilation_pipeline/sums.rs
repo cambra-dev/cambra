@@ -3,8 +3,9 @@
 //!
 //! A conditional is the *usual* way two candidates end up in one sum, so these
 //! shapes are easy to mistake for conditional-specific ones. They are not: every
-//! program here has a single arm and no `Case` at all. `conditionals.rs` carries
-//! the multi-candidate half, and the two share one gap.
+//! program here has a single arm and no `Case` at all — the witness is
+//! **determined**, and that is what lets it be erased rather than materialized.
+//! `conditionals.rs` carries the undetermined half, which still needs an extent.
 //!
 //! See `src/ccl/design/type-inference.md`, "Only a term builds a sum".
 
@@ -70,33 +71,26 @@ fn a_filter_inside_the_box_is_already_compiled(#[case] code: &str, #[case] expec
 }
 
 // ---------------------------------------------------------------------------
-// Filtering a boxed collection — the gap
+// Filtering a boxed collection
 // ---------------------------------------------------------------------------
 
-/// **A comprehension filter over a summed source is dropped.** No conditional is
-/// involved: one `box`, one candidate, one filter — and the filter never becomes
-/// an operator.
+/// **A comprehension filter over a summed source.** No conditional is involved:
+/// one `box`, one candidate, one filter.
 ///
-/// This is the *minimal* form of the gap that
-/// `a_filter_over_a_conditional_source_is_dropped` shows with two candidates.
-/// Recording it here is the point: the conditional is incidental, and designing
-/// the fix against the two-candidate case alone would fit a mechanism (a gate per
-/// realized leg) to a shape that the one-candidate case does not have — it has no
-/// legs, because nothing realizes a sum a `Case` did not produce.
+/// A determined witness — one candidate — needs no runtime representation, which
+/// is why `unbox` erases its introduction. What that erasure has to reach is
+/// *both halves*: the term **and** every type still saying `Σ`. A type asserting
+/// an indeterminacy the term no longer has presents a **witness** where the
+/// consuming site expects a domain, and a witness has no extent, so planning
+/// could build no iteration source and dropped the site's filter with it.
 ///
-/// Inference is right in every case below; the type carries the filter exactly
-/// where it belongs, on the candidate:
-/// `Σ 𝜎 ∈ {{[0, 2] | 𝑝}}. (𝜎 ⤇ Int)`.
-/// What is missing is downstream, in `planning::iterate::wrap_with_iterate`:
-/// reading `expr.ty.domain()` on a sum yields its **witness**, the site is
-/// skipped as un-iterable, and the restrict is never emitted. The refinement is
-/// on the *candidate*, which `domain()` does not look at.
-///
-/// The two outcomes below are both present and the silent one is the worse:
-/// - a **let-bound** or parameter-passed box computes the *unfiltered* answer;
-/// - an **inline** box fails loudly at op-conversion (a list literal reaches it
-///   with no iteration source, because the site that was skipped was the one that
-///   would have provided it).
+/// Two shapes made this reach further than the term walk:
+/// - the mentions are scattered (the `Let`, the `Var`, the `cast`, the consumer's
+///   own parameter), so instantiating the witness is a whole-tree type map rather
+///   than a local rewrite;
+/// - a filter's predicate carries **its own copy of the source** (`__elem ▷ src ▷
+///   𝑓`), so with an inline `box` the introduction sits inside a *predicate* — a
+///   term riding a type slot, which no term walk visits.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // How the box reaches the generator: inline, let-bound, UDF parameter.
@@ -146,16 +140,22 @@ f(box([1, 2, 3]))",
     "x = box([1, 2, 3])\nsum([y for y in x]) + sum([z for z in x if z > 1])",
     Value::Int(11)
 )]
-// **Both kinds of refinement on one candidate**: the box carries its own filter
-// (already compiled — `a_filter_inside_the_box_is_already_compiled`) and the
-// consumer adds another (still owed). Whatever distinguishes the two cannot be
-// "which candidate is it on", because here it is the same one.
-#[case(
-    "x = box([z for z in [1, 2, 3] if z > 1])\nsum([y for y in x if y < 3])",
-    Value::Int(2)
-)]
-#[ignore = "a filter over a summed source is never emitted: `wrap_with_iterate` reads \
-            the witness where the refinement is on the candidate; measured 2026-08-08"]
-fn a_filter_over_a_boxed_source_is_dropped(#[case] code: &str, #[case] expected: Value) {
+fn a_filter_over_a_boxed_source_is_applied(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+/// The one shape above that still fails, and **not for a reason about sums**: a
+/// let-bound *filtered* comprehension, filtered again, panics with `no entry found
+/// for key`. The same program without a `box` fails identically on `main` —
+/// `comprehensions.rs`, `filtered_comprehension_shapes_that_do_not_compile` — so
+/// what the `box` contributes here is nothing.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[ignore = "pre-existing on main: a let-bound filtered comprehension, filtered again; \
+            unrelated to sums; measured 2026-08-09"]
+fn a_filter_over_a_box_that_already_carries_one() {
+    check_scalar(
+        "x = box([z for z in [1, 2, 3] if z > 1])\nsum([y for y in x if y < 3])",
+        Value::Int(2),
+    );
 }
