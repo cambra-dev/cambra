@@ -13,7 +13,7 @@
 //! Deliberately not generated: duplicate record/variant keys — outside
 //! `Ty.WF`, where the Rust's trivial-equality short-circuit and its
 //! find-first arms genuinely disagree (pinned below as
-//! `dup_key_record_reflexivity_diverges_from_model`). Everything else in
+//! `dup_key_record_trips_the_uniquely_keyed_invariant`). Everything else in
 //! the ground fragment is fair game, including the gated-partition bridge
 //! arm — `gen_bridge_pair` aims at it and its guard boundary directly.
 
@@ -341,7 +341,7 @@ fn gen_bridge_pair(rng: &mut Rng) -> (Type, Type) {
         // Only the *last* leg's index may shift. Shifting an interior one would
         // land it on its successor's index, and a duplicate-keyed variant is
         // outside `Ty.WF` — the one class where the model and `constrain_go`
-        // deliberately disagree (`dup_key_record_reflexivity_diverges_from_model`),
+        // deliberately disagree (`dup_key_record_trips_the_uniquely_keyed_invariant`),
         // so generating it would manufacture mismatches rather than find them.
         // Shifting the last leg still breaks contiguity, which is what this
         // near-miss is aiming at.
@@ -594,22 +594,31 @@ fn ty_json(t: &Type) -> Option<String> {
     })
 }
 
-/// The one *known, deliberate* divergence from the Lean model, pinned as a
-/// fact: on a duplicate-keyed record `constrain_subtype`'s trivial-equality
-/// short-circuit accepts `t <: t`, while the arm the short-circuit shadows
-/// (find-first field lookup) — and therefore the model, which has no
-/// short-circuit — rejects it (`Ty.WF` names the unique-keys invariant this
-/// rests on; the fuzz generator stays inside it). If this test starts
-/// failing, the short-circuit or the record arm changed and the model needs
-/// a matching decision.
+/// The **tripwire is armed** for the one place `constrain_go` and the model
+/// can disagree.
+///
+/// On a duplicate-keyed record the trivial-equality short-circuit accepts
+/// `t <: t`, while the arm it shadows (find-first field lookup) — and
+/// therefore the model, which has no short-circuit — rejects it: find-first
+/// answers the *first* `a` for both of the rhs's `a` fields, demanding
+/// `Int <: Bool`. The disagreement is not a bug in either one; it is a type
+/// outside the uniquely-keyed invariant both rest on, which `Ty.WF` states and
+/// `Sub.refl` is proved under (`formal/CclFormal/Ty.lean`).
+///
+/// Nothing in `Type` enforces that invariant, so `constrain_go` asserts it in
+/// debug builds *before* the short-circuit — the only placement that covers
+/// `t <: t`, the very case the two answer differently. This test pins that the
+/// assert fires, so the guard cannot rot into a no-op.
 #[test]
-fn dup_key_record_reflexivity_diverges_from_model() {
+#[cfg(debug_assertions)]
+#[should_panic(expected = "duplicate record key")]
+fn dup_key_record_trips_the_uniquely_keyed_invariant() {
     let dup = Type::Record(vec![
         ("a".to_string(), Type::Base(BaseType::Int)),
         ("a".to_string(), Type::Base(BaseType::Bool)),
     ]);
     let mut cache = ConstrainCache::new();
-    assert!(constrain_subtype(&dup, &dup.clone(), &mut cache).is_ok());
+    let _ = constrain_subtype(&dup, &dup.clone(), &mut cache);
 }
 
 /// **Finding, repaired: partition collapse now composes.** Under the retired
