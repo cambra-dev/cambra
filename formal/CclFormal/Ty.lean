@@ -59,9 +59,18 @@ deriving Repr, DecidableEq
 
 /-- Mirror of the ground fragment of `ccl::ty::Type`.
 
-`refined` carries **one** refinement layer, exactly like
-`Type::Refinement(base, r)` — a multiply-refined type is nested `refined`
-layers, and the subtype relation peels them all at once.
+`refined` carries a **claim set**, exactly like
+`Type::Refinement(base, RefinementSet)`: a base narrowed by the conjunction of
+its claims, with `Ty.WF` requiring the same two invariants `Type::refined`
+establishes — the claims are non-empty, and the base is not itself refined, so
+layers never nest.
+
+The claims are *represented* as a `List Pred` and `Ty.beq` compares them
+positionally, which keeps `beq` propositional equality (`Ty.beq_iff`) and so
+keeps `DecidableEq`. The **relation** is what treats them as a set: `deficit`
+is containment, never list equality, so `Sub` cannot observe claim order —
+stated and proved as `sub_claims_perm` rather than left as a reading of the
+rules.
 
 Equality is hand-written (`Ty.beq` — the `BEq`/`DecidableEq` deriving
 handlers do not support this nested inductive) and bridged to propositional
@@ -76,7 +85,7 @@ inductive Ty where
   | tuple (ts : List Ty)
   | record (fields : List (String × Ty))
   | variant (tags : List (FieldKey × Ty))
-  | refined (base : Ty) (p : Pred)
+  | refined (base : Ty) (claims : List Pred)
 deriving Repr
 
 mutual
@@ -186,6 +195,23 @@ instance : LawfulBEq Ty where
 /-- Propositional equality of ground types is decidable. -/
 instance : DecidableEq Ty := fun a b => decidable_of_iff _ (Ty.beq_iff a b)
 
+/-- Whether `t` is a refinement node. The flattening invariant forbids one
+directly under another, so this is what `Ty.WF` checks of a base. -/
+def Ty.isRefined : Ty → Bool
+  | .refined _ _ => true
+  | _ => false
+
+/-- Mirror of `Type::refined`: `base` narrowed by `claims`, establishing both
+invariants. No claims is no refinement, and a base that is already refined has
+`claims` merged into its set rather than stacked on top. -/
+def Ty.mkRefined (base : Ty) (claims : List Pred) : Ty :=
+  match claims with
+  | [] => base
+  | _ =>
+    match base with
+    | .refined b ps => .refined b (ps ++ claims.filter (· ∉ ps))
+    | bare => .refined bare claims
+
 /-- Well-formedness the Rust builders maintain but the `Type` representation
 does not enforce: record fields and variant tags are keyed **uniquely**.
 
@@ -206,6 +232,7 @@ inductive Ty.WF : Ty → Prop where
       Ty.WF (.record fs)
   | variant {tags} : (tags.map (·.1)).Nodup → (∀ t ∈ tags, Ty.WF t.2) →
       Ty.WF (.variant tags)
-  | refined {b p} : Ty.WF b → Ty.WF (.refined b p)
+  | refined {b ps} : ps ≠ [] → b.isRefined = false → Ty.WF b →
+      Ty.WF (.refined b ps)
 
 end CclFormal

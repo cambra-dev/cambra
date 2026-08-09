@@ -567,19 +567,18 @@ fn ty_json(t: &Type) -> Option<String> {
                 .collect();
             format!(r#"{{"k":"variant","tags":[{}]}}"#, ts?.join(","))
         }
-        // The model's `refined` node carries **one** predicate, so a
-        // multi-claim set has no faithful encoding: serializing it as nested
-        // single-predicate layers reads correctly to the subtype relation
-        // (which peels layers into a set) but *not* to partition collapse,
-        // whose `legUnder` peels one layer where `partition_domain` now takes
-        // the claims common to every leg. Refuse rather than mis-serialize —
-        // the emitter's standing contract — until the model's grammar carries
-        // a claim set too.
-        Type::Refinement(base, claims) => format!(
-            r#"{{"k":"refined","base":{},"pred":{}}}"#,
-            ty_json(base)?,
-            pred_json(&claims.sole()?.predicate)?
-        ),
+        // The model's `refined` node carries the whole claim set, matching
+        // `RefinementSet` — so a multi-claim position serializes as one node
+        // with a `claims` array rather than as nested single-predicate layers.
+        Type::Refinement(base, claims) => {
+            let preds: Option<Vec<String>> =
+                claims.iter().map(|r| pred_json(&r.predicate)).collect();
+            format!(
+                r#"{{"k":"refined","base":{},"claims":[{}]}}"#,
+                ty_json(base)?,
+                preds?.join(",")
+            )
+        }
         _ => return None,
     })
 }
@@ -778,7 +777,6 @@ fn differential_ground_subtype_vs_lean_model() {
 
     let mut rng = Rng::new(seed);
     let mut cases = Vec::with_capacity(n);
-    let mut unencodable = 0usize;
     while cases.len() < n {
         let (lhs, rhs) = match rng.below(8) {
             0 => {
@@ -794,11 +792,7 @@ fn differential_ground_subtype_vs_lean_model() {
             _ => gen_pair(&mut rng, 3),
         };
         let (Some(lj), Some(rj)) = (ty_json(&lhs), ty_json(&rhs)) else {
-            // The only shape the generator produces that the wire schema
-            // cannot carry is a multi-claim refinement (see `ty_json`).
-            // Counted and reported, never silently dropped.
-            unencodable += 1;
-            continue;
+            panic!("generator produced a type outside the ground wire schema: {lhs:?} / {rhs:?}");
         };
         let mut cache = ConstrainCache::new();
         let rust = constrain_subtype(&lhs, &rhs, &mut cache).is_ok();
@@ -840,8 +834,7 @@ fn differential_ground_subtype_vs_lean_model() {
 
     let accepted = cases.iter().filter(|(_, rust)| *rust).count();
     eprintln!(
-        "differential: {} cases (seed {seed}), rust accepted {accepted}, rejected {}, \
-         {unencodable} skipped as multi-claim refinements the model cannot yet carry",
+        "differential: {} cases (seed {seed}), rust accepted {accepted}, rejected {}",
         cases.len(),
         cases.len() - accepted
     );
