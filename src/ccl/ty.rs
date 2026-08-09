@@ -833,6 +833,77 @@ impl Type {
     /// the binder's presence — rebuilt combinator arrows (`fun_ty_or_hole`,
     /// [`Type::fun`]) are constructed with `name: None`. If those sites ever
     /// preserve binders on rebuilt arrows, this helper can retire.
+    /// The **α-normal form**: every Pi binder renamed to the reserved
+    /// depth-indexed name ([`crate::ccl::Name::pi`]) and every predicate
+    /// reference rewritten through the rename — the same scheme the solver
+    /// applies as it flattens types (`compact.rs`), exposed as a pure
+    /// function so comparisons between solver output (already canonical) and
+    /// independently-rebuilt types (source-named binders) can meet on one
+    /// form. Two α-equivalent types have equal α-normal forms.
+    pub fn alpha_normalized(&self) -> Type {
+        use crate::ccl::Name;
+        use crate::ccl::subst::Subst;
+        fn go(t: &Type, depth: u8, subst: &Subst) -> Type {
+            match t {
+                Type::Fun {
+                    name,
+                    kind,
+                    domain,
+                    codomain,
+                } => {
+                    let dom = go(domain, depth, subst);
+                    let (name, cod_subst) = match name {
+                        Some(b) => {
+                            let canon = Name::pi(depth);
+                            (Some(canon.clone()), subst.extended_rename(b.clone(), canon))
+                        }
+                        None => (None, subst.clone()),
+                    };
+                    let cod = go(codomain, depth + 1, &cod_subst);
+                    Type::Fun {
+                        name,
+                        kind: kind.clone(),
+                        domain: Box::new(dom),
+                        codomain: Box::new(cod),
+                    }
+                }
+                Type::Refinement(base, r) => {
+                    Type::Refinement(Box::new(go(base, depth, subst)), subst.force_refinement(r))
+                }
+                Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| go(t, depth, subst)).collect()),
+                Type::Record(fs) => Type::Record(
+                    fs.iter()
+                        .map(|(n, t)| (n.clone(), go(t, depth, subst)))
+                        .collect(),
+                ),
+                Type::Variant(tags) => Type::Variant(
+                    tags.iter()
+                        .map(|(k, t)| (k.clone(), go(t, depth, subst)))
+                        .collect(),
+                ),
+                Type::History {
+                    value,
+                    domain,
+                    kind,
+                } => Type::History {
+                    value: Box::new(go(value, depth, subst)),
+                    domain: Box::new(go(domain, depth, subst)),
+                    kind: *kind,
+                },
+                Type::Below(t) => Type::Below(Box::new(go(t, depth, subst))),
+                Type::Base(_)
+                | Type::UIntRange(_)
+                | Type::DataSource(_)
+                | Type::ChanDom(..)
+                | Type::Txn
+                | Type::Infer(_)
+                | Type::SharedHole(_)
+                | Type::Hole => t.clone(),
+            }
+        }
+        go(self, 0, &Subst::id())
+    }
+
     pub fn without_pi_names(&self) -> Type {
         match self {
             Type::Fun {

@@ -68,13 +68,31 @@ pub enum ReservedName {
     /// The refinement element binder, spelled `__elem`. One shared name across
     /// every refinement (see the module docs and [`crate::ccl::Refinement`]).
     Elem,
+    /// A **canonical Pi binder**, spelled `__pi{depth}` — `depth` counts the
+    /// enclosing Pi binders at the arrow's position. The solver canonicalizes
+    /// every arrow's binder to this name as it flattens types
+    /// (`compact.rs` / `spec_key.rs`), the same move [`ReservedName::Elem`] makes for
+    /// refinements: one shared name per position makes α-equivalence coincide
+    /// with structural equality, so α-variant types merge, dedup, and key
+    /// identically instead of splitting on which source binder they descended
+    /// from.
+    Pi(u8),
 }
+
+/// Spellings for [`ReservedName::Pi`], one per supported depth. Sixteen is
+/// far beyond any real Pi spine (the deepest today is three); the indexing
+/// panic on a deeper one is a loud tripwire, not a silent cap.
+const PI_SPELLINGS: [&str; 16] = [
+    "__pi0", "__pi1", "__pi2", "__pi3", "__pi4", "__pi5", "__pi6", "__pi7", "__pi8", "__pi9",
+    "__pi10", "__pi11", "__pi12", "__pi13", "__pi14", "__pi15",
+];
 
 impl ReservedName {
     /// The canonical source-disjoint spelling.
     pub fn spelling(self) -> &'static str {
         match self {
             ReservedName::Elem => "__elem",
+            ReservedName::Pi(depth) => PI_SPELLINGS[depth as usize],
         }
     }
 }
@@ -169,6 +187,11 @@ impl Name {
     /// The refinement element binder `__elem`.
     pub fn elem() -> Self {
         Name::Reserved(ReservedName::Elem)
+    }
+
+    /// The canonical Pi binder at `depth` (see [`ReservedName::Pi`]).
+    pub fn pi(depth: u8) -> Self {
+        Name::Reserved(ReservedName::Pi(depth))
     }
 
     /// Mint a compiler-introduced binder of `kind` with a globally fresh
