@@ -42,6 +42,8 @@ use crate::ccl::{BaseType, InferVar, Level, Type};
 
 pub mod coalesce;
 pub mod compact;
+#[cfg(test)]
+mod confluence;
 pub mod constrain;
 #[cfg(test)]
 mod differential;
