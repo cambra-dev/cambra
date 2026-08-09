@@ -325,8 +325,15 @@ pub enum Type {
     /// path, and one width-subtyping rule. `Vec` order is preserved for
     /// display.
     Variant(Vec<(FieldKey, Type)>),
-    /// A refinement of another type
-    Refinement(Box<Type>, Refinement),
+    /// A base type narrowed by the conjunction of a [`RefinementSet`]'s claims.
+    ///
+    /// **Invariants**, both established by [`Type::refined`] (which every
+    /// construction site should go through rather than building this variant
+    /// directly): the set is non-empty, and the base is not itself a
+    /// `Refinement` — nested layers flatten into one set, so `{{𝑇 | 𝑝} | 𝑞}` is
+    /// unrepresentable and the question "which layer is outermost" cannot be
+    /// asked. See [`RefinementSet`] for why that question had no good answer.
+    Refinement(Box<Type>, RefinementSet),
     /// Pre-inference placeholder stamped by lowering on every new node.
     ///
     /// Invariant: every `Hole` must be eliminated by the end of inference.
@@ -617,9 +624,21 @@ impl fmt::Display for Type {
             // `5`. That is the whole content of the type, and spelling it out puts a
             // predicate in front of the reader at every literal. Every other
             // refinement prints in the general form.
-            Type::Refinement(t, r) => match singleton_value(self) {
+            // Claims render comma-separated (`{Int | p, q}`) — a conjunction.
+            // Sorted, because the set is unordered: a rendering must not depend
+            // on which order claims happened to be inserted in, or a diagnostic
+            // (or a test comparing rendered types) would see a difference that
+            // the type system says is not there.
+            Type::Refinement(t, claims) => match singleton_value(self) {
                 Some(lit) => write!(f, "{}", symbolic::symbolic(lit)),
-                None => write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate)),
+                None => {
+                    let mut rendered: Vec<String> = claims
+                        .iter()
+                        .map(|r| symbolic::symbolic(&r.predicate))
+                        .collect();
+                    rendered.sort();
+                    write!(f, "{{{t} | {}}}", rendered.join(", "))
+                }
             },
             Type::Hole => write!(f, "_"),
             // A hole with an identity renders as one: `_#0` and `_#1` are distinct
@@ -651,13 +670,11 @@ impl fmt::Display for Type {
 /// rule that handles refinements handles this one unchanged — and this recognizes
 /// the shape just well enough to print it as what it means.
 fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
-    let Type::Refinement(base, r) = ty else {
+    let Type::Refinement(_, claims) = ty else {
         return None;
     };
-    // Exactly one layer: a further-refined singleton is not one.
-    if matches!(base.as_ref(), Type::Refinement(..)) {
-        return None;
-    }
+    // Exactly one claim: a base carrying further restrictions is not a singleton.
+    let r = claims.sole()?;
     let TypedExprNode::BinOp {
         left,
         op: crate::ccl::BinOpKind::Compare(crate::ccl::CompareKind::Equals),
@@ -721,7 +738,43 @@ impl Type {
         }
     }
 
-    /// Look through every outer [`Type::Refinement`] layer, returning the bare
+    /// Build `base` narrowed by `claims` — **the** way to construct a
+    /// [`Type::Refinement`], establishing both of its invariants.
+    ///
+    /// Empty `claims` yields `base` unrefined (a position claiming nothing is
+    /// its base type), and a `base` that is already refined has its claims
+    /// merged in rather than stacked on top, so refinement sets never nest.
+    /// Flattening is sound because every claim at a position restricts the same
+    /// underlying element: a refinement narrows which values inhabit a type, it
+    /// does not change them, so an outer claim's [`REFINEMENT_BINDER`] ranges
+    /// over exactly the values the inner one does.
+    pub fn refined(base: Type, claims: RefinementSet) -> Type {
+        if claims.is_empty() {
+            return base;
+        }
+        match base {
+            Type::Refinement(inner, existing) => Type::Refinement(inner, existing.union(&claims)),
+            bare => Type::Refinement(Box::new(bare), claims),
+        }
+    }
+
+    /// [`Type::refined`] with a single claim — the common case at a site that
+    /// mints one predicate.
+    pub fn refined_one(base: Type, claim: Refinement) -> Type {
+        Type::refined(base, RefinementSet::one(claim))
+    }
+
+    /// The claims carried at this position — empty for an unrefined type, so a
+    /// caller can compare or filter what two positions demand without
+    /// case-splitting on whether either is refined.
+    pub fn claims(&self) -> &[Refinement] {
+        match self {
+            Type::Refinement(_, claims) => claims.as_slice(),
+            _ => &[],
+        }
+    }
+
+    /// Look through the [`Type::Refinement`] wrapper, returning the bare
     /// structural type underneath. Borrowing and non-allocating; refinements
     /// nested inside the structure are left in place.
     ///
@@ -735,11 +788,12 @@ impl Type {
     /// is a different operation: it *drops* claims rather than looking past them,
     /// allocates, and is only meaningful on a resolved type.
     pub fn peel_refinements(&self) -> &Type {
-        let mut cur = self;
-        while let Type::Refinement(inner, _) = cur {
-            cur = inner;
+        match self {
+            // One layer suffices: `Type::refined` flattens, so a refinement's
+            // base is never itself refined.
+            Type::Refinement(inner, _) => inner,
+            other => other,
         }
-        cur
     }
 
     /// The value type of the mutable register this denotes, or `None` if it is not
@@ -867,9 +921,10 @@ impl Type {
                         codomain: Box::new(cod),
                     }
                 }
-                Type::Refinement(base, r) => {
-                    Type::Refinement(Box::new(go(base, depth, subst)), subst.force_refinement(r))
-                }
+                Type::Refinement(base, claims) => Type::refined(
+                    go(base, depth, subst),
+                    claims.iter().map(|r| subst.force_refinement(r)).collect(),
+                ),
                 Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| go(t, depth, subst)).collect()),
                 Type::Record(fs) => Type::Record(
                     fs.iter()
@@ -929,8 +984,8 @@ impl Type {
                     .map(|(k, t)| (k.clone(), t.without_pi_names()))
                     .collect(),
             ),
-            Type::Refinement(base, r) => {
-                Type::Refinement(Box::new(base.without_pi_names()), r.clone())
+            Type::Refinement(base, claims) => {
+                Type::refined(base.without_pi_names(), claims.clone())
             }
             Type::History {
                 value,
@@ -1247,12 +1302,11 @@ fn eq_cast_target_predicates(t1: &Type, t2: &Type) -> bool {
         ccl_utils::cast_target_refinement(t2),
     ) {
         (None, None) => true,
-        (Some(r1), Some(r2)) => {
-            if Rc::ptr_eq(&r1.predicate, &r2.predicate) {
-                return true;
-            }
-            eq_refinement_predicate_go(&r1.predicate, &r2.predicate)
-        }
+        // Set equality, whose member comparison is `Refinement`'s own
+        // (`eq_refinement_predicate`, pointer short-circuit included). The
+        // mutual recursion terminates on tree shape: predicates are acyclic
+        // `Rc<TypedExpr>`s, so a cast target cannot contain the term comparing it.
+        (Some(s1), Some(s2)) => s1 == s2,
         _ => false,
     }
 }
@@ -1463,6 +1517,238 @@ impl std::hash::Hash for Refinement {
     }
 }
 
+/// The claims carried at one refined position: an **unordered set** of
+/// [`Refinement`]s, deduplicated by their structural [`PartialEq`].
+///
+/// A refined type narrows its base by the *conjunction* of these claims, and
+/// conjunction is commutative, idempotent, and associative — so a set is the
+/// honest carrier and a chain of nested `{{𝑇 | 𝑝} | 𝑞}` layers was not. That
+/// chain gave one representation three incompatible readings: a *set* to
+/// subtyping (the deficit machinery compares layers as a set), a *stack* to
+/// planning (whichever layer sat outermost drove which restrict it built), and
+/// an *identity* to `SpecKey` and the recorded-vs-recomputed walls (`Type`'s
+/// derived equality is position-sensitive). Layers accumulated in constraint
+/// *arrival* order, so the stack reading made typing depend on the order two
+/// bounds happened to meet at a variable. Set semantics deletes the degree of
+/// freedom rather than pinning it to a canonical order: there is no position to
+/// read, so planning is free to apply predicates in whatever order it likes
+/// (cheapest filter first, say) without changing an identity.
+///
+/// The invariant, maintained by [`insert`](Self::insert) and relied on by
+/// [`PartialEq`]: **no two members are equal**. Given that, mutual containment
+/// reduces to equal length plus one-way containment.
+#[derive(Debug, Clone, Default)]
+pub struct RefinementSet(Vec<Refinement>);
+
+/// Whether to build refinement sets in reversed physical order — the
+/// order-independence **stress knob**, driven by `CAMBRA_REFINEMENT_ORDER=reverse`.
+///
+/// Set semantics makes the backing `Vec`'s order meaningless by contract, but
+/// two classes of order-dependence survive a representation change that the
+/// type system cannot catch: a consumer that *iterates* the set and lets the
+/// order reach something observable, and a dedup that keeps the
+/// first-inserted of two `eq`-equal members whose (type-blind-equal) predicate
+/// terms carry different embedded type slots. Flipping the physical order
+/// globally and re-running the suite is the only way to exercise both. Reading
+/// it once into a `LazyLock` keeps the check to a cached bool, and it is
+/// `debug_assertions`-only so a release compiler cannot be perturbed by the
+/// environment.
+#[cfg(debug_assertions)]
+fn stress_reversed() -> bool {
+    static REVERSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("CAMBRA_REFINEMENT_ORDER").as_deref() == Ok("reverse")
+    });
+    *REVERSED
+}
+
+#[cfg(not(debug_assertions))]
+fn stress_reversed() -> bool {
+    false
+}
+
+impl RefinementSet {
+    /// The empty set — an unrefined position.
+    pub fn new() -> Self {
+        RefinementSet(Vec::new())
+    }
+
+    /// The singleton set carrying one claim.
+    pub fn one(r: Refinement) -> Self {
+        RefinementSet(vec![r])
+    }
+
+    /// Add a claim, keeping the set deduplicated. Returns whether it was new.
+    ///
+    /// A claim already present is dropped rather than replacing the incumbent:
+    /// the two are equal as *restrictions* ([`eq_refinement_predicate`]), and
+    /// keeping the incumbent preserves whatever predicate `Rc` sharing the
+    /// position already had.
+    pub fn insert(&mut self, r: Refinement) -> bool {
+        if self.0.contains(&r) {
+            return false;
+        }
+        if stress_reversed() {
+            self.0.insert(0, r);
+        } else {
+            self.0.push(r);
+        }
+        true
+    }
+
+    /// Add every claim of `other`.
+    pub fn extend(&mut self, other: impl IntoIterator<Item = Refinement>) {
+        for r in other {
+            self.insert(r);
+        }
+    }
+
+    /// The union of two sets — the position claims everything either claims.
+    /// This is the *meet* of the refined types (a narrower value satisfies
+    /// more), so it is what a negative-polarity merge performs.
+    pub fn union(mut self, other: &RefinementSet) -> Self {
+        self.extend(other.iter().cloned());
+        self
+    }
+
+    /// The intersection — only the claims *both* sides guarantee, which is
+    /// what a value known to be one of two things reliably carries (the
+    /// positive-polarity merge, and the *join* of the refined types).
+    pub fn intersect(&self, other: &RefinementSet) -> Self {
+        RefinementSet(
+            self.0
+                .iter()
+                .filter(|r| other.contains(r))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    pub fn contains(&self, r: &Refinement) -> bool {
+        self.0.contains(r)
+    }
+
+    pub fn as_slice(&self) -> &[Refinement] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Refinement> {
+        self.0.iter()
+    }
+
+    /// Mutable access to each claim, for the passes that rewrite predicates in
+    /// place (substitution forcing, predicate compilation). Rewriting cannot
+    /// change *which* claims are present, so the dedup invariant is preserved
+    /// by construction — a rewrite that merged two claims into one would leave
+    /// a duplicate, which is why the rewriting passes re-`insert` instead.
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Refinement> {
+        self.0.iter_mut()
+    }
+
+    /// The sole claim, or `None` if the set does not hold exactly one.
+    ///
+    /// For the positions built with exactly one predicate by construction — a
+    /// `cast` target's domain refinement, a literal singleton's pin — where
+    /// "the" refinement is a real notion rather than a position in a chain.
+    pub fn sole(&self) -> Option<&Refinement> {
+        match self.0.as_slice() {
+            [r] => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// Walk `claims` in **application order**: each claim paired with the type its
+/// element has at the point that claim applies — `base` narrowed by every claim
+/// applied before it.
+///
+/// A claim set is unordered as a *fact* about a value, but materializing it is a
+/// pipeline — planning emits one `restrict` per claim — and a pipeline is
+/// sequential: stage 𝑘 reads elements already narrowed by stages 1..𝑘-1, so its
+/// element type is not the bare base. Planning therefore *chooses* an order here.
+/// Which order is free (any of them yields a well-typed pipeline for the same
+/// final domain, and a cost model could pick the cheapest filter first); what is
+/// not free is choosing *differently* in two places, since the types along the
+/// pipeline and the predicates compiled for it must agree. Every site that
+/// lowers or types that pipeline goes through this function, so they agree by
+/// construction rather than by coincidence.
+pub fn application_order<'a>(
+    claims: &'a [Refinement],
+    base: &'a Type,
+) -> impl Iterator<Item = (&'a Refinement, Type)> + 'a {
+    let mut narrowed = RefinementSet::new();
+    claims.iter().map(move |r| {
+        let elem_ty = Type::refined(base.clone(), narrowed.clone());
+        narrowed.insert(r.clone());
+        (r, elem_ty)
+    })
+}
+
+impl PartialEq for RefinementSet {
+    /// Set equality. Sound as stated because both sides are deduplicated
+    /// ([`insert`](RefinementSet::insert)), so equal cardinality plus one-way
+    /// containment is mutual containment.
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().all(|r| other.0.contains(r))
+    }
+}
+
+impl Eq for RefinementSet {}
+
+impl std::hash::Hash for RefinementSet {
+    /// Order-insensitive, as [`PartialEq`] demands: each member's hash is
+    /// folded in with a commutative operation. `wrapping_add` rather than
+    /// `XOR` because XOR lets two hash-colliding members cancel to the empty
+    /// set's hash; the length is mixed in for the same reason.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut combined: u64 = 0;
+        for r in &self.0 {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(r, &mut h);
+            combined = combined.wrapping_add(std::hash::Hasher::finish(&h));
+        }
+        std::hash::Hash::hash(&self.0.len(), state);
+        std::hash::Hash::hash(&combined, state);
+    }
+}
+
+impl FromIterator<Refinement> for RefinementSet {
+    fn from_iter<I: IntoIterator<Item = Refinement>>(iter: I) -> Self {
+        let mut out = RefinementSet::new();
+        out.extend(iter);
+        out
+    }
+}
+
+impl IntoIterator for RefinementSet {
+    type Item = Refinement;
+    type IntoIter = std::vec::IntoIter<Refinement>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a RefinementSet {
+    type Item = &'a Refinement;
+    type IntoIter = std::slice::Iter<'a, Refinement>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl From<Refinement> for RefinementSet {
+    fn from(r: Refinement) -> Self {
+        RefinementSet::one(r)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,7 +1799,7 @@ mod tests {
     #[test]
     fn handle_accessors_see_through_a_refinement() {
         let claim = Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true))));
-        let refine = |t: Type| Type::Refinement(Box::new(t), claim.clone());
+        let refine = |t: Type| Type::refined_one(t, claim.clone());
         let int = Type::Base(BaseType::Int);
         let register = Type::History {
             value: Box::new(int.clone()),

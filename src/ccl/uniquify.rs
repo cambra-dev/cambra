@@ -277,14 +277,16 @@ impl Uniquifier {
     /// (see module docs), with every occurrence re-pointed at the rebuilt `Rc`
     /// via `memo`.
     fn ty(&mut self, t: &mut Type) {
-        if let Type::Refinement(_, r) = t {
+        if let Type::Refinement(_, claims) = t {
             // A handle clone, so `self` stays freely borrowable for the rebuild —
             // which re-enters this same memo through `self.expr` → `self.ty`.
             let memo = self.memo.clone();
-            memo.rebuild(r, &(), |pred| {
-                self.expr(pred);
-                true
-            });
+            for r in claims.iter_mut() {
+                memo.rebuild(r, &(), |pred| {
+                    self.expr(pred);
+                    true
+                });
+            }
         }
         t.walk_children_mut(|c| self.ty(c));
     }
@@ -362,7 +364,7 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
     use crate::ccl::provenance::NodeId;
 
     fn from_ty(t: &Type, out: &mut Vec<NodeId>) {
-        if let Type::Refinement(_, r) = t {
+        for r in t.claims() {
             from_expr(&r.predicate, out);
         }
         t.walk_children(|c| from_ty(c, out));
@@ -444,7 +446,7 @@ mod tests {
     /// inside other refinements' predicate expressions.
     fn collect_refinements(e: &Expr, out: &mut Vec<Refinement>) {
         fn from_ty(t: &Type, out: &mut Vec<Refinement>) {
-            if let Type::Refinement(_, r) = t {
+            for r in t.claims() {
                 out.push(r.clone());
                 collect_refinements(&r.predicate, out);
             }

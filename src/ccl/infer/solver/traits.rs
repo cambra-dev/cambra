@@ -939,8 +939,8 @@ mod tests {
     /// emission an operand is usually still a variable with nothing to strip.
     #[test]
     fn a_refinement_narrows_as_its_base() {
-        let refined = Type::Refinement(
-            Box::new(Type::Base(BaseType::String)),
+        let refined = Type::refined_one(
+            Type::Base(BaseType::String),
             crate::ccl::Refinement::born(Rc::new(crate::ccl::TypedExpr::lit(
                 crate::ccl::Lit::Bool(true),
             ))),

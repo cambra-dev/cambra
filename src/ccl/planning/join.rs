@@ -718,20 +718,13 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
         JoinPlan::Loop { arms, predicate } => {
             let base_iteration = (|| {
                 if arms.len() == 1 {
-                    if let Type::Refinement(base_ty, refinement) = &types[arms[0]] {
-                        // `convert_loop_join` only reads the predicate (it
-                        // builds a new expr), so borrow the immutable term
-                        // rather than clone it.
-                        let pred = &*refinement.predicate;
-                        trace!("Attempting loop join conversion inside iteration");
-                        if let Some(transformed) = convert_loop_join(base_ty, pred) {
-                            trace!(
-                                "Converted iteration to {} : {}",
-                                symbolic(&transformed),
-                                transformed.ty
-                            );
-                            return transformed;
-                        }
+                    if let Some(transformed) = convert_claim_to_join(&types[arms[0]]) {
+                        trace!(
+                            "Converted iteration to {} : {}",
+                            symbolic(&transformed),
+                            transformed.ty
+                        );
+                        return transformed;
                     }
                     make_iterate(trivially_true_predicate(types[arms[0]].clone()))
                 } else {
@@ -1036,22 +1029,46 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
 /// `FinalOrDefault` streams, at `Loop` sources, at `CollectionUnion`
 /// operands, or as a let-bound function value.
 ///
+/// Compile **one** of a refined domain's claims into a join, leaving the others
+/// as ordinary restrictions on the domain the join reads.
+///
+/// Any claim may be the join condition — the set is unordered, so there is no
+/// "the" predicate to read — and the first that [`convert_loop_join`] accepts
+/// wins. That also gives planning latitude it could not have while claims were
+/// a chain: when several are joinable, which one becomes the join is a free
+/// choice a cost model may later make, and the rest remain filters either way.
+/// `None` for an unrefined domain or when no claim forms a join.
+fn convert_claim_to_join(domain_ty: &Type) -> Option<Expr> {
+    let Type::Refinement(base, claims) = domain_ty else {
+        return None;
+    };
+    trace!("Attempting loop join conversion inside iteration");
+    claims.iter().enumerate().find_map(|(i, r)| {
+        let rest = Type::refined(
+            (**base).clone(),
+            claims
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, c)| c.clone())
+                .collect(),
+        );
+        // `convert_loop_join` only reads the predicate (it builds a new expr),
+        // so borrow the immutable term rather than clone it.
+        convert_loop_join(&rest, &r.predicate)
+    })
+}
+
 /// Supports n-way joins (n ≥ 2) when all arms are connected via equality
 /// conditions that form a spanning tree.  Build/probe assignment follows
 /// the BFS order of that spanning tree.  For now, predicates must be
 /// expressed as conjunctions of single-arm equality conditions.
 pub(super) fn try_hash_join_rewrite(expr: &mut Expr, domain_ty: &Type) -> bool {
-    let Type::Refinement(base, refinement) = domain_ty else {
-        return false;
-    };
-    // `convert_loop_join` only reads the predicate (it builds a new expr), so
-    // borrow the immutable term rather than clone it.
-    let pred = &*refinement.predicate;
     trace!(
         "Attempting hash-join rewrite at iteration site: {}",
         symbolic(expr),
     );
-    let Some(transformed) = convert_loop_join(base, pred) else {
+    let Some(transformed) = convert_claim_to_join(domain_ty) else {
         trace!("Hash-join pattern did not match");
         return false;
     };

@@ -1126,7 +1126,7 @@ fn collect_type_errors(
             collect_type_errors(value, context_sym, strictness, errors, seen_refinements);
             collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
         }
-        Type::Refinement(inner, refinement) => {
+        Type::Refinement(inner, claims) => {
             // Walk each predicate term only once: a predicate term shared by
             // `Rc` across occurrences (its own type slots can carry the same
             // refinement) is a DAG, so this dedups it. (Immutable predicates
@@ -1138,8 +1138,15 @@ fn collect_type_errors(
             // [`crate::ccl::ccl_utils::walk_refined_predicates`]). This site
             // doesn't share the helper because it mixes per-node error checks
             // with the refinement walk.
-            if seen_refinements.insert(refinement.predicate_id()) {
-                collect_expr_errors(&refinement.predicate, strictness, errors, seen_refinements);
+            for refinement in claims {
+                if seen_refinements.insert(refinement.predicate_id()) {
+                    collect_expr_errors(
+                        &refinement.predicate,
+                        strictness,
+                        errors,
+                        seen_refinements,
+                    );
+                }
             }
             collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
         }

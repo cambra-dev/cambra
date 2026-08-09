@@ -369,11 +369,13 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx, pi_depth: u
         // dependent-application discharge lands in the key as the predicate the
         // clone will actually carry — that is use-specific information, and two
         // uses discharging different arguments *should* key apart.
-        Type::Refinement(inner, r) => {
+        Type::Refinement(inner, claims) => {
             let mut k = key_go(inner, pol, subst_acc, ctx, pi_depth);
-            let r = subst_acc.force_refinement(r);
-            if !k.refinements.contains(&r) {
-                k.refinements.push(r);
+            for r in claims {
+                let r = subst_acc.force_refinement(r);
+                if !k.refinements.contains(&r) {
+                    k.refinements.push(r);
+                }
             }
             k
         }
@@ -545,14 +547,8 @@ mod tests {
 
     #[test]
     fn refinement_sets_compare_order_insensitively() {
-        let a = Type::Refinement(
-            Box::new(Type::Refinement(Box::new(int()), refined(1))),
-            refined(2),
-        );
-        let b = Type::Refinement(
-            Box::new(Type::Refinement(Box::new(int()), refined(2))),
-            refined(1),
-        );
+        let a = Type::refined_one(Type::refined_one(int(), refined(1)), refined(2));
+        let b = Type::refined_one(Type::refined_one(int(), refined(2)), refined(1));
         assert_eq!(spec_key(&a), spec_key(&b));
     }
 

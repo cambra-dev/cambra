@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 use crate::ccl::{
     BaseType, BinOpKind, Branch, Builtin, Expr, F_COMMIT, F_FIRE_SUFFIX, F_WRITES, Lit, LogicKind,
-    Name, PredicateId, Refinement, Type, TypedExprNode, UnaryOpKind,
+    Name, PredicateId, Refinement, RefinementSet, Type, TypedExprNode, UnaryOpKind,
 };
 
 /// Disjoin control-flow `paths` into one boolean commit gate — the writer
@@ -149,12 +149,14 @@ pub(crate) fn debug_assert_no_iteration_markers_in_type(ty: &Type) {
             || e.fold_children(false, |acc, c| acc || expr_has_marker(c))
     }
     fn go(ty: &Type) {
-        if let Type::Refinement(_, r) = ty {
-            debug_assert!(
-                !expr_has_marker(&r.predicate),
-                "iteration/restrict marker leaked into a refinement predicate: {}",
-                crate::ccl::symbolic::symbolic(&r.predicate)
-            );
+        if let Type::Refinement(_, claims) = ty {
+            for r in claims {
+                debug_assert!(
+                    !expr_has_marker(&r.predicate),
+                    "iteration/restrict marker leaked into a refinement predicate: {}",
+                    crate::ccl::symbolic::symbolic(&r.predicate)
+                );
+            }
         }
         ty.walk_children(go);
     }
@@ -407,10 +409,7 @@ pub fn refine_codomain(morphism: Expr, bare_predicate: &Expr) -> Expr {
     // is stored directly — *not* via `refine_with`, which wraps a predicate
     // *function*. Storing the identical bare term keeps the producer codomain
     // structurally equal to the cast demand.
-    let refined = Type::Refinement(
-        Box::new(codomain),
-        Refinement::born(Rc::new(bare_predicate.clone())),
-    );
+    let refined = Type::refined_one(codomain, Refinement::born(Rc::new(bare_predicate.clone())));
     set_codomain(morphism, refined)
 }
 
@@ -498,16 +497,21 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
 /// [`TypedExprNode::Cast`]'s `target` to reattach the refinement to the
 /// reconstructed `groupby` lambda.  (Inference does not need it: it types the
 /// cast as the upcast `value_ty <: target` and lets the solver carry the
-/// refinement.) The returned `Refinement` shares the predicate's `Rc<Expr>` with
+/// refinement.) The returned claims share their predicates' `Rc<Expr>`s with
 /// `target`.
-pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
+///
+/// The whole [`RefinementSet`] is returned rather than a single claim: a target
+/// is *built* carrying one predicate ([`refined_data_fun`]), but the domain it
+/// unifies against may contribute more, and a caller reattaching "the cast's
+/// refinement" wants all of what the target demands.
+pub fn cast_target_refinement(target: &Type) -> Option<RefinementSet> {
     let Type::Fun { domain, .. } = target else {
         return None;
     };
-    let Type::Refinement(_, refinement) = domain.as_ref() else {
+    let Type::Refinement(_, claims) = domain.as_ref() else {
         return None;
     };
-    Some(refinement.clone())
+    Some(claims.clone())
 }
 
 /// Build a function type whose domain is `base_domain` wrapped in a fresh
@@ -523,7 +527,7 @@ pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
 /// inference fills them in by unifying against the value being cast.
 pub fn refined_data_fun(base_domain: Type, predicate: Expr, codomain: Type) -> Type {
     Type::data_fun(
-        Type::Refinement(Box::new(base_domain), Refinement::born(Rc::new(predicate))),
+        Type::refined_one(base_domain, Refinement::born(Rc::new(predicate))),
         codomain,
     )
 }
@@ -632,7 +636,7 @@ pub(crate) fn refine_with(base: Type, predicate: &Expr) -> Type {
         return base;
     }
     let bare = bare_predicate_of_fn(&base, predicate.clone());
-    Type::Refinement(Box::new(base), Refinement::born(Rc::new(bare)))
+    Type::refined_one(base, Refinement::born(Rc::new(bare)))
 }
 
 /// Count free occurrences of `name` in `expr`, including occurrences in
@@ -826,10 +830,12 @@ pub fn walk_refined_predicates<F>(ty: &Type, visited: &mut HashSet<PredicateId>,
 where
     F: FnMut(&Expr, &mut HashSet<PredicateId>),
 {
-    if let Type::Refinement(_, refinement) = ty
-        && visited.insert(refinement.predicate_id())
-    {
-        f(&refinement.predicate, visited);
+    if let Type::Refinement(_, claims) = ty {
+        for refinement in claims {
+            if visited.insert(refinement.predicate_id()) {
+                f(&refinement.predicate, visited);
+            }
+        }
     }
     ty.walk_children(|child| walk_refined_predicates(child, visited, f));
 }
@@ -1093,12 +1099,14 @@ impl TermMemo {
 /// refinement, i.e. whether sharing was split (see `tests/predicate_sharing.rs`).
 pub fn reachable_refinements(expr: &Expr) -> Vec<Refinement> {
     fn in_type(ty: &Type, out: &mut Vec<Refinement>, seen: &mut HashSet<PredicateId>) {
-        if let Type::Refinement(_, r) = ty
-            && seen.insert(r.predicate_id())
-        {
-            out.push(r.clone());
-            // A predicate's own subexpressions carry further refinements.
-            in_expr(&r.predicate, out, seen);
+        if let Type::Refinement(_, claims) = ty {
+            for r in claims {
+                if seen.insert(r.predicate_id()) {
+                    out.push(r.clone());
+                    // A predicate's own subexpressions carry further refinements.
+                    in_expr(&r.predicate, out, seen);
+                }
+            }
         }
         ty.walk_children(|c| in_type(c, out, seen));
     }
@@ -1155,8 +1163,10 @@ where
     F: FnMut(&mut Expr, &PredMemo<C>) -> bool,
 {
     let mut changed = false;
-    if let Type::Refinement(_, refinement) = ty {
-        changed |= memo.rebuild(refinement, context, |pred| f(pred, memo));
+    if let Type::Refinement(_, claims) = ty {
+        for refinement in claims.iter_mut() {
+            changed |= memo.rebuild(refinement, context, |pred| f(pred, memo));
+        }
     }
     ty.walk_children_mut(|child| changed |= walk_refined_predicates_mut(child, memo, context, f));
     changed

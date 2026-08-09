@@ -136,7 +136,7 @@ Types (from `Display for Type` in `src/ccl/mod.rs`):
 
 - **Function**: `(T ⇒ U)` for a compute function; `(T ⤇ U)` (plain-text `|=>`) for a data function (the domain is the data map, joins must be lossless). FunKind is inferred by the solver (`FunKind::Var`, resolved at coalesce — see `src/ccl/design/type-inference.md` §4.6) and `Display` renders it live: a data collection shows `⤇`, a capability (and a genuinely unresolved kind var) `⇒`. A comprehension over a **let-bound** collection source resolves to `⤇` just like one over a literal source (`let x = [1,2,3] in [y + 10 for y in x]` is `⤇`) — its domain is a data collection.
 - **Sigma** (in-flight, same stack): `Σ{D0, D1} ⤇ V` — a data function whose domain is exactly one of the listed choices; with a live witness binder, `(Σ n ∈ {D0, D1}. n ⤇ V)`.
-- **Refinement**: `{T | predicate}` — predicate is rendered via `symbolic`.
+- **Refinement**: `{T | p, q}` — a base narrowed by the *conjunction* of an unordered `RefinementSet`'s claims, each rendered via `symbolic` (one claim renders `{T | p}`). Claims print sorted, so a rendering never depends on insertion order; refinements never nest (`Type::refined` flattens `{{T | p} | q}` to `{T | p, q}`).
 - **UIntRange**: `[0, N]`, or `∅` when empty.
 - **Hole**: `_`.
 - **Infer**: `?N` (where `N` is the variable id).
@@ -161,7 +161,7 @@ Use the symbolic forms below in prose and inline pseudo-code (not in fenced code
 - **Function type with named binder** (`Type::Fun` with `name: Some(_)`): `(𝑥: 𝐴) ⇒ 𝐵`. `𝑥` is bound in `𝐵`.
 - **Function type with no named binder** (`Type::Fun` with `name: None`): `𝐴 ⇒ 𝐵`.
 - **Data function type** (`FunKind::Data`, kind inferred and rendered live): `𝐴 ⤇ 𝐵`, named-binder form `(𝑥: 𝐴) ⤇ 𝐵` — same associativity as `⇒`; the bar reads "the domain is the data". **Σ type** (formation live; witness binder still dormant): `Σ 𝑛 ∈ {𝐷₀, 𝐷₁}. 𝑛 ⤇ 𝑉` — a dependent sum over candidate domains; anonymous-witness shorthand `Σ{𝐷₀, 𝐷₁} ⤇ 𝑉`.
-- **Refinement type**: `{𝑥: 𝑇 | 𝑝(𝑥)}` — standard subset-type notation.
+- **Refinement type**: `{𝑥: 𝑇 | 𝑝(𝑥)}` — standard subset-type notation; several claims at one position conjoin, `{𝑥: 𝑇 | 𝑝(𝑥), 𝑞(𝑥)}`, and are an unordered set.
 - **Lambda** (term): `λ 𝑥 → body`. The `→` after the binder separates the parameter from the body.
 - **Forward apply** (term level): `𝑎 ▷ 𝑓` means `𝑓(𝑎)`.
 - **Forward compose** (term level): `𝑓 ≫ 𝑔` means `λ 𝑥 → 𝑔(𝑓(𝑥))`.
