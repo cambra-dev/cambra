@@ -86,31 +86,35 @@ theorem lookupBy_of_mem_nodup [BEq α] [LawfulBEq α] {l : List (α × Ty)}
         rw [hfind]
         exact this
 
-/-- No type is an index partition of *itself*: the first leg's stripped
-payload would have to equal the stripped variant that strictly contains it,
-which `sizeOf` forbids. This is what routes every reflexive function pair
-through the general arms in `Sub.refl`. -/
-theorem isIndexPartitionOf_irrefl : (d : Ty) → ¬IsIndexPartitionOf d d
-  | .base _ => fun h => h
-  | .uintRange _ => fun h => h
-  | .dataSource _ => fun h => h
-  | .txn => fun h => h
-  | .fn .. => fun h => h
-  | .tuple _ => fun h => h
-  | .record _ => fun h => h
-  | .refined .. => fun h => h
-  | .variant tags => fun h => by
-      obtain ⟨hne, hpart⟩ := h
-      match tags, hpart with
-      | (k, p) :: rest, ⟨_, hstrip, _⟩ =>
-        have hmem : ((k, p).1, (k, p).2.stripRefinements) ∈
-            (((k, p) :: rest).map fun e => (e.1, e.2.stripRefinements)) :=
-          List.mem_map_of_mem (List.mem_cons_self ..)
-        have hsz := List.sizeOf_lt_of_mem hmem
-        simp only [Ty.stripRefinements] at hstrip
-        rw [hstrip] at hsz
-        simp at hsz
-        omega
+/-- Normalization preserves well-formedness: the common domain is (under)
+the first leg, whose well-formedness the variant carries. -/
+theorem partitionDomain_wf {d u : Ty} (hwf : d.WF)
+    (h : partitionDomain d = some u) : u.WF := by
+  match d, h with
+  | .variant ((k0, p0) :: rest), h =>
+      simp only [partitionDomain] at h
+      split at h
+      · injection h with h
+        subst h
+        cases hwf with
+        | variant hnd hts =>
+            have hp0 : p0.WF := hts (k0, p0) (List.mem_cons_self ..)
+            cases hp : p0 with
+            | refined b p =>
+                rw [hp] at hp0
+                cases hp0 with
+                | refined hb => simpa [legUnder] using hb
+            | _ => simpa [legUnder, ← hp] using hp0
+      · exact absurd h (by simp)
+
+theorem normFun_wf {t t' : Ty} (hwf : t.WF) (h : normFun t = some t') :
+    t'.WF := by
+  match t, h with
+  | .fn n k d c, h =>
+      simp only [normFun, Option.map_eq_some_iff] at h
+      obtain ⟨d', hd, rfl⟩ := h
+      cases hwf with
+      | fn hd0 hc => exact .fn (partitionDomain_wf hd0 hd) hc
 
 /-- The refined case's termination shape: peeling the base stays under the
 refined node's size, whatever the predicate contributes. -/
@@ -137,16 +141,27 @@ theorem Sub.refl : (t : Ty) → t.WF → (ρl ρr : Ren) → ρl.IsId → ρr.Is
   | .dataSource s, _, _, _, _, _ => .dataSource s
   | .txn, _, _, _, _, _ => .txn
   | .fn n k d c, hwf, ρl, ρr, hl, hr => by
-      cases hwf with
-      | fn hd hc =>
-        have hcod := Sub.refl c hc (codRen n n ρl) ρr (codRen_diag_isId n hl) hr
-        cases k with
-        | data =>
-            exact .fnData (isIndexPartitionOf_irrefl d)
-              (Sub.refl d hd ρr ρl hr hl) (Sub.refl d hd ρl ρr hl hr) hcod
-        | compute =>
-            exact .fnCompute (fun h => nomatch h.1) trivial (fun h => nomatch h.1)
-              (Sub.refl d hd ρr ρl hr hl) hcod
+      cases hn : normFun (.fn n k d c) with
+      | some t' =>
+          -- A partition-typed function is reflexively below itself through
+          -- its (shared) normal form.
+          refine Sub.fnNorm (.inl (by simp [hn])) ?_
+          rw [hn]
+          simp only [Option.getD_some]
+          have hsz := normFun_sizeOf hn
+          exact Sub.refl t' (normFun_wf hwf hn) ρl ρr hl hr
+      | none =>
+          cases hwf with
+          | fn hd hc =>
+            have hcod :=
+              Sub.refl c hc (codRen n n ρl) ρr (codRen_diag_isId n hl) hr
+            cases k with
+            | data =>
+                exact .fnData hn hn (Sub.refl d hd ρr ρl hr hl)
+                  (Sub.refl d hd ρl ρr hl hr) hcod
+            | compute =>
+                exact .fnCompute hn hn trivial (fun h => nomatch h.1)
+                  (Sub.refl d hd ρr ρl hr hl) hcod
   | .tuple ts, hwf, ρl, ρr, hl, hr => by
       cases hwf with
       | tuple hts =>
@@ -189,5 +204,6 @@ decreasing_by
     | omega
     | (have := List.sizeOf_lt_of_mem ‹_ ∈ _›; try simp at this; omega)
     | apply Ty.peel_fst_lt_one_add
+    | (simp at hsz; omega)
 
 end CclFormal
