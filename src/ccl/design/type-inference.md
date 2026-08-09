@@ -411,10 +411,15 @@ place. A pass that processes a predicate at one occurrence must therefore reach
 threads a memo keyed on the original predicate's identity so occurrences that
 shared one term are re-pointed at the same rebuild (the immutable replacement
 for "mutate the shared cell, every alias observes it"). One consequence worth
-naming: a `Cast`'s `target` type slot is the cast's recorded type, so passes
-that rebuild a predicate on `expr.ty` re-sync the `target` to it
-(`ccl_utils::sync_cast_targets`) — the post-inference check reconstructs a cast
-from its `target`.
+naming: a `Cast`'s `target` slot carries the cast's **born** claims (the
+assertion), never a copy of the recorded type — a pass that rebuilds node types
+restores the canonical split afterwards (`ccl_utils::canonicalize_cast_types`:
+`target` = born claims on the rebuilt view's bases, `expr.ty` = value-claims ∪
+born) rather than overwriting `target` with `expr.ty`. The post-inference check
+reconstructs a cast as value-claims ∪ target-claims, and a wholesale overwrite
+satisfied that check only by making the cast's claim *identity* track whatever
+route-dependent type the rebuild derived — the arrival-order defect the
+canonical split retires (see the coalesce-time rule at `canonical_cast_ty`).
 
 #### Sharing is an invariant, not an optimization detail
 

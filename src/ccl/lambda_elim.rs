@@ -91,11 +91,12 @@ pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
     // → simplify (→ planning) sub-pipeline when a refined type is iterated
     // (`planning::compile_refinement_predicates`).
     let mut simplified = simplify(point_free);
-    // Predicate rewrites during elimination/simplification rebuild the
-    // immutable predicate on each node's `expr.ty`; re-sync every `Cast`'s
-    // `target` slot to its `expr.ty` so the post-pass typecheck's
-    // reconstruction matches the recorded type.
-    crate::ccl::ccl_utils::sync_cast_targets(&mut simplified);
+    // Elimination and simplification rebuild node types from surrounding term
+    // structure; restore each `Cast`'s canonical split (`target` = born
+    // claims, `expr.ty` = value-claims ∪ born on the rebuilt view) so the
+    // post-pass typecheck's reconstruction matches the recorded type without
+    // making the cast's claims route-dependent.
+    crate::ccl::ccl_utils::canonicalize_cast_types(&mut simplified);
     Ok(simplified)
 }
 

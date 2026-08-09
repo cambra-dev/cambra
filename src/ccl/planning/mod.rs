@@ -115,11 +115,7 @@ pub fn run(mut expr: Expr) -> Expr {
     // the `Apply(_, Iterate)` / `Apply(_, Restrict)` markers just inserted,
     // so the only rules that fire here are the always-safe cleanups (plus
     // any reduction of a fully marker-free sub-tree, which is sound).
-    let mut expr = simplify(expr);
-    // Compilation rebuilt the immutable predicate on each node's `expr.ty`;
-    // re-sync every `Cast`'s `target` slot so the post-planning typecheck's
-    // reconstruction (which reads `target`) matches the compiled recorded type.
-    ccl_utils::sync_cast_targets(&mut expr);
+    let expr = simplify(expr);
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_live_reads` (pre-lambda-elim), so by here every
     // such read is already an `as_of` join — nothing to do at planning time.
