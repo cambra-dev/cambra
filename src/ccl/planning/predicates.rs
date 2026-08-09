@@ -109,8 +109,45 @@ fn term_mentions_pair_binder(e: &Expr) -> bool {
 /// case the per-`Rc` memo keeps shared occurrences equal despite `lambda_elim`'s
 /// `__pair` minting (see [`PredMemo`]).
 pub(crate) fn compile_refinement_predicates(expr: &mut Expr, memo: &PredMemo<Type>) {
+    // A `Cast`'s target claims are assertions on the cast's *value*: the
+    // checker types them with `__elem` bound at the value's domain (see
+    // `emit_cast`), which carries the value's own claims. Compile them against
+    // that same base — a target holds only the cast's *born* claims, so
+    // deriving the element type from the target alone would stamp `__elem`
+    // bare and fail the checker's argument edge against a predicate function
+    // whose domain the value's claims narrow.
+    if let TypedExprNode::Cast { value, target } = &mut expr.node {
+        let value_dom = value.ty.domain();
+        compile_cast_target(target, value_dom, memo);
+        compile_predicates_in_type(&mut expr.ty, memo);
+        compile_refinement_predicates(value, memo);
+        return;
+    }
     expr.walk_type_slots_mut(|ty| compile_predicates_in_type(ty, memo));
     expr.walk_children_mut(|child| compile_refinement_predicates(child, memo));
+}
+
+/// Compile a cast target's domain claims against the value's domain (the
+/// assertion base — see [`compile_refinement_predicates`]), then the rest of
+/// the target generically. The top-level domain refinement must not be
+/// revisited by the generic walk: recompiling it against the target's bare
+/// base would re-stamp `__elem` with the narrower context lost.
+fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMemo<Type>) {
+    if let Type::Fun {
+        domain, codomain, ..
+    } = target
+    {
+        if let Type::Refinement(base, claims) = domain.as_mut() {
+            let assert_base = value_dom.unwrap_or_else(|| (**base).clone());
+            compile_claims(claims, &assert_base, memo);
+            compile_predicates_in_type(base, memo);
+        } else {
+            compile_predicates_in_type(domain, memo);
+        }
+        compile_predicates_in_type(codomain, memo);
+    } else {
+        compile_predicates_in_type(target, memo);
+    }
 }
 
 /// The point-free predicate function `p : base ⇒ Bool` underlying a refinement's
@@ -129,11 +166,22 @@ pub(crate) fn fn_of_bare_predicate(base: &Type, bare: &Expr) -> Expr {
 
 fn compile_predicates_in_type(ty: &mut Type, memo: &PredMemo<Type>) {
     if let Type::Refinement(base, claims) = ty {
-        // Each claim is compiled against the element type it sees in the
-        // restrict pipeline planning will build for this domain — the base
-        // narrowed by the claims applied before it. `wrap_with_iterate` builds
-        // that pipeline from the same `application_order`, so the compiled
-        // predicates and the pipeline's types agree.
+        let base = base.clone();
+        compile_claims(claims, &base, memo);
+    }
+    // Recurse into structural type children (refinement base, function
+    // domain/codomain, tuple/record/variant elements).
+    ty.walk_children_mut(|child| compile_predicates_in_type(child, memo));
+}
+
+/// Compile each claim of a set against the element type it sees in the
+/// restrict pipeline planning will build for this domain — `base` narrowed by
+/// the claims applied before it. `wrap_with_iterate` builds that pipeline from
+/// the same `application_order`, so the compiled predicates and the pipeline's
+/// types agree. For a cast target's claims, `base` is the cast value's domain
+/// (the assertion base — see [`compile_refinement_predicates`]).
+fn compile_claims(claims: &mut crate::ccl::RefinementSet, base: &Type, memo: &PredMemo<Type>) {
+    {
         let elem_tys: Vec<Type> = crate::ccl::application_order(claims.as_slice(), base)
             .map(|(_, t)| t)
             .collect();
@@ -173,7 +221,4 @@ fn compile_predicates_in_type(ty: &mut Type, memo: &PredMemo<Type>) {
             });
         }
     }
-    // Recurse into structural type children (refinement base, function
-    // domain/codomain, tuple/record/variant elements).
-    ty.walk_children_mut(|child| compile_predicates_in_type(child, memo));
 }

@@ -19,7 +19,7 @@
 // (`coalesce_node` ↔ `specialize_use`) over one shared [`CoalesceCtx`], so they
 // live in a single module.
 
-use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
@@ -1221,66 +1221,6 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             expr.ty = canonical_cast_ty(&born, Some(&value.ty), view);
         }
     }
-}
-
-/// The canonical type of a `Cast` node: the coalesced `view`'s shape and bases,
-/// carrying the claims the **term** determines — the value's own domain claims
-/// plus the `born` target's claim set. Inference resolves a cast's bases; it
-/// does not decide its claims.
-///
-/// A cast is an *assertion*: `cast(value, {𝐷 | 𝑝} ⇒ 𝑉)` claims exactly `𝑝` on
-/// top of whatever its value already established, and both parts are fixed by
-/// the term — the born claims when the cast was written (lowering's filter, a
-/// group-by's key equation), the value's claims by the value's own type, which
-/// coalesced first (this walk is bottom-up, so a cast value's type is already
-/// canonical by induction). The graph view of the same position accumulates
-/// the same union on the ordinary route — the upcast `value <: target` is how
-/// the value's claims flow in — but *which* claims an occurrence's variable
-/// accumulates depends on the route bounds took through the graph: an embedded
-/// copy of a cast (a comprehension source cloned into a filter predicate) has
-/// its own variable, and under an adversarial bound order it coalesces bare,
-/// or decorated with a sibling layer's filter. Installing the view wholesale
-/// (the previous behaviour) therefore made a cast's *identity* route-dependent
-/// — which refinement equality, deliberately cast-target-aware, then refused
-/// to dedup. Deriving the claims from the term instead is route-independent
-/// and agrees with the view on every deterministic route.
-///
-/// When the view's claims already equal the term-derived set, the view is
-/// installed wholesale — preserving the predicate-`Rc` sharing between the
-/// target and the node type that planning's compile-once relies on.
-/// `value_ty: None` computes the canonical *target* (born claims alone);
-/// `Some` computes the canonical node *type* (value's domain claims ∪ born).
-fn canonical_cast_ty(born: &Type, value_ty: Option<&Type>, view: Type) -> Type {
-    let born_claims = match born.domain() {
-        Some(d) => d.claims().to_vec(),
-        None => return view,
-    };
-    let Some(view_dom) = view.domain() else {
-        return view;
-    };
-    // The term-determined claim set: value's domain claims (type position
-    // only) ∪ born claims.
-    let mut canon_claims: crate::ccl::RefinementSet = value_ty
-        .and_then(|t| t.domain())
-        .map(|d| d.claims().to_vec())
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    canon_claims.extend(born_claims);
-    let view_claims = view_dom.claims();
-    let same = canon_claims.len() == view_claims.len()
-        && view_claims.iter().all(|r| canon_claims.contains(r));
-    if same {
-        return view;
-    }
-    let cod = view
-        .codomain()
-        .expect("a type with a domain has a codomain");
-    Type::fun_like(
-        &view,
-        Type::refined(view_dom.peel_refinements().clone(), canon_claims),
-        cod,
-    )
 }
 
 /// Coalesce refinement predicates embedded anywhere in `ty` (see the call

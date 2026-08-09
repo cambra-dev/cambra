@@ -221,25 +221,26 @@ fn refinement_claims_are_arrival_order_independent() {
     assert_eq!(format!("{a}"), format!("{b}"));
 }
 
-/// **Finding, open: claim *dedup* is order-sensitive, because refinement
-/// equality distinguishes vintages that rendering does not.**
+/// **Exhibit (behaviour retained by design): refinement equality
+/// distinguishes cast-target vintages that rendering does not.**
 ///
-/// [`RefinementSet`](crate::ccl::RefinementSet) removes order from the
-/// representation, but two claims can be `eq`-**unequal** while denoting the
-/// same restriction to every reader that does not look at embedded `Cast`
-/// targets — the predicate *vintages* a dependent-application discharge mints
-/// (`𝑝(xs)`, `𝑝(cast(xs))`, …). `eq_refinement_predicate` deliberately
-/// compares a cast's target predicate, so two vintages do not dedup; which
-/// vintage a position ends up holding still depends on which arrived first.
+/// Two claims can be `eq`-**unequal** while rendering identically, because
+/// `eq_refinement_predicate` deliberately compares a cast's target predicate —
+/// a semantic filter, not inference metadata (pinned by
+/// `refinement_eq_distinguishes_cast_target_predicates`). Conflating two casts
+/// whose targets carry different filters would let refinement-deficit matching
+/// accept an unsatisfied demand, so dedup must not collapse them.
 ///
-/// Running the suite under `CAMBRA_REFINEMENT_ORDER=reverse` exhibits it: a
-/// claim set grows a second copy of one restriction, and a recorded type and
-/// its recomputation disagree while *rendering identically*. That is the
-/// canonical-discharge question (are two vintages the same refinement?), not
-/// an ordering mechanism — see `formal/design.md`. This test pins the
-/// mechanism directly, so it is a reproducible exhibit rather than a claim in
-/// a comment: two claims that render the same compare unequal, hence dedup
-/// cannot collapse them.
+/// This used to be the order-sensitivity residue: passes *manufactured*
+/// divergent vintages of one claim (wholesale `target := expr.ty` overwrites
+/// promoted route-dependent rebuilt types into the compared slot), and dedup
+/// correctly refused to collapse them — surfacing as duplicated claims under
+/// `CAMBRA_REFINEMENT_ORDER=reverse`. The canonical-discharge ruling closed
+/// that at the source (a cast's claims are term-determined; see
+/// `canonical_cast_ty` / `canonicalize_cast_types`, and `formal/design.md`),
+/// so the pipeline no longer produces render-alike unequal twins. This test
+/// keeps the equality's semantics pinned from the other side: when targets
+/// *genuinely* differ, rendering alike must not make them one claim.
 #[test]
 fn vintage_claims_render_alike_but_do_not_dedup() {
     use crate::ccl::{BaseType, Refinement, Type, TypedExpr, ccl_utils::make_cast};
