@@ -1676,8 +1676,17 @@ pub fn application_order<'a>(
     claims: &'a [Refinement],
     base: &'a Type,
 ) -> impl Iterator<Item = (&'a Refinement, Type)> + 'a {
+    // Planning's chosen order is a deterministic function of the claims'
+    // *content* — their rendered predicates — never of the set's physical
+    // (insertion) order, which carries no meaning. Any order yields a correct
+    // pipeline; choosing one that ignores insertion order keeps the built term
+    // reproducible however the claims happened to accumulate, and matches the
+    // order `Display` renders a claim set in. A cost model is free to replace
+    // this key (cheapest filter first) without touching identity.
+    let mut ordered: Vec<&Refinement> = claims.iter().collect();
+    ordered.sort_by_key(|r| crate::ccl::symbolic::symbolic(&r.predicate));
     let mut narrowed = RefinementSet::new();
-    claims.iter().map(move |r| {
+    ordered.into_iter().map(move |r| {
         let elem_ty = Type::refined(base.clone(), narrowed.clone());
         narrowed.insert(r.clone());
         (r, elem_ty)
