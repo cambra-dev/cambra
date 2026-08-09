@@ -360,6 +360,55 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
 /// literally-same-domain demands, so subsumption failed to be transitive
 /// (see `differential.rs :: bridge_normalization_composes`).
 ///
+/// The **uniquely-keyed** invariant the record and variant arms rest on, checked
+/// where they rest on it.
+///
+/// Both arms look a key up with `iter().find(..)` — *first* match wins — so on a
+/// duplicate-keyed product the answer depends on which copy comes first, and the
+/// arm disagrees with `constrain_go`'s own trivial-equality short-circuit: the
+/// short-circuit accepts `𝑡 <: 𝑡` while find-first demands cross-subtyping
+/// between the duplicates and rejects it. Whether a type is a subtype of itself
+/// would then depend on whether the two sides happened to be structurally
+/// identical.
+///
+/// Nothing in `Type` enforces uniqueness — `Record(Vec<(String, Type)>)` admits
+/// duplicates and the builders merely happen not to produce them — so this is a
+/// real invariant that is not type-enforced, which is where a `debug_assert`
+/// earns its keep. The model states it as `Ty.WF` and proves `Sub.refl` exactly
+/// under it (`formal/CclFormal/Ty.lean`); the differential generator stays
+/// inside it, and `dup_key_record_trips_the_uniquely_keyed_invariant` pins that
+/// this assert fires, so the guard cannot rot into a no-op.
+///
+/// Debug-only and shallow: it checks the type's own key list, not its payloads,
+/// since recursion reaches every nested product on its own.
+#[cfg(debug_assertions)]
+fn debug_assert_unique_product_keys(t: &Type) {
+    match t {
+        Type::Record(fs) => debug_assert_unique_keys(fs.iter().map(|(n, _)| n), "record", t),
+        Type::Variant(tags) => debug_assert_unique_keys(tags.iter().map(|(k, _)| k), "variant", t),
+        _ => {}
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_unique_product_keys(_t: &Type) {}
+
+#[cfg(debug_assertions)]
+fn debug_assert_unique_keys<'a, K: Eq + std::fmt::Debug + 'a>(
+    keys: impl Iterator<Item = &'a K>,
+    what: &str,
+    in_type: &Type,
+) {
+    let keys: Vec<&K> = keys.collect();
+    for (i, k) in keys.iter().enumerate() {
+        debug_assert!(
+            !keys[..i].contains(k),
+            "duplicate {what} key {k:?} in {in_type}: find-first lookup makes the \
+             uniquely-keyed invariant load-bearing here (see `Ty.WF` in formal/)"
+        );
+    }
+}
+
 /// A leg's claims are its **gate** plus whatever the shared domain already
 /// claimed, and the two are told apart by *agreement*: the gates are per-leg by
 /// construction (first-match predicates, mutually exclusive), so a claim every
@@ -469,6 +518,12 @@ fn constrain_go(
     sr: &Subst,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
+    // Checked *before* the short-circuit, deliberately: the case the two
+    // disagree on is `𝑡 <: 𝑡` itself, which the short-circuit would answer and
+    // return before any arm looked at the keys.
+    debug_assert_unique_product_keys(lhs);
+    debug_assert_unique_product_keys(rhs);
+
     // The trivial-equality short-circuit is only sound when the edge carries
     // no transformation — under non-identity morphisms `lhs` and `rhs` live
     // in different contexts even when structurally equal.
