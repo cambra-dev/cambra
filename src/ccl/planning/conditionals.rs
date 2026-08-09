@@ -62,7 +62,7 @@ fn realize_and_unbox(
     // which it can only do while the inner one is still a `Case`. Realizing children
     // first turns it into a union, the flatten silently no-ops, and the outer fan-out
     // ends up with a leg that is already a fan-out.
-    realize_here(expr);
+    changed |= realize_here(expr);
     expr.walk_children_mut(|child| changed |= realize_and_unbox(child, erased, memo));
     // **A refinement predicate is a term too, and it carries its own copy of the source.**
     // A filter looks the collection up at the index (`__elem ▷ src ▷ 𝑓`), so when `src` is
@@ -87,12 +87,12 @@ fn realize_and_unbox(
     // witness yet (`src/ccl/design/collections.md`, "Future work"), so it is left standing
     // to be rejected by name at op-conversion — which is the correct failure, and the
     // signal that the runtime witness is what the program needs.
-    let before = erased.len();
-    *expr = unbox(
+    let (unboxed, erased_here) = unbox(
         std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)),
         Some(erased),
     );
-    changed |= erased.len() != before;
+    *expr = unboxed;
+    changed |= erased_here;
     changed
 }
 
@@ -134,19 +134,24 @@ fn instantiate_erased_in_type(
     }
 }
 
-fn realize_here(expr: &mut Expr) {
+/// Returns whether this node was realized — load-bearing, not bookkeeping: a `Case` inside
+/// a **refinement predicate** is rewritten through [`PredMemo::rebuild`], which *discards*
+/// the rewrite when the caller reports no change. A realization that forgot to report would
+/// be silently undone, leaving an unrealized `Case` in a predicate for op-conversion to
+/// reject.
+fn realize_here(expr: &mut Expr) -> bool {
     let TypedExprNode::Case {
         scrutinee: None,
         branches,
     } = &expr.node
     else {
-        return;
+        return false;
     };
     if !branches.iter().all(|b| b.pattern.is_none()) {
-        return;
+        return false;
     }
     let Some(value_ty) = collection_value_ty(&expr.ty) else {
-        return;
+        return false;
     };
     let TypedExprNode::Case { branches, .. } =
         std::mem::replace(&mut expr.node, TypedExprNode::Lit(crate::ccl::Lit::Unit))
@@ -166,12 +171,12 @@ fn realize_here(expr: &mut Expr) {
             // A multi-candidate arm is a genuinely nested conditional collection, and a
             // described one needs the runtime witness. Either way this rewrite does not
             // apply; leave the `Case` for op-conversion to reject by name.
-            return;
+            return false;
         };
         let gate = synthesize_arm_predicate(&b.guard, &prior_guards);
         prior_guards.push(b.guard);
         let Ok(gate_pf) = lambda_elim::run(gate) else {
-            return;
+            return false;
         };
         let gate_fn = apply_primitive(
             gate_pf,
@@ -180,7 +185,11 @@ fn realize_here(expr: &mut Expr) {
         );
         let refined = refine_with(arm_dom, &gate_fn);
         tags.push((FieldKey::Index(tags.len()), refined.clone()));
-        arms.push(unbox(b.body, None).with_ty(Type::data_fun(refined, value_ty.clone())));
+        arms.push(
+            unbox(b.body, None)
+                .0
+                .with_ty(Type::data_fun(refined, value_ty.clone())),
+        );
     }
 
     // One branch denotes just that arm's collection — no union, and no witness left to
@@ -217,6 +226,7 @@ fn realize_here(expr: &mut Expr) {
     } else {
         realized
     };
+    true
 }
 
 /// The shared element type of a collection-valued `Case`, or `None` when the `Case` is
@@ -293,12 +303,12 @@ fn arm_domain(ty: &Type) -> Option<Type> {
 fn unbox(
     e: Expr,
     erased: Option<&mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>>,
-) -> Expr {
+) -> (Expr, bool) {
     let TypedExprNode::Apply { function, argument } = &e.node else {
-        return e;
+        return (e, false);
     };
     if !matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) {
-        return e;
+        return (e, false);
     }
     // Only a determined witness — one candidate — is erasable.
     match peel_refinements(&e.ty) {
@@ -306,9 +316,11 @@ fn unbox(
             if let Some(erased) = erased {
                 erased.insert(s.binder());
             }
-            (**argument).clone()
+            // Reported rather than inferred from the recorded set: the *same* binder can be
+            // erased at two occurrences, and a set that already holds it does not grow.
+            ((**argument).clone(), true)
         }
-        _ => e,
+        _ => (e, false),
     }
 }
 
@@ -317,6 +329,67 @@ mod tests {
     use super::*;
     use crate::ccl::infer_var::fresh_witness_binder_id;
     use crate::ccl::{Branch, Lit, Name};
+
+    /// **A `Case` inside a refinement predicate is realized, and the realization sticks.**
+    ///
+    /// A filter's predicate looks the collection up at the index (`__elem ▷ src ▷ 𝑓`), so
+    /// when `src` is a conditional the predicate carries a whole `Case` — a term riding a
+    /// *type* slot, which no term walk reaches. Both walks descend into predicates for
+    /// that reason, and predicates are rewritten through [`PredMemo::rebuild`], which
+    /// **discards** the rewrite unless the caller reports a change.
+    ///
+    /// So the report is load-bearing rather than bookkeeping: realizing without reporting
+    /// leaves the original predicate in place, and an unrealized `Case` reaches
+    /// op-conversion, which rejects it. Ablate [`realize_here`]'s `true` and this fails
+    /// while the whole end-to-end suite stays green — nothing consumes such a predicate
+    /// yet, which is exactly why it needs pinning here.
+    #[test]
+    fn a_case_inside_a_refinement_predicate_is_realized() {
+        let int = Type::Base(BaseType::Int);
+        let arm = |dom: usize| {
+            Expr::new(TypedExprNode::Var(Name::from("xs")))
+                .with_ty(Type::data_fun(Type::UIntRange(dom), int.clone()))
+        };
+        let guard = |b: bool| Expr::lit(Lit::Bool(b)).with_ty(Type::Base(BaseType::Bool));
+        let case = Expr::new(TypedExprNode::Case {
+            scrutinee: None,
+            branches: vec![
+                Branch {
+                    pattern: None,
+                    guard: guard(true),
+                    body: arm(2),
+                },
+                Branch {
+                    pattern: None,
+                    guard: guard(true),
+                    body: arm(3),
+                },
+            ],
+        })
+        .with_ty(Type::data_fun(Type::UIntRange(2), int.clone()));
+
+        // A node whose *type* carries a refinement whose predicate embeds that `Case`.
+        let refined = Type::Refinement(
+            Box::new(Type::UIntRange(2)),
+            crate::ccl::Refinement::born(std::rc::Rc::new(case)),
+        );
+        let mut expr =
+            Expr::new(TypedExprNode::Var(Name::from("site"))).with_ty(Type::data_fun(refined, int));
+
+        realize_conditional_collections(&mut expr);
+
+        let Type::Fun { domain, .. } = &expr.ty else {
+            panic!("expected a function type, got {}", expr.ty);
+        };
+        let Type::Refinement(_, refinement) = &**domain else {
+            panic!("expected the refinement to survive, got {domain}");
+        };
+        assert!(
+            !matches!(refinement.predicate.node, TypedExprNode::Case { .. }),
+            "the predicate's `Case` was realized and then discarded: {}",
+            crate::ccl::symbolic::symbolic(&refinement.predicate)
+        );
+    }
 
     /// **Realization never changes a type that names the witness.** `Realize` asserts the
     /// pre-realization type precisely so that nothing above a realized `Case` has to be
