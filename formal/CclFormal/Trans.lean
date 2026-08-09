@@ -30,7 +30,7 @@ def recA : Ty := .record [("a", .base .int)]
 def recAB : Ty := .record [("a", .base .int), ("b", .base .bool)]
 
 /-- One gated leg over `recA`. -/
-def gate : Ty := .refined recA (.litBool true)
+def gate : Ty := .refined recA [(.litBool true)]
 
 /-- `⧺{recA | true} ⤇ Int` — the partition-domained data function. -/
 def a : Ty := .fn none .data (.variant [(.idx 0, gate)]) (.base .int)

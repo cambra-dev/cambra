@@ -45,7 +45,10 @@ def Canon : Nat → Ty → Prop
   | d, .tuple ts => ∀ t ∈ ts, Canon d t
   | d, .record fs => ∀ e ∈ fs, Canon d e.2
   | d, .variant tags => ∀ e ∈ tags, Canon d e.2
-  | d, .refined b _ => Canon d b
+  -- Claims are non-empty, mirroring `Type::refined`'s invariant: an empty
+  -- claim set is not a refinement, it is the base, and the solver's flattening
+  -- layer never emits one.
+  | d, .refined b ps => ps ≠ [] ∧ Canon d b
   | _, .base _ | _, .uintRange _ | _, .dataSource _ | _, .txn => True
 termination_by _ t => sizeOf t
 decreasing_by
@@ -70,11 +73,17 @@ theorem not_and_or' {a b : Prop} [Decidable a] (h : ¬(a ∧ b)) : ¬a ∨ ¬b :
 theorem one_le_sizeOf (t : Ty) : 1 ≤ sizeOf t := by
   cases t <;> simp <;> omega
 
-/-- A type with no top-level refinement layer is its own peel. -/
-theorem peel_nil_self : {t : Ty} → t.peel.2 = [] → t.peel.1 = t
-  | .base _, _ | .uintRange _, _ | .dataSource _, _ | .txn, _
-  | .fn .., _ | .tuple _, _ | .record _, _ | .variant _, _ => rfl
-  | .refined b p, h => by simp [Ty.peel] at h
+/-- A type with no top-level refinement layer is its own peel. Canonical
+because a `refined` node whose claim set is empty would peel to nothing while
+remaining a distinct term — a shape `Canon` excludes exactly as
+`Type::refined` does. -/
+theorem peel_nil_self {d : Nat} : {t : Ty} → Canon d t → t.peel.2 = [] → t.peel.1 = t
+  | .base _, _, _ | .uintRange _, _, _ | .dataSource _, _, _ | .txn, _, _
+  | .fn .., _, _ | .tuple _, _, _ | .record _, _, _ | .variant _, _, _ => rfl
+  | .refined b p, hc, h => by
+      rw [Canon] at hc
+      simp [Ty.peel] at h
+      exact absurd h.1 hc.1
 
 theorem canon_peel_fst : (d : Nat) → (t : Ty) → Canon d t → Canon d t.peel.1
   | _, .base _, h => h
@@ -86,10 +95,23 @@ theorem canon_peel_fst : (d : Nat) → (t : Ty) → Canon d t → Canon d t.peel
   | _, .record _, h => h
   | _, .variant _, h => h
   | d, .refined b _, h => by
-      have hb : Canon d b := by rw [Canon] at h; exact h
+      have hb : Canon d b := by rw [Canon] at h; exact h.2
       simpa [Ty.peel] using canon_peel_fst d b hb
 termination_by _ t => sizeOf t
 decreasing_by simp_wf; omega
+
+theorem canon_legNormal (d : Nat) (t : Ty) (rest : List (FieldKey × Ty))
+    (h : Canon d t) : Canon d (legNormal t rest) := by
+  cases t <;> simp [legNormal] <;> try exact h
+  case refined b ps =>
+    rw [Canon] at h
+    split
+    · exact h.2
+    · split
+      · exact h.2
+      · rename_i hEmpty
+        rw [Canon]
+        exact ⟨by simpa using hEmpty, h.2⟩
 
 theorem canon_legUnder : (d : Nat) → (t : Ty) → Canon d t → Canon d (legUnder t)
   | _, .base _, h => h
@@ -100,7 +122,7 @@ theorem canon_legUnder : (d : Nat) → (t : Ty) → Canon d t → Canon d (legUn
   | _, .tuple _, h => h
   | _, .record _, h => h
   | _, .variant _, h => h
-  | d, .refined b _, h => by rw [Canon] at h; simpa [legUnder] using h
+  | d, .refined b _, h => by rw [Canon] at h; simpa [legUnder] using h.2
 
 theorem canon_partitionDomain {d : Nat} {t u : Ty} (h : Canon d t)
     (hd : partitionDomain t = some u) : Canon d u := by
@@ -113,7 +135,7 @@ theorem canon_partitionDomain {d : Nat} {t u : Ty} (h : Canon d t)
         have hp0 : Canon d p0 := by
           rw [Canon] at h
           exact h (k0, p0) (List.mem_cons_self ..)
-        exact canon_legUnder d p0 hp0
+        exact canon_legNormal d p0 rest hp0
       · exact absurd hd (by simp)
 
 theorem canon_normFun {d : Nat} {t t' : Ty} (h : Canon d t)
@@ -663,7 +685,7 @@ theorem sub_trans_aux : (n : Nat) → TransIH n
       have hdef : deficit ρl ρr x.peel.2 z.peel.2 = [] :=
         (deficit_isId_nil_iff hρl hρr).mpr fun p hp => hc1 p (hc2 p hp)
       by_cases hxz : x.peel.2 = [] ∧ z.peel.2 = []
-      · rw [peel_nil_self hxz.1, peel_nil_self hxz.2] at hbase
+      · rw [peel_nil_self hx hxz.1, peel_nil_self hz hxz.2] at hbase
         exact hbase
       · exact Sub.refined rfl rfl (not_and_or' hxz) hdef hbase
 
@@ -698,5 +720,81 @@ example : Sub .id .id transCex.a transCex.c :=
     (by simp [Canon, transCex.b, transCex.recA])
     (by simp [Canon, transCex.c, transCex.recAB])
     transCex.sub_a_b transCex.sub_b_c
+
+/-! ## Claim order is not observable
+
+`Type::Refinement` carries a `RefinementSet` — unordered and deduplicated —
+while the model *represents* the claims as a `List Pred` so that `Ty.beq` stays
+propositional equality. The two agree only if the relation genuinely cannot
+see the list structure, which is what this section proves rather than asserts.
+
+The statements are in terms of **containment**, not permutation, because that
+is what `deficit` actually uses: it asks whether each demanded claim has *some*
+supplier, so a supplier list may be reordered, duplicated, or widened freely.
+Permutation and dedup-invariance are corollaries (`sub_claims_perm`), which is
+exactly the latitude the Rust representation takes.
+-/
+
+/-- Widening (hence reordering or duplicating) the **supplied** claims
+preserves the relation. -/
+theorem sub_claims_left {ρl ρr : Ren} {b z : Ty} {ps qs : List Pred}
+    (hne : qs ≠ []) (hsupp : ∀ p ∈ ps, p ∈ qs)
+    (h : Sub ρl ρr (.refined b ps) z) : Sub ρl ρr (.refined b qs) z := by
+  obtain ⟨hdef, hbase⟩ := sub_peel_inv h
+  refine Sub.refined rfl rfl (.inl ?_) ?_ hbase
+  · simp
+    exact fun hc => absurd hc hne
+  · rw [deficit_eq_nil_iff] at hdef ⊢
+    intro p hp
+    obtain ⟨q, hq, hqe⟩ := hdef p hp
+    refine ⟨q, ?_, hqe⟩
+    simp [Ty.peel] at hq ⊢
+    rcases hq with hq | hq
+    · exact Or.inl (hsupp q hq)
+    · exact Or.inr hq
+
+/-- Narrowing (hence reordering or deduplicating) the **demanded** claims
+preserves the relation. -/
+theorem sub_claims_right {ρl ρr : Ren} {x b : Ty} {ps qs : List Pred}
+    (hne : qs ≠ []) (hdem : ∀ p ∈ qs, p ∈ ps)
+    (h : Sub ρl ρr x (.refined b ps)) : Sub ρl ρr x (.refined b qs) := by
+  obtain ⟨hdef, hbase⟩ := sub_peel_inv h
+  refine Sub.refined rfl rfl (.inr ?_) ?_ hbase
+  · simp
+    exact fun hc => absurd hc hne
+  · rw [deficit_eq_nil_iff] at hdef ⊢
+    intro p hp
+    simp at hp
+    refine hdef p ?_
+    simp [Ty.peel]
+    rcases hp with hp | hp
+    · exact Or.inl (hdem p hp)
+    · exact Or.inr hp
+
+/-- **Claim order is not observable**: two claim lists with the same members
+are interchangeable on either side of the relation. This is the model's
+statement of what `RefinementSet` guarantees — that making the representation
+unordered changed no verdict, so the arrival order two bounds happened to meet
+in cannot reach typing. -/
+theorem sub_claims_perm {ρl ρr : Ren} {b z : Ty} {ps qs : List Pred}
+    (hne : qs ≠ []) (hmem : ∀ p, p ∈ ps ↔ p ∈ qs) :
+    Sub ρl ρr (.refined b ps) z ↔ Sub ρl ρr (.refined b qs) z := by
+  have hqne : ps ≠ [] := by
+    intro hc
+    obtain ⟨q, hq⟩ := List.exists_mem_of_ne_nil qs hne
+    exact absurd ((hmem q).mpr hq) (by simp [hc])
+  exact ⟨sub_claims_left hne (fun p hp => (hmem p).mp hp),
+         sub_claims_left hqne (fun p hp => (hmem p).mpr hp)⟩
+
+/-- The same, in demand position. -/
+theorem sub_claims_perm_right {ρl ρr : Ren} {x b : Ty} {ps qs : List Pred}
+    (hne : qs ≠ []) (hmem : ∀ p, p ∈ ps ↔ p ∈ qs) :
+    Sub ρl ρr x (.refined b ps) ↔ Sub ρl ρr x (.refined b qs) := by
+  have hqne : ps ≠ [] := by
+    intro hc
+    obtain ⟨q, hq⟩ := List.exists_mem_of_ne_nil qs hne
+    exact absurd ((hmem q).mpr hq) (by simp [hc])
+  exact ⟨sub_claims_right hne (fun p hp => (hmem p).mpr hp),
+         sub_claims_right hqne (fun p hp => (hmem p).mp hp)⟩
 
 end CclFormal

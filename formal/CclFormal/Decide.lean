@@ -113,16 +113,16 @@ regression net for the rules' shape.
 -/
 
 /- `{Int | p} <: Int` — dropping a refinement is subsumption. -/
-#guard subCheck .id .id (.refined (.base .int) .elem) (.base .int) = true
+#guard subCheck .id .id (.refined (.base .int) [.elem]) (.base .int) = true
 
 /- `Int ⊀ {Int | p}` — a refinement cannot be conjured (that is `Restrict`). -/
-#guard subCheck .id .id (.base .int) (.refined (.base .int) .elem) = false
+#guard subCheck .id .id (.base .int) (.refined (.base .int) [.elem]) = false
 
 /- `{T | p} <: {U | p}` iff `T <: U` — the refined base is covariant:
 `{{a, b} | p} <: {{a} | p}` by record width under the shared predicate. -/
 #guard subCheck .id .id
-  (.refined (.record [("a", .base .int), ("b", .base .bool)]) .elem)
-  (.refined (.record [("a", .base .int)]) .elem) = true
+  (.refined (.record [("a", .base .int), ("b", .base .bool)]) [.elem])
+  (.refined (.record [("a", .base .int)]) [.elem]) = true
 
 /- `UIntRange` is equality-only: `[0,3) ⊀ [0,4)` despite the inclusion. -/
 #guard subCheck .id .id (.uintRange 3) (.uintRange 4) = false
@@ -165,23 +165,23 @@ demand, a capability never satisfies a collection demand. -/
 α-renamed twin (`(x: [0,3)) ⤇ {Int | __elem == x}` vs the same under `y`). -/
 #guard subCheck .id .id
   (.fn (some "x") .data (.uintRange 3)
-    (.refined (.base .int) (.binop "eq" .elem (.var "x"))))
+    (.refined (.base .int) [(.binop "eq" .elem (.var "x"))]))
   (.fn (some "y") .data (.uintRange 3)
-    (.refined (.base .int) (.binop "eq" .elem (.var "y")))) = true
+    (.refined (.base .int) [(.binop "eq" .elem (.var "y"))])) = true
 
 /- ...and a genuinely different binder reference does not match. -/
 #guard subCheck .id .id
   (.fn (some "x") .data (.uintRange 3)
-    (.refined (.base .int) (.binop "eq" .elem (.var "x"))))
+    (.refined (.base .int) [(.binop "eq" .elem (.var "x"))]))
   (.fn (some "y") .data (.uintRange 3)
-    (.refined (.base .int) (.binop "eq" .elem (.var "z")))) = false
+    (.refined (.base .int) [(.binop "eq" .elem (.var "z"))])) = false
 
 /- Partition normalization: `⧺ᵢ ({D | πᵢ} ⤇ W) <: D ⤇ W` — a gated
 partition of `D` *is* the plain data function over `D`. -/
 #guard subCheck .id .id
   (.fn none .data
-    (.variant [(.idx 0, .refined (.uintRange 3) (.litInt 0)),
-               (.idx 1, .refined (.uintRange 3) (.litInt 1))])
+    (.variant [(.idx 0, .refined (.uintRange 3) [(.litInt 0)]),
+               (.idx 1, .refined (.uintRange 3) [(.litInt 1)])])
     (.base .int))
   (.fn none .data (.uintRange 3) (.base .int)) = true
 
@@ -189,7 +189,7 @@ partition of `D` *is* the plain data function over `D`. -/
 general arm's domain edge (`[0,3) ⊀ Variant`) then rejects. -/
 #guard subCheck .id .id
   (.fn none .data
-    (.variant [(.idx 1, .refined (.uintRange 3) (.litInt 0))])
+    (.variant [(.idx 1, .refined (.uintRange 3) [(.litInt 0)])])
     (.base .int))
   (.fn none .data (.uintRange 3) (.base .int)) = false
 
@@ -197,7 +197,7 @@ general arm's domain edge (`[0,3) ⊀ Variant`) then rejects. -/
 fails data-data invariance against the demand. -/
 #guard subCheck .id .id
   (.fn none .data
-    (.variant [(.idx 0, .refined (.uintRange 4) (.litInt 0))])
+    (.variant [(.idx 0, .refined (.uintRange 4) [(.litInt 0)])])
     (.base .int))
   (.fn none .data (.uintRange 3) (.base .int)) = false
 
@@ -207,17 +207,17 @@ supplier's domain is partition-shaped (the retired bridge arm rejected this
 pair by skipping the Pi correspondence). -/
 #guard subCheck .id .id
   (.fn (some "x") .data
-    (.variant [(.idx 0, .refined (.uintRange 3) (.litInt 0))])
-    (.refined (.base .int) (.binop "eq" .elem (.var "x"))))
+    (.variant [(.idx 0, .refined (.uintRange 3) [(.litInt 0)])])
+    (.refined (.base .int) [(.binop "eq" .elem (.var "x"))]))
   (.fn (some "y") .data (.uintRange 3)
-    (.refined (.base .int) (.binop "eq" .elem (.var "y")))) = true
+    (.refined (.base .int) [(.binop "eq" .elem (.var "y"))])) = true
 
 /- **Repaired composition**: the counterexample chain that refuted
 transitivity under the bridge arm now composes — see
 `CclFormal/Trans.lean` for the machine-checked derivations. -/
 #guard subCheck .id .id
   (.fn none .data
-    (.variant [(.idx 0, .refined (.record [("a", .base .int)]) (.litBool true))])
+    (.variant [(.idx 0, .refined (.record [("a", .base .int)]) [(.litBool true)])])
     (.base .int))
   (.fn none .compute (.record [("a", .base .int), ("b", .base .bool)])
     (.base .int)) = true
