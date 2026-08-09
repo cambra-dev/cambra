@@ -5,3 +5,4 @@ import CclFormal.Json
 import CclFormal.Props
 import CclFormal.Equiv
 import CclFormal.Trans
+import CclFormal.Transitivity
