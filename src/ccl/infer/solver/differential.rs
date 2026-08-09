@@ -338,7 +338,18 @@ fn gen_bridge_pair(rng: &mut Rng) -> (Type, Type) {
             leg = Type::refined_one(leg, Refinement::born(gen_pred(rng)));
         }
         // Near-misses: a shifted index or a structurally different payload.
-        let index = if rng.chance(1, 8) { i + 1 } else { i } as usize;
+        // Only the *last* leg's index may shift. Shifting an interior one would
+        // land it on its successor's index, and a duplicate-keyed variant is
+        // outside `Ty.WF` — the one class where the model and `constrain_go`
+        // deliberately disagree (`dup_key_record_reflexivity_diverges_from_model`),
+        // so generating it would manufacture mismatches rather than find them.
+        // Shifting the last leg still breaks contiguity, which is what this
+        // near-miss is aiming at.
+        let index = if i + 1 == legs && rng.chance(1, 8) {
+            i + 1
+        } else {
+            i
+        } as usize;
         if rng.chance(1, 8) {
             leg = gen_ty(rng, 1);
         }
