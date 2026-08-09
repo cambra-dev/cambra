@@ -43,6 +43,8 @@ use crate::ccl::{BaseType, InferVar, Level, Type};
 pub mod coalesce;
 pub mod compact;
 pub mod constrain;
+#[cfg(test)]
+mod differential;
 pub mod scheme;
 pub mod simplify_type;
 pub mod spec_key;
