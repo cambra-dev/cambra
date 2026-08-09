@@ -392,6 +392,109 @@ fn gen_bridge_pair(rng: &mut Rng) -> (Type, Type) {
     (lhs, rhs)
 }
 
+/// Peel outer refinement layers (the generator's own small inverse of the
+/// gates it adds — not the deep `strip_refinements`).
+fn peel_outer(mut t: &Type) -> &Type {
+    while let Type::Refinement(base, _) = t {
+        t = base;
+    }
+    t
+}
+
+/// A plausible subtype-partner for `t`, biased toward *accepted* edges so
+/// transitivity chains form at a workable rate: clones, directed edits,
+/// bridge-shaped partners for functions (partition the domain / un-bridge a
+/// partition), and domain/codomain-level edits that exercise contravariance.
+fn partner(rng: &mut Rng, t: &Type) -> Type {
+    match rng.below(8) {
+        0 => t.clone(),
+        1 | 2 => edit(rng, t),
+        3 => match t {
+            // Partition a function's domain: a bridge-lhs partner.
+            Type::Fun {
+                name,
+                domain,
+                codomain,
+                ..
+            } => {
+                let legs = 1 + rng.below(2);
+                let mut tags = Vec::new();
+                for i in 0..legs {
+                    let mut leg = (**domain).clone();
+                    for _ in 0..rng.below(2) {
+                        leg = Type::Refinement(Box::new(leg), Refinement::born(gen_pred(rng)));
+                    }
+                    tags.push((FieldKey::Index(i as usize), leg));
+                }
+                Type::Fun {
+                    name: name.clone(),
+                    kind: FunKind::Data,
+                    domain: Box::new(Type::Variant(tags)),
+                    codomain: codomain.clone(),
+                }
+            }
+            _ => gen_ty(rng, 2),
+        },
+        4 => match t {
+            // Un-bridge: a partitioned data function's plain counterpart.
+            Type::Fun {
+                name,
+                kind: FunKind::Data,
+                domain,
+                codomain,
+            } => match &**domain {
+                Type::Variant(tags) if !tags.is_empty() => Type::Fun {
+                    name: name.clone(),
+                    kind: if rng.chance(1, 2) {
+                        FunKind::Data
+                    } else {
+                        FunKind::Compute
+                    },
+                    domain: Box::new(peel_outer(&tags[0].1).clone()),
+                    codomain: codomain.clone(),
+                },
+                _ => gen_ty(rng, 2),
+            },
+            _ => gen_ty(rng, 2),
+        },
+        5 | 6 => match t {
+            // Edit *inside* a function: domain/codomain near-misses probe the
+            // contravariant edge and the codomain correspondence.
+            Type::Fun {
+                name,
+                kind,
+                domain,
+                codomain,
+            } => {
+                let flip_kind = rng.chance(1, 4);
+                Type::Fun {
+                    name: name.clone(),
+                    kind: if flip_kind {
+                        match kind {
+                            FunKind::Data => FunKind::Compute,
+                            _ => FunKind::Data,
+                        }
+                    } else {
+                        kind.clone()
+                    },
+                    domain: Box::new(if rng.chance(1, 2) {
+                        edit(rng, domain)
+                    } else {
+                        (**domain).clone()
+                    }),
+                    codomain: Box::new(if rng.chance(1, 2) {
+                        edit(rng, codomain)
+                    } else {
+                        (**codomain).clone()
+                    }),
+                }
+            }
+            _ => edit(rng, t),
+        },
+        _ => gen_ty(rng, 3),
+    }
+}
+
 /// Serialize a predicate into the model's `Pred` wire schema. `None` means
 /// "outside the modeled vocabulary" — the case is refused rather than
 /// serialized wrongly (the generator never produces such a predicate, so a
@@ -497,19 +600,64 @@ fn dup_key_record_reflexivity_diverges_from_model() {
     assert!(constrain_subtype(&dup, &dup.clone(), &mut cache).is_ok());
 }
 
-/// **Finding, pinned**: the gated-partition bridge arm compares codomains
-/// under the *unchanged* lhs morphism — `constrain_go` recurses
-/// `(c0, c1, sl, sr)` where the general `Fun` arm would use
-/// `sl.extended_rename(k, x)` — so two dependent codomains that are
-/// α-equivalent through their Pi binders match through the general arm but
-/// **not** through the bridge. The same `⤇` value, demanded at binder `y`
-/// instead of `x`, changes verdict purely because its *domain shape* routed
-/// it through a different arm. Surfaced by the Lean model (M0), confirmed
-/// here; whether a real program reaches it is the cleanup-time question —
-/// if this test starts failing, the arm gained the correspondence and the
-/// model's `fnBridge` rule should drop the quirk.
+/// **Finding, repaired: partition collapse now composes.** Under the retired
+/// target-relative bridge arm this exact chain violated transitivity — the
+/// arm only connected a partition to literally-same-domain demands, so
+/// `⧺{𝐷|π} ⤇ W <: 𝐷 ⤇ W <: 𝐷′ ⇒ W` held hop-by-hop while the direct edge
+/// failed (machine-checked at the time as `sub_not_trans`). The
+/// normalize-then-recurse rewrite (`partition_domain` /
+/// `normalized_partition_fun` in `constrain.rs`) makes the collapse an
+/// equation applied before comparison, so the direct edge now exists.
 #[test]
-fn bridge_arm_skips_pi_correspondence() {
+fn bridge_normalization_composes() {
+    let rec_a = Type::Record(vec![("a".to_string(), Type::Base(BaseType::Int))]);
+    let rec_ab = Type::Record(vec![
+        ("a".to_string(), Type::Base(BaseType::Int)),
+        ("b".to_string(), Type::Base(BaseType::Bool)),
+    ]);
+    let gate = Type::Refinement(
+        Box::new(rec_a.clone()),
+        Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
+    );
+    let fun = |kind: FunKind, domain: Type| Type::Fun {
+        name: None,
+        kind,
+        domain: Box::new(domain),
+        codomain: Box::new(Type::Base(BaseType::Int)),
+    };
+    let a = fun(
+        FunKind::Data,
+        Type::Variant(vec![(FieldKey::Index(0), gate)]),
+    );
+    let b = fun(FunKind::Data, rec_a);
+    let c = fun(FunKind::Compute, rec_ab);
+
+    let mut cache = ConstrainCache::new();
+    assert!(
+        constrain_subtype(&a, &b, &mut cache).is_ok(),
+        "a <: b (normalization)"
+    );
+    let mut cache = ConstrainCache::new();
+    assert!(
+        constrain_subtype(&b, &c, &mut cache).is_ok(),
+        "b <: c (general arm, width)"
+    );
+    let mut cache = ConstrainCache::new();
+    assert!(
+        constrain_subtype(&a, &c, &mut cache).is_ok(),
+        "a <: c — the composed edge exists under normalization"
+    );
+}
+
+/// **Finding, repaired: partition-domained functions keep the Pi
+/// correspondence.** The retired bridge arm recursed its codomain edge
+/// under the unchanged lhs morphism, so α-equivalent dependent codomains
+/// failed exactly when the domain shape routed the pair through the
+/// bridge. Normalize-then-recurse re-enters the general `Fun` arm, which
+/// mints the correspondence — the verdict no longer depends on the domain
+/// shape.
+#[test]
+fn bridge_normalization_carries_pi_correspondence() {
     let dep_fun = |binder: &str, domain: Type| Type::Fun {
         name: Some(Name::raw(binder)),
         kind: FunKind::Data,
@@ -539,12 +687,68 @@ fn bridge_arm_skips_pi_correspondence() {
         "general Fun arm should α-reconcile dependent codomains"
     );
 
-    // Bridge arm: the *same* codomain pair fails, purely because the
-    // partition-shaped domain routes the constraint through the bridge.
+    // Partition-domained lhs: the same codomain pair reconciles identically
+    // — normalization re-enters the general arm, correspondence included.
     let mut cache = ConstrainCache::new();
     assert!(
-        constrain_subtype(&dep_fun("x", partition), &dep_fun("y", d1), &mut cache).is_err(),
-        "bridge arm currently drops the Pi correspondence on its codomain edge"
+        constrain_subtype(&dep_fun("x", partition), &dep_fun("y", d1), &mut cache).is_ok(),
+        "normalization must carry the Pi correspondence"
+    );
+}
+
+/// Transitivity chain fuzz: build chains `a <: b <: c` that `constrain`
+/// accepts and check the direct edge. Under the retired bridge arm this
+/// found the composition violation now pinned (repaired) as
+/// `bridge_normalization_composes`; with partition collapse as a
+/// normalization, **no violations are tolerated** — any hit is a new
+/// finding and fails the test with the triple printed.
+#[test]
+fn transitivity_chain_fuzz() {
+    let seed: u64 = std::env::var("CAMBRA_DIFF_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0xBEEF);
+    let n: usize = std::env::var("CAMBRA_DIFF_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4000);
+
+    let ok = |x: &Type, y: &Type| {
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(x, y, &mut cache).is_ok()
+    };
+    let mut rng = Rng::new(seed);
+    let mut chains = 0usize;
+    let mut attempts = 0usize;
+    let mut violations: Vec<(Type, Type, Type)> = Vec::new();
+    while chains < n && attempts < n * 100 {
+        attempts += 1;
+        let b = gen_ty(&mut rng, 3);
+        let a = partner(&mut rng, &b);
+        let c = partner(&mut rng, &b);
+        if !(ok(&a, &b) && ok(&b, &c)) {
+            continue;
+        }
+        chains += 1;
+        if !ok(&a, &c) {
+            violations.push((a, b, c));
+        }
+    }
+
+    eprintln!(
+        "transitivity: {chains} chains (seed {seed}, {attempts} attempts), {} violations",
+        violations.len()
+    );
+    let render = |t: &Type| ty_json(t).unwrap_or_else(|| format!("{t:?}"));
+    assert!(
+        violations.is_empty(),
+        "transitivity violations (first 5):\n{}",
+        violations
+            .iter()
+            .take(5)
+            .map(|(a, b, c)| format!("a={}\nb={}\nc={}\n", render(a), render(b), render(c)))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
