@@ -396,7 +396,14 @@ fn partition_domain(union_dom: &Type) -> Option<Type> {
         }
     }
     let base = common?.clone();
-    if rest.iter().all(|(_, p)| p.claims() == first.1.claims()) {
+    // Claim *sets*, so this asks whether the legs agree on what they claim,
+    // not whether they list it in the same order.
+    let same_claims =
+        |a: &[Refinement], b: &[Refinement]| a.len() == b.len() && a.iter().all(|r| b.contains(r));
+    if rest
+        .iter()
+        .all(|(_, p)| same_claims(p.claims(), first.1.claims()))
+    {
         return Some(base);
     }
     let shared: RefinementSet = first

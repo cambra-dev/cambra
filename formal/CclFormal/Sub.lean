@@ -84,7 +84,7 @@ def Pred.rename (ρ : Ren) : Pred → Pred
 /-- Peel all outer refinement layers: mirror of
 `constrain.rs :: peel_refinements` (outermost predicate first). -/
 def Ty.peel : Ty → Ty × List Pred
-  | .refined b p => (b.peel.1, p :: b.peel.2)
+  | .refined b ps => (b.peel.1, ps ++ b.peel.2)
   | t => (t, [])
 
 /-- Peeling never grows a type. -/
@@ -146,13 +146,21 @@ theorem lookupBy_sizeOf [BEq α] [SizeOf α] {l : List (α × Ty)} {k : α} {t :
       simp at hm
       omega
 
-/-- A leg's contribution to the partition's common domain: what sits under
-its gate, or the leg itself when the gate lives in the term (a
-`filter_values` restrict) and the leg type is bare. At most one layer is
-peeled — mirror of the leg handling in `constrain.rs :: partition_domain`. -/
+/-- A leg's bare base — what its claims narrow, or the leg itself when it is
+unrefined (the gate lives in the term, a `filter_values` restrict). -/
 def legUnder : Ty → Ty
   | .refined u _ => u
   | t => t
+
+/-- The claims a leg carries; none when it is bare. -/
+def Ty.claims : Ty → List Pred
+  | .refined _ ps => ps
+  | _ => []
+
+/-- Same claims, in any order — claim lists are compared as *sets* wherever
+the relation compares them at all. -/
+def sameClaims (a b : List Pred) : Bool :=
+  a.length == b.length && a.all (· ∈ b)
 
 /-- Contiguous `Index` keys from `i`, every leg's `legUnder` equal to
 `common`. -/
@@ -162,13 +170,36 @@ def partitionTagsGo (common : Ty) : Nat → List (FieldKey × Ty) → Bool
       k == .idx i && legUnder p == common && partitionTagsGo common (i + 1) rest
 
 /-- The domain a gated **partition** normalizes to — mirror of
-`constrain.rs :: partition_domain`: a `Variant` with contiguous
-`Index(0..n)` tags (n ≥ 1) whose legs share one domain under (at most) one
-gate layer each. `none` for anything shaped differently. -/
+`constrain.rs :: partition_domain`: a `Variant` with contiguous `Index(0..n)`
+tags (n ≥ 1) whose legs share one bare base.
+
+A leg's claims are its **gate** plus whatever the shared domain already
+claimed, told apart by *agreement*: gates are per-leg by construction
+(first-match predicates, mutually exclusive), so a claim every leg carries is
+domain and the common claims are the **intersection**, which must survive into
+the normal form. Dropping them would normalize `⧺ᵢ({𝐸 | 𝑝, π̂ᵢ})` to `𝐸`,
+claiming the gates cover all of `𝐸` when they cover only its `𝑝`-satisfying
+part. When the legs all claim the same thing nothing distinguishes gate from
+domain and the claims are peeled — which subsumes the single-leg case under
+one rule. `none` for anything shaped differently.
+
+`legNormal` is that per-leg rule, split out so its size bound
+(`legNormal_sizeOf_le`) is stated once. -/
+def legNormal (p0 : Ty) (rest : List (FieldKey × Ty)) : Ty :=
+  match p0 with
+  | .refined b ps =>
+      if rest.all (fun t => sameClaims t.2.claims ps) then b
+      else
+        let shared := ps.filter (fun r => rest.all (fun t => r ∈ t.2.claims))
+        if shared.isEmpty then b else .refined b shared
+  -- A bare leg claims nothing, so the intersection is empty and the common
+  -- domain is the leg itself.
+  | bare => bare
+
 def partitionDomain : Ty → Option Ty
   | .variant ((k0, p0) :: rest) =>
       if k0 == .idx 0 && partitionTagsGo (legUnder p0) 1 rest then
-        some (legUnder p0)
+        some (legNormal p0 rest)
       else none
   | _ => none
 
@@ -182,6 +213,30 @@ def normFun : Ty → Option Ty
 theorem legUnder_sizeOf_le (t : Ty) : sizeOf (legUnder t) ≤ sizeOf t := by
   cases t <;> simp [legUnder] <;> omega
 
+/-- Filtering never grows a list — the size side-condition for keeping a
+partition's shared claims in its normal form. -/
+theorem List.sizeOf_filter_le {α} [SizeOf α] (f : α → Bool) :
+    (l : List α) → sizeOf (l.filter f) ≤ sizeOf l
+  | [] => by simp
+  | a :: t => by
+      have ih := List.sizeOf_filter_le f t
+      by_cases h : f a = true <;> simp [h] <;> omega
+
+/-- A leg's normal form never exceeds the leg: it is the leg's bare base, or
+that base carrying a *sublist* of the leg's own claims. -/
+theorem legNormal_sizeOf_le (p0 : Ty) (rest : List (FieldKey × Ty)) :
+    sizeOf (legNormal p0 rest) ≤ sizeOf p0 := by
+  cases p0 <;> simp [legNormal]
+  case refined b ps =>
+    split
+    · omega
+    · split
+      · omega
+      · have := List.sizeOf_filter_le
+          (fun r => rest.all (fun t => r ∈ t.2.claims)) ps
+        simp
+        omega
+
 /-- Normalizing a domain strictly shrinks it (the common domain sits inside
 the variant's first leg). -/
 theorem partitionDomain_sizeOf {d u : Ty} (h : partitionDomain d = some u) :
@@ -192,7 +247,7 @@ theorem partitionDomain_sizeOf {d u : Ty} (h : partitionDomain d = some u) :
       split at h
       · injection h with h
         subst h
-        have := legUnder_sizeOf_le p0
+        have := legNormal_sizeOf_le p0 rest
         simp
         omega
       · exact absurd h (by simp)

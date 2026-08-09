@@ -112,7 +112,9 @@ partial def Ty.toJson : Ty → Json
       Json.mkObj [("k", "variant"),
         ("tags", Json.arr (tags.map fun (key, t) =>
           Json.arr #[Lean.toJson key, t.toJson]).toArray)]
-  | .refined b p => Json.mkObj [("k", "refined"), ("base", b.toJson), ("pred", Lean.toJson p)]
+  | .refined b ps =>
+      Json.mkObj [("k", "refined"), ("base", b.toJson),
+        ("claims", Json.arr (ps.map Lean.toJson).toArray)]
 
 mutual
 
@@ -141,7 +143,7 @@ partial def Ty.fromJson? (j : Json) : Except String Ty := do
       return .variant tags
   | .ok "refined" =>
       return .refined (← Ty.fromJson? (← j.getObjVal? "base"))
-        (← Lean.fromJson? (← j.getObjVal? "pred"))
+        (← Lean.fromJson? (← j.getObjVal? "claims"))
   | _ => throw s!"unknown Ty: {j.compress}"
 
 /-- A `[key, ty]` 2-array pair (record field / variant tag). -/
@@ -164,7 +166,10 @@ private def roundTrips (t : Ty) : Bool :=
 
 #guard roundTrips (.base .int)
 #guard roundTrips (.fn (some "x") .data (.uintRange 3)
-  (.refined (.base .int) (.binop "eq" .elem (.var "x"))))
+  (.refined (.base .int) [.binop "eq" .elem (.var "x")]))
+-- A multi-claim position round-trips too: the wire carries the whole set.
+#guard roundTrips (.refined (.base .int)
+  [.binop "eq" .elem (.var "x"), .binop "eq" .elem (.var "y")])
 #guard roundTrips (.record [("a", .base .bool), ("b", .tuple [.txn, .dataSource "s"])])
 #guard roundTrips (.variant [(.idx 0, .base .unit), (.name "tag", .base .string)])
 

@@ -86,8 +86,24 @@ theorem lookupBy_of_mem_nodup [BEq α] [LawfulBEq α] {l : List (α × Ty)}
         rw [hfind]
         exact this
 
-/-- Normalization preserves well-formedness: the common domain is (under)
-the first leg, whose well-formedness the variant carries. -/
+/-- A leg's normal form is well-formed: it is the leg's own base (whose
+well-formedness the leg carries) or that base re-refined by a non-empty
+sublist of the leg's claims, which is exactly `Ty.WF.refined`'s shape. -/
+theorem legNormal_wf {p0 : Ty} (h : p0.WF) (rest : List (FieldKey × Ty)) :
+    (legNormal p0 rest).WF := by
+  cases p0 <;> simp [legNormal] <;> try exact h
+  case refined b ps =>
+    cases h with
+    | refined hne hnr hb =>
+      split
+      · exact hb
+      · split
+        · exact hb
+        · rename_i hEmpty
+          exact .refined (by simpa using hEmpty) hnr hb
+
+/-- Normalization preserves well-formedness: the common domain is the first
+leg's normal form, whose well-formedness the variant carries. -/
 theorem partitionDomain_wf {d u : Ty} (hwf : d.WF)
     (h : partitionDomain d = some u) : u.WF := by
   match d, h with
@@ -98,13 +114,7 @@ theorem partitionDomain_wf {d u : Ty} (hwf : d.WF)
         subst h
         cases hwf with
         | variant hnd hts =>
-            have hp0 : p0.WF := hts (k0, p0) (List.mem_cons_self ..)
-            cases hp : p0 with
-            | refined b p =>
-                rw [hp] at hp0
-                cases hp0 with
-                | refined hb => simpa [legUnder] using hb
-            | _ => simpa [legUnder, ← hp] using hp0
+            exact legNormal_wf (hts (k0, p0) (List.mem_cons_self ..)) rest
       · exact absurd h (by simp)
 
 theorem normFun_wf {t t' : Ty} (hwf : t.WF) (h : normFun t = some t') :
@@ -128,7 +138,7 @@ theorem Ty.WF.peel_fst : {t : Ty} → t.WF → t.peel.1.WF
   | .base _, h | .uintRange _, h | .dataSource _, h | .txn, h
   | .fn .., h | .tuple _, h | .record _, h | .variant _, h => by
       simpa [Ty.peel] using h
-  | .refined _ _, .refined hb => by
+  | .refined _ _, .refined _ _ hb => by
       simpa [Ty.peel] using hb.peel_fst
 
 /-- **Reflexivity is derivable** (for uniquely-keyed types, under
@@ -190,10 +200,12 @@ theorem Sub.refl : (t : Ty) → t.WF → (ρl ρr : Ren) → ρl.IsId → ρr.Is
           injection hlk with h
           subst h
           exact Sub.refl t0 (ht (k, t0) hm) ρl ρr hl hr
-  | .refined b p, hwf, ρl, ρr, hl, hr => by
+  | .refined b ps, hwf, ρl, ρr, hl, hr => by
       cases hwf with
-      | refined hb =>
-        refine .refined rfl rfl (.inl (by simp)) (deficit_self hl hr _) ?_
+      | refined hne _ hb =>
+        refine .refined rfl rfl
+          (.inl (by simp; exact fun hc => absurd hc hne))
+          (deficit_self hl hr _) ?_
         show Sub ρl ρr b.peel.1 b.peel.1
         exact Sub.refl b.peel.1 (Ty.WF.peel_fst hb) ρl ρr hl hr
 termination_by t _ _ _ _ _ => sizeOf t
