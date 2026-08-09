@@ -6,35 +6,48 @@ import CclFormal.Trans
 # Transitivity of the ground subtype relation
 
 Transitivity was **refuted** while the gated-partition bridge arm was a
-target-relative comparison (`CclFormal/Trans.lean` records the history); with
-partition collapse re-homed as a normalization it became a live conjecture,
-and the chain fuzz (`differential.rs :: transitivity_chain_fuzz`, zero
-tolerated violations) has found no counterexample since.
+target-relative comparison (`CclFormal/Trans.lean` records the history),
+became a live conjecture once the collapse was re-homed as a normalization,
+and was first proved for the binder-free fragment (`NoPi`). The remaining
+obstruction was the **σ-gap**: chaining dependent codomains produces
+premises that view the middle type under different renames, which compose
+only through a reconciliation morphism — the model analogue of
+`constrain.rs :: bridge_holder_gap`.
 
-This file proves it for the **non-dependent fragment** (`NoPi`: no function
-type carries a Pi binder), under a single ambient rename environment. That
-covers every rule of the relation — including partition normalization, the
-kind lattice, data-domain invariance, and refinement-set containment — and
-leaves exactly one obligation open, stated at the bottom: reconciling the
-*middle view* when dependent codomains chain, which is the model's analogue
-of `constrain.rs :: bridge_holder_gap`.
+Canonical Pi binders dissolved the gap. The solver now names every arrow's
+binder by its depth (`__pi0`, `__pi1`, … — `ReservedName::Pi`, the
+`REFINEMENT_BINDER` move applied to arrows), so any two types compared at
+the same position carry the *same* binder when both carry one. Every binder
+correspondence a canonical chain mints is therefore **diagonal**
+(`__piK ↦ __piK`), and diagonal extensions act as the identity on rename
+environments. This file proves transitivity for that fragment (`Canon`),
+with the environments generalized to six independent identity-acting ones —
+which is what makes the diagonal observation compositional. Pure
+transitivity at the identity environment (`sub_trans_id` at the bottom)
+covers every type the solver emits; the former `NoPi` fragment is the
+special case where every binder is `none`.
 -/
 
 namespace CclFormal
 
-/-- The non-dependent fragment: no function type carries a Pi binder.
+/-- The canonical spelling of the Pi binder at `depth` — mirror of
+`ReservedName::Pi` (`names.rs`). -/
+def piName (d : Nat) : String := "__pi" ++ toString d
 
-With no binder anywhere, `codRen n0 n1 ρ = ρ` at every function edge, so one
-ambient rename environment serves the whole derivation and the middle view
-of a chain needs no reconciliation. -/
-def NoPi : Ty → Prop
-  | .fn n _ d c => n = none ∧ NoPi d ∧ NoPi c
-  | .tuple ts => ∀ t ∈ ts, NoPi t
-  | .record fs => ∀ e ∈ fs, NoPi e.2
-  | .variant tags => ∀ e ∈ tags, NoPi e.2
-  | .refined b _ => NoPi b
-  | .base _ | .uintRange _ | .dataSource _ | .txn => True
-termination_by t => sizeOf t
+/-- The **canonical fragment**, mirroring what `compact_go` emits: at depth
+`d` every arrow's binder is absent or the reserved `piName d`; codomains
+live one deeper, everything else at the same depth (exactly the walk
+`compact.rs` performs). Two `Canon` types compared at one position
+therefore carry the *same* binder whenever both carry one. -/
+def Canon : Nat → Ty → Prop
+  | d, .fn n _ dom cod =>
+      (n = none ∨ n = some (piName d)) ∧ Canon d dom ∧ Canon (d + 1) cod
+  | d, .tuple ts => ∀ t ∈ ts, Canon d t
+  | d, .record fs => ∀ e ∈ fs, Canon d e.2
+  | d, .variant tags => ∀ e ∈ tags, Canon d e.2
+  | d, .refined b _ => Canon d b
+  | _, .base _ | _, .uintRange _ | _, .dataSource _ | _, .txn => True
+termination_by _ t => sizeOf t
 decreasing_by
   all_goals simp_wf
   all_goals
@@ -48,66 +61,99 @@ decreasing_by
          try simp
          omega)
 
+/-- De Morgan for a decidable conjunction (no Mathlib in this development). -/
+theorem not_and_or' {a b : Prop} [Decidable a] (h : ¬(a ∧ b)) : ¬a ∨ ¬b := by
+  by_cases ha : a
+  · exact Or.inr fun hb => h ⟨ha, hb⟩
+  · exact Or.inl ha
+
+theorem one_le_sizeOf (t : Ty) : 1 ≤ sizeOf t := by
+  cases t <;> simp <;> omega
+
 /-- A type with no top-level refinement layer is its own peel. -/
 theorem peel_nil_self : {t : Ty} → t.peel.2 = [] → t.peel.1 = t
   | .base _, _ | .uintRange _, _ | .dataSource _, _ | .txn, _
   | .fn .., _ | .tuple _, _ | .record _, _ | .variant _, _ => rfl
   | .refined b p, h => by simp [Ty.peel] at h
 
-theorem noPi_peel_fst : (t : Ty) → NoPi t → NoPi t.peel.1
-  | .base _, h => h
-  | .uintRange _, h => h
-  | .dataSource _, h => h
-  | .txn, h => h
-  | .fn .., h => h
-  | .tuple _, h => h
-  | .record _, h => h
-  | .variant _, h => h
-  | .refined b _, h => by
-      have hb : NoPi b := by rw [NoPi] at h; exact h
-      simpa [Ty.peel] using noPi_peel_fst b hb
-termination_by t => sizeOf t
+theorem canon_peel_fst : (d : Nat) → (t : Ty) → Canon d t → Canon d t.peel.1
+  | _, .base _, h => h
+  | _, .uintRange _, h => h
+  | _, .dataSource _, h => h
+  | _, .txn, h => h
+  | _, .fn .., h => h
+  | _, .tuple _, h => h
+  | _, .record _, h => h
+  | _, .variant _, h => h
+  | d, .refined b _, h => by
+      have hb : Canon d b := by rw [Canon] at h; exact h
+      simpa [Ty.peel] using canon_peel_fst d b hb
+termination_by _ t => sizeOf t
 decreasing_by simp_wf; omega
 
-theorem noPi_legUnder : (t : Ty) → NoPi t → NoPi (legUnder t)
-  | .base _, h => h
-  | .uintRange _, h => h
-  | .dataSource _, h => h
-  | .txn, h => h
-  | .fn .., h => h
-  | .tuple _, h => h
-  | .record _, h => h
-  | .variant _, h => h
-  | .refined b _, h => by rw [NoPi] at h; simpa [legUnder] using h
+theorem canon_legUnder : (d : Nat) → (t : Ty) → Canon d t → Canon d (legUnder t)
+  | _, .base _, h => h
+  | _, .uintRange _, h => h
+  | _, .dataSource _, h => h
+  | _, .txn, h => h
+  | _, .fn .., h => h
+  | _, .tuple _, h => h
+  | _, .record _, h => h
+  | _, .variant _, h => h
+  | d, .refined b _, h => by rw [Canon] at h; simpa [legUnder] using h
 
-theorem noPi_partitionDomain {d u : Ty} (h : NoPi d)
-    (hd : partitionDomain d = some u) : NoPi u := by
-  match d, hd with
+theorem canon_partitionDomain {d : Nat} {t u : Ty} (h : Canon d t)
+    (hd : partitionDomain t = some u) : Canon d u := by
+  match t, hd with
   | .variant ((k0, p0) :: rest), hd =>
       simp only [partitionDomain] at hd
       split at hd
       · injection hd with hd
         subst hd
-        have hp0 : NoPi p0 := by
-          rw [NoPi] at h
+        have hp0 : Canon d p0 := by
+          rw [Canon] at h
           exact h (k0, p0) (List.mem_cons_self ..)
-        exact noPi_legUnder p0 hp0
+        exact canon_legUnder d p0 hp0
       · exact absurd hd (by simp)
 
-theorem noPi_normFun {t t' : Ty} (h : NoPi t) (hn : normFun t = some t') :
-    NoPi t' := by
+theorem canon_normFun {d : Nat} {t t' : Ty} (h : Canon d t)
+    (hn : normFun t = some t') : Canon d t' := by
   match t, hn with
-  | .fn n k d c, hn =>
+  | .fn n k dom c, hn =>
       simp only [normFun, Option.map_eq_some_iff] at hn
       obtain ⟨d', hd, rfl⟩ := hn
-      rw [NoPi] at h ⊢
-      exact ⟨h.1, noPi_partitionDomain h.2.1 hd, h.2.2⟩
+      rw [Canon] at h ⊢
+      exact ⟨h.1, canon_partitionDomain h.2.1 hd, h.2.2⟩
 
-/-- `getD` form: normalization stays inside the fragment. -/
-theorem noPi_normFun_getD {t : Ty} (h : NoPi t) : NoPi ((normFun t).getD t) := by
+theorem canon_normFun_getD {d : Nat} {t : Ty} (h : Canon d t) :
+    Canon d ((normFun t).getD t) := by
   cases hn : normFun t with
   | none => simpa using h
-  | some t' => simpa using noPi_normFun h hn
+  | some t' => simpa using canon_normFun h hn
+
+theorem canon_fn_binder {d n k dom c} (h : Canon d (.fn n k dom c)) :
+    n = none ∨ n = some (piName d) := by
+  rw [Canon] at h; exact h.1
+
+theorem canon_fn_dom {d n k dom c} (h : Canon d (.fn n k dom c)) :
+    Canon d dom := by
+  rw [Canon] at h; exact h.2.1
+
+theorem canon_fn_cod {d n k dom c} (h : Canon d (.fn n k dom c)) :
+    Canon (d + 1) c := by
+  rw [Canon] at h; exact h.2.2
+
+/-- The codomain correspondence a **canonical** edge mints acts as the
+identity: both binders (when present) are the same reserved name, so the
+extension is diagonal. This is the whole reason the σ-gap dissolves. -/
+theorem codRen_canon_isId {d : Nat} {n0 n1 : Option String} {ρ : Ren}
+    (h0 : n0 = none ∨ n0 = some (piName d))
+    (h1 : n1 = none ∨ n1 = some (piName d)) (hρ : ρ.IsId) :
+    (codRen n0 n1 ρ).IsId := by
+  rcases h0 with rfl | rfl <;> rcases h1 with rfl | rfl <;>
+    first
+      | exact hρ
+      | exact hρ.extend_diag _
 
 theorem deficit_eq_nil_iff {ρl ρr : Ren} {l r : List Pred} :
     deficit ρl ρr l r = [] ↔
@@ -126,22 +172,25 @@ theorem deficit_eq_nil_iff {ρl ρr : Ren} {l r : List Pred} :
     simp only [Bool.not_eq_true', Bool.not_eq_false]
     exact List.elem_eq_true_of_mem (List.mem_map.mpr ⟨q, hq, hqe⟩)
 
-/-- Refinement-set containment composes (single ambient environment). -/
-theorem deficit_trans {ρ : Ren} {l m r : List Pred}
-    (h1 : deficit ρ ρ l m = []) (h2 : deficit ρ ρ m r = []) :
-    deficit ρ ρ l r = [] := by
-  rw [deficit_eq_nil_iff] at h1 h2 ⊢
-  intro p hp
-  obtain ⟨q, hq, hqe⟩ := h2 p hp
-  obtain ⟨s, hs, hse⟩ := h1 q hq
-  exact ⟨s, hs, hse.trans hqe⟩
+/-- Under identity-acting environments the deficit is plain set
+containment — so any two identity-acting environment pairs agree on it. -/
+theorem deficit_isId_nil_iff {ρl ρr : Ren} (hl : ρl.IsId) (hr : ρr.IsId)
+    {S T : List Pred} : deficit ρl ρr S T = [] ↔ ∀ p ∈ T, p ∈ S := by
+  rw [deficit_eq_nil_iff]
+  constructor
+  · intro h p hp
+    obtain ⟨q, hq, hqe⟩ := h p hp
+    rw [Pred.rename_isId hl q, Pred.rename_isId hr p] at hqe
+    exact hqe ▸ hq
+  · intro h p hp
+    exact ⟨p, h p hp, by rw [Pred.rename_isId hl p, Pred.rename_isId hr p]⟩
 
 /-- Universal peel inversion: **every** rule leaves the peeled bases related
 and the peeled refinement sets contained. For the head-constructor rules
 both peels are `(t, [])`, so this is the derivation itself; for the
 refinement rule it is exactly its premises. -/
-theorem sub_peel_inv {ρ : Ren} {x y : Ty} (h : Sub ρ ρ x y) :
-    deficit ρ ρ x.peel.2 y.peel.2 = [] ∧ Sub ρ ρ x.peel.1 y.peel.1 := by
+theorem sub_peel_inv {ρl ρr : Ren} {x y : Ty} (h : Sub ρl ρr x y) :
+    deficit ρl ρr x.peel.2 y.peel.2 = [] ∧ Sub ρl ρr x.peel.1 y.peel.1 := by
   cases h with
   | base b => exact ⟨rfl, .base b⟩
   | uintRange n => exact ⟨rfl, .uintRange n⟩
@@ -160,9 +209,9 @@ theorem sub_peel_inv {ρ : Ren} {x y : Ty} (h : Sub ρ ρ x y) :
 /-- Every function-to-function edge relates the two sides' **normal forms**:
 `fnNorm` says so directly, and the general rules only fire when both sides
 are already normal. -/
-theorem sub_normFun {ρ : Ren} {n0 k0 d0 c0 n1 k1 d1 c1}
-    (h : Sub ρ ρ (.fn n0 k0 d0 c0) (.fn n1 k1 d1 c1)) :
-    Sub ρ ρ ((normFun (.fn n0 k0 d0 c0)).getD (.fn n0 k0 d0 c0))
+theorem sub_normFun {ρl ρr : Ren} {n0 k0 d0 c0 n1 k1 d1 c1}
+    (h : Sub ρl ρr (.fn n0 k0 d0 c0) (.fn n1 k1 d1 c1)) :
+    Sub ρl ρr ((normFun (.fn n0 k0 d0 c0)).getD (.fn n0 k0 d0 c0))
       ((normFun (.fn n1 k1 d1 c1)).getD (.fn n1 k1 d1 c1)) := by
   cases h with
   | fnNorm _ hplain => exact hplain
@@ -178,15 +227,6 @@ theorem sub_normFun {ρ : Ren} {n0 k0 d0 c0 n1 k1 d1 c1}
       obtain ⟨-, hr⟩ := hpr
       subst hl; subst hr
       rcases hg with hg | hg <;> exact absurd rfl hg
-
-/-- De Morgan for a decidable conjunction (no Mathlib in this development). -/
-theorem not_and_or' {a b : Prop} [Decidable a] (h : ¬(a ∧ b)) : ¬a ∨ ¬b := by
-  by_cases ha : a
-  · exact Or.inr fun hb => h ⟨ha, hb⟩
-  · exact Or.inl ha
-
-theorem one_le_sizeOf (t : Ty) : 1 ≤ sizeOf t := by
-  cases t <;> simp <;> omega
 
 theorem kindOk_trans {k0 km k1 : FunKind}
     (h1 : kindOk k0 km) (h2 : kindOk km k1) : kindOk k0 k1 := by
@@ -211,8 +251,8 @@ theorem lookupBy_mem [BEq α] [LawfulBEq α] {l : List (α × Ty)} {k : α} {t :
       exact hmem
 
 /-- Shape inversion: a bare type below a function type is a function type. -/
-theorem sub_fn_rhs_shape {ρ : Ren} {x : Ty} {nm km dm cm}
-    (h : Sub ρ ρ x (.fn nm km dm cm)) (hx : x.peel.2 = []) :
+theorem sub_fn_rhs_shape {ρl ρr : Ren} {x : Ty} {nm km dm cm}
+    (h : Sub ρl ρr x (.fn nm km dm cm)) (hx : x.peel.2 = []) :
     ∃ n0 k0 d0 c0, x = .fn n0 k0 d0 c0 := by
   cases h with
   | fnNorm _ _ => exact ⟨_, _, _, _, rfl⟩
@@ -228,8 +268,8 @@ theorem sub_fn_rhs_shape {ρ : Ren} {x : Ty} {nm km dm cm}
       · exact absurd rfl hg
 
 /-- Shape inversion: a bare type above a function type is a function type. -/
-theorem sub_fn_lhs_shape {ρ : Ren} {z : Ty} {nm km dm cm}
-    (h : Sub ρ ρ (.fn nm km dm cm) z) (hz : z.peel.2 = []) :
+theorem sub_fn_lhs_shape {ρl ρr : Ren} {z : Ty} {nm km dm cm}
+    (h : Sub ρl ρr (.fn nm km dm cm) z) (hz : z.peel.2 = []) :
     ∃ n1 k1 d1 c1, z = .fn n1 k1 d1 c1 := by
   cases h with
   | fnNorm _ _ => exact ⟨_, _, _, _, rfl⟩
@@ -244,32 +284,35 @@ theorem sub_fn_lhs_shape {ρ : Ren} {z : Ty} {nm km dm cm}
       · exact absurd rfl hg
       · exact absurd hz hg
 
-theorem noPi_fn_binder {n k d c} (h : NoPi (.fn n k d c)) : n = none := by
-  rw [NoPi] at h; exact h.1
+/-- Bundled induction hypothesis: transitivity for anything smaller, with
+all six environments free (each identity-acting). The freedom is the point:
+a chain's premises arrive under *their* environments and the conclusion is
+wanted under a third pair, and for canonical types all of them act as the
+identity, so no reconciliation morphism (σ) is ever needed. -/
+def TransIH (n : Nat) : Prop :=
+  ∀ (d : Nat) (a b c : Ty), sizeOf a + sizeOf b + sizeOf c ≤ n →
+    Canon d a → Canon d b → Canon d c →
+    ∀ {ρ1l ρ1r ρ2l ρ2r ρl ρr : Ren},
+      ρ1l.IsId → ρ1r.IsId → ρ2l.IsId → ρ2r.IsId → ρl.IsId → ρr.IsId →
+      Sub ρ1l ρ1r a b → Sub ρ2l ρ2r b c → Sub ρl ρr a c
 
-theorem noPi_fn_dom {n k d c} (h : NoPi (.fn n k d c)) : NoPi d := by
-  rw [NoPi] at h; exact h.2.1
-
-theorem noPi_fn_cod {n k d c} (h : NoPi (.fn n k d c)) : NoPi c := by
-  rw [NoPi] at h; exact h.2.2
-
-/-- The function case of transitivity, with the induction hypothesis passed
-in explicitly (`IH`) so the three ways of concluding a function edge —
-`fnNorm`, `fnCompute`, `fnData` — are handled once rather than per caller. -/
-theorem sub_trans_fn {ρ : Ren} {n : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
-    (IH : ∀ a b c : Ty, sizeOf a + sizeOf b + sizeOf c ≤ n →
-      NoPi a → NoPi b → NoPi c → Sub ρ ρ a b → Sub ρ ρ b c → Sub ρ ρ a c)
+/-- The function case, factored out so the three ways of concluding a
+function edge are handled once. -/
+theorem sub_trans_fn {n d : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
+    {ρ1l ρ1r ρ2l ρ2r ρl ρr : Ren}
+    (IH : TransIH n)
     (hbound : sizeOf (Ty.fn n0 k0 d0 c0) + sizeOf (Ty.fn nm km dm cm)
       + sizeOf z ≤ n + 1)
-    (hx : NoPi (.fn n0 k0 d0 c0)) (hy : NoPi (.fn nm km dm cm)) (hz : NoPi z)
-    (hzb : z.peel.2 = [])
-    (h1 : Sub ρ ρ (.fn n0 k0 d0 c0) (.fn nm km dm cm))
-    (h2 : Sub ρ ρ (.fn nm km dm cm) z) :
-    Sub ρ ρ (.fn n0 k0 d0 c0) z := by
+    (hx : Canon d (.fn n0 k0 d0 c0)) (hy : Canon d (.fn nm km dm cm))
+    (hz : Canon d z) (hzb : z.peel.2 = [])
+    (h1l : ρ1l.IsId) (h1r : ρ1r.IsId) (h2l : ρ2l.IsId) (h2r : ρ2r.IsId)
+    (hρl : ρl.IsId) (hρr : ρr.IsId)
+    (h1 : Sub ρ1l ρ1r (.fn n0 k0 d0 c0) (.fn nm km dm cm))
+    (h2 : Sub ρ2l ρ2r (.fn nm km dm cm) z) :
+    Sub ρl ρr (.fn n0 k0 d0 c0) z := by
   obtain ⟨n1, k1, d1, c1, rfl⟩ := sub_fn_lhs_shape h2 hzb
   have e1 := sub_normFun h1
   have e2 := sub_normFun h2
-  -- Sizes: a normalized side never grows, and shrinks when it normalizes.
   have hlex : sizeOf ((normFun (Ty.fn n0 k0 d0 c0)).getD (Ty.fn n0 k0 d0 c0))
       ≤ sizeOf (Ty.fn n0 k0 d0 c0) := by
     cases hn : normFun (Ty.fn n0 k0 d0 c0) with
@@ -287,9 +330,10 @@ theorem sub_trans_fn {ρ : Ren} {n : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
     | some t => simpa using Nat.le_of_lt (normFun_sizeOf hn)
   by_cases hnorm : (normFun (Ty.fn n0 k0 d0 c0)).isSome ∨
       (normFun (Ty.fn n1 k1 d1 c1)).isSome
-  · -- At least one side normalizes: collapse both and recurse.
-    refine Sub.fnNorm hnorm (IH _ _ _ ?_ (noPi_normFun_getD hx)
-      (noPi_normFun_getD hy) (noPi_normFun_getD hz) e1 e2)
+  · -- At least one outer side normalizes: collapse and recurse.
+    refine Sub.fnNorm hnorm (IH d _ _ _ ?_ (canon_normFun_getD hx)
+      (canon_normFun_getD hy) (canon_normFun_getD hz)
+      h1l h1r h2l h2r hρl hρr e1 e2)
     have hstrict : sizeOf ((normFun (Ty.fn n0 k0 d0 c0)).getD (Ty.fn n0 k0 d0 c0))
         + sizeOf ((normFun (Ty.fn n1 k1 d1 c1)).getD (Ty.fn n1 k1 d1 c1))
         < sizeOf (Ty.fn n0 k0 d0 c0) + sizeOf (Ty.fn n1 k1 d1 c1) := by
@@ -320,7 +364,8 @@ theorem sub_trans_fn {ρ : Ren} {n : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
     simp only [Option.getD_none] at e1 e2
     by_cases hny : (normFun (Ty.fn nm km dm cm)).isSome
     · -- Only the middle normalizes: recurse through its normal form.
-      refine IH _ _ _ ?_ hx (noPi_normFun_getD hy) hz e1 e2
+      refine IH d _ _ _ ?_ hx (canon_normFun_getD hy) hz
+        h1l h1r h2l h2r hρl hρr e1 e2
       have hstrict : sizeOf ((normFun (Ty.fn nm km dm cm)).getD (Ty.fn nm km dm cm))
           < sizeOf (Ty.fn nm km dm cm) := by
         cases hn : normFun (Ty.fn nm km dm cm) with
@@ -335,17 +380,20 @@ theorem sub_trans_fn {ρ : Ren} {n : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
         cases hn : normFun (Ty.fn nm km dm cm) with
         | none => rfl
         | some t => rw [hn] at hny; simp at hny
-      have hb0 : n0 = none := noPi_fn_binder hx
-      have hbm : nm = none := noPi_fn_binder hy
-      have hb1 : n1 = none := noPi_fn_binder hz
-      subst hb0; subst hbm; subst hb1
-      -- Sizes for the domain and codomain recursions.
       have hdom_sz : sizeOf d1 + sizeOf dm + sizeOf d0 ≤ n := by
         simp only [Ty.fn.sizeOf_spec] at hbound
         omega
       have hcod_sz : sizeOf c0 + sizeOf cm + sizeOf c1 ≤ n := by
         simp only [Ty.fn.sizeOf_spec] at hbound
         omega
+      -- Canonical binder facts feed the diagonal-correspondence lemma:
+      -- every codomain environment in sight is identity-acting.
+      have hb0 := canon_fn_binder hx
+      have hbm := canon_fn_binder hy
+      have hb1 := canon_fn_binder hz
+      have hcod1_id : (codRen n0 nm ρ1l).IsId := codRen_canon_isId hb0 hbm h1l
+      have hcod2_id : (codRen nm n1 ρ2l).IsId := codRen_canon_isId hbm hb1 h2l
+      have hcodC_id : (codRen n0 n1 ρl).IsId := codRen_canon_isId hb0 hb1 hρl
       cases h1 with
       | fnNorm hg _ =>
           rcases hg with hg | hg
@@ -358,7 +406,6 @@ theorem sub_trans_fn {ρ : Ren} {n : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
           subst hl; subst hr
           rcases hg with hg | hg <;> exact absurd rfl hg
       | fnCompute _ _ hok1 hnd1 hdom1 hcod1 =>
-          simp only [codRen] at hcod1
           cases h2 with
           | fnNorm hg _ =>
               rcases hg with hg | hg
@@ -371,28 +418,24 @@ theorem sub_trans_fn {ρ : Ren} {n : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
               subst hl; subst hr
               rcases hg with hg | hg <;> exact absurd rfl hg
           | fnCompute _ _ hok2 hnd2 hdom2 hcod2 =>
-              simp only [codRen] at hcod2
-              have hdom := IH d1 dm d0 hdom_sz (noPi_fn_dom hz) (noPi_fn_dom hy)
-                (noPi_fn_dom hx) hdom2 hdom1
-              have hcod := IH c0 cm c1 hcod_sz (noPi_fn_cod hx) (noPi_fn_cod hy)
-                (noPi_fn_cod hz) hcod1 hcod2
+              have hdom := IH d d1 dm d0 hdom_sz (canon_fn_dom hz)
+                (canon_fn_dom hy) (canon_fn_dom hx)
+                h2r h2l h1r h1l hρr hρl hdom2 hdom1
+              have hcod := IH (d + 1) c0 cm c1 hcod_sz (canon_fn_cod hx)
+                (canon_fn_cod hy) (canon_fn_cod hz)
+                hcod1_id h1r hcod2_id h2r hcodC_id hρr hcod1 hcod2
               refine Sub.fnCompute hnx hnz (kindOk_trans hok1 hok2) ?_ hdom hcod
               rintro ⟨rfl, rfl⟩
-              -- k0 = k1 = data forces km = compute (h1) and then h2's kind
-              -- edge is `compute <: data`, which the lattice rejects.
               have hkm : km ≠ FunKind.data := fun h => hnd1 ⟨rfl, h⟩
               cases km with
               | data => exact hkm rfl
               | compute => exact hok2
           | fnData _ _ _ _ _ =>
-              -- h2 pins km = data, so h1's `¬(k0 = data ∧ km = data)` forces
-              -- k0 = compute — and then h1's kind edge is `compute <: data`.
               have hk0 : k0 ≠ FunKind.data := fun h => hnd1 ⟨h, rfl⟩
               cases k0 with
               | data => exact absurd rfl hk0
               | compute => exact absurd hok1 (by simp [kindOk])
       | fnData _ _ hdom1a hdom1b hcod1 =>
-          simp only [codRen] at hcod1
           cases h2 with
           | fnNorm hg _ =>
               rcases hg with hg | hg
@@ -405,42 +448,41 @@ theorem sub_trans_fn {ρ : Ren} {n : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
               subst hl; subst hr
               rcases hg with hg | hg <;> exact absurd rfl hg
           | fnCompute _ _ hok2 hnd2 hdom2 hcod2 =>
-              simp only [codRen] at hcod2
-              have hdom := IH d1 dm d0 hdom_sz (noPi_fn_dom hz) (noPi_fn_dom hy)
-                (noPi_fn_dom hx) hdom2 hdom1a
-              have hcod := IH c0 cm c1 hcod_sz (noPi_fn_cod hx) (noPi_fn_cod hy)
-                (noPi_fn_cod hz) hcod1 hcod2
+              have hdom := IH d d1 dm d0 hdom_sz (canon_fn_dom hz)
+                (canon_fn_dom hy) (canon_fn_dom hx)
+                h2r h2l h1r h1l hρr hρl hdom2 hdom1a
+              have hcod := IH (d + 1) c0 cm c1 hcod_sz (canon_fn_cod hx)
+                (canon_fn_cod hy) (canon_fn_cod hz)
+                hcod1_id h1r hcod2_id h2r hcodC_id hρr hcod1 hcod2
               refine Sub.fnCompute hnx hnz hok2 ?_ hdom hcod
               rintro ⟨-, rfl⟩
               exact hnd2 ⟨rfl, rfl⟩
           | fnData _ _ hdom2a hdom2b hcod2 =>
-              simp only [codRen] at hcod2
-              have hdomA := IH d1 dm d0 hdom_sz (noPi_fn_dom hz) (noPi_fn_dom hy)
-                (noPi_fn_dom hx) hdom2a hdom1a
-              have hdomB := IH d0 dm d1 (by omega) (noPi_fn_dom hx)
-                (noPi_fn_dom hy) (noPi_fn_dom hz) hdom1b hdom2b
-              have hcod := IH c0 cm c1 hcod_sz (noPi_fn_cod hx) (noPi_fn_cod hy)
-                (noPi_fn_cod hz) hcod1 hcod2
+              have hdomA := IH d d1 dm d0 hdom_sz (canon_fn_dom hz)
+                (canon_fn_dom hy) (canon_fn_dom hx)
+                h2r h2l h1r h1l hρr hρl hdom2a hdom1a
+              have hdomB := IH d d0 dm d1 (by omega) (canon_fn_dom hx)
+                (canon_fn_dom hy) (canon_fn_dom hz)
+                h1l h1r h2l h2r hρl hρr hdom1b hdom2b
+              have hcod := IH (d + 1) c0 cm c1 hcod_sz (canon_fn_cod hx)
+                (canon_fn_cod hy) (canon_fn_cod hz)
+                hcod1_id h1r hcod2_id h2r hcodC_id hρr hcod1 hcod2
               exact Sub.fnData hnx hnz hdomA hdomB hcod
 
-/-- Fuel-bounded transitivity: `n` bounds the summed size, so the induction
-hypothesis is an ordinary function that the helper above can take. -/
-theorem sub_trans_aux : (n : Nat) → (ρ : Ren) → (x y z : Ty) →
-    sizeOf x + sizeOf y + sizeOf z ≤ n →
-    NoPi x → NoPi y → NoPi z →
-    Sub ρ ρ x y → Sub ρ ρ y z → Sub ρ ρ x z
-  | 0, _, x, y, z, hn, _, _, _, _, _ => by
+/-- Fuel-bounded transitivity for the canonical fragment. -/
+theorem sub_trans_aux : (n : Nat) → TransIH n
+  | 0 => by
+      intro d x y z hn _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
       have := one_le_sizeOf x
       have := one_le_sizeOf y
       have := one_le_sizeOf z
       omega
-  | n + 1, ρ, x, y, z, hn, hx, hy, hz, h1, h2 => by
-    have IH : ∀ a b c : Ty, sizeOf a + sizeOf b + sizeOf c ≤ n →
-        NoPi a → NoPi b → NoPi c → Sub ρ ρ a b → Sub ρ ρ b c → Sub ρ ρ a c :=
-      fun a b c hb ha hbb hc s1 s2 => sub_trans_aux n ρ a b c hb ha hbb hc s1 s2
+  | n + 1 => by
+    intro d x y z hn hx hy hz ρ1l ρ1r ρ2l ρ2r ρl ρr h1l h1r h2l h2r hρl hρr
+      h1 h2
+    have IH : TransIH n := sub_trans_aux n
     by_cases hbare : x.peel.2 = [] ∧ y.peel.2 = [] ∧ z.peel.2 = []
-    · -- No top-level refinement anywhere: the head-constructor rules.
-      obtain ⟨hxb, hyb, hzb⟩ := hbare
+    · obtain ⟨hxb, hyb, hzb⟩ := hbare
       cases h1 with
       | base b =>
           cases h2 with
@@ -487,12 +529,14 @@ theorem sub_trans_aux : (n : Nat) → (ρ : Ren) → (x y z : Ty) →
               · exact absurd rfl hg
               · exact absurd hzb hg
       | fnNorm hg hp =>
-          exact sub_trans_fn IH (by omega) hx hy hz hzb (.fnNorm hg hp) h2
-      | fnCompute a b c d e f =>
           exact sub_trans_fn IH (by omega) hx hy hz hzb
-            (.fnCompute a b c d e f) h2
-      | fnData a b c d e =>
-          exact sub_trans_fn IH (by omega) hx hy hz hzb (.fnData a b c d e) h2
+            h1l h1r h2l h2r hρl hρr (.fnNorm hg hp) h2
+      | fnCompute a b c d' e f =>
+          exact sub_trans_fn IH (by omega) hx hy hz hzb
+            h1l h1r h2l h2r hρl hρr (.fnCompute a b c d' e f) h2
+      | fnData a b c d' e =>
+          exact sub_trans_fn IH (by omega) hx hy hz hzb
+            h1l h1r h2l h2r hρl hρr (.fnData a b c d' e) h2
       | tuple hlen1 hpt1 =>
           cases h2 with
           | tuple hlen2 hpt2 =>
@@ -510,13 +554,14 @@ theorem sub_trans_aux : (n : Nat) → (ρ : Ren) → (x y z : Ty) →
               have s0 := List.sizeOf_lt_of_mem hm0
               have sm := List.sizeOf_lt_of_mem hmm
               have s1 := List.sizeOf_lt_of_mem hm1
-              refine IH t0 bs[i] t1 ?_ ?_ ?_ ?_ (hpt1 i t0 bs[i] h0 hb)
+              refine IH d t0 bs[i] t1 ?_ ?_ ?_ ?_
+                h1l h1r h2l h2r hρl hρr (hpt1 i t0 bs[i] h0 hb)
                 (hpt2 i bs[i] t1 hb h1')
               · simp only [Ty.tuple.sizeOf_spec] at hn
                 omega
-              · rw [NoPi] at hx; exact hx t0 hm0
-              · rw [NoPi] at hy; exact hy bs[i] hmm
-              · rw [NoPi] at hz; exact hz t1 hm1
+              · rw [Canon] at hx; exact hx t0 hm0
+              · rw [Canon] at hy; exact hy bs[i] hmm
+              · rw [Canon] at hz; exact hz t1 hm1
           | refined hpl hpr hg _ _ =>
               rw [hpr] at hzb
               simp only [Ty.peel, Prod.mk.injEq] at hpl hzb
@@ -540,14 +585,15 @@ theorem sub_trans_aux : (n : Nat) → (ρ : Ren) → (x y z : Ty) →
                 have s0 := List.sizeOf_lt_of_mem hm0
                 have sm := List.sizeOf_lt_of_mem hmm
                 have s1 := List.sizeOf_lt_of_mem hm
-                refine IH t0 tm t1 ?_ ?_ ?_ ?_ (hsub1 nkey t0 tm hmm hlk)
+                refine IH d t0 tm t1 ?_ ?_ ?_ ?_
+                  h1l h1r h2l h2r hρl hρr (hsub1 nkey t0 tm hmm hlk)
                   (hsub2 nkey tm t1 hm htm)
                 · simp only [Ty.record.sizeOf_spec] at hn
                   simp only [Prod.mk.sizeOf_spec] at s0 sm s1
                   omega
-                · rw [NoPi] at hx; exact hx (nkey, t0) hm0
-                · rw [NoPi] at hy; exact hy (nkey, tm) hmm
-                · rw [NoPi] at hz; exact hz (nkey, t1) hm
+                · rw [Canon] at hx; exact hx (nkey, t0) hm0
+                · rw [Canon] at hy; exact hy (nkey, tm) hmm
+                · rw [Canon] at hz; exact hz (nkey, t1) hm
           | refined hpl hpr hg _ _ =>
               rw [hpr] at hzb
               simp only [Ty.peel, Prod.mk.injEq] at hpl hzb
@@ -571,14 +617,15 @@ theorem sub_trans_aux : (n : Nat) → (ρ : Ren) → (x y z : Ty) →
                 have s0 := List.sizeOf_lt_of_mem hm
                 have sm := List.sizeOf_lt_of_mem hmm
                 have s1 := List.sizeOf_lt_of_mem hm1
-                refine IH t0 tm t1 ?_ ?_ ?_ ?_ (hsub1 key t0 tm hm htm)
+                refine IH d t0 tm t1 ?_ ?_ ?_ ?_
+                  h1l h1r h2l h2r hρl hρr (hsub1 key t0 tm hm htm)
                   (hsub2 key tm t1 hmm hlk)
                 · simp only [Ty.variant.sizeOf_spec] at hn
                   simp only [Prod.mk.sizeOf_spec] at s0 sm s1
                   omega
-                · rw [NoPi] at hx; exact hx (key, t0) hm
-                · rw [NoPi] at hy; exact hy (key, tm) hmm
-                · rw [NoPi] at hz; exact hz (key, t1) hm1
+                · rw [Canon] at hx; exact hx (key, t0) hm
+                · rw [Canon] at hy; exact hy (key, tm) hmm
+                · rw [Canon] at hz; exact hz (key, t1) hm1
           | refined hpl hpr hg _ _ =>
               rw [hpr] at hzb
               simp only [Ty.peel, Prod.mk.injEq] at hpl hzb
@@ -594,9 +641,12 @@ theorem sub_trans_aux : (n : Nat) → (ρ : Ren) → (x y z : Ty) →
           rcases hg with hg | hg
           · exact absurd hxb hg
           · exact absurd hyb hg
-    · -- Some side carries a refinement layer: peel all three, recurse, re-wrap.
+    · -- Some side carries a refinement layer: peel all three, compose the
+      -- set containments, recurse on the bases, re-wrap.
       obtain ⟨hd1, hs1⟩ := sub_peel_inv h1
       obtain ⟨hd2, hs2⟩ := sub_peel_inv h2
+      have hc1 := (deficit_isId_nil_iff h1l h1r).mp hd1
+      have hc2 := (deficit_isId_nil_iff h2l h2r).mp hd2
       have hlt : sizeOf x.peel.1 + sizeOf y.peel.1 + sizeOf z.peel.1
           < sizeOf x + sizeOf y + sizeOf z := by
         have hax := Ty.peel_fst_sizeOf_le x
@@ -607,71 +657,46 @@ theorem sub_trans_aux : (n : Nat) → (ρ : Ren) → (x y z : Ty) →
         · rcases not_and_or' h' with h'' | h''
           · have := Ty.peel_fst_sizeOf_lt y h''; omega
           · have := Ty.peel_fst_sizeOf_lt z h''; omega
-      have hbase := IH x.peel.1 y.peel.1 z.peel.1 (by omega)
-        (noPi_peel_fst x hx) (noPi_peel_fst y hy) (noPi_peel_fst z hz) hs1 hs2
-      have hdef := deficit_trans hd1 hd2
+      have hbase := IH d x.peel.1 y.peel.1 z.peel.1 (by omega)
+        (canon_peel_fst d x hx) (canon_peel_fst d y hy) (canon_peel_fst d z hz)
+        h1l h1r h2l h2r hρl hρr hs1 hs2
+      have hdef : deficit ρl ρr x.peel.2 z.peel.2 = [] :=
+        (deficit_isId_nil_iff hρl hρr).mpr fun p hp => hc1 p (hc2 p hp)
       by_cases hxz : x.peel.2 = [] ∧ z.peel.2 = []
       · rw [peel_nil_self hxz.1, peel_nil_self hxz.2] at hbase
         exact hbase
       · exact Sub.refined rfl rfl (not_and_or' hxz) hdef hbase
 
-/-- **Transitivity of ground subtyping on the non-dependent fragment.** -/
-theorem sub_trans {ρ : Ren} {x y z : Ty}
-    (hx : NoPi x) (hy : NoPi y) (hz : NoPi z)
-    (h1 : Sub ρ ρ x y) (h2 : Sub ρ ρ y z) : Sub ρ ρ x z :=
-  sub_trans_aux (sizeOf x + sizeOf y + sizeOf z) ρ x y z (Nat.le_refl _) hx hy hz h1 h2
+/-- **Transitivity for the canonical fragment**, environments free: any
+chain composes under any identity-acting environments — no `NoPi`
+restriction, no σ-side condition. Canonical binders are what every type
+leaving the solver carries (`compact.rs` / `spec_key.rs`), so this is
+transitivity for the system's actual types. -/
+theorem sub_trans {d : Nat} {x y z : Ty}
+    (hx : Canon d x) (hy : Canon d y) (hz : Canon d z)
+    {ρ1l ρ1r ρ2l ρ2r ρl ρr : Ren}
+    (h1l : ρ1l.IsId) (h1r : ρ1r.IsId) (h2l : ρ2l.IsId) (h2r : ρ2r.IsId)
+    (hρl : ρl.IsId) (hρr : ρr.IsId)
+    (h1 : Sub ρ1l ρ1r x y) (h2 : Sub ρ2l ρ2r y z) : Sub ρl ρr x z :=
+  sub_trans_aux (sizeOf x + sizeOf y + sizeOf z) d x y z (Nat.le_refl _)
+    hx hy hz h1l h1r h2l h2r hρl hρr h1 h2
+
+/-- **Pure transitivity** at the identity environment — the form the ground
+oracle exercises. -/
+theorem sub_trans_id {d : Nat} {x y z : Ty}
+    (hx : Canon d x) (hy : Canon d y) (hz : Canon d z)
+    (h1 : Sub .id .id x y) (h2 : Sub .id .id y z) : Sub .id .id x z :=
+  sub_trans hx hy hz Ren.isId_id Ren.isId_id Ren.isId_id Ren.isId_id
+    Ren.isId_id Ren.isId_id h1 h2
 
 /-- End-to-end: the triangle that **refuted** transitivity under the bridge
-arm is now an instance of the general theorem, not just three hand-built
-derivations (`CclFormal/Trans.lean`). -/
+arm is an instance of the general theorem (its binders are all `none`,
+which is canonical at any depth). -/
 example : Sub .id .id transCex.a transCex.c :=
-  sub_trans
-    (by simp [NoPi, transCex.a, transCex.gate, transCex.recA])
-    (by simp [NoPi, transCex.b, transCex.recA])
-    (by simp [NoPi, transCex.c, transCex.recAB])
+  sub_trans_id (d := 0)
+    (by simp [Canon, transCex.a, transCex.gate, transCex.recA])
+    (by simp [Canon, transCex.b, transCex.recA])
+    (by simp [Canon, transCex.c, transCex.recAB])
     transCex.sub_a_b transCex.sub_b_c
-
-/-!
-## The remaining obligation: dependent codomains
-
-`sub_trans` is restricted to `NoPi` because the dependent case needs a
-reconciliation step the statement above cannot express. Chaining two
-function edges gives codomain premises
-
-* `Sub (codRen 𝑛₀ 𝑛ₘ ρl) ρm 𝑐₀ 𝑐ₘ`  (from `𝑥 <: 𝑦`), and
-* `Sub (codRen 𝑛ₘ 𝑛₁ ρm) ρr 𝑐ₘ 𝑐₁`  (from `𝑦 <: 𝑧`),
-
-while the conclusion needs `Sub (codRen 𝑛₀ 𝑛₁ ρl) ρr 𝑐₀ 𝑐₁`. The two
-premises disagree about the **middle view**: the first sees `𝑦`'s codomain
-under `ρm`, the second under `ρm.extend 𝑛ₘ 𝑛₁`. They compose only through
-the rename `σ = [𝑛ₘ ↦ 𝑛₁]` that relates those views, and then the
-conclusion's left view is the first premise's left view composed with `σ`
-— `σ ∘ (ρl.extend 𝑛₀ 𝑛ₘ) = ρl.extend 𝑛₀ 𝑛₁` — which holds only under a
-freshness side condition (`ρl` must not already produce `𝑛ₘ`).
-
-So the dependent statement is not `Sub ρl ρm 𝑥 𝑦 → Sub ρm ρr 𝑦 𝑧 → …` but
-the σ-indexed generalization
-
-```
-Sub ρl ρm 𝑥 𝑦 → Sub (σ ∘ ρm) ρr 𝑦 𝑧 → Sub (σ ∘ ρl) ρr 𝑥 𝑧
-```
-
-which is precisely what `constrain.rs :: bridge_holder_gap` computes when
-two bounds recorded under different morphisms meet at one variable — the
-implementation already invented this reconciliation; the metatheory needs
-the same one. Proving it additionally requires stating the freshness
-discipline the Rust gets for free from globally-uniquified `Name`s
-(Barendregt convention) but never writes down. Recorded as the next
-milestone rather than attempted here.
--/
-
-/-- The unrestricted conjecture, stated but **not proved**: transitivity
-without the `NoPi` restriction. The chain fuzz
-(`differential.rs :: transitivity_chain_fuzz`) exercises it with dependent
-refinements and has found no counterexample; the σ-gap above is what a
-proof must supply. -/
-def TransitivityConjecture : Prop :=
-  ∀ (ρ : Ren) (x y z : Ty), Sub ρ ρ x y → Sub ρ ρ y z → Sub ρ ρ x z
-
 
 end CclFormal
