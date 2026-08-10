@@ -135,6 +135,16 @@ Next increment: progress + preservation (substitution and inversion lemmas over 
 
 The Rust dumps the typed AST for generated small programs; Lean checks admissibility of the root typing. This is where the model starts catching *inference* bugs rather than comparison bugs.
 
+### M3b — Dependent-fragment transitivity: canonical first, α-aware as a bug hunt
+
+The transitivity proof covers the `NoPi` fragment; a Pi binder makes predicate identity *relative*, and extending the proof through it splits into two pushes with different purposes:
+
+- **Canonical-fragment transitivity** *(the near-term step, in progress)*: state transitivity for types whose Pi binders are canonical (`__pi{n}` by depth — `Subst::canonical_pi_binder`'s output). At a fixed comparison position all three types share depth context, so the position-relativity that refuted *minting-level* canonicalization is harmless: canonical binders are equal, the rename environments are identity, and predicates compare structurally — the proof is the `NoPi` development plus a `CanonPi` invariant carried through peel and normalization. This validates the discipline the Rust actually relies on: every comparison that *chains* (compaction onward) happens post-canonicalization.
+
+- **α-aware transitivity** *(this milestone's main body — deliberately framed as a bug hunt)*: the full statement, with rename-environment composition through the middle type. The load-bearing pieces: a composition lemma for the rename pairs (which forces stating the injectivity/freshness invariants the environments actually need), claim-set containment *modulo rename* threaded through the peel route's membership chase (`sub_peel_inv`, `sub_claims_left/right` generalize from structural equality to equality-under-ρ), and the fn-route helper gaining the binder-extension case. This is a multi-session push and the route most likely to find real defects — the `NoPi` transitivity attempt found the bridge-arm defect this way, and the known α-smells (first-arrival binder in bound merges, predicates referencing a binder the type no longer binds; both recorded under M0) live exactly where this proof has to tread. A failure to prove is a finding, not a setback.
+
+Sequencing: after M3, because the typing oracle gives the α-machinery a second consumer (admissibility checks exercise `without_pi_names` / `extended_rename` against real trees), and any rule gap the proof exposes then has an executable reproduction path. The M2 *safety* extension to dependent types (type-level substitution — the §6.2 discharge, proposal O8) is a separate lift that waits for the discharge machinery to be modeled; it is tracked under M2, not here.
+
 ### M4 — The solver model
 
 `constrain` / coalesce modeled as a state monad over a store of variables with bound lists, fuel-based at first. Two theorems:
