@@ -1,0 +1,309 @@
+import CclFormal.Ty
+import CclFormal.Sub
+
+/-!
+# M2 — Terms, typing, and the small-step semantics (definitional core)
+
+The pure-core term language, its values, capture-free substitution, the
+call-by-value small-step relation, and the declarative typing judgment
+`HasTy Γ e T`. Progress/preservation and the two corollaries (refinement
+soundness, case-binder preservation) build on these in the next increment.
+
+## Adjudications (deviations-on-contact, in the M0 tradition)
+
+- **Terms are de Bruijn; types keep their named Pi binders.** The subtype
+  relation never moves a binder, so names-with-renames mirrored the Rust
+  one-to-one there. Reduction *duplicates and re-scopes* binders, where named
+  representations buy α-conversion obligations and nothing else — and the
+  Rust's term binders are uniquified (`uniquify`), so they are α-irrelevant
+  identifiers, not semantic content. The M3 bridge maps uniquified names to
+  indices mechanically.
+- **The non-dependent fragment first**: every refinement predicate is over
+  the reserved `__elem` only (`Pred.elemOnly`) — no predicate references an
+  enclosing term binder. Types are therefore **closed under term
+  substitution**, exactly the fragment the transitivity proof covers
+  (`NoPi`); the dependent extension rides with the Pi-binder thread.
+- **`cast` checks its claims at runtime, and progress is stated modulo
+  filtering.** In CCL a cast is the refinement introduction (lowering's
+  filter); at runtime the corresponding `Restrict` *drops* elements. A
+  scalar small-step mirrors that as: `cast` steps through when every claim
+  evaluates to `true` on the value and is **blocked** otherwise. "Well-typed
+  terms don't get stuck" becomes "a well-typed term is a value, steps, or is
+  filter-blocked at a cast" — and refinement soundness (`⊢ e : {T | p}` and
+  `e ⇓ v` implies `p(v) = true`) holds because the cast is the only door.
+
+Left for later increments, recorded not dropped: `compose` (the point-free
+core — the source-shaped lambda fragment is what M3's oracle checks first),
+records (keyed tuples; nothing new algebraically), and the dependent
+fragment.
+-/
+
+namespace CclFormal
+
+/-- Term-level literals (the ground fragment of `ccl::Lit`). -/
+inductive Lit where
+  | int (n : Int)
+  | bool (b : Bool)
+  | str (s : String)
+  | unit
+deriving Repr, DecidableEq
+
+/-- The type of a literal. -/
+def Lit.ty : Lit → Ty
+  | .int _ => .base .int
+  | .bool _ => .base .bool
+  | .str _ => .base .string
+  | .unit => .base .unit
+
+/-- The pure-core term language (de Bruijn indices; see the module docs).
+
+`case` arms pair a variant tag with a body whose index 0 is the payload
+binder — the scrutinee-derived bound the calibration lemma is about. `cast`
+carries the claim set it asserts; it is the only refinement introduction,
+mirroring CCL (a filter's lowering). -/
+inductive Tm where
+  | lit (l : Lit)
+  | var (n : Nat)
+  | lam (dom : Ty) (body : Tm)
+  | app (f a : Tm)
+  | letE (bound body : Tm)
+  | tuple (es : List Tm)
+  | proj (e : Tm) (i : Nat)
+  | variant (tag : FieldKey) (e : Tm)
+  | caseE (scrut : Tm) (arms : List (FieldKey × Tm))
+  | cast (claims : List Pred) (e : Tm)
+deriving Repr
+
+namespace Tm
+
+/-- Values: literals, lambdas, tuples of values, variants of values. -/
+inductive IsVal : Tm → Prop
+  | lit (l : Lit) : IsVal (.lit l)
+  | lam (dom : Ty) (body : Tm) : IsVal (.lam dom body)
+  | tuple {es : List Tm} : (∀ e ∈ es, IsVal e) → IsVal (.tuple es)
+  | variant {e : Tm} (tag : FieldKey) : IsVal e → IsVal (.variant tag e)
+
+/-- Shift free indices `≥ c` by one (the standard de Bruijn lift). -/
+def shift (c : Nat) : Tm → Tm
+  | .lit l => .lit l
+  | .var n => if n < c then .var n else .var (n + 1)
+  | .lam dom body => .lam dom (shift (c + 1) body)
+  | .app f a => .app (shift c f) (shift c a)
+  | .letE bound body => .letE (shift c bound) (shift (c + 1) body)
+  | .tuple es => .tuple (es.attach.map fun ⟨e, _⟩ => shift c e)
+  | .proj e i => .proj (shift c e) i
+  | .variant tag e => .variant tag (shift c e)
+  | .caseE scrut arms =>
+      .caseE (shift c scrut) (arms.attach.map fun ⟨(tag, body), _⟩ => (tag, shift (c + 1) body))
+  | .cast claims e => .cast claims (shift c e)
+termination_by e => sizeOf e
+decreasing_by all_goals
+  first
+  | (simp; omega)
+  | (rename_i h _; have := List.sizeOf_lt_of_mem h; simp at this ⊢; omega)
+  | (rename_i h; have := List.sizeOf_lt_of_mem h; simp at this ⊢; omega)
+
+/-- Substitute `v` for index `k` (types are closed in this fragment, so no
+type substitution exists to perform). -/
+def subst (k : Nat) (v : Tm) : Tm → Tm
+  | .lit l => .lit l
+  | .var n => if n = k then v else if n < k then .var n else .var (n - 1)
+  | .lam dom body => .lam dom (subst (k + 1) (shift 0 v) body)
+  | .app f a => .app (subst k v f) (subst k v a)
+  | .letE bound body => .letE (subst k v bound) (subst (k + 1) (shift 0 v) body)
+  | .tuple es => .tuple (es.attach.map fun ⟨e, _⟩ => subst k v e)
+  | .proj e i => .proj (subst k v e) i
+  | .variant tag e => .variant tag (subst k v e)
+  | .caseE scrut arms =>
+      .caseE (subst k v scrut)
+        (arms.attach.map fun ⟨(tag, body), _⟩ => (tag, subst (k + 1) (shift 0 v) body))
+  | .cast claims e => .cast claims (subst k v e)
+termination_by e => sizeOf e
+decreasing_by all_goals
+  first
+  | (simp; omega)
+  | (rename_i h _; have := List.sizeOf_lt_of_mem h; simp at this ⊢; omega)
+  | (rename_i h; have := List.sizeOf_lt_of_mem h; simp at this ⊢; omega)
+
+end Tm
+
+/-! ## Predicate evaluation
+
+A refinement predicate is a `Pred` over the reserved element binder; its
+truth on a value is what `cast` checks and what refinement soundness is
+about. Evaluation is partial — an op outside the interpreted vocabulary, or
+a shape mismatch, yields `none` — mirroring that the wire emitter maps only
+a fixed `BinOpKind` vocabulary. -/
+
+/-- Evaluate a predicate against the value bound to `__elem`. Returns the
+literal result, or `none` where the fragment does not interpret. -/
+def Pred.eval (v : Tm) : Pred → Option Lit
+  | .elem =>
+      match v with
+      | .lit l => some l
+      | _ => none
+  | .var _ => none
+  | .litInt n => some (.int n)
+  | .litBool b => some (.bool b)
+  | .litStr s => some (.str s)
+  | .litUnit => some .unit
+  | .unop op a =>
+      match op, Pred.eval v a with
+      | "not", some (.bool b) => some (.bool !b)
+      | "neg", some (.int n) => some (.int (-n))
+      | _, _ => none
+  | .binop op a b =>
+      match op, Pred.eval v a, Pred.eval v b with
+      | "eq", some x, some y => some (.bool (x = y))
+      | "ne", some x, some y => some (.bool (x ≠ y))
+      | "lt", some (.int x), some (.int y) => some (.bool (x < y))
+      | "le", some (.int x), some (.int y) => some (.bool (x ≤ y))
+      | "gt", some (.int x), some (.int y) => some (.bool (x > y))
+      | "ge", some (.int x), some (.int y) => some (.bool (x ≥ y))
+      | "add", some (.int x), some (.int y) => some (.int (x + y))
+      | "sub", some (.int x), some (.int y) => some (.int (x - y))
+      | "mul", some (.int x), some (.int y) => some (.int (x * y))
+      | "and", some (.bool x), some (.bool y) => some (.bool (x && y))
+      | "or", some (.bool x), some (.bool y) => some (.bool (x || y))
+      | _, _, _ => none
+  | .proj a k =>
+      match Pred.eval v a with
+      | _ => none  -- literal results carry no fields; projection needs the
+                   -- structured-value extension
+  | .app _ _ => none
+
+/-- Every claim of a set holds on `v`. -/
+def Tm.claimsHold (claims : List Pred) (v : Tm) : Bool :=
+  claims.all fun p => Pred.eval v p == some (.bool true)
+
+/-! ## The call-by-value small-step relation -/
+
+namespace Tm
+
+/-- One step. `cast` is the door refinements guard: it steps through exactly
+when every claim holds on the value (a blocked cast is a *filtered* element,
+not a stuck term — see the module docs). -/
+inductive Step : Tm → Tm → Prop
+  | appL {f f' a} : Step f f' → Step (.app f a) (.app f' a)
+  | appR {f a a'} : IsVal f → Step a a' → Step (.app f a) (.app f a')
+  | beta {dom body a} : IsVal a → Step (.app (.lam dom body) a) (subst 0 a body)
+  | letL {bound bound' body} : Step bound bound' → Step (.letE bound body) (.letE bound' body)
+  | letV {bound body} : IsVal bound → Step (.letE bound body) (subst 0 bound body)
+  | tupleAt {pre : List Tm} {e e' : Tm} {post : List Tm} :
+      (∀ x ∈ pre, IsVal x) → Step e e' →
+      Step (.tuple (pre ++ e :: post)) (.tuple (pre ++ e' :: post))
+  | projE {e e' i} : Step e e' → Step (.proj e i) (.proj e' i)
+  | projV {es : List Tm} {i : Nat} {e : Tm} :
+      (∀ x ∈ es, IsVal x) → es[i]? = some e → Step (.proj (.tuple es) i) e
+  | variantE {tag e e'} : Step e e' → Step (.variant tag e) (.variant tag e')
+  | caseS {scrut scrut' arms} : Step scrut scrut' → Step (.caseE scrut arms) (.caseE scrut' arms)
+  | caseV {tag v arms body} :
+      IsVal v → arms.lookup tag = some body →
+      Step (.caseE (.variant tag v) arms) (subst 0 v body)
+  | castE {claims e e'} : Step e e' → Step (.cast claims e) (.cast claims e')
+  | castV {claims v} :
+      IsVal v → claimsHold claims v = true → Step (.cast claims v) v
+
+/-- A term is *filter-blocked* when its next redex is a cast whose claims do
+not all hold on the value — the scalar face of a `Restrict` dropping a row.
+Progress is stated modulo this outcome. -/
+inductive Blocked : Tm → Prop
+  | castV {claims v} : IsVal v → claimsHold claims v = false → Blocked (.cast claims v)
+  | appL {f a} : Blocked f → Blocked (.app f a)
+  | appR {f a} : IsVal f → Blocked a → Blocked (.app f a)
+  | letL {bound body} : Blocked bound → Blocked (.letE bound body)
+  | tupleAt {pre : List Tm} {e : Tm} {post : List Tm} :
+      (∀ x ∈ pre, IsVal x) → Blocked e → Blocked (.tuple (pre ++ e :: post))
+  | projE {e i} : Blocked e → Blocked (.proj e i)
+  | variantE {tag e} : Blocked e → Blocked (.variant tag e)
+  | caseS {scrut arms} : Blocked scrut → Blocked (.caseE scrut arms)
+  | castE {claims e} : Blocked e → Blocked (.cast claims e)
+
+end Tm
+
+/-! ## The declarative typing judgment -/
+
+/-- Predicates of the non-dependent fragment: over `__elem` only, no
+references to enclosing binders. -/
+def Pred.elemOnly : Pred → Bool
+  | .elem | .litInt _ | .litBool _ | .litStr _ | .litUnit => true
+  | .var _ => false
+  | .unop _ a => a.elemOnly
+  | .binop _ a b => a.elemOnly && b.elemOnly
+  | .proj a _ => a.elemOnly
+  | .app f a => f.elemOnly && a.elemOnly
+
+/-- `Γ ⊢ e : T` for the pure core. Contexts are de Bruijn (index 0 is the
+innermost binder). Subsumption is the M0 relation at empty rename
+environments — the non-dependent fragment never transports a Pi binder.
+
+`cast` is the refinement introduction: it asserts its claims on top of the
+value's type, and the small-step checks them — the pairing refinement
+soundness rests on. `caseE` types every arm's body under the payload type
+the scrutinee's variant assigns to its tag: the scrutinee-derived bound of
+the calibration lemma. -/
+inductive HasTy : List Ty → Tm → Ty → Prop
+  | lit {Γ} (l : Lit) : HasTy Γ (.lit l) l.ty
+  | var {Γ n T} : Γ[n]? = some T → HasTy Γ (.var n) T
+  | lam {Γ dom body cod} :
+      HasTy (dom :: Γ) body cod →
+      HasTy Γ (.lam dom body) (.fn none .compute dom cod)
+  | app {Γ f a name kind dom cod} :
+      HasTy Γ f (.fn name kind dom cod) → HasTy Γ a dom →
+      HasTy Γ (.app f a) cod
+  | letE {Γ bound body T U} :
+      HasTy Γ bound T → HasTy (T :: Γ) body U →
+      HasTy Γ (.letE bound body) U
+  | tuple {Γ} {es : List Tm} {Ts : List Ty} :
+      es.length = Ts.length →
+      (∀ (i : Nat) e T, es[i]? = some e → Ts[i]? = some T → HasTy Γ e T) →
+      HasTy Γ (.tuple es) (.tuple Ts)
+  | proj {Γ e i} {Ts : List Ty} {T : Ty} :
+      HasTy Γ e (.tuple Ts) → Ts[i]? = some T →
+      HasTy Γ (.proj e i) T
+  | variant {Γ e tag T} {tags : List (FieldKey × Ty)} :
+      HasTy Γ e T → tags.lookup tag = some T →
+      HasTy Γ (.variant tag e) (.variant tags)
+  | caseE {Γ scrut arms U} {tags : List (FieldKey × Ty)} :
+      HasTy Γ scrut (.variant tags) →
+      (∀ tag T, tags.lookup tag = some T → (arms.lookup tag).isSome) →
+      (∀ tag T body, tags.lookup tag = some T → arms.lookup tag = some body →
+        HasTy (T :: Γ) body U) →
+      HasTy Γ (.caseE scrut arms) U
+  | cast {Γ e T} {claims : List Pred} :
+      HasTy Γ e T →
+      claims ≠ [] → (∀ p ∈ claims, p.elemOnly = true) →
+      T.isRefined = false →
+      HasTy Γ (.cast claims e) (.refined T claims)
+  | sub {Γ e T U} :
+      HasTy Γ e T → Sub [] [] T U →
+      HasTy Γ e U
+
+/-! ## First sanity facts -/
+
+/-- Values do not step. -/
+theorem Tm.IsVal.not_step {v v' : Tm} (hv : v.IsVal) : ¬ Tm.Step v v' := by
+  intro hs
+  induction hs with
+  | tupleAt hpre _ ih =>
+    cases hv with
+    | tuple hall =>
+      exact ih (hall _ (by simp))
+  | variantE _ ih =>
+    cases hv with
+    | variant _ he => exact ih he
+  | _ => cases hv <;> simp_all
+
+/-- Values are not blocked. -/
+theorem Tm.IsVal.not_blocked {v : Tm} (hv : v.IsVal) : ¬ Tm.Blocked v := by
+  intro hb
+  induction hb with
+  | tupleAt hpre _ ih =>
+    cases hv with
+    | tuple hall => exact ih (hall _ (by simp))
+  | variantE _ ih =>
+    cases hv with
+    | variant _ he => exact ih he
+  | _ => cases hv <;> simp_all
+
+end CclFormal
