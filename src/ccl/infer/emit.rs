@@ -341,6 +341,7 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), L
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
+        | Type::SharedHole(_)
         | Type::Infer(_) => Ok(()),
     }
 }

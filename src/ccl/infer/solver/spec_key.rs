@@ -357,7 +357,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // no `Hole` reaches a use's instantiation type in the first place. The
         // arm is for exhaustiveness, and "no information here" is the honest
         // reading if one ever did.
-        Type::Hole => KeyView::default(),
+        Type::Hole | Type::SharedHole(_) => KeyView::default(),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
         // dependent-application discharge lands in the key as the predicate the

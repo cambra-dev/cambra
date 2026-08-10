@@ -1203,6 +1203,7 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
+        | Type::SharedHole(_)
         | Type::Infer(_) => {}
     }
 }

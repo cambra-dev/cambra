@@ -72,6 +72,19 @@ pub(super) fn lower_call(
             let collection = lower_expr(&args[0], ctx)?;
             let key_fn = lower_expr(&args[1], ctx)?;
 
+            // A partition function's **domain is the type of its keys**, and nothing
+            // in the lowered shape says so. One `SharedHole` states it, on the key
+            // application and on the domain of the group-by's own `data_fun`
+            // annotation — the two positions the claim is about. (`__gb_k` is an
+            // artifact of this desugaring, so the binder stays a plain `Hole` and
+            // takes its type from the annotation like any other parameter.)
+            //
+            // On the annotation's domain the edge is also **directional for free**:
+            // `bind_annotation` records `inferred <: ann` and a function type is
+            // contravariant in its domain, so this reduces to `key_ty <: ⟨the
+            // parameter⟩` — produced keys flow *into* the domain, rather than the two
+            // being forced equal.
+            let key_ty = ctx.fresh_shared_hole();
             // `bare_pred` (and the `collection` clone inside it) lives in the
             // cast target's refinement predicate — a type slot outside the
             // `walk_children` domain — so its nodes are deliberately untagged.
@@ -79,7 +92,8 @@ pub(super) fn lower_call(
                 Expr::apply(
                     Expr::apply(Expr::var(Name::elem()), collection.clone()),
                     key_fn,
-                ),
+                )
+                .with_user_annotation(key_ty.clone()),
                 BinOpKind::Compare(CompareKind::Equals),
                 Expr::var("__gb_k"),
             );
@@ -100,7 +114,7 @@ pub(super) fn lower_call(
             // concrete-kind stamp — see `emit_node`), so its kind is data-by-
             // construction rather than guessed from its (scalar key) domain.
             Ok(Expr::lambda("__gb_k", Type::Hole, cast)
-                .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)))
+                .with_user_annotation(Type::data_fun(key_ty, Type::Hole)))
         }
         "sum" | "max" => {
             if args.len() != 1 {

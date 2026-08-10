@@ -832,7 +832,10 @@ fn collect_type_errors(
     seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
     match ty {
-        Type::Hole => errors.push(InferError::UnresolvedHole {
+        // A `SharedHole` is a `Hole` with an identity, and just as transient:
+        // `normalize_annotation` resolves both. A survivor means the annotation
+        // never reached normalization, which is the same compiler bug either way.
+        Type::Hole | Type::SharedHole(_) => errors.push(InferError::UnresolvedHole {
             at: context_sym.to_string(),
         }),
         Type::Infer(var) => {
