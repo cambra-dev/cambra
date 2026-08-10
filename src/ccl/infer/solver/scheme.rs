@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use super::traits::{TraitObligation, TraitObligationId};
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
 use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr};
@@ -27,7 +28,7 @@ use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr
 /// # Usage
 ///
 /// Two sources of schemes: (1) operator/projection signatures that are
-/// inherently polymorphic (`Compare : ∀α. α → α → Bool`,
+/// inherently polymorphic (`Max : ∀α γ. (α ⤇ γ) ⇒ γ`,
 /// `Proj(Index n) : ∀α. {n: α, …} → α`, etc.), built once in
 /// `OperatorSchemes`; and (2) let-generalization — a multi-use function
 /// binding is generalized into a `PolyScheme` at its binding level
@@ -90,6 +91,13 @@ pub struct FreshenCache {
     /// `DomainJoinConflict`. Freshening mints one `κ'` per original `κ` (bounds
     /// copied so def-intrinsic forcing survives), consistently within a copy.
     pub kind_vars: HashMap<FunKindVarId, Rc<FunKindVar>>,
+    /// Original trait obligation → its per-instantiation copy, for the same reason
+    /// as [`kind_vars`](Self::kind_vars): a generalized function's operator
+    /// requirements are quantified along with the variables they constrain, so each
+    /// use discharges *its own* copy. `λ 𝑥 → 𝑥 + 1` generalizes to
+    /// `∀A O. (A : Addable(A, Int)) ⇒ A → O`; sharing one obligation across uses
+    /// would let a `String` use narrow the `Int` use's candidate set to nothing.
+    pub obligations: HashMap<TraitObligationId, Rc<TraitObligation>>,
 }
 
 impl FreshenCache {
@@ -352,8 +360,51 @@ pub fn freshen_above(
                 s.set_lower(new_lows);
                 s.set_upper(new_ups);
             }
+            freshen_watches(lim, tv, &v, target, cache);
             Type::Infer(v)
         }
+    }
+}
+
+/// Copy `tv`'s trait obligations onto its freshened counterpart `v`.
+///
+/// Runs *after* the bounds write-back, so an obligation reached through a bound has
+/// already had its variables freshened into the cache and the copy's watches line up
+/// with the copy's variables.
+///
+/// The clone is inserted into the cache **before** its associated positions are
+/// freshened.
+/// The obligation graph is cyclic — an obligation holds its output type, which holds
+/// a variable, which watches the obligation — so freshening the output re-enters
+/// here, and a clone that is not yet reachable would be minted twice: once per
+/// operand, each watching a different copy, and neither ever narrowed by both
+/// operands.
+fn freshen_watches(
+    lim: Level,
+    tv: &Rc<InferVar>,
+    v: &Rc<InferVar>,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) {
+    let watches = tv.watches.borrow().clone();
+    for (obligation, pos) in watches {
+        if let Some(existing) = cache.obligations.get(&obligation.uid) {
+            existing.watch(&Type::Infer(Rc::clone(v)), pos);
+            continue;
+        }
+        // Phase 1: a copy carrying the original's candidate set, with the output
+        // position still pointing at the definition's — enough to be reachable.
+        let copy = TraitObligation::new_from(&obligation);
+        cache.obligations.insert(obligation.uid, Rc::clone(&copy));
+        copy.watch(&Type::Infer(Rc::clone(v)), pos);
+        // Phase 2: now that re-entry finds the copy, freshen the output.
+        copy.set_assoc_types(
+            obligation
+                .assoc_types()
+                .iter()
+                .map(|ty| freshen_above(lim, ty, target, cache))
+                .collect(),
+        );
     }
 }
 

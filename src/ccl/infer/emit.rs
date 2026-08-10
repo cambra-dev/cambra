@@ -12,13 +12,15 @@ use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, Type, TypedBinding,
-    TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
+    AggregateKind, BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, Type,
+    TypedBinding, TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
 };
 
 use super::context::InferCtx;
+use super::schemes::{OpSignature, OperatorResult};
 use super::typing::{Typing, peel_refinements_outer};
 use super::{product, variant_type};
+use crate::ccl::infer::solver::traits::Trait;
 
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
@@ -101,18 +103,18 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // borrow on the registry so the rule can take `ctx` mutably; schemes
         // are `Rc`-shaped, so the clone is cheap.
         TypedExprNode::BinOp { left, op, right } => {
-            let scheme = ctx.schemes.binop(*op).clone();
-            emit_binop(left, right, &scheme, ctx)?
+            let sig = ctx.schemes.binop(*op);
+            emit_binop(left, right, &sig, ctx)?
         }
 
         TypedExprNode::UnaryOp(op, inner) => {
-            let scheme = ctx.schemes.unary(*op).clone();
-            emit_unary(inner, &scheme, ctx)?
+            let sig = ctx.schemes.unary(*op);
+            emit_unary(inner, &sig, ctx)?
         }
 
         TypedExprNode::Aggregate { input, kind } => {
             let scheme = ctx.schemes.aggregate(*kind).clone();
-            emit_aggregate(input, &scheme, ctx)?
+            emit_aggregate(input, &scheme, *kind, ctx)?
         }
 
         TypedExprNode::Let {
@@ -409,19 +411,14 @@ fn emit_bare_predicate<C: Typing>(
 /// Apply a binary scheme: instantiate, build the expected call shape,
 /// constrain_subtype. Returns the fresh result variable.
 ///
-/// Operand types enter **stripped of refinements**, and that is load-bearing rather
-/// than tidying. An operator scheme relates *base* types — arithmetic is
-/// `∀α. α → α → α`, one variable shared across both operands and the result — so any
-/// refinement reaching α propagates to the result, claiming the operator preserved
-/// it. No binary operator does: `+` on two values that are each `2` produces `4`, not
-/// a `2`. The claim is invisible while both operands merely *join* (distinct
-/// refinements intersect to none), and wrong the moment they do not — `x + x` keeps
-/// `x`'s refinement, because intersecting a set with itself is that set.
+/// Only the **monomorphic** binary operators come here — `and`/`or`/… and `++`,
+/// whose signatures are fixed (`Bool → Bool → Bool`, `String → String → String`).
+/// Nothing is shared between an operand and the result, so a refined operand simply
+/// flows into a concrete domain and the refinement stops there; the operands
+/// therefore enter verbatim.
 ///
-/// A refinement is a fact about a *value*; carrying it across an operator that
-/// computes a new value is exactly the mistake this prevents. (An operator that
-/// genuinely refines its result — a future constant fold — states that itself,
-/// rather than inheriting it by variable sharing.)
+/// The polymorphic operators — arithmetic and comparison — have no scheme at all:
+/// their requirement is a trait ([`Typing::require_trait`]).
 fn apply_binary_scheme<C: Typing>(
     ctx: &mut C,
     scheme: &PolyScheme,
@@ -431,10 +428,7 @@ fn apply_binary_scheme<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     let body = ctx.instantiate(scheme);
     let result = ctx.fresh();
-    let expected = fun(
-        strip_refinements(left),
-        fun(strip_refinements(right), result.clone()),
-    );
+    let expected = fun(left.clone(), fun(right.clone(), result.clone()));
     ctx.require_sub(&body, &expected, at)?;
     Ok(result)
 }
@@ -602,24 +596,59 @@ pub(super) fn emit_apply<C: Typing>(
     ctx.apply(&fn_ty, &arg_ty, argument, &|| "Apply".to_string())
 }
 
+/// Record an operator's single obligation and give back its result type.
+///
+/// The translation between the two halves of the contract: [`OperatorResult`] is what
+/// the *operator* declares, [`Typing::require_trait`] speaks only of associations.
+fn require_single_obligation<C: Typing>(
+    ctx: &mut C,
+    trait_: Trait,
+    operands: &[&Type],
+    result: &OperatorResult,
+    at: &dyn Fn() -> String,
+) -> Result<Type, LocatedInferError> {
+    match result {
+        OperatorResult::Associated(name) => {
+            let ty = ctx.require_trait(trait_, operands, Some(*name), at)?;
+            Ok(ty.expect("an operator asking for an association gets its position back"))
+        }
+        OperatorResult::Fixed(base) => {
+            ctx.require_trait(trait_, operands, None, at)?;
+            Ok(Type::Base(base.clone()))
+        }
+    }
+}
+
 pub(super) fn emit_binop<C: Typing>(
     left: &mut Expr,
     right: &mut Expr,
-    scheme: &PolyScheme,
+    sig: &OpSignature,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let left_ty = ctx.subexpr(left)?;
     let right_ty = ctx.subexpr(right)?;
-    apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &|| "BinOp".to_string())
+    let at = || "BinOp".to_string();
+    match sig {
+        OpSignature::Scheme(scheme) => apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at),
+        OpSignature::SingleObligation { trait_, result } => {
+            require_single_obligation(ctx, *trait_, &[&left_ty, &right_ty], result, &at)
+        }
+    }
 }
 
 pub(super) fn emit_unary<C: Typing>(
     inner: &mut Expr,
-    scheme: &PolyScheme,
+    sig: &OpSignature,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let inner_ty = ctx.subexpr(inner)?;
-    apply_unary_scheme(ctx, scheme, &inner_ty, &|| "UnaryOp".to_string())
+    let at = || "UnaryOp".to_string();
+    match sig {
+        OpSignature::Scheme(scheme) => apply_unary_scheme(ctx, scheme, &inner_ty, &at),
+        OpSignature::SingleObligation { trait_, result } => {
+            require_single_obligation(ctx, *trait_, &[&inner_ty], result, &at)
+        }
+    }
 }
 
 /// Tuple literal: each element type becomes a positional product field.
@@ -857,10 +886,20 @@ pub(super) fn emit_collection_union<C: Typing>(
 pub(super) fn emit_aggregate<C: Typing>(
     input: &mut Expr,
     scheme: &PolyScheme,
+    kind: AggregateKind,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let input_ty = ctx.subexpr(input)?;
-    apply_unary_scheme(ctx, scheme, &input_ty, &|| "Aggregate".to_string())
+    let at = || "Aggregate".to_string();
+    let result = apply_unary_scheme(ctx, scheme, &input_ty, &at)?;
+    // `max` returns an element of what it consumes, so the scheme already gives it a
+    // type; what the scheme cannot say is that the element must be *orderable*. That
+    // is a pure requirement — `Comparable` associates nothing, and the result type
+    // stays the scheme's.
+    if kind == AggregateKind::Max {
+        ctx.require_trait(Trait::Comparable, &[&result], None, &at)?;
+    }
+    Ok(result)
 }
 
 /// Emit/check a `let`, returning the body type.

@@ -5,10 +5,61 @@
 use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
+use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
-use crate::ccl::{AggregateKind, BaseType, BinOpKind, Builtin, Level, Type, UnaryOpKind};
+use crate::ccl::{
+    AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Level, Type,
+    UnaryOpKind,
+};
 
 use super::product;
+
+/// Where a trait-typed operator's result type comes from.
+///
+/// This is the operator's half of the contract, which is why it lives here beside the
+/// signatures rather than with the traits: a trait *associates* a type when that type
+/// depends on the types satisfying it, and an operator whose result is the same
+/// whatever it accepts states that itself. Keeping the two apart is what stops a
+/// constant from being mis-recorded as an associated type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorResult {
+    /// An associated type of the required trait — `+`'s result is `Addable`'s
+    /// `Output`.
+    Associated(Assoc),
+    /// Fixed by the operator regardless of the operand types — `==` yields `Bool` for
+    /// every pair `Equatable` accepts, which is why `Equatable` associates nothing.
+    Fixed(BaseType),
+}
+
+/// How an operator states what it requires of its operands.
+///
+/// Two shapes, because there are two genuinely different situations: an operator
+/// whose operand types are *fixed* is fully described by a signature, and one that is
+/// polymorphic in them is not — the only relation a signature can state between two
+/// operands is that they share a variable, which also forces every other lattice
+/// dimension to agree.
+pub(super) enum OpSignature {
+    /// A fixed signature: `and`, `or`, …, `++`, and `not`.
+    Scheme(PolyScheme),
+    /// The operands — **all of them, in order** — are the arguments of exactly one
+    /// obligation `trait_(𝐴₁, …, 𝐴ₙ)`, and the operator's result is either fixed or
+    /// one of *that* obligation's associated types.
+    ///
+    /// Deliberately narrower than "this operator is trait-typed", and named for the
+    /// shape rather than the mechanism because it cannot express: more than one
+    /// obligation; an obligation over a subset of the operands; a separate obligation
+    /// per operand; or a result drawn from some obligation other than the one
+    /// constraining the operands. Every operator has this shape today. One that did
+    /// not would want its own rule in `emit_node` rather than a wider variant here,
+    /// since a wider variant would have to be interpreted somewhere and that
+    /// interpretation is what a rule *is*.
+    SingleObligation {
+        /// The trait the operands jointly satisfy.
+        trait_: Trait,
+        /// Where the operator's own result type comes from.
+        result: OperatorResult,
+    },
+}
 
 /// Schemes for operators that lift cleanly to fixed signatures.
 ///
@@ -18,20 +69,16 @@ use super::product;
 /// whose typing rules require AST-level reasoning (`Apply`, `Lambda`,
 /// `Let`, `Case`, `List`, …) are handled by per-case rules in
 /// `emit_node` rather than via this registry.
+///
+/// Arithmetic, comparison and negation are absent for a different reason: they are
+/// polymorphic in their operands, which no signature can state without also forcing
+/// every other lattice dimension to agree. They state a [`Trait`] instead — see
+/// [`OpSignature`], which is what a lookup here returns.
 pub struct OperatorSchemes {
-    /// `∀α. α → α → α` — both operands agree, result is the same type.
-    /// Matches today's `infer_binop` Arithmetic rule which only enforces
-    /// operand agreement, not numeric-ness (operator conversion catches
-    /// non-numeric arithmetic later).
-    arithmetic: PolyScheme,
-    /// `∀α. α → α → Bool`.
-    compare: PolyScheme,
     /// `Bool → Bool → Bool`.
     bool_logic: PolyScheme,
     /// `String → String → String`.
     concat: PolyScheme,
-    /// `Int → Int`.
-    neg: PolyScheme,
     /// `Bool → Bool`.
     not_op: PolyScheme,
     /// `∀α. (α → Int) → Int` — the full Sum operator type, applied
@@ -73,18 +120,6 @@ impl OperatorSchemes {
         const SCHEME_LEVEL: Level = 0;
         const BODY_LEVEL: Level = 1;
 
-        // Arithmetic: ∀α. α → α → α
-        let alpha = fresh_var(BODY_LEVEL);
-        let arithmetic =
-            PolyScheme::poly(SCHEME_LEVEL, fun(alpha.clone(), fun(alpha.clone(), alpha)));
-
-        // Compare: ∀α. α → α → Bool
-        let alpha = fresh_var(BODY_LEVEL);
-        let compare = PolyScheme::poly(
-            SCHEME_LEVEL,
-            fun(alpha.clone(), fun(alpha, prim(BaseType::Bool))),
-        );
-
         // BoolLogic: Bool → Bool → Bool
         let bool_logic = PolyScheme::mono(fun(
             prim(BaseType::Bool),
@@ -96,9 +131,6 @@ impl OperatorSchemes {
             prim(BaseType::String),
             fun(prim(BaseType::String), prim(BaseType::String)),
         ));
-
-        // Neg: Int → Int
-        let neg = PolyScheme::mono(fun(prim(BaseType::Int), prim(BaseType::Int)));
 
         // Not: Bool → Bool
         let not_op = PolyScheme::mono(fun(prim(BaseType::Bool), prim(BaseType::Bool)));
@@ -173,11 +205,8 @@ impl OperatorSchemes {
         let get_prev_txn = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), nu));
 
         Self {
-            arithmetic,
-            compare,
             bool_logic,
             concat,
-            neg,
             not_op,
             aggregate_sum,
             aggregate_max,
@@ -187,19 +216,57 @@ impl OperatorSchemes {
         }
     }
 
-    pub(super) fn binop(&self, op: BinOpKind) -> &PolyScheme {
+    /// How `op`'s signature is stated — a fixed scheme, or a trait requirement.
+    ///
+    /// The split is total and exclusive: an operator whose operand types are fixed
+    /// has a scheme, and one that is polymorphic in them has a trait. There is no
+    /// operator with both, because a scheme that quantified over its operands could
+    /// only relate them by *sharing a variable*, which is precisely the claim that
+    /// is wrong in both polarities (see [`OpSignature::SingleObligation`]).
+    /// Which typing rule `op` states.
+    ///
+    /// The arithmetic and comparison operators are polymorphic in their operands, so
+    /// they state a trait; `and`/`or`/… and `++` have fixed operand types, so an
+    /// ordinary scheme says everything there is to say and an obligation would add a
+    /// mechanism with no choice to make.
+    ///
+    /// A scheme is cloned rather than borrowed so the caller's `ctx` borrow is
+    /// released before the rule takes `ctx` mutably; a [`PolyScheme`] is `Rc`-shaped,
+    /// so this is cheap.
+    pub(super) fn binop(&self, op: BinOpKind) -> OpSignature {
+        let arithmetic = |trait_| OpSignature::SingleObligation {
+            trait_,
+            result: OperatorResult::Associated(Assoc::Output),
+        };
+        // Every comparison yields `Bool` whatever operands it accepts, so the result
+        // is the operator's to state and `Equatable`/`Orderable` associate nothing.
+        let comparison = |trait_| OpSignature::SingleObligation {
+            trait_,
+            result: OperatorResult::Fixed(BaseType::Bool),
+        };
         match op {
-            BinOpKind::Arithmetic(_) => &self.arithmetic,
-            BinOpKind::Compare(_) => &self.compare,
-            BinOpKind::BoolLogic(_) => &self.bool_logic,
-            BinOpKind::Concat => &self.concat,
+            BinOpKind::Arithmetic(ArithmeticKind::Add) => arithmetic(Trait::Addable),
+            BinOpKind::Arithmetic(ArithmeticKind::Sub) => arithmetic(Trait::Subtractable),
+            BinOpKind::Arithmetic(ArithmeticKind::Mul) => arithmetic(Trait::Multipliable),
+            BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => arithmetic(Trait::Divisible),
+            BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals) => {
+                comparison(Trait::Equatable)
+            }
+            BinOpKind::Compare(_) => comparison(Trait::Orderable),
+            BinOpKind::BoolLogic(_) => OpSignature::Scheme(self.bool_logic.clone()),
+            BinOpKind::Concat => OpSignature::Scheme(self.concat.clone()),
         }
     }
 
-    pub(super) fn unary(&self, op: UnaryOpKind) -> &PolyScheme {
+    /// See [`Self::binop`] — the same split. `not` is genuinely monomorphic
+    /// (`Bool → Bool`), so it keeps a scheme.
+    pub(super) fn unary(&self, op: UnaryOpKind) -> OpSignature {
         match op {
-            UnaryOpKind::Neg => &self.neg,
-            UnaryOpKind::Not => &self.not_op,
+            UnaryOpKind::Neg => OpSignature::SingleObligation {
+                trait_: Trait::Negatable,
+                result: OperatorResult::Associated(Assoc::Output),
+            },
+            UnaryOpKind::Not => OpSignature::Scheme(self.not_op.clone()),
         }
     }
 
@@ -235,7 +302,6 @@ impl Default for OperatorSchemes {
 mod tests {
     use super::super::test_helpers::*;
     use super::OperatorSchemes;
-    use crate::ccl::infer::int_lit_ty;
     use crate::ccl::{AggregateKind, Builtin, Type, TypedBinding, TypedExpr, TypedExprNode};
 
     /// `GetPrevTxn`'s scheme instantiates to
@@ -300,29 +366,25 @@ mod tests {
         );
     }
 
-    /// TRIPWIRE — documents a known soundness gap, NOT desired behavior.
+    /// `max` is defined at eval only for orderable bases (`Int`/`UInt`/`String` —
+    /// see merge/identity in `ccl/mod.rs`), and its scheme `∀α γ. (α ⤇ γ) ⇒ γ`
+    /// cannot say so: `γ` is the codomain it *returns*, so nothing about it is
+    /// constrained.
     ///
-    /// `Max` has scheme `∀α γ. (α ⇒ γ) ⇒ γ` (see `aggregate_max`), so its
-    /// codomain `γ` is wholly unconstrained and it type-checks over *any*
-    /// codomain. But `Max` is only *defined* at eval for orderable base types
-    /// (`Int`/`UInt`/`String` — see merge/identity in `ccl/mod.rs`). So `max`
-    /// over a function with a tuple codomain type-checks and infers
-    /// `Tuple([Int, Int])`, even though it has no defined runtime behavior.
+    /// `Comparable(γ)` says it — a **pure requirement**, associating nothing, since
+    /// the scheme already supplies the result type. A codomain the program never
+    /// determines is still accepted here, as an unresolved variable rather than a
+    /// missing implementation; that is the ordinary limit of narrowing, not a gap
+    /// specific to `max`.
     ///
-    /// `Max` *should* require an orderable codomain. The correct long-term fix
-    /// is a first-class comparability bound, which arrives with traits — there
-    /// is no value in a stopgap validation now. When that lands, inference will
-    /// start rejecting this program and this test will fail loudly; whoever
-    /// lands traits should flip it to assert rejection.
-    ///
-    /// Tracked by `type-checker-traits-comparability` (P3) in the project vault.
+    /// Closes `type-checker-traits-comparability` (P3) in the project vault.
     #[test]
-    fn max_over_non_orderable_codomain_is_unsoundly_accepted() {
+    fn max_over_a_non_orderable_codomain_is_rejected() {
         // Aggregate { input: λx → (1, 2), kind: Max }. The input stands in for a
         // data collection of tuples (what `max` really consumes), so it carries
         // the `data_fun` provenance stamp lowering puts on a collection — without
         // it, the bare lambda is a `Compute` capability and `max`'s `Data` demand
-        // rejects it on *kind* before the codomain-orderability gap under test.
+        // rejects it on *kind* before the codomain orderability under test.
         let lam = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: "x".into(),
@@ -336,8 +398,14 @@ mod tests {
         })
         .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole));
         let mut e = TypedExpr::aggregate(lam, AggregateKind::Max);
-        let ty = run_inference(&mut e).expect("inference succeeds (the bug under test)");
-        // Buggy current behavior: the non-orderable tuple codomain is accepted.
-        assert_eq!(ty, Type::Tuple(vec![int_lit_ty(1), int_lit_ty(2)]));
+        let errs = run_inference(&mut e).expect_err("a tuple codomain is not orderable");
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                crate::ccl::infer::InferError::NoTraitImpl { trait_, .. }
+                    if trait_ == "Comparable"
+            )),
+            "expected NoTraitImpl for Comparable, got {errs:?}"
+        );
     }
 }

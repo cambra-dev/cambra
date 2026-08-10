@@ -46,6 +46,7 @@ pub mod constrain;
 pub mod scheme;
 pub mod simplify_type;
 pub mod spec_key;
+pub mod traits;
 
 // Re-export every symbol that external modules reach through the
 // `crate::ccl::infer::solver::…` path (chiefly the inference engine), so the

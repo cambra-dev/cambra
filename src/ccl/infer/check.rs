@@ -18,6 +18,7 @@ use super::emit::{
 use super::schemes::OperatorSchemes;
 use super::typing::{Typing, peel_refinements_outer};
 use super::{lit_base, map_constrain_err};
+use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
 
 /// Post-inference structural type-check state.
 ///
@@ -111,6 +112,75 @@ impl Typing for CheckCtx {
         // A fully-typed tree carries no `Hole`s, so normalization is the
         // identity; refinements are kept (as everywhere else).
         ann.clone()
+    }
+
+    fn require_trait(
+        &mut self,
+        trait_: Trait,
+        operands: &[&Type],
+        assoc: Option<Assoc>,
+        at: &dyn Fn() -> String,
+    ) -> Result<Option<Type>, LocatedInferError> {
+        // No obligation is created here, for two independent reasons. Types are
+        // already concrete, so there is nothing to discharge incrementally; and Check
+        // runs outside any `InferArena`, so an obligation's variable⇄obligation cycle
+        // would never be broken.
+        //
+        // What this rule is *for* is supplying the node's type so the reconcile below
+        // has something to compare against — the common path, taken 3,812 times across
+        // the pipeline suite.
+        //
+        // The rejection branch is not a user-error backstop. Catching user type errors
+        // is entirely inference's job; Check exists to catch **compiler bugs that
+        // corrupt types**, which is why a Check error that is not `UnresolvedInfer`
+        // panics at the wall rather than being reported. So this firing means
+        // inference has a hole or a later pass rewrote the tree into something
+        // ill-typed — and it reuses `NoTraitImpl` for the same reason
+        // [`Typing::require_sub`] reuses `TypeMismatch` here: the error vocabulary
+        // describes the inconsistency, the wall supplies the interpretation. Measured
+        // across the suite: it never fires.
+        let bases: Option<Vec<&BaseType>> = operands.iter().map(|t| offered_base(t)).collect();
+        let Some(bases) = bases else {
+            // Pre-desugar residue (a `Feed` handle, an un-eliminated `Mut`, a
+            // still-`Infer` position under `Strictness::PreDesugar`) is not something
+            // this rule can judge — the strictness wall decides whether a residual
+            // type is tolerable at this point in the pipeline.
+            return Ok(assoc.map(|_| self.fresh()));
+        };
+        let matched = trait_
+            .impls()
+            .iter()
+            .find(|i| i.args.len() == bases.len() && i.args.iter().eq(bases.iter().copied()));
+        match matched {
+            Some(matched) => Ok(assoc.map(|name| {
+                matched
+                    .assoc_ty(name)
+                    .map(|b| Type::Base(b.clone()))
+                    .unwrap_or_else(|| fresh_var(self.level))
+            })),
+            None => {
+                // Blame the last position: with the earlier ones fixed, it is the one
+                // whose type ruled the implementation out.
+                let position = bases.len().saturating_sub(1);
+                let prefix: Vec<BaseType> =
+                    bases[..position].iter().map(|b| (*b).clone()).collect();
+                let accepted: Vec<Type> = trait_
+                    .impls()
+                    .iter()
+                    .filter(|i| i.args.len() == bases.len() && i.args[..position] == prefix[..])
+                    .filter_map(|i| i.args.get(position).cloned().map(Type::Base))
+                    .collect();
+                let located = self.raise(InferError::NoTraitImpl {
+                    trait_: trait_.to_string(),
+                    position: position as u8,
+                    found: Box::new(Type::Base(bases[position].clone())),
+                    accepted,
+                    at: at(),
+                });
+                self.errors.push(located);
+                Ok(assoc.map(|_| fresh_var(self.level)))
+            }
+        }
     }
 
     fn require_sub(
@@ -345,18 +415,18 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
         TypedExprNode::BinOp { left, op, right } => {
-            let scheme = ctx.schemes.binop(*op).clone();
-            emit_binop(left, right, &scheme, ctx)?
+            let sig = ctx.schemes.binop(*op);
+            emit_binop(left, right, &sig, ctx)?
         }
 
         TypedExprNode::UnaryOp(op, inner) => {
-            let scheme = ctx.schemes.unary(*op).clone();
-            emit_unary(inner, &scheme, ctx)?
+            let sig = ctx.schemes.unary(*op);
+            emit_unary(inner, &sig, ctx)?
         }
 
         TypedExprNode::Aggregate { input, kind } => {
             let scheme = ctx.schemes.aggregate(*kind).clone();
-            emit_aggregate(input, &scheme, ctx)?
+            emit_aggregate(input, &scheme, *kind, ctx)?
         }
 
         // Check never generalizes (`is_generalizable` is `false`), so every
