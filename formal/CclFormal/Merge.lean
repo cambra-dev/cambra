@@ -1152,6 +1152,998 @@ theorem merge_idem (pol : Bool) : (a : CTy) → wf a = true → eqv (merge pol a
 termination_by a => sizeOf a
 decreasing_by all_goals (simp; omega)
 
+/-! ## Congruence: `merge` respects `eqv`
+
+The one gate inside `merge` — the positive `data ⊔ data` domain dedup — is
+`eqv` itself, so it cannot distinguish `eqv`-equal inputs (`eqv_congr_bool`).
+That is the whole reason congruence holds; a gate keyed on anything finer
+(e.g. structural equality, with `eqv` coarser than it) would break it. -/
+
+/-- Replacing one side of the gate by an `eqv`-equal value leaves the gate's
+verdict unchanged. -/
+theorem eqv_congr_bool {x x' : CTy} (h : eqv x x' = true) (y : CTy) :
+    eqv x y = eqv x' y := by
+  rcases hg : eqv x' y with _ | _
+  · rcases hg' : eqv x y with _ | _
+    · rfl
+    · rw [eqv_trans x' x y (eqv_symm x x' h) hg'] at hg
+      exact hg
+  · exact eqv_trans x x' y h hg
+
+/-- `FunEqv` is reflexive. -/
+theorem funEqv_refl (s : KindM × Option CTy × CTy) : FunEqv s s := by
+  obtain ⟨k, d, c⟩ := s
+  refine ⟨rfl, ?_, eqv_refl c⟩
+  rcases d with _ | x
+  · trivial
+  · exact eqv_refl x
+
+mutual
+
+theorem merge_congr_left (pol : Bool) :
+    (a a' b : CTy) → eqv a a' = true → eqv (merge pol a b) (merge pol a' b) = true
+  | .mk a1 r1 v1 f1 c1 e1, .mk a1' r1' v1' f1' c1' e1', .mk b1 rb vb fb cb eb => by
+    intro h
+    rw [eqv.eq_def] at h
+    simp only [Bool.and_eq_true] at h
+    obtain ⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, hr⟩, hv⟩, hf⟩, hc1'⟩, hc2'⟩, he⟩ := h
+    -- Pointwise congruence for the two keyed merges.
+    have hinterC : ∀ (p : Bool) (m1 m1' m2 : List (FieldKey × CTy)),
+        (subKeys m1 m1' (m1.map Prod.fst) && subKeys m1' m1 (m1'.map Prod.fst)) = true →
+        (∀ x x' y k, m1.lookup k = some x → m1'.lookup k = some x' → m2.lookup k = some y →
+          eqv (merge p x y) (merge p x' y) = true) →
+        (subKeys (interMap p m1 m2) (interMap p m1' m2)
+            ((interMap p m1 m2).map Prod.fst) &&
+          subKeys (interMap p m1' m2) (interMap p m1 m2)
+            ((interMap p m1' m2).map Prod.fst)) = true := by
+      intro p m1 m1' m2 hcl hcong
+      rw [mapClause_iff] at hcl ⊢
+      obtain ⟨hdom, hfwd, hbwd⟩ := hcl
+      refine ⟨fun k => ?_, fun k x y hx hy => ?_, fun k x y hx hy => ?_⟩
+      · rw [interMap_lookup, interMap_lookup]
+        rcases hl1 : m1.lookup k with _ | v <;> rcases hl2 : m2.lookup k with _ | w <;>
+          rcases hl1' : m1'.lookup k with _ | v' <;>
+          first
+          | (simp; done)
+          | (have hcontra := hdom k; simp [hl1, hl1'] at hcontra)
+      · rw [interMap_lookup] at hx hy
+        cases hl1 : m1.lookup k with
+        | none =>
+          rw [hl1] at hx
+          exact absurd hx (by simp)
+        | some v =>
+          rw [hl1] at hx
+          cases hl2 : m2.lookup k with
+          | none =>
+            rw [hl2] at hx
+            exact absurd hx (by simp)
+          | some w =>
+            rw [hl2] at hx
+            dsimp only at hx
+            obtain ⟨v', hv'⟩ := Option.isSome_iff_exists.mp ((hdom k).mp (by simp [hl1]))
+            rw [hv', hl2] at hy
+            dsimp only at hy
+            cases hx
+            cases hy
+            exact hcong _ _ _ k hl1 hv' hl2
+      · rw [interMap_lookup] at hx hy
+        cases hl1' : m1'.lookup k with
+        | none =>
+          rw [hl1'] at hy
+          exact absurd hy (by simp)
+        | some v' =>
+          rw [hl1'] at hy
+          cases hl2 : m2.lookup k with
+          | none =>
+            rw [hl2] at hy
+            exact absurd hy (by simp)
+          | some w =>
+            rw [hl2] at hy
+            dsimp only at hy
+            obtain ⟨v, hv⟩ := Option.isSome_iff_exists.mp ((hdom k).mpr (by simp [hl1']))
+            rw [hv, hl2] at hx
+            dsimp only at hx
+            cases hx
+            cases hy
+            exact eqv_symm _ _ (hcong _ _ _ k hv hl1' hl2)
+    have hunionC : ∀ (p : Bool) (m1 m1' m2 : List (FieldKey × CTy)),
+        (subKeys m1 m1' (m1.map Prod.fst) && subKeys m1' m1 (m1'.map Prod.fst)) = true →
+        (∀ x x' y k, m1.lookup k = some x → m1'.lookup k = some x' → m2.lookup k = some y →
+          eqv (merge p x y) (merge p x' y) = true) →
+        (subKeys (unionMap p m1 m2) (unionMap p m1' m2)
+            ((unionMap p m1 m2).map Prod.fst) &&
+          subKeys (unionMap p m1' m2) (unionMap p m1 m2)
+            ((unionMap p m1' m2).map Prod.fst)) = true := by
+      intro p m1 m1' m2 hcl hcong
+      have hpay : ∀ x x' k, m1.lookup k = some x → m1'.lookup k = some x' →
+          eqv x x' = true := (mapClause_iff.mp hcl).2.1 |> fun hh => fun x x' k hx hx' =>
+            hh k x x' hx hx'
+      rw [mapClause_iff] at hcl ⊢
+      obtain ⟨hdom, hfwd, hbwd⟩ := hcl
+      refine ⟨fun k => ?_, fun k x y hx hy => ?_, fun k x y hx hy => ?_⟩
+      · rw [unionMap_lookup, unionMap_lookup]
+        rcases hl1 : m1.lookup k with _ | v <;> rcases hl2 : m2.lookup k with _ | w <;>
+          rcases hl1' : m1'.lookup k with _ | v' <;>
+          first
+          | (simp; done)
+          | (have hcontra := hdom k; simp [hl1, hl1'] at hcontra)
+      · rw [unionMap_lookup] at hx hy
+        cases hl1 : m1.lookup k with
+        | none =>
+          rw [hl1] at hx
+          cases hl2 : m2.lookup k with
+          | none =>
+            rw [hl2] at hx
+            exact absurd hx (by simp)
+          | some w =>
+            rw [hl2] at hx
+            dsimp only at hx
+            have hno : m1'.lookup k = none := by
+              rcases hl1' : m1'.lookup k with _ | v'
+              · rfl
+              · exact absurd ((hdom k).mpr (by simp [hl1'])) (by simp [hl1])
+            rw [hno, hl2] at hy
+            dsimp only at hy
+            cases hx
+            cases hy
+            exact eqv_refl _
+        | some v =>
+          rw [hl1] at hx
+          obtain ⟨v', hv'⟩ := Option.isSome_iff_exists.mp ((hdom k).mp (by simp [hl1]))
+          rw [hv'] at hy
+          cases hl2 : m2.lookup k with
+          | none =>
+            rw [hl2] at hx hy
+            dsimp only at hx hy
+            cases hx
+            cases hy
+            exact hpay _ _ k hl1 hv'
+          | some w =>
+            rw [hl2] at hx hy
+            dsimp only at hx hy
+            cases hx
+            cases hy
+            exact hcong _ _ _ k hl1 hv' hl2
+      · rw [unionMap_lookup] at hx hy
+        cases hl1' : m1'.lookup k with
+        | none =>
+          rw [hl1'] at hy
+          cases hl2 : m2.lookup k with
+          | none =>
+            rw [hl2] at hy
+            exact absurd hy (by simp)
+          | some w =>
+            rw [hl2] at hy
+            dsimp only at hy
+            have hno : m1.lookup k = none := by
+              rcases hl1 : m1.lookup k with _ | v
+              · rfl
+              · exact absurd ((hdom k).mp (by simp [hl1])) (by simp [hl1'])
+            rw [hno, hl2] at hx
+            dsimp only at hx
+            cases hx
+            cases hy
+            exact eqv_refl _
+        | some v' =>
+          rw [hl1'] at hy
+          obtain ⟨v, hv⟩ := Option.isSome_iff_exists.mp ((hdom k).mpr (by simp [hl1']))
+          rw [hv] at hx
+          cases hl2 : m2.lookup k with
+          | none =>
+            rw [hl2] at hx hy
+            dsimp only at hx hy
+            cases hx
+            cases hy
+            exact eqv_symm _ _ (hpay _ _ k hv hl1')
+          | some w =>
+            rw [hl2] at hx hy
+            dsimp only at hx hy
+            cases hx
+            cases hy
+            exact eqv_symm _ _ (hcong _ _ _ k hv hl1' hl2)
+    rw [merge.eq_def, merge.eq_def, eqv.eq_def]
+    simp only [Bool.and_eq_true]
+    simp only [List.all_eq_true, List.contains_iff_mem] at h1 h2
+    refine ⟨⟨⟨⟨⟨⟨⟨?_, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩
+    · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
+      exact fun x hx => hx.imp (fun hm => by simpa using h1 x hm) id
+    · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
+      exact fun x hx => hx.imp (fun hm => by simpa using h2 x hm) id
+    · rcases r1 with _ | m1 <;> rcases r1' with _ | m1' <;>
+        first
+        | (simp at hr; done)
+        | skip
+      · rcases rb with _ | mb
+        · rfl
+        · simp [subKeys_self]
+      · rcases rb with _ | mb
+        · simpa using hr
+        · have hcong : ∀ x x' y k, m1.lookup k = some x → m1'.lookup k = some x' →
+              mb.lookup k = some y → eqv (merge pol x y) (merge pol x' y) = true := by
+            intro x x' y k hx hx' hy
+            have hszx := lookup_sizeOf hx
+            have hszx' := lookup_sizeOf hx'
+            have hszy := lookup_sizeOf hy
+            have hxx' : eqv x x' = true :=
+              (mapClause_iff.mp (by simpa using hr)).2.1 k x x' hx hx'
+            exact merge_congr_left pol x x' y hxx'
+          cases pol
+          · simpa [unionMap] using hunionC false m1 m1' mb (by simpa using hr) hcong
+          · simpa using hinterC true m1 m1' mb (by simpa using hr) hcong
+    · rcases v1 with _ | m1 <;> rcases v1' with _ | m1' <;>
+        first
+        | (simp at hv; done)
+        | skip
+      · rcases vb with _ | mb
+        · rfl
+        · simp [subKeys_self]
+      · rcases vb with _ | mb
+        · simpa using hv
+        · have hcong : ∀ x x' y k, m1.lookup k = some x → m1'.lookup k = some x' →
+              mb.lookup k = some y → eqv (merge pol x y) (merge pol x' y) = true := by
+            intro x x' y k hx hx' hy
+            have hszx := lookup_sizeOf hx
+            have hszx' := lookup_sizeOf hx'
+            have hszy := lookup_sizeOf hy
+            have hxx' : eqv x x' = true :=
+              (mapClause_iff.mp (by simpa using hv)).2.1 k x x' hx hx'
+            exact merge_congr_left pol x x' y hxx'
+          cases pol
+          · simpa using hinterC false m1 m1' mb (by simpa using hv) hcong
+          · simpa [unionMap] using hunionC true m1 m1' mb (by simpa using hv) hcong
+    · rcases f1 with _ | s1 <;> rcases f1' with _ | s1' <;>
+        first
+        | (simp at hf; done)
+        | skip
+      · rcases fb with _ | sb
+        · rfl
+        · simpa using funClause_of_funEqv (funEqv_refl sb)
+      · rcases fb with _ | sb
+        · simpa using hf
+        · obtain ⟨k1, d1, cod1⟩ := s1
+          obtain ⟨k1', d1', cod1'⟩ := s1'
+          simp only [Bool.and_eq_true] at hf
+          obtain ⟨⟨hk, hd⟩, hcod⟩ := hf
+          have hk' : k1 = k1' := by simpa using hk
+          have hsz : sizeOf (k1, d1, cod1) + sizeOf (k1', d1', cod1') + sizeOf sb <
+              sizeOf (CTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 e1) +
+                sizeOf (CTy.mk a1' r1' v1' (some (k1', d1', cod1')) c1' e1') +
+                sizeOf (CTy.mk b1 rb vb (some sb) cb eb) := by
+            simp
+            omega
+          have hde : FunEqv (k1, d1, cod1) (k1', d1', cod1') := by
+            refine ⟨hk', ?_, hcod⟩
+            rcases d1 with _ | x <;> rcases d1' with _ | x' <;> simp_all
+          simpa using funClause_of_funEqv
+            (mergeFun_congr_left pol (k1, d1, cod1) (k1', d1', cod1') sb hde)
+    · cases pol
+      · simp only [Bool.false_eq_true, reduceIte, List.all_eq_true, List.contains_iff_mem,
+          List.mem_append]
+        simp only [List.all_eq_true, List.contains_iff_mem] at hc1'
+        exact fun x hx => hx.imp (fun hm => by simpa using hc1' x hm) id
+      · simp only [reduceIte, List.all_eq_true, List.contains_iff_mem, List.mem_filter]
+        simp only [List.all_eq_true, List.contains_iff_mem] at hc1'
+        exact fun x hx => ⟨by simpa using hc1' x hx.1, hx.2⟩
+    · cases pol
+      · simp only [Bool.false_eq_true, reduceIte, List.all_eq_true, List.contains_iff_mem,
+          List.mem_append]
+        simp only [List.all_eq_true, List.contains_iff_mem] at hc2'
+        exact fun x hx => hx.imp (fun hm => by simpa using hc2' x hm) id
+      · simp only [reduceIte, List.all_eq_true, List.contains_iff_mem, List.mem_filter]
+        simp only [List.all_eq_true, List.contains_iff_mem] at hc2'
+        exact fun x hx => ⟨by simpa using hc2' x hx.1, hx.2⟩
+    · simp at he
+      simp [he]
+termination_by a a' b => (sizeOf a + sizeOf a' + sizeOf b, 1)
+decreasing_by all_goals
+  first
+  | (apply Prod.Lex.left; omega)
+  | (apply Prod.Lex.left; simp; omega)
+  | (apply Prod.Lex.right; simp; omega)
+
+theorem mergeFun_congr_left (pol : Bool) :
+    (s1 s1' sb : KindM × Option CTy × CTy) → FunEqv s1 s1' →
+      FunEqv (mergeFun pol s1 sb) (mergeFun pol s1' sb)
+  | (k1, d1, c1), (k1', d1', c1'), (kb, db, cb) => by
+    intro ⟨hk, hd, hc⟩
+    subst hk
+    have hszc : sizeOf c1 + sizeOf c1' + sizeOf cb <
+        sizeOf (k1, d1, c1) + sizeOf (k1, d1', c1') + sizeOf (kb, db, cb) := by
+      simp
+      omega
+    have hcod : eqv (merge pol c1 cb) (merge pol c1' cb) = true :=
+      merge_congr_left pol c1 c1' cb hc
+    rw [mergeFun.eq_def, mergeFun.eq_def]
+    simp only
+    rcases hcf1 : k1 == KindM.conflict with _ | _ <;>
+      rcases hcf2 : kb == KindM.conflict with _ | _ <;>
+      simp only [hcf1, hcf2, Bool.true_or, Bool.or_true, Bool.false_or, if_true]
+    case true.true | true.false | false.true => exact ⟨rfl, trivial, hcod⟩
+    simp only [Bool.or_false, if_false, Bool.false_eq_true]
+    cases pol
+    · simp only [if_false, Bool.false_eq_true]
+      rcases d1 with _ | x <;> rcases d1' with _ | x' <;>
+        first
+        | (simp at hd; done)
+        | skip
+        <;> rcases db with _ | y
+      · exact ⟨rfl, trivial, hcod⟩
+      · exact ⟨rfl, trivial, hcod⟩
+      · exact ⟨rfl, trivial, hcod⟩
+      · simp only at hd
+        have hszd : sizeOf x + sizeOf x' + sizeOf y <
+            sizeOf (k1, some x, c1) + sizeOf (k1, some x', c1') + sizeOf (kb, some y, cb) := by
+          simp
+          omega
+        exact ⟨rfl, merge_congr_left true x x' y hd, hcod⟩
+    · simp only [if_true]
+      rcases k1 with _ | _ | _ <;> rcases kb with _ | _ | _ <;> simp_all
+      -- data ⊔ data
+      · rcases d1 with _ | x <;> rcases d1' with _ | x' <;>
+          first
+          | (simp at hd; done)
+          | skip
+          <;> rcases db with _ | y
+        · exact ⟨rfl, trivial, hcod⟩
+        · exact ⟨rfl, trivial, hcod⟩
+        · exact ⟨rfl, trivial, hcod⟩
+        · simp only at hd
+          dsimp only
+          rw [eqv_congr_bool hd y]
+          rcases hg : eqv x' y with _ | _ <;> simp only [hg, Bool.false_eq_true, reduceIte]
+          · exact ⟨rfl, trivial, hcod⟩
+          · exact ⟨rfl, hd, hcod⟩
+      -- data ⊔ compute
+      · rcases d1 with _ | x <;> rcases d1' with _ | x' <;>
+          first
+          | (simp at hd; done)
+          | skip
+          <;> rcases db with _ | y
+        · exact ⟨rfl, trivial, hcod⟩
+        · exact ⟨rfl, trivial, hcod⟩
+        · exact ⟨rfl, trivial, hcod⟩
+        · simp only at hd
+          have hszd : sizeOf x + sizeOf x' + sizeOf y <
+              sizeOf (KindM.data, some x, c1) + sizeOf (KindM.data, some x', c1') +
+                sizeOf (KindM.compute, some y, cb) := by
+            simp
+            omega
+          exact ⟨rfl, merge_congr_left false x x' y hd, hcod⟩
+      -- compute ⊔ data
+      · rcases d1 with _ | x <;> rcases d1' with _ | x' <;>
+          first
+          | (simp at hd; done)
+          | skip
+          <;> rcases db with _ | y
+        · exact ⟨rfl, trivial, hcod⟩
+        · exact ⟨rfl, trivial, hcod⟩
+        · exact ⟨rfl, trivial, hcod⟩
+        · simp only at hd
+          have hszd : sizeOf x + sizeOf x' + sizeOf y <
+              sizeOf (KindM.compute, some x, c1) + sizeOf (KindM.compute, some x', c1') +
+                sizeOf (KindM.data, some y, cb) := by
+            simp
+            omega
+          exact ⟨rfl, merge_congr_left false x x' y hd, hcod⟩
+      -- compute ⊔ compute
+      · rcases d1 with _ | x <;> rcases d1' with _ | x' <;>
+          first
+          | (simp at hd; done)
+          | skip
+          <;> rcases db with _ | y
+        · exact ⟨rfl, trivial, hcod⟩
+        · exact ⟨rfl, trivial, hcod⟩
+        · exact ⟨rfl, trivial, hcod⟩
+        · simp only at hd
+          have hszd : sizeOf x + sizeOf x' + sizeOf y <
+              sizeOf (KindM.compute, some x, c1) + sizeOf (KindM.compute, some x', c1') +
+                sizeOf (KindM.compute, some y, cb) := by
+            simp
+            omega
+          exact ⟨rfl, merge_congr_left false x x' y hd, hcod⟩
+termination_by s1 s1' sb => (sizeOf s1 + sizeOf s1' + sizeOf sb, 0)
+decreasing_by all_goals
+  first
+  | (apply Prod.Lex.left; omega)
+  | (apply Prod.Lex.left; simp; omega)
+  | (apply Prod.Lex.right; simp; omega)
+
+end
+
+/-- Congruence in the right argument (via commutativity). -/
+theorem merge_congr_right (pol : Bool) (a b b' : CTy) (h : eqv b b' = true) :
+    eqv (merge pol a b) (merge pol a b') = true :=
+  eqv_trans _ _ _ (merge_comm pol a b)
+    (eqv_trans _ _ _ (merge_congr_left pol b b' a h) (merge_comm pol b' a))
+
+/-- Full congruence. -/
+theorem merge_congr (pol : Bool) {a a' b b' : CTy}
+    (ha : eqv a a' = true) (hb : eqv b b' = true) :
+    eqv (merge pol a b) (merge pol a' b') = true :=
+  eqv_trans _ _ _ (merge_congr_left pol a a' b ha) (merge_congr_right pol a' b b' hb)
+
+/-! ## Associativity fails in general: the mixed-kind counterexample
+
+Three function bounds at one position — two `data` collections over *distinct*
+domains and one `compute` capability — merge to different outcomes depending
+on association:
+
+- `(D{Int} ⊔ D{Str}) ⊔ C{Int}`: the data join accumulates two alternatives,
+  and a multi-domain data side meeting a compute side has no honest upcast —
+  **conflict** (coalesce rejects the program).
+- `(D{Int} ⊔ C{Int}) ⊔ D{Str}` (any association that pairs a single-domain
+  data side with the compute side first): each step is the honest upcast —
+  **compute** (accepted).
+
+`compact_go` folds a variable's bounds left-to-right in arrival order, so this
+is arrival order deciding accept-vs-reject. The fuzz's generated vocabulary
+has not covered this shape (`confluence.rs` reports clean runs); whether a
+real program can place these three bounds on one variable is a Rust-side
+question this model can only pose. Until it is answered, associativity — and
+therefore fold-order invariance — is proved on the compute-free fragment
+(`merge_assoc_of_computeFree`), where the mixed arm cannot fire. -/
+
+/-- The empty position (no contribution). -/
+private def cxTop : CTy := .mk [] none none none [] false
+
+/-- An atom position. -/
+private def cxAtom (b : BaseTy) : CTy := .mk [.prim b] none none none [] false
+
+/-- A single-domain function bound of the given kind. -/
+private def cxFun (k : KindM) (d : CTy) : CTy :=
+  .mk [] none none (some (k, some d, cxTop)) [] false
+
+/-- The kind of a position's function slot. -/
+private def fnKind : CTy → Option KindM
+  | .mk _ _ _ f _ _ => f.map (·.1)
+
+/-- One association conflicts (coalesce rejects)… -/
+theorem merge_mixed_left_conflicts :
+    fnKind (merge true (merge true (cxFun .data (cxAtom .int)) (cxFun .data (cxAtom .string)))
+        (cxFun .compute (cxAtom .int))) = some .conflict := by
+  simp [cxFun, cxTop, cxAtom, merge, mergeFun, fnKind, eqv]
+
+/-- …while the other association is an accepted compute function: association
+(hence bound arrival order) decides accept-vs-reject. -/
+theorem merge_mixed_right_accepts :
+    fnKind (merge true (cxFun .data (cxAtom .int)) (merge true (cxFun .data (cxAtom .string))
+        (cxFun .compute (cxAtom .int)))) = some .compute := by
+  simp [cxFun, cxTop, cxAtom, merge, mergeFun, fnKind, eqv]
+
+/-- The headline: `merge` is **not** associative up to `eqv`. -/
+theorem merge_not_assoc :
+    ∃ (pol : Bool) (a b c : CTy),
+      eqv (merge pol (merge pol a b) c) (merge pol a (merge pol b c)) = false := by
+  refine ⟨true, cxFun .data (cxAtom .int), cxFun .data (cxAtom .string),
+    cxFun .compute (cxAtom .int), ?_⟩
+  simp [cxFun, cxTop, cxAtom, merge, mergeFun, eqv, subKeys]
+
+/-! ## The compute-free fragment: associativity
+
+On bounds whose function slots are all `data` — collections, the common case —
+the mixed-kind arm cannot fire and the merge is associative. (`compute`-only
+inputs are symmetric but meet through the contravariant domain, whose `none`
+states conflict; the all-`data` fragment is the one the fold theorems need.) -/
+
+mutual
+
+/-- Every function slot reachable from this position is a `data` slot. -/
+def computeFree : CTy → Bool
+  | .mk _ r v f _ _ =>
+    (match r with
+     | none => true
+     | some m => cfKeys m (m.map Prod.fst))
+      && (match v with
+          | none => true
+          | some m => cfKeys m (m.map Prod.fst))
+      && (match f with
+          | none => true
+          | some (k, d, cod) =>
+            (k == .data)
+              && (match d with
+                  | some x => computeFree x
+                  | none => true)
+              && computeFree cod)
+termination_by t => (sizeOf t, 0)
+
+/-- All payloads of a map are `computeFree` (worklist form). -/
+def cfKeys (m : List (FieldKey × CTy)) : List FieldKey → Bool
+  | [] => true
+  | k :: ks =>
+    (match h : m.lookup k with
+     | some v => computeFree v
+     | none => true)
+      && cfKeys m ks
+termination_by ks => (sizeOf m, ks.length)
+decreasing_by
+  · have := lookup_sizeOf h
+    apply Prod.Lex.left
+    omega
+  · apply Prod.Lex.right
+    simp
+
+end
+
+/-- Pointwise reading of `cfKeys`. -/
+theorem cfKeys_iff {m : List (FieldKey × CTy)} {ks : List FieldKey} :
+    cfKeys m ks = true ↔ ∀ k ∈ ks, ∀ v, m.lookup k = some v → computeFree v = true := by
+  induction ks with
+  | nil => simp [cfKeys]
+  | cons k ks ih =>
+    rw [cfKeys, Bool.and_eq_true, ih]
+    constructor
+    · intro ⟨hhead, htail⟩ k' hk'
+      rcases List.mem_cons.mp hk' with h | h
+      · subst h
+        intro v hv
+        rw [hv] at hhead
+        exact hhead
+      · exact htail k' h
+    · intro h
+      refine ⟨?_, fun k' hk' => h k' (by simp [hk'])⟩
+      rcases hv : m.lookup k with _ | v
+      · rfl
+      · exact h k (by simp) v hv
+
+mutual
+
+theorem merge_assoc_cf (pol : Bool) :
+    (a b c : CTy) → computeFree a = true → computeFree b = true → computeFree c = true →
+      eqv (merge pol (merge pol a b) c) (merge pol a (merge pol b c)) = true
+  | .mk a1 r1 v1 f1 c1 e1, .mk a2 r2 v2 f2 c2 e2, .mk a3 r3 v3 f3 c3 e3 => by
+    intro ha hb hc
+    rw [computeFree.eq_def] at ha hb hc
+    simp only [Bool.and_eq_true] at ha hb hc
+    obtain ⟨⟨har, hav⟩, haf⟩ := ha
+    obtain ⟨⟨hbr, hbv⟩, hbf⟩ := hb
+    obtain ⟨⟨hcr, hcv⟩, hcf⟩ := hc
+    -- Pointwise associativity for the two keyed merges.
+    have hinterA : ∀ (p : Bool) (m1 m2 m3 : List (FieldKey × CTy)),
+        (∀ x y z k, m1.lookup k = some x → m2.lookup k = some y → m3.lookup k = some z →
+          eqv (merge p (merge p x y) z) (merge p x (merge p y z)) = true) →
+        (subKeys (interMap p (interMap p m1 m2) m3) (interMap p m1 (interMap p m2 m3))
+            ((interMap p (interMap p m1 m2) m3).map Prod.fst) &&
+          subKeys (interMap p m1 (interMap p m2 m3)) (interMap p (interMap p m1 m2) m3)
+            ((interMap p m1 (interMap p m2 m3)).map Prod.fst)) = true := by
+      intro p m1 m2 m3 hassoc
+      rw [mapClause_iff]
+      refine ⟨fun k => ?_, fun k x y hx hy => ?_, fun k x y hx hy => ?_⟩
+      · rw [interMap_lookup, interMap_lookup, interMap_lookup, interMap_lookup]
+        rcases m1.lookup k with _ | v <;> rcases m2.lookup k with _ | w <;>
+          rcases m3.lookup k with _ | u <;> simp
+      · rw [interMap_lookup, interMap_lookup] at hx
+        rw [interMap_lookup, interMap_lookup] at hy
+        rcases h1 : m1.lookup k with _ | v <;> rw [h1] at hx hy <;>
+          rcases h2 : m2.lookup k with _ | w <;> rw [h2] at hx hy <;>
+          rcases h3 : m3.lookup k with _ | u <;> rw [h3] at hx hy <;>
+          dsimp only at hx hy <;>
+          first
+          | (simp only [reduceCtorEq] at hx)
+          | (cases hx; cases hy; exact hassoc _ _ _ k h1 h2 h3)
+      · rw [interMap_lookup, interMap_lookup] at hx
+        rw [interMap_lookup, interMap_lookup] at hy
+        rcases h1 : m1.lookup k with _ | v <;> rw [h1] at hx hy <;>
+          rcases h2 : m2.lookup k with _ | w <;> rw [h2] at hx hy <;>
+          rcases h3 : m3.lookup k with _ | u <;> rw [h3] at hx hy <;>
+          dsimp only at hx hy <;>
+          first
+          | (simp only [reduceCtorEq] at hx)
+          | (cases hx; cases hy; exact eqv_symm _ _ (hassoc _ _ _ k h1 h2 h3))
+    have hunionA : ∀ (p : Bool) (m1 m2 m3 : List (FieldKey × CTy)),
+        (∀ x y z k, m1.lookup k = some x → m2.lookup k = some y → m3.lookup k = some z →
+          eqv (merge p (merge p x y) z) (merge p x (merge p y z)) = true) →
+        (subKeys (unionMap p (unionMap p m1 m2) m3) (unionMap p m1 (unionMap p m2 m3))
+            ((unionMap p (unionMap p m1 m2) m3).map Prod.fst) &&
+          subKeys (unionMap p m1 (unionMap p m2 m3)) (unionMap p (unionMap p m1 m2) m3)
+            ((unionMap p m1 (unionMap p m2 m3)).map Prod.fst)) = true := by
+      intro p m1 m2 m3 hassoc
+      rw [mapClause_iff]
+      refine ⟨fun k => ?_, fun k x y hx hy => ?_, fun k x y hx hy => ?_⟩
+      · rw [unionMap_lookup, unionMap_lookup, unionMap_lookup, unionMap_lookup]
+        rcases m1.lookup k with _ | v <;> rcases m2.lookup k with _ | w <;>
+          rcases m3.lookup k with _ | u <;> simp
+      · rw [unionMap_lookup, unionMap_lookup] at hx
+        rw [unionMap_lookup, unionMap_lookup] at hy
+        rcases h1 : m1.lookup k with _ | v <;> rw [h1] at hx hy <;>
+          rcases h2 : m2.lookup k with _ | w <;> rw [h2] at hx hy <;>
+          rcases h3 : m3.lookup k with _ | u <;> rw [h3] at hx hy <;>
+          dsimp only at hx hy <;>
+          first
+          | (simp only [reduceCtorEq] at hx)
+          | (cases hx; cases hy;
+             first
+             | exact eqv_refl _
+             | exact hassoc _ _ _ k h1 h2 h3)
+      · rw [unionMap_lookup, unionMap_lookup] at hx
+        rw [unionMap_lookup, unionMap_lookup] at hy
+        rcases h1 : m1.lookup k with _ | v <;> rw [h1] at hx hy <;>
+          rcases h2 : m2.lookup k with _ | w <;> rw [h2] at hx hy <;>
+          rcases h3 : m3.lookup k with _ | u <;> rw [h3] at hx hy <;>
+          dsimp only at hx hy <;>
+          first
+          | (simp only [reduceCtorEq] at hx)
+          | (cases hx; cases hy;
+             first
+             | exact eqv_refl _
+             | exact eqv_symm _ _ (hassoc _ _ _ k h1 h2 h3))
+    rw [merge.eq_def, merge.eq_def, merge.eq_def, merge.eq_def, eqv.eq_def]
+    dsimp only
+    simp only [Bool.and_eq_true]
+    refine ⟨⟨⟨⟨⟨⟨⟨?_, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩
+    · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
+      exact fun x hx => by simpa [or_assoc] using hx
+    · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
+      exact fun x hx => by simpa [or_assoc] using hx
+    · rcases r1 with _ | m1 <;> rcases r2 with _ | m2 <;> rcases r3 with _ | m3 <;>
+        first
+        | rfl
+        | (simp [subKeys_self]; done)
+        | skip
+      have hassoc : ∀ x y z k, m1.lookup k = some x → m2.lookup k = some y →
+          m3.lookup k = some z →
+          eqv (merge pol (merge pol x y) z) (merge pol x (merge pol y z)) = true := by
+        intro x y z k hx hy hz
+        have hszx := lookup_sizeOf hx
+        have hszy := lookup_sizeOf hy
+        have hszz := lookup_sizeOf hz
+        exact merge_assoc_cf pol x y z
+          ((cfKeys_iff.mp (by simpa using har)) k (mem_keys_of_lookup hx) x hx)
+          ((cfKeys_iff.mp (by simpa using hbr)) k (mem_keys_of_lookup hy) y hy)
+          ((cfKeys_iff.mp (by simpa using hcr)) k (mem_keys_of_lookup hz) z hz)
+      cases pol
+      · simpa [unionMap] using hunionA false m1 m2 m3 hassoc
+      · simpa using hinterA true m1 m2 m3 hassoc
+    · rcases v1 with _ | m1 <;> rcases v2 with _ | m2 <;> rcases v3 with _ | m3 <;>
+        first
+        | rfl
+        | (simp [subKeys_self]; done)
+        | skip
+      have hassoc : ∀ x y z k, m1.lookup k = some x → m2.lookup k = some y →
+          m3.lookup k = some z →
+          eqv (merge pol (merge pol x y) z) (merge pol x (merge pol y z)) = true := by
+        intro x y z k hx hy hz
+        have hszx := lookup_sizeOf hx
+        have hszy := lookup_sizeOf hy
+        have hszz := lookup_sizeOf hz
+        exact merge_assoc_cf pol x y z
+          ((cfKeys_iff.mp (by simpa using hav)) k (mem_keys_of_lookup hx) x hx)
+          ((cfKeys_iff.mp (by simpa using hbv)) k (mem_keys_of_lookup hy) y hy)
+          ((cfKeys_iff.mp (by simpa using hcv)) k (mem_keys_of_lookup hz) z hz)
+      cases pol
+      · simpa using hinterA false m1 m2 m3 hassoc
+      · simpa [unionMap] using hunionA true m1 m2 m3 hassoc
+    · rcases f1 with _ | s1 <;> rcases f2 with _ | s2 <;> rcases f3 with _ | s3 <;>
+        first
+        | rfl
+        | (simpa using funClause_of_funEqv (funEqv_refl _))
+        | skip
+      obtain ⟨k1, d1, cod1⟩ := s1
+      obtain ⟨k2, d2, cod2⟩ := s2
+      obtain ⟨k3, d3, cod3⟩ := s3
+      simp only [Bool.and_eq_true] at haf hbf hcf
+      have hsz : sizeOf (k1, d1, cod1) + sizeOf (k2, d2, cod2) + sizeOf (k3, d3, cod3) <
+          sizeOf (CTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 e1) +
+            sizeOf (CTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2 e2) +
+            sizeOf (CTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3 e3) := by
+        simp
+        omega
+      simpa using funClause_of_funEqv
+        (mergeFun_assoc_cf pol (k1, d1, cod1) (k2, d2, cod2) (k3, d3, cod3)
+          (by simpa using haf.1.1) (by simpa using hbf.1.1) (by simpa using hcf.1.1)
+          (by
+            rcases d1 with _ | x
+            · intro x hx
+              cases hx
+            · intro x' hx'
+              cases hx'
+              simpa using haf.1.2)
+          (by
+            rcases d2 with _ | x
+            · intro x hx
+              cases hx
+            · intro x' hx'
+              cases hx'
+              simpa using hbf.1.2)
+          (by
+            rcases d3 with _ | x
+            · intro x hx
+              cases hx
+            · intro x' hx'
+              cases hx'
+              simpa using hcf.1.2)
+          haf.2 hbf.2 hcf.2)
+    · cases pol
+      · simp only [Bool.false_eq_true, reduceIte, List.all_eq_true, List.contains_iff_mem,
+          List.mem_append]
+        exact fun x hx => by simpa [or_assoc] using hx
+      · simp only [reduceIte, List.all_eq_true, List.contains_iff_mem, List.mem_filter]
+        exact fun x hx => by simpa [and_assoc] using hx
+    · cases pol
+      · simp only [Bool.false_eq_true, reduceIte, List.all_eq_true, List.contains_iff_mem,
+          List.mem_append]
+        exact fun x hx => by simpa [or_assoc] using hx
+      · simp only [reduceIte, List.all_eq_true, List.contains_iff_mem, List.mem_filter]
+        exact fun x hx => by simpa [and_assoc] using hx
+    · simp [Bool.or_assoc]
+termination_by a b c => (sizeOf a + sizeOf b + sizeOf c, 1)
+decreasing_by all_goals
+  first
+  | (apply Prod.Lex.left; omega)
+  | (apply Prod.Lex.left; simp; omega)
+  | (apply Prod.Lex.right; simp; omega)
+
+theorem mergeFun_assoc_cf (pol : Bool) :
+    (s1 s2 s3 : KindM × Option CTy × CTy) →
+      s1.1 = .data → s2.1 = .data → s3.1 = .data →
+      (∀ x, s1.2.1 = some x → computeFree x = true) →
+      (∀ x, s2.2.1 = some x → computeFree x = true) →
+      (∀ x, s3.2.1 = some x → computeFree x = true) →
+      computeFree s1.2.2 = true → computeFree s2.2.2 = true → computeFree s3.2.2 = true →
+      FunEqv (mergeFun pol (mergeFun pol s1 s2) s3) (mergeFun pol s1 (mergeFun pol s2 s3))
+  | (k1, d1, c1), (k2, d2, c2), (k3, d3, c3) => by
+    intro hk1 hk2 hk3 hd1 hd2 hd3 hc1 hc2 hc3
+    subst hk1
+    subst hk2
+    subst hk3
+    simp only at hd1 hd2 hd3 hc1 hc2 hc3
+    have hszc : sizeOf c1 + sizeOf c2 + sizeOf c3 <
+        sizeOf (KindM.data, d1, c1) + sizeOf (KindM.data, d2, c2) +
+          sizeOf (KindM.data, d3, c3) := by
+      simp
+      omega
+    have hcod : eqv (merge pol (merge pol c1 c2) c3) (merge pol c1 (merge pol c2 c3)) = true :=
+      merge_assoc_cf pol c1 c2 c3 hc1 hc2 hc3
+    have hgdc : (KindM.data == KindM.conflict) = false := rfl
+    have hgdd : (KindM.data == KindM.data) = true := rfl
+    have hgcc : (KindM.conflict == KindM.conflict) = true := rfl
+    cases pol
+    · -- Negative: kinds stay data; a missing domain conflicts on both sides.
+      rcases d1 with _ | x <;> rcases d2 with _ | y <;> rcases d3 with _ | z <;>
+        simp only [mergeFun.eq_def, hgdc, hgdd, hgcc, Bool.or_self, Bool.or_false,
+          Bool.false_or, Bool.true_or, Bool.or_true, Bool.false_eq_true, reduceIte] <;>
+        first
+        | exact ⟨rfl, trivial, hcod⟩
+        | (have hszd : sizeOf x + sizeOf y + sizeOf z <
+              sizeOf (KindM.data, some x, c1) + sizeOf (KindM.data, some y, c2) +
+                sizeOf (KindM.data, some z, c3) := by
+            simp
+            omega
+           exact ⟨rfl, merge_assoc_cf true x y z (hd1 x rfl) (hd2 y rfl) (hd3 z rfl), hcod⟩)
+    · -- Positive: the gate algebra.
+      rcases d1 with _ | x <;> rcases d2 with _ | y <;> rcases d3 with _ | z <;>
+        simp only [mergeFun.eq_def, hgdc, hgdd, hgcc, Bool.or_self, Bool.or_false,
+          Bool.false_or, Bool.true_or, Bool.or_true, Bool.false_eq_true, reduceIte] <;>
+        first
+        | exact ⟨rfl, trivial, hcod⟩
+        | (rcases hxy : eqv x y with _ | _ <;>
+             simp only [hxy, Bool.false_eq_true, reduceIte] <;>
+             exact ⟨rfl, trivial, hcod⟩)
+        | (rcases hyz : eqv y z with _ | _ <;>
+             simp only [hyz, Bool.false_eq_true, reduceIte] <;>
+             exact ⟨rfl, trivial, hcod⟩)
+        | (rcases hxy : eqv x y with _ | _
+           · simp only [hxy, Bool.false_eq_true, reduceIte]
+             rcases hyz : eqv y z with _ | _ <;>
+               simp only [hyz, hxy, Bool.false_eq_true, reduceIte] <;>
+               exact ⟨rfl, trivial, hcod⟩
+           · simp only [hxy, reduceIte]
+             have hxz : eqv x z = eqv y z := eqv_congr_bool hxy z
+             rcases hyz : eqv y z with _ | _
+             · rw [hxz, hyz]
+               simp only [Bool.false_eq_true, reduceIte]
+               exact ⟨rfl, trivial, hcod⟩
+             · rw [hxz, hyz]
+               simp only [hxy, reduceIte]
+               exact ⟨rfl, eqv_refl x, hcod⟩)
+termination_by s1 s2 s3 => (sizeOf s1 + sizeOf s2 + sizeOf s3, 0)
+decreasing_by all_goals
+  first
+  | (apply Prod.Lex.left; omega)
+  | (apply Prod.Lex.left; simp; omega)
+  | (apply Prod.Lex.right; simp; omega)
+
+end
+
+/-! ## The fold: coalescing a bound list is order- and duplicate-invariant
+
+`compact_go` folds a variable's bounds through `merge` from the first bound
+(no identity element exists — see the module docs). On the compute-free
+fragment the outcome is a function of the bound *set*: permutations
+(`foldMerge_perm`) and duplicates (`foldMerge_dup`) cannot change it. This is
+the algebraic statement behind the confluence fuzz's \"outcomes agree under
+permuted constraint orders\". -/
+
+/-- Positive merges stay compute-free (the join of two `data` slots is a
+`data` slot). The *negative* direction genuinely does not preserve the
+fragment — a multi-alternative domain meeting anything conflicts — which is
+why the fold theorems are stated at positive polarity. -/
+theorem computeFree_merge_pos : (a b : CTy) → computeFree a = true → computeFree b = true →
+    computeFree (merge true a b) = true
+  | .mk a1 r1 v1 f1 c1 e1, .mk a2 r2 v2 f2 c2 e2 => by
+    intro ha hb
+    rw [computeFree.eq_def] at ha hb
+    simp only [Bool.and_eq_true] at ha hb
+    obtain ⟨⟨har, hav⟩, haf⟩ := ha
+    obtain ⟨⟨hbr, hbv⟩, hbf⟩ := hb
+    have hmapI : ∀ (m1 m2 : List (FieldKey × CTy)),
+        (∀ x k, m1.lookup k = some x → computeFree x = true) →
+        (∀ x k, m2.lookup k = some x → computeFree x = true) →
+        (∀ x y k, m1.lookup k = some x → m2.lookup k = some y →
+          computeFree (merge true x y) = true) →
+        cfKeys (interMap true m1 m2) ((interMap true m1 m2).map Prod.fst) = true := by
+      intro m1 m2 _ _ hrec
+      rw [cfKeys_iff]
+      intro k _ v hv
+      rw [interMap_lookup] at hv
+      cases h1 : m1.lookup k with
+      | none =>
+        rw [h1] at hv
+        exact absurd hv (by simp)
+      | some x =>
+        rw [h1] at hv
+        cases h2 : m2.lookup k with
+        | none =>
+          rw [h2] at hv
+          exact absurd hv (by simp)
+        | some y =>
+          rw [h2] at hv
+          dsimp only at hv
+          cases hv
+          exact hrec _ _ k h1 h2
+    have hmapU : ∀ (m1 m2 : List (FieldKey × CTy)),
+        (∀ x k, m1.lookup k = some x → computeFree x = true) →
+        (∀ x k, m2.lookup k = some x → computeFree x = true) →
+        (∀ x y k, m1.lookup k = some x → m2.lookup k = some y →
+          computeFree (merge true x y) = true) →
+        cfKeys (unionMap true m1 m2) ((unionMap true m1 m2).map Prod.fst) = true := by
+      intro m1 m2 hm1 hm2 hrec
+      rw [cfKeys_iff]
+      intro k _ v hv
+      rw [unionMap_lookup] at hv
+      cases h1 : m1.lookup k with
+      | none =>
+        rw [h1] at hv
+        cases h2 : m2.lookup k with
+        | none =>
+          rw [h2] at hv
+          exact absurd hv (by simp)
+        | some y =>
+          rw [h2] at hv
+          dsimp only at hv
+          cases hv
+          exact hm2 _ k h2
+      | some x =>
+        rw [h1] at hv
+        cases h2 : m2.lookup k with
+        | none =>
+          rw [h2] at hv
+          dsimp only at hv
+          cases hv
+          exact hm1 _ k h1
+        | some y =>
+          rw [h2] at hv
+          dsimp only at hv
+          cases hv
+          exact hrec _ _ k h1 h2
+    rw [merge.eq_def, computeFree.eq_def]
+    simp only [Bool.and_eq_true]
+    refine ⟨⟨?_, ?_⟩, ?_⟩
+    · rcases r1 with _ | m1 <;> rcases r2 with _ | m2
+      · rfl
+      · simpa using hbr
+      · simpa using har
+      · have hrec : ∀ x y k, m1.lookup k = some x → m2.lookup k = some y →
+            computeFree (merge true x y) = true := by
+          intro x y k hx hy
+          have hszx := lookup_sizeOf hx
+          have hszy := lookup_sizeOf hy
+          exact computeFree_merge_pos x y
+            ((cfKeys_iff.mp (by simpa using har)) k (mem_keys_of_lookup hx) x hx)
+            ((cfKeys_iff.mp (by simpa using hbr)) k (mem_keys_of_lookup hy) y hy)
+        simpa using hmapI m1 m2
+          (fun x k hx => (cfKeys_iff.mp (by simpa using har)) k (mem_keys_of_lookup hx) x hx)
+          (fun x k hx => (cfKeys_iff.mp (by simpa using hbr)) k (mem_keys_of_lookup hx) x hx)
+          hrec
+    · rcases v1 with _ | m1 <;> rcases v2 with _ | m2
+      · rfl
+      · simpa using hbv
+      · simpa using hav
+      · have hrec : ∀ x y k, m1.lookup k = some x → m2.lookup k = some y →
+            computeFree (merge true x y) = true := by
+          intro x y k hx hy
+          have hszx := lookup_sizeOf hx
+          have hszy := lookup_sizeOf hy
+          exact computeFree_merge_pos x y
+            ((cfKeys_iff.mp (by simpa using hav)) k (mem_keys_of_lookup hx) x hx)
+            ((cfKeys_iff.mp (by simpa using hbv)) k (mem_keys_of_lookup hy) y hy)
+        simpa [unionMap] using hmapU m1 m2
+          (fun x k hx => (cfKeys_iff.mp (by simpa using hav)) k (mem_keys_of_lookup hx) x hx)
+          (fun x k hx => (cfKeys_iff.mp (by simpa using hbv)) k (mem_keys_of_lookup hx) x hx)
+          hrec
+    · rcases f1 with _ | ⟨k1, d1, cod1⟩ <;> rcases f2 with _ | ⟨k2, d2, cod2⟩
+      · rfl
+      · simpa using hbf
+      · simpa using haf
+      · simp only [Bool.and_eq_true] at haf hbf
+        have hk1 : k1 = .data := by
+          have := haf.1.1
+          rcases k1 with _ | _ | _ <;> simp_all
+        have hk2 : k2 = .data := by
+          have := hbf.1.1
+          rcases k2 with _ | _ | _ <;> simp_all
+        subst hk1
+        subst hk2
+        have hszc : sizeOf cod1 + sizeOf cod2 <
+            sizeOf (CTy.mk a1 r1 v1 (some (KindM.data, d1, cod1)) c1 e1) +
+              sizeOf (CTy.mk a2 r2 v2 (some (KindM.data, d2, cod2)) c2 e2) := by
+          simp
+          omega
+        have hcod : computeFree (merge true cod1 cod2) = true :=
+          computeFree_merge_pos cod1 cod2 haf.2 hbf.2
+        dsimp only
+        rw [mergeFun.eq_def]
+        simp only [show (KindM.data == KindM.conflict) = false from rfl, Bool.or_self,
+          Bool.false_eq_true, reduceIte]
+        rcases d1 with _ | x <;> rcases d2 with _ | y <;>
+          first
+          | (simp [hcod]; done)
+          | skip
+        have hcfx : computeFree x = true := by simpa using haf.1.2
+        rcases hg : eqv x y with _ | _ <;> simp [hg, hcod, hcfx]
+termination_by a b => sizeOf a + sizeOf b
+decreasing_by all_goals (simp; omega)
+
+/-- The fold `compact_go` performs over a variable's bound list, seeded at the
+first bound. -/
+def foldMerge (pol : Bool) (t : CTy) (ts : List CTy) : CTy :=
+  ts.foldl (merge pol) t
+
+/-- The fold respects `eqv` in its seed (any polarity). -/
+theorem foldMerge_congr (pol : Bool) {t t' : CTy} (ts : List CTy) (h : eqv t t' = true) :
+    eqv (foldMerge pol t ts) (foldMerge pol t' ts) = true := by
+  induction ts generalizing t t' with
+  | nil => exact h
+  | cons x ts ih => exact ih (merge_congr_left pol t t' x h)
+
+/-- **Order-invariance**: on compute-free bounds, permuting the bound list
+cannot change the coalesced outcome (up to `eqv`). -/
+theorem foldMerge_perm {l1 l2 : List CTy} (h : l1.Perm l2) :
+    ∀ (t : CTy), computeFree t = true → (∀ x ∈ l1, computeFree x = true) →
+      eqv (foldMerge true t l1) (foldMerge true t l2) = true := by
+  induction h with
+  | nil => exact fun t _ _ => eqv_refl _
+  | @cons x l1 l2 hp ih =>
+    intro t ht hl
+    exact ih (merge true t x) (computeFree_merge_pos t x ht (hl x (by simp)))
+      (fun u hu => hl u (by simp [hu]))
+  | @swap x y l =>
+    intro t ht hl
+    have hx : computeFree x = true := hl x (by simp)
+    have hy : computeFree y = true := hl y (by simp)
+    -- merge (merge t y) x ~ merge t (merge y x) ~ merge t (merge x y)
+    --   ~ merge (merge t x) y
+    have hseed : eqv (merge true (merge true t y) x) (merge true (merge true t x) y) = true :=
+      eqv_trans _ _ _ (merge_assoc_cf true t y x ht hy hx)
+        (eqv_trans _ _ _ (merge_congr_right true t _ _ (merge_comm true y x))
+          (eqv_symm _ _ (merge_assoc_cf true t x y ht hx hy)))
+    simpa [foldMerge, List.foldl_cons] using foldMerge_congr true l hseed
+  | @trans l1 l2 l3 h12 h23 ih1 ih2 =>
+    intro t ht hl
+    exact eqv_trans _ _ _ (ih1 t ht hl)
+      (ih2 t ht (fun u hu => hl u (h12.mem_iff.mpr hu)))
+
+/-- **Duplicate-invariance**: a bound occurring twice contributes once — the
+other half of \"the outcome is a function of the bound set\". Needs `wf` for
+the duplicated bound (idempotence does). -/
+theorem foldMerge_dup {t x : CTy} (l : List CTy)
+    (ht : computeFree t = true) (hx : computeFree x = true) (hwx : wf x = true) :
+    eqv (foldMerge true t (x :: x :: l)) (foldMerge true t (x :: l)) = true := by
+  -- merge (merge t x) x ~ merge t (merge x x) ~ merge t x
+  have hseed : eqv (merge true (merge true t x) x) (merge true t x) = true :=
+    eqv_trans _ _ _ (merge_assoc_cf true t x x ht hx hx)
+      (merge_congr_right true t _ _ (merge_idem true x hwx))
+  simpa [foldMerge, List.foldl_cons] using foldMerge_congr true l hseed
+
 end CTy
 
 end CclFormal
