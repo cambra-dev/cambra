@@ -120,6 +120,17 @@ Declarative typing `Γ ⊢ 𝑒 : 𝑇` for the pure core — λ, apply, compose
 - **Refinement soundness**: `⊢ 𝑒 : {𝑇 | 𝑝}` and `𝑒 ⇓ 𝑣` implies `𝑝(𝑣) ⇓ true`. The theorem form of "a refinement is a fact about a value", and the property the literal-singleton-types work leans on.
 - **Case-binder preservation**: the `case` payload binder retains its scrutinee-derived bound through reduction. A previously-observed defect — the wildcard `case _:` arm's payload binder losing its scrutinee bound — is precisely a counterexample to a lemma of this shape; retroactively rediscovering that known bug is the calibration test for the whole model.
 
+#### M2 status and adjudicated decisions
+
+Landed: the definitional core (`CclFormal/Term.lean`) — the pure-core term grammar `Tm` (lit, var, λ, apply, let, tuples, projection, variants, `case`, `cast`), values, capture-free substitution, partial predicate evaluation (`Pred.eval`, the interpreted `BinOpKind` vocabulary), the call-by-value small-step `Step`, the *filter-blocked* judgment `Blocked`, and the declarative typing `HasTy Γ e T` with subsumption via the M0 `Sub` relation. Sanity theorems: values neither step nor block. Adjudications, on contact:
+
+- **Terms are de Bruijn; types keep named Pi binders.** Subtyping never moves a binder (names-with-renames mirrored the Rust exactly); reduction duplicates and re-scopes binders, where names buy only α-obligations — and the Rust's term binders are uniquified, hence α-irrelevant. The M3 bridge maps uniquified names to indices mechanically.
+- **Non-dependent fragment first** (`Pred.elemOnly`): predicates over `__elem` only, so types are closed under term substitution — the same fragment the transitivity proof covers (`NoPi`); the dependent extension rides with the Pi-binder thread.
+- **`cast` checks its claims; progress is modulo filtering.** A cast is CCL's refinement introduction (a filter's lowering), and its runtime face (`Restrict`) *drops* elements. The small-step mirrors this: `cast` passes a value through exactly when every claim evaluates true, else the term is `Blocked` — the scalar face of a dropped row. Progress will read "value, steps, or filter-blocked"; refinement soundness holds because the cast is the only door into a refined type.
+- Deferred, recorded: `compose` (the source-shaped λ fragment is what M3 checks first), records, the dependent fragment.
+
+Next increment: progress + preservation (substitution and inversion lemmas over `Sub`, canonical forms modulo refinement peeling), then the two corollaries — refinement soundness and case-binder preservation (the calibration test: the `case _:` payload-binder defect should fall out as a counterexample to the naive statement).
+
 ### M3 — Typing oracle *(oracle)*
 
 The Rust dumps the typed AST for generated small programs; Lean checks admissibility of the root typing. This is where the model starts catching *inference* bugs rather than comparison bugs.
