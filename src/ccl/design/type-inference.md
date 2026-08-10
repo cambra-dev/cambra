@@ -1062,26 +1062,15 @@ Reconstructing the result *after* coalesce instead needs a walk order that respe
 
 ### The representation
 
-An `App` **denotes** a type; it does not construct one. `Add(Int, Int)` *is* `Int`, written in a form that does not yet know it — so it adds no inhabitants and no subtyping edges, and **reduction is normalization** rather than an observable step. Nothing in the solver ever has to decide `Add(α, β) <: Add(γ, δ)` structurally; it decides the reduced types once the arguments are known.
+An `App` **denotes** a type; it does not construct one. `Add(Int, Int)` *is* `Int`, written in a form that does not yet know it — so it adds no inhabitants and no subtyping edges, and **reduction is normalization** rather than an observable step. Nothing in the solver ever has to decide `Add(α, β) <: Add(γ, δ)` structurally; it decides the reduced types once the arguments are known. `App` is therefore **transient** in the same sense as `Infer`: every `Type` that escapes inference is `App`-free, and a survivor at the strict wall is a compiler bug (`UnreducedApp`), distinct from an application whose arguments the program never determined (`UnresolvedInfer` — the arguments are missing, not the rule).
 
-`App` is **transient** in the same sense as `Infer`: every `Type` that escapes inference is `App`-free. A survivor at the strict wall is a compiler bug, flagged as `UnreducedApp`. An application whose arguments the program never determined is a different thing — it reduces to the undetermined position itself and is reported as `UnresolvedInfer`, which is the honest description: the arguments are missing, not the rule.
-
-Reduction is **demand-driven**. Materializing an `App` (`compact_go`'s `App` arm) resolves each argument through the ordinary pipeline — pulling whatever the graph knows, wherever the walk happens to be — and then applies the rule. Nothing is deposited, so no phase ordering can make the answer wrong.
+Reduction is **demand-driven**: materializing an `App` resolves each argument through the ordinary pipeline and applies the rule, depositing nothing, so no phase ordering can make the answer wrong.
 
 ### What a reduction rule must satisfy
 
-A rule is a pure function of resolved argument types. Adding a `TypeFn` variant means writing one, and it is sound only if it obeys all four laws. Each is a property of the reduction *mechanism*, checkable by reading the rule, and each buys a specific guarantee; the normative statement lives in `src/ccl/infer/solver/reduce.rs`, "The laws a rule must satisfy".
+A rule is a pure function of resolved argument types, and is sound only if it is **pure**, **monotone** in the subtype order, **normalizing** (its result contains no `App`), and **declares a [`CycleTolerance`](#cycles-are-recurrences-in-the-program)**. Each is checkable by reading the rule; what each one buys inference is stated normatively in `src/ccl/infer/solver/reduce.rs`, "The laws a rule must satisfy", and is not repeated here.
 
-| Law | Statement | Guarantee |
-|---|---|---|
-| 1. Pure | a function of `(fun, args)`: no inference context, no bound graph, no fresh variables, no recorded constraints | reduction may run at any point in any walk, so it can be demand-driven rather than scheduled |
-| 2. Monotone | `𝑎ᵢ <: 𝑏ᵢ` for all `𝑖` ⟹ `𝑓(𝑎⃗) <: 𝑓(𝑏⃗)` | an argument only gets more precise as the graph fills in, so a later reduction refines an earlier one rather than contradicting it |
-| 3. Declares a `CycleTolerance` | whether the rule can answer while an argument is cyclic; `reduce` enforces it | a rule that cannot answer reports the cycle instead of guessing, and one that can is never asked to — see [Cycles are recurrences in the program](#cycles-are-recurrences-in-the-program) |
-| 4. Normalizing | the result contains no `App` | one reduction terminates without a fixpoint — the rule set is closed and no rule feeds itself |
-
-**There is deliberately no law about refinements.** Whether a rule may carry an argument's refinement into its result is not a property of reduction — it is a question about what the operator *means*, and [Which operators need one](#which-operators-need-one) is where it is decided: a rule that **selects** one of its arguments must carry it, one that **computes** a new value must not.
-
-As a law it would be wrong twice: it would forbid the selecting rules outright, and it would still miss the failure that actually threatens soundness — a rule that *invents* a claim its arguments do not support inherits nothing and is monotone, so it passes all four. `shared_base`'s `debug_assert` is a postcondition of that one function, not a rule the others obey.
+**There is deliberately no law about refinements.** Whether a rule may carry an argument's refinement into its result is not a property of reduction but a question about what the operator *means*, decided per operator in [Which operators need one](#which-operators-need-one). As a law it would forbid the selecting rules outright, and would still miss the failure that actually threatens soundness — a rule that *invents* a claim its arguments do not support inherits nothing and is monotone, so it passes every law above.
 
 ### Where an operand requirement lives
 
@@ -1122,13 +1111,7 @@ a fixpoint equation, because an accumulator *is* one. Measured, 1,910 cyclic arg
 
 Deliberately **not per-argument**. Every rule's condition is about *how many* arguments are cyclic rather than which — arithmetic's operands are interchangeable to its rule, and a rule needing one argument needs it whichever position it occupies. A rule wanting "at least 𝑛 known" would generalize this to a count; none does.
 
-#### The cut is an unrolling, not an iteration
-
-The cut does **not** iterate the equation towards its fixpoint. It unrolls it a number of times fixed by the shape of the program and stops. Traced on `x := 0; x := x + 1; x`, one materialization reduces `Add(⟨cyclic⟩, 1) → Int` and then `Add(Int, 1) → Int`, and ends; `x + x` reaches three levels because each operand re-enters separately. In every shape measured the **outermost** frame — the one whose answer becomes the node's type — sees every argument known, which is where operands that genuinely disagree are caught.
-
-The consequence for a rule author is the opposite of the familiar one. Because nothing iterates, whatever a rule answers at a cut is **what the unrolling carries**; there is no later pass that widens it. A rule must therefore be *sound* at the cut, not merely improvable. Both of today's rules are, for free: arithmetic drops to the shared base — the top of the chain the missing operand could have contributed to — and comparison is constant on its domain.
-
-A sharper rule that kept what it could see at the cut would instead return whatever a bounded unrolling happened to reach, sound only by accident of how far the program unrolled. That is the check to run when writing the range-aware `Arithmetic` in [Known gaps](#known-gaps), and **widening does not answer it**, because there is no iteration to widen: answer the base at a cut, or declare `AllKnown` and report.
+The cut is an **unrolling, not an iteration**: it unrolls the equation a number of times fixed by the shape of the program and stops, and the outermost frame — whose answer becomes the node's type — sees every argument known, which is where genuinely disagreeing operands are caught. So whatever a rule answers at a cut is what the unrolling carries, and a rule must be *sound* there rather than merely improvable; widening is not the remedy, because there is no iteration to widen. `reduce.rs`, "What the cut actually is" has the trace and the consequences for a rule author — it is the thing to read before writing the range-aware `Arithmetic` in [Known gaps](#known-gaps).
 
 ### Obligations that are not decidable yet are parked
 
@@ -1136,9 +1119,9 @@ A sharper rule that kept what it could see at the cut would instead return whate
 
 So the obligation is **parked** rather than decided or dropped. `constrain_go` records it with the in-flight substitutions applied; `require_sub` tags it with the node to blame; `InferCtx::check_parked_obligations` retries it between emission and coalesce — the point at which every edge the program implies has been recorded and reduction is meaningful. Each side materializes to an `App`-free type and the obligation becomes an ordinary subtyping check.
 
-Only **fully determined** obligations are checked, which is what keeps the retry from perturbing the graph it is reading. A side that still contains a variable after materialization is one the program never determined; re-constraining it would record a bound, and a graph mutation after emission would make a later resolution's answer depend on whether this pass ran. Skipping is not a hole — an undetermined operand is an ambiguous program, and coalesce reports it as `UnresolvedInfer`. With both sides variable-free the check cannot deposit anything.
+Only **fully determined** obligations are checked, which is what keeps the retry from perturbing the graph it reads: a side still holding a variable is one the program never determined, and coalesce reports that as `UnresolvedInfer` anyway. Both directions park, because the arm's rule is "undecidable now" rather than a claim about which shapes arrive.
 
-Both directions are parked, because the arm's rule is "undecidable now" rather than a claim about which shapes arrive. The direction that matters is an application on the *lower* side against a concrete demand: `(1 + 2) and True` closes to `Add(α, β) <: Bool`, which nothing downstream re-derives. Accepting it silently turned an ordinary user type error into a panic at the `check_pre_desugar` wall, which cannot distinguish one from a compiler bug.
+This is what makes `(1 + 2) and True` an ordinary diagnostic. It closes to `Add(α, β) <: Bool`, which nothing downstream re-derives, so accepting it silently turned a user type error into a panic at the `check_pre_desugar` wall — which cannot tell one from a compiler bug.
 
 ### Which operators need one
 
@@ -1185,7 +1168,7 @@ Two problems look like this one and are not:
 
 **The interaction with inference** — a computation blocked on an unsolved metavariable — is Agda's **constraint postponement** (Norell, *Towards a practical programming language based on dependent type theory*, Chalmers, 2007): a constraint that cannot be decided because a meta blocks reduction is suspended and retried when the meta is solved. Parking is the same move at coarser granularity, retried once after emission rather than woken per-solution. The coarser version is sound here because emission is a single bounded phase with no solving after it; a system that solved incrementally would need the finer wake-up.
 
-**Refinements** are inferred elsewhere by predicate abstraction over a fixed qualifier set ([Rondon, Kawaguchi & Jhala, *Liquid Types*, PLDI 2008](https://dl.acm.org/doi/10.1145/1375581.1375602)). Law 5 is the dual discipline and deliberately weaker: a refinement is never *inferred* for a computed type, only *derived* by a rule that knows how. Range-aware arithmetic is where deriving would start.
+**Refinements** are inferred elsewhere by predicate abstraction over a fixed qualifier set ([Rondon, Kawaguchi & Jhala, *Liquid Types*, PLDI 2008](https://dl.acm.org/doi/10.1145/1375581.1375602)). The discipline here is deliberately weaker: a refinement is never *inferred* for a computed type, only *derived* by a rule that knows how. Range-aware arithmetic is where deriving would start.
 
 ### Known gaps
 
@@ -1200,6 +1183,8 @@ Two problems look like this one and are not:
 ### `groupby`
 
 `groupby` is not a dedicated node. It lowers to a cast-wrapped key lambda — `λ k → cast({I | i ▷ c ▷ key == k} ⇒ A, λ i → c(i))` — so its typing falls out of the ordinary `Lambda`/`Cast` rules plus the dependent-refinement machinery of [§4.5](#45-dependent-refinements-via-pi-types); planning's `convert_groupby_pointful` then recognizes the resulting Pi-const source.
+
+One thing the shape does not say is that the partition's **domain is the type of its keys** — `k`'s only occurrence is an operand of that `==`, and a comparison does not relate its operands ([§4.7](#47-type-functions)). Lowering states it with a `Type::SharedHole(id)`: a `Hole` with an identity, where every occurrence of one id normalizes to the same inference variable. It is carried by the key application and by the domain of the group-by's own `data_fun` annotation, so the edge runs `key_ty <: ⟨the parameter⟩` through the annotation's contravariance rather than forcing the two equal.
 
 ### BinOp type rules
 

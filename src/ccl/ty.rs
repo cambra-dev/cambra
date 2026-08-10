@@ -343,21 +343,22 @@ pub enum Type {
     /// This is how lowering states a relation between two type positions it cannot
     /// name. A plain `Hole` says "infer this", and each occurrence gets its own
     /// fresh variable; `SharedHole(id)` says "infer this, and it is the same one as
-    /// that" — the weakest thing that lets a desugaring connect a binder to a type
-    /// only inference will learn.
+    /// that" — the weakest thing that lets a desugaring relate two positions whose
+    /// common type only inference will learn.
     ///
-    /// The motivating site is `groupby`, whose lowering binds a key parameter
-    /// whose only occurrence is inside a refinement predicate:
+    /// The motivating site is `groupby`, whose partition domain *is* the type of the
+    /// keys its predicate compares:
     ///
     /// ```text
     /// λ __gb_k → cast({_ | __elem ▷ coll ▷ key_fn == __gb_k} ⤇ _, …)
     /// ```
     ///
-    /// The key's type *is* `key_fn`'s codomain, present in the same expression, but
-    /// nothing relates them — so the parameter's type could only ever arrive
-    /// backwards through the `==`, via the operand requirement that relates a
-    /// comparison's two sides. Stating the relation directly is what removes that
-    /// dependence.
+    /// Nothing in that shape says so — `__gb_k`'s only occurrence is an operand of
+    /// the `==`, and a comparison does not relate its operands — so the id is
+    /// carried by the key application and by the domain of the group-by's own
+    /// `data_fun` annotation. Both are facts about the group-by; `__gb_k` is a name
+    /// this lowering invented, which is why the *binder* is not where the relation
+    /// is stated (see `lower_call`'s `groupby` arm for the direction that buys).
     ///
     /// Lowering cannot mint a [`Type::Infer`] itself for three reasons: the
     /// `InferArena` that owns every variable is created *inside* `infer`, so a
