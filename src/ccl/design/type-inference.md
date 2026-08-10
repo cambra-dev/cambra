@@ -600,7 +600,9 @@ The reason is that a literal knows more about itself than its base does, and tha
 
 What this changed is instructive, because refinements were rare enough before that several rules assumed their absence. Each was already wrong for a user-written refinement; literals are merely the first thing that makes them reachable.
 
-* **An operator does not propagate its operands' refinements** (`apply_binary_scheme` strips them). Arithmetic's `∀α. α → α → α` shares *one* variable across both operands and the result, so a refinement reaching α claims the operator preserved it. No binary operator does: `x + x` where `x` is `2` gives `4`. The claim is invisible while operands merely join — distinct refinements intersect to none — and wrong when they do not, since intersecting a set with itself is that set. The unary path deliberately keeps them: its operators are monomorphic, and its other user is aggregates, whose operand is a *collection* whose refinements describe its domain.
+* **An operator does not *inherit* its operands' refinements**, and does not have to be *made* not to. A refinement is a fact about a value, so an operator that computes a new value cannot carry one over: `𝑥 + 𝑥` where `𝑥` is `2` produces `4`. Arithmetic, comparison and negation state their requirement as a [trait](#traits), over a variable per operand and per associated type — all unrelated — which leaves no path for an operand's refinement to reach the result by sharing. The remaining monomorphic operators (`and`, `++`, `not`) keep an ordinary scheme and pass their operands verbatim — nothing is shared with the result, so a refined operand simply flows into a concrete domain. Aggregates likewise keep theirs, since their operand is a *collection* whose refinements describe its domain and the rule must see them.
+
+  Inheriting is not the same as **computing**, and only the first is ruled out. `{Int | __elem == 2} + {Int | __elem == 3}` genuinely *is* `{Int | __elem == 5}`, and a trait implementation is where such a rule would live, since it determines the output type rather than forcing it to be a position the operands already occupy. Today every implementation computes a base and stops — a property of the table, not of the mechanism. Two things would have to change to lift it: an implementation would need the operands' *types* rather than their bases, and the deposit would have to move to a point where those types are final. Eager deposit is sound for a base because a base never weakens, while a refinement set only shrinks as further lower bounds arrive — so a refinement computed from a partial view is too strong. A rule computing from resolved operands then meets recurrences (`x := x + 1` resolves its operand through its own output), where it must already be sound at the cut; and anything beyond constant folding and interval arithmetic needs predicate *implication*, which the lattice deliberately does not have (refinements match structurally — see this file's module-level note in `src/ccl/infer/solver/mod.rs`).
 * **A mutable register takes no refinement** from its initializer or from any single write. A register is not one value but the sequence its writes produce, so its value type is the join over all of them; taking one contribution's refinement would assert it never changes, which is what declaring it mutable denies. The rule holds at every place a register's value type is *built*, not just at the `:=`/`+=` rule: the `Transact` carrier's keys (where the seed is the value type's only lower bound, so an unstripped seed would resolve the register — and every read of it — to the seed's singleton), the recognition that builds that carrier, and the phase that reads the value type back off the seed binding.
 * **Every merge point joins** — a list's elements, a `Case`'s arms, a register's seed and writes, a channel's contributions. This is the one rule the singleton made load-bearing, and the one place it is easy to get wrong, because a merge that simply *adopts one input's type* looks right until the inputs carry different refinements. The law: a refinement is a fact about **a value**, and a merge point is not one value — it is whichever input the runtime supplies — so a refinement survives the merge only if *every* input establishes it. Two arms depositing different singletons intersect to none (`1 if 𝑐 else 2` is an `Int`); two arms depositing the same restriction keep it (identical filtered comprehensions stay filtered, `5 if 𝑐 else 5` is still the `5`). Where the merge is a fresh variable every input flows into, the solver's join *is* the rule and nothing has to strip; where a pass builds the merged type by hand (`channelize`'s channel union, the `Transact` carrier's key seeds) it must intersect the refinements explicitly.
 
@@ -1046,6 +1048,67 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
 
 ---
 
+## Traits
+
+The constraint lattice can state that two positions are **equal** or **related by subtyping**. That is everything an operator needs when its result *is* one of its operands — `max(xs)` returns an element, `x.f` returns the field — because "is one of" is a shared lattice position. It is not enough for an operator whose result is **computed from** its operands, and `+` is the smallest example: the sum of two values is neither of them. (Sharing one variable across operands and result — the signature this replaced — states the requirement in the one place it is wrong in both polarities at once; `an_operator_result_carries_no_operand_refinement` pins the consequence.)
+
+### Vocabulary
+
+* A **trait** is a named requirement a type may satisfy — `Addable`, `Orderable`, `Comparable`. **A trait is not a type**: no `Type` variant, no lattice point, no subtyping edge, and the type grammar and `constrain_go`'s rules are untouched. Types *satisfy* traits.
+* An **implementation** is one row of a trait's table: the types it accepts, and the types it associates with them.
+* An **associated type** is a type a trait *names* — `Output`, the type an arithmetic operator's result takes. A trait is a requirement rather than a function, so it associates any number, **including none**. A type is associated only when it *depends* on the types satisfying the trait: a comparison's `Bool` is the same for every pair `Equatable` accepts, so it belongs to the operator's signature and `Equatable` associates nothing — recording it as an association would claim the trait determines something it does not.
+* An **obligation** is one recorded instance of a trait at specific type positions: one **operand position** per argument the trait takes, and one **associated position** per type it names. It is a single claim with two halves, and neither alone is the obligation: *the operand positions are types some implementation accepts*, **and** *each associated position is what that implementation associates*. Every position is an ordinary inference variable, unrelated to the others.
+
+An operator's signature is therefore `𝐴₁ → … → 𝐴ₙ → 𝑅` plus the obligation, for the trait's arity `𝑛`, where `𝑅` is either one of the associated positions or a type the operator fixes. The three shapes the operators take:
+
+| operator | signature | obligation |
+|---|---|---|
+| `+` | `∀ 𝐴 𝐵 𝑂. 𝐴 → 𝐵 → 𝑂` | `Addable(𝐴, 𝐵)`, `Output` at `𝑂` |
+| `==` | `∀ 𝐴 𝐵. 𝐴 → 𝐵 → Bool` | `Equatable(𝐴, 𝐵)`, nothing associated |
+| unary `-` | `∀ 𝐴 𝑂. 𝐴 → 𝑂` | `Negatable(𝐴)`, `Output` at `𝑂` |
+
+Mechanism: `src/ccl/infer/solver/traits.rs`.
+
+Because an associated position like `𝑂` is an ordinary variable rather than a marker standing for a computation, information flows *backwards* through an operator's result and misusing that result is an ordinary diagnostic — `(1 + 2) and True` fails as a bound conflict. A computed-type marker cannot have this property: the solver cannot compare an unreduced computation against anything, so a function could not be typechecked without seeing its call sites.
+
+### Refinements are transparent
+
+`{𝑇 | 𝑝}` satisfies a trait exactly when `𝑇` does. This holds *by construction*: satisfaction is judged on each bound contribution as it arrives, with refinements peeled at that moment — when the base actually exists. An operand is usually still an inference variable at emission, so a peel performed *there* would have nothing to work on.
+
+### Discharge is incremental
+
+An obligation is a monotone fact discharged as the graph fills in, the shape [`FunKindVar`](#46-data-vs-compute-functions) already uses for kinds — not a sweep at the end of solving. Each operand position carries a **candidate set** of implementations that only ever shrinks; each associated type is deposited on its position as an ordinary lower bound as soon as every surviving candidate agrees on it. Order therefore does not matter.
+
+What arrives at a position is classified three ways, and the third is easy to miss: a contribution either offers a **base**, is **not determined yet** (an inference variable, a hole, a transient `Feed` handle whose payload arrives separately), or is **determined and not a base** (a tuple, record, variant or function). The first narrows; the third is rejected outright, because no implementation can ever accept it; only the second is genuinely "nothing to say".
+
+Collapsing the last two is a live hazard rather than a hypothetical. While "no base here" meant "no information", `(1, 2) == (3, 4)` type-checked as `Bool`: a tuple narrowed nothing, and a comparison has no associated position to leave unresolved, so no later wall saw it either. The same hole let `max` accept a tuple codomain.
+
+What narrowing cannot reject is a position the program never determines — which is the honest outcome, reported as an unresolved variable rather than as a missing implementation.
+
+### What an obligation determines, and what it leaves alone
+
+The deposit rule is *whatever every surviving implementation agrees on*, applied to the **associated positions only**. Nothing is ever deposited onto an operand.
+
+The asymmetry is not soundness — with one candidate left, its operand types are implied exactly as its associated types are. It is that the obligation is an associated position's **only** source of information and never an operand's: an associated position is a fresh variable nothing else constrains from below, while an operand always has the program's own `operandᵢ <: 𝐴ᵢ` edge. Determining an operand from the table would be recovering information the program was supposed to supply, which hides an under-connected lowering instead of fixing it.
+
+How much gets determined is therefore a property of the table, and shrinks as the table grows — **for the output too**. Today `λ 𝑥 → 𝑥 + 1` is `∀𝐴 𝑂. (𝐴 : Addable(𝐴, Int)) ⇒ 𝐴 → 𝑂` with `𝑂` resolving to `Int`, because `Int` in the second position leaves only `(Int, Int) ⇝ Int`. Adding `Addable(Float, Int) ⇝ Float` would leave two candidates whose outputs disagree, and the result would become as open as the parameter already is. That is the type honestly tracking a language that has become more permissive, and it is why the deposit waits for *agreement* rather than firing on a unique candidate.
+
+### Delivery: the watch follows the edge
+
+An obligation is attached to each operand variable as a *watch* (`InferVar::watches`), and everything the invariant rests on is **delivery** — a concrete type reaching an operand variable has to reach the obligation watching it.
+
+The bound closure does not deliver on its own. When two variables sit at different polymorphism levels — which is what a `let` RHS produces, being emitted one level deeper — their edge is recorded by the arm whose closure runs against the *other* side's bounds, so a type already sitting on the lower variable is never re-offered. The graph is still correct, but only *transitively* readable, which is something coalesce does and emission does not.
+
+A variable's lower bounds are written in exactly four places, and delivery is wired into every one: `constrain_go`'s two variable arms (a concrete contribution is delivered directly; a var-var edge propagates the watch *downward*, toward the variables feeding the watched one, and delivers what they already know), `extrude`'s proxy seeding, and `freshen_above`'s clone — the latter two because both seed bounds by direct writes rather than through `constrain_go`.
+
+That the list is closed is an argument about today's code, not something the compiler enforces, and a missed delivery is quiet: the obligation simply never narrows, so a type is left undetermined and surfaces phases later on an interior node. `verify_narrowing_is_complete` therefore checks the argument rather than trusting it — after emission, every watched operand is resolved against the completed graph, and a resolved base must already have narrowed its obligation. `a_concrete_operand_reaches_its_obligation` covers the four writers with a case per mechanism.
+
+### Requirements are generalized
+
+Obligations ride variables through `freshen_above`, so a generalized function carries its operators' requirements into its scheme. Each use instantiates and discharges its **own** copy — sharing one would let a `String` use empty an `Int` use's candidate set.
+
+---
+
 ## 5. CCL-specific inference rules
 
 §1–§4 describe the engine generically; the general two-pass structure (emit → coalesce) is §2. This section covers the per-node wiring specific to CCL's AST — the structural rule each `TypedExprNode` variant emits. `ccl::infer` runs on a `TypedExpr` whose nodes all carry `Type::Hole`, calls the emit rules below per node, and coalesces the resulting constraint graph back onto each `expr.ty` (§2). A residual `Type::Infer(id)` after inference means the coalesce pass left a variable genuinely unconstrained (e.g. the parameter of an unapplied identity lambda).
@@ -1058,18 +1121,20 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
 
 | Op kind | Operand constraint | Result type |
 |---|---|---|
-| `Arithmetic` | both operands constrained `<: α` (joined into a shared variable) | operand type |
+| `Arithmetic` | a trait obligation over two *unrelated* variables — `Addable`, `Subtractable`, `Multipliable`, `Divisible` | the trait's `Output` |
+| `Compare` | a trait obligation — `Equatable` (`==`, `!=`) or `Orderable` (`<`, `<=`, `>`, `>=`), which associate nothing | `Bool`, fixed by the operator |
 | `Concat` | both operands constrained to `String` | `String` |
-| `Compare` | both operands constrained `<: α` (joined into a shared variable) | `Bool` |
 | `BoolLogic` | both operands constrained to `Bool` | `Bool` |
 
-**Note**: String + String → `Concat` rewriting is performed at **compile time** (in `lambda_elim.rs`), not at inference time. The inference pass only constrains both operands to `String` and returns `String` as the result type.
+The bottom two rows are ordinary schemes, because their operand types are fixed. The top two are not, and could not be: see [Traits](#traits).
+
+**Note**: String + String → `Concat` rewriting is performed at **compile time** (in `simplify.rs`), not at inference time. Inference accepts `(String, String) ⇝ String` as an `Addable` implementation and returns `String`.
 
 ### UnaryOp type rules
 
 | Op kind | Operand constraint | Result type |
 |---|---|---|
-| `Neg` | operand constrained to `Int` | `Int` |
+| `Neg` | a **unary** trait obligation — `Negatable` | the trait's `Output` |
 | `Not` | operand constrained to `Bool` | `Bool` |
 
 ### `Case` inference

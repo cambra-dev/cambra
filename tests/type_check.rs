@@ -171,6 +171,275 @@ fn test_binary_op(#[case] code: &str, #[case] expected: BaseType) {
     assert_eq!(infer_program(code), Type::Base(expected));
 }
 
+/// An operator **computes** a new value, so it carries no refinement from its
+/// operands — not even when both operands carry the *same* one.
+///
+/// The `same_variable_twice` case is the one that regresses under a shared-variable
+/// signature (`∀α. α → α → α`): the result position is positive, where refinement
+/// sets *intersect*, and intersecting a set with itself returns it, so `x + x` where
+/// `x` is `2` claimed the sum was `2`. Distinct singletons intersect to nothing,
+/// which is why the other two cases pass either way.
+#[rstest]
+#[case::same_variable_twice("x = 2\nx + x")]
+#[case::distinct_singletons("x = 2\ny = 3\nx + y")]
+#[case::literals("2 + 2")]
+fn an_operator_result_carries_no_operand_refinement(#[case] code: &str) {
+    assert_eq!(infer_program(code), int());
+}
+
+/// The three shapes a trait can take are each exercised by a real program, which is
+/// what keeps the machinery from being fitted to one of them.
+///
+/// | | arity | associates |
+/// |---|---|---|
+/// | `Negatable` | unary | `Output` |
+/// | `Addable` | binary | `Output` |
+/// | `Equatable` / `Orderable` | binary | nothing |
+///
+/// The last row is the one worth stating: a comparison's `Bool` comes from the
+/// *operator*, not the trait — it is the same `Bool` for every pair the trait accepts,
+/// so it says nothing about them. Recording it as an associated type would claim the
+/// trait determines something it does not.
+#[rstest]
+#[case::unary_with_an_output("-(2 + 3)", int())]
+#[case::binary_with_an_output("2 + 3", int())]
+#[case::binary_associating_nothing("2 < 3", bool_ty())]
+#[case::composed("-(2 + 3) < 4", bool_ty())]
+fn each_trait_shape_types_a_real_program(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
+}
+
+/// Negation is a trait, so an operand it has no implementation for is rejected as a
+/// missing implementation rather than as a mismatch against a hardcoded domain.
+#[test]
+fn negation_rejects_an_operand_with_no_implementation() {
+    let errs = infer_program_err(r#"-"a""#);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == "Negatable")),
+        "expected NoTraitImpl for Negatable, got {errs:?}"
+    );
+}
+
+/// Composites are **not** comparable, and not addable either.
+///
+/// The tables have no row for a tuple, record or collection — but an absent row is
+/// not by itself a rejection, and for a while it was not one: a composite offers no
+/// base to narrow with, and a comparison has no associated type to leave unresolved,
+/// so `(1, 2) == (3, 4)` type-checked as `Bool` and failed in the interpreter. What
+/// rejects it is the distinction between *not determined yet* and *determined, and
+/// not a base* (`Offered` in `src/ccl/infer/solver/traits.rs`).
+#[rstest]
+#[case::tuple_equality("(1, 2) == (3, 4)", "Equatable")]
+#[case::tuple_ordering("(1, 2) < (3, 4)", "Orderable")]
+#[case::tuple_arithmetic("(1, 2) + (3, 4)", "Addable")]
+#[case::record_equality("(a=1) == (a=2)", "Equatable")]
+#[case::collection_equality("[1, 2] == [3, 4]", "Equatable")]
+fn a_composite_satisfies_no_trait(#[case] code: &str, #[case] expected: &str) {
+    let errs = infer_program_err(code);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == expected)),
+        "expected NoTraitImpl for {expected}, got {errs:?}"
+    );
+}
+
+/// `unit` is comparable to nothing, because the interpreter cannot compare units —
+/// an out-of-table *base*, rejected by ordinary narrowing rather than by the
+/// composite rule above.
+#[test]
+fn a_base_outside_the_table_is_rejected() {
+    let errs = infer_program_err("None == None");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == "Equatable")),
+        "expected NoTraitImpl for Equatable, got {errs:?}"
+    );
+}
+
+/// A refinement is transparent to a trait: `{Int | …}` satisfies `Addable` exactly
+/// when `Int` does, in both directions.
+///
+/// The positive half is `2 + 2` above (singletons are addable). This is the negative
+/// half — a refined `String` is no more subtractable than a bare one, and the
+/// rejection names the trait rather than reporting two types that "don't match".
+#[test]
+fn a_refinement_does_not_make_a_type_satisfy_a_trait() {
+    let errs = infer_program_err(r#""a" - "b""#);
+    assert!(
+        errs.iter().any(
+            |e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == "Subtractable")
+        ),
+        "expected NoTraitImpl for Subtractable, got {errs:?}"
+    );
+}
+
+/// Operands no implementation accepts together are rejected — including for a
+/// **comparison**, whose result type is `Bool` whatever the operands are.
+///
+/// That last part is the whole reason the requirement is recorded as an obligation
+/// rather than derived from the result. A comparison's result mentions neither
+/// operand, so any scheme that reads the requirement off the result type would never
+/// look at them: `1 > "a"` would type cleanly as `Bool` and fail in the interpreter.
+#[rstest]
+#[case::compare_int_string(r#"1 > "a""#)]
+#[case::equate_int_bool("1 == True")]
+#[case::add_int_bool("1 + True")]
+fn operands_no_implementation_accepts_are_rejected(#[case] code: &str) {
+    let errs = infer_program_err(code);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, InferError::NoTraitImpl { .. })),
+        "expected NoTraitImpl, got {errs:?}"
+    );
+}
+
+/// An operator's result flows onward as an ordinary type, so misusing it is an
+/// ordinary diagnostic rather than a wall the compiler cannot explain.
+///
+/// This is what an *unreduced computed type* in the result position costs: the
+/// solver cannot compare one against anything, so the obligation has to be deferred
+/// and retried, and a conflict that nothing re-derives escapes inference entirely.
+/// Here the result is a plain inference variable that the trait deposits `Int` on, so
+/// `and` rejects it exactly as it would reject any other `Int`.
+#[rstest]
+#[case::arithmetic_into_bool_logic("(1 + 2) and True")]
+#[case::string_arithmetic_into_sum(r#"sum(["a" + "b"])"#)]
+fn misusing_an_operator_result_is_an_ordinary_diagnostic(#[case] code: &str) {
+    assert!(
+        !infer_program_err(code).is_empty(),
+        "expected the misuse of an operator's result to be rejected"
+    );
+}
+
+/// A generalized function carries its operators' requirements into its scheme, so it
+/// typechecks on its own and each use discharges its **own** copy.
+///
+/// `f = \a -> \b -> a + b` is `∀A B O. (Addable(A, B) ⇝ O) ⇒ A → B → O`. Two uses at
+/// different types both succeed, which is the property that fails if instantiations
+/// share one obligation: whichever use narrowed first would empty the other's
+/// candidate set.
+#[test]
+fn a_generalized_function_instantiates_its_operator_requirements() {
+    assert_eq!(infer_program("f = \\a, b -> a + b\nf(1, 2)"), int());
+    assert_eq!(
+        infer_program("f = \\a, b -> a + b\nf(\"x\", \"y\")"),
+        string()
+    );
+    assert_eq!(
+        infer_program("f = \\a, b -> a + b\n(f(1, 2), f(\"x\", \"y\"))"),
+        Type::Tuple(vec![int(), string()])
+    );
+}
+
+// An obligation is discharged by *delivery*: a concrete type reaching an operand
+// variable has to reach the obligation watching it. Production code writes a
+// variable's lower bounds in exactly four places — `constrain_go`'s two variable
+// arms, `extrude`'s proxy seeding, and `freshen_above`'s clone — and there is a case
+// per mechanism below, each confirmed to discriminate by deleting the mechanism it
+// names and watching only its own case fail.
+//
+// A missed delivery leaves a type *undetermined* rather than wrong, so it reads as an
+// ordinary under-determined program rather than an error — which is why these assert
+// through the consistency wall.
+#[rstest]
+// The variable arms, across a *level boundary*: `s + i` sits in a `let` RHS, emitted
+// one level deeper than the loop binder, so `⟨binder⟩ <: A` is recorded by the arm
+// that closes against `A`'s uppers and never re-offers the `Int` already sitting on
+// the binder. Delivery has to follow the var-var edge downward instead.
+#[case::across_a_level_boundary("s := 0\nfor i in [1, 2, 3]:\n    y = s + i\n    s := y\ns")]
+// `extrude`: a generalized multi-argument function is emitted a level deeper than its
+// use, so constraining its tuple parameter down to the use's level mints proxies
+// whose bounds are seeded by *direct writes* rather than through `constrain_go`. The
+// nesting matters — the outer operator's operand is the inner operator's output, and
+// that is the variable that gets approximated.
+#[case::through_an_extrusion_proxy("m = \\a, b -> a * b + 1\nm(3, 4)")]
+// `freshen_above`: each use of a generalized function instantiates its own copy of
+// the obligation, which has to be reachable from the freshened operand variables.
+#[case::through_a_freshened_instantiation("k = \\a, b -> a + b\nk(k(1, 2), 3)")]
+fn a_concrete_operand_reaches_its_obligation(#[case] code: &str) {
+    // The wall, not the root type: a missed delivery can leave an *interior* node
+    // undetermined while the program's own type resolves fine — which is exactly how
+    // the extrusion case presents.
+    infer_and_check(code);
+}
+
+// The value type of a register, ignoring the sequencing domain — an `Infer` until the
+// mutability-elimination phases resolve it, so it cannot be asserted on here.
+fn register_value_type(code: &str) -> Type {
+    match infer_program(code) {
+        Type::History { value, .. } => *value,
+        other => panic!("expected a register type for `{code}`, got {other}"),
+    }
+}
+
+// A register that reads itself in its own write is a **cycle**: `value(x)` is defined
+// by an equation mentioning `value(x)`. These pin that an operator inside one still
+// gets a type — and, more precisely, *why* it needs no cycle machinery to do so.
+//
+// Narrowing consumes a bound at the moment it is recorded, not a resolved type, so an
+// obligation never enters the recurrence at all. The base it needs is on the
+// register's **seed**, which is an ordinary lower bound of the value variable and
+// reaches the operand positions like any other. That holds even when *both* operands
+// are the cycle (`x := x * x`), where a rule that resolved its operands would have
+// nothing to work from.
+//
+// The loop-carried accumulator is covered end-to-end in
+// `compilation_pipeline::mutability`; these are the harder shapes no test reached —
+// both operands cyclic, a cycle crossing a call boundary, mutual recursion between
+// registers, and a non-`Int` base.
+#[rstest]
+// One cyclic operand, the shape every accumulator has.
+#[case::self_add("x := 0\nx := x + 1\nx", "Int")]
+// **Both** operands cyclic: only the seed offers a base.
+#[case::self_multiply("x := 2\nx := x * x\nx", "Int")]
+#[case::self_subtract("x := 10\nx := x - x\nx", "Int")]
+// Nested, so an inner operator's output is itself an operand of an outer one.
+#[case::nested("x := 0\nx := (x + 1) * (x + 2)\nx", "Int")]
+#[case::deeply_nested("x := 1\nx := ((x + x) * (x + x)) + ((x * x) + (x + x))\nx", "Int")]
+// Routed through user functions, so the cycle crosses a call boundary — and the
+// obligations are the *freshened* copies of the callee's.
+#[case::through_functions(
+    "def f(a):\n    a + 1\ndef g(a):\n    a * 2\nx := 0\nx := f(x) + g(x)\nx",
+    "Int"
+)]
+#[case::through_nested_calls("def f(a):\n    a + 1\nx := 0\nx := f(f(x))\nx", "Int")]
+// Two registers each defined in terms of the other: the cycle spans two equations.
+#[case::mutual("x := 0\ny := 0\nx := y + 1\ny := x + 1\nx", "Int")]
+#[case::three_way("x := 0\ny := 0\nz := 0\nx := z + 1\ny := x + 1\nz := y + 1\nz", "Int")]
+// A non-`Int` base, so the answer comes from the operands rather than a hardcoded row.
+#[case::string_accumulator("s := \"a\"\ns := s + \"b\"\ns", "String")]
+// A comparison cycle: its output is `Bool` for every implementation, so it is settled
+// at birth and the cycle costs it nothing. Nothing else in the suite writes one.
+#[case::self_comparison("b := True\nb := (b == True)\nb", "Bool")]
+#[case::conditional("x := 0\nx := x + 1 if x == 0 else x - 1\nx", "Int")]
+fn a_register_that_reads_itself_still_gets_a_type(#[case] code: &str, #[case] base: &str) {
+    assert_eq!(register_value_type(code).to_string(), base);
+}
+
+/// A cycle must not hide a conflict: the seed and the write have to agree, and the
+/// obligation sees both as ordinary bounds.
+#[test]
+fn a_cycle_does_not_hide_an_operand_conflict() {
+    assert!(
+        !infer_program_err("x := 0\nx := x + \"a\"\nx").is_empty(),
+        "a conflict reachable only through a cyclic operand must still be a diagnostic"
+    );
+}
+
+/// The requirement travels with the function, so applying it at a type no
+/// implementation accepts is rejected at the call site.
+#[test]
+fn a_generalized_function_rejects_a_use_its_trait_forbids() {
+    let errs = infer_program_err("f = \\a, b -> a - b\nf(\"x\", \"y\")");
+    assert!(
+        errs.iter().any(
+            |e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == "Subtractable")
+        ),
+        "expected NoTraitImpl for Subtractable, got {errs:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Let binding / scoping tests
 // ---------------------------------------------------------------------------
@@ -800,23 +1069,51 @@ fn test_self_application_types() {
     );
 }
 
+/// An unapplied lambda whose parameter is used only as an operator's operand keeps an
+/// **open parameter** and, today, a determined result.
+///
+/// `\x -> x + 1` carries the obligation `Addable(A, Int) ⇝ O`. Nothing is ever
+/// deposited onto an operand position, so `A` stays an inference variable exactly as
+/// it does for `\x -> x` — the program states "`x` is addable to `Int`", and `A`'s
+/// information is the program's to supply.
+///
+/// `O` is a different matter: the obligation is its only source, and every
+/// implementation whose second operand is `Int` returns `Int`, so it resolves. That
+/// is a fact about today's table rather than a stable property — adding
+/// `Addable(Float, Int) ⇝ Float` would leave two candidates whose outputs disagree
+/// and open the result too, which is why this asserts the codomain per case rather
+/// than as a rule.
 #[rstest]
 #[case::comparison(
     r"
 f = \x -> x > 1
 f
 ",
-    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
+    bool_ty()
 )]
 #[case::arithmetic(
     r"
 f = \x -> x + 1
 f
 ",
-    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(int()) }
+    int()
 )]
-fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
-    assert_eq!(infer_program(code), expected);
+fn test_lambda_unapplied(#[case] code: &str, #[case] expected_codomain: Type) {
+    let ty = infer_program(code);
+    let Type::Fun {
+        domain, codomain, ..
+    } = &ty
+    else {
+        panic!("expected a function type, got {ty}");
+    };
+    assert_eq!(
+        **codomain, expected_codomain,
+        "the operator's trait determines the result even with an open operand",
+    );
+    assert!(
+        matches!(**domain, Type::Infer(_)),
+        "an operand a trait does not determine stays open, got {domain}",
+    );
 }
 
 #[test]

@@ -214,6 +214,19 @@ pub struct InferVar {
     pub level: Level,
     /// Mutable lower/upper bound lists.
     pub bounds: RefCell<InferBounds>,
+    /// Trait obligations this variable is an operand of, with the position it
+    /// occupies in each. Every lower bound recorded here is delivered to them by
+    /// `notify_lower` (`src/ccl/infer/solver/traits.rs`), which is how an operator's
+    /// requirement is discharged incrementally rather than by a pass that goes
+    /// looking for obligations once solving has stopped.
+    ///
+    /// The list lives on the variable rather than in a side map on the inference
+    /// context because the three places that must reach it — the bound-recording
+    /// arms, `extrude`, and `freshen_above` — are free functions with no context in
+    /// hand. Like [`bounds`](Self::bounds) it is severed at arena teardown: an
+    /// obligation holds its output `Type`, which holds a variable, which holds the
+    /// obligation.
+    pub watches: RefCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
 }
 
 thread_local! {
@@ -269,6 +282,7 @@ impl InferVar {
             uid: fresh_infer_var_id(),
             level,
             bounds: RefCell::new(InferBounds::default()),
+            watches: RefCell::new(Vec::new()),
         });
         ACTIVE_ARENA.with(|slot| {
             if let Some(vars) = slot.borrow_mut().as_mut() {
