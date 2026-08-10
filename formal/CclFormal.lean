@@ -1,4 +1,5 @@
 import CclFormal.Ty
+import CclFormal.Merge
 import CclFormal.Sub
 import CclFormal.Decide
 import CclFormal.Json
