@@ -585,6 +585,31 @@ fn test_collection_union_heterogeneous_rejected() {
 // GroupBy + aggregate tests
 // ---------------------------------------------------------------------------
 
+// A group-by's key type is its key function's codomain, and the lowering says so
+// **directly** rather than leaving it to be recovered through the partition
+// predicate's `==`.
+//
+// `__gb_k`'s only occurrence in the lowered shape is as an operand of that
+// comparison, so without a stated relation its type can only arrive backwards
+// along the operand requirement that relates a comparison's two sides — making a
+// group-by's key inference depend on an operator's internals. One
+// `Type::SharedHole` states it, carried by the key application and by the domain of
+// the group-by's own `data_fun` annotation; these cases pin that the key resolves
+// to the key function's result type and not to the collection's element type.
+//
+// The relation is **not** visible in `test_lower_groupby`'s snapshots, because
+// `symbolic` does not render annotations. These are the tests that cover it.
+#[rstest]
+#[case("groupby([1, 2, 3], \\x -> x)", int())]
+#[case("groupby([(a=1, b=\"w\"), (a=2, b=\"e\")], \\r -> r.b)", string())]
+fn test_groupby_key_type_comes_from_the_key_function(#[case] code: &str, #[case] key_ty: Type) {
+    let ty = infer_program(code);
+    let Type::Fun { domain, .. } = &ty else {
+        panic!("a group-by is a function from key to partition, got {ty}");
+    };
+    assert_eq!(**domain, key_ty, "wrong key type for {code}");
+}
+
 #[test]
 fn test_groupby_aggregate() {
     // groups = groupby([1, 2, 3], \x -> x)

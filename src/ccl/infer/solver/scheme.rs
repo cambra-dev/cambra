@@ -227,9 +227,12 @@ pub fn freshen_above(
         return ty.clone();
     }
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => {
-            ty.clone()
-        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::SharedHole(_) => ty.clone(),
         // A channel domain minted inside the generalized definition
         // (level > lim) is *quantified* exactly like a variable — each
         // instantiation is its own channel. But a rigid name cannot be

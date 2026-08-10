@@ -761,6 +761,7 @@ impl Subst {
             | Type::DataSource(_)
             | Type::Txn
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_) => {}
 
             // a nominal channel domain names its defer
@@ -979,6 +980,7 @@ impl Subst {
             | Type::DataSource(_)
             | Type::Txn
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_) => ty.clone(),
 
             // rename the named defer binder, mirroring the
@@ -1089,7 +1091,8 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Txn
-        | Type::Hole => false,
+        | Type::Hole
+        | Type::SharedHole(_) => false,
         Type::Infer(_) => true,
         Type::Fun {
             domain, codomain, ..
@@ -1137,6 +1140,7 @@ fn collect_type_fv(
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
+        | Type::SharedHole(_)
         | Type::Infer(_) => {}
         Type::Fun {
             name,
