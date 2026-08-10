@@ -7,7 +7,7 @@ import CclFormal.Sub
 The pure-core term language, its values, capture-free substitution, the
 call-by-value small-step relation, and the declarative typing judgment
 `HasTy Γ e T`. Progress/preservation and the two corollaries (refinement
-soundness, case-binder preservation) build on these in the next increment.
+soundness, case-binder preservation) live in `Safety.lean`.
 
 ## Adjudications (deviations-on-contact, in the M0 tradition)
 
@@ -31,11 +31,26 @@ soundness, case-binder preservation) build on these in the next increment.
   terms don't get stuck" becomes "a well-typed term is a value, steps, or is
   filter-blocked at a cast" — and refinement soundness (`⊢ e : {T | p}` and
   `e ⇓ v` implies `p(v) = true`) holds because the cast is the only door.
+- **The fragment is enforced *in the judgment*** (`Ty.TermFrag` premises on
+  the rules that choose types freely: `lam`'s domain, `variant`'s tags,
+  `sub`'s target), not assumed of the theorem statements. Hypothesizing it
+  only at the boundary would not confine a derivation's *internal* types —
+  `sub` can detour through arbitrary types — and two preservation
+  counterexamples live on such detours; see `Ty.TermFrag`.
+- **`refineV` — checked values inhabit the refinement.** `cast` is the only
+  refinement *door* a program can write, but preservation forces a second,
+  value-level introduction: `cast p v` (claims holding) steps to `v`, and
+  `v`'s refined typing must come from somewhere — `Sub` deliberately forbids
+  refinement conjuring. `refineV` says a claim that *evaluates true on a
+  value* types that value: the term-model face of literal-singleton typing
+  (a refinement is a fact about a value). Runtime-checked (`claimsHold`),
+  value-only, so it is exactly the knowledge the `castV` step validates.
 
 Left for later increments, recorded not dropped: `compose` (the point-free
 core — the source-shaped lambda fragment is what M3's oracle checks first),
-records (keyed tuples; nothing new algebraically), and the dependent
-fragment.
+records (keyed tuples; nothing new algebraically), the dependent fragment,
+and wildcard `case` arms (needed before the case-binder calibration lemma —
+the Rust's `case _:` payload-binder defect — can be *stated*).
 -/
 
 namespace CclFormal
@@ -233,19 +248,63 @@ def Pred.elemOnly : Pred → Bool
   | .proj a _ => a.elemOnly
   | .app f a => f.elemOnly && a.elemOnly
 
+/-- The types the term fragment covers, hereditarily. Two conditions, each
+excising a concrete preservation counterexample (spelled out in
+`formal/design.md`):
+
+- **Every refinement predicate is `Pred.elemOnly`** — the non-dependent
+  fragment. Off it, the codomain edge's Pi correspondence (`codRen`) can
+  α-move a *dangling* `Pred.var` reference, producing subtype links whose
+  typing transport is underivable (a modeling artifact: the model does not
+  scope predicate variables).
+- **No `fn` domain is partition-shaped** (`partitionDomain` = `none`).
+  `Sub.fnNorm` collapses a partition domain `⧺ᵢ({𝐷 | π̂ᵢ})` to `𝐷` at *any*
+  kind — deliberate in the Rust, where a partition variant in domain
+  position describes untagged pieces of a collection — but the term model
+  reads `variant` types as *tagged values*, and under that reading the
+  collapse lets a bare `𝐷` value reach a lambda whose body expects the
+  variant: preservation fails at beta. Soundness in the Rust rests on the
+  implicit invariant that index-contiguous same-base variants are fan-out
+  descriptors, never value-variant types.
+
+The shape follows `Ty.WF`: an inductive with one constructor per head, so
+`cases` is the inversion. -/
+inductive Ty.TermFrag : Ty → Prop
+  | base (b) : Ty.TermFrag (.base b)
+  | uintRange (n) : Ty.TermFrag (.uintRange n)
+  | dataSource (s) : Ty.TermFrag (.dataSource s)
+  | txn : Ty.TermFrag .txn
+  | fn {n k d c} : partitionDomain d = none → Ty.TermFrag d → Ty.TermFrag c →
+      Ty.TermFrag (.fn n k d c)
+  | tuple {ts} : (∀ t ∈ ts, Ty.TermFrag t) → Ty.TermFrag (.tuple ts)
+  | record {fs} : (∀ f ∈ fs, Ty.TermFrag f.2) → Ty.TermFrag (.record fs)
+  | variant {tags} : (∀ t ∈ tags, Ty.TermFrag t.2) → Ty.TermFrag (.variant tags)
+  | refined {b ps} : (∀ p ∈ ps, p.elemOnly = true) → Ty.TermFrag b →
+      Ty.TermFrag (.refined b ps)
+
 /-- `Γ ⊢ e : T` for the pure core. Contexts are de Bruijn (index 0 is the
 innermost binder). Subsumption is the M0 relation at empty rename
 environments — the non-dependent fragment never transports a Pi binder.
 
-`cast` is the refinement introduction: it asserts its claims on top of the
-value's type, and the small-step checks them — the pairing refinement
-soundness rests on. `caseE` types every arm's body under the payload type
-the scrutinee's variant assigns to its tag: the scrutinee-derived bound of
-the calibration lemma. -/
+`cast` is the refinement introduction a *program* writes: it asserts its
+claims on top of the value's type, and the small-step checks them — the
+pairing refinement soundness rests on. `refineV` is the value-level
+introduction preservation forces (see the module docs): claims that
+evaluate true on a value type that value. `caseE` types every arm's body
+under the payload type the scrutinee's variant assigns to its tag: the
+scrutinee-derived bound of the calibration lemma.
+
+The rules that choose a type freely — `lam`'s domain annotation,
+`variant`'s tag table, `sub`'s target, and `caseE`'s result (free only in
+the degenerate empty-tags elimination, where every arm premise is vacuous
+and `U` is otherwise unconstrained) — require it in the term fragment
+(`Ty.TermFrag`); everything else inherits fragment membership from its
+premises (`hasTy_frag` in `Safety.lean` is that invariant, stated). -/
 inductive HasTy : List Ty → Tm → Ty → Prop
   | lit {Γ} (l : Lit) : HasTy Γ (.lit l) l.ty
   | var {Γ n T} : Γ[n]? = some T → HasTy Γ (.var n) T
   | lam {Γ dom body cod} :
+      dom.TermFrag → partitionDomain dom = none →
       HasTy (dom :: Γ) body cod →
       HasTy Γ (.lam dom body) (.fn none .compute dom cod)
   | app {Γ f a name kind dom cod} :
@@ -262,9 +321,11 @@ inductive HasTy : List Ty → Tm → Ty → Prop
       HasTy Γ e (.tuple Ts) → Ts[i]? = some T →
       HasTy Γ (.proj e i) T
   | variant {Γ e tag T} {tags : List (FieldKey × Ty)} :
+      Ty.TermFrag (.variant tags) →
       HasTy Γ e T → tags.lookup tag = some T →
       HasTy Γ (.variant tag e) (.variant tags)
   | caseE {Γ scrut arms U} {tags : List (FieldKey × Ty)} :
+      U.TermFrag →
       HasTy Γ scrut (.variant tags) →
       (∀ tag T, tags.lookup tag = some T → (arms.lookup tag).isSome) →
       (∀ tag T body, tags.lookup tag = some T → arms.lookup tag = some body →
@@ -275,8 +336,14 @@ inductive HasTy : List Ty → Tm → Ty → Prop
       claims ≠ [] → (∀ p ∈ claims, p.elemOnly = true) →
       T.isRefined = false →
       HasTy Γ (.cast claims e) (.refined T claims)
+  | refineV {Γ v T} {claims : List Pred} :
+      HasTy Γ v T → v.IsVal →
+      Tm.claimsHold claims v = true →
+      claims ≠ [] → (∀ p ∈ claims, p.elemOnly = true) →
+      T.isRefined = false →
+      HasTy Γ v (.refined T claims)
   | sub {Γ e T U} :
-      HasTy Γ e T → Sub [] [] T U →
+      HasTy Γ e T → Sub [] [] T U → U.TermFrag →
       HasTy Γ e U
 
 /-! ## First sanity facts -/

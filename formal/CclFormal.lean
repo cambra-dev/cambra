@@ -1,6 +1,7 @@
 import CclFormal.Ty
 import CclFormal.Merge
 import CclFormal.Term
+import CclFormal.Safety
 import CclFormal.Sub
 import CclFormal.Decide
 import CclFormal.Json
