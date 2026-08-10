@@ -1111,7 +1111,7 @@ a fixpoint equation, because an accumulator *is* one. Measured, 1,910 cyclic arg
 
 Deliberately **not per-argument**. Every rule's condition is about *how many* arguments are cyclic rather than which — arithmetic's operands are interchangeable to its rule, and a rule needing one argument needs it whichever position it occupies. A rule wanting "at least 𝑛 known" would generalize this to a count; none does.
 
-The cut is an **unrolling, not an iteration**: it unrolls the equation a number of times fixed by the shape of the program and stops, and the outermost frame — whose answer becomes the node's type — sees every argument known, which is where genuinely disagreeing operands are caught. So whatever a rule answers at a cut is what the unrolling carries, and a rule must be *sound* there rather than merely improvable; widening is not the remedy, because there is no iteration to widen. `reduce.rs`, "What the cut actually is" has the trace and the consequences for a rule author — it is the thing to read before writing the range-aware `Arithmetic` in [Known gaps](#known-gaps).
+The cut is an **unrolling, not an iteration**: it unrolls the equation a number of times fixed by the shape of the program and stops. Whether any frame sees *every* argument known is shape-dependent — `x := 2; x := x * x` reaches `[Int, Int]`, while `x := "a"; x := x * x` never reaches `[String, String]` — so a rule check must be written against the operands it *does* have rather than against the joined base. So whatever a rule answers at a cut is what the unrolling carries, and a rule must be *sound* there rather than merely improvable; widening is not the remedy, because there is no iteration to widen. `reduce.rs`, "What the cut actually is" has the trace and the consequences for a rule author — it is the thing to read before writing the range-aware `Arithmetic` in [Known gaps](#known-gaps).
 
 ### Obligations that are not decidable yet are parked
 
@@ -1137,6 +1137,8 @@ Sharing a lattice position between an input and the result is right exactly when
 | `CollectionUnion` | codomain across operands | *merges* on the codomain; its **domain** is a computation and is hand-rolled for that reason ✔ |
 | `Proj` | codomain with the projected field | *selects* the field, refinement included ✔ |
 | `Arithmetic`, `Compare` | nothing — operands are unrelated variables | *computes*; the rule both checks the operands and builds the result ✔ |
+
+An arithmetic rule's check is **two** obligations, not one: the operands must agree with each other *and* their shared base must be one the operation is defined on. Having only the first is how `"a" * "b"` typed as `String` — the operands agree perfectly, and multiplication still has nothing to say about strings. `Add` accepts `Int` and `String` (it is concatenation until `lambda_elim` rewrites it to `Concat`); `Sub`, `Mul` and `FloorDiv` accept `Int`. That is what the `kind` on `TypeFn::Arithmetic` earns today, ahead of the range-aware rule it was recorded for.
 
 `Sum`'s concrete `Int` is a simplifying assumption of the current numeric tower, not a property of summation. When `Sum` becomes numeric-polymorphic its result stops being a constant and becomes a computation over the element type, at which point it moves to the last row and takes a rule of its own. Nothing about the design has to change for that: it is the same shape as `Compare`, whose rule is also constant on its domain today.
 

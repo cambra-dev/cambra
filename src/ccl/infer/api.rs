@@ -354,6 +354,18 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
+    /// The operands agree on a base the operation is not defined for — `"a" * "b"`.
+    ///
+    /// The dual of [`NoCommonBase`](InferError::NoCommonBase): there the operands
+    /// disagree, here they agree and the *operator* is what has nothing to say.
+    UndefinedForBase {
+        /// The type function, as it is spelled in a type (`Mul`, `Sub`).
+        fun: String,
+        /// The offending base, rendered.
+        base: String,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
     /// A [`Type::App`] survived inference without reducing — the strict wall's
     /// guard on a transient type, like the [`Type::History`](crate::ccl::Type) and
     /// [`Type::ChanDom`](crate::ccl::Type) checks beside it rather than a diagnosis
@@ -612,6 +624,9 @@ impl std::fmt::Debug for InferError {
                     "Operands of {fun} have no base in common: {} in expression: {at}",
                     bases.join(" vs ")
                 )
+            }
+            InferError::UndefinedForBase { fun, base, at } => {
+                write!(f, "{fun} is not defined on {base} in expression: {at}")
             }
             InferError::UnreducedApp { ty, at } => {
                 write!(

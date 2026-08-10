@@ -260,6 +260,15 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
                  without it"
             ))
         }
+        // The operands agree and the *operator* is what has nothing to say, so the
+        // message names one base rather than a conflicting pair.
+        CoalesceError::Reduce(ReduceError::UndefinedForBase { fun, base }) => {
+            InferError::UndefinedForBase {
+                fun,
+                base,
+                at: ctx_label.to_string(),
+            }
+        }
     }
 }
 

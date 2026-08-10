@@ -1094,10 +1094,66 @@ fn test_a_register_that_reads_itself_still_gets_a_type(#[case] code: &str, #[cas
     assert_eq!(register_value_type(code).to_string(), base);
 }
 
+// Agreement is necessary and **not sufficient**: `"a" * "b"` has operands that agree
+// perfectly, and multiplication still has nothing to say about strings. Checking only
+// that the operands share a base reported `String` for all three of these.
+#[rstest]
+#[case::multiply_strings(r#""a" * "b""#, "Mul", "String")]
+#[case::subtract_strings(r#""a" - "b""#, "Sub", "String")]
+#[case::divide_strings(r#""a" // "b""#, "FloorDiv", "String")]
+#[case::add_bools("True + True", "Add", "Bool")]
+fn test_an_operation_is_rejected_on_a_base_it_is_not_defined_for(
+    #[case] code: &str,
+    #[case] fun: &str,
+    #[case] base: &str,
+) {
+    let errs = infer_program_err(code);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            InferError::UndefinedForBase { fun: f, base: b, .. } if f == fun && b == base
+        )),
+        "expected {fun} to be rejected on {base}, got {errs:?}"
+    );
+}
+
+// `+` is the one arithmetic operator with a second base: it is string concatenation
+// until `lambda_elim` rewrites it to `Concat`, which happens after inference.
+#[rstest]
+#[case(r#""a" + "b""#, string())]
+#[case("1 + 2", int())]
+#[case("1 * 2", int())]
+#[case("7 // 2", int())]
+fn test_an_operation_is_accepted_on_a_base_it_is_defined_for(
+    #[case] code: &str,
+    #[case] expected: Type,
+) {
+    assert_eq!(infer_program(code), expected);
+}
+
+// The domain check must survive a **cycle**, and it cannot be left to the frame that
+// sees every argument — for `x := "a"; x := x * x` there is no such frame. Traced, every
+// reduction of that program sees at least one cyclic operand (`[⟨cyclic⟩, String]` and
+// `[String, ⟨cyclic⟩]`, never `[String, String]`), where the same shape over `Int` does
+// reach `[Int, Int]`. So the rule judges each *available* operand: a known operand
+// outside the operation's domain is a violation whatever the others turn out to be.
+#[test]
+fn test_a_cycle_does_not_hide_an_undefined_operation() {
+    let errs = infer_program_err("x := \"a\"\nx := x * x\nx");
+    assert!(
+        errs.iter().any(
+            |e| matches!(e, InferError::UndefinedForBase { fun, base, .. }
+                              if fun == "Mul" && base == "String")
+        ),
+        "a cyclic operand must not hide that Mul is undefined on String, got {errs:?}"
+    );
+}
+
 // The cut-off costs the agreement **check**, not the answer — so a disagreement inside a
-// cycle must still be caught. It is: the outermost frame of the unrolling reduces with
-// every argument known (see `reduce.rs`, "What the cut actually is"), which is where
-// operands that genuinely conflict are rejected.
+// cycle must still be caught. It is, though *not* by the reduction rule: for these shapes
+// the register's own value join rejects first (`Incompatible lower bounds`), because the
+// seed and the write contribute conflicting bases to one variable. Measured: the rule
+// never fires on any of them.
 #[test]
 fn test_a_cycle_does_not_hide_an_operand_conflict() {
     assert!(

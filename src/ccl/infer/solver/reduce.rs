@@ -88,11 +88,14 @@
 //! ```
 //!
 //! and stops. `x + x` reaches three levels because each operand re-enters
-//! separately; a second write adds more. Always finite, and — in every shape
-//! measured — the **outermost** frame, the one whose answer becomes the node's type,
-//! sees every argument known. That is where operands which genuinely disagree are
-//! caught, so a tolerant rule's imprecision at the cut does not become the answer
-//! directly; it feeds the cyclic argument's own resolution.
+//! separately; a second write adds more. Always finite.
+//!
+//! Whether a frame ever sees *every* argument known is **shape-dependent**, and a rule
+//! must not rely on it: `x := 2; x := x * x` does reach `[Int, Int]`, while
+//! `x := "a"; x := x * x` never reaches `[String, String]` — every reduction of it has
+//! at least one cyclic operand. So a check written against the joined base alone can
+//! simply never fire. Judge each **available** operand instead; a known operand is not
+//! going to become something else.
 //!
 //! The consequence for a rule author is the part worth stating, because it is the
 //! opposite of the familiar one: since nothing iterates, **whatever a rule answers
@@ -116,7 +119,7 @@
 //! arm through `reduce` would need a rule that declares it.
 
 use crate::ccl::ccl_utils::strip_refinements;
-use crate::ccl::{Type, TypeFn};
+use crate::ccl::{ArithmeticKind, BaseType, Type, TypeFn};
 
 /// One resolved argument, or the fact that resolving it re-entered the resolution
 /// **already computing it**.
@@ -191,6 +194,17 @@ pub enum ReduceError {
         /// The type function that could not answer, as it is spelled in a type.
         fun: String,
     },
+    /// The operands agree on a base the operation is not defined for — `"a" * "b"`.
+    ///
+    /// The dual of [`NoCommonBase`](ReduceError::NoCommonBase): there the operands
+    /// disagree with each other, here they agree perfectly and the *operator* is what
+    /// has nothing to say, so the message names one base rather than a pair.
+    UndefinedForBase {
+        /// The type function that could not reduce, as it is spelled in a type.
+        fun: String,
+        /// The offending base, rendered.
+        base: String,
+    },
 }
 
 /// Run `fun` on `args`, where `None` marks an argument whose resolution is already
@@ -212,7 +226,19 @@ pub fn reduce(fun: &TypeFn, args: &[Arg]) -> Result<Type, ReduceError> {
         // what is addable and computing the result are one step. The kind is kept
         // because a range-aware rule needs it (`+` and `*` map operand ranges
         // differently), which is also where the two stop coinciding.
-        TypeFn::Arithmetic(_) => shared_base(fun, &available),
+        TypeFn::Arithmetic(kind) => {
+            let base = shared_base(fun, &available)?;
+            // Judged per **available operand**, not on the joined base. At a cycle the
+            // join reflects only what is known — for `x := "a"; x := x * x` every
+            // reduction sees at least one cyclic operand, so the join is never
+            // `String ⊔ String` and a check on it alone never fires. A *known* operand
+            // outside the operation's domain is a violation whatever the others turn
+            // out to be, which is what makes this sound at a cut.
+            for operand in &available {
+                check_arithmetic_domain(*kind, &strip_refinements(operand), fun)?;
+            }
+            Ok(base)
+        }
         // A comparison **checks and then discards**: its result is `Bool` for any
         // operands that share a base and undefined for any that do not, so the rule
         // is constant on its domain and the whole of its content is the domain.
@@ -228,7 +254,7 @@ pub fn reduce(fun: &TypeFn, args: &[Arg]) -> Result<Type, ReduceError> {
         // result whether or not the operands have resolved.
         TypeFn::Compare(_) => {
             shared_base(fun, &available)?;
-            Ok(Type::Base(crate::ccl::BaseType::Bool))
+            Ok(Type::Base(BaseType::Bool))
         }
     }
 }
@@ -268,6 +294,40 @@ pub fn reduce(fun: &TypeFn, args: &[Arg]) -> Result<Type, ReduceError> {
 /// skipped. A compound-argument type function — `FieldOf(ρ, 𝑘)` and
 /// `CollectionUnion` are the named next clients — must not reuse this test; it needs
 /// agreement *modulo* unresolved positions, the way the lattice itself compares.
+/// Reject a base the operation is not defined on.
+///
+/// **Agreement is not the whole requirement.** [`shared_base`] answers "do the operands
+/// describe the same thing", which `"a" * "b"` satisfies perfectly — so on its own the
+/// rule reported `String` for it. Each operation carries its own domain, which is why
+/// the kind rides on [`TypeFn::Arithmetic`] rather than being erased at lowering.
+///
+/// Only a resolved [`Type::Base`] is judged: an unresolved position is one the graph has
+/// not filled in rather than a violation, and a non-scalar shape reaching arithmetic is
+/// [`shared_base`]'s own leaf-argument gap (see the module docs) rather than this rule's
+/// to decide.
+fn check_arithmetic_domain(
+    kind: ArithmeticKind,
+    base: &Type,
+    fun: &TypeFn,
+) -> Result<(), ReduceError> {
+    let Type::Base(b) = base else { return Ok(()) };
+    let defined = match kind {
+        // `+` is also string concatenation. `lambda_elim` rewrites it to `Concat`
+        // *after* inference, so at this point it is still the arithmetic scheme.
+        ArithmeticKind::Add => matches!(b, BaseType::Int | BaseType::String),
+        ArithmeticKind::Sub | ArithmeticKind::Mul | ArithmeticKind::FloorDiv => {
+            matches!(b, BaseType::Int)
+        }
+    };
+    if defined {
+        return Ok(());
+    }
+    Err(ReduceError::UndefinedForBase {
+        fun: fun.name().to_string(),
+        base: b.to_string(),
+    })
+}
+
 fn shared_base(fun: &TypeFn, args: &[&Type]) -> Result<Type, ReduceError> {
     let mut bases = args.iter().map(|t| strip_refinements(t));
     let Some(first) = bases.next() else {

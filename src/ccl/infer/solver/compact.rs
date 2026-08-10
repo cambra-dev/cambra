@@ -77,7 +77,16 @@ impl Drop for InFlight {
 /// applied chain of generic wrappers is exponential in depth with the cache or
 /// without it (37s vs 45s at depth 10), so the thing worth attacking is that, not
 /// the constant.
-fn resolve_argument(arg: &Type, subst_acc: &Subst) -> Option<Type> {
+/// Resolve one argument of a [`Type::App`].
+///
+/// The three outcomes are genuinely different and the signature keeps them apart:
+/// `Ok(Some(t))` resolved, `Ok(None)` re-entered the resolution already computing it
+/// (a cycle), and `Err(e)` the argument's *own* reduction failed. Collapsing the last
+/// two — which `.ok()` did — hands a rule `Arg::Cyclic` for an argument that is not
+/// cyclic but poisoned, and the rule then coarsens past a real type error: `x := "a";
+/// x := x * x` typed as `Mut(String)` because the inner `Mul` rejection arrived as
+/// "unavailable". Poisoned stays poisoned, the same rule [`CompactType::merge`] follows.
+fn resolve_argument(arg: &Type, subst_acc: &Subst) -> Result<Option<Type>, super::ReduceError> {
     // The argument rides the application through whatever substitutions the edges
     // walked so far composed; force them before resolving, exactly as the
     // refinement arm forces them on a predicate.
@@ -95,17 +104,27 @@ fn resolve_argument(arg: &Type, subst_acc: &Subst) -> Option<Type> {
     // A concrete argument is neither cyclic nor memoizable: resolving it cannot
     // re-enter *this* argument, and there is no variable to key an entry on.
     let Type::Infer(v) = arg else {
-        return super::coalesce_compact(&super::simplify_type(compact_type(arg))).ok();
+        return resolved_or_poisoned(arg);
     };
     let uid = v.uid;
     // This resolution is already running further up the stack: answering would
     // recurse forever, so report the argument as unavailable and let the rule
     // coarsen.
     if ARGS_IN_FLIGHT.with(|s| s.borrow().contains(&uid)) {
-        return None;
+        return Ok(None);
     }
     let _in_flight = InFlight::mark(uid);
-    super::coalesce_compact(&super::simplify_type(compact_type(arg))).ok()
+    resolved_or_poisoned(arg)
+}
+
+/// Run the resolution pipeline, keeping a reduction failure as a failure and treating
+/// every other coalesce outcome as "nothing known at this position".
+fn resolved_or_poisoned(arg: &Type) -> Result<Option<Type>, super::ReduceError> {
+    match super::coalesce_compact(&super::simplify_type(compact_type(arg))) {
+        Ok(t) => Ok(Some(t)),
+        Err(super::CoalesceError::Reduce(e)) => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -714,13 +733,27 @@ fn compact_go(
         // cyclic argument degrades to "no information at this position", which is
         // what lets the enclosing read fall back to its other bounds.
         Type::App { fun, args } => {
-            let resolved: Vec<super::reduce::Arg> = args
-                .iter()
-                .map(|a| match resolve_argument(a, subst_acc) {
-                    Some(t) => super::reduce::Arg::Known(t),
-                    None => super::reduce::Arg::Cyclic,
-                })
-                .collect();
+            let mut resolved: Vec<super::reduce::Arg> = Vec::with_capacity(args.len());
+            let mut poisoned = None;
+            for a in args {
+                match resolve_argument(a, subst_acc) {
+                    Ok(Some(t)) => resolved.push(super::reduce::Arg::Known(t)),
+                    Ok(None) => resolved.push(super::reduce::Arg::Cyclic),
+                    // An argument that failed to reduce poisons this position too:
+                    // there is no answer to compute from it, and reporting the inner
+                    // failure is more use than a coarsened outer one.
+                    Err(e) => {
+                        poisoned = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = poisoned {
+                return CompactType {
+                    reduce_error: Some(e),
+                    ..Default::default()
+                };
+            }
             match super::reduce::reduce(fun, &resolved) {
                 Ok(reduced) => compact_go(&reduced, pol, subst_acc, parents, st),
                 Err(e) => CompactType {

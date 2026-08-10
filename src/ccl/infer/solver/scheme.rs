@@ -166,10 +166,10 @@ fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKind
 /// The highest level of any inference variable **reachable** in `ty` — including
 /// the ones inside refinement predicates' own type slots.
 ///
-/// This is deliberately *not* [`type_level`], and the difference is the whole
+/// This is deliberately *not* [`type_level`](super::type_level), and the difference is the whole
 /// point. The two answer different questions:
 ///
-/// * [`type_level`] asks "does this participate in the lattice above `lim`?", for
+/// * [`type_level`](super::type_level) asks "does this participate in the lattice above `lim`?", for
 ///   extrusion, bound-recording scope, and let-generalization. A refinement is
 ///   lattice-blind, so it defers to its base and the predicate is correctly
 ///   invisible; a `ChanDom` reports 0 so a rigid atom flows through bounds
