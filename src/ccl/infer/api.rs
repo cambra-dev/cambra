@@ -3408,11 +3408,9 @@ mod tests {
         assert_eq!(typecheck(&expr), Ok(()));
     }
 
-    /// A lambda that applies two different projections to the same parameter
-    /// should infer a tuple-typed domain after `set()` merging and `TupleField`
-    /// constraint accumulation.
+    /// A lambda that applies two different projections to the same parameter infers a
+    /// tuple-typed domain, after `set()` merging and `TupleField` constraint accumulation.
     #[test]
-    #[ignore]
     fn test_infer_lambda_two_proj_on_same_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ p → ((p ► .0) + 0, p ► .1)

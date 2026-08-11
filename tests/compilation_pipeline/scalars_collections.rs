@@ -254,8 +254,11 @@ fn test_augmented_assignment(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 #[rstest]
 #[timeout(Duration::from_secs(10))]
+// A comprehension bound to a name, then iterated by a second comprehension. The binding
+// is collection-valued, so what the body reads is a data function rather than a scalar —
+// the shape the `let`-in-`lambda` rule and kind inference had to reach before this could
+// compile without first-class functions.
 #[case("x = [x for x in [1,2,3]]; [y for y in x]", make_int_list(&[1,2,3]))]
-#[ignore = "need first class functions for this let"]
 fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
