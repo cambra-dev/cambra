@@ -452,6 +452,16 @@ fn try_pairwise_in_compose(
         Expr::compose(elts)
     };
     expr.ty = ty;
+    // A chain that collapsed to a single `Cast` must not inherit the chain's
+    // interface type wholesale: a cast's claims are term-determined (its type
+    // is the value's domain claims ∪ the target's born claims), while the
+    // chain's recorded type was derived from neighbour types — which can be
+    // route-dependent where inference left route-dependent slots. Keep the
+    // chain's shape and bases, restore the term-determined claims.
+    if let TypedExprNode::Cast { value, target } = &expr.node {
+        let view = expr.ty.clone();
+        expr.ty = crate::ccl::ccl_utils::canonical_cast_ty(target, Some(&value.ty), view);
+    }
     expr.user_annotation = user_annotation;
     true
 }
