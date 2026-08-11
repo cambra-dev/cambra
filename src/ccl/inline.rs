@@ -616,15 +616,7 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
 /// equality. Anything subtler is exactly what should trip the assert and get a real
 /// `restrict` lift.
 fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
-    fn layers(mut ty: &Type) -> Vec<&Refinement> {
-        let mut out = Vec::new();
-        while let Type::Refinement(inner, r) = ty {
-            out.push(r);
-            ty = inner;
-        }
-        out
-    }
-    let demanded = layers(param_ty);
+    let demanded = param_ty.claims();
     if demanded.is_empty() {
         return true;
     }
@@ -636,11 +628,11 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
     // survive on the bare `Var` for the phase to find the read. Comparing the stamp
     // against the parameter would ask a handle to entail a fact about a value. See
     // `src/ccl/design/mutability.md`, "`Mut` is a CCL type".
-    let mut supplied = layers(arg_ty);
+    let mut supplied: Vec<&Refinement> = arg_ty.claims().iter().collect();
     if let Some(value) = arg_ty.mut_value_type() {
-        supplied.extend(layers(value));
+        supplied.extend(value.claims());
     }
-    demanded.iter().all(|d| supplied.contains(d))
+    demanded.iter().all(|d| supplied.contains(&d))
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +720,7 @@ mod tests {
         use std::rc::Rc;
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
         let refinement = Refinement::born(pred);
-        let ty = Type::Refinement(Box::new(Type::Base(BaseType::Int)), refinement);
+        let ty = Type::refined_one(Type::Base(BaseType::Int), refinement);
         assert!(!is_iterable_domain(&ty));
     }
 
@@ -738,7 +730,7 @@ mod tests {
         use std::rc::Rc;
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
         let refinement = Refinement::born(pred);
-        let ty = Type::Refinement(Box::new(Type::UIntRange(3)), refinement);
+        let ty = Type::refined_one(Type::UIntRange(3), refinement);
         assert!(is_iterable_domain(&ty));
     }
 
@@ -807,7 +799,7 @@ mod tests {
             name: None,
             kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
-            codomain: Box::new(Type::Refinement(Box::new(inner_fun), refinement)),
+            codomain: Box::new(Type::refined_one(inner_fun, refinement)),
         };
         assert!(should_inline(&ty));
     }

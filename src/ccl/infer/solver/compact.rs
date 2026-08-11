@@ -12,7 +12,9 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::{BaseType, HistoryKind, InferVarId, Name, Refinement, Type, fresh_infer_var_id};
+use crate::ccl::{
+    BaseType, HistoryKind, InferVarId, Name, RefinementSet, Type, fresh_infer_var_id,
+};
 
 use crate::ccl::FieldKey;
 
@@ -276,15 +278,14 @@ pub struct CompactType {
     /// `Data ⊔ Data` join accumulated alternatives via [`union_domains`]), and the
     /// codomain. Recursively merged with polarity flip on the domain.
     pub fun: Option<CompactFun>,
-    /// Refinement contributions at this position. A set with `==`
-    /// membership (deduplicated by [`Refinement`]'s structural `PartialEq`),
-    /// stored as a `Vec` in first-insertion order. A refinement-set is
-    /// width-subtyped exactly like `rec`: more refinements ⇒ subtype
-    /// (`{T | p, q} <: {T | p}`), so at positive polarity the sets are
-    /// *intersected* and at negative *unioned* (see
-    /// [`CompactType::merge`]). The stored [`Refinement`] is the payload
-    /// carried to coalesce.
-    pub refinements: Vec<Refinement>,
+    /// Refinement contributions at this position — the same
+    /// [`RefinementSet`](crate::ccl::RefinementSet) the materialized `Type`
+    /// carries, so flattening and coalescing agree on what a claim set *is*
+    /// rather than each keeping its own bag. A claim set is width-subtyped
+    /// exactly like `rec`: more claims ⇒ subtype (`{T | p, q} <: {T | p}`), so
+    /// at positive polarity the sets are *intersected* and at negative
+    /// *unioned* (see [`CompactType::merge`]).
+    pub refinements: RefinementSet,
     /// History-handle `(value, domain, kind)`, if a [`Type::History`]
     /// contributed here — a mutable variable (`kind: Overwrite`) or a feed channel
     /// (`kind: Feed`).
@@ -366,19 +367,13 @@ impl CompactType {
     /// position the value reliably carries only the refinements *both*
     /// sides guarantee; at a negative position a consumer that may
     /// impose either set imposes their union.
-    fn merge_refinements(pol: bool, lhs: Vec<Refinement>, rhs: Vec<Refinement>) -> Vec<Refinement> {
+    fn merge_refinements(pol: bool, lhs: RefinementSet, rhs: RefinementSet) -> RefinementSet {
         if pol {
             // The types are being unioned, so the refinements should be intersected.
-            lhs.into_iter().filter(|r| rhs.contains(r)).collect()
+            lhs.intersect(&rhs)
         } else {
             // The types are being intersected, so the refinements should be unioned.
-            let mut out = lhs;
-            for r in rhs {
-                if !out.contains(&r) {
-                    out.push(r);
-                }
-            }
-            out
+            lhs.union(&rhs)
         }
     }
 
@@ -615,11 +610,10 @@ fn compact_go(
         // application's argument) before the refinement lands in the position.
         // The predicate is an immutable term, so a non-vacuous force builds a
         // fresh predicate from the (freshened) bound's content directly.
-        Type::Refinement(inner, r) => {
+        Type::Refinement(inner, claims) => {
             let mut ct = compact_go(inner, pol, subst_acc, parents, st, pi_depth);
-            let r = subst_acc.force_refinement(r);
-            if !ct.refinements.contains(&r) {
-                ct.refinements.push(r);
+            for r in claims {
+                ct.refinements.insert(subst_acc.force_refinement(r));
             }
             ct
         }
@@ -875,8 +869,8 @@ mod tests {
             name: Some(Name::raw(binder)),
             kind: FunKind::Data,
             domain: Box::new(Type::UIntRange(3)),
-            codomain: Box::new(Type::Refinement(
-                Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::refined_one(
+                Type::Base(BaseType::Int),
                 Refinement::born(dep_pred(binder)),
             )),
         };
@@ -932,8 +926,8 @@ mod tests {
                 name: Some(Name::raw("y")),
                 kind: FunKind::Data,
                 domain: Box::new(Type::UIntRange(4)),
-                codomain: Box::new(Type::Refinement(
-                    Box::new(Type::Base(BaseType::Int)),
+                codomain: Box::new(Type::refined_one(
+                    Type::Base(BaseType::Int),
                     Refinement::born(dep_pred(referenced)),
                 )),
             }),
@@ -955,9 +949,8 @@ mod tests {
         use crate::ccl::infer::solver::test_helpers::dep_pred;
         use crate::ccl::{FunKind, Name, Refinement};
 
-        let dep = |binder: &str, base: Type| {
-            Type::Refinement(Box::new(base), Refinement::born(dep_pred(binder)))
-        };
+        let dep =
+            |binder: &str, base: Type| Type::refined_one(base, Refinement::born(dep_pred(binder)));
         let fun = |binder: Option<&str>, domain: Type, codomain: Type| Type::Fun {
             name: binder.map(Name::raw),
             kind: FunKind::Data,

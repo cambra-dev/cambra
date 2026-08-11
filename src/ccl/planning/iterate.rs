@@ -367,30 +367,28 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     // `restrict(p_inner)`, `restrict(p_next)`, … per refinement layer,
     // narrowing the domain layer by layer.  Unrefined sites get just
     // the iterate.
-    // Recover each layer's point-free predicate function from its bare
-    // `__elem ▷ p` form — that is what `make_restrict` filters with (the
-    // refinement type it then re-stamps stays bare).
-    let mut preds: Vec<Expr> = Vec::new();
-    let mut current = &domain_ty;
-    while let Type::Refinement(base, refinement) = current {
-        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate));
-        current = base.as_ref();
-    }
-    preds.reverse();
+    let base = domain_ty.peel_refinements();
     let body = take(expr);
-    // Build the iteration source by applying one `restrict(p)` per
-    // refinement layer (innermost first) to a chain-head `iterate(true)`
-    // over the unrefined base.  Each `restrict` is a function transformer
-    // *applied* to its upstream (not composed): `make_restrict` narrows
-    // the domain layer by layer while preserving the codomain, so `source`
-    // ends with type `{{…{D | p_inner} …} | p_outer} ⇒ D` — the full
-    // refinement on the domain.  The value-producing `body` is then
+    // Build the iteration source by applying one `restrict(p)` per claim to a
+    // chain-head `iterate(true)` over the unrefined base.  Each `restrict` is a
+    // function transformer *applied* to its upstream (not composed):
+    // `make_restrict` narrows the domain by one claim while preserving the
+    // codomain, so `source` ends with type `{D | p₁, …, pₙ} ⇒ D` — the site's
+    // full claim set on the domain.  The value-producing `body` is then
     // composed onto that source as a genuine CCC morphism.
+    //
+    // Each claim's predicate function is recovered from its bare `__elem ▷ p`
+    // form against the element type that stage of the pipeline actually sees —
+    // the base narrowed by the claims applied before it (`application_order`,
+    // which `compile_predicates_in_type` walks identically so the compiled
+    // predicates match these stages). Any order of the claims yields a
+    // well-typed pipeline for the same final domain; the order is planning's to
+    // choose, which is what lets the claim set itself stay unordered.
     let site_ty = body.ty.clone();
-    let source = preds.into_iter().fold(
-        make_iterate(trivially_true_predicate(current.clone())),
-        |upstream, pred| make_restrict(pred, upstream),
-    );
+    let mut source = make_iterate(trivially_true_predicate(base.clone()));
+    for (r, elem_ty) in crate::ccl::application_order(domain_ty.claims(), base) {
+        source = make_restrict(fn_of_bare_predicate(&elem_ty, &r.predicate), source);
+    }
     // An iteration source produces the refined extent it iterates, so its
     // codomain is the *site's* refined domain `{D | p}`, mirroring
     // `make_iterate`'s `{D | p} ⇒ {D | p}` symmetry. Surfacing the refinement
