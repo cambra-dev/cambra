@@ -94,7 +94,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::{FieldKey, HistoryKind, InferVarId, Refinement, Type};
+use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
 use super::compact::{AtomKey, KindMerge};
 
@@ -336,12 +336,12 @@ pub fn spec_key(ty: &Type) -> SpecKey {
     // One walk-wide `ctx` for both reads: its memo is keyed by polarity, so the
     // two reads share it without contaminating each other.
     SpecKey {
-        positive: key_go(ty, true, &Subst::id(), &mut ctx),
-        negative: key_go(ty, false, &Subst::id(), &mut ctx),
+        positive: key_go(ty, true, &Subst::id(), &mut ctx, 0),
+        negative: key_go(ty, false, &Subst::id(), &mut ctx, 0),
     }
 }
 
-fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView {
+fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx, pi_depth: u8) -> KeyView {
     match ty {
         // `BoundedHole` is a *pre-inference* annotation marker: `normalize_annotation`
         // erases it into a bounded variable before any constraint is emitted, so
@@ -373,7 +373,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // clone will actually carry — that is use-specific information, and two
         // uses discharging different arguments *should* key apart.
         Type::Refinement(inner, r) => {
-            let mut k = key_go(inner, pol, subst_acc, ctx);
+            let mut k = key_go(inner, pol, subst_acc, ctx, pi_depth);
             let r = subst_acc.force_refinement(r);
             if !k.refinements.contains(&r) {
                 k.refinements.push(r);
@@ -388,15 +388,18 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         } => {
             // The domain is contravariant — the flip that makes the dual read
             // follow an argument's *lower* bounds.
-            let dom = key_go(domain, !pol, subst_acc, ctx);
-            // A Pi binder shadows the accumulated substitution inside the
-            // codomain, as in `compact_go`. The binder *name* itself is not part
-            // of the key — see `SpecKey::fun`.
+            let dom = key_go(domain, !pol, subst_acc, ctx, pi_depth);
+            // Canonical Pi binders, as in `compact_go`: the binder is renamed
+            // to the reserved depth-indexed name so a keyed predicate that
+            // references it does so α-insensitively — two uses whose
+            // instantiation types differ only in source binder names key
+            // together. (The binder *name* itself is still not part of the
+            // key — see `SpecKey::fun` — this rewrites the *references*.)
             let cod_acc = match name {
-                Some(b) => subst_acc.shadow(b),
+                Some(b) => subst_acc.extended_rename(b.clone(), Name::pi(pi_depth)),
                 None => subst_acc.clone(),
             };
-            let cod = key_go(codomain, pol, &cod_acc, ctx);
+            let cod = key_go(codomain, pol, &cod_acc, ctx, pi_depth + 1);
             // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
             // so keying on it would split every use; its *bounds* are the answer, and
@@ -410,7 +413,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             rec: ts
                 .iter()
                 .enumerate()
-                .map(|(i, t)| (FieldKey::Index(i), key_go(t, pol, subst_acc, ctx)))
+                .map(|(i, t)| (FieldKey::Index(i), key_go(t, pol, subst_acc, ctx, pi_depth)))
                 .collect(),
             ..Default::default()
         },
@@ -420,7 +423,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 .map(|(n, t)| {
                     (
                         FieldKey::Name(SmolStr::from(n.as_str())),
-                        key_go(t, pol, subst_acc, ctx),
+                        key_go(t, pol, subst_acc, ctx, pi_depth),
                     )
                 })
                 .collect(),
@@ -429,7 +432,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Variant(tags) => KeyView {
             var: tags
                 .iter()
-                .map(|(k, t)| (k.clone(), key_go(t, pol, subst_acc, ctx)))
+                .map(|(k, t)| (k.clone(), key_go(t, pol, subst_acc, ctx, pi_depth)))
                 .collect(),
             ..Default::default()
         },
@@ -440,8 +443,8 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             domain,
             kind,
         } => {
-            let value = key_go(value, pol, subst_acc, ctx);
-            let domain = key_go(domain, pol, subst_acc, ctx);
+            let value = key_go(value, pol, subst_acc, ctx, pi_depth);
+            let domain = key_go(domain, pol, subst_acc, ctx, pi_depth);
             KeyView {
                 history: BTreeMap::from([(*kind, (Box::new(value), Box::new(domain)))]),
                 ..Default::default()
@@ -477,7 +480,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 // does: a bound reached transitively arrives with every edge's
                 // substitution composed.
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                acc.union(key_go(&b.ty, pol, &inner_acc, ctx));
+                acc.union(key_go(&b.ty, pol, &inner_acc, ctx, pi_depth));
             }
             ctx.visiting.remove(&memo_key);
             if memoizable && ctx.truncations == truncations_before {
@@ -501,6 +504,43 @@ mod tests {
     use crate::ccl::infer::solver::{ConstrainCache, constrain_subtype, fresh_var};
     use crate::ccl::infer_var::Bound;
     use crate::ccl::{BaseType, Lit, TypedExpr};
+
+    /// **Finding, repaired: α-variant dependent types key together.** Before
+    /// canonical Pi binders (`key_go` renaming references to `Name::pi(depth)`
+    /// as it walks), the binder name — deliberately excluded from the key —
+    /// leaked back in through the *predicates* that reference it, so
+    /// `(𝑥: 𝐷) ⤇ {Int | __elem == 𝑥}` at one call site and its `𝑦`-twin at
+    /// another keyed apart and split a specialization that should be shared.
+    #[test]
+    fn spec_key_shares_alpha_variant_dependent_types() {
+        use super::spec_key;
+        use crate::ccl::infer::solver::test_helpers::dep_pred;
+        use crate::ccl::{FunKind, Name, Refinement};
+
+        let dep_fun = |binder: &str| Type::Fun {
+            name: Some(Name::raw(binder)),
+            kind: FunKind::Data,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Refinement(
+                Box::new(Type::Base(BaseType::Int)),
+                Refinement::born(dep_pred(binder)),
+            )),
+        };
+        let fx = dep_fun("x");
+        let fy = dep_fun("y");
+
+        // The relation reconciles the α-variants both ways…
+        let mut c = ConstrainCache::new();
+        assert!(constrain_subtype(&fx, &fy, &mut c).is_ok());
+        let mut c = ConstrainCache::new();
+        assert!(constrain_subtype(&fy, &fx, &mut c).is_ok());
+        // …and the specialization key now agrees.
+        assert_eq!(
+            spec_key(&fx),
+            spec_key(&fy),
+            "α-variant dependent instantiation types must share a specialization"
+        );
+    }
 
     fn int() -> Type {
         Type::Base(BaseType::Int)
@@ -733,12 +773,14 @@ mod tests {
             true,
             &Subst::id(),
             &mut fresh_ctx(),
+            0,
         );
         merged.union(key_go(
             &Type::data_fun(int(), int()),
             true,
             &Subst::id(),
             &mut fresh_ctx(),
+            0,
         ));
         assert_eq!(
             merged.fun.len(),
@@ -771,12 +813,14 @@ mod tests {
             true,
             &Subst::id(),
             &mut fresh_ctx(),
+            0,
         );
         merged.union(key_go(
             &history(HistoryKind::Append),
             true,
             &Subst::id(),
             &mut fresh_ctx(),
+            0,
         ));
         assert_eq!(
             merged.history.len(),

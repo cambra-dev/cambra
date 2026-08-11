@@ -1259,13 +1259,16 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             #[cfg(debug_assertions)]
             let original = symbolic(&Expr::lambda(&param.name, param.ty.clone(), *body.clone()));
             let result = elim_lambda(ctx, &param.name, &param.ty, *body)?;
-            // Compare modulo Pi binder *presence*: the point-free
-            // construction keeps a dependent morphism's own binder (same
-            // `Name`, uid-preserved) but rebuilds combinator arrows with
-            // `name: None`; see `Type::without_pi_names`.
+            // Compare modulo Pi binder *identity and presence*: the
+            // coalesced original carries canonical (`__pi{n}`) binders while
+            // the point-free construction rebuilds from the term's own
+            // binder names (and combinator arrows with `name: None`) — so
+            // α-normalize both sides first, then erase binder presence; see
+            // `Type::alpha_normalized` / `Type::without_pi_names`.
             #[cfg(debug_assertions)]
             assert!(
-                original_ty.without_pi_names() == result.ty.without_pi_names(),
+                original_ty.alpha_normalized().without_pi_names()
+                    == result.ty.alpha_normalized().without_pi_names(),
                 "{}\nto\n{}\nwith {} vs {}",
                 original,
                 symbolic(&result),
@@ -1423,7 +1426,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         debug_typecheck(e);
         #[cfg(debug_assertions)]
         assert!(
-            original_ty.without_pi_names() == e.ty.without_pi_names(),
+            original_ty.alpha_normalized().without_pi_names()
+                == e.ty.alpha_normalized().without_pi_names(),
             "{} vs {}",
             original_ty,
             e.ty

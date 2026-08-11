@@ -508,7 +508,7 @@ pub fn compact_type(ty: &Type) -> CompactGraph {
         recursive: HashMap::new(),
         rec_vars: BTreeMap::new(),
     };
-    let term = compact_go(ty, true, &Subst::id(), None, &mut st);
+    let term = compact_go(ty, true, &Subst::id(), None, &mut st, 0);
     CompactGraph {
         term,
         rec_vars: st.rec_vars,
@@ -587,6 +587,8 @@ fn compact_go(
     subst_acc: &Subst,
     parents: Option<&ParentPath<'_>>,
     st: &mut CompactState,
+
+    pi_depth: u8,
 ) -> CompactType {
     match ty {
         // Not a type — an annotation-position obligation, erased by
@@ -613,7 +615,7 @@ fn compact_go(
         // The predicate is an immutable term, so a non-vacuous force builds a
         // fresh predicate from the (freshened) bound's content directly.
         Type::Refinement(inner, r) => {
-            let mut ct = compact_go(inner, pol, subst_acc, parents, st);
+            let mut ct = compact_go(inner, pol, subst_acc, parents, st, pi_depth);
             let r = subst_acc.force_refinement(r);
             if !ct.refinements.contains(&r) {
                 ct.refinements.push(r);
@@ -633,17 +635,33 @@ fn compact_go(
             // per child mirrors Scala's `Set.empty` argument — cycles
             // span only one variable's bound chain, not across
             // function boundaries.
-            let dom = compact_go(d, !pol, subst_acc, None, st);
-            // A Pi binder shadows the accumulated substitution inside the
-            // codomain (it binds the name locally), so restrict it there.
-            let cod_acc = match name {
-                Some(b) => subst_acc.shadow(b),
-                None => subst_acc.clone(),
+            let dom = compact_go(d, !pol, subst_acc, None, st, pi_depth);
+            // **Canonical Pi binders**: the binder is renamed to the reserved
+            // depth-indexed name (`Name::pi`), and the rename rides the
+            // accumulated substitution so every predicate reference inside
+            // the codomain is rewritten as it lands (the same force that
+            // discharges dependent applications). This is `__elem`'s move
+            // applied to arrows: one shared name per position means
+            // α-variant bounds compact to *identical* shapes — they merge,
+            // their refinement copies dedup instead of accumulating a
+            // dangling twin, and every identity built on the flattened form
+            // (`SpecKey`, equality walls, caches) is α-insensitive. The
+            // rename also shadows any outer mapping of the source binder,
+            // which is what the previous `shadow(b)` was for.
+            let (name, cod_acc) = match name {
+                Some(b) => {
+                    let canon = Name::pi(pi_depth);
+                    (
+                        Some(canon.clone()),
+                        subst_acc.extended_rename(b.clone(), canon),
+                    )
+                }
+                None => (None, subst_acc.clone()),
             };
-            let cod = compact_go(c, pol, &cod_acc, None, st);
+            let cod = compact_go(c, pol, &cod_acc, None, st, pi_depth + 1);
             CompactType {
                 fun: Some(CompactFun {
-                    name: name.clone(),
+                    name,
                     kind: KindMerge::of(kind),
                     domains: vec![dom],
                     codomain: Box::new(cod),
@@ -656,7 +674,10 @@ fn compact_go(
         Type::Tuple(ts) => {
             let mut compacted = BTreeMap::new();
             for (i, v) in ts.iter().enumerate() {
-                compacted.insert(FieldKey::Index(i), compact_go(v, pol, subst_acc, None, st));
+                compacted.insert(
+                    FieldKey::Index(i),
+                    compact_go(v, pol, subst_acc, None, st, pi_depth),
+                );
             }
             CompactType {
                 rec: Some(compacted),
@@ -668,7 +689,7 @@ fn compact_go(
             for (n, v) in fs {
                 compacted.insert(
                     FieldKey::Name(SmolStr::from(n.as_str())),
-                    compact_go(v, pol, subst_acc, None, st),
+                    compact_go(v, pol, subst_acc, None, st, pi_depth),
                 );
             }
             CompactType {
@@ -683,7 +704,7 @@ fn compact_go(
             // payload depth is unaffected.
             let mut compacted = BTreeMap::new();
             for (k, v) in tags {
-                compacted.insert(k.clone(), compact_go(v, pol, subst_acc, None, st));
+                compacted.insert(k.clone(), compact_go(v, pol, subst_acc, None, st, pi_depth));
             }
             CompactType {
                 var: Some(compacted),
@@ -700,8 +721,8 @@ fn compact_go(
             domain,
             kind,
         } => {
-            let value = compact_go(value, pol, subst_acc, None, st);
-            let domain = compact_go(domain, pol, subst_acc, None, st);
+            let value = compact_go(value, pol, subst_acc, None, st, pi_depth);
+            let domain = compact_go(domain, pol, subst_acc, None, st, pi_depth);
             CompactType {
                 history_slot: Some((Box::new(value), Box::new(domain), *kind)),
                 ..Default::default()
@@ -798,7 +819,7 @@ fn compact_go(
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                let bc = compact_go(&b.ty, pol, &inner_acc, Some(&new_parents), st);
+                let bc = compact_go(&b.ty, pol, &inner_acc, Some(&new_parents), st, pi_depth);
                 bound = Some(match bound {
                     None => bc,
                     Some(acc) => CompactType::merge(pol, acc, bc),
@@ -820,7 +841,7 @@ fn compact_go(
             if no_concrete {
                 for b in opposite_bounds.iter() {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                    let bc = compact_go(&b.ty, !pol, &inner_acc, Some(&new_parents), st);
+                    let bc = compact_go(&b.ty, !pol, &inner_acc, Some(&new_parents), st, pi_depth);
                     bound = Some(match bound {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),
@@ -848,6 +869,59 @@ fn compact_go(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Finding, repaired: merging α-variant dependent bounds is canonical.**
+    /// Before canonical Pi binders, the merged fun shape kept the *first
+    /// arrival's* binder while the refinement sets unioned both α-copies of one
+    /// constraint, coalescing to the order-dependent — and dangling —
+    /// `(𝑥: 𝐷) ⤇ {{Int | __elem == 𝑥} | __elem == 𝑦}`. With `compact_go`
+    /// renaming binders and references to `Name::pi(depth)` as bounds flatten,
+    /// α-variants compact identically: the copies dedup, the binder is
+    /// arrival-independent, and nothing dangles.
+    #[test]
+    fn alpha_variant_bound_merge_is_canonical() {
+        use crate::ccl::infer::solver::test_helpers::dep_pred;
+        use crate::ccl::infer::solver::{
+            ConstrainCache, coalesce_compact, compact_type, constrain_subtype, fresh_var,
+            simplify_type,
+        };
+        use crate::ccl::{FunKind, Name, Refinement};
+
+        let dep_fun = |binder: &str| Type::Fun {
+            name: Some(Name::raw(binder)),
+            kind: FunKind::Data,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Refinement(
+                Box::new(Type::Base(BaseType::Int)),
+                Refinement::born(dep_pred(binder)),
+            )),
+        };
+        let coalesce_with_order = |first: &Type, second: &Type| {
+            let v = fresh_var(0);
+            constrain_subtype(&v, first, &mut ConstrainCache::new()).unwrap();
+            constrain_subtype(&v, second, &mut ConstrainCache::new()).unwrap();
+            coalesce_compact(&simplify_type(compact_type(&v))).unwrap()
+        };
+        let (fx, fy) = (dep_fun("x"), dep_fun("y"));
+        let a = coalesce_with_order(&fx, &fy);
+        let b = coalesce_with_order(&fy, &fx);
+        assert_eq!(
+            a, b,
+            "α-variant bound merge must be arrival-order-independent"
+        );
+        // The α-copies collapsed: one binder, one predicate, nothing dangling.
+        let Type::Fun { name, codomain, .. } = &a else {
+            panic!("expected a function, got {a}");
+        };
+        assert_eq!(*name, Some(Name::pi(0)));
+        let Type::Refinement(base, _) = &**codomain else {
+            panic!("expected exactly one refinement layer, got {codomain}");
+        };
+        assert!(
+            !matches!(&**base, Type::Refinement(..)),
+            "the two α-copies of one constraint must dedup to one layer, got {codomain}"
+        );
+    }
 
     /// Compact merge at positive polarity unions tags.
     #[test]
