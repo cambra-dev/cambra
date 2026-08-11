@@ -2131,8 +2131,13 @@ fn extract_for_defer_impl(
                         let let_ty =
                             crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone())
                                 .apply_type(&original.ty);
-                        *feed = Expr::let_bind(binding.name.clone(), bound_expr.clone(), original)
-                            .with_ty(let_ty);
+                        // The `Let` this walk is rebuilding keeps the original
+                        // `bound_expr` in the body, and each extracted feed that
+                        // captures the binder gets its own re-binding of the same
+                        // definition, so every wrap is a copy.
+                        *feed =
+                            Expr::let_bind(binding.name.clone(), bound_expr.fresh_copy(), original)
+                                .with_ty(let_ty);
                     }
                 }
                 new_body
@@ -2216,7 +2221,10 @@ fn extract_for_defer_impl(
                     // (the argument matches `param.ty`). Typed at construction.
                     let v_ty = v.ty.clone();
                     let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
-                    let channel = Expr::apply(new_argument.clone(), channel_lambda).with_ty(v_ty);
+                    // Each companion channel applies the same source, which also
+                    // stays on the rebuilt `Apply` below, so each gets its own copy.
+                    let channel =
+                        Expr::apply(new_argument.fresh_copy(), channel_lambda).with_ty(v_ty);
                     feeds.push(channel);
                 }
                 let new_function = TypedExpr {
@@ -2374,7 +2382,11 @@ fn extract_for_defer_impl(
                                         .with_ty(Type::Base(BaseType::Bool));
                                     let refinement_struct =
                                         Refinement::born(Rc::new(pred_on_source));
-                                    let mut refined_prefix = source_prefix.clone();
+                                    // One refined source per feeding arm, so
+                                    // each arm's copy must carry its own ids —
+                                    // a bare clone would put one identity at N
+                                    // live positions.
+                                    let mut refined_prefix = source_prefix.fresh_copy();
                                     refine_source_domain(&mut refined_prefix, refinement_struct);
                                     let channel_lambda =
                                         Expr::lambda(&param.name, param.ty.clone(), value);
@@ -2432,7 +2444,10 @@ fn extract_for_defer_impl(
                             // handle's rigid `ChanDom` domain, closed by the
                             // final `erase_chan_domains` substitution.
                             let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
-                            let mut channel_elts = new_elts.clone();
+                            // The prefix stays in `new_elts` for the rebuilt
+                            // compose, so each companion channel takes its own copy.
+                            let mut channel_elts: Vec<Expr> =
+                                new_elts.iter().map(Expr::fresh_copy).collect();
                             channel_elts.push(channel_lambda);
                             // A single-element "compose" is just that
                             // element; otherwise build a Compose.

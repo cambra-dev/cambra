@@ -380,21 +380,28 @@ fn build_value_case_cform(
         // gate (a leading `if True`) leaves the driver unrefined (always fires).
         let refined_dom = refine_with(driver_dom.clone(), &gate_fn);
         arm_domains.push(refined_dom.clone());
+        default_body = Some(body.clone());
         // const(eᵢ) : {UIntRange(1) | π̂ᵢ} ⤇ V — lift the value over the gated driver.
         let arm = apply_primitive(
-            body.clone(),
+            body,
             Builtin::Const,
             Type::data_fun(refined_dom, result_ty.clone()),
         );
         arms.push(arm);
-        default_body = Some(body);
     }
 
     // A one-branch value `Case` denotes just that branch's value.
     let default_body = default_body.expect("value-selecting Case has at least one branch");
     if arms.len() == 1 {
+        // The single arm is discarded, so this body reaches the output once and
+        // keeps the branch's own ids.
         return Ok(default_body);
     }
+    // Past here the last branch's body reaches the output *twice*: as its own
+    // gated arm, and as `final_or_default`'s default. The arm is the copy that
+    // actually fires, so it keeps the source ids and the unreachable type anchor
+    // is the freshened sibling.
+    let default_body = default_body.fresh_copy();
 
     // Union domain = Variant({Index(i): {UIntRange(1)|π̂ᵢ}}) — the same tagged
     // union `emit_copair` produces, so op-conversion's `UnionOperator`

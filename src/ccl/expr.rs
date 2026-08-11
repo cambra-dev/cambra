@@ -916,6 +916,24 @@ impl TypedExpr {
         freshen_from_expr(self);
     }
 
+    /// An id-freshened copy — the same value at a distinct identity.
+    ///
+    /// Reach for this instead of a bare `clone` whenever one subtree reaches the
+    /// output tree at **more than one position**. `Clone` is derived, so it copies
+    /// `node_id`; two positions sharing an id make the pane projection ambiguous
+    /// (one attribution for two nodes), collapse the two into one entry in every
+    /// `NodeId`-keyed walk, and make a cross-domain map non-functional. Cloning
+    /// means siblings, and freshening is what says so.
+    ///
+    /// Every re-minted node fires the `on_copy` hook, so an open lineage step
+    /// captures the copy as a `Copy` of its origin — identical provenance,
+    /// distinct identity. No call site needs to know whether recording is on.
+    pub(crate) fn fresh_copy(&self) -> Self {
+        let mut copy = self.clone();
+        copy.freshen_node_ids_deep();
+        copy
+    }
+
     /// Deep-freshen the **interior** of this node — every descendant — while
     /// leaving the node's *own* [`NodeId`] untouched.
     ///

@@ -886,6 +886,7 @@ pub fn compile_program(
     let post_inference_ir = expr.clone();
 
     expr = inline::inline_capability_lambdas(expr);
+    assert_unique_node_ids(&expr, "post-inline");
     debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).map_err(|errs| {
         if errs
@@ -939,6 +940,7 @@ pub fn compile_program(
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     expr = transact_phase::run(expr, &txn_mut_vars)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    assert_unique_node_ids(&expr, "post-transact");
     debug!("Transact phase CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).expect("transact phase produced an inconsistent tree");
 
@@ -951,6 +953,7 @@ pub fn compile_program(
     // The tree still carries Defer/Feed here, so the walls are the relaxed
     // pre-desugar check.
     let phase_out = mut_elim::run(expr);
+    assert_unique_node_ids(&phase_out, "post-letrec-run");
     debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));
     check_pre_desugar(&phase_out).expect("letrec phase produced an inconsistent tree");
 
@@ -965,6 +968,7 @@ pub fn compile_program(
     // channel domains by substitution; the strict `typecheck` below is the
     // release-visible enforcement.
     let mut desugared = channelize::run(phase_out).errs()?;
+    assert_unique_node_ids(&desugared, "post-desugar");
     debug!("Channelized:\n{}", symbolic(&desugared));
     typecheck(&desugared).expect("channelize produced an ill-typed tree");
 
@@ -986,6 +990,7 @@ pub fn compile_program(
     typecheck(&desugared).expect("as-of-read rewrite produced an ill-typed tree");
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;
+    assert_unique_node_ids(&lambda_elim, "post-lambda-elim");
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
     debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
 
@@ -1006,6 +1011,7 @@ pub fn compile_program(
     typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
 
     let join_planned = planning::run(recognized);
+    assert_unique_node_ids(&join_planned, "post-planning");
     debug!(
         "Join-planned CCL:\n{} : {}",
         symbolic(&join_planned),

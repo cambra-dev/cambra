@@ -1269,8 +1269,17 @@ fn transform_chain(
                 // `commit` field must be point-free like `writes`.
                 let pi = subst_env(synthesize_arm_predicate(&br.guard, &priors), env);
                 priors.push(br.guard.clone());
-                let spliced = splice_after_unit(br.body, rest.clone());
-                let mut branch_env = env.clone();
+                // The post-`Case` remainder is walked once per branch, and each
+                // branch's writes and feeds land in the decision, so every branch
+                // gets its own copy of it.
+                let spliced = splice_after_unit(br.body, rest.fresh_copy());
+                // Likewise the entering values: a branch that leaves an
+                // accumulator alone carries that value into its write set, so a
+                // bare env clone would stamp one value's ids into every branch.
+                let mut branch_env: HashMap<Name, Expr> = env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.fresh_copy()))
+                    .collect();
                 // Each branch walks under `path ∧ πᵢ`, collecting its feeds into the
                 // shared `feeds` (unique field names, per-branch fire paths) — so a
                 // feed under a guard becomes a `to_<feed>__fire`-gated tap that fires
@@ -1478,7 +1487,10 @@ fn conditional_decision(
     writes_ty: &Type,
 ) -> Expr {
     let bool_ty = Type::Base(BaseType::Bool);
-    let mut commit_guards: Vec<Expr> = writing.iter().map(|(g, _)| g.clone()).collect();
+    // Each writing branch's guard reaches the output once in the commit
+    // disjunction and once more per accumulator (as a value-`Case` arm guard
+    // below), so every placement is a copy.
+    let mut commit_guards: Vec<Expr> = writing.iter().map(|(g, _)| g.fresh_copy()).collect();
     // An **unconditional** write (before the `Case`, or after it in `rest`, spliced
     // into every branch) is baked into the `carry` — so `carry ≠ entering` means the
     // accumulator changed at *every* position, and the change must commit
@@ -1502,7 +1514,9 @@ fn conditional_decision(
                 .iter()
                 .map(|(g, w)| Branch {
                     pattern: None,
-                    guard: g.clone(),
+                    // One guard, one value-`Case` per accumulator: see
+                    // `commit_guards` above.
+                    guard: g.fresh_copy(),
                     body: w[i].clone(),
                 })
                 .collect();
@@ -1612,13 +1626,15 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
             // to the shared decision builder (the one place the `__fire` encoding
             // lives — see `ccl_utils::writer_decision_record`).
             let commit = crate::ccl::ccl_utils::disjoin(
-                std::iter::once(commit_base).chain(feeds.iter().map(|f| f.fire.clone())),
+                // Each fire path lands in the record twice — here, widening the
+                // commit gate, and again as the tap's `__fire` field below.
+                std::iter::once(commit_base).chain(feeds.iter().map(|f| f.fire.fresh_copy())),
                 false,
                 &bool_ty,
             );
             let feed_tuples: Vec<(String, Expr, Expr)> = feeds
                 .iter()
-                .map(|f| (f.field.clone(), f.value.clone(), f.fire.clone()))
+                .map(|f| (f.field.clone(), f.value.clone(), f.fire.fresh_copy()))
                 .collect();
             crate::ccl::ccl_utils::writer_decision_record(commit, writes, &feed_tuples)
         }
@@ -1652,7 +1668,15 @@ fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(rep) = env.get(n)
     {
-        return rep.clone();
+        // Root-carry. One environment value, N reads of the name: each read is
+        // inlined into the decision, so every occurrence needs its own identity.
+        // The replacement denotes the same thing the `Var` did — the value of
+        // `n` *here* — so the read site keeps its own id (and with it its
+        // span/attribution) and only the interior is freshened. N reads still
+        // give N distinct roots, so uniqueness holds.
+        let mut copy = rep.clone();
+        copy.freshen_interior_node_ids();
+        return copy.re_root(e.node_id());
     }
     e.map_children(|c| subst_env(c, env));
     e

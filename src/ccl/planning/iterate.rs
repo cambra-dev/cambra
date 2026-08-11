@@ -407,7 +407,12 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     let mut preds: Vec<Expr> = Vec::new();
     let mut current = &domain_ty;
     while let Type::Refinement(base, refinement) = current {
-        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate));
+        // Lifting a predicate out of a *type* and into the term tree copies nodes
+        // from outside the checked id domain — a predicate's interior may already
+        // alias main-tree ids (lowering shares a comprehension's source term
+        // between the generator and the guard), and one predicate `Rc` reached
+        // from two iteration sites would land twice. Freshen at the lift.
+        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate).fresh_copy());
         current = base.as_ref();
     }
     preds.reverse();

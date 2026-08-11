@@ -364,7 +364,9 @@ fn proj_pair(p: &Name, pair_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
 fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
     if let TypedExprNode::Var(n) = &e.node {
         if n == name {
-            *e = replacement.clone();
+            // One replacement, N occurrences: each occurrence needs its own
+            // identity or the tree carries the same ids at every read site.
+            *e = replacement.fresh_copy();
         }
         return;
     }
@@ -405,8 +407,11 @@ fn build_as_of(trigger: &Expr, source: &Expr, codomain: Type) -> Option<Expr> {
     let b = trigger.ty.domain()?;
     let out = Type::fun(b, codomain);
     let arg_ty = Type::Tuple(vec![trigger.ty.clone(), source.ty.clone()]);
-    let arg = Expr::new(TypedExprNode::Tuple(vec![trigger.clone(), source.clone()]))
-        .with_ty(arg_ty.clone());
+    let arg = Expr::new(TypedExprNode::Tuple(vec![
+        trigger.fresh_copy(),
+        source.fresh_copy(),
+    ]))
+    .with_ty(arg_ty.clone());
     let as_of_fn = Expr::builtin(Builtin::AsOf).with_ty(Type::fun(arg_ty, out.clone()));
     Some(Expr::apply(arg, as_of_fn).with_ty(out))
 }
@@ -1075,7 +1080,10 @@ fn strip(
             let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
             out.sites.push(RawSite {
                 target: target.clone(),
-                source: source.clone(),
+                // The enclosing `For` keeps its `iter` in the stripped tree while
+                // the site carries the same expression into the writer's source,
+                // so the site's copy is its own.
+                source: source.fresh_copy(),
                 block: txn_block,
                 read_keys,
                 write_keys,
@@ -1894,7 +1902,9 @@ fn build_writer(
             continue;
         }
         if site.enclosing_writes.contains(n) {
-            site_accs.push((n.clone(), info.view.clone(), info.value_ty.clone()));
+            // `acc_views` is shared across writer sites, and each site zips the
+            // view into its own source, so every site takes its own copy.
+            site_accs.push((n.clone(), info.view.fresh_copy(), info.value_ty.clone()));
         } else {
             broadcasts.push((n.clone(), info.final_var.clone(), info.value_ty.clone()));
         }
@@ -2043,7 +2053,10 @@ fn block_reads_var(block: &Expr, name: &Name) -> bool {
 fn proj_item(item: &Expr, item_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
     let mut proj = Expr::proj_index(i);
     proj.ty = Type::fun(item_ty.clone(), elt_ty.clone());
-    let mut app = Expr::apply(item.clone(), proj);
+    // One item expression, one projection per slot: every slot's projection ends
+    // up in the environment and thence in the decision, so each needs its own
+    // copy of the item it projects from.
+    let mut app = Expr::apply(item.fresh_copy(), proj);
     app.ty = elt_ty.clone();
     app
 }
@@ -2146,7 +2159,10 @@ fn walk_block(
                     env.insert(name.clone(), val);
                     // This write commits on the current path (a spine write's path
                     // is `true`); the disjunction over all writes is the commit.
-                    commit_paths.push(path.clone());
+                    // Several writes (and feeds) can share one path, and `disjoin`
+                    // puts every contribution in the output, so each contribution
+                    // is its own copy.
+                    commit_paths.push(path.fresh_copy());
                 }
                 TypedExprNode::Case {
                     scrutinee: None,
@@ -2183,9 +2199,11 @@ fn walk_block(
                     let val = subst_env(value, env);
                     let field = format!("to_{}_{}", name.base(), *feed_counter);
                     *feed_counter += 1;
-                    feeds.push((name.clone(), field, val, path.clone()));
+                    // The tap's `__fire` gate and the commit disjunction both carry
+                    // this path into the decision record, so each gets its own copy.
+                    feeds.push((name.clone(), field, val, path.fresh_copy()));
                     // A read-only transaction commits to emit its reply.
-                    commit_paths.push(path.clone());
+                    commit_paths.push(path.fresh_copy());
                 }
                 other => panic!(
                     "transact_phase: unexpected statement in `with begin():` block: {other:?}"
@@ -2246,7 +2264,13 @@ fn walk_case(
         let pi = synthesize_arm_predicate(&guard, &priors);
         priors.push(guard.clone());
         let arm_path = and_path(path, &pi);
-        let mut arm_env = snapshot.clone();
+        // Each arm gets its own copy of the entering values: an arm that leaves a
+        // key unchanged carries that value into the rejoin, so a bare clone would
+        // stamp one value's ids into every arm.
+        let mut arm_env: HashMap<Name, Expr> = snapshot
+            .iter()
+            .map(|(k, v)| (k.clone(), v.fresh_copy()))
+            .collect();
         walk_block(
             &br.body,
             &mut arm_env,
@@ -2290,11 +2314,12 @@ fn walk_case(
             .iter()
             .map(|(g, ae)| crate::ccl::Branch {
                 pattern: None,
-                guard: g.clone(),
+                // The guard is spliced into one `Case` per rejoined key.
+                guard: g.fresh_copy(),
                 body: ae
                     .get(wk)
                     .or(snap_v)
-                    .cloned()
+                    .map(Expr::fresh_copy)
                     .expect("a rejoined write key has a per-arm or snapshot value"),
             })
             .collect();
@@ -2335,7 +2360,15 @@ fn subst_env(e: &Expr, env: &HashMap<Name, Expr>) -> Expr {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(rep) = env.get(n)
     {
-        return rep.clone();
+        // Root-carry. One environment value, N reads of the name: every
+        // occurrence lands in the decision record, so a bare clone would stamp
+        // the binding's ids at each read site. The replacement denotes the same
+        // thing the `Var` did — the value of `n` *here* — so the read site keeps
+        // its own id (and with it its span/attribution) and only the interior is
+        // freshened. N reads still give N distinct roots, so uniqueness holds.
+        let mut copy = rep.clone();
+        copy.freshen_interior_node_ids();
+        return copy.re_root(e.node_id());
     }
     let mut out = e.clone();
     out.map_children(|c| subst_env(&c, env));
@@ -2718,7 +2751,11 @@ fn plan_store(
         let v = value_ty(k);
         let reg_k = hist[k].clone();
         let t = Name::fresh("__t");
-        let init = key_init.get(k).cloned().expect("key init present");
+        // A key's init reaches the output twice — as the `get_prev_txn` default
+        // here and as the trailing `final_or_default` default in `splice_letrec`
+        // — while the `let` that held the original is dropped by
+        // `rebind_letrec`, so both placements are copies.
+        let init = key_init[k].fresh_copy();
         // The `get_prev_txn` history slot — the design's denotation: the
         // `⧺`-merged **per-key commit views** of every site writing this key
         // ("multiple writer sites for one variable merge their commit
