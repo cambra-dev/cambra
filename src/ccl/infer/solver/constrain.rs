@@ -344,6 +344,58 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
     );
 }
 
+/// The **uniquely-keyed** invariant the record and variant arms rest on, checked
+/// where they rest on it.
+///
+/// Both arms look a key up with `iter().find(..)` — *first* match wins — so on a
+/// duplicate-keyed product the answer depends on which copy comes first, and the
+/// arm disagrees with `constrain_go`'s own trivial-equality short-circuit: the
+/// short-circuit accepts `𝑡 <: 𝑡` while find-first demands cross-subtyping
+/// between the duplicates and rejects it. Whether a type is a subtype of itself
+/// would then depend on whether the two sides happened to be structurally
+/// identical.
+///
+/// Nothing in `Type` enforces uniqueness — `Record(Vec<(String, Type)>)` admits
+/// duplicates and the builders merely happen not to produce them — so this is a
+/// real invariant that is not type-enforced, which is where a `debug_assert`
+/// earns its keep. `dup_key_record_trips_the_uniquely_keyed_invariant` pins that
+/// this assert fires, so the guard cannot rot into a no-op.
+///
+/// No program in the suite trips it, so the invariant does hold across the
+/// pipeline today; what changes is that a builder which starts violating it fails
+/// loudly instead of silently making subtyping depend on incidental structure.
+///
+/// Debug-only and shallow: it checks the type's own key list, not its payloads,
+/// since recursion reaches every nested product on its own.
+#[cfg(debug_assertions)]
+fn debug_assert_unique_product_keys(t: &Type) {
+    match t {
+        Type::Record(fs) => debug_assert_unique_keys(fs.iter().map(|(n, _)| n), "record", t),
+        Type::Variant(tags) => debug_assert_unique_keys(tags.iter().map(|(k, _)| k), "variant", t),
+        _ => {}
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_unique_product_keys(_t: &Type) {}
+
+#[cfg(debug_assertions)]
+fn debug_assert_unique_keys<'a, K: Eq + std::fmt::Debug + 'a>(
+    keys: impl Iterator<Item = &'a K>,
+    what: &str,
+    in_type: &Type,
+) {
+    let keys: Vec<&K> = keys.collect();
+    for (i, k) in keys.iter().enumerate() {
+        debug_assert!(
+            !keys[..i].contains(k),
+            "duplicate {what} key {k:?} in {in_type}: find-first lookup makes the \
+             uniquely-keyed invariant load-bearing here, and the trivial-equality \
+             short-circuit disagrees with it on `t <: t`"
+        );
+    }
+}
+
 /// Whether `union_dom` is a gated **partition** of the single domain `target`:
 /// a `Variant` with contiguous `Index(0..n)` tags (n ≥ 1) whose every payload,
 /// with its gate refinement stripped, is structurally `target` (also stripped).
@@ -392,6 +444,12 @@ fn constrain_go(
     sr: &Subst,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
+    // Checked *before* the short-circuit, deliberately: the case the two
+    // disagree on is `𝑡 <: 𝑡` itself, which the short-circuit would answer and
+    // return before any arm looked at the keys.
+    debug_assert_unique_product_keys(lhs);
+    debug_assert_unique_product_keys(rhs);
+
     // Structural descent over two types at once, one frame per constructor pair;
     // grow on demand as the other deep walks do.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
@@ -1233,6 +1291,27 @@ mod tests {
     use crate::ccl::{
         BaseType, BinOpKind, CompareKind, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode,
     };
+
+    /// The tripwire is armed for the one place the record/variant arms and the
+    /// trivial-equality short-circuit can disagree.
+    ///
+    /// On a duplicate-keyed record the short-circuit accepts `t <: t`, while the
+    /// arm it shadows — find-first field lookup — answers the *first* `a` for both
+    /// of the rhs's `a` fields and demands `Int <: Bool`. The disagreement is not a
+    /// bug in either one; it is a type outside the uniquely-keyed invariant both
+    /// rest on. Pinning that the assert *fires* is what keeps the guard from
+    /// rotting into a no-op.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "duplicate record key")]
+    fn dup_key_record_trips_the_uniquely_keyed_invariant() {
+        let dup = Type::Record(vec![
+            ("a".to_string(), Type::Base(BaseType::Int)),
+            ("a".to_string(), Type::Base(BaseType::Bool)),
+        ]);
+        let mut cache = ConstrainCache::new();
+        let _ = constrain_subtype(&dup, &dup.clone(), &mut cache);
+    }
 
     #[test]
     fn refined_superset_is_subtype() {
