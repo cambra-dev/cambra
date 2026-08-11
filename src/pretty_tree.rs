@@ -12,6 +12,26 @@
 //! This module has no dependencies on interpreter or domain types — it is
 //! purely a tree renderer used by [`crate::pretty_graph`].
 
+/// A node's rewrite tag — the native per-node attribution the inspector wire
+/// carries in place of the old flat provenance string. `None` on an
+/// [`InspectNode`] means the node was directly lowered (a source construct's
+/// image); `Some` means a pass rewrote it, tagged with how.
+///
+/// Stored as plain `String`s to keep `pretty_tree` free of any `ccl`/domain-type
+/// dependency (the module's standing invariant): the inspector query layer
+/// converts the `ccl::lineage::RewriteTag` (`Pass`/`Nature`/label) into these.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct RewriteInfo {
+    /// The pass that performed the rewrite (the `Pass` debug name, e.g. `"Mono"`).
+    pub via: String,
+    /// `"expansion"` (faithful expansion of a user construct) or `"machinery"`
+    /// (pure plumbing) — the lowercase `Nature` discriminant.
+    pub nature: String,
+    /// The rewrite's stable label, e.g. `"channelize.feed_union"`.
+    pub label: String,
+}
+
 // Box-drawing connector strings, used by render_node.
 const CONNECTOR_LAST: &str = "└── ";
 const CONNECTOR_MID: &str = "├── ";
@@ -40,6 +60,35 @@ pub struct InspectNode {
     pub intent_guard: Option<String>,
     /// Children with optional edge labels, e.g. ("left", child_desc)
     pub children: Vec<(String, InspectNode)>,
+
+    // --- Inspector source-linking fields (added for `expand`) ---
+    //
+    // These extend the tree node additively so the inspector's `expand` query
+    // can cross-link a tree row to source + types + provenance, while the CLI
+    // Unicode renderer and the existing `to_json` shape stay unaffected (all
+    // `None`/absent for the non-inspector callers in `pretty_graph` etc.).
+    //
+    // Stored as primitives — `u64` node id, `(start, end)` byte span — to keep
+    // `pretty_tree` free of any `ccl`/domain-type dependency (the module's
+    // standing invariant: it is a pure tree renderer). The inspector query layer
+    // converts its `NodeId`/`Span`/`Type` into these.
+    /// The IR node's stable id (its `NodeId` as a wire number), if this row
+    /// corresponds to an IR node.
+    pub node_id: Option<u64>,
+    /// The node's primary source span `(start, end)` (byte offsets), if known.
+    pub span: Option<(usize, usize)>,
+    /// The node's rewrite tag (`via`/`nature`/`label`) when a pass produced it;
+    /// `None` for a directly-lowered source node. The spans channel of the
+    /// node's attribution rides the `span` field above.
+    pub rewritten: Option<RewriteInfo>,
+    /// The node's type as a Display string (e.g. `"Int"`, `"(Int ⇒ Int)"`, or a
+    /// hole `"_"`/`"?N"` pre-inference), if this row corresponds to a typed IR
+    /// node. A dedicated field rather than a positional `annotations[0]` entry:
+    /// the type is a first-class wire field (`"type"`), not smuggled into the
+    /// free-form annotation list, so a consumer reads `node.type` directly. The
+    /// string is CCL's canonical type rendering (`Display for Type`), so any
+    /// change there changes this verbatim — see `crate::ccl::Type`.
+    pub ty: Option<String>,
 }
 
 impl InspectNode {
@@ -53,6 +102,10 @@ impl InspectNode {
             obsolete_guard: None,
             intent_guard: None,
             children: Vec::new(),
+            node_id: None,
+            span: None,
+            rewritten: None,
+            ty: None,
         }
     }
 
@@ -97,6 +150,30 @@ impl InspectNode {
         self
     }
 
+    /// Set the inspector node id (wire number). Additive — see the field docs.
+    pub fn with_node_id(mut self, id: u64) -> Self {
+        self.node_id = Some(id);
+        self
+    }
+
+    /// Set the inspector source span `(start, end)`. Additive.
+    pub fn with_node_span(mut self, span: (usize, usize)) -> Self {
+        self.span = Some(span);
+        self
+    }
+
+    /// Set the node's type (a CCL `Display` string). Additive — see the field docs.
+    pub fn with_type(mut self, ty: impl Into<String>) -> Self {
+        self.ty = Some(ty.into());
+        self
+    }
+
+    /// Set the inspector rewrite tag. Additive — see the field docs.
+    pub fn with_rewritten(mut self, rewritten: RewriteInfo) -> Self {
+        self.rewritten = Some(rewritten);
+        self
+    }
+
     /// Serialize this node tree to a JSON string without serde.
     ///
     /// Field names mirror the Rust struct fields. `None` guard fields are
@@ -122,6 +199,25 @@ impl InspectNode {
 
         let mut json = format!("{{\"label\":\"{}\"", escape_json(&self.label));
         json.push_str(&format!(",\"annotations\":[{}]", ann_strs.join(",")));
+        // Inspector source-linking fields: emitted only when present, so
+        // non-inspector callers' JSON is unchanged.
+        if let Some(id) = self.node_id {
+            json.push_str(&format!(",\"node_id\":{id}"));
+        }
+        if let Some((start, end)) = self.span {
+            json.push_str(&format!(",\"span\":{{\"start\":{start},\"end\":{end}}}"));
+        }
+        if let Some(ref r) = self.rewritten {
+            json.push_str(&format!(
+                ",\"rewritten\":{{\"via\":\"{}\",\"nature\":\"{}\",\"label\":\"{}\"}}",
+                escape_json(&r.via),
+                escape_json(&r.nature),
+                escape_json(&r.label),
+            ));
+        }
+        if let Some(ref t) = self.ty {
+            json.push_str(&format!(",\"type\":\"{}\"", escape_json(t)));
+        }
         if let Some(ref t) = self.tiling {
             json.push_str(&format!(",\"tiling\":\"{}\"", escape_json(t)));
         }
@@ -136,6 +232,60 @@ impl InspectNode {
         }
         json.push_str(&format!(",\"children\":[{}]}}", children_strs.join(",")));
         json
+    }
+}
+
+// Wire shape (inspector, feature `serde`): the `expand`-node / `ir`-root shape
+// the cambra-inspector `/api/snapshot` payload uses. Field names are camelCase
+// (`nodeId`) and children serialize as `{ "edge": "...", "node": { ... } }`
+// pairs. Hand-written (not derived) for that `{edge,node}` child reshaping and
+// the `nodeId` key.
+//
+// This is a DISTINCT wire from the hand-rolled [`InspectNode::to_json`] above
+// (the legacy `web_inspector` dashboard): that shape uses snake_case `node_id`,
+// omits `None` fields, and carries the tile-producer runtime fields
+// (`yield_guard`/`obsolete_guard`/`intent_guard`) that this one drops. The two
+// feed different frontends and are not kept byte-identical.
+#[cfg(feature = "serde")]
+impl serde::Serialize for InspectNode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        /// A `{ "edge", "node" }` child pair, serialized to mirror `to_json`.
+        struct Child<'a>(&'a str, &'a InspectNode);
+        impl serde::Serialize for Child<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut s = serializer.serialize_struct("Child", 2)?;
+                s.serialize_field("edge", self.0)?;
+                s.serialize_field("node", self.1)?;
+                s.end()
+            }
+        }
+
+        /// `{ "start", "end" }`, matching the `Span` wire shape.
+        #[derive(serde::Serialize)]
+        struct WireSpan {
+            start: usize,
+            end: usize,
+        }
+
+        let children: Vec<Child<'_>> = self
+            .children
+            .iter()
+            .map(|(edge, node)| Child(edge, node))
+            .collect();
+        let span = self.span.map(|(start, end)| WireSpan { start, end });
+
+        let mut s = serializer.serialize_struct("InspectNode", 8)?;
+        s.serialize_field("label", &self.label)?;
+        s.serialize_field("annotations", &self.annotations)?;
+        s.serialize_field("nodeId", &self.node_id)?;
+        s.serialize_field("span", &span)?;
+        s.serialize_field("rewritten", &self.rewritten)?;
+        s.serialize_field("type", &self.ty)?;
+        s.serialize_field("tiling", &self.tiling)?;
+        s.serialize_field("children", &children)?;
+        s.end()
     }
 }
 

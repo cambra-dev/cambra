@@ -185,10 +185,6 @@ impl Nature {
     /// `"source"` must **never** actually reach the wire — a `Source`-nature tag
     /// null-compresses at the emission sites (see [`is_source`](Self::is_source));
     /// the arm exists for the validators' guard and for completeness.
-    ///
-    /// Compiled only under the `serde` feature (the `Serialize` impl below is its
-    /// sole caller), so a default build sees it as dead.
-    #[allow(dead_code)]
     pub(crate) fn wire_str(self) -> &'static str {
         match self {
             Nature::Source => "source",
