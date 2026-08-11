@@ -199,8 +199,8 @@ column names the branch that *will* land it.
 
 ### Realization notes
 
-Two mechanisms behind the `[Implemented]` rows that are not obvious from the
-rules, recorded because both were arrived at the hard way.
+Three mechanisms behind the `[Implemented]` rows that are not obvious from the
+rules, recorded because each was arrived at the hard way.
 
 - **A domain refinement inside a type must be built *typed*, not `Hole`.** Only
   *node* annotations re-infer embedded predicates (`emit_annotation_predicates`); a
@@ -222,6 +222,21 @@ rules, recorded because both were arrived at the hard way.
   `has_enumerable_extent`. The switch had to land with `groupby-keyed-collection`:
   only there is a `groupby` a `Data` arrow, which the old shape heuristic would have
   gone on inlining as a non-iterable domain.
+- **Realization is demand-directed, so a restricted conditional is copied to each
+  consumer.** A consuming site's filter rides the witness — `Σ 𝜎 ∈ 𝐾. ({𝜎 | 𝑝} ⤇ 𝑉)` —
+  and the site can do nothing with it, having no extent for a witness. Realization can:
+  inside leg 𝑖 the conditional *is* `armᵢ`, so the leg is gated twice, by its path
+  condition `π̂ᵢ` and by `𝑝` rewritten to read that arm. Rewriting is what makes the fact
+  *sayable* — a predicate may hold a plain arm but not a gated union, which needs the
+  `iterate`/`restrict` a predicate is forbidden.
+
+  The legs therefore carry one consumer's demand, and a `let`-bound conditional consumed
+  twice has one set of legs and two. So planning copies a conditional to each consumer
+  that restricts it and drops the binding, which also puts the `Case` back *below* the
+  site that restricts it — a binding precedes its body by scope, so no traversal order
+  reaches the demand first. An unrestricted conditional owes nothing and stays shared.
+  The price is a union per restricting consumer; the runtime witness is what would let
+  one materialized union serve several, by moving the filter back to the consumer.
 
 The rest of this document is the design of record for every row above.
 
@@ -1385,7 +1400,9 @@ rest in, and why that order. Each step is independently landable and pins a test
    3. **Consuming a sum at a domain-preserving consumer.** **Landed.** A conditional
       collection survives a comprehension by every route — inline, `let`-bound, and through
       a UDF parameter — all yielding `Σ 𝐷 ∈ {[0, 1], [0, 2]}. 𝐷 ⤇ Int`, and a filtered one
-      distributes its restriction over the candidates.
+      restricts the **witness**, `Σ 𝜎 ∈ {[0, 1], [0, 2]}. ({𝜎 | 𝑝} ⤇ Int)`, which
+      realization discharges into the legs (see [Realization
+      notes](#realization-notes)).
 
       *Not* by forming the Σ earlier — that was an earlier reading of this step and it is
       wrong; a conditional whose arms are both parameters proves no syntactic rule can

@@ -24,7 +24,7 @@
 
 use crate::ccl::ccl_utils::{
     PredMemo, apply_primitive, flatten_trailing_value_case, peel_refinements, refine_with,
-    synthesize_arm_predicate, walk_refined_predicates_mut,
+    synthesize_arm_predicate, walk_refined_predicates, walk_refined_predicates_mut,
 };
 use crate::ccl::{BaseType, Builtin, Expr, FieldKey, Type, TypedExprNode, lambda_elim};
 
@@ -35,11 +35,12 @@ pub(super) fn realize_conditional_collections(
 ) -> std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId> {
     let mut erased = std::collections::HashSet::new();
     let mut discharged = std::collections::HashSet::new();
+    inline_restricted_conditionals(expr);
     realize_and_unbox(
         expr,
         &mut erased,
         &PredMemo::new(),
-        &mut std::collections::HashMap::new(),
+        &OwedRestrictions::new(),
         false,
         &mut discharged,
     );
@@ -62,11 +63,89 @@ pub(super) fn realize_conditional_collections(
     discharged
 }
 
+/// Give every consumer of a **restricted** conditional collection its own copy of it,
+/// dropping the binding that shared it.
+///
+/// Realization is demand-directed: the legs it builds carry the consuming site's filter,
+/// gated arm by arm ([`realize_here`]). So the legs belong to *one* consumer's demand, and a
+/// binding consumed twice has one set of legs and two demands. Two filters cannot both gate
+/// one shared union, and an unfiltered consumer of the same binding must not be handed the
+/// other's filter at all. Spelled inline, with a conditional per consumer, both programs
+/// already compile; this is that spelling, performed.
+///
+/// It also puts the `Case` back *below* the site that restricts it. The restriction rides
+/// the consuming site's type, so a `Case` in the binding is reached before the demand it
+/// owes is known — an ordering no walk direction fixes, since the binding precedes the body
+/// by scope, not by traversal.
+///
+/// Only conditionals someone restricts are inlined. An unrestricted one owes nothing, so
+/// sharing costs nothing and duplicating it would only duplicate the union.
+fn inline_restricted_conditionals(expr: &mut Expr) {
+    let mut restricted = std::collections::HashSet::new();
+    collect_restricted_witnesses(expr, &mut std::collections::HashSet::new(), &mut restricted);
+    if !restricted.is_empty() {
+        inline_restricted(expr, &restricted);
+    }
+}
+
+fn collect_restricted_witnesses(
+    expr: &Expr,
+    visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
+    restricted: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+) {
+    if let Some((binder, _)) = restriction_on_a_witness(&expr.ty) {
+        restricted.insert(binder);
+    }
+    // A filter's predicate reads the collection it filters, so a restricted sum is named
+    // inside predicates as well as on terms.
+    expr.walk_type_slots(|ty| {
+        walk_refined_predicates(ty, visited, &mut |pred, visited| {
+            collect_restricted_witnesses(pred, visited, restricted);
+        });
+    });
+    expr.walk_children(|child| collect_restricted_witnesses(child, visited, restricted));
+}
+
+fn inline_restricted(
+    expr: &mut Expr,
+    restricted: &std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+) {
+    expr.walk_children_mut(|child| inline_restricted(child, restricted));
+    let TypedExprNode::Let { bound_expr, .. } = &expr.node else {
+        return;
+    };
+    let is_conditional_collection = matches!(
+        bound_expr.node,
+        TypedExprNode::Case {
+            scrutinee: None,
+            ..
+        }
+    ) && collection_value_ty(&bound_expr.ty).is_some();
+    if !is_conditional_collection
+        || !witness_named_by(&bound_expr.ty).is_some_and(|w| restricted.contains(&w))
+    {
+        return;
+    }
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = std::mem::replace(&mut expr.node, TypedExprNode::Lit(crate::ccl::Lit::Unit))
+    else {
+        unreachable!("matched a Let above")
+    };
+    // Substitution reaches type slots and their predicates, which is required rather than
+    // thorough: the filter's predicate holds its own read of the binding, and a copy left
+    // naming a variable this rewrite just deleted would outlive it.
+    *expr = lambda_elim::substitute(*body, &binding.name, &bound_expr);
+}
+
 /// What a consuming site placed on a witness, and the sum it said it about.
 ///
 /// The candidate list travels with the predicate because it is the only usable key for
 /// finding the *same* sum inside that predicate: a predicate holds its own copy of the
 /// source, and the copy carries a different witness binder (see [`read_the_arm_instead`]).
+#[derive(Clone)]
 struct Owed {
     kind: crate::ccl::ty::TypeKind,
     restriction: crate::ccl::Refinement,
@@ -74,11 +153,17 @@ struct Owed {
 
 type OwedRestrictions = std::collections::HashMap<crate::ccl::infer_var::WitnessBinderId, Owed>;
 
-/// `owed` carries, per witness binder, the restriction a *consuming site above* placed on
-/// that witness — `Σ σ ∈ 𝐾. ({σ | 𝑝} ⤇ 𝑉)`, the shape a filtered comprehension over a
-/// conditional collection has. Realization is what materializes the witness, so it is what
-/// discharges the restriction: [`realize_here`] gates each leg by `𝑝` rewritten to read
-/// *that leg's arm*. Gathered on the way down, which is why the walk stays top-down.
+/// `owed` carries, per witness binder, the restriction a consuming site **on the path from
+/// the root to here** placed on that witness — `Σ σ ∈ 𝐾. ({σ | 𝑝} ⤇ 𝑉)`, the shape a
+/// filtered comprehension over a conditional collection has. Realization is what
+/// materializes the witness, so it is what discharges the restriction: [`realize_here`]
+/// gates each leg by `𝑝` rewritten to read *that leg's arm*.
+///
+/// Scoped to the path, not accumulated over the tree, and the binder is not enough to make
+/// it so: [`inline_restricted_conditionals`] gives each consumer its own copy of the
+/// conditional, and the copies share the binder they were cloned from. Two consumers
+/// restricting the same sum differently are told apart by *where they are*, so a map that
+/// outlived the subtree that filled it would hand one consumer's filter to the other's legs.
 ///
 /// `in_predicate` records that this subtree *is* a refinement predicate. A predicate may
 /// carry no realized collection (`debug_assert_no_iteration_markers_in_type`: a gated union
@@ -90,14 +175,25 @@ fn realize_and_unbox(
     expr: &mut Expr,
     erased: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
     memo: &PredMemo<()>,
-    owed: &mut OwedRestrictions,
+    owed: &OwedRestrictions,
     in_predicate: bool,
     discharged: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
 ) -> bool {
     let mut changed = false;
-    if let Some((binder, restriction)) = restriction_on_a_witness(&expr.ty) {
-        owed.entry(binder).or_insert(restriction);
-    }
+    let extended;
+    let owed = match restriction_on_a_witness(&expr.ty) {
+        // Innermost wins: a site nested under another restricting the same sum is the one
+        // whose demand these legs serve.
+        Some((binder, restriction)) => {
+            extended = {
+                let mut path = owed.clone();
+                path.insert(binder, restriction);
+                path
+            };
+            &extended
+        }
+        None => owed,
+    };
     // **Top-down.** An `elif` chain is a `Case` whose trailing arm is another `Case`, and
     // `flatten_trailing_value_case` collapses the chain into one N-choice partition —
     // which it can only do while the inner one is still a `Case`. Realizing children
@@ -120,7 +216,7 @@ fn realize_and_unbox(
                 pred,
                 erased,
                 memo,
-                &mut std::collections::HashMap::new(),
+                &OwedRestrictions::new(),
                 true,
                 &mut std::collections::HashSet::new(),
             )
@@ -575,13 +671,12 @@ mod tests {
     /// the witness — whether the naming type is the sum itself or the arrow view
     /// `𝑤 ⤇ 𝑉` a lambda-eliminated `Case` carries inside a predicate.
     ///
-    /// Pinned as a unit test because the assertion is unobservable end-to-end today: the
-    /// arrow-view shape reaches realization from a *passing* program (the mapping
-    /// comprehension over a conditional), but nothing above it reads the type there yet.
-    /// The consumer that does is the filtered comprehension, and it is blocked on
-    /// per-leg restriction (`a_filter_over_a_conditional_source_is_dropped`). Without
-    /// this, that path silently shifts the enclosing composition's domain from the
-    /// witness to the realized union.
+    /// Pinned as a unit test because end-to-end the shift it forbids is invisible until
+    /// something above the `Case` reads the type: the arrow view is what a mapping
+    /// comprehension leaves, and only its *filtered* form
+    /// (`a_filter_over_a_conditional_source_is_applied`) looks. Without the assertion that
+    /// path silently shifts the enclosing composition's domain from the witness to the
+    /// realized union.
     #[test]
     fn realizing_an_arrow_view_case_keeps_the_witness_in_its_type() {
         let int = Type::Base(BaseType::Int);
@@ -625,6 +720,86 @@ mod tests {
             matches!(expr.node, TypedExprNode::Realize(_)),
             "the assertion is carried by a `Realize` node, got {:?}",
             expr.node
+        );
+    }
+
+    /// **A conditional binding is inlined only when someone restricts it.**
+    ///
+    /// Both halves are one decision and neither is observable end-to-end — the programs
+    /// compute the same answer whether the binding was shared or copied — so the sharing
+    /// itself is what gets asserted here.
+    ///
+    /// Copying is what lets the legs carry a consumer's filter, since the legs are then that
+    /// consumer's alone; the price is a union per consumer, which is why an unrestricted
+    /// binding, owing nothing, keeps its one.
+    #[test]
+    fn a_conditional_binding_is_copied_to_its_consumer_only_when_restricted() {
+        let int = Type::Base(BaseType::Int);
+        let w = fresh_witness_binder_id();
+        let kind = TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let sum = |body| {
+            Type::Sigma(Box::new(SigmaType::bound(
+                Witness::bound_to(w, kind.clone()),
+                body,
+            )))
+        };
+        // `Σ σ ∈ {[0, 2], [0, 3]}. (σ ⤇ Int)` — the conditional's own type, and what an
+        // unrestricted consumer sees.
+        let unrestricted = sum(Type::data_fun(Type::WitnessRef(w), int.clone()));
+        // `Σ σ ∈ {[0, 2], [0, 3]}. ({σ | 𝑝} ⤇ Int)` — a filtered comprehension's, the
+        // restriction riding the witness.
+        let restricted = sum(Type::data_fun(
+            Type::Refinement(
+                Box::new(Type::WitnessRef(w)),
+                crate::ccl::Refinement::born(std::rc::Rc::new(
+                    Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)),
+                )),
+            ),
+            int.clone(),
+        ));
+        let guard = |b: bool| Expr::lit(Lit::Bool(b)).with_ty(Type::Base(BaseType::Bool));
+        let arm = |dom: usize| {
+            Expr::new(TypedExprNode::Var(Name::from("xs")))
+                .with_ty(Type::data_fun(Type::UIntRange(dom), int.clone()))
+        };
+        let bind_to = |consumer_ty: Type| {
+            Expr::let_bind(
+                "x",
+                Expr::new(TypedExprNode::Case {
+                    scrutinee: None,
+                    branches: vec![
+                        Branch {
+                            pattern: None,
+                            guard: guard(true),
+                            body: arm(2),
+                        },
+                        Branch {
+                            pattern: None,
+                            guard: guard(true),
+                            body: arm(3),
+                        },
+                    ],
+                })
+                .with_ty(unrestricted.clone()),
+                Expr::new(TypedExprNode::Var(Name::from("x"))).with_ty(consumer_ty),
+            )
+            .with_ty(unrestricted.clone())
+        };
+
+        let mut shared = bind_to(unrestricted.clone());
+        inline_restricted_conditionals(&mut shared);
+        assert!(
+            matches!(shared.node, TypedExprNode::Let { .. }),
+            "an unrestricted conditional owes nothing, so its binding stays shared: {:?}",
+            shared.node
+        );
+
+        let mut copied = bind_to(restricted);
+        inline_restricted_conditionals(&mut copied);
+        assert!(
+            matches!(copied.node, TypedExprNode::Case { .. }),
+            "a restricted consumer gets the conditional itself, not a name for it: {:?}",
+            copied.node
         );
     }
 }

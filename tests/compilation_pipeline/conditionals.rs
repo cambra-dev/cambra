@@ -697,8 +697,7 @@ sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 3])",
 // **Two consumers, each with its own conditional.** A restriction is discharged into the
 // arms, so arms cannot be shared between consumers that restrict differently — spelled
 // inline, each consumer has its own `Case` and there is nothing to share. These are the
-// controls for the let-bound pair below, which is the same program with one binding: what
-// fails there is the sharing, not the second filter.
+// controls for the let-bound pair below, which is the same program with one binding.
 #[case(
     r"
 c: Bool = False
@@ -712,28 +711,10 @@ c: Bool = False
 sum([y for y in (box([1, 2]) if c else box([1, 2, 3]))]) + sum([z for z in (box([1, 2]) if c else box([1, 2, 3])) if z > 1])",
     Value::Int(11)
 )]
-fn a_filter_over_a_conditional_source_is_applied(#[case] code: &str, #[case] expected: Value) {
-    check_scalar(code, expected);
-}
-
-/// The shapes the per-leg discharge does **not** reach yet — every one of them a
-/// **let-bound** conditional. All fail loudly at the post-planning typecheck rather than
-/// computing an unfiltered answer.
-///
-/// Binding the conditional is what separates the `Case` from the site that restricts it,
-/// and it does so in two ways that need different answers:
-///
-/// - the `Case` sits in the binding while the filter sits on a use in the body, and
-///   realization walks top-down, so the restriction has not been seen when the legs are
-///   built. (A UDF parameter is *not* in this group — inlining puts the conditional back
-///   inline at the call, which is why that case passes.)
-/// - a binding can have **two consumers**, owing two different restrictions to one set of
-///   legs. The first seen wins; the second is what fails. Spelled inline instead — each
-///   consumer with its own `Case` — both of these compile and filter today, which is what
-///   says the restriction is a fact about the *consumer* and the legs about the producer.
-#[rstest]
-#[timeout(Duration::from_secs(30))]
-// Let-bound: the `Case` is realized before the site's restriction is in scope.
+// **Let-bound**, the same three programs with the conditional shared through a binding.
+// The legs carry the consumer's filter, so a shared conditional is inlined at each consumer
+// before realization — which is also what puts the `Case` back below the site that restricts
+// it, where the binding had placed it above.
 #[case(
     r"
 c: Bool = False
@@ -741,7 +722,6 @@ x = box([1, 2]) if c else box([1, 2, 3])
 sum([y for y in x if y > 1])",
     Value::Int(5)
 )]
-// Two consumers, each with its own filter — one set of legs, two restrictions.
 #[case(
     r"
 c: Bool = False
@@ -756,12 +736,7 @@ x = box([1, 2]) if c else box([1, 2, 3])
 sum([y for y in x]) + sum([z for z in x if z > 1])",
     Value::Int(11)
 )]
-#[ignore = "let-bound: the restriction is not in scope where the legs are built, or two \
-            consumers owe two restrictions to one set of legs; measured 2026-08-11"]
-fn a_filter_over_a_conditional_source_the_legs_cannot_reach(
-    #[case] code: &str,
-    #[case] expected: Value,
-) {
+fn a_filter_over_a_conditional_source_is_applied(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
