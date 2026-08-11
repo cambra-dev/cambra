@@ -530,7 +530,7 @@ fn trailing_commit_value(code: &str) -> Value {
     p: Mut({Int, Int}, Txn) := (100, 0)
     for r in [10, 20]:
         with begin():
-            p := (p[0] - r, p[1] + r)
+            p := (p.0 - r, p.1 + r)
     with begin():
         out << p
     out
@@ -542,8 +542,8 @@ fn trailing_commit_value(code: &str) -> Value {
     p: Mut({Int, Int}, Txn) := (100, 0)
     for r in [60, 60]:
         with begin():
-            if p[0] >= r:
-                p := (p[0] - r, p[1] + r)
+            if p.0 >= r:
+                p := (p.0 - r, p.1 + r)
     with begin():
         out << p
     out
@@ -581,7 +581,7 @@ out", make_record(&[("x", Value::Int(70)), ("y", Value::Int(30))]))]
     for r in [10, 20]:
         with begin():
             s := s + r
-            p := (p[0] - r, p[1] + r)
+            p := (p.0 - r, p.1 + r)
     with begin():
         out << (s, p)
     out
@@ -599,9 +599,9 @@ fn test_compound_txn_register_field() {
                 p: Mut({Int, Int}, Txn) := (100, 0)
                 for r in [10, 20]:
                     with begin():
-                        p := (p[0] - r, p[1] + r)
+                        p := (p.0 - r, p.1 + r)
                 with begin():
-                    out << p[0]
+                    out << p.0
                 out
             "#}),
         Value::Int(70),

@@ -859,7 +859,7 @@ acc", make_tuple(&[Value::Int(3), Value::Int(3)]))]
 #[case(r"
 acc := (0, 10)
 for i in [1, 2, 3]:
-    acc := (acc[0] + i, acc[1] + i)
+    acc := (acc.0 + i, acc.1 + i)
 acc", make_tuple(&[Value::Int(6), Value::Int(16)]))]
 // Single-arm conditional write to a tuple: fires at i>1 → last (3, 3).
 #[case(r"
@@ -906,15 +906,15 @@ fn test_compound_register(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-/// Projecting a field off the final tuple accumulator: `acc[0]` after the loop.
+/// Projecting a field off the final tuple accumulator: `acc.0` after the loop.
 #[test]
 fn test_compound_register_field_read() {
     check_scalar(
         r"
 acc := (0, 0)
 for i in [1, 2, 3]:
-    acc := (acc[0] + i, acc[1])
-acc[0]",
+    acc := (acc.0 + i, acc.1)
+acc.0",
         Value::Int(6),
     );
 }
