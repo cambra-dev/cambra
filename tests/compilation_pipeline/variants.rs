@@ -806,43 +806,27 @@ fn test_variant_valued_register(#[case] code: &str, #[case] expected: Value) {
 
 /// A **multi-arm `match` over a conditionally-built collection**.
 ///
-/// Blocked, and the blocker is not variant-specific — it is where a *copairing's*
-/// domain meets a flat merge. A conditional-element comprehension
-/// (`[a if g else b for x in xs]`) lowers to a `Copair`, whose domain is by
-/// definition the coproduct of its arms' domains, so the resulting collection is
-/// keyed by a tagged `Variant({Index(i): {D | π̂ᵢ}})` rather than by `D`. A `match`
-/// with two or more arms then builds a `DisjointJoin` over that stream, and
-/// `flat_merge` reassembles a disjoint join **by position** — so it meets a tagged
-/// key where an element index belongs and fails loudly.
+/// The case where a fed stream's own index set is a *coproduct*. A
+/// conditional-element comprehension (`[a if g else b for x in xs]`) is a
+/// `Copair`, so `ys` is keyed by `Variant({Index(i): {D | π̂ᵢ}})` rather than by
+/// `D`; the two-arm `match` then flat-merges a stream whose positions are
+/// `Union { tag, inner }` rather than bare `UInt`s. Reassembling those needs only
+/// the order `Value` already defines on a tagged pair — see `flat_merge` in
+/// `src/interpreter/tile_operators/union.rs`.
 ///
-/// Neither half is wrong in isolation, which is why this is not a local fix:
+/// Every type here is consistent, which is why the fix was in the merge and not in
+/// the producer: the join's operands share the *element* variant, and `sum` accepts
+/// the coproduct index set. Emitting a `DisjointJoin` from the comprehension
+/// instead would need an inference rule for a pre-inference birth site — its domain
+/// variable carries only lower bounds while a domain sits in negative position — the
+/// same missing construction as [The domain join is a Σ](../../src/ccl/design/type-inference.md#the-domain-join-is-a-σ).
 ///
-/// - Making the comprehension emit a `DisjointJoin` is arguably right — its arms
-///   *are* gated partitions of one source — but `emit_disjoint_join` has no working
-///   inference rule for a pre-inference birth site. It mints a fresh **domain**
-///   variable with only lower bounds, and a domain sits in negative position, so the
-///   variable resolves from upper bounds and comes out unresolved. It works today
-///   only because a `DisjointJoin` is born *after* inference, where the CHECK-mode
-///   typecheck has a stamped type to resolve against. (Measured: switching
-///   `fan_out_element_case` to `disjoint_join` leaves the node's domain variable
-///   unresolved and takes `test_conditional_element_comprehension` with it. The
-///   polarity is the whole obstruction — a domain variable carrying only lower
-///   bounds has nothing to resolve *from* — which makes it the same missing
-///   construction as [The domain join is a Σ](../../src/ccl/design/type-inference.md#the-domain-join-is-a-σ).)
-/// - Making `flat_merge` merge on general domain keys needs either a total order on
-///   a tagged `Value` (its `PartialOrd` is deliberately partial) or fed-row
-///   provenance threaded through the projections.
-///
-/// The blocker is narrow, and three live cases bound it. A **one-arm** `match` over
-/// the same conditional source works (no union is built, so nothing flat-merges); a
-/// multi-arm `match` over an unconditional comprehension works; and a multi-arm
-/// `match` over a **mixed-tag list literal** works too
-/// ([`test_list_literal_of_variants`]) — so neither multi-arm dispatch nor a merged
-/// tag set is the problem. It is specifically the copairing's *domain*.
+/// Bounding cases either side: a **one-arm** `match` over the same source builds no
+/// merge at all, and a multi-arm `match` over an unconditional comprehension keeps
+/// plain `UInt` positions
+/// ([`test_multi_arm_match_over_plain_collection`]).
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[ignore = "a copairing's tagged domain cannot flat-merge; needs either an inference \
-            rule for a pre-inference DisjointJoin or a key-general flat merge"]
 fn test_match_over_conditional_collection() {
     let code = r"
 def unwrap(m):

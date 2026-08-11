@@ -168,15 +168,24 @@ impl UnionOperator {
 
 /// Flat-merge disjoint `SealedFunction` arms into one flat tile, sorted by domain
 /// key. Each arm is a filtered slice of the *same* fed element stream (a
-/// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`), so the arms'
-/// (`UInt`) positions are disjoint and reassemble the full column — which then
-/// co-iterates with the decision record's sibling `commit` field. The codomain is
-/// a scalar decision-field value, or a boxed-compound `Tile::Record` for a
-/// tuple/record accumulator; the shared fed predicate is taken from the first arm
-/// (all arms carry it).
-fn flat_merge(tiles: Vec<Tile>, codomain_tiling: &Tiling) -> Tile {
+/// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`, or a `match`'s
+/// tag fan-out), so the arms' keys are disjoint and reassemble the full column —
+/// which then co-iterates with the decision record's sibling `commit` field. The
+/// codomain is a scalar decision-field value, or a boxed-compound `Tile::Record`
+/// for a tuple/record accumulator; the shared fed predicate is taken from the
+/// first arm (all arms carry it).
+///
+/// **The key is the domain value, not a position.** Reassembling needs only a
+/// total order (to restore the fed order) and equality (to catch two arms
+/// claiming one key), and both hold for any *one* collection's keys — its domain
+/// is a single [`Extent`], so its values are homogeneous in shape. A `UInt`
+/// position is the common case; a fed stream whose own index set is a coproduct
+/// carries `Union { tag, inner }` keys instead, which [`Value`]'s order already
+/// compares lexicographically by tag then payload. Keying on `usize` is what
+/// restricted this to the former.
+fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling) -> Tile {
     let value_extent = codomain_tiling.extent();
-    let mut pairs: Vec<(usize, Value)> = Vec::new();
+    let mut pairs: Vec<(Value, Value)> = Vec::new();
     let mut domain_predicate = Predicate::False;
     for (i, tile) in tiles.into_iter().enumerate() {
         let Tile::SealedFunction {
@@ -207,25 +216,26 @@ fn flat_merge(tiles: Vec<Tile>, codomain_tiling: &Tiling) -> Tile {
             if deleted.contains(row) {
                 continue;
             }
-            let key = domain.index_at(row);
-            let Value::UInt(pos) = key else {
-                // A flat merge reassembles the arms *by position* into one column, so
-                // every arm's domain key has to be a position. A tagged key means the
-                // arms came from a copairing — whose domain deliberately keeps the
-                // arms apart — and those do not merge back onto one domain at all.
-                panic!(
-                    "flat_merge: arm {i} row {row} is keyed {key:?}, not a UInt \
-                     position; a flat merge reassembles arms by position, so a \
-                     tagged domain here means these arms are a copairing rather \
-                     than a disjoint join. Arm domain: {domain:?}"
-                );
-            };
-            pairs.push((pos, values.index_at(row)));
+            pairs.push((domain.index_at(row), values.index_at(row)));
         }
     }
-    // Disjoint by first-match, so a stable sort by position reassembles the full
-    // column in the fed order — matching the sibling `commit` field's domain.
-    pairs.sort_by_key(|(pos, _)| *pos);
+    // Disjoint by first-match, so a stable sort by key reassembles the full column
+    // in the fed order — matching the sibling `commit` field's domain.
+    //
+    // The keys come from one collection's domain, so they are one `Extent`'s
+    // values and mutually comparable. An incomparable pair means two arms were fed
+    // *different* domains, which is not a disjoint join at all — the caller built
+    // the wrong node — so say that rather than ordering them arbitrarily.
+    pairs.sort_by(|(a, _), (b, _)| {
+        a.partial_cmp(b).unwrap_or_else(|| {
+            panic!(
+                "flat_merge: domain keys {a:?} and {b:?} are not comparable, so these \
+                 arms are not slices of one domain — a disjoint join requires that, \
+                 and a copairing (whose arms deliberately live over distinct index \
+                 sets) is the node for arms that do not"
+            )
+        })
+    });
     // Disjointness is a *precondition*, not something the merge can repair: two
     // arms claiming one position put two values at one domain key, which the tile
     // contract forbids ("known data inside a Tile is immutable" — see the
@@ -239,19 +249,19 @@ fn flat_merge(tiles: Vec<Tile>, codomain_tiling: &Tiling) -> Tile {
     // beside the sort above, so this is a hard assert rather than a debug one.
     if let Some(w) = pairs.windows(2).find(|w| w[0].0 == w[1].0) {
         panic!(
-            "flat_merge: arms are not disjoint — position {} is claimed by more \
-             than one arm, so the merge would place two values at one domain key",
+            "flat_merge: arms are not disjoint — domain key {} is claimed by more \
+             than one arm, so the merge would place two values at that key",
             w[0].0
         );
     }
-    let positions: Vec<usize> = pairs.iter().map(|(pos, _)| *pos).collect();
+    let keys: Vec<Value> = pairs.iter().map(|(k, _)| k.clone()).collect();
     let values: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
     // Build the codomain to match the operator's *declared* tiling shape: a
     // scalar field stays `Tile::Scalar`, a compound (tuple/record) field unboxes
     // the record-valued column back into a struct-of-arrays `Tile::Record`.
     let cv = ColumnValue::from_values(values, &value_extent);
     Tile::SealedFunction {
-        domain: ColumnValue::from_uints(positions),
+        domain: ColumnValue::from_values(keys, domain_extent),
         codomain: Box::new(column_value_to_tile(cv, codomain_tiling)),
         domain_predicate,
         deleted: BitSet::new(),
@@ -336,11 +346,16 @@ impl TileProducer for UnionProducer {
             .collect();
 
         if self.flat {
-            let codomain_tiling = match self.tiling() {
-                Tiling::SealedFunction { codomain, .. } => (**codomain).clone(),
+            // The merged column is described by the operator's *declared* tiling at
+            // both ends: the domain the arms share, and the codomain shape the
+            // decision field carries.
+            let (domain_extent, codomain_tiling) = match self.tiling() {
+                Tiling::SealedFunction { domain, codomain } => {
+                    (domain.clone(), (**codomain).clone())
+                }
                 other => panic!("flat union tiling is a SealedFunction, got {other}"),
             };
-            return flat_merge(tiles, &codomain_tiling);
+            return flat_merge(tiles, &domain_extent, &codomain_tiling);
         }
 
         let mut domains: Vec<ColumnValue> = Vec::new();
@@ -482,6 +497,7 @@ impl TileProducer for UnionProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::FieldKey;
     use crate::interpreter::{BaseType, ColumnValue, Extent};
     use std::cell::RefCell;
 
@@ -524,7 +540,7 @@ mod tests {
     fn named_variant(arms: &[(&str, Extent)]) -> Extent {
         Extent::Union(TagMap::from_arms(
             arms.iter()
-                .map(|(t, e)| (crate::ccl::FieldKey::Name((*t).into()), e.clone()))
+                .map(|(t, e)| (FieldKey::Name((*t).into()), e.clone()))
                 .collect(),
         ))
     }
@@ -632,6 +648,7 @@ mod tests {
     fn flat_merge_reassembles_disjoint_arms_by_position() {
         let out = flat_merge(
             vec![flat_arm(&[(1, 20), (3, 40)]), flat_arm(&[(0, 10), (2, 30)])],
+            &Extent::uint_range(4),
             &Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
         let Tile::SealedFunction {
@@ -647,6 +664,65 @@ mod tests {
         );
     }
 
+    /// A fed stream whose own index set is a **coproduct** keys its rows
+    /// `Union { tag, inner }`, not `UInt` — the shape a `match` over a
+    /// conditional-element comprehension merges. Reassembly needs nothing new: the
+    /// order on a tagged pair is lexicographic by tag then payload, so the arms
+    /// interleave back into the fed order across both tags.
+    #[test]
+    fn flat_merge_reassembles_coproduct_keyed_arms() {
+        let key = |tag: usize, inner: usize| Value::Union {
+            tag: FieldKey::Index(tag),
+            inner: Box::new(Value::UInt(inner)),
+        };
+        let arm = |pairs: Vec<(Value, i64)>| Tile::SealedFunction {
+            domain: ColumnValue::from_values(
+                pairs.iter().map(|(k, _)| k.clone()).collect(),
+                &coproduct_extent(),
+            ),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(
+                pairs.iter().map(|(_, v)| *v).collect(),
+            ))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        };
+        // Arms arrive out of order and each straddles both tags.
+        let out = flat_merge(
+            vec![
+                arm(vec![(key(0, 1), 20), (key(1, 0), 30)]),
+                arm(vec![(key(0, 0), 10), (key(1, 1), 40)]),
+            ],
+            &coproduct_extent(),
+            &Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = out
+        else {
+            panic!("flat merge yields a SealedFunction");
+        };
+        assert_eq!(
+            (0..domain.len())
+                .map(|i| domain.index_at(i))
+                .collect::<Vec<_>>(),
+            vec![key(0, 0), key(0, 1), key(1, 0), key(1, 1)],
+            "tagged keys reassemble by tag then payload"
+        );
+        assert_eq!(
+            *codomain,
+            Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))
+        );
+    }
+
+    /// Two `[0, 1]` halves under a positional sum — the extent a conditional-element
+    /// comprehension gives its result.
+    fn coproduct_extent() -> Extent {
+        Extent::Union(TagMap::from_positional(vec![
+            Extent::uint_range(2),
+            Extent::uint_range(2),
+        ]))
+    }
+
     /// The precondition violated. Overlapping arms are a **caller** bug — a
     /// value-`Case` whose first-match gates are not actually exclusive, or a tag
     /// fan-out that lost a `variant_project` — and the merge cannot repair it:
@@ -654,10 +730,11 @@ mod tests {
     /// Left unchecked it is silent, since the sort just leaves the duplicates
     /// adjacent and a column one row too long flows on downstream.
     #[test]
-    #[should_panic(expected = "position 1 is claimed by more than one arm")]
+    #[should_panic(expected = "domain key u1 is claimed by more than one arm")]
     fn flat_merge_rejects_arms_that_claim_one_position_twice() {
         let _ = flat_merge(
             vec![flat_arm(&[(0, 10), (1, 20)]), flat_arm(&[(1, 99)])],
+            &Extent::uint_range(2),
             &Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
     }
