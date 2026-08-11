@@ -7,6 +7,7 @@
 //! sibling [`mod@super::simplify_type`] and [`super::coalesce`] modules.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use smol_str::SmolStr;
 
@@ -507,10 +508,39 @@ pub fn compact_type(ty: &Type) -> CompactGraph {
         recursive: HashMap::new(),
         rec_vars: BTreeMap::new(),
     };
-    let term = compact_go(ty, true, &Subst::id(), &BTreeSet::new(), &mut st);
+    let term = compact_go(ty, true, &Subst::id(), None, &mut st);
     CompactGraph {
         term,
         rec_vars: st.rec_vars,
+    }
+}
+
+/// The variables whose bounds the current path is walking, as a chain of stack
+/// frames rather than a set on the heap.
+///
+/// It is a **path**, not a set: one entry per variable on the current bound chain,
+/// reset at every structural boundary, and only ever asked whether a uid is on it.
+/// A `BTreeSet` answers the same question and allocates a copy of itself at every
+/// variable visit to do so — which on a bound-graph walk is millions of copies, for
+/// a path that is a handful of entries deep. Borrowing the caller's frame costs
+/// nothing and says what the thing is.
+struct ParentPath<'a> {
+    uid: InferVarId,
+    prev: Option<&'a ParentPath<'a>>,
+}
+
+impl ParentPath<'_> {
+    /// Whether `uid` is on the path. Linear in the path's depth, which is the
+    /// length of one variable's bound chain.
+    fn contains(&self, uid: InferVarId) -> bool {
+        let mut frame = Some(self);
+        while let Some(f) = frame {
+            if f.uid == uid {
+                return true;
+            }
+            frame = f.prev;
+        }
+        false
     }
 }
 
@@ -555,7 +585,7 @@ fn compact_go(
     ty: &Type,
     pol: bool,
     subst_acc: &Subst,
-    parents: &BTreeSet<InferVarId>,
+    parents: Option<&ParentPath<'_>>,
     st: &mut CompactState,
 ) -> CompactType {
     match ty {
@@ -596,14 +626,14 @@ fn compact_go(
             // per child mirrors Scala's `Set.empty` argument — cycles
             // span only one variable's bound chain, not across
             // function boundaries.
-            let dom = compact_go(d, !pol, subst_acc, &BTreeSet::new(), st);
+            let dom = compact_go(d, !pol, subst_acc, None, st);
             // A Pi binder shadows the accumulated substitution inside the
             // codomain (it binds the name locally), so restrict it there.
             let cod_acc = match name {
                 Some(b) => subst_acc.shadow(b),
                 None => subst_acc.clone(),
             };
-            let cod = compact_go(c, pol, &cod_acc, &BTreeSet::new(), st);
+            let cod = compact_go(c, pol, &cod_acc, None, st);
             CompactType {
                 fun: Some(CompactFun {
                     name: name.clone(),
@@ -619,10 +649,7 @@ fn compact_go(
         Type::Tuple(ts) => {
             let mut compacted = BTreeMap::new();
             for (i, v) in ts.iter().enumerate() {
-                compacted.insert(
-                    FieldKey::Index(i),
-                    compact_go(v, pol, subst_acc, &BTreeSet::new(), st),
-                );
+                compacted.insert(FieldKey::Index(i), compact_go(v, pol, subst_acc, None, st));
             }
             CompactType {
                 rec: Some(compacted),
@@ -634,7 +661,7 @@ fn compact_go(
             for (n, v) in fs {
                 compacted.insert(
                     FieldKey::Name(SmolStr::from(n.as_str())),
-                    compact_go(v, pol, subst_acc, &BTreeSet::new(), st),
+                    compact_go(v, pol, subst_acc, None, st),
                 );
             }
             CompactType {
@@ -649,10 +676,7 @@ fn compact_go(
             // payload depth is unaffected.
             let mut compacted = BTreeMap::new();
             for (k, v) in tags {
-                compacted.insert(
-                    k.clone(),
-                    compact_go(v, pol, subst_acc, &BTreeSet::new(), st),
-                );
+                compacted.insert(k.clone(), compact_go(v, pol, subst_acc, None, st));
             }
             CompactType {
                 var: Some(compacted),
@@ -669,8 +693,8 @@ fn compact_go(
             domain,
             kind,
         } => {
-            let value = compact_go(value, pol, subst_acc, &BTreeSet::new(), st);
-            let domain = compact_go(domain, pol, subst_acc, &BTreeSet::new(), st);
+            let value = compact_go(value, pol, subst_acc, None, st);
+            let domain = compact_go(domain, pol, subst_acc, None, st);
             CompactType {
                 history_slot: Some((Box::new(value), Box::new(domain), *kind)),
                 ..Default::default()
@@ -680,7 +704,7 @@ fn compact_go(
             let uid = state.uid;
             let key = (uid, pol);
             if st.in_process.contains(&key) {
-                if parents.contains(&uid) {
+                if parents.is_some_and(|p| p.contains(uid)) {
                     // Spurious cycle (a <: b and b <: a with no
                     // structural intermediary). Drop the bound.
                     return CompactType::empty();
@@ -720,7 +744,9 @@ fn compact_go(
             // only those clones and the per-use instantiations reach here,
             // each fixed by a single use site.
             let s = state.bounds.borrow();
-            let primary = if pol { &s.lower } else { &s.upper };
+            // `Rc::clone`, not a copy: taking the list out of the `RefCell` is a
+            // refcount bump, and this is the walk's hot read.
+            let primary_bounds = Rc::clone(if pol { s.lower() } else { s.upper() });
             // When the polarity-correct list is empty we fall back to the
             // opposite-polarity bounds (see the rationale above). Track which
             // polarity the bounds came from so we walk + merge them at THAT
@@ -744,12 +770,7 @@ fn compact_go(
             // cover these halves); see `design/type-inference.md` ("Apply is
             // one-way" and "Closing the single-sided blind spots (no separate
             // pass)").
-            let primary_bounds = primary.clone();
-            let opposite_bounds = if pol {
-                s.upper.clone()
-            } else {
-                s.lower.clone()
-            };
+            let opposite_bounds = Rc::clone(if pol { s.upper() } else { s.lower() });
             drop(s);
             // Walk bounds, transitively expanding. We fold the bounds'
             // contributions *without* seeding from the variable's own identity
@@ -762,16 +783,15 @@ fn compact_go(
             // `rec`/`var`/`fun` get this for free from their `None` merge
             // identity, but refinement sets have no such sentinel, so we keep
             // the var out of the structural fold.
-            let mut new_parents = parents.clone();
-            new_parents.insert(uid);
+            let new_parents = ParentPath { uid, prev: parents };
             let mut bound: Option<CompactType> = None;
-            for b in &primary_bounds {
+            for b in primary_bounds.iter() {
                 // Compose this edge's morphisms onto the accumulator before
                 // descending: a bound reached transitively through `v → w → …`
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                let bc = compact_go(&b.ty, pol, &inner_acc, &new_parents, st);
+                let bc = compact_go(&b.ty, pol, &inner_acc, Some(&new_parents), st);
                 bound = Some(match bound {
                     None => bc,
                     Some(acc) => CompactType::merge(pol, acc, bc),
@@ -791,9 +811,9 @@ fn compact_go(
                 b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none() && b.history_slot.is_none()
             });
             if no_concrete {
-                for b in &opposite_bounds {
+                for b in opposite_bounds.iter() {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                    let bc = compact_go(&b.ty, !pol, &inner_acc, &new_parents, st);
+                    let bc = compact_go(&b.ty, !pol, &inner_acc, Some(&new_parents), st);
                     bound = Some(match bound {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),
