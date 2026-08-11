@@ -1054,22 +1054,36 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
 /// witnesses apart (`two_conditional_sources_keep_their_witnesses_apart`, in
 /// `tests/type_check.rs`); what it does not yet do is compile.
 ///
-/// The blocker is a **concrete domain meeting a bound witness**: `[0, 1] <: σ` reaches
-/// `constrain_go`'s witness arm, which is `unreachable!` because relating a candidate to a
-/// witness would be the `𝑒 = 𝑑` reading of Σ-width rather than the rule. Two witnesses in
-/// scope at once is what produces the edge — a pairing search has to try one source's
-/// candidate against the other's witness — and what the rule should say there is not yet
-/// settled.
+/// Two generators nest two sums — `Σ σ₄ ∈ 𝐾₄. Σ σ₇ ∈ 𝐾₇. ((σ₄, σ₇) ⤇ Int)` — and what
+/// each blocker has in common is that **a nested sum has no settled rule**, not that a case
+/// is missing. Measured in order, each one reached by getting past the last:
+///
+/// 1. `SigmaType::body_residue` hits its `unreachable!`: the body is a `Sigma`, and the
+///    witness-independent residue of a sum inside a sum is not defined. Returning the inner
+///    sum's residue gets past it and is probably right, but it is a *guess* until width says
+///    what a nested sum's search covers.
+/// 2. Consumption (`Σ <: Fun`) then places a range demand from **one** witness on the
+///    consumer's whole domain, which here is the tuple `(σ₄, σ₇)`. Two witnesses index two
+///    tuple components; one demand cannot say that.
+/// 3. `Proj` on that tuple fails with `expected [0, 1], found σ` — projecting a component
+///    resolves against a concrete candidate where a witness stands.
+///
+/// The question under all three is whether nesting means one sum over the **product** kind
+/// (candidates `𝐾₄ × 𝐾₇`, one witness, everything downstream unchanged, n×m candidates) or
+/// two binders peeled in turn (no explosion, but width, consumption and projection each
+/// need a rule for *which* witness a position names). That is a type-system decision, so it
+/// is not made here.
 ///
 /// It is **not** the copair/disjoint-join split, which this test was previously ignored
 /// for: that diagnosis predates the witness-identity work and does not survive it. The
-/// failure has moved three times under measurement (a sum in a domain position reaching `extent_of`,
-/// then a free witness on the index, then an unresolved variable), so the reason above is
-/// what a run says today and nothing more — re-measure before trusting it.
+/// failure has moved four times under measurement (a sum in a domain position reaching
+/// `extent_of`, then a free witness on the index, then an unresolved variable, then
+/// `[0, 1] <: σ` at `constrain_go`'s witness arm), so the reasons above are what a run says
+/// today and nothing more — re-measure before trusting them.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[ignore = "two generators nest two sums; `body_residue`, Check's Σ-wrapper rebuild and \
-            `Proj` on a witness-typed tuple each assume one witness; measured 2026-08-08"]
+#[ignore = "two generators nest two sums, and a nested sum has no width, consumption or \
+            projection rule; measured 2026-08-11"]
 fn two_conditional_sources_compile() {
     check_scalar(
         r"
