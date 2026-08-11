@@ -489,8 +489,37 @@ fn unify_sum_witnesses(lv: &Rc<InferVar>, lows: Vec<Bound>) -> Vec<Bound> {
 /// this point, so the reference stays free in the graph until materialization binds it
 /// (in `src/ccl/infer/solver/compact.rs`). None may survive coalesce still free — that is
 /// the escape check.
+/// Bring the sum's witnesses under the **names the context already gave them**, position by
+/// position. Answers whether every witness in `body_domain` was named, in which case there is
+/// no edge left to draw.
+///
+/// A consumer whose domain is a witness reference was written against a consumption that
+/// already happened, and the sum's own binder is bound, so adopting the context's name is
+/// α-conversion and changes nothing. Nesting makes that positional rather than whole:
+/// two generators index a `Tuple`, one witness per component, and each names its own.
+///
+/// The range travels with the name — a `Type::WitnessRef` names a binder and nothing else,
+/// so a reader holding the context's name has to find the range under *that* binder. At one
+/// witness the range is the sum's own kind; deeper, each peeled binder published its range
+/// on the way in, so the index is where the inner ones are read from.
+fn adopt_the_contexts_names(consumer: &Type, body_domain: &Type, range: &TypeKind) -> bool {
+    match (consumer, body_domain) {
+        (Type::WitnessRef(named), Type::WitnessRef(w)) => {
+            let range = crate::ccl::ty::witness_ctx::range(*w).unwrap_or_else(|| range.clone());
+            crate::ccl::ty::witness_ctx::note_range(*named, &range);
+            true
+        }
+        (Type::Tuple(cs), Type::Tuple(bs)) if cs.len() == bs.len() => cs
+            .iter()
+            .zip(bs)
+            .all(|(c, b)| adopt_the_contexts_names(c, b, range)),
+        _ => false,
+    }
+}
+
 fn demand_domain_range(
     domain: &Type,
+    body_domain: &Type,
     binder: crate::ccl::infer_var::WitnessBinderId,
     range: &TypeKind,
     sl: &Subst,
@@ -509,14 +538,18 @@ fn demand_domain_range(
     // carried by the *term* could deliver; taking the name the context offers is the same
     // move the `Fun` rule makes for a Pi binder, which is derived from the correspondence
     // rather than reproduced.
-    if let Type::WitnessRef(named) = domain {
-        crate::ccl::ty::witness_ctx::note_range(*named, &range);
+    if adopt_the_contexts_names(domain, body_domain, &range) {
         return Ok(());
     }
     // Publish before handing out a reference: a `Type::WitnessRef` names a binder and
     // nothing else, so the range has to be findable from the binder alone.
     crate::ccl::ty::witness_ctx::note_range(binder, &range);
-    constrain_go(domain, &Type::WitnessRef(binder), sr, sl, cache)
+    // **The body's domain, not the bare witness.** At one binder deep the two are the same
+    // type — a sum's body is `𝑤 ⤇ 𝑉` — but once sums nest, the innermost body's domain is
+    // a `Tuple` naming a witness per position. Relating structurally puts each consumer
+    // position against the witness that indexes it, and needs no rule about tuples: the
+    // ordinary walk reaches the `Type::WitnessRef` leaves.
+    constrain_go(domain, body_domain, sr, sl, cache)
 }
 
 fn free_witness_of(domain: &Type) -> Option<crate::ccl::infer_var::WitnessBinderId> {
@@ -1157,6 +1190,15 @@ fn constrain_go_impl(
                 ..
             },
         ) => {
+            // **A sum whose body is a sum** publishes its own range and hands the body to
+            // this same rule. Binders peel one at a time and the demand lands on the
+            // innermost body, whose domain names every witness peeled on the way — so
+            // nothing here has to know how deep the nesting goes.
+            if matches!(&*s.body, Type::Sigma(_)) {
+                let range = s.kind().map_children(|d| sl.apply_type(d));
+                crate::ccl::ty::witness_ctx::note_range(s.binder(), &range);
+                return constrain_go(&s.body, rhs, sl, sr, cache);
+            }
             match s.body_residue() {
                 // A **factored** sum, `Σ 𝐷 ∈ 𝐾. 𝐷 ⤇ 𝑉`. Naming the witness needs no
                 // candidates at all — that is exactly what naming buys over presenting —
@@ -1168,7 +1210,11 @@ fn constrain_go_impl(
                 // `Fun`/`Fun` arm would derive has to be derived here too — the body is
                 // destructured rather than recursed into.
                 Some((binder, cod)) => {
-                    demand_domain_range(d1, s.binder(), s.kind(), sl, sr, cache)?;
+                    let body_dom = s
+                        .body
+                        .domain()
+                        .expect("a residue means the body is an arrow");
+                    demand_domain_range(d1, &body_dom, s.binder(), s.kind(), sl, sr, cache)?;
                     let cod_sl = match (binder.as_ref(), n1) {
                         (Some(k), Some(x)) => sl.extended_rename(k, x),
                         _ => sl.clone(),
@@ -1185,7 +1231,16 @@ fn constrain_go_impl(
                 None => match collection_candidates(lhs) {
                     Some(domains) => {
                         let range = TypeKind::Enumerated(domains);
-                        demand_domain_range(d1, s.binder(), &range, sl, sr, cache)?;
+                        // The body *is* the witness here, so it is its own domain.
+                        demand_domain_range(
+                            d1,
+                            &Type::WitnessRef(s.binder()),
+                            s.binder(),
+                            &range,
+                            sl,
+                            sr,
+                            cache,
+                        )?;
                         for cod in collection_codomains(lhs) {
                             constrain_go(&cod, c1, sl, sr, cache)?;
                         }
@@ -1664,11 +1719,32 @@ fn constrain_go_impl(
         //
         // A described kind lists nothing to distribute over and stays a mismatch: the
         // consumer would have to be valid at domains not yet named.
-        (Type::Sigma(s), _) if s.kind().listed().is_some() => {
+        //
+        // **Witness-bodied only**, which is the shape named above and not a further
+        // condition: distributing *instantiates* the witness, so a body that still mentions
+        // it after instantiation has had it pinned to one candidate — the silent narrowing
+        // the `Type::WitnessRef` arms refuse by name. Where the body is the witness there is
+        // nothing left to pin. The arm below is the same rule for a body that is not.
+        (Type::Sigma(s), _) if s.body_is_witness() && s.kind().listed().is_some() => {
             for c in s.kind().listed().expect("guarded above") {
                 constrain_go(&s.instantiate_body(c), rhs, sl, sr, cache)?;
             }
             Ok(())
+        }
+
+        // **A demand that still names the witness is domain-*preserving*,** so it takes the
+        // naming rule rather than distribution — the same split the `(Σ, Fun)` arm makes,
+        // stated for the shapes that arm does not cover. A nested sum's body is a `Tuple`
+        // (two generators index a pair, one component per witness), and a tuple demand
+        // relates componentwise, so each witness meets its own position and none is pinned.
+        //
+        // Publish before recursing: the body's witness references are about to reach edges,
+        // and a reference names a binder and nothing else, so the range has to be findable
+        // from the binder alone.
+        (Type::Sigma(s), _) => {
+            let range = s.kind().map_children(|d| sl.apply_type(d));
+            crate::ccl::ty::witness_ctx::note_range(s.binder(), &range);
+            constrain_go(&s.body, rhs, sl, sr, cache)
         }
 
         _ => Err(ConstrainError::Mismatch {

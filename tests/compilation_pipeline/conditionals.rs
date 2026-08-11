@@ -1054,36 +1054,39 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
 /// witnesses apart (`two_conditional_sources_keep_their_witnesses_apart`, in
 /// `tests/type_check.rs`); what it does not yet do is compile.
 ///
-/// Two generators nest two sums — `Σ σ₄ ∈ 𝐾₄. Σ σ₇ ∈ 𝐾₇. ((σ₄, σ₇) ⤇ Int)` — and what
-/// each blocker has in common is that **a nested sum has no settled rule**, not that a case
-/// is missing. Measured in order, each one reached by getting past the last:
+/// Two generators nest two sums — `Σ σ₄ ∈ 𝐾₄. Σ σ₇ ∈ 𝐾₇. ((σ₄, σ₇) ⤇ Int)`. The **typing**
+/// half now works: formation is pinned by `two_conditional_sources_keep_their_witnesses_apart`
+/// and consumption by `a_nested_sum_is_consumed_by_an_aggregate` (both in `tests/type_check.rs`),
+/// the latter reaching the post-inference wall where every depth-one assumption lived.
 ///
-/// 1. `SigmaType::body_residue` hits its `unreachable!`: the body is a `Sigma`, and the
-///    witness-independent residue of a sum inside a sum is not defined. Returning the inner
-///    sum's residue gets past it and is probably right, but it is a *guess* until width says
-///    what a nested sum's search covers.
-/// 2. Consumption (`Σ <: Fun`) then places a range demand from **one** witness on the
-///    consumer's whole domain, which here is the tuple `(σ₄, σ₇)`. Two witnesses index two
-///    tuple components; one demand cannot say that.
-/// 3. `Proj` on that tuple fails with `expected [0, 1], found σ` — projecting a component
-///    resolves against a concrete candidate where a witness stands.
+/// What remains is downstream of inference, and is **not** about nesting. At the
+/// post-lambda-elimination wall an application's argument edge compares the collection
+/// **opened** against the parameter's **closed** sum:
 ///
-/// The question under all three is whether nesting means one sum over the **product** kind
-/// (candidates `𝐾₄ × 𝐾₇`, one witness, everything downstream unchanged, n×m candidates) or
-/// two binders peeled in turn (no explosion, but width, consumption and projection each
-/// need a rule for *which* witness a position names). That is a type-system decision, so it
-/// is not made here.
+/// ```text
+/// found    (σ@4, σ@7)                                              — the body, witnesses free
+/// expected Σ σ@4 ∈ {[0,1],[0,2]}. Σ σ@7 ∈ {[0,1],[0,2]}. (σ@4, σ@7) — the sum that binds them
+/// ```
+///
+/// The two render identically because `coalesce_for_error` closes a free witness back into
+/// its sum for display — which is why the reported message says the types agree. Structurally
+/// it is a **bound-versus-free** disagreement: "one leaf, and scope decides what it means",
+/// at a position where the two decisions differ.
+///
+/// The fix is *not* a `𝑈 <: Σ` subtyping arm — "only a term builds a sum" is load-bearing,
+/// and an arm admitting an opened body would be that rule with an extra condition. Whatever
+/// produced the opened type at an argument position is what has to bind it back, the way
+/// `lambda_elim`'s Σ rebuild does for a lambda (which does not fire here: it needs an arrow,
+/// and this body is a tuple).
 ///
 /// It is **not** the copair/disjoint-join split, which this test was previously ignored
 /// for: that diagnosis predates the witness-identity work and does not survive it. The
-/// failure has moved four times under measurement (a sum in a domain position reaching
-/// `extent_of`, then a free witness on the index, then an unresolved variable, then
-/// `[0, 1] <: σ` at `constrain_go`'s witness arm), so the reasons above are what a run says
-/// today and nothing more — re-measure before trusting them.
+/// failure has moved five times under measurement, so the reason above is what a run says
+/// today and nothing more — re-measure before trusting it.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[ignore = "two generators nest two sums, and a nested sum has no width, consumption or \
-            projection rule; measured 2026-08-11"]
+#[ignore = "post-lambda-elim: an argument edge meets the collection opened against the \
+            parameter's closed sum — bound versus free; measured 2026-08-11"]
 fn two_conditional_sources_compile() {
     check_scalar(
         r"

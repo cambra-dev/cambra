@@ -236,6 +236,24 @@ impl Typing for CheckCtx {
             // destructured here and reaches the error below by name: consuming one is
             // per-candidate, which this position cannot express.
             Type::Sigma(s) if s.body_residue().is_some() => {
+                // **Peel every binder, publishing each range.** One deep, the body is
+                // `𝑤 ⤇ 𝑉` and the consumer's domain is that witness. Nested, the innermost
+                // body's domain names one witness per position, and that is what the
+                // consumer destructures to — so the loop, not a second rule.
+                let mut innermost: &crate::ccl::ty::SigmaType = s;
+                let mut nested = false;
+                crate::ccl::ty::witness_ctx::note_range(innermost.binder(), innermost.kind());
+                while let Type::Sigma(inner) = &*innermost.body {
+                    innermost = inner;
+                    nested = true;
+                    crate::ccl::ty::witness_ctx::note_range(innermost.binder(), innermost.kind());
+                }
+                if nested
+                    && let Some((_, cod)) = innermost.body_residue()
+                    && let Some(dom) = innermost.body.domain()
+                {
+                    return Ok((dom, cod.clone()));
+                }
                 let (_, cod) = s.body_residue().expect("guarded by the arm");
                 // **Opened, exactly as Emit opens it.** The consumer's domain is a name for
                 // whichever domain the witness picked, carrying the kind it ranges over —

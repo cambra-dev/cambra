@@ -515,9 +515,19 @@ fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
         .find(|((_, x), y)| x != y)
         .map(|((i, _), _)| i)
     else {
-        // One structure is a *prefix* of the other, so no character disagrees and a window
-        // would quote the same text twice. The difference is depth: something wraps one
-        // side and not the other.
+        // No character disagrees. Either one structure is a *prefix* of the other — the
+        // difference is depth, something wrapping one side and not the other — or the two
+        // are structurally identical, in which case the types are not what disagree at all
+        // and the rule that rejected them is where to look.
+        if a.len() == b.len() {
+            return Some(
+                "note: these are structurally identical, not merely identical as printed — \
+                 so the disagreement is not in the types. Look at the rule that rejected \
+                 them: it failed on something the types do not carry (a witness range read \
+                 from the index, a kind obligation, a scope) rather than on their shape."
+                    .to_string(),
+            );
+        }
         let (shorter, longer, which) = if a.len() < b.len() {
             (a.len(), b.len(), "found")
         } else {

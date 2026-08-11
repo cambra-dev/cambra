@@ -2618,3 +2618,30 @@ y = a if d else box([1, 2, 3, 4, 5])
         "the two joins keep their witnesses apart: {ty}"
     );
 }
+
+/// **A nested sum is consumed like any other collection.** Aggregating a comprehension over
+/// *two* conditional sources has to reach through both binders: the consumer's demand lands
+/// on the innermost body, whose domain is the index `Tuple` naming one witness per position.
+///
+/// This is the consumption half of `two_conditional_sources_keep_their_witnesses_apart`,
+/// which pins the formation. Every rule between them assumed a sum was one binder deep — a
+/// body `𝑤 ⤇ 𝑉` — and answered the demand against the bare witness, which a tuple is not.
+#[test]
+fn a_nested_sum_is_consumed_by_an_aggregate() {
+    // Through `infer_and_check`: the rules that assumed one binder live at the
+    // post-inference wall, where Check re-derives what Emit inferred, so inference alone
+    // does not exercise them.
+    let ty = infer_and_check(
+        r"
+c = 3 > 2
+d = 4 > 3
+a = box([1, 2]) if c else box([1, 2, 3])
+b = box([10, 20]) if d else box([10, 20, 30])
+sum([x + y for x in a for y in b])",
+    );
+    assert_eq!(
+        ty,
+        Type::Base(cambra::ccl::BaseType::Int),
+        "aggregating over two conditional sources is an `Int`, the witnesses consumed: {ty}"
+    );
+}

@@ -1739,9 +1739,14 @@ impl Type {
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
             },
-            Type::Sigma(s) if matches!(&*s.body, Type::Fun { .. }) => Type::Sigma(Box::new(
-                SigmaType::bound(s.witness.clone(), Type::fun_like(&s.body, domain, codomain)),
-            )),
+            // Through **every** wrapper: a sum's body may be another sum, and rebuilding
+            // only the innermost would drop the binders above it.
+            Type::Sigma(s) if matches!(&*s.body, Type::Fun { .. } | Type::Sigma(_)) => {
+                Type::Sigma(Box::new(SigmaType::bound(
+                    s.witness.clone(),
+                    Type::fun_like(&s.body, domain, codomain),
+                )))
+            }
             _ => Type::fun(domain, codomain),
         }
     }
