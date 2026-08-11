@@ -648,6 +648,16 @@ c: Bool = False
 sum([y for y in (box([x for x in [1, 2]]) if c else box([x for x in [1, 2, 3]])) if y > 1])",
     Value::Int(5)
 )]
+// A **mapping** body. The identity comprehension above simplifies to a bare `cast`, so the
+// `Case` still carries the sum when realization reaches it; composing a map onto the site
+// opens the sum, leaving the `Case` typed by the *arrow view* `σ ⤇ Int`. Both spellings name
+// the same witness and owe the same restriction.
+#[case(
+    r"
+c: Bool = False
+sum([y * 10 for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
+    Value::Int(50)
+)]
 // Three arms: more legs than the two the union shape is usually reasoned about with.
 #[case(
     r"
@@ -684,34 +694,45 @@ c: Bool = False
 sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 3])",
     Value::Int(4)
 )]
+// **Two consumers, each with its own conditional.** A restriction is discharged into the
+// arms, so arms cannot be shared between consumers that restrict differently — spelled
+// inline, each consumer has its own `Case` and there is nothing to share. These are the
+// controls for the let-bound pair below, which is the same program with one binding: what
+// fails there is the sharing, not the second filter.
+#[case(
+    r"
+c: Bool = False
+sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1]) + sum([z for z in (box([1, 2]) if c else box([1, 2, 3])) if z > 2])",
+    Value::Int(8)
+)]
+// ...including one consumer that restricts nothing, which owes the arms *no* gate.
+#[case(
+    r"
+c: Bool = False
+sum([y for y in (box([1, 2]) if c else box([1, 2, 3]))]) + sum([z for z in (box([1, 2]) if c else box([1, 2, 3])) if z > 1])",
+    Value::Int(11)
+)]
 fn a_filter_over_a_conditional_source_is_applied(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-/// The shapes the per-leg discharge does **not** reach yet. All fail loudly at the
-/// post-planning typecheck rather than computing an unfiltered answer.
+/// The shapes the per-leg discharge does **not** reach yet — every one of them a
+/// **let-bound** conditional. All fail loudly at the post-planning typecheck rather than
+/// computing an unfiltered answer.
 ///
-/// Two causes, both about *where* the restriction is found rather than how it is discharged:
+/// Binding the conditional is what separates the `Case` from the site that restricts it,
+/// and it does so in two ways that need different answers:
 ///
-/// - a **let-bound** conditional puts the `Case` in the binding while the filter sits on the
-///   consuming site in the body. Realization walks top-down and reaches the binding first,
-///   so the restriction has not been seen yet when the legs are built. (A UDF parameter is
-///   *not* in this group — inlining puts the conditional back inline at the call, which is
-///   why that case passes.)
-/// - **two consumers** of one conditional owe two different restrictions, and only one set
-///   of legs exists to discharge into. The first one seen wins; the second is what fails.
-///
-/// The mapping-body case is a third, unexplained: it differs from the passing identity
-/// comprehension only in composing a map onto the site.
+/// - the `Case` sits in the binding while the filter sits on a use in the body, and
+///   realization walks top-down, so the restriction has not been seen when the legs are
+///   built. (A UDF parameter is *not* in this group — inlining puts the conditional back
+///   inline at the call, which is why that case passes.)
+/// - a binding can have **two consumers**, owing two different restrictions to one set of
+///   legs. The first seen wins; the second is what fails. Spelled inline instead — each
+///   consumer with its own `Case` — both of these compile and filter today, which is what
+///   says the restriction is a fact about the *consumer* and the legs about the producer.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-// A mapping body, where the identity comprehension simplifies to a bare `cast`.
-#[case(
-    r"
-c: Bool = False
-sum([y * 10 for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1])",
-    Value::Int(50)
-)]
 // Let-bound: the `Case` is realized before the site's restriction is in scope.
 #[case(
     r"
@@ -735,8 +756,8 @@ x = box([1, 2]) if c else box([1, 2, 3])
 sum([y for y in x]) + sum([z for z in x if z > 1])",
     Value::Int(11)
 )]
-#[ignore = "the restriction is not in scope where the legs are built (let-bound), or two \
-            consumers owe two restrictions to one set of legs; measured 2026-08-09"]
+#[ignore = "let-bound: the restriction is not in scope where the legs are built, or two \
+            consumers owe two restrictions to one set of legs; measured 2026-08-11"]
 fn a_filter_over_a_conditional_source_the_legs_cannot_reach(
     #[case] code: &str,
     #[case] expected: Value,

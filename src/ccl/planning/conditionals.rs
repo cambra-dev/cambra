@@ -62,6 +62,18 @@ pub(super) fn realize_conditional_collections(
     discharged
 }
 
+/// What a consuming site placed on a witness, and the sum it said it about.
+///
+/// The candidate list travels with the predicate because it is the only usable key for
+/// finding the *same* sum inside that predicate: a predicate holds its own copy of the
+/// source, and the copy carries a different witness binder (see [`read_the_arm_instead`]).
+struct Owed {
+    kind: crate::ccl::ty::TypeKind,
+    restriction: crate::ccl::Refinement,
+}
+
+type OwedRestrictions = std::collections::HashMap<crate::ccl::infer_var::WitnessBinderId, Owed>;
+
 /// `owed` carries, per witness binder, the restriction a *consuming site above* placed on
 /// that witness — `Σ σ ∈ 𝐾. ({σ | 𝑝} ⤇ 𝑉)`, the shape a filtered comprehension over a
 /// conditional collection has. Realization is what materializes the witness, so it is what
@@ -78,16 +90,12 @@ fn realize_and_unbox(
     expr: &mut Expr,
     erased: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
     memo: &PredMemo<()>,
-    owed: &mut std::collections::HashMap<
-        crate::ccl::infer_var::WitnessBinderId,
-        crate::ccl::Refinement,
-    >,
+    owed: &mut OwedRestrictions,
     in_predicate: bool,
     discharged: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
 ) -> bool {
     let mut changed = false;
     if let Some((binder, restriction)) = restriction_on_a_witness(&expr.ty) {
-        eprintln!("PROBE owed {binder:?} from {}", expr.ty);
         owed.entry(binder).or_insert(restriction);
     }
     // **Top-down.** An `elif` chain is a `Case` whose trailing arm is another `Case`, and
@@ -185,20 +193,40 @@ fn instantiate_erased_in_type(
 /// (`src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness"), so it is a
 /// fact about *whichever* domain the witness turns out to name, and nothing has compiled it
 /// yet: the site cannot, having no extent for a witness.
-fn restriction_on_a_witness(
-    ty: &Type,
-) -> Option<(
-    crate::ccl::infer_var::WitnessBinderId,
-    crate::ccl::Refinement,
-)> {
+fn restriction_on_a_witness(ty: &Type) -> Option<(crate::ccl::infer_var::WitnessBinderId, Owed)> {
     let Type::Sigma(sum) = peel_refinements(ty) else {
         return None;
     };
     let Type::Refinement(base, restriction) = sum.body.domain()? else {
         return None;
     };
-    matches!(*base, Type::WitnessRef(w) if w == sum.binder())
-        .then(|| (sum.binder(), restriction.clone()))
+    matches!(*base, Type::WitnessRef(w) if w == sum.binder()).then(|| {
+        (
+            sum.binder(),
+            Owed {
+                kind: sum.kind().clone(),
+                restriction: restriction.clone(),
+            },
+        )
+    })
+}
+
+/// The witness a collection type names, in **either spelling**.
+///
+/// A `Case` that reaches realization inside a composition (`case ≫ 𝑓` — what a mapping
+/// comprehension body builds) does not carry the sum: the composition opened it, and what
+/// is left on the `Case` is the **arrow view** `σ ⤇ 𝑉`, a data function whose domain is the
+/// witness. Both spellings name the same sum and both owe the same restriction, so reading
+/// the binder off only the `Σ` silently skips the discharge on the composed shape and
+/// leaves the site's filter uncompiled.
+fn witness_named_by(ty: &Type) -> Option<crate::ccl::infer_var::WitnessBinderId> {
+    match peel_refinements(ty) {
+        Type::Sigma(sum) => Some(sum.binder()),
+        other => match peel_refinements(&other.domain()?) {
+            Type::WitnessRef(w) => Some(*w),
+            _ => None,
+        },
+    }
 }
 
 /// `predicate` with the conditional it reads replaced by `arm`.
@@ -253,10 +281,7 @@ fn read_the_arm_instead(
 /// reject.
 fn realize_here(
     expr: &mut Expr,
-    owed: &std::collections::HashMap<
-        crate::ccl::infer_var::WitnessBinderId,
-        crate::ccl::Refinement,
-    >,
+    owed: &OwedRestrictions,
     discharged: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
 ) -> bool {
     let TypedExprNode::Case {
@@ -282,13 +307,7 @@ fn realize_here(
     let branches = flatten_trailing_value_case(branches);
 
     // Which sum this `Case` realizes, so the restriction owed on that witness can be found.
-    let (binder, kind) = match peel_refinements(&expr.ty) {
-        Type::Sigma(s) => (s.binder(), s.kind().clone()),
-        _ => (
-            crate::ccl::infer_var::WitnessBinderId::UNBOUND,
-            crate::ccl::ty::TypeKind::Enumerated(Vec::new()),
-        ),
-    };
+    let owed_here = witness_named_by(&expr.ty).and_then(|w| owed.get(&w).map(|o| (w, o)));
     let bool_ty = Type::Base(BaseType::Bool);
     let mut prior_guards: Vec<Expr> = Vec::new();
     let mut arms: Vec<Expr> = Vec::new();
@@ -316,21 +335,21 @@ fn realize_here(
         // witness, so it owes what the consuming site placed on it — and the leg is the one
         // place that restriction can be said *denotationally*, because here the conditional
         // has become a single arm.
-        let refined = match owed.get(&binder) {
-            Some(restriction) => Type::Refinement(
-                Box::new(refined),
-                crate::ccl::Refinement::born(std::rc::Rc::new(read_the_arm_instead(
-                    &restriction.predicate,
-                    binder,
-                    &kind,
-                    &arm,
-                ))),
-            ),
+        let refined = match owed_here {
+            Some((binder, owed)) => {
+                discharged.insert(binder);
+                Type::Refinement(
+                    Box::new(refined),
+                    crate::ccl::Refinement::born(std::rc::Rc::new(read_the_arm_instead(
+                        &owed.restriction.predicate,
+                        binder,
+                        &owed.kind,
+                        &arm,
+                    ))),
+                )
+            }
             None => refined,
         };
-        if owed.contains_key(&binder) {
-            discharged.insert(binder);
-        }
         tags.push((FieldKey::Index(tags.len()), refined.clone()));
         arms.push(arm.with_ty(Type::data_fun(refined, value_ty.clone())));
     }
