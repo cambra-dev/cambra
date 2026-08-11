@@ -46,9 +46,9 @@
 use std::collections::HashMap;
 
 use crate::ccl::{
-    BaseType, Branch, Builtin, Expr, F_COMMIT, F_WRITES, HistoryKind, Lit, Name, Type,
-    TypedBinding, TypedExprNode,
-    ccl_utils::{strip_refinements, synthesize_arm_predicate, typed_compose},
+    BaseType, Branch, Builtin, Expr, F_WRITES, HistoryKind, Lit, Name, Type, TypedBinding,
+    TypedExprNode,
+    ccl_utils::{COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
     symbolic::symbolic,
 };
@@ -505,9 +505,10 @@ fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
     app
 }
 
-/// `__hist ≫ .writes ≫ .i : domain ⇒ vty` — the accumulator-`i` slice of the
-/// history's proposed-write stream, built as one flat three-element compose so
-/// recognition (and the causal-slot grammar) match it structurally.
+/// `__hist ≫ variant_project(`commit) ≫ .writes ≫ .i : domain ⇒ vty` — the
+/// accumulator-`i` slice of the history's committing-write stream, built as one
+/// flat compose so recognition (and the causal-slot grammar) match it
+/// structurally. The ``variant_project(`commit)`` step eliminates the ``{`commit{𝑃} | `abort}`` decision to its dense payload before the `.writes` read.
 fn writes_index_view(
     h: &Name,
     hist_ty: &Type,
@@ -517,11 +518,13 @@ fn writes_index_view(
     i: usize,
     vty: &Type,
 ) -> Expr {
+    let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
+    let vp = crate::ccl::ccl_utils::commit_project(decision_ty);
     let mut wproj = Expr::proj_field(F_WRITES);
-    wproj.ty = Type::fun(decision_ty.clone(), writes_ty.clone());
+    wproj.ty = Type::fun(payload_ty, writes_ty.clone());
     let mut iproj = Expr::proj_index(i);
     iproj.ty = Type::fun(writes_ty.clone(), vty.clone());
-    let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), wproj, iproj]);
+    let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), vp, wproj, iproj]);
     comp.ty = Type::fun(domain_ty.clone(), vty.clone());
     comp
 }
@@ -535,19 +538,23 @@ pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
     }
 }
 
-/// `__hist ▷ .field : domain ⇒ field_ty` — a projected view of the history's
-/// `{step, to_<feed>*}` record codomain.
+/// `__hist ▷ variant_project(`commit) ▷ .field : domain ⇒ field_ty` — a projected
+/// view of the history's committing-decision payload (`{writes, to_<feed>*}`).
+/// The ``variant_project(`commit)`` step eliminates the `` {`commit{𝑃} | `abort} ``
+/// decision to its dense payload before the field read.
 fn hist_field_view(
     h: &Name,
     hist_ty: &Type,
     domain_ty: &Type,
     field: &str,
     field_ty: &Type,
-    record_ty: &Type,
+    decision_ty: &Type,
 ) -> Expr {
+    let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
+    let vp = crate::ccl::ccl_utils::commit_project(decision_ty);
     let mut proj = Expr::proj_field(field);
-    proj.ty = Type::fun(record_ty.clone(), field_ty.clone());
-    let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), proj]);
+    proj.ty = Type::fun(payload_ty, field_ty.clone());
+    let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), vp, proj]);
     comp.ty = Type::fun(domain_ty.clone(), field_ty.clone());
     comp
 }
@@ -587,10 +594,10 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
 /// `transact_phase` emits for a commit decision:
 ///
 /// ```text
-/// __hist : D ⇒ {commit: Bool, writes: (V₀, …), to_<feed>*} =
-///   λ r → let __prev = get_prev_seq((__hist ≫ .writes, r, (init₀, …)))
+/// __hist : D ⇒ {`commit{writes: (V₀, …), to_<feed>*} | `abort} =
+///   λ r → let __prev = get_prev_seq((__hist ≫ variant_project(`commit) ≫ .writes, r, (init₀, …)))
 ///         in (__prev.0, …, r ▷ iter) ▷ (λ __p → ⟨RYW chain over __p⟩
-///                                       ending in {commit: true, writes, to_*})
+///                                       ending in `commit(⟨writes, to_*⟩) | `abort)
 /// ```
 ///
 /// Factoring here — where the pointful information exists — is what lets
@@ -803,6 +810,12 @@ pub(crate) fn fold_induction_loop(
         loop_body, &mut env, &accs, &writes_ty, &entering, &spine, &mut feeds,
     );
     let chain = attach_feed_fields(chain, &feeds);
+    // Wrap the assembled `{commit, writes, to_<feed>*}` record into the decision
+    // **variant** `` Case[commit → `commit(⟨writes, taps⟩); true → `abort] ``: a
+    // committing position appends the (dense) `commit` payload, a full-carry
+    // (non-writing) position `` `abort ``s — the changelog stays sparse at the
+    // commit/abort level exactly as the old `commit: true`/`false` gate.
+    let chain = crate::ccl::ccl_utils::wrap_decision_variant(chain);
 
     // The decision codomain is exactly the record `attach_feed_fields` built (its
     // type propagates through the RYW `let`s), so `hist_ty`/the body lambda match
@@ -1412,7 +1425,7 @@ fn decision_writes(dec: &Expr) -> Vec<Expr> {
 ///   evaluated at the positions its guard admits — never at a carried position.
 ///
 /// Carry-completeness is also what makes the dense `Recurse` path correct for an
-/// **async source**: that path cycles on `.writes` (not `.commit`), and `writes`
+/// **async source**: that path cycles on `.writes` (not `` `commit ``), and `writes`
 /// now carries `snapshotᵢ` (the previous accumulator) wherever no guard fires, so
 /// the guard is honored by the value rather than silently dropped.
 fn conditional_decision(
@@ -1474,11 +1487,11 @@ fn decision_record(commit: Expr, write_elts: Vec<Expr>, writes_ty: &Type) -> Exp
     let mut writes = Expr::tuple(write_elts);
     writes.ty = writes_ty.clone();
     let mut rec = Expr::new(TypedExprNode::Record(vec![
-        (F_COMMIT.to_string(), commit),
+        (COMMIT_SELECTOR.to_string(), commit),
         (F_WRITES.to_string(), writes),
     ]));
     rec.ty = Type::Record(vec![
-        (F_COMMIT.to_string(), Type::Base(BaseType::Bool)),
+        (COMMIT_SELECTOR.to_string(), Type::Base(BaseType::Bool)),
         (F_WRITES.to_string(), writes_ty.clone()),
     ]);
     rec
@@ -1541,7 +1554,7 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
             let bool_ty = Type::Base(BaseType::Bool);
             let commit_base = fields
                 .iter()
-                .find(|(f, _)| f == F_COMMIT)
+                .find(|(f, _)| f == COMMIT_SELECTOR)
                 .expect("a writer decision has a commit field")
                 .1
                 .clone();
@@ -1732,7 +1745,7 @@ mod tests {
 
     /// Recognition lowers the group onto the domain-parameterized `Transact`
     /// carrier: `let __reg = transact (x = x) { [x]⇒[x] over … do λ __p → …
-    /// {commit: true, writes: (x)} } in (__reg.x, x) ▷ final_or_default`, with
+    /// `commit(⟨writes: (x)⟩) | `abort } in (__reg.x, x) ▷ final_or_default``, with
     /// the key `init` read from the pre-loop binding and each accumulator read
     /// rewritten to a register-record projection.
     #[test]
@@ -1752,8 +1765,8 @@ mod tests {
             "should build a Transact carrier: {s}"
         );
         assert!(
-            s.contains("commit: true") && s.contains("writes:"),
-            "writer body must terminate in a `{{commit, writes}}` decision: {s}"
+            s.contains("variant_wrap(`commit)") && s.contains("writes:") && s.contains("`abort"),
+            "writer body must terminate in a `` `commit(⟨writes⟩) | `abort `` decision: {s}"
         );
         assert!(
             s.contains("__reg.") && s.contains("final_or_default"),

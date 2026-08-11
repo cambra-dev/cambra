@@ -3,7 +3,7 @@ use log::trace;
 use crate::{
     ccl::{
         AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
-        Type, TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate,
+        Type, TypedExprNode, V_COMMIT, WriterSite, ccl_utils::is_trivially_true_predicate,
         symbolic::symbolic,
     },
     interpreter::{
@@ -241,7 +241,7 @@ enum StoreReadKind {
 /// expressed in the CCL, not here.
 struct KeyReadInfo {
     /// The runtime key the variable's value lives under in the commit store map
-    /// (`Commit` stores only; `Value::Unit` for induction stores).
+    /// (`commit` stores only; `Value::Unit` for induction stores).
     runtime_key: Value,
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
@@ -269,7 +269,7 @@ struct StoreReadInfo {
     /// Which engine backs the store (selects the read projection).
     kind: StoreReadKind,
     /// The loop extent `D` an [`InductionChangelog`](StoreReadKind::InductionChangelog)
-    /// read enumerates (its [`StoreDenseRead`] trigger). `None` for a `Commit` or
+    /// read enumerates (its [`StoreDenseRead`] trigger). `None` for a `commit` or
     /// dense `Induction` store.
     induction_extent: Option<Extent>,
 }
@@ -469,6 +469,19 @@ impl OpConversionContext {
 /// Let-bound variables are stored in `ctx.scopes` as [`FanOut`]
 /// entries; each use produces a fresh [`FanOutBranch`] handle via [`FanOut::branch`].
 fn convert_impl(
+    expr: &Expr,
+    input: Option<Box<dyn TileOperator>>,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    // One frame per node, sized for the union of every arm below; grow on demand as
+    // the other pass-level walks do (`lambda_elim`, `check`, `constrain`,
+    // `channelize`).
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        convert_impl_inner(expr, input, ctx)
+    })
+}
+
+fn convert_impl_inner(
     expr: &Expr,
     input: Option<Box<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
@@ -1311,32 +1324,39 @@ fn build_transact_store(
     build_commit_store(keys, writers, ctx)
 }
 
-/// The reply taps on a writer body's `{commit, writes, to_<defer>*}` decision —
-/// every field other than `commit`/`writes`, with its per-commit value type. A
-/// tap is a reply (`out << e`) that desugar folded onto the writer body; for a
-/// commit store, op-conversion commits each tap as a write-only key so the reply
-/// rides the transaction's commit and is read back as a value-stream. Empty for a
-/// writer with no reply.
+/// The reply taps on a writer body's `` {`commit{writes, to_<defer>*} | `abort} ``
+/// decision — every field of the (dense) `commit` payload record other than
+/// `writes`, with its per-commit value type. A tap is a reply (`out << e`) that
+/// desugar folded onto the writer body; for a commit store, op-conversion commits
+/// each tap as a write-only key so the reply rides the transaction's commit and is
+/// read back as a value-stream. Empty for a writer with no reply.
 fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
-    let Some(Type::Record(fields)) = body_ty.codomain() else {
+    let Some(codom) = body_ty.codomain() else {
+        return Vec::new();
+    };
+    // Peel the `commit` payload record out of the decision variant.
+    let Type::Variant(tags) = codom else {
+        return Vec::new();
+    };
+    let Some((_, Type::Record(fields))) = tags
+        .into_iter()
+        .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
+    else {
         return Vec::new();
     };
     fields
         .into_iter()
-        // `commit`/`writes` are the decision core; a `*__fire` field is a tap's
-        // *fire gate* (read by `body_decision_at`), not a tap value itself.
-        .filter(|(f, _)| {
-            f != crate::ccl::F_COMMIT && f != F_WRITES && !f.ends_with(crate::ccl::F_FIRE_SUFFIX)
-        })
+        // `writes` is the decision core; a `*__fire` field is a tap's *fire gate*
+        // (read by `body_decision_at`), not a tap value itself.
+        .filter(|(f, _)| f != F_WRITES && !f.ends_with(crate::ccl::F_FIRE_SUFFIX))
         .collect()
 }
 
 /// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`]
 /// wired in a cyclic [`FanOut`], one *fused* [`CommitWriter`] per writer (a
 /// branch of the shared store output). Each fused writer reads the cyclic store,
-/// runs its body — the `let k₀ = p.0 in … let item = p.r in {commit, writes}`
-/// decision, fed via a buffer the writer owns — and either grants (appends a
-/// proposal) or denies. A single writer is the degenerate case (no conflicts →
+/// runs its body — the ``let k₀ = p.0 in … let item = p.r in {`commit{writes} | `abort}`` decision, fed via a buffer the writer owns — and either grants (appends
+/// a proposal) or denies. A single writer is the degenerate case (no conflicts →
 /// no retries); ≥2 writers serialize through the operator with conflict + retry.
 /// A *fused* writer (not fanned) is load-bearing: a stateful sequencing producer
 /// cannot be fanned without desyncing its append-only proposal positions.
@@ -1378,7 +1398,7 @@ fn build_commit_store(
             KeyReadInfo {
                 runtime_key,
                 value_extent: key_value_extent,
-                index: 0,            // unused for `Commit` reads (keyed by `runtime_key`)
+                index: 0,            // unused for `commit` reads (keyed by `runtime_key`)
                 carry_forward: true, // register: value persists across commits
             },
         );
@@ -1444,7 +1464,7 @@ fn build_commit_store(
                 KeyReadInfo {
                     runtime_key: Value::String(field.clone().into()),
                     value_extent: tap_value_extent,
-                    index: 0, // unused for `Commit` reads (keyed by `runtime_key`)
+                    index: 0, // unused for `commit` reads (keyed by `runtime_key`)
                     // A reply tap is a per-commit event, not a persistent value:
                     // emit it only at the tick that wrote it, so two writers'
                     // taps to one defer don't smear across the shared clock.

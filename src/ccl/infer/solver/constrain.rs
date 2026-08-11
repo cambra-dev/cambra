@@ -373,6 +373,20 @@ fn constrain_go(
     sr: &Subst,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
+    // Structural descent over two types at once, one frame per constructor pair;
+    // grow on demand as the other deep walks do.
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        constrain_go_impl(lhs, rhs, sl, sr, cache)
+    })
+}
+
+fn constrain_go_impl(
+    lhs: &Type,
+    rhs: &Type,
+    sl: &Subst,
+    sr: &Subst,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
     // The trivial-equality short-circuit is only sound when the edge carries
     // no transformation — under non-identity morphisms `lhs` and `rhs` live
     // in different contexts even when structurally equal.

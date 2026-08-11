@@ -6,10 +6,17 @@
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{AggregateKind, BinOpKind, Builtin, Lit, Name, ProjKey, Type, UnaryOpKind};
 
-/// The `commit` field of a [`WriterSite`] decision record — the boolean
-/// grant/deny gating the whole (atomic) write set. Always `true` for the
-/// induction (`mut`-loop) case.
-pub const F_COMMIT: &str = "commit";
+/// The `commit` tag of a writer **decision variant** —
+/// `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense) write/reply payload record
+/// (`{writes, to_<defer>*}`); a committing position carries it. Both the
+/// transaction writer and the induction writer build the same variant through
+/// [`crate::ccl::ccl_utils::wrap_decision_variant`], and the runtime
+/// (`body_decision_at`) decodes the tag: `commit` proposes the payload's writes,
+/// `abort` denies (carry, no proposal).
+pub const V_COMMIT: &str = "commit";
+/// The `abort` tag of a writer **decision variant** — the nullary
+/// whole-transaction deny (nothing fired). See [`V_COMMIT`].
+pub const V_ABORT: &str = "abort";
 /// The `writes` field of a [`WriterSite`] decision record — the positional
 /// tuple of proposed per-key new values (`writes.i` for `write_keys[i]`), one
 /// element even for a single-key write set.
@@ -31,9 +38,9 @@ pub const F_FIRE_SUFFIX: &str = "__fire";
 // per `with begin():` site carries: the commit time `begin(r)` (`time`), the
 // history bindings of the write-set keys (`write_targets`, so recognition can
 // recover the writer's `write_keys` without a per-key merge), and the writer's
-// verbatim `{commit, writes, to_<defer>*}` decision applied to the register
-// snapshot at that time (`decision`). Only `write_targets`/`decision` reach
-// recognition; `time` records the commit clock for the model's honesty.
+// verbatim `` {`commit{writes, to_<defer>*} | `abort} `` decision variant applied to
+// the register snapshot at that time (`decision`). Only `write_targets`/`decision`
+// reach recognition; `time` records the commit clock for the model's honesty.
 /// The `time` field of a commit-record binding — the transaction's commit time
 /// `begin(r)`, at which the writer's register snapshots are read.
 pub const F_TIME: &str = "time";
@@ -42,14 +49,16 @@ pub const F_TIME: &str = "time";
 /// `write_keys[i]`), the encoding recognition reads a site's `write_keys` off.
 pub const F_WRITE_TARGETS: &str = "write_targets";
 /// The `decision` field of a commit-record binding — the writer's verbatim
-/// `{commit, writes, to_<defer>*}` decision record, applied to the register
-/// snapshot at the commit time. Recognition lifts the writer body out of it.
+/// `` {`commit{writes, to_<defer>*} | `abort} `` decision variant, applied to the
+/// register snapshot at the commit time. Recognition lifts the writer body out of it.
 pub const F_DECISION: &str = "decision";
 /// The `write` field of a **per-key commit view** — the single value a site's
-/// commit proposes for one register key (`decision.writes.i`, re-projected). A
-/// key's history binding searches the `⧺`-merged per-key views of every site
-/// writing it: `{time, commit, write}` per commit, the exact record shape the
-/// design doc gives `get_prev_txn`'s history argument.
+/// commit proposes for one register key (`decision ▷ variant_project(`commit) ▷
+/// .writes.i`, re-projected). A key's history binding searches the `⧺`-merged
+/// per-key views of every site writing it: `{time, write}` per *committing*
+/// transaction (the ``variant_project(`commit)`` eliminator drops `` `abort ``
+/// positions), the exact record shape the design doc gives `get_prev_txn`'s
+/// history argument.
 pub const F_WRITE: &str = "write";
 
 /// A typed binding site: a named variable together with its type.
@@ -1793,11 +1802,11 @@ pub struct WriterSite {
     /// whose codomain elements are passed to [`Self::body`]. Sits *outside* the
     /// snapshot-parameter scope.
     pub source: TypedExpr,
-    /// The per-position decision — `Fun(Tuple(snap…, item), {commit: Bool,
-    /// writes: Tuple(new…), to_<defer>*})`: reads the register snapshot, returns a
-    /// grant/deny (`commit`) with the proposed per-key write set (`writes`) and
-    /// any per-position `to_<defer>` feed taps. `commit` is always `true` for
-    /// the induction (`mut`-loop) case.
+    /// The per-position decision — ``Fun(Tuple(snap…, item), {`commit{writes: Tuple(new…), to_<defer>*} | `abort})``: reads the register snapshot and returns
+    /// a grant/deny variant — `` `commit `` carries the (dense) per-key write set and
+    /// any per-position `to_<defer>` feed taps; `` `abort `` is the whole-transaction
+    /// deny (carry, no proposal). An induction (`mut`-loop) position `` `commit ``s
+    /// unless every branch carries (a full non-writing position `` `abort ``s).
     pub body: TypedExpr,
 }
 
