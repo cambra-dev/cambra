@@ -1,0 +1,146 @@
+// The cross-stage provenance resolver — the multi-pane cross-link engine.
+//
+// Given an ordered list of pipeline stages and the non-identity links between
+// adjacent stages, this resolves a *seed* set of `(stage, node)` anchors to the
+// full provenance chain: the set of nodes to highlight **in every stage**, plus
+// the set of source spans those nodes project to.
+//
+// The adjacency between two consecutive stages is the backend's **dense**
+// `paneLinks` map: every edge, self-edges included. A node reaches the same
+// NodeId in a neighbouring stage via the shipped `[id, id]` self-edge (no
+// identity special case), and a fan-out via its `u !== d` edges. Resolution is
+// **bidirectional and transitive** — it walks both upstream and downstream and
+// chases edges through intermediate stages, so e.g. clicking one mono clone
+// reaches its pre-inference original *and* every sibling clone (the type-set).
+//
+// Everything here is a pure function over plain data; the unit tests in
+// `links.test.ts` are its behavioural spec.
+
+import type { Span } from "./types";
+
+/** A node anchor: a NodeId living in a specific stage. */
+export interface StageNode {
+  stageId: string;
+  nodeId: number;
+}
+
+/** The per-stage data the resolver needs: which ids exist, and their spans. */
+export interface StageInfo {
+  id: string;
+  /** Every NodeId present in this stage's IR tree. */
+  nodeIds: Set<number>;
+  /** A node's source span (null if it carries none). */
+  spanOf(nodeId: number): Span | null;
+}
+
+/** The full link graph: ordered stages + the dense edges between them. */
+export interface LinkGraph {
+  /** Stages in pipeline order (upstream -> downstream). */
+  stages: StageInfo[];
+  /**
+   * Dense edges keyed by adjacent stage pair. `edges.get(\`${from}>${to}\`)`
+   * holds `[upstreamId, downstreamId]` pairs for that pair — self-edges
+   * included, so identity is followed as an edge like any other.
+   */
+  edges: Map<string, [number, number][]>;
+}
+
+export interface ResolveResult {
+  /** stageId -> the set of NodeIds to highlight in that stage. */
+  highlightsByStage: Map<string, Set<number>>;
+  /** The union of source spans the highlighted nodes project to (deduped). */
+  sourceSpans: Span[];
+}
+
+function pairKey(from: string, to: string): string {
+  return `${from}>${to}`;
+}
+
+/**
+ * Build a [`LinkGraph`] from the raw stage list + `paneLinks`. Each entry is
+ * keyed by its `(from, to)` ids; the dense edge list (self-edges included) is
+ * stored verbatim, so the resolver follows identity and fan-out uniformly.
+ */
+export function buildLinkGraph(
+  stages: StageInfo[],
+  paneLinks: { from: string; to: string; edges: [number, number][] }[],
+): LinkGraph {
+  const edges = new Map<string, [number, number][]>();
+  for (const link of paneLinks) {
+    edges.set(pairKey(link.from, link.to), link.edges);
+  }
+  return { stages, edges };
+}
+
+/**
+ * Resolve a set of seed anchors to the full provenance chain across all stages.
+ *
+ * Returns, per stage, the set of NodeIds reachable from the seeds via the dense
+ * edges (transitively, both directions; self-edges carry identity), and the
+ * union of source
+ * spans those nodes carry. Unknown seed stages / ids are skipped gracefully.
+ */
+export function resolveLinks(graph: LinkGraph, seeds: StageNode[]): ResolveResult {
+  const indexOf = new Map<string, number>();
+  graph.stages.forEach((s, i) => indexOf.set(s.id, i));
+
+  // BFS over (stageIndex, nodeId) vertices. The visited set is keyed by
+  // "stageIndex:nodeId"; we also accumulate per-stage highlight sets.
+  const highlightsByStage = new Map<string, Set<number>>();
+  for (const s of graph.stages) highlightsByStage.set(s.id, new Set());
+
+  const visited = new Set<string>();
+  const queue: Array<{ stage: number; node: number }> = [];
+
+  const enqueue = (stage: number, node: number): void => {
+    if (stage < 0 || stage >= graph.stages.length) return;
+    if (!graph.stages[stage].nodeIds.has(node)) return;
+    const key = `${stage}:${node}`;
+    if (visited.has(key)) return;
+    visited.add(key);
+    highlightsByStage.get(graph.stages[stage].id)!.add(node);
+    queue.push({ stage, node });
+  };
+
+  for (const seed of seeds) {
+    const idx = indexOf.get(seed.stageId);
+    if (idx !== undefined) enqueue(idx, seed.nodeId);
+  }
+
+  while (queue.length > 0) {
+    const { stage, node } = queue.shift()!;
+
+    // Downstream neighbour (stage + 1): forward edges. The dense map ships a
+    // self-edge for every preserved id, so identity is followed as an edge —
+    // there is no identity special case.
+    if (stage + 1 < graph.stages.length) {
+      const downId = graph.stages[stage + 1].id;
+      const fwd = graph.edges.get(pairKey(graph.stages[stage].id, downId));
+      if (fwd) for (const [up, down] of fwd) if (up === node) enqueue(stage + 1, down);
+    }
+
+    // Upstream neighbour (stage - 1): reverse edges (self-edges included).
+    if (stage - 1 >= 0) {
+      const upId = graph.stages[stage - 1].id;
+      const back = graph.edges.get(pairKey(upId, graph.stages[stage].id));
+      if (back) for (const [up, down] of back) if (down === node) enqueue(stage - 1, up);
+    }
+  }
+
+  // Project the highlighted nodes to their source spans (deduped by start/end).
+  const sourceSpans: Span[] = [];
+  const seenSpan = new Set<string>();
+  for (const stage of graph.stages) {
+    const ids = highlightsByStage.get(stage.id)!;
+    for (const id of ids) {
+      const span = stage.spanOf(id);
+      if (!span) continue;
+      const k = `${span.start}:${span.end}`;
+      if (seenSpan.has(k)) continue;
+      seenSpan.add(k);
+      sourceSpans.push(span);
+    }
+  }
+
+  return { highlightsByStage, sourceSpans };
+}
