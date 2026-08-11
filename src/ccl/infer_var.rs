@@ -185,25 +185,33 @@ impl Bound {
 
 /// The mutable bound lists of an [`InferVar`].
 ///
-/// `lower` are types that flow *into* the variable (`L <: α`); `upper` are
-/// types it must flow into (`α <: U`). The solver appends to
+/// The lower bounds are types that flow *into* the variable (`L <: α`); the
+/// upper bounds are types it must flow into (`α <: U`). The solver appends to
 /// these in place via the variable's [`RefCell`]; coalescing reads them to
 /// materialize a concrete [`Type`]. Each entry is a [`Bound`] carrying the
 /// substitution on its constraint edge.
+///
+/// Each list sits behind an [`Rc`] so a *reader* can take it away from the
+/// `RefCell` without copying it. Materialization does exactly that, once per
+/// variable visit, and a `Bound` owns a whole [`Type`] and a `Subst` — so the
+/// copy is deep, and on a bound-graph walk it is most of the work.
+///
+/// The lists are private because that read/write asymmetry is the whole point:
+/// every write goes through [`lower_mut`](Self::lower_mut) /
+/// [`set_lower`](Self::set_lower) / [`clear`](Self::clear), so "mutation is
+/// copy-on-write" is checked by the compiler rather than by convention.
+///
+/// Writing while a reader holds the list is not hypothetical: the transitive
+/// closure in `constrain_go` walks a snapshot of one bound list while the
+/// recursion under it records edges on the same variable, and a push that lands
+/// on the held list forks it. What makes that cheap is the ratio, not the
+/// absence — a fork costs one copy per *push*, so forks are bounded by the
+/// number of edges recorded, while the copies they replace were one per
+/// *visit*, and visits outnumber edges by orders of magnitude.
 #[derive(Debug, Clone)]
 pub struct InferBounds {
-    /// Lower bounds — `L <: α`. Unioned at positive (output) positions.
-    ///
-    /// Behind an [`Rc`] so a *reader* can take the list away from the `RefCell`
-    /// without copying it. Materialization does exactly that, once per variable
-    /// visit, and a `Bound` owns a whole [`Type`] and a `Subst` — so the copy is
-    /// deep, and on a bound-graph walk it is most of the work. Mutation goes
-    /// through [`lower_mut`](Self::lower_mut), which copies only if a reader is
-    /// still holding the old list; the passes that write bounds hold none.
-    pub lower: Rc<Vec<Bound>>,
-    /// Upper bounds — `α <: U`. Intersected at negative (input) positions.
-    /// Shared like [`lower`](Self::lower).
-    pub upper: Rc<Vec<Bound>>,
+    lower: Rc<Vec<Bound>>,
+    upper: Rc<Vec<Bound>>,
 }
 
 thread_local! {
@@ -226,6 +234,20 @@ impl Default for InferBounds {
 }
 
 impl InferBounds {
+    /// The lower bounds — `L <: α`, unioned at positive (output) positions.
+    ///
+    /// Handed out as the `Rc` itself: a walk clones it to read the list outside
+    /// the `RefCell` borrow, which is a refcount bump.
+    pub fn lower(&self) -> &Rc<Vec<Bound>> {
+        &self.lower
+    }
+
+    /// The upper bounds — `α <: U`, intersected at negative (input) positions.
+    /// Shared like [`lower`](Self::lower).
+    pub fn upper(&self) -> &Rc<Vec<Bound>> {
+        &self.upper
+    }
+
     /// The lower bounds, for mutation — copy-on-write against any reader still
     /// holding the list.
     pub fn lower_mut(&mut self) -> &mut Vec<Bound> {
@@ -235,6 +257,34 @@ impl InferBounds {
     /// The upper bounds, for mutation — see [`lower_mut`](Self::lower_mut).
     pub fn upper_mut(&mut self) -> &mut Vec<Bound> {
         Rc::make_mut(&mut self.upper)
+    }
+
+    /// Install a freshly built lower-bound list, discarding the old one.
+    ///
+    /// Distinct from [`lower_mut`](Self::lower_mut): the caller already owns the
+    /// whole list, so there is nothing to copy out of a shared `Rc` and nothing
+    /// of the old list to preserve.
+    pub fn set_lower(&mut self, bounds: Vec<Bound>) {
+        self.lower = Rc::new(bounds);
+    }
+
+    /// Install a freshly built upper-bound list — see
+    /// [`set_lower`](Self::set_lower).
+    pub fn set_upper(&mut self, bounds: Vec<Bound>) {
+        self.upper = Rc::new(bounds);
+    }
+
+    /// Sever both bound lists, releasing the [`Bound`]s they hold.
+    ///
+    /// Assignment, not `lower_mut().clear()`. On a variable that never took a
+    /// bound the list *is* the shared empty one, so `Rc::make_mut` would
+    /// allocate a copy in order to clear it — twice per variable, over the
+    /// population that dominates. And on a genuinely shared list it would clear
+    /// the copy and sever nothing, which is the opposite of what teardown wants:
+    /// dropping the `Rc` is what releases the bounds, and with them the
+    /// reference cycle, once no reader is left.
+    pub fn clear(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -336,5 +386,62 @@ impl std::hash::Hash for InferVar {
 impl fmt::Debug for InferVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "?{}", self.uid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::BaseType;
+
+    fn a_bound() -> Bound {
+        Bound::conc(Type::Base(BaseType::Int))
+    }
+
+    /// Teardown clears every variable in the arena, and most of them never took
+    /// a bound — so clearing must hand the list back to the shared empty `Rc`
+    /// rather than allocate a copy to clear. Pointer identity is the check: a
+    /// `Rc::make_mut` + `clear` on the shared empty list installs a *fresh* `Rc`
+    /// and fails here.
+    #[test]
+    fn clearing_bounds_restores_the_shared_empty_list() {
+        let mut bounds = InferBounds::default();
+        bounds.lower_mut().push(a_bound());
+        bounds.clear();
+        NO_BOUNDS.with(|empty| {
+            assert!(Rc::ptr_eq(bounds.lower(), empty));
+            assert!(Rc::ptr_eq(bounds.upper(), empty));
+        });
+    }
+
+    /// Clearing severs the holder's reference instead of emptying a copy — which
+    /// is what releases the `Bound`s (and the reference cycle through them) once
+    /// the last reader is gone.
+    #[test]
+    fn clearing_severs_a_shared_list_rather_than_emptying_a_copy() {
+        let mut bounds = InferBounds::default();
+        bounds.lower_mut().push(a_bound());
+        let reader = Rc::clone(bounds.lower());
+
+        bounds.clear();
+
+        assert!(bounds.lower().is_empty(), "the holder released its list");
+        assert_eq!(reader.len(), 1, "the reader's snapshot is untouched");
+        assert_eq!(
+            Rc::strong_count(&reader),
+            1,
+            "the holder no longer references the bounds it dropped"
+        );
+    }
+
+    /// A fresh variable's lists are the shared empty one, so minting costs no
+    /// allocation; the first write copies out of it.
+    #[test]
+    fn a_fresh_variable_shares_the_empty_bound_list() {
+        let bounds = InferBounds::default();
+        NO_BOUNDS.with(|empty| {
+            assert!(Rc::ptr_eq(bounds.lower(), empty));
+            assert!(Rc::ptr_eq(bounds.upper(), empty));
+        });
     }
 }

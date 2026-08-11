@@ -188,8 +188,8 @@ mod tests {
     fn fresh_var_has_no_bounds() {
         let v = InferVar::fresh(0);
         let s = v.bounds.borrow();
-        assert!(s.lower.is_empty());
-        assert!(s.upper.is_empty());
+        assert!(s.lower().is_empty());
+        assert!(s.upper().is_empty());
         assert_eq!(v.level, 0);
     }
 

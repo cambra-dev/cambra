@@ -1558,7 +1558,7 @@ mod review_tests {
                 panic!("fresh() yields a variable");
             };
             let b = v.bounds.borrow();
-            b.lower.len() + b.upper.len()
+            b.lower().len() + b.upper().len()
         };
         assert!(
             bound_count(&d1) > 0,

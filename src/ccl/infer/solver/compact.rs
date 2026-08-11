@@ -7,6 +7,7 @@
 //! sibling [`mod@super::simplify_type`] and [`super::coalesce`] modules.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use smol_str::SmolStr;
 
@@ -531,12 +532,13 @@ struct ParentPath<'a> {
 impl ParentPath<'_> {
     /// Whether `uid` is on the path. Linear in the path's depth, which is the
     /// length of one variable's bound chain.
-    fn contains(mut path: Option<&ParentPath<'_>>, uid: InferVarId) -> bool {
-        while let Some(frame) = path {
-            if frame.uid == uid {
+    fn contains(&self, uid: InferVarId) -> bool {
+        let mut frame = Some(self);
+        while let Some(f) = frame {
+            if f.uid == uid {
                 return true;
             }
-            path = frame.prev;
+            frame = f.prev;
         }
         false
     }
@@ -702,7 +704,7 @@ fn compact_go(
             let uid = state.uid;
             let key = (uid, pol);
             if st.in_process.contains(&key) {
-                if ParentPath::contains(parents, uid) {
+                if parents.is_some_and(|p| p.contains(uid)) {
                     // Spurious cycle (a <: b and b <: a with no
                     // structural intermediary). Drop the bound.
                     return CompactType::empty();
@@ -742,7 +744,9 @@ fn compact_go(
             // only those clones and the per-use instantiations reach here,
             // each fixed by a single use site.
             let s = state.bounds.borrow();
-            let primary = if pol { &s.lower } else { &s.upper };
+            // `Rc::clone`, not a copy: taking the list out of the `RefCell` is a
+            // refcount bump, and this is the walk's hot read.
+            let primary_bounds = Rc::clone(if pol { s.lower() } else { s.upper() });
             // When the polarity-correct list is empty we fall back to the
             // opposite-polarity bounds (see the rationale above). Track which
             // polarity the bounds came from so we walk + merge them at THAT
@@ -766,12 +770,7 @@ fn compact_go(
             // cover these halves); see `design/type-inference.md` ("Apply is
             // one-way" and "Closing the single-sided blind spots (no separate
             // pass)").
-            let primary_bounds = primary.clone();
-            let opposite_bounds = if pol {
-                s.upper.clone()
-            } else {
-                s.lower.clone()
-            };
+            let opposite_bounds = Rc::clone(if pol { s.upper() } else { s.lower() });
             drop(s);
             // Walk bounds, transitively expanding. We fold the bounds'
             // contributions *without* seeding from the variable's own identity

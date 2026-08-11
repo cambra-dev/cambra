@@ -277,7 +277,7 @@ pub fn freshen_above(
             // other variables but must not see partially-mutated state.
             let (lows, ups) = {
                 let s = tv.bounds.borrow();
-                (s.lower.clone(), s.upper.clone())
+                (Rc::clone(s.lower()), Rc::clone(s.upper()))
             };
             // Freshen the bound's type *and* its edge substitutions' discharge
             // payloads: a payload is a captured argument *term* whose type
@@ -302,8 +302,8 @@ pub fn freshen_above(
                 .collect();
             {
                 let mut s = v.bounds.borrow_mut();
-                s.lower = Rc::new(new_lows);
-                s.upper = Rc::new(new_ups);
+                s.set_lower(new_lows);
+                s.set_upper(new_ups);
             }
             Type::Infer(v)
         }
@@ -411,7 +411,7 @@ fn seed_pairings_go(
         if seen.insert(dv.uid) {
             let (lows, ups) = {
                 let s = dv.bounds.borrow();
-                (s.lower.clone(), s.upper.clone())
+                (Rc::clone(s.lower()), Rc::clone(s.upper()))
             };
             for b in lows.iter().chain(ups.iter()) {
                 seed_pairings_go(use_ty, &b.ty, lim, out, seen);
@@ -423,7 +423,7 @@ fn seed_pairings_go(
         if seen.insert(uv.uid) {
             let (lows, ups) = {
                 let s = uv.bounds.borrow();
-                (s.lower.clone(), s.upper.clone())
+                (Rc::clone(s.lower()), Rc::clone(s.upper()))
             };
             for b in lows.iter().chain(ups.iter()) {
                 seed_pairings_go(&b.ty, def_ty, lim, out, seen);

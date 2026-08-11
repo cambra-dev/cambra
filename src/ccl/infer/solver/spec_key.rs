@@ -89,6 +89,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry};
 use std::fmt;
+use std::rc::Rc;
 
 use smol_str::SmolStr;
 
@@ -459,11 +460,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             }
             let bounds = {
                 let b = state.bounds.borrow();
-                if pol {
-                    b.lower.clone()
-                } else {
-                    b.upper.clone()
-                }
+                Rc::clone(if pol { b.lower() } else { b.upper() })
             };
             let truncations_before = ctx.truncations;
             let mut acc = KeyView::default();
