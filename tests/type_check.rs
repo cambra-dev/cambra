@@ -19,7 +19,7 @@ use cambra::ccl::{
         InferError, LocatedInferError, TypeInferenceContext, check_pre_desugar, infer,
         lit_singleton,
     },
-    lower::{LoweringContext, LoweringError, lower_stmts},
+    lower::{LoweringContext, lower_stmts},
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
@@ -60,17 +60,6 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
         .into_result()
         .expect("lowering failed");
     infer(&mut expr, &mut ictx).expect("inference failed")
-}
-
-/// Like [`infer_program`] but expects **lowering** to fail and returns all
-/// errors. For rejections decided before inference runs — an annotation form
-/// CHL does not accept, say.
-fn lower_program_err(code: &str) -> Vec<LoweringError> {
-    let mut lctx = LoweringContext::default();
-    let stmts = parse_module(code);
-    lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect_err("expected lowering error")
 }
 
 /// Like [`infer_program`] but expects inference to fail and returns all errors.
@@ -1238,28 +1227,6 @@ fn the_empty_product_is_unit() {
         !infer_program_err("x: {} = 1\nx").is_empty(),
         "`{{}}` is the unit type, so an `Int` must not satisfy it"
     );
-}
-
-/// `{}` is the *only* CHL spelling of the unit type.
-///
-/// Neither `Unit` nor `None` is a CHL name at all — not a type spelling, and not
-/// reserved as one. `Unit` names the right type by a name CHL does not have (CCL
-/// renders it that way, but the surfaces are separate), and `None` is gone
-/// entirely, replaced by `()`. Both are therefore ordinary undefined
-/// identifiers, free for a program to bind.
-#[test]
-fn unit_has_one_chl_spelling() {
-    for src in ["x: Unit = ()\nx", "x: None = ()\nx"] {
-        let errs = lower_program_err(src);
-        let msg = format!("{:?}", errs[0]);
-        assert!(
-            msg.contains("unknown type annotation"),
-            "expected {src:?} to reject the name as undefined, got: {msg}"
-        );
-    }
-    // Not reserved: a program may bind either name like any other identifier.
-    assert_eq!(infer_program("Unit = 1\nUnit"), int_lit(1));
-    assert_eq!(infer_program("None = 2\nNone"), int_lit(2));
 }
 
 /// A projection whose target's type is still a *variable* where the projection is

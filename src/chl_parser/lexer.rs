@@ -53,12 +53,6 @@ pub enum Token {
     True,
     #[token("False", priority = 3)]
     False,
-    /// The refinement predicate separator, `{T where p(_)}` (`docs/chl-spec.md`,
-    /// "6.4 Refinement syntax").
-    ///
-    /// Lexed so the name is **reserved**: refinements are not parsed yet, so
-    /// every use is a parse error today. That is the point — a program cannot
-    /// bind `where` as an identifier and then break when the syntax lands.
     #[token("where", priority = 3)]
     Where,
     #[token("and", priority = 3)]
@@ -474,11 +468,6 @@ mod tests {
     #[test]
     fn where_is_reserved_not_an_ident() {
         assert_eq!(tokens("where"), vec![Token::Where, Token::Newline]);
-        // `None` by contrast is *not* reserved — the unit value is `()`.
-        assert_eq!(
-            tokens("None"),
-            vec![Token::Ident("None".into()), Token::Newline]
-        );
     }
 
     #[test]

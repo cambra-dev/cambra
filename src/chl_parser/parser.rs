@@ -322,11 +322,8 @@ where
         // Parsing items as `expr (":" expr)?` keeps a single committed brace
         // parser, so classification is a total function of what was matched.
         //
-        // The trailing comma is captured rather than silently allowed, because
-        // it *distinguishes* a one-element tuple type: `{T,}` is the one-tuple
-        // and a comma-free `{T}` is an error, mirroring the term-level
-        // `(e,)`/`(e)` split. Braces are not grouping in type position, so
-        // there is no reading of `{T}` left over to accept.
+        // The trailing comma on `{T,}` is required, so it is captured rather
+        // than silently allowed.
         let brace_item = expr
             .clone()
             .then(just(Token::Colon).ignore_then(expr.clone()).or_not());

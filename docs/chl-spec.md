@@ -624,42 +624,19 @@ of the partiality disappears entirely.)
 
 ### 3.1 Literals
 
-`Int`, `String`, and `Bool` literals denote themselves. The **unit value** is
-written `()` — the single inhabitant of the unit type, whose own spelling is
-`{}` (§6.6). It is an atom rather than a lexical literal (§2.4), and it lowers to
-the CCL `Unit` literal.
+`Int`, `String`, and `Bool` literals denote themselves, and `()` is the literal
+for the unit type `{}` (§6.6).
 
-A literal's **type is the literal itself**, not merely its base: `5` has type
-`{Int | 𝑒 == 5}`, printed `5`. So `x = 5` gives `x` the type `5`, and an
-annotation only has to *admit* the value — `x: Int = 5` leaves `x` at `5`,
-because widening is the annotation's business and not the value's. Any
-operation that computes a *new* value drops it, since it is a fact about one
-value and not about the operation: `x + x` is an `Int`, and a mutable register
-never takes it (a register is the sequence its writes produce, so no one write's
-value describes it). Unit is the exception with nothing to say — it has one
-inhabitant, so a singleton would add nothing to the base.
+A literal's **type says which literal it is**, not merely its base: `5` has type
+`{Int where _ == 5}` (§6.4), the refinement pinning that one value. An annotation
+only has to *admit* it — `x: Int = 5` is accepted, widening being the
+annotation's business and not the value's. Unit is the exception with nothing to
+say: it has one inhabitant, so pinning it would add nothing to the base.
 
-A construct that *selects* or *collects* values rather than computing one keeps
-what **every** value it could yield establishes: `1 if c else 2` is an `Int`
-because the branches disagree, while `5 if c else 5` is still `5`, and a list is
-`[5, 5] : 5`-elemented but `[5, 6] : Int`-elemented. The same rule covers every
-such position — a conditional's branches, a collection's elements, a register's
-writes, a channel's contributions — since none of them is one value.
-
-The point of carrying it is proof: `arr[0]` is only a *total* lookup if `0`'s
-type says it is `0` and so lies inside `arr`'s index range (§3.9). Nothing else
-in the language observes it.
-
-`()` is the unit value's only spelling, and `None` is not reserved (§1.6, §6.6):
-a product constructor says what the value *is*, where a borrowed `None` both
-collided with the term/type capitalization rule (§6.1 — lowercase heads are
-terms, `Caps` means *type*, without exception) and did double duty as the type.
-Distinct from unit: `` `none `` (a variant tag, hence a term — §6.5) is the empty
-case of `Option(_)`, paired with `` `some(v) `` (§3.9).
-
-> **Direction.** `True`/`False` sit under the same capitalization anomaly `None`
-> did — presumably they become `true`/`false`, matching the CCL symbolic
-> rendering, but that spelling is **[Open]**.
+> **Direction [Decided] — `true`/`false`.** The boolean literals are spelled
+> `True`/`False` today, the one exception to the capitalization rule above. They
+> are renamed to `true`/`false`, which is not yet implemented: a boolean literal
+> is a *term*, so `Caps` becomes exceptionless.
 
 ### 3.2 Names
 
@@ -1531,9 +1508,8 @@ marked one carries its status per "How to read this document".)
 - `Int` — signed 64-bit integer.
 - `Bool` — `True` or `False`.
 - `String` — UTF-8 string.
-- `{}` — unit type, one inhabitant, and its only CHL spelling (§6.6). Neither
-  `Unit` nor `None` is a CHL name at all.
-  There is no *empty* (uninhabited) type — §6.6.
+- `{}` — unit type, one inhabitant, and its only CHL spelling (§6.6). There is
+  no *empty* (uninhabited) type.
 - `List(T)` — finite collection of `T`-values, indexed by `[0, n)`.
   The index → element mapping is part of the value (so `xs[i]` is
   well-defined); iteration order, however, is unspecified (§3). Written
@@ -1564,28 +1540,22 @@ a value of the base type for which a predicate holds. Refinements are
 inferred internally by built-ins like `groupby` (§7.2); the decided
 surface form is `{T where p(_)}` (§6.4), not writable yet.
 
-> **Direction [Decided] — function contracts are asserts.** There is
-> no refinement syntax at a function definition site: a function's
-> contract is written as `assert` statements in its body, lifted to
-> refinement types in CCL. The two canonical shapes: precondition
-> asserts at the top of the body, referencing parameters, lift to
-> refinements on those parameters (`assert qty > 0` makes the domain
-> `{qty: Int | qty > 0}` — the lift's results are shown here in CCL's
-> named-binder notation, since a dependent codomain has to name what it
-> closes over; the surface `where`/`_` form is §6.4); an assert on the result variable
-> immediately before it is returned lifts to a refinement on the
-> codomain, dependent on the parameters through `Type::Fun`'s named
-> binders (a trailing `assert p >= item.cost * qty` gives the codomain
-> `{p: Int | p >= item.cost * qty}`). Asserts are not restricted to
-> those positions: an assert anywhere in a block refines the binders
-> in scope from that point on, and one under a conditional contributes
-> a path-sensitive refinement. Call sites must discharge parameter
-> refinements, so preconditions propagate outward to trust boundaries
-> — in the north-star `storefront`, `reserve`'s `assert qty > 0` is
-> what forces the HTTP handler to validate `req.body.qty` before the
-> call typechecks. Type-position refinement syntax (§6.4) remains for
-> **data** — store value types, feed element types; both surfaces meet
-> in CCL as ordinary refinement types.
+> **Direction [Decided] — function contracts.** A contract can be written two
+> ways, and which one to reach for is a matter of the case at hand. As a
+> **refinement type on an annotation** (§6.4), where it is part of the signature
+> a caller reads: a parameter's precondition is `qty: {Int where _ > 0}`, and a
+> postcondition is a return annotation, which may name the parameters because
+> they are in scope there — `{Int where _ >= item.cost * qty}`. Or as an
+> **`assert` in the body**, which suits a contract that falls out of the body's
+> own logic: `assert qty > 0` lifts to the same refinement on `qty`. Asserts are
+> not restricted to the top of a block — one anywhere refines the binders in
+> scope from that point on, and one under a conditional contributes a
+> path-sensitive refinement, which is what an annotation cannot express.
+> Whichever surface writes it, what the checker holds is an ordinary refinement
+> type, and call sites must discharge parameter refinements, so preconditions
+> propagate outward to trust boundaries — in the north-star `storefront`,
+> `reserve`'s `assert qty > 0` is what forces the HTTP handler to validate
+> `req.body.qty` before the call typechecks.
 >
 > Discharge is a spectrum, not a promise of static proof: an assert
 > the compiler can prove is discharged at compile time and erased; one
@@ -1733,9 +1703,8 @@ reserved (§1.6):
   type sits inside the braces in its own spelling, so refining a structural
   type nests two brace pairs (`{{a: Int} where …}`) — the outer pair is the
   refinement, the inner one is the record type. There is no elision.
-- **`where`** as the separator, replacing the earlier `|` (superseded).
-  Moving off `|` is what frees that token to separate variant tags
-  (§6.5, §1.8), and `where` reads as the clause it is.
+- **`where`** as the separator, which leaves `|` free to separate variant tags
+  (§6.5, §1.8) and reads as the clause it is.
 - **`_`** as the refined value. The predicate has no named binder: `_` *is*
   the value, so a refinement is a closed expression about one anonymous
   subject rather than a binder plus a scope. This is the same `_` that
@@ -1768,27 +1737,17 @@ A `match` over `_` is the idiomatic way to refine a variant:
 > would collapse the two; its spelling is undecided. Pattern matching's
 > block syntax is **[Tentative]** in any case (§1.6).
 
-Naming a refinement's subject is *not* how a function states a contract:
-a function's preconditions and postconditions are `assert` statements in
-its body, lifted to refinements over the parameter binders (the Direction
-note in §6). That lift needs the parameter's *name* in the predicate —
-`{qty: Int | qty > 0}`, in CCL's named-binder notation — which is exactly what
-the anonymous `_` cannot express, and exactly why the two surfaces are
-separate: `where`/`_` is for **data** types, `assert` is for **function**
-contracts.
-
-**This is CHL surface syntax only.** CCL renders a refinement
-`{𝑇 | 𝑝}` with an explicit binder, and that notation is unchanged — it
-has to name the binder, since a dependent codomain refinement closes over
-a `Type::Fun` Pi binder. The surface `_` lowers to CCL's element binder
-(`__elem`), so `{Int where _ > 0}` is the CCL type `{Int | __elem > 0}`.
-Expect to see the `|` form in compiler output, design docs, and the
-operational semantics.
+`_` is the value being refined, so a predicate that mentions *another* value
+relies on that value having a name where the refinement sits. In a function
+signature the parameters do, which is what lets a return annotation carry a
+postcondition: `{Int where _ >= item.cost * qty}` refines the result by a
+predicate naming two parameters (§6). Standing alone, a refinement type has no
+such surroundings, and speaks only about its one anonymous subject.
 
 ### 6.5 Variants
 
-**[Decided]** — not implemented. CCL has the sum type; no part of the CHL surface
-below is lexed or parsed.
+**[Decided]** — not implemented: no part of the CHL surface below is lexed or
+parsed.
 
 A **variant** is a tagged sum: a value is one of a fixed set of tags, each
 carrying its own fields. Every tag is prefixed with a backtick, in every
@@ -1835,61 +1794,33 @@ Variants are matched with `match`/`case` (**[Tentative]** as to block
 syntax — §1.6), or destructured directly against a single-tag variant type
 where the match cannot fail (§4.3.1).
 
-CCL has the sum type already (`Type::Variant`, a tag→payload list keyed by
-name or by position) and renders it `[.some(Int) | .none]`; that internal
-notation is unchanged. Nothing in CHL constructs one today — no backtick is
-lexed, and neither `match` nor a tag is parsed.
+Nothing in CHL constructs a variant today — no backtick is lexed, and neither
+`match` nor a tag is parsed.
 
 ### 6.6 The empty product is unit
 
 **A product with no fields is not a type of its own — it is unit.** Unit is a
-base type, spelled `{}` in type position (§2.4) and inhabited by the value `()`
-(§3.11). Neither spelling is a product *expression* that happens to evaluate to
-unit; they are simply how the type and its one value are written.
+base type, spelled `{}` in type position and only that (§2.4), and inhabited by
+the value `()` (§3.11). Neither spelling is a product *expression* that happens
+to evaluate to unit; they are simply how the type and its one value are written.
 
-An "empty tuple type" and an "empty record type" are therefore **not types**.
-They are not two degenerate products alongside unit — a product with no fields
+An "empty tuple type" and an "empty record type" are therefore **not types**
+here. Nothing makes them incoherent in the abstract — a product with no fields
 has nothing to distinguish positional keying from named keying, so both
-descriptions name the same one-inhabitant type. The compiler holds this as an
-invariant on the type representation — where the type is CCL's `Unit`:
-`Tuple([])` and `Record([])` are invalid, products are built through
-constructors that map the empty case to `Unit`, and a `debug_assert` at the
-post-inference wall catches any path that bypasses them.
+descriptions would name the same one-inhabitant type — but neither is a type CHL
+has. The compiler holds that as an invariant rather than a convention: no
+zero-field product exists in the type representation at all, every product is
+built through a constructor that maps the empty case to unit, and an assertion
+catches any path that would bypass one.
 
-This is an invariant and not a convention because two spellings of one type do
-not merely look untidy — they fail to *reconcile*. Inference records a node's
-type and a later consistency check rebuilds it from the node's children, so if
-those two steps can reach a zero-field product by different routes they disagree
-about a node that is perfectly well typed — and the disagreement is
-undiagnosable, since both spellings render `()`. One representation is what makes
-the unit value `()` typecheck at all.
-
-**`{}` is the only CHL spelling, and the alternatives are not reserved.** One
-type, one way to write it — and `{}` is structural, which is what makes
-`Set(K) = Map(K, {})` (§6.3) read as the set it encodes: a map whose values
-carry nothing.
-
-Neither `Unit` nor `None` is a CHL name:
-
-- `Unit` names the right type by a name CHL does not have, so it is an ordinary
-  undefined identifier in annotation position. CCL still *renders* the type as
-  `Unit`, and that is fine: CCL's rendering is a separate surface, not yet
-  settled. The two readers therefore differ on purpose — the CCL primitive-name
-  round-trip accepts `Unit`, and the CHL annotation reader is a strict subset of
-  it.
-- `None` is gone from the language entirely (§1.6, §3.1). It was the unit value
-  and, by accident of the same spelling, readable as the type; `()` is the value
-  now and `{}` the type.
-
-Both are therefore names a program may bind like any other identifier —
-`Unit = 1` is a legal binding. Nothing is reserved against a future use of
-either.
-
-There is **no empty type** (no uninhabited / void type) in CHL or CCL: the
-base types are `Int`, `UInt`, `String`, `Bool`, and `Unit`, and nothing else
-is atomic. `{}` is unambiguous because of this — the empty *sum* would be the
-void type, and there is none to spell. Introducing one would be new design,
-not a re-reading of `{}`.
+**The reason is subtyping.** A product flows into a product that requires a
+subset of its fields — `{a: Int, b: Int}` is accepted where `{a: Int}` is
+required, and the extra field is simply not read. An *empty* field set is a
+subset of every field set, so a zero-field **product** would be a type every
+product flows into, arriving with every field dropped and nothing in the
+program to mark the loss. Unit is a **base** type instead, and a base type
+accepts only itself: getting from a product to unit takes an operation that
+says so.
 
 ---
 
@@ -2409,12 +2340,12 @@ with parser-level support that lowering rejects:
   surface form is `{T where p(_)}` (**[Decided]**, §6.4), not yet in
   the grammar. `where` is already **lexed** and reserved (§1.6); what is
   missing is the brace-form production and `_` in term position inside the
-  predicate. Function contracts arrive as `assert`s
-  lifted to refinements (**[Decided]**, §6) — `assert` is likewise not yet
-  a statement.
+  predicate. Function contracts are written either as those annotations or as
+  `assert`s lifted to refinements (**[Decided]**, §6) — `assert` is likewise not
+  yet a statement.
 - **Variants** — the tagged-sum surface, ``{ `some{Int} | `none }`` as a
-  type and `` `some(1) `` as a term (**[Decided]**, §6.5). CCL has the
-  type (`Type::Variant`); CHL has none of the syntax. The backtick is not
+  type and `` `some(1) `` as a term (**[Decided]**, §6.5). CHL has none of
+  the syntax: the backtick is not
   lexed at all, so it is the *first* blocker in every north-star program
   that matches an `Option` — `txn_kv`, `nonneg_inventory`, and both
   `storefront` versions pin that lex failure today.

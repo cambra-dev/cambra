@@ -944,11 +944,10 @@ fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
 ///
 /// Recognised forms:
 /// - Capitalized primitive names (`Caps` means type — `docs/chl-spec.md`):
-///   any [`BaseType`] spelling ([`BaseType::keyword`]) → [`Type::Base`], i.e.
-///   `Int`, `UInt`, `String`, `Bool`, `Unit`.
-/// - `None` (the constant) → `Unit`, and the wildcard `_` → [`Type::Hole`]
-///   ("infer this slot" — inference normalizes an annotation `Hole` to a fresh
-///   variable, so the slot is unconstrained; see `bind_annotation`).
+///   `Int`, `UInt`, `String`, `Bool` → [`Type::Base`].
+/// - The wildcard `_` → [`Type::Hole`] ("infer this slot" — inference
+///   normalizes an annotation `Hole` to a fresh variable, so the slot is
+///   unconstrained; see `bind_annotation`).
 /// - Type application `List(T)` — a type constructor applied to argument types.
 ///   Application is parenthesised at both the term and type level
 ///   (`docs/chl-spec.md`).
@@ -1009,18 +1008,12 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
 /// Resolve a capitalized primitive type name (`Caps` means type —
 /// `docs/chl-spec.md`), or the
 /// inference wildcard `_`. Returns `None` for any other identifier.
-///
-/// **`Unit` is not a CHL type name**, and is not reserved as one either — it is
-/// simply undefined here, like any other unbound capitalized identifier. The
-/// unit type is written structurally, as `{}`
-/// (`docs/chl-spec.md`, "6.6 The empty product is unit").
-///
-/// So this is not simply [`BaseType::from_keyword`]. That reader is the CCL
-/// primitive-name round-trip, where `Unit` stays, since CCL renders the type by
-/// that name; the CHL annotation surface is a strict subset of it.
 fn name_type(id: &str) -> Option<Type> {
     if let Some(base) = BaseType::from_keyword(id) {
-        // `Unit` round-trips as a CCL primitive name but is not writable here.
+        // The unit type is written `{}` — one spelling per type
+        // (`docs/chl-spec.md`, "6.6 The empty product is unit"), so the name
+        // `BaseType::from_keyword` accepts for the CCL round-trip is not a CHL
+        // annotation.
         if matches!(base, BaseType::Unit) {
             return None;
         }
