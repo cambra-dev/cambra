@@ -2740,14 +2740,18 @@ mod tests {
     /// still holds both, because collapsing them would let refinement-deficit
     /// matching accept an unsatisfied demand.
     ///
-    /// A pass that decides a cast's refinements from route-dependent context can
-    /// mint such a pair out of *one* refinement, and dedup then correctly refuses to
-    /// collapse it — which surfaces as a recorded type disagreeing with its
-    /// recomputation while printing the same. No corpus program reaches that pair
-    /// (instrumenting [`RefinementSet::insert`] for a member rendering alike without
-    /// being `eq` counts zero in both physical orders, because a refinement's binding
-    /// is its index rather than its spelling), so the hazard is in the pass rather
-    /// than in the equality pinned here, and closing it is a separate change.
+    /// A pass that decides a cast's refinements from route-dependent context would
+    /// mint such a pair out of *one* refinement, and dedup would then correctly refuse
+    /// to collapse it — surfacing as a recorded type disagreeing with its
+    /// recomputation while printing the same. No pass does: a cast's refinements are
+    /// term-determined
+    /// ([`ccl_utils::canonical_cast_ty`](crate::ccl::ccl_utils::canonical_cast_ty) /
+    /// [`ccl_utils::canonicalize_cast_types`](crate::ccl::ccl_utils::canonicalize_cast_types)),
+    /// pinned by `a_cast_target_does_not_carry_its_value_s_refinements`. Nor is the
+    /// pair otherwise reachable: instrumenting [`RefinementSet::insert`] for a member
+    /// rendering alike without being `eq` counts zero over the corpus in both physical
+    /// orders, because a refinement's binding is its index rather than its spelling.
+    /// So the hazard was in the pass, not in the equality this pins.
     #[test]
     fn cast_target_vintages_render_alike_but_do_not_dedup() {
         // Two casts of one value, differing *only* in their targets' domain

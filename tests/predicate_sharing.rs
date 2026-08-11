@@ -37,6 +37,7 @@
 //! the internal vault; rationale in `ccl/design/type-inference.md`.
 
 use cambra::ccl::ccl_utils::{distinct_predicate_rcs, reachable_refinements};
+use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::ccl::infer::{TypeInferenceContext, infer};
 use cambra::ccl::lower::{LoweringContext, lower_stmts};
 use cambra::ccl::symbolic::symbolic;
@@ -107,6 +108,68 @@ fn assert_no_split(code: &str) {
 /// misses the binder slots and cast targets happens to cost nothing. At two
 /// levels, a filter predicate reachable only through a `Cast.target` appears —
 /// and that is the slot `lambda_elim` and operator conversion read it from.
+/// **A cast's `target` carries only the cast's own refinements.** The value's
+/// refinements belong on the node's *type*, which the post-inference check
+/// recomputes as value-refinements ∪ target-refinements — so a `target` that also
+/// carried the value's would double-book each one.
+///
+/// The minimal exhibit is a nested filter. `coalesce_node` used to overwrite a
+/// `Cast`'s `target` with the occurrence's coalesced view, which carries the
+/// value's filter alongside the cast's own, and three rebuild passes then did the
+/// same from route-dependent types; the inner cast came out with two refinements
+/// where one is its own. Measured over the corpus, the overwrite differed from the
+/// term-determined set at 14 cast sites in either physical refinement order.
+///
+/// A duplicate is currently absorbed rather than observed, because the two copies
+/// of the value's refinement are `eq` and a `RefinementSet` deduplicates them. It
+/// stops being absorbed as soon as they are not — `eq_refinement_predicate`
+/// compares a cast's target predicate, so two vintages of one refinement do not
+/// dedup, and the recomputation then disagrees with the recorded type while
+/// printing the same. This asserts the disjointness rather than that surface,
+/// because the disjointness is what the passes can break and what no fuzz reaches.
+#[test]
+fn a_cast_target_does_not_carry_its_value_s_refinements() {
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
+    let compiled = compile_program(
+        &mut ctx,
+        "[a for a in [b for b in [1, 2, 3, 4] if b < 3] if a < 3]",
+        consumer,
+    )
+    .expect("the nested filter compiles");
+
+    let mut casts = 0;
+    let mut doubled = Vec::new();
+    fn walk(e: &Expr, casts: &mut usize, doubled: &mut Vec<String>) {
+        if let TypedExprNode::Cast { target, value } = &e.node {
+            *casts += 1;
+            let refs_of = |t: &Type| -> Vec<Refinement> {
+                t.domain()
+                    .map(|d| d.refinements().to_vec())
+                    .unwrap_or_default()
+            };
+            let (target_refs, value_refs) = (refs_of(target), refs_of(&value.ty));
+            for r in &target_refs {
+                if value_refs.contains(r) {
+                    doubled.push(symbolic(&r.predicate));
+                }
+            }
+        }
+        e.walk_children(&mut |c| walk(c, casts, doubled));
+    }
+    walk(&compiled.ast, &mut casts, &mut doubled);
+
+    assert!(
+        casts >= 2,
+        "the exhibit needs the nested cast pair; found {casts} cast(s)"
+    );
+    assert!(
+        doubled.is_empty(),
+        "{} cast target(s) carry a refinement the value already establishes: {doubled:?}",
+        doubled.len()
+    );
+}
+
 #[test]
 fn nested_comprehension_shares_predicate_rcs() {
     assert_no_split(
