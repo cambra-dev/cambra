@@ -2214,8 +2214,7 @@ mod variant_ctor_tests {
             commit_abort_ty(Type::Base(CclBase::Int)),
         );
 
-        let channelized =
-            crate::ccl::channelize::run(vc, /* input_typed = */ true).expect("channelize");
+        let channelized = crate::ccl::channelize::run(vc).expect("channelize");
         let lowered = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
 
         let mut ctx = OpConversionContext::new();

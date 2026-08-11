@@ -89,6 +89,20 @@ Collection iteration (list comprehensions) is encoded with the existing `Lambda`
 
 Lambdas do not survive to the dataflow graph: [lambda elimination](optimization.md#lambda-elimination-ccllambda_elimrs) rewrites the applied map-lambda to point-free combinators, which [operator conversion](optimization.md#compilation) then turns into extent-iterating tile operators. See also [/docs/operational-semantics/lowering.md](/docs/operational-semantics/lowering.md).
 
+### `MutDecl` — the register introduction
+
+`x := init` lowers to `MutDecl { binding, init, body }`, the surface marker for the
+declaring half of `:=` (`MutWrite` is its writing half). Both are erased by the
+unified phase, which turns the pair into one `letrec` recurrence or a chain of
+shadowing `Let`s.
+
+It is a node rather than a flag on `Let` because the two have different lifetimes:
+`Let` survives the whole pipeline, while a register introduction is compiled away.
+And it is the **only** node that binds a register — a `Let` cannot, because
+`emit_let` derefs a register-typed initializer, so `b = a` binds `b` at `a`'s value.
+That is what makes register-ness structural: a pass asks which node it is looking
+at, not whether a type or an annotation survived inference.
+
 ### `Cast` — explicit refinement acquisition
 
 `Cast { value, target }` is a type conversion that re-views `value` as the type `target`. It is a node (not a `Builtin`) because it has its own typing rule and its own structural shape — modelling it as `Apply(value, Cast)` with the target hidden on `user_annotation` forced every traversal to special-case the `Apply`-with-Cast-head pattern and read the target out of a side field. The node makes both the value child and the target type first-class.
@@ -133,7 +147,7 @@ Every CCL expression is wrapped in `TypedExpr { node: TypedExprNode, ty: Type, u
 
 - `node` holds the expression kind (the `TypedExprNode` enum).
 - `ty` starts as `Type::Hole` (stamped by `TypedExpr::new()`); the inference pass converts it to a registered `Type::Infer` variable then fills it with the concrete type before compilation.
-- `user_annotation` carries an explicit annotation from the source (e.g. a `cast` call). Inference checks it for compatibility with the inferred type and uses it as the final type if present.
+- `user_annotation` carries an explicit annotation from the source (e.g. a `cast` call). It is a **pre-inference input**: inference reconciles the inferred type against it, records the outcome in `ty`, and then clears the slot, so no pass downstream observes one. A binder additionally carries `declared` — the one fact about its annotation that outlives it. See `src/ccl/design/type-inference.md`, "The binder slot, and why annotations do not outlive inference".
 
 ### `Type::Hole`, `Type::Infer`, `Type::History`, and `Type::ChanDom` — the transient variants
 

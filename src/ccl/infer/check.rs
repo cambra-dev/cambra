@@ -12,8 +12,8 @@ use crate::ccl::{BaseType, Expr, Level, Name, Type, TypedExprNode};
 use super::emit::{
     emit_aggregate, emit_apply, emit_begin, emit_binop, emit_case, emit_cast,
     emit_collection_union, emit_compose, emit_expr_stmt, emit_for, emit_lambda, emit_let,
-    emit_letrec, emit_list, emit_proj, emit_record, emit_transact, emit_tuple, emit_unary,
-    emit_variant_ctor,
+    emit_letrec, emit_list, emit_mut_decl, emit_proj, emit_record, emit_transact, emit_tuple,
+    emit_unary, emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
 use super::typing::Typing;
@@ -419,6 +419,12 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             bound_expr,
             body,
         } => emit_let(binding, bound_expr, body, ctx)?,
+
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => emit_mut_decl(binding, init, body, ctx)?,
 
         TypedExprNode::Tuple(elts) => emit_tuple(elts, ctx)?,
 
