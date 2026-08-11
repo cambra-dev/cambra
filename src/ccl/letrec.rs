@@ -64,7 +64,7 @@ impl std::fmt::Display for LetRecCausalityError {
 /// (transaction domain). In both, a reference consumed only through the
 /// accessor's history slot depends only on strictly earlier positions, so it
 /// is causal (design doc `src/ccl/design/mutability.md`, "Builtins").
-fn is_causal_builtin(b: Builtin) -> bool {
+fn is_causal_builtin(b: &Builtin) -> bool {
     matches!(b, Builtin::GetPrevSeq | Builtin::GetPrevTxn)
 }
 
@@ -176,7 +176,7 @@ fn collect_noncausal_refs(e: &TypedExpr, live: &BTreeSet<Name>, out: &mut BTreeS
     // positions) — see `is_causal_history_slot` for the exact grammar.
     if let TypedExprNode::Apply { function, argument } = &e.node
         && let TypedExprNode::Builtin(b) = &function.node
-        && is_causal_builtin(*b)
+        && is_causal_builtin(b)
         && let TypedExprNode::Tuple(elems) = &argument.node
         && let Some((history, rest)) = elems.split_first()
         && is_causal_history_slot(history, live)
@@ -198,7 +198,7 @@ fn collect_noncausal_refs(e: &TypedExpr, live: &BTreeSet<Name>, out: &mut BTreeS
     // has normalized the phase-emitted pointful form.
     if let TypedExprNode::Compose(elts) = &e.node
         && let Some((last, init_elts)) = elts.split_last()
-        && matches!(&last.node, TypedExprNode::Builtin(b) if is_causal_builtin(*b))
+        && matches!(&last.node, TypedExprNode::Builtin(b) if is_causal_builtin(b))
         && let Some((head, mids)) = init_elts.split_first()
         && let TypedExprNode::Apply { argument, function } = &head.node
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::Zip))

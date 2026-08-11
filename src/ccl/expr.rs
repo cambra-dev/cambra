@@ -308,7 +308,7 @@ pub enum TypedExprNode {
         branches: Vec<Branch>,
     },
 
-    /// Tagged variant constructor: `.Tag(payload)`.
+    /// Tagged variant constructor: `` `Tag(payload) ``.
     ///
     /// Produces a [`Type::Variant`] containing a single tag whose payload type
     /// is inferred from `payload`. Width-subtyping then lets the resulting
@@ -1828,7 +1828,8 @@ pub struct Branch {
 }
 
 /// The structural part of a [`Branch`]: a variant tag plus the binding that
-/// receives its payload.
+/// receives its payload — `` `Tag(binder) ``, the destructuring form mirroring
+/// [`TypedExprNode::VariantCtor`]'s construction.
 ///
 /// Matches one tag of the enclosing [`TypedExprNode::Case`]'s scrutinee and
 /// binds the payload to `binding.name`; `binding.ty` is filled in by

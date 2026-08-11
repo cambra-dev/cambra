@@ -11,8 +11,8 @@ use intervalsets::{
 };
 
 use crate::{
-    ccl::BaseType,
-    interpreter::{ColumnValue, Extent, Tile, Value, transform_hashmap_values},
+    ccl::{BaseType, TagMap},
+    interpreter::{ColumnValue, Extent, Tile, UnionArm, Value, transform_hashmap_values},
 };
 
 /// A predicate that describes a subset of values in an extent.
@@ -32,15 +32,23 @@ pub enum Predicate {
     /// Invariant: arms never directly nest another `Or` (always flattened by
     /// [`Predicate::flatten_or`]).
     Or(Vec<Predicate>),
-    /// Predicate over a discriminated-union domain.
+    /// Predicate over a discriminated-union domain: one predicate per **arm**,
+    /// keyed by the arm's tag.
     ///
-    /// `variants[i]` is the predicate for elements whose tag equals `i`.
-    /// Admits a value `Union { tag, inner }` iff `variants[tag].contains(inner)`.
-    /// Semantically equivalent to `Or` of per-variant predicates, but preserving
-    /// the tag structure for efficient dispatch.
+    /// Admits a value `Union { tag, inner }` iff this map's `tag` arm exists and
+    /// admits `inner`. Semantically equivalent to an `Or` of per-arm predicates,
+    /// but preserving the tag structure for efficient dispatch.
     ///
-    /// Invariant: `variants.len()` matches the number of variants in the domain.
-    Union(Vec<Predicate>),
+    /// A tag the map does not carry admits nothing, which is what makes a predicate
+    /// built for a width-narrower domain usable: an arm that cannot occur simply has
+    /// no entry (see [`TagMap`], "Why keyed rather than positional").
+    ///
+    /// Invariant: the arm set matches the domain's. Pointwise combinations
+    /// ([`intersect`](Predicate::intersect), [`minus`](Predicate::minus),
+    /// [`union`](Predicate::union)) therefore require both sides to carry the same
+    /// tags and panic otherwise, while the *query* [`subsumes`](Predicate::subsumes)
+    /// answers conservatively instead.
+    Union(TagMap<Predicate>),
 }
 
 impl Predicate {
@@ -105,9 +113,9 @@ impl Predicate {
             }
             // Union is true if every variant is true; false if every variant is false.
             Predicate::Union(ps) => {
-                if ps.iter().all(|p| p.as_bool() == Some(true)) {
+                if ps.values().all(|p| p.as_bool() == Some(true)) {
                     Some(true)
-                } else if ps.iter().all(|p| p.as_bool() == Some(false)) {
+                } else if ps.values().all(|p| p.as_bool() == Some(false)) {
                     Some(false)
                 } else {
                     None
@@ -209,19 +217,10 @@ impl Predicate {
             (_, Predicate::Or(arms)) => {
                 Predicate::flatten_or(arms.iter().map(|a| self.intersect(a)).collect())
             }
-            // Union: intersect per variant.
+            // Union: intersect per arm. Pointwise over one arm set — see
+            // `TagMap::zip_same_tags`.
             (Predicate::Union(ps), Predicate::Union(qs)) => {
-                assert_eq!(
-                    ps.len(),
-                    qs.len(),
-                    "Union intersect: variant count mismatch"
-                );
-                Predicate::Union(
-                    ps.iter()
-                        .zip(qs.iter())
-                        .map(|(p, q)| p.intersect(q))
-                        .collect(),
-                )
+                Predicate::Union(ps.zip_same_tags(qs, "Predicate::intersect", Predicate::intersect))
             }
             _ => panic!("Cannot intersect incompatible predicates: {self:?} and {other:?}"),
         }
@@ -302,10 +301,10 @@ impl Predicate {
                 }
                 res
             }
-            // Union: subtract per variant.
+            // Union: subtract per arm. Pointwise over one arm set — see
+            // `TagMap::zip_same_tags`.
             (Predicate::Union(ps), Predicate::Union(qs)) => {
-                assert_eq!(ps.len(), qs.len(), "Union minus: variant count mismatch");
-                Predicate::Union(ps.iter().zip(qs.iter()).map(|(p, q)| p.minus(q)).collect())
+                Predicate::Union(ps.zip_same_tags(qs, "Predicate::minus", Predicate::minus))
             }
             _ => panic!("Cannot subtract incompatible predicates: {self:?} minus {other:?}"),
         }
@@ -350,10 +349,10 @@ impl Predicate {
                 new_arms.extend(arms.iter().cloned());
                 Predicate::flatten_or(new_arms)
             }
-            // Union: union per variant.
+            // Union: union per arm. Pointwise over one arm set — see
+            // `TagMap::zip_same_tags`.
             (Predicate::Union(ps), Predicate::Union(qs)) => {
-                assert_eq!(ps.len(), qs.len(), "Union union: variant count mismatch");
-                Predicate::Union(ps.iter().zip(qs.iter()).map(|(p, q)| p.union(q)).collect())
+                Predicate::Union(ps.zip_same_tags(qs, "Predicate::union", Predicate::union))
             }
             _ => panic!("Cannot union incompatible predicates: {self:?} and {other:?}"),
         }
@@ -379,7 +378,7 @@ impl Predicate {
             Predicate::Or(arms) => arms.iter().any(|a| a.contains(value)),
             // Union: value is admitted if the per-variant predicate for its tag admits its inner value.
             Predicate::Union(ps) => match value {
-                Value::Union { tag, inner } => ps.get(*tag).is_some_and(|p| p.contains(inner)),
+                Value::Union { tag, inner } => ps.get(tag).is_some_and(|p| p.contains(inner)),
                 _ => false,
             },
         }
@@ -435,8 +434,8 @@ impl Predicate {
             (_, Predicate::Or(arms)) => arms.iter().all(|a| self.subsumes(a)),
             // Union: self ⊇ other iff every per-variant predicate of self subsumes
             // the corresponding variant of other.
-            (Predicate::Union(ps), Predicate::Union(qs)) if ps.len() == qs.len() => {
-                ps.iter().zip(qs.iter()).all(|(p, q)| p.subsumes(q))
+            (Predicate::Union(ps), Predicate::Union(qs)) if ps.same_tags(qs) => {
+                ps.zip_matching(qs).all(|(_, p, q)| p.subsumes(q))
             }
             // Incompatible variants (e.g. Record vs LessThanEq): conservative false.
             _ => false,
@@ -498,11 +497,11 @@ impl Predicate {
                 panic!("Cannot build predicate from FunctionBindings")
             }
             // Union domains: build one predicate per variant, tracking tags separately.
-            ColumnValue::Union { tags, variants } => {
-                if tags.is_empty() {
+            ColumnValue::Union(arms) => {
+                if arms.values().all(UnionArm::is_empty) {
                     return Predicate::False;
                 }
-                Predicate::Union(variants.iter().map(Predicate::from_column_value).collect())
+                Predicate::Union(arms.map(|_, arm| Predicate::from_column_value(arm.values())))
             }
         }
     }
@@ -553,13 +552,12 @@ impl Predicate {
             Predicate::Or(arms) => arms.iter().all(|p| p.is_applicable_to(&extent)),
             // Union: each per-variant predicate must be applicable to its variant extent.
             Predicate::Union(ps) => match &extent {
-                Extent::Union(ext_variants) => {
-                    ps.len() == ext_variants.len()
-                        && ps
-                            .iter()
-                            .zip(ext_variants.iter())
-                            .all(|(p, e)| p.is_applicable_to(e))
-                }
+                // Width subtyping: the predicate may cover fewer arms than the
+                // extent declares (the missing ones cannot occur), but every arm it
+                // does cover must match that arm's extent.
+                Extent::Union(ext_arms) => ps
+                    .iter()
+                    .all(|(k, p)| ext_arms.get(k).is_some_and(|e| p.is_applicable_to(e))),
                 _ => false,
             },
         }
@@ -696,38 +694,30 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
                 domain_predicate,
                 |v| ColumnValue::from_values(v, &record_cv_to_extent(fields)),
             ),
-            // Union domain: each entry has (tag, position-within-tag).
-            // Sort entries lexicographically by that pair so two tiles
-            // representing the same multiset of `(tag, var_value) → cod`
-            // entries canonicalize to the same form regardless of the
-            // order each variant happened to be drained.  The variants
-            // themselves stay in their pre-existing order; only the
-            // top-level `tags`/`codomain` parallel vectors get
-            // re-permuted.
-            (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Union { tags, variants }) => {
-                // For each entry, count how many earlier entries shared
-                // its tag — that's the index of this entry into its
-                // variant's value list.  Pair `((tag, var_pos), cod)`
-                // for sorting.
-                let mut tag_counts: HashMap<usize, usize> = HashMap::new();
-                let mut pairs: Vec<((usize, usize), i64)> = tags
-                    .iter()
-                    .zip(cod_ints)
-                    .map(|(&tag, cod)| {
-                        let counter = tag_counts.entry(tag).or_insert(0);
-                        let pos = *counter;
-                        *counter += 1;
-                        ((tag, pos), cod)
-                    })
-                    .collect();
-                pairs.sort_by_key(|((tag, pos), _)| (*tag, *pos));
-                let sorted_tags: Vec<usize> = pairs.iter().map(|((t, _), _)| *t).collect();
-                let sorted_cod: Vec<i64> = pairs.into_iter().map(|(_, c)| c).collect();
+            // Union domain: canonicalize entries by `(tag, slot)` so two tiles
+            // representing the same multiset of `(tag, payload) → cod` entries
+            // compare equal regardless of the order the arms happened to be
+            // drained in.
+            //
+            // The arm-keyed column already *stores* that pair — arms are in
+            // canonical tag order and each arm's rows ascend by slot — so
+            // concatenating the arms in order **is** the canonical sequence, and
+            // the codomain just follows the same permutation.
+            (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Union(arms)) => {
+                let mut sorted_cod: Vec<i64> = Vec::with_capacity(cod_ints.len());
+                let mut next_row = 0usize;
+                let canonical = arms.map(|_, arm| {
+                    for &row in arm.rows() {
+                        sorted_cod.push(cod_ints[row]);
+                    }
+                    let rows: Vec<usize> = (next_row..next_row + arm.len()).collect();
+                    next_row += arm.len();
+                    UnionArm::new(rows, arm.values().clone())
+                });
+                let domain = ColumnValue::Union(canonical);
+                domain.debug_assert_union_invariants();
                 Tile::SealedFunction {
-                    domain: ColumnValue::Union {
-                        tags: sorted_tags,
-                        variants,
-                    },
+                    domain,
                     codomain: Box::new(Tile::Scalar(ColumnValue::Ints(sorted_cod))),
                     domain_predicate,
                     deleted: BitSet::new(),
@@ -746,6 +736,7 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
 
 #[cfg(test)]
 mod tests {
+    use crate::ccl::FieldKey;
     use bit_vec::BitVec;
     use intervalsets::ops::Contains;
 
@@ -1797,35 +1788,35 @@ mod tests {
     // ── Predicate::Union ──────────────────────────────────────────────────────
 
     fn union_ext() -> Extent {
-        Extent::Union(vec![int(), bool_ext()])
+        Extent::Union(TagMap::from_positional(vec![int(), bool_ext()]))
     }
 
     fn union_pred(p0: Predicate, p1: Predicate) -> Predicate {
-        Predicate::Union(vec![p0, p1])
+        Predicate::Union(TagMap::from_positional(vec![p0, p1]))
     }
 
     fn union_val(tag: usize, inner: Value) -> Value {
         Value::Union {
-            tag,
+            tag: FieldKey::Index(tag),
             inner: Box::new(inner),
         }
     }
 
     #[test]
     fn union_from_column_value_empty_tags_is_false() {
-        let cv = ColumnValue::Union {
-            tags: vec![],
-            variants: vec![ColumnValue::Ints(vec![]), ColumnValue::Bools(BitVec::new())],
-        };
+        let cv = ColumnValue::positional_union(
+            &[],
+            vec![ColumnValue::Ints(vec![]), ColumnValue::Bools(BitVec::new())],
+        );
         assert_eq!(Predicate::from_column_value(&cv), Predicate::False);
     }
 
     #[test]
     fn union_from_column_value_builds_per_variant_predicate() {
-        let cv = ColumnValue::Union {
-            tags: vec![0, 1, 0],
-            variants: vec![ColumnValue::Ints(vec![1, 3]), ColumnValue::Ints(vec![7])],
-        };
+        let cv = ColumnValue::positional_union(
+            &[0, 1, 0],
+            vec![ColumnValue::Ints(vec![1, 3]), ColumnValue::Ints(vec![7])],
+        );
         let pred = Predicate::from_column_value(&cv);
         assert!(matches!(pred, Predicate::Union(ref ps) if ps.len() == 2));
         // Tag-0 predicate admits 1 and 3 but not 7.
@@ -2006,19 +1997,35 @@ mod tests {
         assert!(!pred.is_applicable_to(&int()));
     }
 
+    /// A predicate covering **fewer** arms than the extent is applicable: variant
+    /// width subtyping says the uncovered tags simply cannot occur, so there is
+    /// nothing to constrain for them. Requiring equal arm counts would reject a
+    /// legal subtype.
     #[test]
-    fn applicable_union_predicate_rejects_wrong_variant_count() {
-        // Predicate has 2 variants but the extent has 3.
+    fn applicable_union_predicate_accepts_a_subset_of_the_extents_arms() {
         let pred = union_pred(Predicate::True, Predicate::True);
-        let three_variant_ext = Extent::Union(vec![int(), bool_ext(), int()]);
-        assert!(!pred.is_applicable_to(&three_variant_ext));
+        let three_arm_ext = Extent::Union(TagMap::from_positional(vec![int(), bool_ext(), int()]));
+        assert!(pred.is_applicable_to(&three_arm_ext));
+    }
+
+    /// The converse is rejected: a predicate constraining a tag the extent does
+    /// not carry cannot apply, because that arm has no extent to be checked
+    /// against.
+    #[test]
+    fn applicable_union_predicate_rejects_a_tag_the_extent_lacks() {
+        let pred = Predicate::Union(TagMap::from_arms(vec![(
+            FieldKey::Name("nope".into()),
+            Predicate::True,
+        )]));
+        let ext = Extent::Union(TagMap::from_positional(vec![int(), bool_ext()]));
+        assert!(!pred.is_applicable_to(&ext));
     }
 
     #[test]
     fn applicable_union_predicate_rejects_wrong_variant_type() {
         // Tag-0 predicate is an Int interval but the extent says Bool for tag 0.
         let pred = union_pred(int_intervals(&[1]), Predicate::True);
-        let swapped = Extent::Union(vec![bool_ext(), int()]);
+        let swapped = Extent::Union(TagMap::from_positional(vec![bool_ext(), int()]));
         assert!(!pred.is_applicable_to(&swapped));
     }
 }

@@ -1,9 +1,10 @@
 use bit_set::BitSet;
-use std::{cell::RefCell, iter, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 use super::*;
 use crate::{
-    interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value},
+    ccl::TagMap,
+    interpreter::{ColumnValue, Consumer, Extent, Scheduler, UnionArm, Value},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -13,11 +14,13 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Merges N `SealedFunction` operators into one by taking the discriminated
-/// union of their domains and the deduplicated union of their codomains.
+/// union of their domains and the **join** of their codomains.
 ///
-/// The output tiling is `SealedFunction { domain: Union(d₀, …, dₙ₋₁), codomain }`,
-/// where `codomain` is the shared codomain tiling when all inputs agree, or a
-/// `Scalar(Union(…))` wrapping otherwise.
+/// The output tiling is `SealedFunction { domain: Union(d₀, …, dₙ₋₁), codomain }`.
+/// The domain keeps every arm apart — which arm a row came from is what
+/// `final_or_default` dispatches on. The codomain does the opposite: the arms are
+/// alternative values at one row, so it is their [`Extent::join`], falling back to
+/// an anonymous positional sum only for arms that have none.
 pub struct UnionOperator {
     tiling: Tiling,
     /// Input operators; each must have a `SealedFunction` tiling.
@@ -32,8 +35,8 @@ impl UnionOperator {
     /// Create a new `UnionOperator` from the given input operators.
     ///
     /// All inputs must be `SealedFunction` tilings.  The output domain is
-    /// `Extent::Union` of all input domains; the codomain is shared if
-    /// all inputs agree, or `Extent::Union` (deduplicated) otherwise.
+    /// `Extent::Union` of all input domains; the codomain is the arms' join (see
+    /// the type-level note above).
     pub fn new(inputs: Vec<Box<dyn TileOperator>>) -> Self {
         assert!(
             !inputs.is_empty(),
@@ -54,21 +57,59 @@ impl UnionOperator {
             })
             .collect();
 
-        // Dedup codomains: if all agree use the shared tiling, else wrap in Union.
+        // The codomain is the arms' **join** where they have one, and an anonymous
+        // positional sum only where they do not.
+        //
+        // Agreeing arms are the join's trivial case. The one that matters is arms
+        // whose *variants* differ: `` `pos(n) `` and `` `neg(n) `` are alternative values
+        // of one result, and the column this operator actually merges them into is
+        // the tag-merged sum carrying both tags with the arm that did not occur
+        // left empty. Declaring a positional sum instead describes a value shaped
+        // like "arm 0's variant *or* arm 1's variant", which is not what any row
+        // holds — and the tile then fails to conform to its own tiling.
+        //
+        // Where the arms genuinely have no join, the positional sum is right: for
+        // a concatenation the arm a row came from is part of its identity.
         let codomain = if codomains.windows(2).all(|w| w[0] == w[1]) {
             codomains[0].clone()
         } else {
-            let exts: Vec<Extent> = codomains.iter().map(|t| t.extent()).collect();
-            let deduped = dedup_extents(exts);
-            Tiling::Scalar(if deduped.len() == 1 {
-                deduped.into_iter().next().unwrap()
-            } else {
-                Extent::Union(deduped)
-            })
+            // Differing arms are alternative values at one row, so merging them
+            // yields one *column* — which is also the only codomain shape
+            // `UnionProducer` can build (it concatenates like columns, or
+            // materialises `Value` rows into a `Variants` column). Flattening a
+            // non-`Scalar` arm tiling through `Tiling::extent` here would declare a
+            // scalar column of *functions*: a tile the producer cannot emit and
+            // panics on at the first `get`. Reject it where the shape is already
+            // known instead.
+            let exts: Vec<Extent> = codomains
+                .iter()
+                .map(|t| match t {
+                    Tiling::Scalar(e) => e.clone(),
+                    other => panic!(
+                        "UnionOperator: arms with differing codomains merge into one \
+                         column, so each must be Scalar; got {other}"
+                    ),
+                })
+                .collect();
+            let joined = exts
+                .iter()
+                .skip(1)
+                .try_fold(exts[0].clone(), |acc, e| acc.join(e));
+            match joined {
+                Some(ext) => Tiling::Scalar(ext),
+                None => {
+                    let deduped = dedup_extents(exts);
+                    Tiling::Scalar(if deduped.len() == 1 {
+                        deduped.into_iter().next().unwrap()
+                    } else {
+                        Extent::Union(TagMap::from_positional(deduped))
+                    })
+                }
+            }
         };
 
         let tiling = Tiling::SealedFunction {
-            domain: Extent::Union(domains),
+            domain: Extent::Union(TagMap::from_positional(domains)),
             codomain: Box::new(codomain),
         };
         Self {
@@ -91,13 +132,13 @@ impl UnionOperator {
         op.flat = true;
         if let Tiling::SealedFunction { domain, codomain } = op.tiling {
             let deduped = dedup_extents(match domain {
-                Extent::Union(ds) => ds,
+                Extent::Union(ds) => ds.into_values(),
                 other => vec![other],
             });
             let domain = if deduped.len() == 1 {
                 deduped.into_iter().next().unwrap()
             } else {
-                Extent::Union(deduped)
+                Extent::Union(TagMap::from_positional(deduped))
             };
             op.tiling = Tiling::SealedFunction { domain, codomain };
         }
@@ -137,8 +178,18 @@ fn flat_merge(tiles: Vec<Tile>, value_extent: &Extent) -> Tile {
             if deleted.contains(row) {
                 continue;
             }
-            let Value::UInt(pos) = domain.index_at(row) else {
-                panic!("flat_merge: writer-body fan-out arms have UInt (position) domains");
+            let key = domain.index_at(row);
+            let Value::UInt(pos) = key else {
+                // A flat merge reassembles the arms *by position* into one column, so
+                // every arm's domain key has to be a position. A tagged key means the
+                // arms came from a copairing — whose domain deliberately keeps the
+                // arms apart — and those do not merge back onto one domain at all.
+                panic!(
+                    "flat_merge: arm {i} row {row} is keyed {key:?}, not a UInt \
+                     position; a flat merge reassembles arms by position, so a \
+                     tagged domain here means these arms are a copairing rather \
+                     than a disjoint join. Arm domain: {domain:?}"
+                );
             };
             pairs.push((pos, values.index_at(row)));
         }
@@ -146,6 +197,21 @@ fn flat_merge(tiles: Vec<Tile>, value_extent: &Extent) -> Tile {
     // Disjoint by first-match, so a stable sort by position reassembles the full
     // column in the fed order — matching the sibling `commit` field's domain.
     pairs.sort_by_key(|(pos, _)| *pos);
+    // Disjointness is a *precondition*, not something the merge can repair: two
+    // arms claiming one position put two values at one domain key, which is a
+    // monotonic-merge violation however it is resolved — and silently, since the
+    // sort just leaves them adjacent and the longer column flows on. Check it
+    // where the arms are actually side by side rather than trusting the caller: a
+    // value-`Case` whose first-match gates overlap, and a tag fan-out that lost a
+    // `variant_project` to const-reduction, both land here. The scan is free
+    // beside the sort above, so this is a hard assert rather than a debug one.
+    if let Some(w) = pairs.windows(2).find(|w| w[0].0 == w[1].0) {
+        panic!(
+            "flat_merge: arms are not disjoint — position {} is claimed by more \
+             than one arm, so the merge would place two values at one domain key",
+            w[0].0
+        );
+    }
     let positions: Vec<usize> = pairs.iter().map(|(pos, _)| *pos).collect();
     let values: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
     Tile::SealedFunction {
@@ -268,18 +334,22 @@ impl TileProducer for UnionProducer {
             }
         }
 
-        let domain_predicate = Predicate::Union(domain_predicates);
+        let domain_predicate = Predicate::Union(TagMap::from_positional(domain_predicates));
 
-        // Build the discriminated-union domain column.
-        let total_len: usize = domains.iter().map(|d| d.len()).sum();
-        let mut tags: Vec<usize> = Vec::with_capacity(total_len);
-        for (i, d) in domains.iter().enumerate() {
-            tags.extend(iter::repeat_n(i, d.len()));
-        }
-        let union_domain = ColumnValue::Union {
-            tags,
-            variants: domains,
-        };
+        // Build the discriminated-union domain column. Each arm occupies a
+        // contiguous run of rows, in arm order.
+        let mut next_row = 0usize;
+        let union_domain = ColumnValue::Union(TagMap::from_positional(
+            domains
+                .into_iter()
+                .map(|d| {
+                    let rows: Vec<usize> = (next_row..next_row + d.len()).collect();
+                    next_row += d.len();
+                    UnionArm::new(rows, d)
+                })
+                .collect(),
+        ));
+        union_domain.debug_assert_union_invariants();
 
         // Build the interleaved codomain tile.
         // If all codomains are Scalar ColumnValues of the same variant, concatenate them.
@@ -314,7 +384,7 @@ impl TileProducer for UnionProducer {
                 Tile::Scalar(combined)
             } else {
                 // Heterogeneous codomains: materialise one Value per row in source order.
-                let mut values: Vec<Value> = Vec::with_capacity(total_len);
+                let mut values: Vec<Value> = Vec::new();
                 for cod in codomains {
                     let n = cod.len();
                     match cod {
@@ -356,7 +426,7 @@ impl TileProducer for UnionProducer {
                     self.inputs.len(),
                     "UnionProducer::release_impl: variant count mismatch"
                 );
-                for (input, pred) in self.inputs.iter_mut().zip(ps) {
+                for (input, (_, pred)) in self.inputs.iter_mut().zip(ps) {
                     input.release(TileGuard::Function(FunctionGuard::Domain(pred)));
                 }
             }
@@ -397,6 +467,165 @@ mod tests {
         }
     }
 
+    /// A `SealedFunction` operator with a chosen tiling, for asserting on what
+    /// [`UnionOperator::new`] *declares* (the tiling), independent of any data.
+    struct TilingOnly(Tiling);
+
+    impl TileOperator for TilingOnly {
+        fn tiling(&self) -> &Tiling {
+            &self.0
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            unimplemented!("tiling-only stub is never pulled")
+        }
+    }
+
+    fn named_variant(arms: &[(&str, Extent)]) -> Extent {
+        Extent::Union(TagMap::from_arms(
+            arms.iter()
+                .map(|(t, e)| (crate::ccl::FieldKey::Name((*t).into()), e.clone()))
+                .collect(),
+        ))
+    }
+
+    fn sealed_with_codomain(codomain: Extent) -> Box<dyn TileOperator> {
+        Box::new(TilingOnly(Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(codomain)),
+        }))
+    }
+
+    /// Arms whose codomains are differently-tagged variants are **alternative
+    /// values of one result**, so the declared codomain is their merged tag set —
+    /// which is the column the union actually builds, with the arm that did not
+    /// occur left empty. Declaring a positional sum instead describes a value no
+    /// row holds, and the tile then fails to conform to its own tiling.
+    #[test]
+    fn codomain_of_differently_tagged_variant_arms_is_the_merged_variant() {
+        let op = UnionOperator::new(vec![
+            sealed_with_codomain(named_variant(&[("pos", Extent::Base(BaseType::Int))])),
+            sealed_with_codomain(named_variant(&[("neg", Extent::Base(BaseType::Int))])),
+        ]);
+        let Tiling::SealedFunction { codomain, .. } = op.tiling() else {
+            panic!("union of sealed functions is a sealed function");
+        };
+        assert_eq!(
+            **codomain,
+            Tiling::Scalar(named_variant(&[
+                ("neg", Extent::Base(BaseType::Int)),
+                ("pos", Extent::Base(BaseType::Int)),
+            ]))
+        );
+    }
+
+    /// Agreeing arms are the join's trivial case and keep the shared codomain.
+    #[test]
+    fn codomain_of_agreeing_arms_is_shared() {
+        let op = UnionOperator::new(vec![
+            sealed_with_codomain(Extent::Base(BaseType::Int)),
+            sealed_with_codomain(Extent::Base(BaseType::Int)),
+        ]);
+        let Tiling::SealedFunction { codomain, .. } = op.tiling() else {
+            panic!("union of sealed functions is a sealed function");
+        };
+        assert_eq!(**codomain, Tiling::Scalar(Extent::Base(BaseType::Int)));
+    }
+
+    /// Arms with no join stay an anonymous positional sum: for a concatenation the
+    /// arm a row came from is part of its identity, so the two are kept apart
+    /// rather than merged.
+    #[test]
+    fn codomain_of_unjoinable_arms_stays_a_positional_sum() {
+        let op = UnionOperator::new(vec![
+            sealed_with_codomain(Extent::Base(BaseType::Int)),
+            sealed_with_codomain(Extent::Base(BaseType::String)),
+        ]);
+        let Tiling::SealedFunction { codomain, .. } = op.tiling() else {
+            panic!("union of sealed functions is a sealed function");
+        };
+        assert_eq!(
+            **codomain,
+            Tiling::Scalar(Extent::Union(TagMap::from_positional(vec![
+                Extent::Base(BaseType::Int),
+                Extent::Base(BaseType::String),
+            ])))
+        );
+    }
+
+    /// Differing arms merge into one *column*, which is also the only codomain
+    /// shape `UnionProducer` can build. A non-`Scalar` arm is therefore rejected
+    /// here rather than declared as a scalar column of functions — a tile the
+    /// producer cannot emit, and which would have failed at the first `get`
+    /// instead of at graph construction where the shape is known.
+    #[test]
+    #[should_panic(expected = "arms with differing codomains merge into one column")]
+    fn differing_non_scalar_codomains_are_rejected_at_construction() {
+        let nested = Box::new(TilingOnly(Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(int_sealed_tiling()),
+        })) as Box<dyn TileOperator>;
+        let _ = UnionOperator::new(vec![
+            sealed_with_codomain(Extent::Base(BaseType::Int)),
+            nested,
+        ]);
+    }
+
+    // ── flat_merge: the arms' domains must partition, not overlap ─────────────
+
+    /// A `SealedFunction` arm holding `(key, value)` pairs — one slice of the
+    /// fed element stream, as a tag fan-out or a first-match value-`Case` produces.
+    fn flat_arm(pairs: &[(usize, i64)]) -> Tile {
+        Tile::SealedFunction {
+            domain: ColumnValue::from_uints(pairs.iter().map(|(k, _)| *k).collect()),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(
+                pairs.iter().map(|(_, v)| *v).collect(),
+            ))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        }
+    }
+
+    /// The precondition holding: disjoint arms reassemble into the full column,
+    /// sorted by position, whatever order the arms arrive in.
+    #[test]
+    fn flat_merge_reassembles_disjoint_arms_by_position() {
+        let out = flat_merge(
+            vec![flat_arm(&[(1, 20), (3, 40)]), flat_arm(&[(0, 10), (2, 30)])],
+            &Extent::Base(BaseType::Int),
+        );
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = out
+        else {
+            panic!("flat merge yields a SealedFunction");
+        };
+        assert_eq!(domain, ColumnValue::from_uints(vec![0, 1, 2, 3]));
+        assert_eq!(
+            *codomain,
+            Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))
+        );
+    }
+
+    /// The precondition violated. Overlapping arms are a **caller** bug — a
+    /// value-`Case` whose first-match gates are not actually exclusive, or a tag
+    /// fan-out that lost a `variant_project` — and the merge cannot repair it:
+    /// two values at one domain key violate monotonic merge however it picks.
+    /// Left unchecked it is silent, since the sort just leaves the duplicates
+    /// adjacent and a column one row too long flows on downstream.
+    #[test]
+    #[should_panic(expected = "position 1 is claimed by more than one arm")]
+    fn flat_merge_rejects_arms_that_claim_one_position_twice() {
+        let _ = flat_merge(
+            vec![flat_arm(&[(0, 10), (1, 20)]), flat_arm(&[(1, 99)])],
+            &Extent::Base(BaseType::Int),
+        );
+    }
+
     /// Build a `UnionProducer` with two spy inputs that record what guard they receive.
     ///
     /// Returns the producer plus `Rc<RefCell<Vec<TileGuard>>>` for each input.
@@ -429,10 +658,10 @@ mod tests {
         let log1: Rc<RefCell<Vec<TileGuard>>> = Rc::new(RefCell::new(Vec::new()));
 
         let union_tiling = Tiling::SealedFunction {
-            domain: Extent::Union(vec![
+            domain: Extent::Union(TagMap::from_positional(vec![
                 Extent::Base(BaseType::Int),
                 Extent::Base(BaseType::Int),
-            ]),
+            ])),
             codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
 
@@ -497,10 +726,9 @@ mod tests {
 
         let pred0 = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 2]));
         let pred1 = Predicate::from_column_value(&ColumnValue::Ints(vec![3, 4]));
-        let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::Union(vec![
-            pred0.clone(),
-            pred1.clone(),
-        ])));
+        let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::Union(
+            TagMap::from_positional(vec![pred0.clone(), pred1.clone()]),
+        )));
 
         producer.release(guard);
 

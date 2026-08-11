@@ -959,6 +959,226 @@ fn elim_lambda_impl(
             }
         }
 
+        // A **`VariantCtor` inside a lambda body** (``λ param → `cᵢ(eᵢ(param))``):
+        // the point-free **constructor**, the dual of the scrutinee-`Case`'s
+        // `variant_project(cᵢ)`. Elaborate to `eᵢ ≫ variant_wrap(cᵢ)` — a
+        // composable morphism `param_ty ⇒ Union` that can sit as the RHS of a
+        // `≫`, so the value-`Case`-in-lambda fan-out
+        // `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)` accepts a variant-valued arm (the writer
+        // decision ``if p: acc := `commit(…) else: acc := `abort(unit)``). A
+        // `VariantCtor` whose payload is *constant* in `param` never reaches here
+        // — the `const` arm above lifts the whole scalar variant value with
+        // ``const(`cᵢ(…))``, which op-conversion broadcasts.
+        TypedExprNode::VariantCtor { tag, payload } => {
+            // `variant_wrap` carries the tag itself, so there is nothing to resolve
+            // here and nothing to fail: the node's type need not have been
+            // width-subtyped up to its consumer's tag set for the injection to be
+            // well-defined. (A position would have had to be resolved against that
+            // full tag set — see `TagMap`, "Why keyed rather than positional".)
+            debug_assert!(
+                matches!(strip_refinements(&body_ty), Type::Variant(_)),
+                "VariantCtor must have a Variant type, got {body_ty}"
+            );
+            let payload_ty = payload.ty.clone();
+            // eᵢ  ⟹  point-free `param_ty ⇒ P_c`.
+            let payload_pf = elim_lambda(ctx, param, param_ty, *payload)?;
+            // variant_wrap(c) : P_c ⇒ Union (the tag injection).
+            let vw = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(tag.as_str().into())))
+                .with_ty(Type::fun(payload_ty, body_ty.clone()));
+            Ok(typed_compose(vec![payload_pf, vw]).with_ty(result_ty))
+        }
+
+        // A **scrutinee-`Case`** over a variant inside a lambda body
+        // (`λ param → match scrut { cᵢ(wᵢ) → eᵢ }`): the point-free **union of
+        // tag-restricts**. The branch tags *partition* the scrutinee's domain,
+        // so elimination is the same fan-out the value-`Case` above emits —
+        // keyed on **tag** rather than a boolean first-match gate:
+        //
+        //   ⧺ᵢ ( scrut ≫ variant_project(cᵢ) ≫ (λ wᵢ → eᵢ) )
+        //
+        // Every element of that chain is a **morphism out of `param_ty`**, so the
+        // arm is a `≫`-composition and not an application: `scrut` is the
+        // scrutinee *as a function of the binder* (`param_ty ⇒ scrut_ty`, the
+        // result of eliminating it), `variant_project(cᵢ)` is `scrut_ty ⇒ Pᵢ`,
+        // and the eliminated arm body is `Pᵢ ⇒ V`.
+        //
+        // Each arm narrows the fed scrutinee stream to tag `cᵢ`'s partition and
+        // reads that arm's inner payload (`variant_project(cᵢ)` fuses
+        // restrict+project — see the builtin docs), binds the payload
+        // `wᵢ`, then maps `eᵢ`. The flat `UnionOperator` re-totals the disjoint
+        // partitions; exhaustiveness (one arm per scrutinee tag, enforced by
+        // inference's width-subtyping) makes the union total, so no
+        // `final_or_default` scalar collapse is needed — this is the fan-out
+        // shape, not the C-form.
+        //
+        // **Outer-binder arms.** When `eᵢ` closes over the outer binder as well
+        // as its payload (`eᵢ(param, wᵢ)` — e.g. a per-key view
+        // `λ __c → match __c.decision { commit(w) → (time: __c.time, write: w.i) }`
+        // reading both the record's sibling field and the commit payload), the
+        // arm zips the outer element alongside the projected payload:
+        //
+        //   ⧺ᵢ ( ⟨id, scrut ≫ variant_project(cᵢ)⟩ ▷ zip ≫ (λ (param, wᵢ) → eᵢ) )
+        //
+        // Both components of the pair are morphisms **out of the outer binder**,
+        // which is why `id` sits beside the whole `scrut ≫ variant_project(cᵢ)`
+        // chain rather than inside it: the left component must deliver `param`
+        // (the full element the arm body reads its sibling fields off), and
+        // `scrut ≫ ⟨id, variant_project(cᵢ)⟩` would deliver the *scrutinee*
+        // instead — a different, strictly narrower value whenever `scrut` is a
+        // projection like `param.decision`. (`⟨f, g⟩ ▷ zip` is the fan-out
+        // itself: an `Apply` of `Builtin::Zip` to the tuple of the two
+        // morphisms, hence `▷` there and `≫` on either side of it.)
+        //
+        // `variant_project(cᵢ)` keeps the scrutinee's *real* domain keys (a union
+        // *stream* carries them explicitly), so the outer `id` arm (the full
+        // element) and the tag-restricted payload co-iterate by key under the
+        // `zip`/`FanIn`, which inner-joins on the shared keys — the outer arm
+        // need not be pre-restricted (the join drops the non-tag-`cᵢ` positions).
+        // The two binders merge into one pair (`param ↦ pair.0`, `wᵢ ↦ pair.1`),
+        // exactly as the nested-lambda rule does.
+        TypedExprNode::Case {
+            scrutinee: Some(scrut),
+            branches,
+        } if branches.iter().all(|b| b.pattern.is_some()) => {
+            let value_ty = body_ty.clone();
+            let scrut = *scrut;
+            let scrut_ty = scrut.ty.clone();
+            // The scrutinee's own tag set, which the exhaustiveness check below
+            // reads: every tag the scrutinee can carry must be handled by some arm.
+            // Nothing here resolves a tag to a position — `variant_project` names
+            // its tag — so this is the only reason the concrete type is needed.
+            let variants = match strip_refinements(&scrut_ty) {
+                Type::Variant(v) => v,
+                other => {
+                    return Err(LambdaElimError::Unsupported(format!(
+                        "scrutinee-Case over a non-variant type {other}"
+                    )));
+                }
+            };
+            // The scrutinee as a point-free morphism `param_ty ⇒ scrut_ty`. When
+            // the scrutinee is the bound parameter itself it collapses to `id`,
+            // which is dropped from the compose chain.
+            let scrut_pf = elim_lambda(ctx, param, param_ty, scrut)?;
+            let scrut_is_id = matches!(&scrut_pf.node, TypedExprNode::Builtin(Builtin::Id));
+
+            let mut arms: Vec<Expr> = Vec::with_capacity(branches.len());
+            // Each branch's tag position, collected to check exhaustiveness and
+            // one-arm-per-tag after the loop — load-bearing invariants inference's
+            // stamping guarantees but that are not type-enforced at this boundary.
+            let mut seen_tags: Vec<FieldKey> = Vec::with_capacity(branches.len());
+            for br in branches {
+                // A scrutinee-Case is a pattern match, not a guarded conditional:
+                // its branches carry the trivial `true` guard. Variant elimination
+                // dispatches on the tag and does not thread a secondary guard, so a
+                // non-trivial one would be silently dropped.
+                debug_assert!(
+                    matches!(&br.guard.node, TypedExprNode::Lit(Lit::Bool(true))),
+                    "scrutinee-Case branch carries a non-trivial guard; variant \
+                     elimination dispatches on the tag and does not thread guards"
+                );
+                let pat = br
+                    .pattern
+                    .expect("guarded: scrutinee-Case branches all bind a pattern");
+                // Projecting names the tag, so an arm the scrutinee's *type* does
+                // not list needs no special handling: `variant_project` yields an
+                // empty restriction for a tag the value never carries, which is
+                // exactly what width subtyping means. Nothing to resolve, nothing
+                // to reject.
+                let tag_key = FieldKey::Name(pat.tag.as_str().into());
+                seen_tags.push(tag_key.clone());
+                let payload_ty = pat.binding.ty.clone();
+                let payload_name = pat.binding.name.clone();
+                // variant_project(cᵢ) : scrut_ty ⇒ Pᵢ (the tag-restricting projection).
+                let vp = Expr::builtin(Builtin::VariantProject(tag_key))
+                    .with_ty(Type::fun(scrut_ty.clone(), payload_ty.clone()));
+                // Does `eᵢ` close over the outer binder as well as its payload?
+                // (Checked on the raw body — the payload binder `wᵢ` shadows
+                // nothing, so a free `param` is genuinely the outer element.)
+                let uses_outer = is_free(param, &br.body);
+
+                let arm = if !uses_outer {
+                    // Payload-only: scrut ≫ variant_project(cᵢ) ≫ (λ wᵢ → eᵢ).
+                    let arm_fn = elim_lambda(ctx, &payload_name, &payload_ty, br.body)?;
+                    let mut chain: Vec<Expr> = Vec::with_capacity(3);
+                    if !scrut_is_id {
+                        chain.push(scrut_pf.clone());
+                    }
+                    chain.push(vp);
+                    chain.push(arm_fn);
+                    typed_compose(chain).with_ty(Type::data_fun(param_ty.clone(), value_ty.clone()))
+                } else {
+                    // Outer-binder: zip the whole element alongside the projected
+                    // payload, then feed the pair to `eᵢ`. Merge `param` and `wᵢ`
+                    // into one pair binder (`param ↦ pair.0`, `wᵢ ↦ pair.1`) — the
+                    // same rewrite the nested-lambda rule uses.
+                    let pair = ctx.fresh_pair_name();
+                    let pair_ty = Type::Tuple(vec![param_ty.clone(), payload_ty.clone()]);
+                    let sub_x = Expr::apply(
+                        Expr::var(&pair).with_ty(pair_ty.clone()),
+                        Expr::proj_index(0).with_ty(Type::fun(pair_ty.clone(), param_ty.clone())),
+                    )
+                    .with_ty(param_ty.clone());
+                    let sub_w = Expr::apply(
+                        Expr::var(&pair).with_ty(pair_ty.clone()),
+                        Expr::proj_index(1).with_ty(Type::fun(pair_ty.clone(), payload_ty.clone())),
+                    )
+                    .with_ty(payload_ty.clone());
+                    let merged =
+                        substitute(substitute(br.body, &payload_name, &sub_w), param, &sub_x);
+                    // λ (param, wᵢ) → eᵢ  ⟹  point-free `(param_ty, Pᵢ) ⇒ V`.
+                    let arm_fn2 = elim_lambda(ctx, &pair, &pair_ty, merged)?;
+                    // Payload morphism `param_ty ⇒ Pᵢ` (scrut ≫ variant_project(cᵢ)).
+                    let payload_pf = if scrut_is_id {
+                        vp
+                    } else {
+                        typed_compose(vec![scrut_pf.clone(), vp])
+                    };
+                    // Outer morphism `param_ty ⇒ param_ty` — the full element; the
+                    // zip's `FanIn` restricts it to the tag-`cᵢ` keys by inner-join.
+                    let outer_pf = id().with_ty(Type::fun(param_ty.clone(), param_ty.clone()));
+                    // ⟨id, scrut ≫ variant_project(cᵢ)⟩ : param_ty ⇒ (param_ty, Pᵢ).
+                    let pair_stream = zip_pair(outer_pf, payload_pf);
+                    typed_compose(vec![pair_stream, arm_fn2])
+                        .with_ty(Type::data_fun(param_ty.clone(), value_ty.clone()))
+                };
+                arms.push(arm);
+            }
+            // Two invariants, and note they are now **directional** — which is the
+            // point of keying arms by tag rather than by position.
+            //
+            // No duplicate tag: two arms projecting one tag would union two
+            // partitions onto the same domain positions, a monotonic-merge
+            // violation.
+            debug_assert!(
+                {
+                    let mut s = seen_tags.clone();
+                    s.sort();
+                    s.dedup();
+                    s.len() == seen_tags.len()
+                },
+                "scrutinee-Case has two branches for one tag"
+            );
+            // Exhaustive *over the scrutinee's* tags: every tag the scrutinee can
+            // carry must be handled, or the union re-totals to a domain with gaps.
+            // The converse is deliberately **not** required: arms for tags the
+            // scrutinee cannot carry are dead, project empty, and contribute
+            // nothing — so a `match` written for a wider type than the scrutinee
+            // was inferred to have is fine, and needs no arms pruned away.
+            debug_assert!(
+                variants.iter().all(|(k, _)| seen_tags.contains(k)),
+                "scrutinee-Case is non-exhaustive: scrutinee tags {:?} are not all \
+                 covered by arms {:?}",
+                variants.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                seen_tags
+            );
+            match arms.len() {
+                0 => unreachable!("a scrutinee-Case has at least one branch"),
+                1 => Ok(arms.pop().expect("len == 1")),
+                _ => Ok(Expr::collection_union(arms)
+                    .with_ty(Type::data_fun(param_ty.clone(), value_ty))),
+            }
+        }
+
         // Unsupported constructs.
         body => Err(LambdaElimError::Unsupported(format!(
             "unsupported body kind in lambda elimination for param '{param}' in body {body:?}"
@@ -1612,6 +1832,156 @@ mod tests {
             "the refinement element binder is bound by its refinement, so it is never \
              free in a type — reporting it free is what falsely tripped the \
              value-dependent-dependent-function guard on nested filters"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scrutinee-`Case` over a variant: the point-free shape, and its typing
+    // -----------------------------------------------------------------------
+
+    fn unit_ty() -> Type {
+        Type::Base(BaseType::Unit)
+    }
+
+    /// ``{`abort | `commit{Int}}``, the two-arm decision sum.
+    fn commit_abort_ty() -> Type {
+        Type::Variant(vec![
+            (FieldKey::Name("commit".into()), int_ty()),
+            (FieldKey::Name("abort".into()), unit_ty()),
+        ])
+    }
+
+    /// A pattern-matching branch `.tag(binder: ty) → body` with the trivial
+    /// guard a scrutinee-`Case` always carries.
+    fn arm(tag: &str, binder: &str, binder_ty: Type, body: Expr) -> Branch {
+        use crate::ccl::{Pattern, TypedBinding};
+        Branch {
+            pattern: Some(Pattern {
+                tag: tag.into(),
+                binding: TypedBinding {
+                    name: binder.into(),
+                    ty: binder_ty,
+                    user_annotation: None,
+                },
+            }),
+            guard: Expr::lit(Lit::Bool(true)).with_ty(bool_ty()),
+            body,
+        }
+    }
+
+    /// Eliminate `λ binder: 𝑇 → body` and **typecheck the result**, returning
+    /// its symbolic form.
+    ///
+    /// The typecheck is the load-bearing half: it confirms the emitted arms are
+    /// well-typed `≫`-chains and not merely well-shaped ones — that
+    /// `variant_project(cᵢ)`'s stamped `scrut_ty ⇒ Pᵢ` really does compose
+    /// between the eliminated scrutinee and the eliminated arm body. `run`
+    /// itself only checks this under the opt-in `deep-typecheck` feature, so
+    /// asking here keeps it checked in every configuration.
+    fn elim_and_typecheck(binder: &str, binder_ty: Type, body: Expr) -> String {
+        let result = run(Expr::lambda(binder, binder_ty, body)).expect("lambda elimination");
+        assert_eq!(
+            crate::ccl::infer::check_pre_desugar(&result),
+            Ok(()),
+            "the eliminated form must typecheck: {}",
+            crate::ccl::symbolic::symbolic_typed(&result)
+        );
+        symbolic(&result)
+    }
+
+    /// The **payload-only** arm shape:
+    ///
+    ///   λ x → match x { commit(w) → w + 1 ; abort(a) → 0 }
+    ///     ⟹  ⧺ᵢ ( variant_project(cᵢ) ≫ (λ wᵢ → eᵢ) )
+    ///
+    /// Every element of an arm is a morphism out of the eliminated binder, so
+    /// the arm is a `≫`-**composition**, not an application chain — pinned here
+    /// because the two read the same in prose and only one of them typechecks.
+    /// The scrutinee is the binder itself, so its own morphism is `id` and drops
+    /// out of the chain, leaving the projection at the head.
+    #[test]
+    fn scrutinee_case_elaborates_to_a_composition_of_tag_restricts() {
+        let x_ty = commit_abort_ty();
+        let w_plus_1 = Expr::binop(
+            var("w").with_ty(int_ty()),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            lit(1).with_ty(int_ty()),
+        )
+        .with_ty(int_ty());
+        let case = Expr::new(TypedExprNode::Case {
+            scrutinee: Some(Box::new(var("x").with_ty(x_ty.clone()))),
+            branches: vec![
+                arm("commit", "w", int_ty(), w_plus_1),
+                arm("abort", "a", unit_ty(), lit(0).with_ty(int_ty())),
+            ],
+        })
+        .with_ty(int_ty());
+
+        assert_eq!(
+            elim_and_typecheck("x", x_ty, case),
+            "variant_project(`commit) ≫ (id, 1 ▷ const) ▷ zip ≫ add \
+             ⊎ variant_project(`abort) ≫ 0 ▷ const"
+        );
+    }
+
+    /// The **outer-binder** arm shape: an arm body that reads the enclosing
+    /// element as well as its payload zips the two, so the merged binder can
+    /// project either half.
+    ///
+    ///   λ c → match c.decision { commit(w) → (c.time, w) }
+    ///     ⟹  ⟨id, .decision ≫ variant_project(`commit)⟩ ▷ zip ≫ (λ pair → …)
+    ///
+    /// `id` sits *beside* the projection chain rather than inside it: both
+    /// components are morphisms out of the **outer** binder, and the left one
+    /// must deliver the whole element `c`. Composing the pair after the
+    /// scrutinee instead — ``.decision ≫ ⟨id, variant_project(`commit)⟩`` — would
+    /// pair the decision with its own payload and lose `c.time` entirely.
+    #[test]
+    fn outer_binder_arm_zips_the_element_beside_the_projection() {
+        let decision_ty = commit_abort_ty();
+        let c_ty = Type::Record(vec![
+            ("decision".to_string(), decision_ty.clone()),
+            ("time".to_string(), int_ty()),
+        ]);
+        let c_decision = Expr::apply(
+            var("c").with_ty(c_ty.clone()),
+            Expr::proj_field("decision").with_ty(fun_ty(c_ty.clone(), decision_ty.clone())),
+        )
+        .with_ty(decision_ty);
+        let c_time = Expr::apply(
+            var("c").with_ty(c_ty.clone()),
+            Expr::proj_field("time").with_ty(fun_ty(c_ty.clone(), int_ty())),
+        )
+        .with_ty(int_ty());
+        let body_ty = Type::Tuple(vec![int_ty(), int_ty()]);
+        let pair_body = Expr::tuple(vec![c_time, var("w").with_ty(int_ty())]).with_ty(body_ty);
+
+        let case = Expr::new(TypedExprNode::Case {
+            scrutinee: Some(Box::new(c_decision)),
+            branches: vec![
+                arm("commit", "w", int_ty(), pair_body),
+                arm(
+                    "abort",
+                    "a",
+                    unit_ty(),
+                    Expr::tuple(vec![lit(0).with_ty(int_ty()), lit(0).with_ty(int_ty())])
+                        .with_ty(Type::Tuple(vec![int_ty(), int_ty()])),
+                ),
+            ],
+        })
+        .with_ty(Type::Tuple(vec![int_ty(), int_ty()]));
+
+        // The commit arm reads `c.time`, so it takes the zip path; the abort arm
+        // is constant in both binders, so it stays on the payload-only path.
+        //
+        // Simplification has fused the left component `id ≫ .0 ≫ .time` down to
+        // `.time`, which is the clearest possible statement of the point: it is a
+        // morphism out of **`c`**, running beside the scrutinee chain rather than
+        // after it. Nothing derived from `c.decision` could have produced it.
+        assert_eq!(
+            elim_and_typecheck("c", c_ty, case),
+            "(.time, .decision ≫ variant_project(`commit)) ▷ zip \
+             ⊎ .decision ≫ variant_project(`abort) ≫ (0, 0) ▷ const"
         );
     }
 }

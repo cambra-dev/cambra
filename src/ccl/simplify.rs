@@ -475,6 +475,35 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
     )
 }
 
+/// Whether `expr` **narrows the domain at runtime, leaving no refinement behind**.
+///
+/// Two compose elements do this, and they are the two const-reduce must never
+/// collapse past:
+///
+/// - `filter_values(p)` — a value predicate, applied to its predicate
+///   (`Apply(p, filter_values)`).
+/// - `variant_project(c)` — a tag restriction, which names its tag in the builtin
+///   and consumes the fed stream, so it appears **bare**.
+///
+/// What unites them, and separates both from `restrict`, is that the narrowing
+/// leaves no domain refinement for planning to re-materialise: once the element is
+/// gone nothing downstream can reconstruct which positions survived. Collapsing
+/// `left ≫ const(g)` past one would apply `g` at *every* position instead of only
+/// the surviving ones — and for a tag fan-out that means the arms overlap, which
+/// the flat merge relies on not happening.
+///
+/// Only a compose *element* is in scope. A projection nested inside a `zip` (the
+/// outer-binder arm `⟨id, s ≫ variant_project(c)⟩ ▷ zip ≫ eᵢ`) is not one, and
+/// needs no guard: that arm reads the zipped pair, so it is never constant and
+/// there is nothing for const-reduce to collapse.
+fn narrows_domain_irrecoverably(expr: &Expr) -> bool {
+    match &expr.node {
+        TypedExprNode::Apply { function, .. } => is_builtin(function, Builtin::FilterValues),
+        TypedExprNode::Builtin(Builtin::VariantProject(_)) => true,
+        _ => false,
+    }
+}
+
 /// Const reduce: `f ≫ g ▷ const  ⟹  g ▷ const` (with updated type)
 ///
 /// When composing with a lifted constant, the constant discards its input and
@@ -483,26 +512,13 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
 /// to `domain(f) → codomain(g)`.
 ///
 /// Operates pairwise in an n-ary compose; trailing elements are preserved.
-/// Whether `expr` is a value-preserving filter application `filter_values(p)` —
-/// `Apply(p, Builtin::FilterValues)`. Such an upstream restricts the domain at
-/// runtime, so it must survive [`try_const_reduce`] (dropping it would apply the
-/// constant everywhere).
-fn is_filter_values_led(expr: &Expr) -> bool {
-    matches!(
-        &expr.node,
-        TypedExprNode::Apply { function, .. } if is_builtin(function, Builtin::FilterValues)
-    )
-}
-
 fn try_const_reduce(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         // A `left ≫ const(g)` collapses to `const(g)` carrying `left`'s *type*
-        // domain — sound only when `left` is a pure reshaping. `filter_values`
-        // restricts the domain at *runtime* and carries no refinement for planning
-        // to re-materialise (unlike `restrict`), so collapsing it would drop the
-        // filter and apply the constant at every position — never reduce past one.
-        |left, right| as_const(right).is_some() && !is_filter_values_led(left),
+        // domain — sound only when `left` is a pure reshaping, which is exactly what
+        // `narrows_domain_irrecoverably` rules out.
+        |left, right| as_const(right).is_some() && !narrows_domain_irrecoverably(left),
         |left, right| {
             let Some(g) = as_const(&right) else {
                 unreachable!()
@@ -1006,6 +1022,7 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::FieldKey;
     use crate::ccl::ccl_utils::{
         apply_primitive, make_iterate, make_restrict, trivially_true_predicate,
     };
@@ -1456,6 +1473,54 @@ mod tests {
             simplify(guarded.clone()),
             guarded,
             "const-reduce must not drop the restrict (its upstream iterate guards it)"
+        );
+    }
+
+    #[test]
+    fn simplify_preserves_variant_project_under_const_reduce() {
+        // `variant_project(c) ≫ const(g)` must NOT collapse to `const(g)`: the
+        // projection restricts the domain to arm `c`'s tag partition at runtime
+        // and carries no refinement to re-materialise, so dropping it would apply
+        // the constant at *every* position, overlapping the other arms. Guards
+        // `narrows_domain_irrecoverably`.
+        let vp = Expr::builtin(Builtin::VariantProject(FieldKey::Index(0)))
+            .with_ty(fun_ty(int_ty(), int_ty()));
+        let const_k = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
+        let compose = typed_compose2(vp, const_k);
+        assert_eq!(
+            simplify(compose.clone()),
+            compose,
+            "const-reduce must not collapse past variant_project (drops the tag restriction)"
+        );
+    }
+
+    #[test]
+    fn simplify_preserves_filter_values_under_const_reduce() {
+        // The other half of `narrows_domain_irrecoverably`, and the same argument:
+        // `filter_values(p)` narrows the domain at runtime with no refinement left
+        // for planning to re-materialise, so collapsing `filter_values(p) ≫ const(g)`
+        // would apply `g` at every position rather than only the ones that passed.
+        // The two guarded elements are spelled differently — this one is an `Apply`
+        // of its predicate, the projection is a bare builtin — so covering only one
+        // would leave the other's pattern unexercised.
+        let pred = typed_const(
+            Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)),
+            int_ty(),
+        );
+        let filter = Expr::apply(
+            pred,
+            Expr::builtin(Builtin::FilterValues).with_ty(fun_ty(
+                fun_ty(int_ty(), Type::Base(BaseType::Bool)),
+                fun_ty(int_ty(), int_ty()),
+            )),
+        )
+        .with_ty(fun_ty(int_ty(), int_ty()));
+        let const_k = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
+        let compose = typed_compose2(filter, const_k);
+        assert_eq!(
+            simplify(compose.clone()),
+            compose,
+            "const-reduce must not collapse past filter_values (drops the filter)"
         );
     }
 
