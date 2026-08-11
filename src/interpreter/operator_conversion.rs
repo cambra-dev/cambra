@@ -2300,8 +2300,7 @@ mod variant_ctor_tests {
             commit_abort_ty(Type::Base(CclBase::Int)),
         );
 
-        let channelized =
-            crate::ccl::channelize::run(vc, /* input_typed = */ true).expect("channelize");
+        let channelized = crate::ccl::channelize::run(vc).expect("channelize");
         let lowered = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
 
         let mut ctx = OpConversionContext::new();
@@ -2402,8 +2401,7 @@ mod variant_ctor_tests {
             },
             Type::Base(CclBase::Int),
         );
-        let channelized =
-            crate::ccl::channelize::run(applied, /* input_typed = */ true).expect("channelize");
+        let channelized = crate::ccl::channelize::run(applied).expect("channelize");
         let lowered = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
         let mut ctx = OpConversionContext::new();
         let op = convert_to_operators(&lowered, &mut ctx).expect("op-conversion");
@@ -2650,8 +2648,7 @@ mod variant_ctor_tests {
         );
 
         // Compile the matcher to a point-free transformer.
-        let channelized =
-            crate::ccl::channelize::run(matcher, /* input_typed = */ true).expect("channelize");
+        let channelized = crate::ccl::channelize::run(matcher).expect("channelize");
         let transformer = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
 
         // A two-row `{time, decision: commit(_)}` stream: (time 10, commit 1),
@@ -2797,8 +2794,7 @@ mod variant_ctor_tests {
 
         // Elaborating the in-lambda VariantCtor arms must now succeed (the
         // Phase-A probe returned Err here).
-        let channelized =
-            crate::ccl::channelize::run(matcher, /* input_typed = */ true).expect("channelize");
+        let channelized = crate::ccl::channelize::run(matcher).expect("channelize");
         let transformer = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
 
         // Drive over the value stream [0, 1] (injected at the op boundary).

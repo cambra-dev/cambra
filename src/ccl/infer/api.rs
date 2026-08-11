@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
+use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     Expr, FieldKey, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode,
@@ -425,15 +426,6 @@ pub enum InferError {
         /// The composite type that illegally contains a `Mut`.
         ty: Type,
     },
-    /// An *unannotated* binding was inferred to have [`Type::History`] type — the
-    /// second-class discipline's rule 3. `b = a` where `a` is mutable would
-    /// alias the mutable variable; the design forbids it. To copy the current value,
-    /// annotate the deref (`b: Int = a`); to seed a new mutable variable, introduce one
-    /// with `:=` (`b: Mut(Int) := a`). Reported by [`check_mut_discipline`].
-    UnannotatedMutBinding {
-        /// The base name of the offending binding.
-        name: String,
-    },
     /// A bare-variable argument to a `Mut` parameter does not name a mutable
     /// variable — its (peeled) type is not [`Type::History`]. The second-class
     /// discipline's rule 1: a `Mut` argument must be a `Mut`-*introduced* variable,
@@ -672,15 +664,6 @@ impl std::fmt::Debug for InferError {
                      (Mut second-class rule 2): {ty} at {at}"
                 )
             }
-            InferError::UnannotatedMutBinding { name } => {
-                write!(
-                    f,
-                    "binding `{name}` is a mutable reference but is not annotated `Mut` \
-                     (Mut second-class rule 3): to copy the current value annotate \
-                     `{name}: <value type>`; to introduce a new mutable variable annotate \
-                     `{name}: Mut(...)`"
-                )
-            }
             InferError::MutArgNotMutable { at } => {
                 write!(
                     f,
@@ -713,6 +696,10 @@ impl std::fmt::Debug for InferError {
 /// — those are erased by `channelize`, which runs next (see
 /// [`Strictness::PreDesugar`]).
 ///
+/// It also **consumes every user annotation**: annotations are an input to
+/// inference, and on success no `user_annotation` slot survives it (see
+/// [`clear_annotations`]).
+///
 /// Each error carries its own blame node ([`LocatedInferError`]) so the caller
 /// can resolve it to a source span; there is no separate location channel to
 /// keep in step with the error list.
@@ -727,7 +714,95 @@ pub fn infer(
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
     let _arena = InferArena::new();
-    super::run(expr, &ctx.source_types)
+    let ty = super::run(expr, &ctx.source_types)?;
+    // Only on success: an error path's tree is reported against, and the
+    // annotation is part of what an `AnnotationMismatch` renders.
+    clear_annotations(expr);
+    Ok(ty)
+}
+
+/// Drop every `user_annotation` in the tree — inference has consumed them.
+///
+/// An annotation is a **pre-inference input**: the type the user declared, which
+/// inference reconciles against what it infers and then records in the binder's
+/// `ty`. Keeping it afterwards is not free, because it is a *raw* type from
+/// lowering — it never had holes filled, and no coalesce ever visited it — so a
+/// later pass that pattern-matches on it reads a shape from before inference ran.
+/// That shape is genuinely raw: a two-parameter `def f(a: Int, b)` reaches the end of
+/// inference with its uncurried parameter annotated `(Int, _)` — an un-erased
+/// `Type::Hole` that `collect_type_errors` does not walk, so nothing would report it.
+/// Clearing is what makes that unobservable instead of merely unread.
+///
+/// Nothing outlives the annotation: the one fact a later pass used to need from it
+/// — whether this binder is a mutable variable — is answered by
+/// [`TypedExprNode::MutDecl`] being the node that binds one.
+fn clear_annotations(expr: &mut Expr) {
+    clear_annotations_in(expr, &PredMemo::new());
+}
+
+/// Returns whether anything was cleared, which is what the predicate memo needs
+/// to decide between rebuilding a predicate term and reusing it — clearing a tree
+/// with no annotations left in it must not split the `Rc` sharing that downstream
+/// per-predicate memos dedup on.
+fn clear_annotations_in(expr: &mut Expr, predicates: &PredMemo<()>) -> bool {
+    let mut cleared = expr.user_annotation.take().is_some();
+    expr.walk_binders_mut(|b| cleared |= b.user_annotation.take().is_some());
+    // Annotations also ride expressions hanging off *type* slots — a refinement's
+    // predicate — and those nodes are outside `walk_children` entirely. Inference
+    // reads them there (`groupby` stamps the key relation that ties `__gb_k` to its
+    // key function on a node inside the cast target's predicate), so clearing has
+    // to follow the same route, or an annotation survives exactly where only a type
+    // walk can find it.
+    expr.walk_type_slots_mut(|ty| {
+        cleared |= walk_refined_predicates_mut(ty, predicates, &(), &mut |predicate, memo| {
+            clear_annotations_in(predicate, memo)
+        });
+    });
+    expr.walk_children_mut(|child| cleared |= clear_annotations_in(child, predicates));
+    cleared
+}
+
+/// Post-inference invariant: no `user_annotation` survives anywhere in the tree.
+///
+/// Checked at both post-inference walls rather than argued, because the failure
+/// mode is silent — a stale annotation is only *read* by whichever pass thinks to
+/// look, so a leak surfaces as a wrong answer somewhere else entirely.
+pub(super) fn debug_assert_annotations_cleared(expr: &Expr) {
+    // The walk allocates, and every assertion inside it is compiled out in
+    // release — so skip it there rather than paying for a walk that can no
+    // longer report anything.
+    if cfg!(debug_assertions) {
+        let mut visited = HashSet::new();
+        assert_annotations_cleared(expr, &mut visited);
+    }
+}
+
+fn assert_annotations_cleared(expr: &Expr, visited: &mut HashSet<crate::ccl::PredicateId>) {
+    debug_assert!(
+        expr.user_annotation.is_none(),
+        "annotation survived inference on node `{}`: annotations are a \
+         pre-inference input and are cleared by `infer`",
+        symbolic(expr)
+    );
+    expr.walk_binders(|b| {
+        debug_assert!(
+            b.user_annotation.is_none(),
+            "annotation survived inference on binder `{}`: annotations are a \
+             pre-inference input and are cleared by `infer`",
+            b.name
+        );
+    });
+    // An expression also hangs off the *type* slots — a refinement's predicate —
+    // and those nodes are outside `walk_children` entirely. Inference reads
+    // annotations there (`groupby` stamps its key relation on a node inside the
+    // cast target's predicate), so a check that walked only children would
+    // declare the tree clean while a live annotation sat in a type.
+    expr.walk_type_slots(|ty| {
+        walk_refined_predicates(ty, visited, &mut |predicate, visited| {
+            assert_annotations_cleared(predicate, visited);
+        });
+    });
+    expr.walk_children(|child| assert_annotations_cleared(child, visited));
 }
 
 /// How the annotation checks treat inference-transient type variants.
@@ -759,7 +834,11 @@ pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
 }
 
 /// [`check_fully_typed`] at the given [`Strictness`].
+///
+/// Both walls run *after* inference, so this is also where the
+/// annotations-are-cleared invariant is pinned.
 fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<InferError>> {
+    debug_assert_annotations_cleared(expr);
     let mut errors = Vec::new();
     let mut seen: HashSet<crate::ccl::PredicateId> = HashSet::new();
     collect_expr_errors(expr, strictness, &mut errors, &mut seen);
@@ -1077,12 +1156,7 @@ fn has_pre_desugar_artifacts(expr: &Expr) -> bool {
     }
     fn binder_has_transient(expr: &Expr) -> bool {
         let mut found = false;
-        expr.walk_binders(|b| {
-            found |= ty_has_transient(&b.ty);
-            if let Some(ann) = &b.user_annotation {
-                found |= ty_has_transient(ann);
-            }
-        });
+        expr.walk_binders(|b| found |= ty_has_transient(&b.ty));
         found
     }
     matches!(
@@ -1097,29 +1171,16 @@ fn has_pre_desugar_artifacts(expr: &Expr) -> bool {
 // Second-class `Mut` discipline
 // ---------------------------------------------------------------------------
 
-/// Whether a user annotation is a bare inference hole once outer
-/// [`Type::Refinement`] layers are stripped — i.e. `_` (or a refined `_`).
-///
-/// Rule 3 treats such an annotation as *unspecified*: it names no concrete
-/// type, so it does not disambiguate a value-copy from a mutable-variable re-seed the way
-/// `b: Int = a` / `b: Mut(Int) := a` do.
-fn annotation_peels_to_hole(ty: &Type) -> bool {
-    match ty {
-        Type::Hole => true,
-        Type::Refinement(inner, _) => annotation_peels_to_hole(inner),
-        _ => false,
-    }
-}
-
 /// Enforce the second-class `Mut` discipline (design doc
 /// `src/ccl/design/mutability.md`, "No aliasing: `Mut` values are
 /// second-class (downward-only)"): a post-inference structural pass over the
 /// fully-typed, still-`Mut`-bearing tree. Runs *after* [`check_pre_desugar`]
 /// and *before* `inline`, so it sees the pre-inline `Apply`/parameter
-/// structure (rule 1's argument check) and the coalesced `.ty` slots plus each
-/// binder's [`TypedBinding::user_annotation`].
+/// structure (rule 1's argument check) and the coalesced `.ty` slots. Every rule
+/// reads the binder's `ty`; none reads an annotation, which inference has already
+/// cleared.
 ///
-/// The three rules, all of which keep a mutable value statically traceable to
+/// The two rules, both of which keep a mutable value statically traceable to
 /// a single introduction (so the writer set of every mutable variable is known):
 ///
 /// 1. A `Mut`-typed *value* must be a bare variable reference — no computed
@@ -1133,9 +1194,17 @@ fn annotation_peels_to_hole(ty: &Type) -> bool {
 /// 2. `Mut` may not appear inside any composite type — only at a top-level
 ///    binding/parameter/expression position or a function *domain*
 ///    ([`InferError::MutInCompositeType`]).
-/// 3. An *unannotated* binding may not have `Mut` type — `b = a` aliases a
-///    mutable variable and is rejected ([`InferError::UnannotatedMutBinding`]).
+///
+/// There is no third rule about an *unannotated* binding holding a `Mut`. It was
+/// needed while a `Let` could bind a mutable variable, so that `b = a` did not silently
+/// alias one; now only [`TypedExprNode::MutDecl`] and a pass-by-reference `Lambda`
+/// param can, and an initializer that is a mutable variable *reads* at a `Let` (`emit_let`
+/// derefs it). The alias is unrepresentable rather than rejected, and writing
+/// through the copy is caught by [`check_mut_write_targets`] — which blames the
+/// write rather than the binding. Asserted in debug by
+/// [`debug_assert_no_mut_var_let`].
 pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<InferError>> {
+    debug_assert_no_mut_var_let(expr);
     let mut errors = Vec::new();
     check_mut_discipline_go(expr, &mut errors);
     if errors.is_empty() {
@@ -1143,6 +1212,31 @@ pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<InferError>> {
     } else {
         Err(errors)
     }
+}
+
+/// Post-inference invariant: **no `Let` binder is bound at an `Overwrite` history.**
+///
+/// This is what retired the discipline's third rule. `emit_let` reads through an
+/// initializer that is a mutable variable, so the only binders left are
+/// [`TypedExprNode::MutDecl`] (a `:=` introduction) and a pass-by-reference
+/// `Lambda` param — both declarations by construction. Checked rather than argued,
+/// because the failure is silent: a mutable variable reaching a `Let` binder is an alias,
+/// and an alias means a register with an unknown writer set.
+///
+/// A **feed** handle on a `Let` is legal and common (`let d = Defer in …`), which is
+/// why this keys on `mut_value_type` (`Overwrite` only) and not `is_handle`.
+fn debug_assert_no_mut_var_let(expr: &Expr) {
+    if let TypedExprNode::Let { binding, .. } = &expr.node {
+        debug_assert!(
+            binding.ty.mut_value_type().is_none(),
+            "a `let` binder is bound at a mutable variable (`{}` : {}); an initializer that is a mutable \
+             variable must read through, and only a `MutDecl` or a pass-by-reference \
+             param may bind one",
+            binding.name,
+            binding.ty
+        );
+    }
+    expr.walk_children(debug_assert_no_mut_var_let);
 }
 
 /// Rule 2's position-aware type walk. `allow_mut` is `true` only where a `Mut`
@@ -1195,34 +1289,16 @@ fn check_no_nested_mut(
     }
 }
 
-/// Rule 3 (unannotated `Mut` binding) plus rule 2 (no nested `Mut`) on a single
-/// binder slot. `Loop`, `For`, `Case`-pattern, `LetRec`, `Lambda`, and `Let`
-/// binder types are unreachable by `walk_children`, so the caller invokes this
-/// on each explicitly.
+/// Rule 2 (no nested `Mut`) on a single binder slot. `For`, `Case`-pattern,
+/// `LetRec`, `Lambda`, `MutDecl`, and `Let` binder types are unreachable by
+/// `walk_children`, so the caller invokes this on each explicitly.
+///
+/// There is no longer a rule about an *undeclared* binder holding a `Mut`: only
+/// [`TypedExprNode::MutDecl`] and a pass-by-reference `Lambda` param can bind a
+/// mutable variable, both of which are declarations by construction. A `Let` cannot —
+/// `emit_let` reads through an initializer that is a mutable variable, so `b = a` binds `b` at `a`'s
+/// value. That is asserted rather than checked; see [`debug_assert_no_mut_var_let`].
 fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
-    // Rule 3: an *unspecified* binder whose resolved type is a mutable variable is an
-    // alias (`b = a`) — rejected, to force disambiguation between copying the
-    // value and seeding a new mutable variable. A *concrete* annotation is a deliberate
-    // choice and is allowed: `y: Mut(V) := cnt` seeds a new mutable variable (the `:=`
-    // binder carries a `Mut` annotation); `y: Int = cnt` copies the value. The
-    // value-copy's slot can still *coalesce* to `Mut`
-    // (coalesce mirrors the RHS node's `Mut` type onto the binding slot, and the
-    // unified phase peels it later), so keying rule 3 on the slot's `Mut`-ness
-    // would flag that benign artifact — hence the gate is the *absence of a
-    // concrete annotation*, not the slot type.
-    //
-    // A bare `_` (`b: _ = a`, `user_annotation == Some(Hole)`) is not a concrete
-    // choice — it requests inference, exactly like no annotation — so it must
-    // fire rule 3 too; otherwise `b: _ = a` slips through and aliases the mutable variable.
-    let annotation_is_unspecified = match &binding.user_annotation {
-        None => true,
-        Some(ann) => annotation_peels_to_hole(ann),
-    };
-    if annotation_is_unspecified && binding.ty.mut_value_type().is_some() {
-        errors.push(InferError::UnannotatedMutBinding {
-            name: binding.name.base().to_string(),
-        });
-    }
     // A binder slot is a top-level type position, so `Mut` itself is legal;
     // only a `Mut` *nested* in the declared type is a rule-2 violation.
     check_no_nested_mut(
@@ -1247,7 +1323,7 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
     // forwarding ancestor.
     let forwards_tail = matches!(
         expr.node,
-        TypedExprNode::Let { .. } | TypedExprNode::ExprStmt { .. }
+        TypedExprNode::Let { .. } | TypedExprNode::MutDecl { .. } | TypedExprNode::ExprStmt { .. }
     );
 
     // Rule 1(a): a `Mut`-typed value must be a bare variable reference. `Var`
@@ -1296,9 +1372,11 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
         }
     }
 
-    // Rules 3 + 2 on binder slots `walk_children` does not reach.
+    // Rule 2 on the binder slots `walk_children` does not reach.
     match &expr.node {
-        TypedExprNode::Let { binding, .. } => check_binder(binding, errors),
+        TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
+            check_binder(binding, errors)
+        }
         TypedExprNode::Lambda { param, .. } => check_binder(param, errors),
         TypedExprNode::For { target, .. } => check_binder(target, errors),
         TypedExprNode::LetRec { bindings, .. } => {
@@ -1327,9 +1405,16 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
 /// which rewrites each `MutWrite` target to its binder's α-unique `Name` (see
 /// `uniquify.rs`). Names are therefore unique, so a flat `Name → Type` map over
 /// the tree's binders resolves each write target unambiguously — no lexical
-/// scope stack, and shadowing is handled for free. A target whose peeled type
-/// is not `Mut` is [`InferError::MutWriteToNonMutable`]; a target absent from the
-/// map is an unbound write inference already rejected, and is skipped.
+/// scope stack, and shadowing is handled for free.
+///
+/// The rule is that a target must **resolve to a mutable binder** — so a target whose
+/// binder says it is not one and a target with no binder at all are both
+/// [`InferError::MutWriteToNonMutable`]. Absence is not the "inference already rejected
+/// this" case it reads as: coalesce rebuilds a generalized `let` as the chain of its
+/// per-use specializations, which is *empty* when nothing reads the binding, so
+/// `def f(…)` followed by a write to `f` and no other mention leaves a write naming a
+/// binder that no longer exists. Treating that as nothing to object to accepted the
+/// write silently.
 pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut muts: HashMap<Name, bool> = HashMap::new();
     collect_mut_binders(expr, &mut muts);
@@ -1342,28 +1427,31 @@ pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<InferError>> {
     }
 }
 
-/// Whether a binder denotes a mutable variable. An **explicit annotation is
-/// authoritative**: `x := e` and pass-by-reference `Mut(…)` parameters stamp
-/// `Mut` on `user_annotation` (while the coalesced `.ty` slot is the value type
-/// — reads deref), and a *non-`Mut`* annotation (`y: int = x`) declares a value,
-/// so the binding is not a mutable variable even if a write-site demand coalesced its `.ty`
-/// to `Mut`. Only when there is no annotation does `.ty` itself decide mutability (a
-/// coalesced alias). Reading the annotation first is what makes `y += 1` on a
-/// `y: int = x` deref-copy the "not a mutable variable" error the discipline
-/// promises, rather than a silently-accepted write.
+/// Whether a binder denotes a mutable variable — decided by the binder's own
+/// type, which records what it is *bound at*.
+///
+/// That is the whole rule because the slot is honest about the annotated cases:
+/// a deref-copy (`y: Int = x`) is bound at the value type, so it is not a mutable
+/// variable and `y += 1` gets the "not a mutable variable" error the discipline
+/// promises; a `:=` introduction and a pass-by-reference `Mut(…)` parameter are
+/// bound at the history, so they are. This consulted `user_annotation` first for
+/// as long as the slot recorded the *initializer's* type instead, where a
+/// deref-copy's slot could read `Mut` and the annotation was the only place the
+/// user's declaration survived.
 fn binder_is_mut(b: &TypedBinding) -> bool {
-    match &b.user_annotation {
-        Some(a) => a.mut_value_type().is_some(),
-        None => b.ty.mut_value_type().is_some(),
-    }
+    b.ty.mut_value_type().is_some()
 }
 
 /// Record every binder's `name → is-a-mut`. Binder-typed slots are unreachable
 /// by `walk_children` (mirroring [`check_binder`]'s call sites), so each binder
 /// node is handled explicitly before recursing into children.
+///
+/// "Every" is load-bearing now that absence is itself an error: a binding node missing
+/// from this match makes its binder look like it does not exist, which would reject
+/// every write to it.
 fn collect_mut_binders(expr: &Expr, out: &mut HashMap<Name, bool>) {
     match &expr.node {
-        TypedExprNode::Let { binding, .. } => {
+        TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
             out.insert(binding.name.clone(), binder_is_mut(binding));
         }
         TypedExprNode::Lambda { param, .. } => {
@@ -1395,7 +1483,7 @@ fn check_mut_write_targets_go(
     errors: &mut Vec<InferError>,
 ) {
     if let TypedExprNode::MutWrite { name, .. } = &expr.node
-        && muts.get(name) == Some(&false)
+        && muts.get(name) != Some(&true)
     {
         errors.push(InferError::MutWriteToNonMutable {
             name: name.base().to_string(),

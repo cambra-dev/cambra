@@ -255,6 +255,32 @@ pub(super) fn outer_binding_write_error(span: Span, name: &str) -> LoweringError
     )
 }
 
+/// Rejection for a **mutable variable introduced inside a for-loop body**, at any
+/// spelling: `x := e`, `x: T := e`, or `x: Mut(V) = e`.
+///
+/// The mutable variable would have to be scoped to one iteration, and its sequencing
+/// domain is the loop's own iteration extent — so the loop body would carry a
+/// nested recurrence the unified phase has no domain for. Blocked at lowering
+/// rather than misinterpreted: the alternative every spelling used to fall back
+/// on is a per-iteration shadowing `let`, which silently discards each update at
+/// the iteration boundary.
+///
+/// Uniform across spellings on purpose. Whether the introduction carries a type
+/// annotation says nothing about whether it introduces a mutable variable, so gating on
+/// the annotation accepted `x := e` and rejected `x: Mut(V) := e` for the same
+/// construct.
+fn in_loop_mut_var_error(span: Span, name: &str) -> LoweringError {
+    LoweringError::unsupported(
+        span,
+        format!(
+            "`{name}` is a mutable variable introduced inside a for-loop body, \
+             which is not supported: declare it before the loop (`{name} := …`) \
+             so its updates carry across iterations, or bind a per-iteration \
+             value immutably with `{name} = …`"
+        ),
+    )
+}
+
 /// `frame_introduced` — names introduced by the current for clause (the
 /// iteration variable) and any let-bindings accumulated so far. These may
 /// be re-bound (shadowed) inside the body without triggering a mutation error.
@@ -299,11 +325,7 @@ fn lower_for_body_stmts(
                     return Err(outer_binding_write_error(stmt.span, &name));
                 }
                 if mut_annotation_parts(annotation).is_some() {
-                    return Err(LoweringError::unsupported(
-                        stmt.span,
-                        "a `Mut(…)` declaration inside a for-loop body is not \
-                         supported; declare the accumulator before the loop",
-                    ));
+                    return Err(in_loop_mut_var_error(stmt.span, &name));
                 }
                 let ann = lower_type_annotation(annotation)?;
                 let val = lower_expr(value, ctx)?;
@@ -789,33 +811,26 @@ fn lower_loop_body_chain(
                     ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
                 }
             }
-            // `x := value` — a mutable write inside the loop body. A write to
-            // an accumulator is a `MutWrite` (the recurrence the phase
-            // threads); a `:=` to any other name is a per-iteration local
-            // `let`. An annotated `:=` intro inside the loop is rejected, like
-            // the `Mut(…)` declaration below — accumulators are declared
-            // before the loop.
-            ChlStmt::MutAssign {
-                target,
-                annotation,
-                value,
-            } => {
+            // `x := value` — a write to an accumulator declared before the
+            // loop, lowered to the `MutWrite` the phase threads as the
+            // recurrence.
+            //
+            // A `:=` naming anything *else* introduces a mutable variable, and a
+            // mutable variable declared inside a loop body is not supported at any
+            // spelling — the annotation is orthogonal to that. It cannot fall
+            // back to a per-iteration `let`: `:=` is a mutable operator, and
+            // silently rebinding it would be the shadowing the design forbids
+            // by name (`src/ccl/design/mutability.md`, "Sequencing domains"),
+            // discarding every update at the iteration boundary.
+            ChlStmt::MutAssign { target, value, .. } => {
                 let name = extract_name_target(target, "mutable assignment")?;
-                if annotation.is_some() && !acc_names.contains(&name) {
-                    return Err(LoweringError::unsupported(
-                        stmt.span,
-                        "a `:=` accumulator declaration inside a for-loop body is not \
-                         supported; declare the accumulator before the loop",
-                    ));
+                if !acc_names.contains(&name) {
+                    return Err(in_loop_mut_var_error(stmt.span, &name));
                 }
                 check_mut_write_context(&name, stmt.span, ctx)?;
                 let val = lower_expr(value, ctx)?;
-                if acc_names.contains(&name) {
-                    let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
-                    ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
-                } else {
-                    ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
-                }
+                let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+                ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
             }
             // `y: T = value` — an ordinary annotated per-iteration local, the
             // annotated counterpart of the plain `y = value` binding above.
@@ -829,11 +844,7 @@ fn lower_loop_body_chain(
             } => {
                 let name = extract_name_target(target, "annotated assignment")?;
                 if mut_annotation_parts(annotation).is_some() {
-                    return Err(LoweringError::unsupported(
-                        stmt.span,
-                        "a `Mut(…)` declaration inside a for-loop body is not \
-                         supported; declare the accumulator before the loop",
-                    ));
+                    return Err(in_loop_mut_var_error(stmt.span, &name));
                 }
                 let ann = lower_type_annotation(annotation)?;
                 let val = lower_expr(value, ctx)?;
@@ -1365,7 +1376,7 @@ x";
         let s = symbolic(&ccl);
         assert_eq!(
             s,
-            "let x = 0\n\
+            "x : Mut(_, _) := 0\n\
              in for i in [1, 2] do { i > 0 → x := x + i; unit; \
              true → x := x - i; unit }; unit; x",
             "if/else conditional write lowers to a two-branch filter-Case, each \
@@ -1451,7 +1462,7 @@ x";
         let s = symbolic(&ccl);
         assert_eq!(
             s,
-            "let x = 0\n\
+            "x : Mut(_, _) := 0\n\
              in for i in [1, 2, 3] do { i > 1 → x := x + i; unit; true → unit }; unit; x",
             "conditional write lowers to a statement-position filter-Case with the \
              MutWrite in the guarded leg and a `true → unit` carry-forward complement"
