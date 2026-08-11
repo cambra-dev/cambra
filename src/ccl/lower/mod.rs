@@ -84,7 +84,9 @@ use crate::{
         Branch, Expr, Lit, TypedExprNode,
         lineage::{Nature, RewriteLabel},
     },
-    chl_parser::ast::{Expr as ChlExpr, RecordField, Span, Spanned, Stmt as ChlStmt},
+    chl_parser::ast::{
+        Expr as ChlExpr, Lit as ChlLit, RecordField, Span, Spanned, Stmt as ChlStmt,
+    },
     interpreter::{DataSink, DataSourceDomainExtentImpl, http_server::SharedHttpServer},
 };
 
