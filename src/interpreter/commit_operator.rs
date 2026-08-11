@@ -376,7 +376,7 @@ fn frontier_from_domain(domain: &ColumnValue, domain_predicate: &Predicate) -> O
 /// The decided frontier tick of a store tile, from its `frontier` predicate and
 /// `changes`. `None` if `tile` is not a [`Tile::Store`], is empty, or is
 /// undecided. Mirrors [`frontier_from_domain`]: `LessThanEq(w)` reads the
-/// watermark directly; the terminal `True` flip takes the last (largest) change
+/// watermark directly; the terminal `True` flip takes the final (largest) change
 /// tick.
 pub fn store_frontier(tile: &Tile) -> Option<CommitTs> {
     let Tile::Store {
@@ -441,7 +441,7 @@ pub fn store_delta_at(tile: &Tile, t: CommitTs, key: &Value) -> Option<Value> {
 /// readers ([`StoreValueStream`] over commit ticks and [`StoreDenseRead`] over
 /// loop positions):
 ///
-/// - a **register / accumulator** (`carry_forward: true`) carries its last write
+/// - a **register / accumulator** (`carry_forward: true`) carries its latest write
 ///   forward — the value as-of `t` is the latest write ≤ `t` ([`store_value_at`]);
 /// - a **reply tap** (`carry_forward: false`) is a per-tick event — a value only
 ///   at the tick that actually wrote it ([`store_delta_at`]), `None` elsewhere.
@@ -541,7 +541,7 @@ pub fn store_snapshot_at(tile: &Tile, t: CommitTs) -> HashMap<Value, Value> {
 
 /// `key`'s current value — its latest change at or below the decided frontier —
 /// with the frontier tick. `None` if the store is undecided/empty or `key` was
-/// never written. Unlike an `ExtractLast` over a `SealedFunction`, this is
+/// never written. Unlike an `ExtractFinal` over a `SealedFunction`, this is
 /// defined *without the stream ever terminating*: it reads the decided frontier,
 /// which a live store advances on every commit. This is the read the writers
 /// perform on the store they read back through the cycle.
@@ -1328,7 +1328,7 @@ struct InductionStoreProducer {
     /// Iteration positions already fed to the body and stepped into the engine.
     /// Monotonic; the drive resumes here each pull as the source grows.
     processed: usize,
-    /// Whether the iteration source is complete (its last pull was terminal). A
+    /// Whether the iteration source is complete (its most recent pull was terminal). A
     /// batch source (a list — the usual loop extent) is complete on the first pull.
     source_complete: bool,
     /// Highest source position released back upstream (the reclaimed prefix). The
@@ -1482,10 +1482,10 @@ impl TileProducer for InductionStoreProducer {
         }
         // Signal terminality once the source is complete and every arrived position
         // has been decided: the accumulator is final, so the frontier *closes*
-        // (`terminal`) and a downstream `ExtractLast`/`final_or_default` resolves.
+        // (`terminal`) and a downstream `ExtractFinal`/`final_or_default` resolves.
         // The frontier keeps its `LessThanEq(w)` watermark, which spans the whole
         // extent including a trailing run of carries — so `len`/`store_frontier`
-        // no longer undercount to the last change tick when the tail is all carry.
+        // no longer undercount to the latest change tick when the tail is all carry.
         // A terminal source has a gapless domain, so having driven every contiguous
         // position (`by_pos` no longer holds `processed`) means the whole extent is
         // decided — robust to the incremental prefix release above shrinking
@@ -1518,7 +1518,7 @@ impl TileProducer for InductionStoreProducer {
         // which is exactly what the drive's own recurrence needs (`read_as_of(
         // processed)` folds to the latest ≤ processed), so the GC never strands the
         // recurrence — bounding a never-terminating streaming loop's changelog to
-        // O(keys) + the slowest reader's lag. (A scalar-final `ExtractLast` reader
+        // O(keys) + the slowest reader's lag. (A scalar-final `ExtractFinal` reader
         // holds the whole stream until terminal, so it releases nothing early — but
         // that read is inherently non-terminating over an endless source anyway.)
         if let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard
@@ -1544,7 +1544,7 @@ impl TileProducer for InductionStoreProducer {
 /// `carry_forward: false`, one entry per commit tick) and the **read-your-writes
 /// register carry** (`carry_forward: true`, the latest write ≤ each tick). A read
 /// fed *out* of a block does not reduce this stream — it folds the store as-of via
-/// [`AsOf`] instead — so there is no `ExtractLast`-over-this-stream register-read
+/// [`AsOf`] instead — so there is no `ExtractFinal`-over-this-stream register-read
 /// path; a fed-out read always samples an arbitrary commit position, never a
 /// "final".
 pub struct StoreValueStream {
@@ -1553,7 +1553,7 @@ pub struct StoreValueStream {
     key: Value,
     value_extent: Extent,
     /// Whether the key's value persists across commit ticks that don't write it.
-    /// A **register** (`true`) carries its last committed value forward — reading
+    /// A **register** (`true`) carries its latest committed value forward — reading
     /// it at any tick yields the latest write ≤ that tick. A **reply tap**
     /// (`false`) is a per-commit event: it appears only at the tick that wrote it,
     /// so two writers' taps to one defer don't smear each other's values across
@@ -1619,7 +1619,7 @@ struct StoreValueStreamProducer {
     store_producer: Box<dyn TileProducer>,
     key: Value,
     value_extent: Extent,
-    /// See [`StoreValueStream::carry_forward`]: register (carry the last value
+    /// See [`StoreValueStream::carry_forward`]: register (carry the latest value
     /// across ticks that don't write the key) vs. reply tap (emit only at the
     /// tick that wrote it).
     carry_forward: bool,
@@ -1753,14 +1753,14 @@ impl TileProducer for StoreValueStreamProducer {
 /// extent recorded on the tile: the positions come from the `trigger`
 /// (`IterateExtent`-style enumeration of `D`), the values from the fold.
 ///
-/// A scalar-final read (`total` after the loop) is `ExtractLast` over this dense
+/// A scalar-final read (`total` after the loop) is `ExtractFinal` over this dense
 /// stream; a co-iterated read is the stream itself — one reader serves both.
 ///
 /// The per-tick fold — register carries, tap is a delta event — is the shared
 /// [`fold_changelog_key`]; this reader and [`StoreValueStream`] are the same
 /// changelog projection differing only on *which* ticks they fold (loop positions
 /// at `p + 1` here, commit ticks there) and how they emit (full re-emit here for
-/// `fan_in`/`ExtractLast`; delta-once there for `Memo`-accumulating consumers).
+/// `fan_in`/`ExtractFinal`; delta-once there for `Memo`-accumulating consumers).
 pub struct StoreDenseRead {
     /// Output tiling `SealedFunction { domain: D, codomain: Scalar(V) }`.
     tiling: Tiling,
@@ -1858,7 +1858,7 @@ struct StoreDenseReadProducer {
     carry_forward: bool,
     key: Value,
     value_extent: Extent,
-    /// Ascending ticks at which `key` was written, cached from the last fold. A
+    /// Ascending ticks at which `key` was written, cached from the previous fold. A
     /// carry read's [`Self::release_impl`] uses it to find the carry source of the
     /// earliest still-needed position — the store prefix it can safely release.
     key_write_ticks: Vec<usize>,
@@ -1898,7 +1898,7 @@ impl TileProducer for StoreDenseReadProducer {
         // Sort the trigger's positions ascending before folding. An async source's
         // iteration domain arrives in arbitrary (set) order, but the dense read's
         // output domain must be position-ordered: a scalar-final read is
-        // `ExtractLast` over this stream — the *last column* — which is the final
+        // `ExtractFinal` over this stream — the *final column* — which is the final
         // accumulator only if the highest loop position is last. (A co-iterated
         // read aligns by domain *value* via `fan_in`, so ordering is immaterial
         // there; sorting is correct for both.)
@@ -2814,7 +2814,7 @@ impl TileOperator for TransactWriter {
             committed_base: 0,
             emitted: Vec::new(),
             emitted_item: Vec::new(),
-            last_emit: None,
+            latest_emit: None,
             pending: None,
             source_complete: false,
         })
@@ -2860,25 +2860,25 @@ struct TransactWriterProducer {
     /// Source-item index per live emitted position (for idempotent
     /// release-advance), in lockstep with `emitted`.
     emitted_item: Vec<usize>,
-    /// `(item, frontier)` of the last emit — the retry-suppression idempotency
+    /// `(item, frontier)` of the latest emit — the retry-suppression idempotency
     /// key. Sound because a proposal is a *pure function of `(item, frontier)`*:
     /// the read set is `read_keys` folded against the store at `frontier`, and
     /// the write set is the body applied to that snapshot — so re-pulling at an
     /// unchanged `(item, frontier)` would re-derive a byte-identical proposal.
     /// Suppressing it keeps the append-only proposal stream from double-emitting
     /// the same transaction within one frontier (positions never shift).
-    last_emit: Option<(usize, CommitTs)>,
+    latest_emit: Option<(usize, CommitTs)>,
     /// `(item, frontier)` of a body-input row pushed whose decision is not yet
     /// ready — the decision reads a **broadcast cross-loop accumulator final**
     /// (`store := store − cnt`, `cnt` a *different*, completed loop) whose
-    /// `ExtractLast` is empty until that loop's `Recurse` drains, one position per
+    /// `ExtractFinal` is empty until that loop's `Recurse` drains, one position per
     /// body pull. While pending, the writer reuses this one row (re-pushing would
     /// duplicate a buffer position against the body's `Memo`) and re-arms itself
     /// via [`wakeups`](Self::wakeups) each pull; the `Memo` sees a legal monotonic
     /// empty→value growth at the position. Cleared once the decision resolves.
-    /// Distinct from `last_emit`, which marks a *proposal already emitted*.
+    /// Distinct from `latest_emit`, which marks a *proposal already emitted*.
     pending: Option<(usize, CommitTs)>,
-    /// Whether the writer's source is *complete* — its last pull returned a
+    /// Whether the writer's source is *complete* — its most recent pull returned a
     /// terminal (`Predicate::True`) tile. A batch source (a list) is complete on
     /// the first pull; a live source (an HTTP request stream) never is. The writer
     /// reports its proposal stream terminal only when the source is complete *and*
@@ -3059,7 +3059,7 @@ impl TileProducer for TransactWriterProducer {
         // release here:
         //
         //  - **Empty read set** (a collection-append / overwrite writer, e.g.
-        //    `<<` or `last = msg`): it reads no tick's value, only the frontier,
+        //    `<<` or `latest = msg`): it reads no tick's value, only the frontier,
         //    so it releases the whole decided prefix.
         //  - **Non-empty read set** (a register drawdown, e.g. `pool = pool - r`):
         //    it releases strictly *below* the oldest tick it read this pull. This
@@ -3091,13 +3091,13 @@ impl TileProducer for TransactWriterProducer {
                 )));
         }
         // Process the current item, unless a proposal for this `(item, frontier)`
-        // is already emitted and awaiting commit (`last_emit == key`) — re-running
+        // is already emitted and awaiting commit (`latest_emit == key`) — re-running
         // would double-emit it into the append-only stream. `(item, frontier)` is
         // a sound key: the proposal (and the body-input row it derives from) is a
         // pure function of `(read_keys, frontier)`.
         if self.current < n_items
             && let Some(frontier) = snapshot
-            && self.last_emit != Some((self.current, frontier))
+            && self.latest_emit != Some((self.current, frontier))
         {
             let key = (self.current, frontier);
             // Push the item's body-input row **once per `(item, frontier)`**; a
@@ -3182,7 +3182,7 @@ impl TileProducer for TransactWriterProducer {
                     self.drop_superseded(self.current);
                     self.emitted.push((frontier, reads, writes));
                     self.emitted_item.push(self.current);
-                    self.last_emit = Some(key);
+                    self.latest_emit = Some(key);
                     self.pending = None;
                     self.compact_body_input(pos);
                 }
@@ -3211,7 +3211,7 @@ impl TileProducer for TransactWriterProducer {
                     }
                     // Otherwise the decision is **not ready**: it reads a broadcast
                     // cross-loop accumulator final still converging — its
-                    // `ExtractLast` is empty until the sibling loop's `Recurse`
+                    // `ExtractFinal` is empty until the sibling loop's `Recurse`
                     // drains, one position per body pull. `current` is left
                     // unadvanced, so the pending item keeps this writer non-terminal
                     // and the unified re-arm below re-pulls it, each re-pull
@@ -3321,7 +3321,7 @@ mod tests {
         assert_eq!(
             e.watermark(),
             3,
-            "frontier reaches the last position, not the last write"
+            "frontier reaches the final position, not the latest write"
         );
         // Folded reads: carries inherit (None → the reader's init default), writes resolve.
         assert_eq!(e.read_as_of(0, &acc), None); // carry → init 0
@@ -4569,12 +4569,12 @@ mod tests {
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
 
         // Drive the cycle: bootstrap + 3 commits + a fixpoint pull, with margin.
-        let mut last = producer.get(producer.tiling().universal_guard());
+        let mut latest = producer.get(producer.tiling().universal_guard());
         for _ in 0..6 {
-            last = producer.get(producer.tiling().universal_guard());
+            latest = producer.get(producer.tiling().universal_guard());
         }
         // Store: init 0 @0, then 1@1, 2@2, 3@3 — the counter reached 3.
-        assert_eq!(store_at(&last, &acct("n")), Some((3, 3)));
+        assert_eq!(store_at(&latest, &acct("n")), Some((3, 3)));
     }
 
     /// One accumulated proposal: `(snapshot, read set, write set)`.
@@ -4737,15 +4737,15 @@ mod tests {
         let guard = external.tiling().universal_guard();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
 
-        let mut last = producer.get(producer.tiling().universal_guard());
+        let mut latest = producer.get(producer.tiling().universal_guard());
         for _ in 0..6 {
-            last = producer.get(producer.tiling().universal_guard());
+            latest = producer.get(producer.tiling().universal_guard());
         }
         // Exactly one draw commits: 100−70=30 < 50 and 100−50=50 < 70, so
         // whichever commits first, the other denies. The round-robin drain picks
         // the winner, so the resting value is schedule-dependent (30 or 50) but
         // always a valid, non-negative outcome — exactly one commit either way.
-        let (frontier, pool) = store_at(&last, &acct("pool")).expect("pool decided");
+        let (frontier, pool) = store_at(&latest, &acct("pool")).expect("pool decided");
         assert_eq!(frontier, 1, "exactly one commit");
         assert!(
             pool == 30 || pool == 50,
@@ -4782,15 +4782,15 @@ mod tests {
         let guard = external.tiling().universal_guard();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
 
-        let mut last = producer.get(producer.tiling().universal_guard());
+        let mut latest = producer.get(producer.tiling().universal_guard());
         for _ in 0..10 {
-            last = producer.get(producer.tiling().universal_guard());
+            latest = producer.get(producer.tiling().universal_guard());
         }
         // Which draws fit (and in what order) is schedule-dependent under the
         // round-robin drain, but the token-pool safety invariant holds under every
         // serialization: the pool is never oversold (≥ 0) and never exceeds its
         // initial 100 — a draw commits only when it fits the pool it read.
-        let (_, pool) = store_at(&last, &acct("pool")).expect("pool decided");
+        let (_, pool) = store_at(&latest, &acct("pool")).expect("pool decided");
         assert!(
             (0..=100).contains(&pool),
             "pool stays within [0, 100]; got {pool}"
@@ -4898,11 +4898,11 @@ mod tests {
 
         // Pulling the reader drives the cycle. Before the watermark reaches 2 the
         // read is ⊥ (empty); once it does, it resolves to the value at tick 2.
-        let mut last = Tile::Scalar(ColumnValue::from_ints(vec![]));
+        let mut latest = Tile::Scalar(ColumnValue::from_ints(vec![]));
         for _ in 0..8 {
-            last = producer.get(producer.tiling().universal_guard());
+            latest = producer.get(producer.tiling().universal_guard());
         }
-        let Tile::Scalar(cv) = &last else { panic!() };
+        let Tile::Scalar(cv) = &latest else { panic!() };
         assert_eq!(cv.as_single(), Some(int(2)));
     }
 
@@ -5024,11 +5024,11 @@ mod tests {
         let guard = external.tiling().universal_guard();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
 
-        let mut last = producer.get(producer.tiling().universal_guard());
+        let mut latest = producer.get(producer.tiling().universal_guard());
         for _ in 0..pulls {
-            last = producer.get(producer.tiling().universal_guard());
+            latest = producer.get(producer.tiling().universal_guard());
         }
-        last
+        latest
     }
 
     /// Two writers transfer over *disjoint* account pairs — A: alice→bob 30,
@@ -5113,9 +5113,9 @@ mod tests {
     /// `StoreValueStream` projects the store's history to `key`'s commit-value
     /// stream (`Txn ⇀ Value`), observable as it commits — no terminal gate — with
     /// terminality flowing through from the store. This checks the projection
-    /// (both values visible while still committing) and that `ExtractLast` *can*
+    /// (both values visible while still committing) and that `ExtractFinal` *can*
     /// compose over it once terminal — a stream-mechanism test, not the register
-    /// read path (a fed-out register read is `AsOf`, not `ExtractLast`).
+    /// read path (a fed-out register read is `AsOf`, not `ExtractFinal`).
     #[test]
     fn store_value_stream_projects_committed_values() {
         let value_ext = Extent::Base(BaseType::Int);
@@ -5152,7 +5152,7 @@ mod tests {
         let vals: Vec<Value> = (0..cv.len()).map(|i| cv.index_at(i)).collect();
         assert_eq!(vals, vec![int(100), int(60)]);
 
-        // Once the store is terminal, so is the stream — and `ExtractLast` over
+        // Once the store is terminal, so is the stream — and `ExtractFinal` over
         // it gives the final value 60 (the latest committed entry).
         if let Tile::Store { terminal, .. } = &mut store_tile {
             *terminal = true;
@@ -5170,10 +5170,10 @@ mod tests {
             tiling: Tiling::Scalar(value_ext.clone()),
             tile: Tile::Scalar(ColumnValue::single(int(100))),
         });
-        let mut last =
-            crate::interpreter::tile_operators::ExtractLast::new(Box::new(stream), default);
-        let g = last.tiling().universal_guard();
-        let mut p = last.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+        let mut extract =
+            crate::interpreter::tile_operators::ExtractFinal::new(Box::new(stream), default);
+        let g = extract.tiling().universal_guard();
+        let mut p = extract.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
         let t = p.get(p.tiling().universal_guard());
         let Tile::Scalar(cv) = &t else { panic!() };
         assert_eq!(cv.as_single(), Some(int(60)));
@@ -5332,9 +5332,9 @@ mod tests {
         assert_eq!(store_frontier(&live), Some(2));
         // A terminal store keeps its `LessThanEq(w)` watermark (terminality is the
         // separate flag), so `store_frontier` reads `w` directly — even when the
-        // watermark is *past the last change tick* (trailing carries). Here the
-        // last change is at tick 3 but the decided watermark is 5: the frontier is
-        // 5, not 3 (the former `True`-reconstruction undercounted to the last
+        // watermark is *past the latest change tick* (trailing carries). Here the
+        // latest change is at tick 3 but the decided watermark is 5: the frontier is
+        // 5, not 3 (the former `True`-reconstruction undercounted to the latest
         // change).
         let done = store_tile(
             &[(0, &[("alice", 100)]), (3, &[("alice", 70)])],
@@ -5342,7 +5342,7 @@ mod tests {
         );
         assert_eq!(store_frontier(&done), Some(5));
         // `Tile::len` counts decided *positions* (watermark + 1), spanning the
-        // trailing carries at ticks 4 and 5 — not the 2 change ticks, nor the last
+        // trailing carries at ticks 4 and 5 — not the 2 change ticks, nor the latest
         // change tick + 1 (4) the former `True`-reconstruction would have given.
         assert_eq!(done.len(), 6);
         // Empty changelog and non-store tiles have no frontier.
@@ -5391,7 +5391,7 @@ mod tests {
     fn store_current_reads_a_live_undecided_store() {
         // The C1 property: `store_current` resolves against the *decided*
         // frontier of a store that is still live (watermark predicate, not the
-        // terminal `True`) — where an `ExtractLast` would hang waiting for
+        // terminal `True`) — where an `ExtractFinal` would hang waiting for
         // termination that never comes.
         let live = skew_store(2);
         assert!(!live.is_terminal(), "watermark store must not be terminal");
@@ -5408,7 +5408,7 @@ mod tests {
         // arrived keys), and the codomain aligns to the domain *column*, not to
         // position. Decoding must pair each item with its actual domain position
         // and sort — otherwise the position-driven drive reads the wrong item at
-        // each tick, and a scalar-final `ExtractLast` over the dense read (which
+        // each tick, and a scalar-final `ExtractFinal` over the dense read (which
         // relies on the highest position being last) picks a mid-loop value.
         let tile = Tile::SealedFunction {
             domain: ColumnValue::from_uints(vec![2, 0, 1]),

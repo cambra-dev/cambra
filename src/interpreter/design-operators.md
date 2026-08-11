@@ -172,7 +172,7 @@ during compilation; producers are created on demand at runtime.
 | `MapExtractAggregate` | `SealedFunction(extent → Aggregation)` | `SealedFunction(extent → Scalar)` | Extracts terminal per-key aggregation results from a `SealedFunction(D, Aggregation)`, producing `SealedFunction(D, Scalar)`. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::branch()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across branches. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose branches feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other branch is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
 | `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Immediately releases data from its input upon receipt so that the input can clear out any state. |
-| `ExtractLast` | two inputs: `source` (`SealedFunction(D → Scalar(T))`) and `default` (`Scalar(T')` for any `T'` that `T` includes) | `Scalar(T)` | Extracts the last codomain value of `source` once it signals terminal.  When `source` is terminal but emits zero values (e.g. a mutation loop whose body ran zero times because its iteration source was empty), emits the `default` scalar's value instead — keeping post-loop accumulators total.  Every emission is built at the **declared** extent `T`, not from the extracted value alone: a variant value carries only its own tag, so a column built from it would be width-narrower than `T` whenever the collapsed alternatives carry more tags between them — which is also why the `default` need only be *included in* `T` rather than equal to it (a conditional's trailing arm carries its tag and not its siblings').  Returns an empty scalar before `source` is terminal.  On the first terminal pull it releases both `source` and `default` universally — a final-consumer signal that propagates back through `FanOut`/`Memo`/mutation-loop bodies to the underlying data source. |
+| `ExtractFinal` | two inputs: `source` (`SealedFunction(D → Scalar(T))`) and `default` (`Scalar(T')` for any `T'` that `T` includes) | `Scalar(T)` | Extracts the final codomain value of `source` once it signals terminal.  When `source` is terminal but emits zero values (e.g. a mutation loop whose body ran zero times because its iteration source was empty), emits the `default` scalar's value instead — keeping post-loop accumulators total.  Every emission is built at the **declared** extent `T`, not from the extracted value alone: a variant value carries only its own tag, so a column built from it would be width-narrower than `T` whenever the collapsed alternatives carry more tags between them — which is also why the `default` need only be *included in* `T` rather than equal to it (a conditional's trailing arm carries its tag and not its siblings').  Returns an empty scalar before `source` is terminal.  On the first terminal pull it releases both `source` and `default` universally — a final-consumer signal that propagates back through `FanOut`/`Memo`/mutation-loop bodies to the underlying data source. |
 | `UnionOperator` | N inputs of `SealedFunction(dᵢ → Scalar(C))` tilings | `SealedFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))` | Merges N sealed-function operators into one by forming the discriminated union of their domains and the **join** of their codomains. The domain keeps every arm apart — which arm a row came from is what `final_or_default` dispatches on. The codomain does the opposite: the arms are alternative values at one row, so it is their `Extent::join` — for arms carrying different *tags* that is the merged tag set, which is the union column the operator actually builds (the arm that did not occur present but empty). Arms with no join fall back to an anonymous positional sum, which is right for a concatenation, where the arm a row came from is part of its identity. `UnionProducer::release_impl` splits an incoming `Predicate::Union` guard and forwards each per-variant predicate to the corresponding input, so release propagates correctly through the merge. |
 | `VariantWrap` | Payload: `Scalar(Pₜ)` or `SealedFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `SealedFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. |
 | `VariantProject` | Scrutinee: `Scalar(Union(P₀,…,Pₙ))` or `SealedFunction(D → Scalar(Union))` | `SealedFunction(UInt → Scalar(Pᵢ))` for a bare scrutinee (implicit `0..N` keys), or `SealedFunction(D → Scalar(Pᵢ))` for a stream scrutinee (the real `D` keys preserved) | **Sum elimination — the read-dual of `VariantWrap`.** Projects the arm named `tag` out of a tagged-union stream, *restricting to the sub-domain of rows carrying that tag* and yielding that arm's payload column, keyed by the original `UInt` position. A tag the scrutinee does not carry yields an **empty** projection rather than an error — that is what makes a width-subtype scrutinee, and so a `match` arm the scrutinee can never reach, inert instead of ill-formed. **Restrict and project are one op**: a [`UnionArm`] stores its rows alongside its payloads, so reading the arm *is* the tag restriction — there is no separate boolean `Restrict` step and no tag-discriminating `Predicate` (a domain-`Restrict` could not express it: the tag lives in the scrutinee's codomain, not its domain). Emitted by `lambda_elim` for a scrutinee-`Case`; consumed as a bare `Builtin::VariantProject(tag)` composed onto the fed scrutinee. |
@@ -218,7 +218,7 @@ A writer processes **one source item per pull** and re-arms itself on the schedu
 
 ### Every fed-out register read is an as-of sample
 
-A register read outside its block compiles to `AsOf` (born in `transact_phase::rewrite_live_reads`) — a sample at an **arbitrary** position in the commit order — whatever the reading trigger's domain: a live `DataSource` request stream, a finite loop, or a standalone read's synthesized singleton. There is no static finiteness classification anywhere on this path; the read folds to `AsOf` purely because its history domain is `Type::Txn`. There is likewise **no terminal/"final" register read**: no term requests the store's last value (a future `await_final` would), so nothing routes a register read to `ExtractLast`, which reduces only genuinely-terminating histories (a post-loop induction accumulator, a broadcast source). A trailing standalone read that observes the drained store did so by scheduling, not by promise. `AsOf` itself stays non-terminal until the store is terminal *and* every live trigger position is latched, so it cannot report "done" while a store no other consumer drives is still committing.
+A register read outside its block compiles to `AsOf` (born in `transact_phase::rewrite_live_reads`) — a sample at an **arbitrary** position in the commit order — whatever the reading trigger's domain: a live `DataSource` request stream, a finite loop, or a standalone read's synthesized singleton. There is no static finiteness classification anywhere on this path; the read folds to `AsOf` purely because its history domain is `Type::Txn`. There is likewise **no terminal/"final" register read**: no term requests the store's final value (a future `await_final` would), so nothing routes a register read to `ExtractFinal`, which reduces only genuinely-terminating histories (a post-loop induction accumulator, a broadcast source). A trailing standalone read that observes the drained store did so by scheduling, not by promise. `AsOf` itself stays non-terminal until the store is terminal *and* every live trigger position is latched, so it cannot report "done" while a store no other consumer drives is still committing.
 
 ### Bounding a long-lived store
 
@@ -363,7 +363,7 @@ The pipeline always bottoms out at one of three consumer shapes:
 
 1. A scalar produced by `Apply(<chain>, Sum)` / `Max` (compiles to
    `Aggregate` + `ExtractAggregate`) or `Apply(Tuple([stream, default]), FinalOrDefault)`
-   (compiles to `ExtractLast`).
+   (compiles to `ExtractFinal`).
 2. A function-typed program result — `convert_to_operators` is the entry
    point, the resulting tile is subscribed by the user-supplied `main_consumer`
    at `compile_program`.
@@ -397,7 +397,7 @@ field). The two representations meet at the register boundaries and are reconcil
 the existing `scalar_tile_to_column_value` (box: `Tile::Record` → `ColumnValue::Records`) and
 its inverse `column_value_to_tile` (unbox to a declared tiling shape): the `InductionStore`
 init seed (`read_initial_scalar`), the conditional-write decision merge (`flat_merge`), and
-the scalar-final read (`ExtractLast`, which matches on *extent* not tiling shape). So a
+the scalar-final read (`ExtractFinal`, which matches on *extent* not tiling shape). So a
 compound accumulator folds, reads-its-own-writes, carries, and conditionally writes like a
 scalar one. The **commit store** shares this: a `Mut[(int, int), Txn]` / `Mut[{x: int}, Txn]`
 transactional register threads through the same `read_initial_scalar` seed and value-Case
@@ -445,7 +445,7 @@ source over the same `D`), and each position `p` reads tick `p + 1` via `store_v
 position inherits the latest earlier write and a leading carry folds to the tick-0 seed).
 The trigger's positions are **sorted ascending** before folding: an async domain arrives in
 arbitrary order, but the output domain must be position-ordered so that the **scalar-final**
-read — `ExtractLast` over this dense stream, i.e. the *last column* — is the highest loop
+read — `ExtractFinal` over this dense stream, i.e. the *final column* — is the highest loop
 position (the final accumulator), not an arbitrary mid-loop value. (A **co-iterated** read —
 an accumulator threaded into another store, e.g. `for r in …: cnt += 1; with begin(): store
 := store + cnt` — aligns by domain *value* via `fan_in`, so ordering is immaterial there;
@@ -459,7 +459,7 @@ once lurked in `Tile::len`/`store_frontier` is now closed at the source: a `Tile
 carries terminality on a separate `terminal` flag and always keeps its numeric watermark as
 `frontier = LessThanEq(w)` (never a `True` that discards `w`), so `len`/`store_frontier`
 read `w` directly — spanning a trailing run of carries — instead of reconstructing it from
-the last *change* tick.
+the latest *change* tick.
 
 **Reply feeds ride the changelog as taps.** A feed inside the loop (`out << e`) rides the
 writer decision as a `to_<defer>` field, exactly as a commit writer's reply tap does. Op-
@@ -502,7 +502,7 @@ Keep-latest is also what makes the drive sound despite reading the changelog it 
 recurrence is never stranded (the delicate part — a naive GC that dropped the latest produced
 the `30`-then-`10` failure a probe once hit). Retention is therefore **O(keys) + the slowest
 reader's lag**, independent of the number of positions processed. A **scalar-final**
-`ExtractLast` drives its own bound: on each non-terminal pull it needs only the highest-domain
+`ExtractFinal` drives its own bound: on each non-terminal pull it needs only the highest-domain
 value, so it releases `[0, max)` incrementally — the same release path bounds the changelog even
 though it never emits until (if ever) the source terminates.
 
