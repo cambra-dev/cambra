@@ -978,9 +978,9 @@ refinements, scoped by the review as "worth doing later, not now":
    payload iff its route fired*, retiring the separate `to_<defer>_k__fire` gate. Same dense-presence
    requirement as (1).
 
-Cost #1 (an off-path partial op faulting) is **fixed**: both induction and transaction value-`Case`s
-compile through the lazy `filter_values` union-of-restricts, so a guard-protected `//`/`%` is never
-evaluated on the path its guard excludes.
+**An off-path partial op cannot fault.** Both induction and transaction value-`Case`s compile through
+the lazy `filter_values` union-of-restricts, so a guard-protected `//`/`%` is never evaluated on the
+path its guard excludes.
 
 ### `with t = begin():` transaction handle
 

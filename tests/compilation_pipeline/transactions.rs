@@ -1932,7 +1932,7 @@ fn heterogeneous_multi_key_store_reads_string_key() {
 // commit|abort decision variant: off-path partial op + interleaving
 // ---------------------------------------------------------------------------
 
-/// **Cost #1 — off-path partial op does not fault.** A guarded `//` in a
+/// **An off-path partial op does not fault.** A guarded `//` in a
 /// conditional transaction write: `if d != 0: acc := acc // d`. The divisor `d`
 /// starts at 3 and is zeroed on the first commit, so the second request's guard
 /// (`d != 0`, read on the snapshot) is false — an `` `abort ``. The write value `acc
