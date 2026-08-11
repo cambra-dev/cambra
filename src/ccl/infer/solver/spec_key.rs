@@ -467,7 +467,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             };
             let truncations_before = ctx.truncations;
             let mut acc = KeyView::default();
-            for b in &bounds {
+            for b in bounds.iter() {
                 // Compose the edge's morphism before descending, as `compact_go`
                 // does: a bound reached transitively arrives with every edge's
                 // substitution composed.
@@ -625,7 +625,7 @@ mod tests {
             let Type::Infer(v) = var else {
                 unreachable!("fresh_var yields Type::Infer");
             };
-            v.bounds.borrow_mut().lower.push(Bound::conc(ty));
+            v.bounds.borrow_mut().lower_mut().push(Bound::conc(ty));
         }
         let a = fresh_var(0);
         let b = fresh_var(0);
