@@ -35,7 +35,7 @@ fn arithmetic_and_literals() {
         "2",
         r#""hello""#,
         "True",
-        "None",
+        "()",
         "2 + 3",
         "4 * 5",
         "7 // 2",
@@ -106,6 +106,51 @@ fn records_and_brace_types() {
     assert!(
         !parse_module(r#"{"name": "alice"}"#).errors.is_empty(),
         "expression-key braces should be a parse error"
+    );
+    // A one-element product carries the comma; `{}` is the zero-element one.
+    assert!(matches!(must_parse_expr("{Int,}").node, Expr::BraceGroup(v) if v.len() == 1));
+    assert!(matches!(must_parse_expr("{}").node, Expr::BraceGroup(v) if v.is_empty()));
+}
+
+/// A rule that rejects what it parsed reports *its own* sentence.
+///
+/// Both messages here come from `Rich::custom` raised in a `validate`, where the
+/// token sequence is well-formed and only the grammar's reading of it fails —
+/// there is no "found X, expected Y" to derive, so the rule's message is the
+/// whole diagnostic. It has to survive the chumsky→`ParseErrorInfo` conversion
+/// to reach the user; dropping it left these rendering as "found end of input".
+#[test]
+fn custom_grammar_errors_keep_their_message() {
+    let cases: [(&str, &str); 2] = [
+        // Braces are always a product in type position, never grouping.
+        ("x: {Int} = (1,)", "{T,}"),
+        // Neither a record type nor a tuple type.
+        ("x: {a: Int, Bool} = (1,)", "is type syntax"),
+    ];
+    for (src, needle) in cases {
+        let result = parse_module(src);
+        assert!(!result.errors.is_empty(), "expected {src:?} to be rejected");
+        let rendered = result.errors[0].to_string();
+        assert!(
+            rendered.contains(needle),
+            "error for {src:?} lost its custom message (missing {needle:?}): {rendered}"
+        );
+    }
+}
+
+/// An inverted `.as_context()` span must not abort the whole report.
+///
+/// chumsky hands back a context span whose start is after its end for an error
+/// raised inside a `validate` (the context opened ahead of the error's own
+/// offset), and ariadne panics on one. Rendering must survive it, so this
+/// exercises the full ariadne path rather than just `Display`.
+#[test]
+fn custom_grammar_errors_render_with_source_context() {
+    let result = parse_module("x: {Int} = (1,)");
+    let rendered = result.render_errors("<test>", "x: {Int} = (1,)");
+    assert!(
+        rendered.contains("{T,}"),
+        "ariadne rendering should carry the custom message, got: {rendered}"
     );
 }
 

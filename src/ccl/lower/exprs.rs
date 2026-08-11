@@ -20,7 +20,6 @@ pub(super) fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
         ChlLit::Int(n) => Lit::Int(*n),
         ChlLit::String(s) => Lit::String(s.clone()),
         ChlLit::Bool(b) => Lit::Bool(*b),
-        ChlLit::None => Lit::Unit,
     };
     Ok(Expr::lit(lit))
 }
@@ -481,7 +480,8 @@ mod tests {
     #[case("2", "2")]
     #[case(r#""hi""#, r#""hi""#)]
     #[case("True", "true")]
-    #[case("None", "unit")]
+    // `()` is the unit value — CHL's only spelling for it.
+    #[case("()", "unit")]
     // Variable
     #[case("x", "x")]
     // Arithmetic

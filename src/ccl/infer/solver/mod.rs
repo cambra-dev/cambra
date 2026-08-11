@@ -129,7 +129,13 @@ pub(crate) mod test_helpers {
     /// otherwise a dense `Tuple` (the only product shapes `ccl::Type` has).
     /// Sparse-`Index` inputs have no `Type` form — tests that need them
     /// build the `CompactType` directly.
+    ///
+    /// No fields → `Unit`, matching the real `product` constructor: the empty
+    /// product has one representation and it is not `Tuple([])`.
     pub(crate) fn record(fields: &[(FieldKey, Type)]) -> Type {
+        if fields.is_empty() {
+            return Type::Base(crate::ccl::BaseType::Unit);
+        }
         if fields.iter().all(|(k, _)| matches!(k, FieldKey::Name(_))) {
             Type::Record(
                 fields

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ccl::{HistoryKind, InferVar, InferVarId, Type};
+use crate::ccl::{BaseType, HistoryKind, InferVar, InferVarId, Type};
 
 use super::compact::{CompactGraph, CompactType};
 use crate::ccl::FieldKey;
@@ -348,8 +348,12 @@ fn materialize_record(
     rec: &BTreeMap<FieldKey, CompactType>,
     polarity: bool,
 ) -> Result<Type, CoalesceError> {
+    // The product of zero fields is unit — the one representation of the empty
+    // product (`docs/chl-spec.md`, "6.6 The empty product is unit"). A record
+    // variable that accumulated no field demands is that product, not an empty
+    // tuple: `Tuple([])` and `Record([])` are not valid types.
     if rec.is_empty() {
-        return Ok(Type::Tuple(Vec::new()));
+        return Ok(Type::Base(BaseType::Unit));
     }
     let all_index = rec.keys().all(|k| matches!(k, FieldKey::Index(_)));
     let all_name = rec.keys().all(|k| matches!(k, FieldKey::Name(_)));

@@ -53,8 +53,8 @@ pub enum Token {
     True,
     #[token("False", priority = 3)]
     False,
-    #[token("None", priority = 3)]
-    None,
+    #[token("where", priority = 3)]
+    Where,
     #[token("and", priority = 3)]
     And,
     #[token("or", priority = 3)]
@@ -202,7 +202,7 @@ impl fmt::Display for Token {
             // Keywords
             Token::True => "True",
             Token::False => "False",
-            Token::None => "None",
+            Token::Where => "where",
             Token::And => "and",
             Token::Or => "or",
             Token::Not => "not",
@@ -440,7 +440,7 @@ mod tests {
 
     #[test]
     fn keywords_beat_idents() {
-        let toks = tokens("if elif else for in def not and or True False None");
+        let toks = tokens("if elif else for in def not and or True False where");
         assert_eq!(
             toks,
             vec![
@@ -455,10 +455,19 @@ mod tests {
                 Token::Or,
                 Token::True,
                 Token::False,
-                Token::None,
+                Token::Where,
                 Token::Newline,
             ]
         );
+    }
+
+    /// `where` is reserved ahead of the syntax that uses it: refinements are not
+    /// parsed yet (`docs/chl-spec.md`, "6.4 Refinement syntax"), so the token
+    /// exists only to keep the name from being bound as an identifier and
+    /// breaking when they land.
+    #[test]
+    fn where_is_reserved_not_an_ident() {
+        assert_eq!(tokens("where"), vec![Token::Where, Token::Newline]);
     }
 
     #[test]

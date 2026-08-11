@@ -153,7 +153,7 @@ fn bool_ty() -> Type {
 #[case::int("2", int_lit(2))]
 #[case::string(r#""hi""#, str_lit("hi"))]
 #[case::bool_lit("True", bool_lit(true))]
-#[case::none("None", Type::Base(BaseType::Unit))]
+#[case::unit("()", Type::Base(BaseType::Unit))]
 fn test_literal(#[case] code: &str, #[case] expected: Type) {
     assert_eq!(infer_program(code), expected);
 }
@@ -1207,6 +1207,26 @@ fn positional_and_named_projection_compose() {
 fn brace_type_annotations_project_by_their_keying() {
     assert_eq!(infer_program("t: {Int, Bool} = (1, True)\nt.0"), int_lit(1));
     assert_eq!(infer_program("r: {a: Int} = (a=1)\nr.a"), int_lit(1));
+    // A *one*-element tuple type carries the trailing comma, like the `(e,)` term.
+    assert_eq!(infer_program("t: {Int,} = (1,)\nt.0"), int_lit(1));
+    // A one-*field* record type needs no comma — `a: Int` already marks the form.
+    assert_eq!(infer_program("r: {a: Int,} = (a=1)\nr.a"), int_lit(1));
+}
+
+/// The empty product is `Unit`, and it is the *only* empty product: `{}` in an
+/// annotation, an empty tuple term, and an empty record term all land on the same
+/// type, so no two passes can disagree about which empty spelling a node has
+/// (`docs/chl-spec.md`, "6.6 The empty product is unit").
+#[test]
+fn the_empty_product_is_unit() {
+    let unit = Type::Base(BaseType::Unit);
+    assert_eq!(infer_program("x: {} = ()\nx"), unit);
+    assert_eq!(infer_program("x = ()\nx"), unit);
+    // `{}` really constrains: a non-unit value against it is an annotation error.
+    assert!(
+        !infer_program_err("x: {} = 1\nx").is_empty(),
+        "`{{}}` is the unit type, so an `Int` must not satisfy it"
+    );
 }
 
 /// A projection whose target's type is still a *variable* where the projection is

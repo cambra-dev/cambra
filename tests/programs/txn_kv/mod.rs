@@ -18,15 +18,18 @@
 //! by concurrent HTTP handlers is only correct if its state is transactional)
 //! and `hit_counter` (the request-stream aggregate).
 //!
-//! **Currently blocked at parsing.**  The `\` lambda now lexes; the next
-//! unsupported construct is `import http` (modules) and the `requires
-//! Transaction` contextual-parameter clause.  Behind those: `with begin()` /
+//! **Currently blocked at lexing.**  The `\` lambda now lexes; the first
+//! unsupported construct is the `` ` `` prefix on the `` `some ``/`` `none ``
+//! variant tags (`docs/chl-spec.md`, "6.5 Variants"),
+//! which the lexer rejects outright — and lexing is a whole-file pass, so it
+//! precedes every parse-level blocker.  Behind it: `import http` (modules),
+//! the `requires Transaction` contextual-parameter clause, `with begin()` /
 //! `abort()`, `match`, map-index assignment, structured requests, and
-//! `restrict` / `count`.  This pins the `requires Transaction` parse failure.
+//! `restrict` / `count`.  This pins the variant-tag lex failure.
 
 use super::common::expect_compile_error;
 
 #[test]
-fn txn_kv_currently_blocked_at_parsing() {
-    expect_compile_error(include_str!("program.cambra"), "requires Transaction");
+fn txn_kv_currently_blocked_at_lexing() {
+    expect_compile_error(include_str!("program.cambra"), "invalid token");
 }

@@ -367,6 +367,17 @@ pub enum Expr {
     /// `docs/chl-spec.md`): a tuple type `{T, U}`. Lowering interprets it as a
     /// [`crate::ccl::Type::Tuple`] in annotation position and rejects it in
     /// value position.
+    ///
+    /// Braces in type position are always a *product*, never grouping, which
+    /// fixes both ends of the arity range (`docs/chl-spec.md`, "2.4 Atoms"):
+    ///
+    /// - **One element** carries the trailing comma, `{T,}`, matching the
+    ///   term-level `(e,)`/`(e)` split. A comma-free `{T}` is rejected by the
+    ///   parser, so it never reaches this variant.
+    /// - **Zero elements** — `{}` — is the **unit type**, not a zero-field
+    ///   product (`docs/chl-spec.md`, "6.6 The empty product is unit"). Lowering
+    ///   maps the empty group there; it does *not* build an empty
+    ///   [`crate::ccl::Type::Tuple`], which is not a valid type.
     BraceGroup(Vec<Spanned<Expr>>),
 
     /// Subscript: `target[index]` — **collection lookup only**. Projecting a product
@@ -439,8 +450,6 @@ pub enum Lit {
     /// String literal with escapes already processed.
     String(String),
     Bool(bool),
-    /// Python `None` — the CHL unit value.
-    None,
 }
 
 /// A named field: `name=value` in an [`Expr::Record`] value, or `name: T` in
