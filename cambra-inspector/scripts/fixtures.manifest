@@ -1,0 +1,21 @@
+# The golden-fixture corpus: `<fixture-basename> <example-basename>` per line.
+#
+# Single source of truth for which example programs have committed snapshot
+# fixtures (web/src/__fixtures__/<fixture>.snapshot.json). Read by BOTH
+# regen-fixtures.sh (the regen/fix path and the ci.sh drift gate) and the cargo
+# golden tests (cambra-inspector/tests/goldens.rs), so the two can never
+# disagree about the corpus. Keep it bounded — every entry adds regen churn.
+arithmetic arithmetic
+polymorphic polymorphic
+list_min list_min
+# A deliberate type error -> the degraded (snapshotKind: "failed") payload.
+failed type_error
+# The recorder-fixes regression corpus (RT shapes from the fixed passes):
+# inline fan-out (RT-3): Derived(Inline) copies + window-2 stageLinks edges.
+udf_fanout udf_fanout
+# transactional store read at 2 sites per block (RT-4a subst_env freshening).
+txn_multi_read txn_multi_read
+# loop accumulator read at 2 sites (RT-4 letrec subst_env/scaffolding).
+mutation_loop mutation_loop
+# UDF-of-defer: try_lift_defer fires, lifted feed head keeps its id (RT-5).
+defer_lift defer_lift

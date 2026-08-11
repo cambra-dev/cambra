@@ -1,0 +1,9 @@
+# Inline fan-out (RT-3 shape). A scalar UDF called at two sites *at the same
+# type*: monomorphization makes one specialization, then `inline` duplicates the
+# body per call site — one copy preserves the input ids, the other is a
+# freshened `Replicated` copy tagged `Derived { via: Inline }`. This is what
+# makes the `post-inference -> post-desugar` stageLinks window non-empty.
+add1 = \x -> x + 1
+a = add1(10)
+b = add1(20)
+a + b

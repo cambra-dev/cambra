@@ -1,3 +1,12 @@
+[workspace]
+# The root `cambra` package is implicitly a workspace member; `cambra-inspector`
+# is the second member. Splitting serde + the inspector HTTP/frontend into a
+# separate crate is what keeps `cargo build -p cambra` serde-free: serde is an
+# optional, default-off feature here, pulled in only when `cambra-inspector`
+# (or `--features serde`) builds it. See projects/program-inspector/m1-static-plan.md §2.
+members = ["cambra-inspector"]
+resolver = "2"
+
 [package]
 name = "cambra"
 version = "0.1.0"
