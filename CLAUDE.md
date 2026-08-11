@@ -14,6 +14,7 @@ cargo clippy --release --all-targets -- -D warnings  # Lint (release) — CI run
 ./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + tests. Skips the release clippy pass, doc, shellcheck, doc-refs. ~1/3 the time of the full gate — use this while iterating.
 ./ci.sh --fix    # Authoritative gate: fmt + ALL FOUR clippy passes + doc + tests, auto-formatting first. Must pass before pushing a PR.
 cargo test -q --no-fail-fast      # Run all tests
+DEEP_TYPECHECK=1 ./ci.sh test     # Tests with the per-op typecheck GitHub CI runs; a bare ./ci.sh does NOT
 cargo test <name>  # Run a specific test by name
 ```
 
@@ -176,6 +177,14 @@ Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k
 ### Workflow
 
 After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. While iterating, `./ci.sh fast` (fmt + debug clippy + tests) is the quick check — roughly a third of the full gate's time. **Before creating or pushing a PR, run the full `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers and that `fast` skips: the other three clippy configurations (release, `serde`, lib-only) plus the doc build. A green debug `cargo clippy` (or `./ci.sh fast`) is not enough (see Build Commands above).
+
+**`./ci.sh` is still not everything CI runs.** The workflow also runs
+`DEEP_TYPECHECK=1 ./ci.sh test`, which enables the `deep-typecheck` feature: a
+typecheck after *every* rewrite, descending into refinement predicates. The
+always-on pass-boundary checks do not look inside predicates, so an ill-typed
+predicate is invisible to a fully green `./ci.sh` and red on GitHub. Run it
+whenever a change constructs, rewrites, or retypes a refinement predicate. It is
+off by default only because it is superlinear on nested comprehensions.
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
 

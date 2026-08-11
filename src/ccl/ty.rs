@@ -2347,6 +2347,20 @@ pub fn has_free_witness_ref(
     go(ty, &mut in_scope.to_vec())
 }
 
+/// Replace every occurrence of `binder` in `ty` by `candidate` — the same substitution
+/// [`SigmaType::instantiate_body`] performs, for a type that is **not** a sum's body.
+///
+/// A witness escapes its sum once a term is decomposed: a filter's predicate is indexed by
+/// the element, so its types name the witness while no `Σ` is in sight. Instantiating such
+/// a type means substituting at the occurrences, there being no binder to strip.
+pub fn instantiate_witness(
+    ty: &Type,
+    binder: crate::ccl::infer_var::WitnessBinderId,
+    candidate: &Type,
+) -> Type {
+    subst_witness_ref(ty, binder, candidate)
+}
+
 /// Point every **unbound** witness occurrence in `ty` at `binder`.
 ///
 /// Materialization is the only place that knows which sum a witness atom belongs to: the

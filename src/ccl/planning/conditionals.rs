@@ -35,6 +35,7 @@ pub(super) fn realize_conditional_collections(
 ) -> std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId> {
     let mut erased = std::collections::HashSet::new();
     let mut discharged = std::collections::HashSet::new();
+    bring_restrictions_under_their_sites_binder(expr);
     inline_restricted_conditionals(expr);
     realize_and_unbox(
         expr,
@@ -194,6 +195,17 @@ fn realize_and_unbox(
         }
         None => owed,
     };
+    // **A conditional inside a predicate is left entirely alone** — not only unrealized,
+    // but un-rewritten. It is a placeholder: the per-leg discharge replaces the whole
+    // predicate with one reading that leg's arm ([`predicate_under_the_leg`]), so nothing
+    // inside this copy survives to be compiled. Descending would only *break* it, and does:
+    // erasing the `box` off each arm leaves a `Case` joining collections over distinct
+    // domains, which is exactly the type error `box` exists to prevent. Nothing on the
+    // normal path notices — the pass-boundary typecheck does not descend into predicates —
+    // so it shows up only under the `deep-typecheck` feature.
+    if in_predicate && collection_value_ty(&expr.ty).is_some() && is_value_case(expr) {
+        return changed;
+    }
     // **Top-down.** An `elif` chain is a `Case` whose trailing arm is another `Case`, and
     // `flatten_trailing_value_case` collapses the chain into one N-choice partition —
     // which it can only do while the inner one is still a `Case`. Realizing children
@@ -282,6 +294,133 @@ fn instantiate_erased_in_type(
     }
 }
 
+/// α-convert each site's restriction onto that site's **own** witness binder.
+///
+/// A filter's predicate holds its own copy of the source, and inference types that copy
+/// independently — so the sum inside the predicate carries a *different* binder than the sum
+/// on the site, for one value. The two print identically (`σ` names no binder) and compare
+/// unequal, so the predicate is ill-typed against its own parameter: `__elem : σ₄` applied to
+/// a collection over `σ₇`. Nothing on the normal path looks — the pass-boundary typecheck
+/// does not descend into predicates — so it surfaces only under `deep-typecheck`, at the
+/// point planning compiles the predicate.
+///
+/// A binder is bound, so renaming one changes nothing about the type
+/// ([`SigmaType::rename_binder`](crate::ccl::ty::SigmaType::rename_binder)); what it changes
+/// is what the *rest* of the type may name. The predicate rides the domain under the site's
+/// binder, so a sum in it describing the same value belongs under that binder — the same
+/// reading that brings a variable's sum-typed lower bounds under one binder before anything
+/// opens them.
+///
+/// Whole-tree rather than per-site because a predicate rides **several** type slots (the
+/// site's own, a `Cast` target, the consumer's parameter) as one shared `Rc`, and they must
+/// agree: renaming the site's copy alone leaves the consumer's parameter naming the binder
+/// that was renamed away.
+///
+/// Sameness is keyed on the **candidate list**, the only key available across copies, so a
+/// copy claimed by two different sites is left alone rather than assigned to either. Witness
+/// identity minted at the value is what would retire the key; until then it is the same one
+/// [`read_the_arm_instead`] matches on, and this makes it agree with identity afterwards.
+fn bring_restrictions_under_their_sites_binder(expr: &mut Expr) {
+    let mut renames = std::collections::HashMap::new();
+    let mut claimed_twice = std::collections::HashSet::new();
+    collect_renames(expr, &mut renames, &mut claimed_twice);
+    renames.retain(|copy, _| !claimed_twice.contains(copy));
+    if !renames.is_empty() {
+        rename_witnesses(expr, &renames, &PredMemo::new());
+    }
+}
+
+fn collect_renames(
+    expr: &Expr,
+    renames: &mut std::collections::HashMap<
+        crate::ccl::infer_var::WitnessBinderId,
+        crate::ccl::infer_var::WitnessBinderId,
+    >,
+    claimed_twice: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+) {
+    if let Some((binder, owed)) = restriction_on_a_witness(&expr.ty) {
+        let mut copies = std::collections::HashSet::new();
+        same_sum_binders(&owed.restriction.predicate, &owed.kind, binder, &mut copies);
+        for copy in copies {
+            if *renames.entry(copy).or_insert(binder) != binder {
+                claimed_twice.insert(copy);
+            }
+        }
+    }
+    expr.walk_children(|child| collect_renames(child, renames, claimed_twice));
+}
+
+/// The binders of every sum in `expr`'s types that lists exactly `kind`'s candidates and is
+/// **not** already `binder` — the copies of one sum, minted apart.
+fn same_sum_binders(
+    expr: &Expr,
+    kind: &crate::ccl::ty::TypeKind,
+    binder: crate::ccl::infer_var::WitnessBinderId,
+    out: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+) {
+    fn in_type(
+        ty: &Type,
+        kind: &crate::ccl::ty::TypeKind,
+        binder: crate::ccl::infer_var::WitnessBinderId,
+        out: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+    ) {
+        if let Type::Sigma(s) = ty
+            && s.kind() == kind
+            && s.binder() != binder
+        {
+            out.insert(s.binder());
+        }
+        ty.walk_children(|child| in_type(child, kind, binder, out));
+    }
+    expr.walk_type_slots(|ty| in_type(ty, kind, binder, out));
+    expr.walk_children(|child| same_sum_binders(child, kind, binder, out));
+}
+
+fn rename_witnesses(
+    expr: &mut Expr,
+    renames: &std::collections::HashMap<
+        crate::ccl::infer_var::WitnessBinderId,
+        crate::ccl::infer_var::WitnessBinderId,
+    >,
+    memo: &PredMemo<()>,
+) {
+    fn in_type(
+        ty: &mut Type,
+        renames: &std::collections::HashMap<
+            crate::ccl::infer_var::WitnessBinderId,
+            crate::ccl::infer_var::WitnessBinderId,
+        >,
+    ) {
+        ty.walk_children_mut(|child| in_type(child, renames));
+        match ty {
+            Type::WitnessRef(w) => {
+                if let Some(to) = renames.get(w) {
+                    *ty = Type::WitnessRef(*to);
+                }
+            }
+            // The body's occurrences were renamed by the walk above, so the binder itself is
+            // all that is left to move.
+            Type::Sigma(s) => {
+                if let Some(to) = renames.get(&s.binder()) {
+                    *ty = Type::Sigma(Box::new(crate::ccl::ty::SigmaType::bound(
+                        crate::ccl::ty::Witness::bound_to(*to, s.kind().clone()),
+                        (*s.body).clone(),
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    expr.walk_type_slots_mut(|ty| {
+        walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+            rename_witnesses(pred, renames, memo);
+            true
+        });
+        in_type(ty, renames);
+    });
+    expr.walk_children_mut(|child| rename_witnesses(child, renames, memo));
+}
+
 /// The restriction a consuming site placed **on a witness**, with the binder it names.
 ///
 /// `Σ σ ∈ 𝐾. ({σ | 𝑝} ⤇ 𝑉)` — a filtered comprehension over a conditional collection. The
@@ -323,6 +462,44 @@ fn witness_named_by(ty: &Type) -> Option<crate::ccl::infer_var::WitnessBinderId>
             _ => None,
         },
     }
+}
+
+/// `predicate` as it reads **under leg `i`**: the conditional replaced by `arm`, and the
+/// witness instantiated to that arm's domain.
+///
+/// Both halves are one act, and the second is not bookkeeping. A filter's predicate is
+/// *indexed by the element* (`__elem ▷ src ▷ 𝑓`), so `__elem` is typed by the witness the
+/// sum's domain names. Swap `src` for a concrete arm and leave the index alone and the
+/// application is ill-typed — `expected σ, found [0, 1]` — which nothing on the normal path
+/// checks, since the always-on pass-boundary typecheck does not descend into predicates
+/// (the `deep-typecheck` feature does, and this is what it caught).
+fn predicate_under_the_leg(
+    predicate: &Expr,
+    binder: crate::ccl::infer_var::WitnessBinderId,
+    kind: &crate::ccl::ty::TypeKind,
+    arm: &Expr,
+    arm_dom: &Type,
+) -> Expr {
+    let mut out = read_the_arm_instead(predicate, binder, kind, arm);
+    instantiate_witness_in_types(&mut out, binder, arm_dom, &PredMemo::new());
+    out
+}
+
+/// Instantiate `binder` to `candidate` throughout a term's **types**, predicates included.
+fn instantiate_witness_in_types(
+    expr: &mut Expr,
+    binder: crate::ccl::infer_var::WitnessBinderId,
+    candidate: &Type,
+    memo: &PredMemo<()>,
+) {
+    expr.walk_type_slots_mut(|ty| {
+        walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+            instantiate_witness_in_types(pred, binder, candidate, memo);
+            true
+        });
+        *ty = crate::ccl::ty::instantiate_witness(ty, binder, candidate);
+    });
+    expr.walk_children_mut(|child| instantiate_witness_in_types(child, binder, candidate, memo));
 }
 
 /// `predicate` with the conditional it reads replaced by `arm`.
@@ -370,6 +547,18 @@ fn read_the_arm_instead(
     out
 }
 
+/// A **value**-`Case` — guardless arms selecting a value, as opposed to a pattern `match`.
+/// The form realization rewrites, and the form a filter's predicate carries a copy of.
+fn is_value_case(expr: &Expr) -> bool {
+    matches!(
+        &expr.node,
+        TypedExprNode::Case {
+            scrutinee: None,
+            branches,
+        } if branches.iter().all(|b| b.pattern.is_none())
+    )
+}
+
 /// Returns whether this node was realized — load-bearing, not bookkeeping: a `Case` inside
 /// a **refinement predicate** is rewritten through [`PredMemo::rebuild`], which *discards*
 /// the rewrite when the caller reports no change. A realization that forgot to report would
@@ -380,14 +569,7 @@ fn realize_here(
     owed: &OwedRestrictions,
     discharged: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
 ) -> bool {
-    let TypedExprNode::Case {
-        scrutinee: None,
-        branches,
-    } = &expr.node
-    else {
-        return false;
-    };
-    if !branches.iter().all(|b| b.pattern.is_none()) {
+    if !is_value_case(expr) {
         return false;
     }
     let Some(value_ty) = collection_value_ty(&expr.ty) else {
@@ -425,7 +607,7 @@ fn realize_here(
             Builtin::Const,
             Type::fun(arm_dom.clone(), bool_ty.clone()),
         );
-        let refined = refine_with(arm_dom, &gate_fn);
+        let refined = refine_with(arm_dom.clone(), &gate_fn);
         let arm = unbox(b.body, None).0;
         // **Discharge the site's restriction into this leg.** Realization materializes the
         // witness, so it owes what the consuming site placed on it — and the leg is the one
@@ -436,11 +618,12 @@ fn realize_here(
                 discharged.insert(binder);
                 Type::Refinement(
                     Box::new(refined),
-                    crate::ccl::Refinement::born(std::rc::Rc::new(read_the_arm_instead(
+                    crate::ccl::Refinement::born(std::rc::Rc::new(predicate_under_the_leg(
                         &owed.restriction.predicate,
                         binder,
                         &owed.kind,
                         &arm,
+                        &arm_dom,
                     ))),
                 )
             }
@@ -758,9 +941,23 @@ mod tests {
             int.clone(),
         ));
         let guard = |b: bool| Expr::lit(Lit::Bool(b)).with_ty(Type::Base(BaseType::Bool));
+        // Each arm is **boxed**, as inference leaves it: two collections over distinct
+        // domains have no common type, so the arms of a conditional that types as a sum
+        // are one-candidate sums themselves. An unboxed arm is not merely unrealistic
+        // here — it is ill-typed, which the `deep-typecheck` feature checks at every
+        // rewrite `substitute` performs.
         let arm = |dom: usize| {
-            Expr::new(TypedExprNode::Var(Name::from("xs")))
-                .with_ty(Type::data_fun(Type::UIntRange(dom), int.clone()))
+            let coll = Type::data_fun(Type::UIntRange(dom), int.clone());
+            let aw = fresh_witness_binder_id();
+            let boxed = Type::Sigma(Box::new(SigmaType::bound(
+                Witness::bound_to(aw, TypeKind::Enumerated(vec![coll.clone()])),
+                Type::WitnessRef(aw),
+            )));
+            Expr::apply(
+                Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(coll.clone()),
+                Expr::builtin(Builtin::Box).with_ty(Type::fun(coll, boxed.clone())),
+            )
+            .with_ty(boxed)
         };
         let bind_to = |consumer_ty: Type| {
             Expr::let_bind(
