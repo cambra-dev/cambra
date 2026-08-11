@@ -44,7 +44,8 @@ use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
     apply_primitive, cast_target_refinement, flatten_trailing_value_case, is_free,
-    is_free_in_value, peel_refinements, refine_with, synthesize_arm_predicate, typed_compose,
+    is_free_in_value, peel_refinements, refine_with, strip_refinements, synthesize_arm_predicate,
+    typed_compose,
 };
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
