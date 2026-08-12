@@ -78,14 +78,35 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static A: Counting = Counting;
 
+/// An open measurement window on the current thread, closed when dropped.
+///
+/// The guard exists so that no path can leave a window open. A `body` that
+/// panics — a failing assertion inside one of these tests is exactly that —
+/// would otherwise leave `COUNTING` set, and every later window on the same
+/// thread would then be measuring from an armed counter it did not arm.
+struct Window;
+
+impl Window {
+    /// Zero this thread's counter and arm it.
+    fn open() -> Self {
+        ALLOCS.set(0);
+        COUNTING.set(true);
+        Window
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        COUNTING.set(false);
+    }
+}
+
 /// Allocations the calling thread performs while running `body`. Other threads'
 /// allocations are not counted — see the module docs for why that is the
 /// measurement the assertions want.
 fn allocations(body: impl FnOnce()) -> usize {
-    ALLOCS.set(0);
-    COUNTING.set(true);
+    let _window = Window::open();
     body();
-    COUNTING.set(false);
     ALLOCS.get()
 }
 
@@ -137,4 +158,49 @@ fn the_probe_counts_allocations_made_by_the_measuring_thread() {
         allocs, 1,
         "one `Vec::with_capacity` is one allocation; the probe saw {allocs}"
     );
+}
+
+/// The other half of that: a window must see *only* its own thread. This is the
+/// property the whole probe rests on, and the one a global counter silently
+/// loses — swap the counters back for process-global ones and this reports 1002
+/// rather than 0, the worker's thousand plus two the test harness happened to
+/// make, while both assertions above stay green.
+///
+/// The window has to bracket the worker's allocating loop and nothing else.
+/// Spawning heap-allocates the closure and the result slot *on the spawning
+/// thread*, and joining does bookkeeping of its own, so a window drawn around
+/// `thread::scope` counts those — correctly, as its own — and drowns the signal.
+/// Hence the handshake: two `AtomicBool`s, which spin without allocating.
+#[test]
+fn another_threads_allocations_are_not_charged_to_this_window() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const N: usize = 1000;
+
+    let go = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !go.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            for _ in 0..N {
+                std::hint::black_box(Vec::<u8>::with_capacity(64));
+            }
+            done.store(true, Ordering::Release);
+        });
+
+        let allocs = allocations(|| {
+            go.store(true, Ordering::Release);
+            while !done.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        });
+
+        assert_eq!(
+            allocs, 0,
+            "another thread's allocations were charged to this window: {allocs}"
+        );
+    });
 }
