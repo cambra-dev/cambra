@@ -8,33 +8,69 @@
 //!
 //! `is_free_in_value` is the right probe — unlike `is_free` it threads no
 //! `visited` set, so nothing but the walk itself can allocate.
+//!
+//! # The window is per-thread, and has to be
+//!
+//! "Allocations during a window of wall-clock time" is not the property under
+//! test; "allocations *this thread* made during the walk" is. A process-global
+//! counter conflates them, and the difference is not hypothetical: libtest runs
+//! each test on a spawned thread and its main thread keeps working right
+//! afterwards, doing exactly four one-time allocations before it blocks —
+//! `running_tests.insert` (first insert into an empty `HashMap`),
+//! `timeout_queue.push_back` (first push into an empty `VecDeque`), and two
+//! inside the first blocking `rx.recv_timeout`. If the spawned test thread wins
+//! the race to the walk, a global counter charges all four to the walk. That is
+//! a real observed failure ("the scoped walk allocated 4 times") — rare, because
+//! the main thread normally finishes those four before a freshly spawned thread
+//! is scheduled at all, but reachable whenever the main thread is preempted
+//! right after the spawn, which is what a loaded CI runner does.
+//!
+//! Counting per-thread costs nothing in strength. The walk is a plain recursive
+//! fold that spawns nothing, so every allocation it could make is made by the
+//! thread that armed the window; the counter still sees all of them and now
+//! sees only them.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use cambra::ccl::TypedBinding;
 use cambra::ccl::ccl_utils::is_free_in_value;
 use cambra::ccl::{Name, TypedExpr};
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static COUNTING: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Allocations this thread has made since it armed its window.
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    /// Is this thread's measurement window open?
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
 
 struct Counting;
 
+impl Counting {
+    /// Charge one allocation to the current thread, if its window is open.
+    ///
+    /// Both thread-locals are `const`-initialized and hold a type with no
+    /// destructor, so the access is a direct TLS read: no lazy initializer, no
+    /// destructor registration, and so no allocation. That matters here and not
+    /// just for accuracy — an allocating counter inside `GlobalAlloc` would
+    /// recurse.
+    fn charge() {
+        if COUNTING.get() {
+            ALLOCS.set(ALLOCS.get() + 1);
+        }
+    }
+}
+
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) != 0 {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
+        Self::charge();
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) != 0 {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
+        Self::charge();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -42,14 +78,36 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static A: Counting = Counting;
 
-/// Allocations performed while running `body`. Single-threaded by construction —
-/// this file holds one test so no other thread is inside the window.
+/// An open measurement window on the current thread, closed when dropped.
+///
+/// The guard exists so that no path can leave a window open. A `body` that
+/// panics — a failing assertion inside one of these tests is exactly that —
+/// would otherwise leave `COUNTING` set, and every later window on the same
+/// thread would then be measuring from an armed counter it did not arm.
+struct Window;
+
+impl Window {
+    /// Zero this thread's counter and arm it.
+    fn open() -> Self {
+        ALLOCS.set(0);
+        COUNTING.set(true);
+        Window
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        COUNTING.set(false);
+    }
+}
+
+/// Allocations the calling thread performs while running `body`. Other threads'
+/// allocations are not counted — see the module docs for why that is the
+/// measurement the assertions want.
 fn allocations(body: impl FnOnce()) -> usize {
-    ALLOCS.store(0, Ordering::Relaxed);
-    COUNTING.store(1, Ordering::Relaxed);
+    let _window = Window::open();
     body();
-    COUNTING.store(0, Ordering::Relaxed);
-    ALLOCS.load(Ordering::Relaxed)
+    ALLOCS.get()
 }
 
 #[test]
@@ -84,4 +142,65 @@ fn a_freeness_query_over_a_letrec_spine_does_not_allocate() {
          substitution, so the walk must borrow its binder group rather than \
          collecting it into a Vec"
     );
+}
+
+/// The probe has to be able to *see* an allocation, or the assertion above
+/// passes for the wrong reason. A zero-allocation claim measured by a counter
+/// that counts nothing is vacuous, and nothing else in this file would notice —
+/// so pay one allocation on the measuring thread and check it lands.
+#[test]
+fn the_probe_counts_allocations_made_by_the_measuring_thread() {
+    let allocs = allocations(|| {
+        let v: Vec<u8> = Vec::with_capacity(64);
+        std::hint::black_box(&v);
+    });
+    assert_eq!(
+        allocs, 1,
+        "one `Vec::with_capacity` is one allocation; the probe saw {allocs}"
+    );
+}
+
+/// The other half of that: a window must see *only* its own thread. This is the
+/// property the whole probe rests on, and the one a global counter silently
+/// loses — swap the counters back for process-global ones and this reports 1002
+/// rather than 0, the worker's thousand plus two the test harness happened to
+/// make, while both assertions above stay green.
+///
+/// The window has to bracket the worker's allocating loop and nothing else.
+/// Spawning heap-allocates the closure and the result slot *on the spawning
+/// thread*, and joining does bookkeeping of its own, so a window drawn around
+/// `thread::scope` counts those — correctly, as its own — and drowns the signal.
+/// Hence the handshake: two `AtomicBool`s, which spin without allocating.
+#[test]
+fn another_threads_allocations_are_not_charged_to_this_window() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const N: usize = 1000;
+
+    let go = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !go.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            for _ in 0..N {
+                std::hint::black_box(Vec::<u8>::with_capacity(64));
+            }
+            done.store(true, Ordering::Release);
+        });
+
+        let allocs = allocations(|| {
+            go.store(true, Ordering::Release);
+            while !done.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        });
+
+        assert_eq!(
+            allocs, 0,
+            "another thread's allocations were charged to this window: {allocs}"
+        );
+    });
 }
