@@ -23,6 +23,7 @@ use cambra::ccl::{
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
+use indoc::indoc;
 use rstest::rstest;
 
 // ---------------------------------------------------------------------------
@@ -584,6 +585,105 @@ fn test_collection_union_heterogeneous_rejected() {
 // ---------------------------------------------------------------------------
 // GroupBy + aggregate tests
 // ---------------------------------------------------------------------------
+
+// A group-by's key type is its key function's codomain, and the lowering says so
+// **directly** rather than leaving it to be recovered through the partition
+// predicate's `==`.
+//
+// `__gb_k`'s only occurrence in the lowered shape is as an operand of that
+// comparison, so without a stated relation its type can only arrive backwards
+// along the operand requirement that relates a comparison's two sides — making a
+// group-by's key inference depend on an operator's internals. One
+// `Type::SharedHole` states it, carried by the key application and by the domain of
+// the group-by's own `data_fun` annotation; these cases pin that the key resolves
+// to the key function's result type and not to the collection's element type.
+//
+// The relation is **not** visible in `test_lower_groupby`'s snapshots, because
+// `symbolic` does not render annotations. These are the tests that cover it.
+#[rstest]
+#[case("groupby([1, 2, 3], \\x -> x)", int())]
+#[case("groupby([(a=1, b=\"w\"), (a=2, b=\"e\")], \\r -> r.b)", string())]
+fn test_groupby_key_type_comes_from_the_key_function(#[case] code: &str, #[case] key_ty: Type) {
+    let ty = infer_program(code);
+    let Type::Fun { domain, .. } = &ty else {
+        panic!("a group-by is a function from key to partition, got {ty}");
+    };
+    assert_eq!(**domain, key_ty, "wrong key type for {code}");
+}
+
+/// The key type of the group-by in `code`'s result, which is expected to be a
+/// tuple of two group-bys — one per instantiation / occurrence under test.
+fn groupby_key_types(code: &str) -> (Type, Type) {
+    let ty = infer_program(code);
+    let Type::Tuple(parts) = &ty else {
+        panic!("expected a pair of group-bys, got {ty}");
+    };
+    let key_of = |t: &Type| match t {
+        Type::Fun { domain, .. } => (**domain).clone(),
+        other => panic!("a group-by is a function from key to partition, got {other}"),
+    };
+    (key_of(&parts[0]), key_of(&parts[1]))
+}
+
+// A `SharedHole` id states an identity, and that identity is scoped to the one
+// lowered construct that minted it. Sharing is the whole point of the marker, so
+// over-sharing is its characteristic failure — and it has two shapes, one per
+// case here. Both collapse the two key types into a single variable, so both
+// surface the same way: not as a wrong key type but as an `Int | String`
+// collision that rejects the program outright.
+//
+//   - **Across instantiations of one construct.** A `def` is lowered once, so
+//     its body carries one id however many times it is called. What keeps the
+//     instantiations apart is not the marker but ordinary generalization:
+//     `normalize_annotation` resolves the id to an inference variable minted at
+//     the current level, and from then on freshening treats it like any other
+//     quantified variable. The `def` here is the case that would notice if it
+//     did not — e.g. if the variable were minted at level 0 and so never
+//     generalized (the level caveat on `InferCtx::shared_holes`).
+//   - **Across distinct constructs.** The id → variable memo lives on the
+//     inference context, so every group-by in a program shares one table; ids
+//     minted per construct must stay distinct within a lowering.
+#[rstest]
+#[case::polymorphic_def(indoc! {r#"
+    def by_key(c, f):
+        groupby(c, f)
+    ints = by_key([1, 2, 3], \x -> x)
+    strs = by_key([(a=1, b="w"), (a=2, b="e")], \r -> r.b)
+    (ints, strs)
+"#})]
+#[case::two_occurrences(indoc! {r#"
+    ints = groupby([1, 2, 3], \x -> x)
+    strs = groupby([(a=1, b="w"), (a=2, b="e")], \r -> r.b)
+    (ints, strs)
+"#})]
+fn test_groupby_key_relation_is_per_occurrence(#[case] code: &str) {
+    assert_eq!(groupby_key_types(code), (int(), string()), "for {code}");
+}
+
+// The tests above pin what a group-by's key type *resolves to*; this one pins
+// that the key type is still **enforced** at a lookup. Stating the relation on
+// the `data_fun` annotation makes the edge directional (`key_ty <: ⟨domain⟩` —
+// contravariance), and a directional edge is exactly the kind that can go slack
+// without any test noticing: every case above would still pass if a lookup at an
+// unrelated key type were silently accepted.
+//
+// Asserted on the rendered message rather than the error *variant*: which check
+// catches this is a property of how `==` is typed, not of the key relation, so
+// pinning the variant would make the test fail on any change to that — it says
+// only that the two types met and were refused.
+#[test]
+fn test_groupby_lookup_at_wrong_key_type_rejected() {
+    let errs = infer_program_err(indoc! {r#"
+        groups = groupby([(a=1, b="w"), (a=2, b="e")], \r -> r.b)
+        groups(1)
+    "#});
+    assert!(
+        errs.iter()
+            .map(|e| format!("{e:?}"))
+            .any(|msg| msg.contains("Int") && msg.contains("String")),
+        "expected the Int key to be rejected against the String key type, got {errs:?}"
+    );
+}
 
 #[test]
 fn test_groupby_aggregate() {

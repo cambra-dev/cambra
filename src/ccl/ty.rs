@@ -555,6 +555,20 @@ pub enum Type {
     /// `UnresolvedHole` (treat as a compiler bug, not a user-facing error).
     /// Created exclusively by [`TypedExpr::new`] and [`crate::ccl::TypedBinding::new_unannotated`].
     Hole,
+    /// A [`Hole`](Type::Hole) with an **identity**: every occurrence carrying the
+    /// same id normalizes to the *same* inference variable.
+    ///
+    /// This is how lowering states a relation between two type positions it cannot
+    /// name. A plain `Hole` says "infer this", and each occurrence gets its own
+    /// fresh variable; `SharedHole(id)` says "infer this, and it is the same one as
+    /// that" — the weakest thing that lets a desugaring connect two positions whose
+    /// common type only inference will learn.
+    ///
+    /// **Transient, like `Hole`**: `normalize_annotation` resolves it, and a
+    /// survivor is a compiler bug (`UnresolvedHole`). Ids are minted per
+    /// [`LoweringContext`](crate::ccl::lower::LoweringContext) and are meaningless
+    /// outside the tree they were minted for.
+    SharedHole(u32),
     /// Unresolved type variable, identified by a unique [`crate::ccl::InferVarId`].
     ///
     /// Created during inference by the inference pass
@@ -774,6 +788,9 @@ impl fmt::Display for Type {
                 None => write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate)),
             },
             Type::Hole => write!(f, "_"),
+            // A hole with an identity renders as one: `_#0` and `_#1` are distinct
+            // requests, two `_#0`s are the same one.
+            Type::SharedHole(id) => write!(f, "_#{id}"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
             Type::ChanDom(name, _) => write!(f, "chan({name})"),
@@ -989,6 +1006,7 @@ impl Type {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -1023,6 +1041,7 @@ impl Type {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -1064,6 +1083,7 @@ impl Type {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)

@@ -950,7 +950,8 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Txn
-        | Type::Hole => ty.clone(),
+        | Type::Hole
+        | Type::SharedHole(_) => ty.clone(),
         Type::Fun {
             name,
             kind,

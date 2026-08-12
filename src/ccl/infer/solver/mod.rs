@@ -91,7 +91,12 @@ pub fn type_level(ty: &Type) -> Level {
         // instantiation), which reads it directly and is exempted from the
         // `type_level` short-circuit.
         Type::ChanDom(..) => 0,
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => 0,
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::SharedHole(_) => 0,
     }
 }
 
