@@ -66,13 +66,18 @@ carry-forward, so channels never close a causal cycle — see [merge laws](#the-
 | `with begin():` transaction | `Txn`, an anonymous total order issued by the runtime | `get_prev_txn` |
 | `while` loop *(future)* | a prefix of `Nat` bounded by the running condition | `get_prev_seq` over a self-ceiling domain |
 
-A mutable variable's domain is fixed by **where it is introduced**, which is why an introduction may not
-sit inside the context that would sequence it. A `:=` inside a `for` body, or inside a
+A mutable variable's domain is the domain of the context that **writes** it (`Txn` excepted — never
+inferred, always spelled at the introduction). What the **introduction** site fixes is not that
+domain but the constraint that it must sit *outside* the context that would sequence the mutable variable.
+A `:=` inside a `for` body, or inside a
 `with begin():` block, would need a domain nested within the enclosing one — the loop's iteration
 extent per iteration, or a `Txn` order per transaction — and neither the recurrence nor the commit
-model has a carrier for that. Both are rejected at lowering, at every spelling: an annotation on
-the introduction says nothing about whether it introduces a mutable variable, so gating on one accepted
-`y := 0` and rejected `y: Mut(Int) := 0` for the same construct. The fallback that rejection
+model has a carrier for that. The **`for` body** is rejected at lowering, at every spelling: an
+annotation on the introduction says nothing about whether it introduces a mutable variable, so gating on one
+accepted `y := 0` and rejected `y: Mut(Int) := 0` for the same construct. The **block** has no gate
+of its own and is a diagnostic gap: lowering emits the `:=` as a *write*, so the program is rejected
+at inference as `Unbound variable`, naming neither the construct nor the alternative. The rejection
+is right; the message is about the wrong thing. The fallback that rejection
 replaces is a per-iteration shadowing `let`, which silently discards each update at the boundary —
 the failure `:=` exists to make impossible.
 
@@ -238,17 +243,15 @@ only after inference. Lowering never tracks it — there is no lowering-side mut
 what keeps lowering a pure representation change: it emits the markers above by *shape and scope
 alone*, and every decision that needs mutability happens later, keyed on the type.
 
-Lowering's two choices, both scope-only:
+Lowering's one classification choice is scope-only: `x := e` where `x` is out of scope is an
+introduction — a `MutDecl` binding `x` at `Mut(𝑉, 𝐷)` (`𝐷 = Txn` iff annotated `Mut(𝑉, Txn)`, else a
+`Hole` the phase resolves). `x := e` / `x += e` where `x` is in scope is a write — a bare
+`MutWrite(x, e)`. The choice is membership in the ambient scope set (which lowering already threads
+for other reasons); it consults no mutability record.
 
-- **Introduction vs. write.** `x := e` where `x` is out of scope is an introduction — a
-  `let x = e` whose binding is stamped `Mut(𝑉, 𝐷)` (`𝐷 = Txn` iff annotated `Mut(𝑉, Txn)`, else a
-  `Hole` the phase resolves). `x := e` / `x += e` where `x` is in scope is a write — a bare
-  `MutWrite(x, e)`. The choice is membership in the ambient scope set (which lowering already
-  threads for other reasons); it consults no mutability record.
-- **Loop shape.** Every `for` becomes a `For` marker (above). Lowering does not decide
-  generator-vs-mutation.
-
-Everything mutability-dependent is then a post-inference decision on the `Type::History`:
+Lowering decides nothing about the loop: every `for` becomes a `For` marker (above), generator
+and mutating alike, because the classification needs a type that does not exist yet. Everything
+mutability-dependent is a post-inference decision on the `Type::History`:
 
 1. **Writes require a mutable** (`MutWrite` target must be `Mut`, above). A `+=` / `:=` to a plain
    binding is a type error, not a shadow. This is the single rule that makes "declare it with `:=`"
@@ -476,7 +479,10 @@ CHL source
   → uniquify
   → infer + check      (on the surface-CCL tree; Feed(V) with a rigid ChanDom domain types the defers)
   → inline             (UDFs — incl. writers and defer-mediating lambdas — reach their call sites)
-  → mut_elim           (overwrite-mutability elimination: collect mutable state + emit causal LetRec,
+  → transact_phase     (the transactional slice of overwrite elimination, and the three rejection
+                        gates ahead of it: strip each `with begin():` site → commit records +
+                        Txn histories; runs first so the induction slice never sees a txn loop)
+  → mut_elim           (the induction slice: collect mutable state + emit causal LetRec,
                         writer bodies decision-factored; eliminates For / MutWrite)
   → channelize         (append-mutability elimination: route feeds on the LetRec tree; erase ChanDom
                         by substitution; eliminates Feed / Defer)
