@@ -37,6 +37,7 @@ Review the changes against these standards:
   - Efficient ownership, borrowing, and lifetime management.
   - Leveraging the type system (Newtype pattern, Enums) for safety.
 - **Maintainability**: Code readability, naming clarity, and modularity.
+  - Testing: ensure that the tests correctly assert the core logic of the new features, or prevent the errors claimed.
 - **Performance**: Pipelining, parallelization, and dataflow efficiency (per Cambra's goals).
 - **Prioritize Impactful Feedback**
   - Ignore whitespace nits in markdown files (such as trailing whitespace).
