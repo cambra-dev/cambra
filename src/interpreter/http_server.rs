@@ -134,6 +134,99 @@ impl SharedHttpServer {
 }
 
 // ---------------------------------------------------------------------------
+// Test port reservation
+// ---------------------------------------------------------------------------
+
+/// Reserve a port for a test program's `http_serve`, held against every other
+/// concurrent test — thread or process — for the rest of this process's life.
+///
+/// **Test-only.** Shared through the default-off `test-helpers` feature so the
+/// integration-test crates hold one implementation rather than a copy each.
+///
+/// The obvious allocator — bind `:0`, read the port the kernel assigned,
+/// close — is unsound here, and flakily so.  Closing makes the port a *hint*
+/// that nothing owns: the listener that will really own it is
+/// [`SharedHttpServer::new`]'s, opened at the far end of `compile_program`, and
+/// until then `bind(:0)` in a *concurrently running test binary* is free to hand
+/// the very same port out again.  Both compiles then race to bind it and the
+/// loser fails with `EADDRINUSE`, surfacing as a lowering error from
+/// `http_serve`.  Under `cargo test`, where the http test binaries run alongside
+/// each other, that is the whole of the observed flakiness (measured: 13
+/// failures in 7200 allocations at 24-way concurrency, every one of them a port
+/// two processes had been handed at once).
+///
+/// So the reservation has to be held by something that outlives the hint.  An
+/// advisory lock on a per-port file does it: exclusive across processes,
+/// released by the OS on exit, so a crashed run cannot permanently blacklist
+/// a port the way a leftover lock *file* would.  Sequential allocation from
+/// `BASE` is then collision-free by construction rather than by luck — the
+/// lock, not chance, decides who gets a port.  The bind probe covers the one
+/// thing the lock cannot: a *foreign* process already listening there.
+///
+/// The exclusion has to hold *within* a process too, since `cargo test` runs a
+/// binary's tests as threads of one process.  It does because [`File::try_lock`]
+/// locks the open file description (`flock`, not a per-process `fcntl` lock), so
+/// the second `File::create` of the same path contends with the first exactly as
+/// another process would.  That property is what
+/// `tests/reserve_port.rs` pins: were it to lapse, this allocator would go back
+/// to handing one port to two callers, and the flakiness would return unchanged.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reserve_test_port() -> u16 {
+    use std::{fs::File, net::TcpListener, sync::Mutex};
+
+    /// Below the lowest `ip_local_port_range` floor in practice (32768 on
+    /// Linux, higher on macOS and Windows) so the kernel's own allocator
+    /// never draws from this band for outbound connections, and clear of the
+    /// privileged range.
+    const BASE: u16 = 20_000;
+    const SPAN: u16 = 10_000;
+
+    /// Every lock this process holds.  The reservation must outlive the call —
+    /// the server binds later, inside `compile_program` — and a test has no
+    /// scope to keep a guard in, so the locks live until the process exits.
+    static RESERVED: Mutex<Vec<File>> = Mutex::new(Vec::new());
+
+    let dir = std::env::temp_dir();
+    let mut last_create_err = None;
+    for candidate in BASE..BASE + SPAN {
+        let lock = match File::create(dir.join(format!("cambra-test-port-{candidate}.lock"))) {
+            Ok(lock) => lock,
+            // Failing to *create* the lock file is not a port being in use, and
+            // the causes are per-directory rather than per-port: a read-only or
+            // full `TMPDIR`, a descriptor limit, or a shared `/tmp` whose lock
+            // files belong to another user.  Each of those rejects all 10 000
+            // candidates, so without the error the loop reports port exhaustion
+            // and points the reader at concurrency limits instead.
+            Err(e) => {
+                last_create_err = Some(e);
+                continue;
+            }
+        };
+        if lock.try_lock().is_err() {
+            continue;
+        }
+        // Probe the same wildcard address `Server::http` will bind, so a
+        // listener on any interface — not just loopback — rules the port out.
+        if TcpListener::bind(("0.0.0.0", candidate)).is_err() {
+            continue;
+        }
+        RESERVED.lock().unwrap().push(lock);
+        return candidate;
+    }
+    match last_create_err {
+        Some(e) => panic!(
+            "no test port available in {BASE}..{}: could not create a lock file in {}: {e}",
+            BASE + SPAN,
+            dir.display(),
+        ),
+        None => panic!(
+            "no test port available in {BASE}..{}: every port is reserved or already bound",
+            BASE + SPAN,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 

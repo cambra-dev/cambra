@@ -7,14 +7,13 @@
 
 use std::{sync::mpsc, thread, time::Duration};
 
-use super::common::{compile_sink, drive_until, free_port, http_get, http_post, wait_for_bind};
+use super::common::{compile_sink, drive_until, http_get, http_post, reserve_test_port};
 
 #[test]
 fn http_greeter() {
-    let port = free_port();
+    let port = reserve_test_port();
     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
     let mut ctx = compile_sink(&source);
-    wait_for_bind();
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {
