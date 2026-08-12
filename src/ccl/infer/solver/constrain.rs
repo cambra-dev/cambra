@@ -816,24 +816,6 @@ fn constrain_go_impl(
             required: rhs.clone(),
         }),
 
-        // A non-`Mut` value meeting a `Mut` demand: deref the demand to its
-        // value. `x: Int = cnt` copies the current value; `MutWrite`
-        // reconciliation flows a written value into the mutable variable's value. Unlike a
-        // feed (where the write capability can't be conjured), a `Mut` demand is
-        // satisfied structurally by its value here, and the *second-class
-        // discipline check* — not the solver — is what rejects passing a
-        // non-variable (`bump(5)`, `bump(a + b)`) to a `Mut` parameter. (A
-        // `Mut`-lhs was already dereffed above; an `Infer`-lhs recorded the `Mut`
-        // as an upper bound — the `Mut`-param-via-variable case.)
-        (
-            _,
-            Type::History {
-                value,
-                kind: HistoryKind::Overwrite,
-                ..
-            },
-        ) => constrain_go(lhs, value, sl, sr, cache),
-
         // A nominal channel domain is *deferred-compatible* with any
         // domain-shaped type it meets — the assembly (channelize) is what
         // determines the concrete domain, and the strict post-channelize
@@ -1922,7 +1904,7 @@ mod tests {
 
     // The deref arm these two tests covered is gone: a mutable variable mention that denotes
     // its value is dereffed by the rule that emits it (`emit::emit_value_read`), so
-    // `Mut(V) <: τ` is no longer a subtyping fact and there is nothing to assert here.
+    // `Mut(V) <: V` is no longer a subtyping fact and there is nothing to assert here.
     // The property they protected — `cnt + 1` yields `Int` rather than leaving a `Mut`
     // on an inference variable — is now pinned where it is decided:
     // `a_register_read_yields_its_value_in_an_operand_position` in `tests/type_check.rs`,
@@ -1956,16 +1938,17 @@ mod tests {
     }
 
     #[test]
-    fn value_meets_mut_demand_derefs() {
-        // Int <: Mut(Int, D) — a plain value meeting a `Mut` demand derefs to the
-        // value (the discipline check, not the solver, rejects passing a
-        // non-variable to a `Mut` parameter). A conflicting value still fails.
+    fn a_value_does_not_satisfy_a_mut_demand() {
+        // `Int <: Mut(Int, D)` is **not** a subtyping fact, the mirror of
+        // `Mut(V) <: V` not being one: a mutable variable is neither above nor below its
+        // value, and a relation that coerces either way cannot tell a read from a
+        // handle. A position that means the value says so itself — `emit_apply`
+        // reads through the parameter's handle for a pass-by-reference argument,
+        // and every other operand derefs at `emit::emit_value_read`.
         let m = mut_ty(prim(BaseType::Int), prim(BaseType::UInt));
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&prim(BaseType::Int), &m, &mut cache).is_ok());
-        let mut cache = ConstrainCache::new();
         assert!(matches!(
-            constrain_subtype(&prim(BaseType::String), &m, &mut cache),
+            constrain_subtype(&prim(BaseType::Int), &m, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }

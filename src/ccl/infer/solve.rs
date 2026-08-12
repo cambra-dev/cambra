@@ -21,6 +21,7 @@
 
 use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::infer::InferError;
+use crate::ccl::infer::emit::read_through;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
     compact_type, constrain_subtype, freshen_expr_type_slots, seed_chan_dom_pairings,
@@ -1217,7 +1218,16 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // (The `Let` arm above composes to fixpoint precisely because it reads its
         // *body's* already-coalesced type; a spine link that does not propagate is a
         // hole in that composition.)
-        TypedExprNode::ExprStmt { body, .. } => Some(body.ty.clone()),
+        //
+        // Through the **deref**, because that is what the node's rule reports: an
+        // effect statement emits its continuation as a value operand
+        // (`emit_expr_stmt`'s `emit_value_read`), so a tail that reads a mutable variable denotes
+        // the mutable variable's *value*. Lifting `body.ty` verbatim would re-stamp the node
+        // with the handle the read just looked through, contradicting the rule that
+        // typed it — and the wall that re-runs that rule would then have to accept a
+        // value against a handle. A `Let` needs no deref here because it does not
+        // deref either (`emit_let` passes its body along; it cannot bind a mutable variable).
+        TypedExprNode::ExprStmt { body, .. } => Some(read_through(&body.ty)),
         // A mutable variable introduction lifts its body's type the same way, but has no
         // discharge available *here*: the term that names a mutable variable's value is minted
         // by `mut_elim`, several passes after closure is demanded. So a refinement that
@@ -1237,7 +1247,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                     label,
                 );
             }
-            Some(body.ty.clone())
+            // Dereffed for the same reason as `ExprStmt`: `emit_mut_decl` reports its
+            // body as a value operand, so `x := 0; …; x` denotes `x`'s value.
+            Some(read_through(&body.ty))
         }
         _ => None,
     };

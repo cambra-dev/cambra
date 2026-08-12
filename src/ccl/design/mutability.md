@@ -99,7 +99,7 @@ lets a feed be a plain output rather than a cyclic binding.)
 ### A mutable variable read is an explicit operation
 
 A mutable variable mention that denotes its **value** is dereffed by the rule that emits it
-(`infer::emit::emit_value_read`), not by the subtyping relation. `Mut(𝑉) <: 𝜏` is not a
+(`infer::emit::emit_value_read`), not by the subtyping relation. `Mut(𝑉) <: 𝑉` is not a
 subtyping fact.
 
 The handle survives in exactly **two** positions, and the second-class discipline is what
@@ -118,23 +118,32 @@ returning a `Mut`, and dereffing would silently accept the escape by turning it 
 read.
 
 That check reads what the body **denotes**, not what its root node is stamped with, and
-the difference is load-bearing. A tail position — a `Let` body, a statement's
-continuation, a mutable variable introduction's body — reports its continuation's *value*, so a
-program ending in a read of its accumulator has that accumulator's value rather than a
-handle. The same deref would hide an escape one line away from the boundary: reading the
+the difference is load-bearing. A **statement's continuation** and a **mutable variable
+introduction's body** report their continuation's *value* — they emit it as a value
+operand — so a program ending in a read of its accumulator has that accumulator's value
+rather than a handle. Their coalesce-time lifted type derefs for the same reason
+(`solve.rs`): a lift that copied the continuation's type verbatim would re-stamp the node
+with the handle the read just looked through, leaving the node's recorded type
+contradicting the rule that typed it. A **`Let` body** is the one tail that does *not*
+deref: a `Let` owns nothing — it cannot even bind a mutable variable — so it reports whatever its
+body reports, handle included, which is what leaves rule 2 an escape to catch. The same
+deref would hide an escape one line away from the boundary: reading the
 type alone, `λ 𝑐 → (𝑐 += 1; 𝑐)` looks like it returns an `Int` while `λ 𝑐 → 𝑐` returns the
 handle. So the escape check walks the tails to the term that actually produces the value.
 Every tail is walked, the mutable variable introduction included — a mutable variable does not escape its
 own introduction either, so returning one declared inside the function is the same escape
 as returning a parameter.
 
-Placing the deref in the relation instead was a coercion wearing a subtyping rule's
-clothes. It put `Mut(𝑉)` *below* `𝑉` while `Mut` is invariant in `𝑉`, and — because it
-fired against a fresh inference variable — nothing could distinguish a read from a handle
-being passed along. That is why passing a mutable variable to a `Mut(𝑉)` parameter used to need a
-separate compensating contribution: the handle was gone before invariance could see it.
-With the handle intact, invariance supplies both directions and the compensation is
-deleted.
+**Neither direction is a subtyping fact**, and the symmetry is the point: `Mut(𝑉) <: 𝑉`
+would put a mutable variable *below* its value and `𝑉 <: Mut(𝑉, 𝐷)` would put it *above*, while
+`Mut` is invariant in `𝑉`. Either one is a coercion wearing a subtyping rule's clothes,
+and — because both fire against a fresh inference variable — neither can distinguish a
+read from a handle being passed along. The relation therefore relates a mutable variable only to
+another mutable variable, by invariance, and every position that means the *value* says so in the
+rule that emits it: `emit::emit_value_read` for an ordinary operand, and `emit_apply` reading
+through the parameter's handle for the one position where a `Mut` parameter is given
+something that is not a mutable variable (a program the second-class discipline rejects, but which
+still has to be typed to be reported well).
 
 ## Surface language
 
@@ -283,7 +292,7 @@ Typing:
 - **Reads deref at the rule that emits them**: `cnt + 1`, `f(cnt)` for an `Int` parameter, and a
   trailing `cnt` all read, and each reads because the rule typing that position asks for a value
   operand (`emit::emit_value_read`). Only a position that *expects* `Mut` — a pass-by-reference
-  argument, a write's target — receives the handle. `Mut(𝑉) <: 𝜏` is deliberately not a subtyping
+  argument, a write's target — receives the handle. `Mut(𝑉) <: 𝑉` is deliberately not a subtyping
   fact; see [A mutable variable read is an explicit operation](#a-mutable-variable-read-is-an-explicit-operation)
   for why putting it in the relation could not distinguish a read from a handle passed along.
   After inlining, no `Mut`-expecting positions remain, so the phase's rewrite is purely structural

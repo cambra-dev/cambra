@@ -627,13 +627,35 @@ pub(super) fn emit_apply<C: Typing>(
     // that mints one (`lower::functions::uncurry_params`). Rule 2 guarantees the
     // mutable variable is the parameter itself and never nested inside it, so there is no
     // composite to walk.
-    let param_is_register = parameter_type(function, &fn_ty)
-        .and_then(Type::mut_value_type)
-        .is_some();
-    let arg_ty = if param_is_register {
-        raw_arg_ty
-    } else {
-        read_through(&raw_arg_ty)
+    let param_ty = parameter_type(function, &fn_ty).cloned();
+    let arg_ty = match (param_ty, raw_arg_ty.mut_value_type()) {
+        // A handle reaching its pass-by-reference parameter: invariance relates the two
+        // value types directly, in both directions.
+        (Some(param), Some(_)) if param.mut_value_type().is_some() => raw_arg_ty,
+        // A pass-by-reference parameter given something that is not a mutable variable
+        // (`bump(x)` for a plain `x`, `bump(x if c else y)` for a selection). The
+        // program is rejected either way — the discipline requires a `Mut` parameter's
+        // argument to be a mutable variable, and `check_mut_discipline` owns that diagnosis,
+        // which is the one worth reading — but the argument still has to be *typed*,
+        // since its own subtree is under-determined without an upper bound.
+        //
+        // So the value edge is emitted here, against the parameter's value, rather than
+        // left to the relation. A value meeting a handle is not a subtyping fact, and
+        // making it one is what put a coercion back in the lattice: the rule that knows
+        // this position is pass-by-reference is the rule that should read through the
+        // handle. The application edge below then relates handle to handle.
+        (Some(param), None) if param.mut_value_type().is_some() => {
+            let value = param
+                .mut_value_type()
+                .expect("guarded by the match arm")
+                .clone();
+            ctx.require_sub(&read_through(&raw_arg_ty), &value, &|| {
+                "pass-by-reference argument".to_string()
+            })?;
+            param
+        }
+        // Every other position is a value operand, so a mutable variable mention reads.
+        _ => read_through(&raw_arg_ty),
     };
     // The application's type is the function's codomain with its Pi binder
     // discharged to the argument (dependent application, design §5). `apply`
@@ -810,7 +832,7 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
 /// Deref a mutable variable reference to its value type. A no-op on every other
 /// type — a feed channel included, since reading one yields its whole stream
 /// rather than a scalar value ([`Type::mut_value_type`]).
-fn read_through(ty: &Type) -> Type {
+pub(super) fn read_through(ty: &Type) -> Type {
     ty.mut_value_type().unwrap_or(ty).clone()
 }
 
@@ -847,7 +869,7 @@ fn denoted_expr(e: &Expr) -> &Expr {
 /// operand it is about to constrain is a handle position without inspecting it.
 ///
 /// Dereffing *here* rather than inside the subtyping relation is the point. A rule
-/// `Mut(V) <: τ` reads as "a mutable variable is a subtype of its value", which is a coercion
+/// `Mut(V) <: V` reads as "a mutable variable is a subtype of its value", which is a coercion
 /// wearing a subtyping rule's clothes: it makes `Mut(V)` sit below `V` while `Mut` is
 /// invariant in `V`, and it fires against a fresh inference variable, so it cannot tell
 /// a read from a handle being passed along.
@@ -1443,7 +1465,13 @@ fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, Loca
     ctx.require_sub(&guard_ty, &prim(BaseType::Bool), &|| {
         "Case guard".to_string()
     })?;
-    ctx.subexpr(&mut b.body)
+    // A **value** operand: the arms join, and rule 2 keeps `Mut` out of every
+    // composite, so a mutable variable mention in an arm is a read. Letting the handle
+    // through instead makes the join itself `Mut`-typed — `x if c else y` over two
+    // mutable variables would denote a handle whose writer the compiler cannot trace, and
+    // the position that catches that (`bump(x if c else y)`) reads the argument
+    // *node*, not its type, precisely because the type is a value.
+    emit_value_read(&mut b.body, ctx)
 }
 
 pub(super) fn emit_variant_ctor<C: Typing>(
