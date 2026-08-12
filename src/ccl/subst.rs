@@ -36,7 +36,9 @@
 //!   stays intact and the common case allocates nothing).
 //! * **In-place rewrite** ([`Subst::rewrite_expr`]) mutates the *term tree* the
 //!   caller owns (lambda elimination, inlining, defer desugaring, lowering's
-//!   uncurrying). A predicate the substitution actually touches is rebuilt as a
+//!   uncurrying, and the mutability-elimination phases' read-your-writes
+//!   environments — see [`Subst::discharge_env_in_place`]). A predicate the
+//!   substitution actually touches is rebuilt as a
 //!   fresh `Rc`; one it doesn't — no substituted binder free in it — keeps its
 //!   `Rc`, exactly as transport mode does.
 //!
@@ -52,7 +54,7 @@
 //! substitution, so scope cannot be left out of the key.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, is_free, strip_iterate_markers};
@@ -700,6 +702,55 @@ impl Subst {
             return;
         }
         Subst::discharge(binder.clone(), term.clone()).rewrite_expr(e);
+    }
+
+    /// Discharge a whole **environment** `{name ↦ term, …}` over `e` in place —
+    /// every name at once, in one traversal.
+    ///
+    /// The env-shaped sibling of [`Self::discharge_in_place`], for the
+    /// read-your-writes environments the mutability-elimination phases thread
+    /// (`mut_elim`, `transact_phase`): a flat map with no binder structure,
+    /// applied to a whole subtree.
+    ///
+    /// **Simultaneous, not a fold of single-name discharges.** [`Subst`] is
+    /// already a simultaneous map, so this is a constructor, not a second
+    /// engine. The distinction is load-bearing rather than notional: a
+    /// sequential fold would re-substitute into a replacement that happens to
+    /// mention another env key, so `{a ↦ b, b ↦ 0}` would send `a` to `0`
+    /// instead of to `b`. A read-your-writes environment resolves each value
+    /// against the environment *before* storing it, so its range is key-free
+    /// today — but that is a property of the callers, not of the operation, and
+    /// the simultaneous reading is the one that stays right if a caller stores
+    /// an unresolved value.
+    ///
+    /// **Root-carry.** Each replaced occurrence keeps its **own** `NodeId`: the
+    /// replacement's root is built at the occurrence's id (so it inherits the
+    /// read site's span and attribution) and only its *interior* is freshened,
+    /// giving every read site a distinct identity. That contract lives in
+    /// [`Mapping::as_expr_preserving`] and [`Self::rewrite_expr_go`]; it is the
+    /// property a hand-rolled copy gets wrong by reaching for a whole-subtree
+    /// freshen, which discards the read site's identity along with the source
+    /// span the projection needs.
+    ///
+    /// Only the entries that actually occur free in `e` are cloned into the
+    /// substitution — the same "vacuous costs no clone" discipline as the
+    /// single-name sibling, and it pays more here: a writer's environment holds
+    /// one fully-inlined value per register, and most subtrees mention none of
+    /// them.
+    pub fn discharge_env_in_place(e: &mut TypedExpr, env: &HashMap<Name, TypedExpr>) {
+        let live: BTreeMap<Binder, Mapping> = env
+            .iter()
+            .filter(|(name, _)| is_free(name, e))
+            .map(|(name, term)| (name.clone(), Mapping::Discharge(Box::new(term.clone()))))
+            .collect();
+        Subst(live).rewrite_expr(e);
+    }
+
+    /// [`Self::discharge_env_in_place`] by value, for the callers that own (or
+    /// clone) the subtree and want the result back.
+    pub fn discharge_env(mut e: TypedExpr, env: &HashMap<Name, TypedExpr>) -> TypedExpr {
+        Self::discharge_env_in_place(&mut e, env);
+        e
     }
 
     fn rewrite_expr_go(&self, e: &mut TypedExpr, memo: &PredMemo<Subst>) {

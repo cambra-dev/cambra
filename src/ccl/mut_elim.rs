@@ -50,6 +50,7 @@ use crate::ccl::{
     TypedExprNode,
     ccl_utils::{COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
+    subst::Subst,
     symbolic::symbolic,
 };
 
@@ -1024,14 +1025,14 @@ fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<
             bound_expr,
             body,
         } => {
-            let bound = subst_env(*bound_expr, env);
+            let bound = Subst::discharge_env(*bound_expr, env);
             env.insert(binding.name, bound);
             collect_feed_only(*body, env, feeds);
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
             match effect.node {
                 TypedExprNode::Feed { name, value } => {
-                    let val = subst_env(*value, env);
+                    let val = Subst::discharge_env(*value, env);
                     feeds.push((name, val));
                 }
                 other => panic!(
@@ -1227,7 +1228,7 @@ fn transform_chain(
             bound_expr,
             body,
         } => {
-            let bound = subst_env(*bound_expr, env);
+            let bound = Subst::discharge_env(*bound_expr, env);
             let rest = transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
             Expr::let_in(b, bound, rest)
         }
@@ -1266,7 +1267,7 @@ fn transform_chain(
                 // loop item / accumulators read their writer-body snapshot slots
                 // (`__p.k` / `__p.i`) rather than the raw loop binder — the
                 // `commit` field must be point-free like `writes`.
-                let pi = subst_env(synthesize_arm_predicate(&br.guard, &priors), env);
+                let pi = Subst::discharge_env(synthesize_arm_predicate(&br.guard, &priors), env);
                 priors.push(br.guard.clone());
                 let spliced = splice_after_unit(br.body, rest.clone());
                 let mut branch_env = env.clone();
@@ -1323,7 +1324,7 @@ fn transform_chain(
                     // branch-local `let` binder (`fresh` unbound at the top). The
                     // shared inlined normal form is what lets induction and
                     // transaction writers recognize identically.
-                    let val = subst_env(*value, env);
+                    let val = Subst::discharge_env(*value, env);
                     // The value is inlined into `env`, not `let`-bound: a writer's
                     // decision body reads it (via `decision_writes`), and a
                     // `let`-bound name would escape the writer lambda.
@@ -1336,7 +1337,7 @@ fn transform_chain(
                 // `fire` is the current control-flow path — `true` on the spine, a
                 // guard conjunction inside an `if`.
                 TypedExprNode::Feed { name, value } => {
-                    let val = subst_env(*value, env);
+                    let val = Subst::discharge_env(*value, env);
                     let field = format!("to_{}_{}", name.base(), feeds.len());
                     feeds.push(FeedSite {
                         defer: name,
@@ -1425,7 +1426,7 @@ fn decision_writes(dec: &Expr) -> Vec<Expr> {
                 bound_expr,
                 body,
             } => {
-                let bound = subst_env((**bound_expr).clone(), &env);
+                let bound = Subst::discharge_env((**bound_expr).clone(), &env);
                 env.insert(binding.name.clone(), bound);
                 cur = body;
             }
@@ -1438,7 +1439,10 @@ fn decision_writes(dec: &Expr) -> Vec<Expr> {
                 let TypedExprNode::Tuple(elts) = &writes.node else {
                     panic!("letrec phase: a decision `writes` is a positional tuple");
                 };
-                return elts.iter().map(|e| subst_env(e.clone(), &env)).collect();
+                return elts
+                    .iter()
+                    .map(|e| Subst::discharge_env(e.clone(), &env))
+                    .collect();
             }
             _ => panic!(
                 "letrec phase: a branch decision is `let* in {{commit, writes}}`, got {}",
@@ -1643,18 +1647,6 @@ fn rename_uses(e: &mut Expr, from: &Name, to: &Name) {
         _ => {}
     }
     e.walk_children_mut(|c| rename_uses(c, from, to));
-}
-
-/// Replace free accumulator reads by their current environment value.
-/// Names are globally unique post-uniquify, so no capture is possible.
-fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
-    if let TypedExprNode::Var(n) = &e.node
-        && let Some(rep) = env.get(n)
-    {
-        return rep.clone();
-    }
-    e.map_children(|c| subst_env(c, env));
-    e
 }
 
 #[cfg(test)]
@@ -1869,5 +1861,70 @@ mod tests {
         // Assert through the real checker rather than a local copy of its walk:
         // uniqueness within a tree is one invariant with one implementation.
         crate::ccl::context::assert_unique_node_ids(&out, "flatten_spine");
+    }
+
+    /// The read-your-writes environment substitution runs through the one
+    /// engine ([`Subst::discharge_env`]), and the property the phase depends on
+    /// is **root-carry**: each replaced read keeps its *own* `NodeId` — so the
+    /// replacement inherits that read site's span and attribution — while only
+    /// the replacement's *interior* is freshened. N reads of one environment
+    /// value therefore become N subtrees with disjoint ids, which is what lets
+    /// the phase's scaffolding assemble them into a tree the pipeline's
+    /// uniqueness invariant still accepts.
+    ///
+    /// A whole-subtree freshen would also be unique, but it discards the read
+    /// site's identity; a bare clone would be neither. Both halves are asserted.
+    #[test]
+    fn subst_env_and_scaffolding_keep_ids_unique() {
+        let int = Type::Base(BaseType::Int);
+        let acc = Name::fresh("acc");
+        let x = Name::fresh("x");
+        let y = Name::fresh("y");
+
+        // A *compound* environment value, so there is an interior to freshen.
+        let mut value = Expr::tuple(vec![tvar(&x, int.clone()), tvar(&y, int.clone())]);
+        value.ty = Type::Tuple(vec![int.clone(), int.clone()]);
+        let value_interior: Vec<NodeId> = {
+            let TypedExprNode::Tuple(elts) = &value.node else {
+                unreachable!("built as a tuple")
+            };
+            elts.iter().map(Expr::node_id).collect()
+        };
+        let env: HashMap<Name, Expr> = HashMap::from([(acc.clone(), value)]);
+
+        // Two reads of the accumulator, wrapped in the scaffolding that carries
+        // them into the writer decision.
+        let read0 = tvar(&acc, int.clone());
+        let read1 = tvar(&acc, int.clone());
+        let (id0, id1) = (read0.node_id(), read1.node_id());
+        let mut scaffold = Expr::tuple(vec![read0, read1]);
+        scaffold.ty = Type::Tuple(vec![int.clone(), int]);
+
+        let out = Subst::discharge_env(scaffold, &env);
+
+        let TypedExprNode::Tuple(replaced) = &out.node else {
+            unreachable!("the scaffolding tuple survives")
+        };
+        assert_eq!(
+            (replaced[0].node_id(), replaced[1].node_id()),
+            (id0, id1),
+            "root-carry: a replaced read keeps its own id, so the inlined value \
+             inherits the read site's span"
+        );
+        for copy in replaced {
+            let TypedExprNode::Tuple(elts) = &copy.node else {
+                unreachable!("the environment value is a tuple")
+            };
+            for e in elts {
+                assert!(
+                    !value_interior.contains(&e.node_id()),
+                    "the replacement's interior is freshened, not shared with the \
+                     environment value"
+                );
+            }
+        }
+        // Assert through the real checker rather than a local copy of its walk:
+        // uniqueness within a tree is one invariant with one implementation.
+        crate::ccl::context::assert_unique_node_ids(&out, "subst_env");
     }
 }
