@@ -3,42 +3,34 @@
 //!
 //! # Vocabulary
 //!
-//! - A **trait** is a named requirement a type may satisfy — `Addable`, `Orderable`.
-//!   It is **not a type**: nothing here adds a [`Type`] variant, a lattice point or a
-//!   subtyping edge, and the type grammar and `constrain_go`'s rules are untouched.
+//! - A **trait** ([`Trait`]) is a named requirement a *list* of types may satisfy —
+//!   `Addable`, `Orderable`. It is **not a type**: nothing here adds a [`Type`]
+//!   variant, a lattice point or a subtyping edge, and the type grammar and
+//!   `constrain_go`'s rules are untouched.
 //! - An **implementation** ([`TraitImpl`]) is one row of a trait's table: the types it
-//!   accepts, and the types it associates with them.
+//!   accepts, and the types it associates with them — written
+//!   `Addable(Int, Int ⇝ Int)`, accepted types then `⇝` then associated ones.
 //! - An **associated type** ([`Assoc`]) is a type a trait *names* — `Output`, the type
-//!   an arithmetic operator's result takes. A trait is a requirement rather than a
-//!   function, so it associates any number, **including none**. A type is associated
-//!   only when it *depends* on the types satisfying the trait: a comparison's `Bool` is
-//!   the same for every pair `Equatable` accepts, so it belongs to the operator's
-//!   signature (`OperatorResult::Fixed`, in `src/ccl/infer/schemes.rs`) and
-//!   `Equatable` associates nothing.
+//!   an arithmetic operator's result takes. A trait associates any number, **including
+//!   none**: only a type that *depends* on the types satisfying the trait belongs here,
+//!   so `Equatable` associates nothing and its `Bool` rides the operator's signature
+//!   instead (`OperatorResult::Fixed`, in `src/ccl/infer/schemes.rs`).
 //! - An **obligation** ([`TraitObligation`]) is one recorded instance of a trait at
 //!   specific type positions: one **operand position** per argument the trait takes,
-//!   and one **associated position** per type it names. It is a single claim with two
-//!   halves, and neither alone is "the obligation": *the operand positions are types
-//!   some implementation accepts*, **and** *each associated position is what that
-//!   implementation associates*. Every position is an ordinary inference variable,
-//!   unrelated to the others. (`Addable(𝐴, 𝐵)` with `Output` at `𝑂` is the shape to
-//!   picture, but the arity and the association count are both the trait's.)
-//! - A **watch** is an obligation's attachment to an operand variable, which is how a
-//!   bound landing anywhere in the program reaches it.
+//!   and one **associated position** per type it names — `Addable(𝐴, 𝐵 ⇝ 𝑂)` is the
+//!   shape to picture, though the arity and the association count are both the trait's.
+//!   It is a single claim with two halves, and neither alone is "the obligation": *the
+//!   operand positions are types some implementation accepts*, **and** *each associated
+//!   position is what that implementation associates*. Every position is an ordinary
+//!   inference variable, unrelated to the others.
+//! - A **watch** is an obligation's attachment to an operand variable
+//!   ([`TraitObligation::watch`]), which is how a bound landing anywhere in the program
+//!   reaches it.
 //!
-//! An operator's signature is therefore `𝐴₁ → … → 𝐴ₙ → 𝑅` plus the obligation, for the
-//! trait's arity `𝑛`, where `𝑅` is either one of the associated positions or a type
-//! the operator fixes — which operator states which is `schemes.rs`'s business, not
-//! this module's. Because an associated position is an
-//! ordinary variable rather than a marker standing for a computation, information
-//! flows *backwards* through an operator's result like any other type — which is what
-//! lets a function be typechecked without consulting its call sites.
-//!
-//! # Refinements are transparent
-//!
-//! `{𝑇 | 𝑝}` satisfies a trait exactly when `𝑇` does, by construction rather than by
-//! a stripping step: satisfaction is judged on each bound contribution as it arrives,
-//! with refinements peeled at that moment — when the base actually exists.
+//! Every position being an ordinary inference variable — not a marker standing for an
+//! unreduced computation — is what lets information flow *backwards* out of an
+//! operator's result, and so what lets a function be typechecked without consulting its
+//! call sites.
 //!
 //! # Discharge is incremental
 //!
@@ -46,30 +38,24 @@
 //! [`FunKindVar`](crate::ccl::ty::FunKindVar) already uses for kinds; no phase runs
 //! "once everything is known". Each operand position carries a **candidate set** of
 //! implementations that only ever shrinks ([`TraitObligation::narrow`]), and each
-//! associated type is deposited on its position as an ordinary lower bound as soon as
-//! every surviving candidate agrees on it ([`TraitObligation::try_deposit`]).
+//! associated type is deposited on its position as an ordinary lower bound once every
+//! surviving candidate *agrees* on it ([`TraitObligation::try_deposit`]) — agreement,
+//! not a lone survivor. A deposit reaches **associated positions only**; nothing is
+//! ever written back onto an operand.
 //!
-//! # What an obligation determines, and what it leaves alone
+//! A refinement narrows exactly as its base does: `{𝑇 | 𝑝}` satisfies a trait when `𝑇`
+//! does, because satisfaction is judged on each bound contribution as it arrives and
+//! peels refinements at that moment — when the base actually exists.
 //!
-//! The deposit rule is *whatever every surviving implementation agrees on*, and it is
-//! applied to the **associated positions only**. Nothing is ever deposited onto an
-//! operand.
+//! # Where to read more
 //!
-//! The asymmetry is not soundness — with one candidate left, its operand types are
-//! implied exactly as its associated types are. It is that the obligation is an
-//! associated position's **only** source of information and never an operand's: an
-//! associated position is a fresh variable nothing else constrains from below, while
-//! an operand always has the program's own `operandᵢ <: 𝐴ᵢ` edge. Determining an operand from the table would be recovering
-//! information the program was supposed to supply, which hides an under-connected
-//! lowering instead of fixing it.
-//!
-//! How much gets determined is therefore a property of the table, and shrinks as the
-//! table grows — **for an associated type too**. Today `λ 𝑥 → 𝑥 + 1` has result `Int`,
-//! because `Int` in the second position leaves only `(Int, Int) ⇝ Int`. Adding
-//! `Addable(Float, Int) ⇝ Float` would leave two candidates whose outputs disagree,
-//! and the result would become as open as the parameter already is. That is the type
-//! honestly tracking a language that has become more permissive, and it is why the
-//! deposit waits for *agreement* rather than firing on a unique candidate.
+//! `src/ccl/design/type-inference.md`, "Traits" is the design of record, and carries
+//! the arguments this module only acts on: why the constraint lattice cannot state an
+//! operator's requirement on its own, why a deposit is one-way and waits for agreement,
+//! why refinement transparency is permanent rather than a convenience, and what a trait
+//! would relate beyond types — associated *functions*, which the shape here allows and
+//! does not yet have. Which operators state which requirement, and which take a fixed
+//! result rather than an associated one, is `schemes.rs`'s business, not this module's.
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -300,8 +286,8 @@ static OBLIGATION_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// One recorded instance of a trait at specific type positions, carrying both halves
 /// of the claim: that the operand positions are types some implementation accepts, and
 /// that each associated position is what that implementation associates. Arity and
-/// association count are the trait's — `Addable(𝐴, 𝐵)` with `Output` at `𝑂` is one
-/// shape, `Negatable(𝐴)` with `Output` and `Equatable(𝐴, 𝐵)` with none are the others.
+/// association count are the trait's — `Addable(𝐴, 𝐵 ⇝ 𝑂)` is one shape,
+/// `Negatable(𝐴 ⇝ 𝑂)` and `Equatable(𝐴, 𝐵)` are the others.
 /// See this module's *Vocabulary*.
 ///
 /// Held by [`Rc`] and *watched* by each operand variable ([`TraitObligation::watch`]),
