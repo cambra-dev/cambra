@@ -544,6 +544,32 @@ impl ParentPath<'_> {
     }
 }
 
+/// Whether the opposite-polarity fallback may fire at the variable currently
+/// being walked, given the chain that reached it.
+///
+/// **Only at a position** — the variable the walk entered structurally, never one
+/// reached by following another variable's bounds.
+///
+/// Walking `𝑎 <: 𝑏 <: 𝑐` computes `𝑎`'s transitive upper bound, and finding none
+/// is a *correct* conclusion: `𝑎`'s upper bound is ⊤. What the fallback does next
+/// — take the lower bound instead — is not a subtyping inference but a **choice**,
+/// the collapse of the `∀α ⊒ 𝐿` this system cannot represent (see the rationale in
+/// [`compact_go`]). Choices do not propagate along subtyping edges: `𝐿 <: 𝑐` and
+/// `𝑎 <: 𝑐` together say nothing whatever about `𝐿` versus `𝑎`. So the collapse is
+/// only ever applied to the variable whose quantifier is being eliminated.
+///
+/// Letting it fire further along makes a function's domain the join of everything
+/// the program does with any use's result: an arm binder's upper-bound chain runs
+/// out through the `match` result and the codomain into the call site's operands,
+/// and the join sitting there comes back as the domain's demand. See
+/// `design/type-inference.md`, "The collapse happens at the position".
+///
+/// A structural boundary starts a new position, which is why [`compact_go`] resets
+/// `parents` to `None` at every structural child.
+fn fallback_allowed(parents: Option<&ParentPath<'_>>) -> bool {
+    parents.is_none()
+}
+
 /// Walk-wide state threaded through [`compact_go`]: the cycle-tracking tables.
 /// (`parents` stays a per-path argument — it is scoped to one variable's bound
 /// chain and reset across structural boundaries — and the substitution
@@ -790,6 +816,10 @@ fn compact_go(
             // `rec`/`var`/`fun` get this for free from their `None` merge
             // identity, but refinement sets have no such sentinel, so we keep
             // the var out of the structural fold.
+            // Whether this variable is the *position* being materialized, which is
+            // the only place the opposite-polarity collapse below may happen
+            // ([`fallback_allowed`]).
+            let allow_fallback = fallback_allowed(parents);
             let new_parents = ParentPath { uid, prev: parents };
             let mut bound: Option<CompactType> = None;
             for b in primary_bounds.iter() {
@@ -813,18 +843,40 @@ fn compact_go(
             // opposite polarity from where the lambda is coalesced. This is the
             // coalesce-time read of monomorphization; it is sound because every
             // var reaching coalesce is monomorphically determined (one type or
-            // an `IncompatibleBounds` error). See the rationale above.
+            // an `IncompatibleBounds` error). See the rationale above, and
+            // [`fallback_allowed`] for why it happens only at a position.
             let no_concrete = bound.as_ref().is_none_or(|b| {
                 b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none() && b.history_slot.is_none()
             });
-            if no_concrete {
+            if no_concrete && allow_fallback {
+                let mut recovered: Option<CompactType> = None;
                 for b in opposite_bounds.iter() {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
                     let bc = compact_go(&b.ty, !pol, &inner_acc, Some(&new_parents), st);
-                    bound = Some(match bound {
+                    recovered = Some(match recovered {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),
                     });
+                }
+                if let Some(mut recovered) = recovered {
+                    // Carry what the polarity-correct walk *did* find — variable
+                    // identities and refinement demands — across without letting
+                    // it into the structural fold. `no_concrete` says that result
+                    // has no shape, so all it could contribute to a `merge` is its
+                    // refinement set, and an empty one is absorbing under the
+                    // positive intersection (the same hazard the `from_var` seed
+                    // avoids above). Refinements union instead: a demanded
+                    // predicate is checked against the value the fallback found,
+                    // so both hold of it.
+                    if let Some(primary) = bound.take() {
+                        recovered.vars.extend(primary.vars);
+                        for r in primary.refinements {
+                            if !recovered.refinements.contains(&r) {
+                                recovered.refinements.push(r);
+                            }
+                        }
+                    }
+                    bound = Some(recovered);
                 }
             }
             // Inject the variable's own identity (refinement-neutral) so it

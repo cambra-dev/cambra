@@ -2515,6 +2515,101 @@ mod tests {
         assert_eq!(used_names.len(), 4, "every specialization is used");
     }
 
+    /// `let f = λm. match m { `a(v) → v; `b(w) → w } in
+    ///  let p = f(`a(1)) in let q = f(`a(2)) in <tail>`
+    ///
+    /// built with `tail` reading `p` or reading `q`. Returns the specializations'
+    /// parameter types in source order.
+    #[cfg(test)]
+    fn case_udf_specialization_domains(tail_reads: &str) -> Vec<Type> {
+        use crate::ccl::{Branch, Pattern, TypedBinding};
+        let arm = |tag: &str, b: &str| Branch {
+            pattern: Some(Pattern {
+                tag: tag.to_string(),
+                binding: TypedBinding {
+                    name: b.into(),
+                    ty: Type::Hole,
+                    user_annotation: None,
+                },
+            }),
+            guard: TypedExpr::lit(crate::ccl::Lit::Bool(true)),
+            body: TypedExpr::var(b),
+        };
+        let f = TypedExpr::lambda(
+            "m",
+            Type::Hole,
+            TypedExpr::new(TypedExprNode::Case {
+                scrutinee: Some(Box::new(TypedExpr::var("m"))),
+                branches: vec![arm("a", "v"), arm("b", "w")],
+            }),
+        );
+        // The tail is what makes the widening observable, and *any* consumer that
+        // joins the use's result with another value does it — the domain used to
+        // acquire that join. A list literal is the join site with the fewest
+        // moving parts: its elements meet on one element variable, with no
+        // operator signature in between.
+        let tail = TypedExpr::list(vec![TypedExpr::var(tail_reads), lit_int(0)]);
+        let call = |n: i64| {
+            TypedExpr::apply(
+                TypedExpr::variant_ctor("a", lit_int(n)),
+                TypedExpr::var("f"),
+            )
+        };
+        let mut e = TypedExpr::let_bind(
+            "f",
+            f,
+            TypedExpr::let_bind("p", call(1), TypedExpr::let_bind("q", call(2), tail)),
+        );
+        run_inference(&mut e).expect("two-arm case UDF type-checks");
+        collect_mono_param_types(&e)
+    }
+
+    /// A specialization's domain is its *own* use's argument — not the join of
+    /// what the program does with any use's result.
+    ///
+    /// The two-arm `match` is the detector, not the cause. A too-wide domain is
+    /// invisible under contravariance until something *reads* it: the dead arm's
+    /// binder takes its type from the payload, that type enters the arms' join,
+    /// and the post-inference wall compares the join against the per-instance
+    /// codomain. A one-arm `match` is widened identically and simply never
+    /// notices — so this must not be "fixed" by teaching the join to skip dead
+    /// arms.
+    ///
+    /// The widening came from the domain's negative read running out of upper
+    /// bounds inside the definition and continuing along the chain into the *call
+    /// site's* consumers, where the opposite-polarity fallback read a join
+    /// (`1 ⊔ 0` at the list literal) and handed it back as the domain's demand.
+    /// See `fallback_allowed` in `src/ccl/infer/solver/compact.rs`.
+    #[test]
+    fn specialization_domain_is_its_own_argument() {
+        let variant_of = |t: Type| {
+            Type::Variant(vec![(
+                crate::ccl::FieldKey::Name(smol_str::SmolStr::new("a")),
+                t,
+            )])
+        };
+        assert_eq!(
+            case_udf_specialization_domains("p"),
+            vec![variant_of(int_lit_ty(1)), variant_of(int_lit_ty(2))],
+            "each clone's domain is the variant its own call site passed"
+        );
+    }
+
+    /// The companion: *which* use the consumer reads must not move the answer.
+    ///
+    /// This is the same program with the consumer reading `q` instead of `p`.
+    /// Before the fix the widened clone followed the consumer — which is what
+    /// made the defect look positional (in the original report the consumed use
+    /// was also the first one).
+    #[test]
+    fn specialization_domains_do_not_follow_the_consumer() {
+        assert_eq!(
+            case_udf_specialization_domains("p"),
+            case_udf_specialization_domains("q"),
+            "the specializations are the same whichever use the tail reads"
+        );
+    }
+
     #[test]
     fn chained_poly_shares_inner_specialization_across_same_typed_clones() {
         // let f = λx. (x, x) in let g = λy. f(y) in (g(1), g(2), g("a"))
