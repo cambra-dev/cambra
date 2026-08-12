@@ -111,6 +111,12 @@ impl InferArena {
         // resolve variables that no longer have bounds.
         #[cfg(debug_assertions)]
         crate::ccl::infer::solver::traits::clear_watch_log();
+        // So is the requirement sweep's narrowing window, and for a sharper reason:
+        // its mark indexes a process-global obligation counter, so one left behind by
+        // an earlier run on this thread sits below everything this run mints and would
+        // make the check pass without checking.
+        #[cfg(debug_assertions)]
+        crate::ccl::infer::solver::traits::unseal_emission();
         InferArena {
             _not_send_sync: std::marker::PhantomData,
         }
@@ -254,6 +260,59 @@ impl DerefMut for TypeInferenceContext {
 // InferError
 // ---------------------------------------------------------------------------
 
+/// One trait requirement on a value, as a diagnostic states it.
+///
+/// The solver-side [`OperandRequirement`](crate::ccl::infer::solver::traits::OperandRequirement)
+/// rendered for display: types instead of bases, and the trait named rather than
+/// referenced, so nothing in a message borrows the solver's vocabulary.
+#[derive(Clone, PartialEq)]
+pub struct StatedRequirement {
+    /// The trait that placed the requirement.
+    pub trait_: String,
+    /// Which of its operand positions the value stands at.
+    pub position: u8,
+    /// What that position still accepts.
+    pub accepted: Vec<Type>,
+    /// The trait's other operand positions and what each still accepts — the reason
+    /// this position is narrowed the way it is, which is otherwise invisible.
+    pub siblings: Vec<(u8, Vec<Type>)>,
+}
+
+/// `Addable accepts only String as its operand 1 (its operand 2 is String)`.
+///
+/// The parenthetical is what makes the line a reason rather than an assertion: a bare
+/// "only `String` here" is a *consequence* of what reached the operand beside it, and
+/// without naming that the reader is told the conclusion and left to reconstruct the
+/// premise. Positions are printed 1-based, as everywhere else in these messages.
+/// Omitted for a unary trait, which has no beside.
+impl std::fmt::Display for StatedRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn or_list(types: &[Type]) -> String {
+            types
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(" or ")
+        }
+        write!(
+            f,
+            "{} accepts only {} as its operand {}",
+            self.trait_,
+            or_list(&self.accepted),
+            self.position + 1,
+        )?;
+        let because = self
+            .siblings
+            .iter()
+            .map(|(pos, accepted)| format!("its operand {} is {}", pos + 1, or_list(accepted)))
+            .collect::<Vec<_>>();
+        if !because.is_empty() {
+            write!(f, " ({})", because.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
 /// Errors that can occur during limited type inference.
 ///
 /// # The `at` / `ctx` / `origin` label fields are for *display*, not location
@@ -384,6 +443,33 @@ pub enum InferError {
         accepted: Vec<Type>,
         /// Display label for the message (see the type docs — not the location).
         at: String,
+    },
+    /// One value carries two or more trait requirements that no type satisfies at
+    /// once — `\a -> (a + 1, a + "s")` needs `a` to be both `Int` and `String`, so the
+    /// definition is ill-typed for every possible argument and is rejected with no
+    /// call site.
+    ///
+    /// Distinct from [`InferError::NoTraitInstance`] because **nothing arrived**: no
+    /// operand type is wrong, and there is none to show. What conflicts is the
+    /// requirements, so the message lists them and what each still accepts.
+    UnsatisfiableOperand {
+        /// One entry per requirement on the value.
+        requirements: Vec<StatedRequirement>,
+    },
+    /// The requirements on one value agree on a type, and the value is already
+    /// something else — `def f(x: Int): x + "s"` requires `String` of a parameter the
+    /// annotation fixed at `Int`.
+    ///
+    /// The sibling of [`InferError::UnsatisfiableOperand`]: there the requirements
+    /// contradict each other, here they agree and contradict the program. Both mean no
+    /// argument could ever work, and this one can name the type that rules it out.
+    RequirementContradictsBound {
+        /// The requirements, which together determined `required`.
+        requirements: Vec<StatedRequirement>,
+        /// The type they agree the value must be.
+        required: Box<Type>,
+        /// The type the value already has.
+        found: Box<Type>,
     },
     /// A partial tuple or partial record was not resolved to a concrete type.
     UnresolvedPartial {
@@ -627,6 +713,32 @@ impl std::fmt::Debug for InferError {
                      the only type accepted there is {accepted}",
                     position + 1,
                 )
+            }
+            InferError::UnsatisfiableOperand { requirements } => {
+                writeln!(
+                    f,
+                    "No type satisfies every requirement placed on this value, so it \
+                     can never be called:"
+                )?;
+                for r in requirements {
+                    writeln!(f, "  {r}")?;
+                }
+                Ok(())
+            }
+            InferError::RequirementContradictsBound {
+                requirements,
+                required,
+                found,
+            } => {
+                writeln!(
+                    f,
+                    "This value is already {found}, but it is required to be \
+                     {required}, so it can never be called:"
+                )?;
+                for r in requirements {
+                    writeln!(f, "  {r}")?;
+                }
+                Ok(())
             }
             InferError::MissingField { key, found, at } => match (key, found) {
                 // A tuple's positions are its width, so that is the fact to state: the

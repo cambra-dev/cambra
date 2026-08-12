@@ -359,6 +359,16 @@ pub(crate) fn arena_exit() -> Vec<Rc<InferVar>> {
     ACTIVE_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default())
 }
 
+/// Every variable minted so far this run, *without* ending the arena.
+///
+/// The enumeration a whole-graph check needs. Unlike a walk of the expression tree
+/// this reaches variables no node's type mentions any more — in particular a
+/// generalized definition's, which coalesce deliberately never visits in place. Hands
+/// back a snapshot rather than a borrow so a caller is free to touch the arena.
+pub(crate) fn arena_vars() -> Vec<Rc<InferVar>> {
+    ACTIVE_ARENA.with(|slot| slot.borrow().clone().unwrap_or_default())
+}
+
 impl InferVar {
     /// Mint a fresh, unconstrained inference variable at `level`.
     ///
