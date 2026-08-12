@@ -396,7 +396,7 @@ fn build_value_case_cform(
     }
 
     // Union domain = Variant({Index(i): {UIntRange(1)|π̂ᵢ}}) — the same tagged
-    // union `emit_collection_union` produces, so op-conversion's `UnionOperator`
+    // union `emit_copair` produces, so op-conversion's `UnionOperator`
     // dispatches to the surviving arm.
     let union_dom = Type::Variant(
         arm_domains
@@ -406,12 +406,36 @@ fn build_value_case_cform(
             .collect(),
     );
     let union_ty = Type::data_fun(union_dom, result_ty.clone());
-    let union = Expr::collection_union(arms).with_ty(union_ty.clone());
+    let union = Expr::copair(arms).with_ty(union_ty.clone());
 
     // (union, eₙ) ▷ final_or_default : V
     let tuple_ty = Type::Tuple(vec![union_ty, result_ty.clone()]);
     let arg = Expr::tuple(vec![union, default_body]).with_ty(tuple_ty);
     Ok(apply_primitive(arg, Builtin::FinalOrDefault, result_ty))
+}
+
+/// Compose one `Case` arm, declaring **both ends from the chain itself** rather
+/// than from the enclosing `Case`.
+///
+/// A `Compose`'s type has to *equal* the composition of its elements, so taking
+/// either end from the `Case` claims something the elements do not provide. The
+/// **codomain** is where they diverge: an arm's result can sit strictly below the
+/// arms' join — `case a(v): v` over a scrutinee pinned to `` `a(1) `` yields the
+/// singleton `{Int | __elem == 1}` where the join with a sibling `Int` arm is plain
+/// `Int`. The widening belongs on the enclosing merge node, which is a single node
+/// and so may record a supertype.
+///
+/// The `Case`'s types serve only as fallbacks for a chain end that declares none.
+fn arm_compose(chain: Vec<Expr>, fallback_dom: Type, joined_cod: &Type) -> Expr {
+    let dom = chain
+        .first()
+        .and_then(|e| e.ty.domain())
+        .unwrap_or(fallback_dom);
+    let cod = chain
+        .last()
+        .and_then(|e| e.ty.codomain())
+        .unwrap_or_else(|| joined_cod.clone());
+    typed_compose(chain).with_ty(Type::data_fun(dom, cod))
 }
 
 /// The element (codomain) type a collection-valued `Case` produces — the codomain
@@ -436,13 +460,12 @@ fn collection_value_ty(ty: &Type) -> Type {
 /// where `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ` ([`synthesize_arm_predicate`]). Each gate is
 /// **constant in the element** (see the C-form above), so an arm's collection
 /// survives whole (gate holds) or is emptied (gate fails); the partition is
-/// exhaustive, so exactly one arm is non-empty and the union is that arm's
-/// collection. The union's type is the tagged `Variant`-domain data function —
-/// the same shape `emit_collection_union` gives a `++`, which the strict wall
-/// reconciles against the arms' joined data function by `is_index_partition_of`
-/// (`src/ccl/design/type-inference.md`, "The domain join is a Σ"). The arms all share
-/// one domain — a join at distinct domains is rejected at inference — so every leg's
-/// payload is that one domain under its own gate.
+/// exhaustive, so exactly one arm is non-empty and the merge is that arm's
+/// collection. The arms all share one domain — a join at distinct domains is
+/// rejected at inference — so this is a [`TypedExprNode::DisjointJoin`] over that
+/// domain, and the node's type is the arms' joined data function directly. A
+/// coproduct domain here would be a claim the arms live over *distinct* index sets,
+/// which every consumer would then have to undo.
 fn build_value_case_fanout(
     ctx: &mut ElimContext,
     branches: Vec<Branch>,
@@ -495,13 +518,13 @@ fn build_value_case_fanout(
         return Ok(arms.pop().unwrap());
     }
 
-    // The node keeps the `Case`'s own type — the arms' joined data function `D ⤇ V`
-    // — so lambda_elim stays type-preserving. The strict `typecheck` then reconciles
-    // the union's structural `Variant([{D | π̂ᵢ}])` domain against that `D` via
-    // `is_index_partition_of` (`src/ccl/design/type-inference.md`, "The domain join
-    // is a Σ"). Op-conversion compiles the union straight to a `UnionOperator`
-    // from its operands, whose domains are concrete domains.
-    Ok(Expr::collection_union(arms).with_ty(result_ty))
+    // The arms are gated restrictions of *one* domain `D` — first-match, so their
+    // supports are disjoint — and the node keeps the `Case`'s own type, the arms'
+    // joined data function `D ⤇ V`. That is a disjoint join: a copair here would
+    // give the node a `Variant([{D | π̂ᵢ}])` domain that every consumer's `D`-shaped
+    // demand then has to undo. Op-conversion compiles it to a flat-merging
+    // `UnionOperator` over the operands, whose domains are concrete.
+    Ok(Expr::disjoint_join(arms).with_ty(result_ty))
 }
 
 // ---------------------------------------------------------------------------
@@ -755,17 +778,17 @@ fn elim_lambda_impl(
             elim_lambda(ctx, param, param_ty, desugared)
         }
 
-        // CollectionUnion inside a lambda body: lift via the
-        // `Apply(Tuple(ops), Builtin::CollectionUnion)` point-free form.
+        // Copair inside a lambda body: lift via the
+        // `Apply(Tuple(ops), Builtin::Copair)` point-free form.
         // This mirrors the BinOp rule — the tuple of operands gets zipped
-        // through the lambda parameter and the binary `CollectionUnion`
+        // through the lambda parameter and the binary `Copair`
         // builtin closes the loop.  At the top level (outside any
         // lambda being eliminated) the dedicated arm in [`elim_lambdas`]
         // keeps the N-ary value-form intact.
-        TypedExprNode::CollectionUnion(ops) => {
+        TypedExprNode::Copair(ops) => {
             let tuple = typed_tuple(ops);
             let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
-            let fn_var = Expr::builtin(Builtin::CollectionUnion).with_ty(fn_ty);
+            let fn_var = Expr::builtin(Builtin::Copair).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             elim_lambda(ctx, param, param_ty, desugared)
         }
@@ -956,8 +979,13 @@ fn elim_lambda_impl(
             match arms.len() {
                 0 => unreachable!("a value-selecting Case has at least one branch"),
                 1 => Ok(arms.pop().expect("len == 1")),
-                _ => Ok(Expr::collection_union(arms)
-                    .with_ty(Type::data_fun(param_ty.clone(), value_ty))),
+                // A **disjoint join**, not a copairing: these arms restrict the
+                // *same* fed domain — by first-match, or by tag — so the result
+                // lands back on it rather than on a coproduct of per-arm domains.
+                _ => {
+                    Ok(Expr::disjoint_join(arms)
+                        .with_ty(Type::data_fun(param_ty.clone(), value_ty)))
+                }
             }
         }
 
@@ -1107,7 +1135,7 @@ fn elim_lambda_impl(
                     }
                     chain.push(vp);
                     chain.push(arm_fn);
-                    typed_compose(chain).with_ty(Type::data_fun(param_ty.clone(), value_ty.clone()))
+                    arm_compose(chain, param_ty.clone(), &value_ty)
                 } else {
                     // Outer-binder: zip the whole element alongside the projected
                     // payload, then feed the pair to `eᵢ`. Merge `param` and `wᵢ`
@@ -1140,8 +1168,7 @@ fn elim_lambda_impl(
                     let outer_pf = id().with_ty(Type::fun(param_ty.clone(), param_ty.clone()));
                     // ⟨id, scrut ≫ variant_project(cᵢ)⟩ : param_ty ⇒ (param_ty, Pᵢ).
                     let pair_stream = zip_pair(outer_pf, payload_pf);
-                    typed_compose(vec![pair_stream, arm_fn2])
-                        .with_ty(Type::data_fun(param_ty.clone(), value_ty.clone()))
+                    arm_compose(vec![pair_stream, arm_fn2], param_ty.clone(), &value_ty)
                 };
                 arms.push(arm);
             }
@@ -1176,8 +1203,13 @@ fn elim_lambda_impl(
             match arms.len() {
                 0 => unreachable!("a scrutinee-Case has at least one branch"),
                 1 => Ok(arms.pop().expect("len == 1")),
-                _ => Ok(Expr::collection_union(arms)
-                    .with_ty(Type::data_fun(param_ty.clone(), value_ty))),
+                // A **disjoint join**, not a copairing: these arms restrict the
+                // *same* fed domain — by first-match, or by tag — so the result
+                // lands back on it rather than on a coproduct of per-arm domains.
+                _ => {
+                    Ok(Expr::disjoint_join(arms)
+                        .with_ty(Type::data_fun(param_ty.clone(), value_ty)))
+                }
             }
         }
 
@@ -1306,18 +1338,18 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             Ok(desugared)
         }
 
-        // CollectionUnion at top level: an N-ary value-form node that
+        // Copair at top level: an N-ary value-form node that
         // represents the eager merge of N collections.  Recurse into each
         // operand (each may itself contain lambdas to eliminate) and keep
         // the node — operator conversion compiles it directly to a
         // `UnionOperator`.  No need to lift through `Apply`/`Tuple`/`Builtin`
         // since there is no surrounding lambda parameter to thread through.
-        TypedExprNode::CollectionUnion(ops) => {
+        TypedExprNode::Copair(ops) => {
             let elim_ops: Vec<Expr> = ops
                 .into_iter()
                 .map(|o| elim_lambdas(ctx, o))
                 .collect::<Result<_, _>>()?;
-            let mut result = Expr::collection_union(elim_ops);
+            let mut result = Expr::copair(elim_ops);
             result.ty = ty;
             debug_typecheck(&result);
             Ok(result)
@@ -1922,7 +1954,7 @@ mod tests {
         assert_eq!(
             elim_and_typecheck("x", x_ty, case),
             "variant_project(`commit) ≫ (id, 1 ▷ const) ▷ zip ≫ add \
-             ⊎ variant_project(`abort) ≫ 0 ▷ const"
+             ⊔ variant_project(`abort) ≫ 0 ▷ const"
         );
     }
 
@@ -1983,7 +2015,7 @@ mod tests {
         assert_eq!(
             elim_and_typecheck("c", c_ty, case),
             "(.time, .decision ≫ variant_project(`commit)) ▷ zip \
-             ⊎ .decision ≫ variant_project(`abort) ≫ (0, 0) ▷ const"
+             ⊔ .decision ≫ variant_project(`abort) ≫ (0, 0) ▷ const"
         );
     }
 }

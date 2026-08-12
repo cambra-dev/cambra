@@ -161,7 +161,7 @@ Types (from `Display for Type` in `src/ccl/mod.rs`):
 - **Infer**: `?N` (where `N` is the variable id).
 - **DataSource**: `source(name)`.
 - **Variant** (a tagged sum): ``{`arm1{T1} | `arm2{T2}}`` — braces around the arms, each arm introduced by a backtick with its stored type in braces. An arm that stores nothing is written bare (``{`commit{Int} | `abort}``, not `` `abort{Unit} ``), and a payload that is itself brace-delimited reuses those braces rather than doubling them (``{`pair{a: Int, b: Int}}``). A single-arm sum is just the general form with one arm: ``{`none}``, ``{`some{Int}}``.
-- **Union** (an *anonymous positional* sum, what `++` / `CollectionUnion` produces — not a tagged variant): `T1 | T2`. Its `Index` keys carry no user-meaningful information, so it renders as a flat join with no arm tags.
+- **Union** (an *anonymous positional* sum, what `++` / `Copair` produces — not a tagged variant): `T1 | T2`. Its `Index` keys carry no user-meaningful information, so it renders as a flat join with no arm tags.
 - **Feed**: `Feed(T)` — a transient deferred-output type inference threads and `channelize` erases.
 - **Mut**: `Mut(value, domain)` — a transient mutable-variable type inference threads and the mutability-elimination phases (`mut_elim`) erase; the domain is an induction extent or `Txn`. Its `HistoryKind` is `Overwrite` (the last-write-wins merge law); the append-law sibling is `Feed`'s `Append` kind.
 - **Txn**: `Txn` — the (nullary) transaction-commit sequencing domain, the second slot of a `Mut(V, Txn)` mutable variable.

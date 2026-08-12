@@ -525,7 +525,7 @@ pub struct CompiledProgram {
     /// This is `expr` captured **right after `channelize`** (which now runs
     /// after `infer`/`inline`/`transact`/`letrec`): fully typed and structurally
     /// final for the source view — no Defer/Feed/Define nodes remain, and the
-    /// channelization artifacts (`Compose` wrapper chains, `CollectionUnion`
+    /// channelization artifacts (`Compose` wrapper chains, `Copair`
     /// fan-ins) are present. Because monomorphization ran earlier (inside
     /// `infer`), this tree is post-mono like [`post_inference_ir`](Self::post_inference_ir).
     ///

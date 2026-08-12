@@ -26,7 +26,6 @@ use crate::ccl::{BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Refi
 use super::traits::{Trait, link_watches, notify_lower};
 use super::type_level;
 use crate::ccl::FieldKey;
-use crate::ccl::ccl_utils::strip_refinements;
 
 // ---------------------------------------------------------------------------
 // Constraint solver
@@ -396,28 +395,6 @@ fn debug_assert_unique_keys<'a, K: Eq + std::fmt::Debug + 'a>(
     }
 }
 
-/// Whether `union_dom` is a gated **partition** of the single domain `target`:
-/// a `Variant` with contiguous `Index(0..n)` tags (n ≥ 1) whose every payload,
-/// with its gate refinement stripped, is structurally `target` (also stripped).
-/// This is the shape lambda_elim's value-`Case` fan-out gives *same-domain* arms
-/// — the signature bridge rule 2 realizes as the plain data function
-/// `target ⤇ W`. Requiring the stripped payloads to equal `target` keeps a
-/// genuine heterogeneous `++` flowing into a fresh-var domain out of this rule
-/// (its legs differ, or the target is an unresolved var, so the ordinary
-/// contravariant arm applies).
-fn is_index_partition_of(union_dom: &Type, target: &Type) -> bool {
-    let Type::Variant(tags) = union_dom else {
-        return false;
-    };
-    if tags.is_empty() {
-        return false;
-    }
-    let base = strip_refinements(target);
-    tags.iter()
-        .enumerate()
-        .all(|(i, (k, payload))| *k == FieldKey::Index(i) && strip_refinements(payload) == base)
-}
-
 /// Constrain `lhs‹sl› <: rhs‹sr›` — each side under its own context morphism,
 /// both mapping into the constraint's shared ambient frame.
 ///
@@ -506,39 +483,6 @@ fn constrain_go_impl(
         // `Txn` is a nullary leaf: reflexively equal to itself, incomparable
         // to every other type (the catch-all `Mismatch` below).
         (Type::Txn, Type::Txn) => Ok(()),
-
-        // Bridge rule 2 (gated-partition `⧺` <: plain data function): the
-        // `Variant`-domain union `⧺ᵢ ({D | π̂ᵢ} ⤇ W)` that lambda_elim's
-        // value-`Case` fan-out produces for **same-domain** arms *is* the plain
-        // data function `D ⤇ W` — an exhaustive + disjoint partition of `D`
-        // (exhaustiveness guaranteed by the stamping phase, not proven here; see
-        // lambda_elim's `build_value_case_fanout` and `design/type-inference.md`
-        // §4.6). Each leg `{D | π̂ᵢ} <: D` by refinement width (covariant, not the
-        // function-domain contravariance below), codomain covariant. Fires only
-        // when every leg refines the *same concrete* target domain `D`, so a
-        // genuine heterogeneous `++` flowing into a fresh-var domain still takes
-        // the ordinary contravariant arm below (its domain var resolves to the
-        // `Variant`, iterating every leg).
-        (
-            Type::Fun {
-                kind: FunKind::Data,
-                domain: union_dom,
-                codomain: c0,
-                ..
-            },
-            Type::Fun {
-                domain: d1,
-                codomain: c1,
-                ..
-            },
-        ) if is_index_partition_of(union_dom, d1) => {
-            if let Type::Variant(tags) = union_dom.as_ref() {
-                for (_, payload) in tags {
-                    constrain_go(payload, d1, sl, sr, cache)?;
-                }
-            }
-            constrain_go(c0, c1, sl, sr, cache)
-        }
 
         // Function: contravariant on domain, covariant on codomain. The
         // codomain edge *derives* the binder correspondence — aligning the two

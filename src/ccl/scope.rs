@@ -229,7 +229,11 @@ where
         N::UnaryOp(_, inner) => open(f, inner),
         N::Aggregate { input, .. } => open(f, input),
         N::VariantCtor { payload, .. } => open(f, payload),
-        N::List(elts) | N::Tuple(elts) | N::Compose(elts) | N::CollectionUnion(elts) => {
+        N::List(elts)
+        | N::Tuple(elts)
+        | N::Compose(elts)
+        | N::Copair(elts)
+        | N::DisjointJoin(elts) => {
             for c in elts {
                 open(f, c);
             }
@@ -484,7 +488,8 @@ where
         | N::Tuple(_)
         | N::Record(_)
         | N::Compose(_)
-        | N::CollectionUnion(_)
+        | N::Copair(_)
+        | N::DisjointJoin(_)
         | N::ExprStmt { .. }
         | N::Begin { .. }
         | N::Lambda { .. }
@@ -568,7 +573,8 @@ mod tests {
                 ("b".into(), var("rb")),
             ])),
             node(N::Compose(vec![var("c0"), var("c1")])),
-            TypedExpr::collection_union(vec![var("cu0"), var("cu1")]),
+            TypedExpr::copair(vec![var("cp0"), var("cp1")]),
+            TypedExpr::disjoint_join(vec![var("dj0"), var("dj1")]),
             TypedExpr::expr_stmt(var("stmt"), var("rest")),
             node(N::Begin {
                 body: Box::new(var("bg")),
@@ -666,7 +672,8 @@ mod tests {
         N::Tuple(_) => "Tuple",
         N::Record(_) => "Record",
         N::Compose(_) => "Compose",
-        N::CollectionUnion(_) => "CollectionUnion",
+        N::Copair(_) => "Copair",
+        N::DisjointJoin(_) => "DisjointJoin",
         N::ExprStmt { .. } => "ExprStmt",
         N::Begin { .. } => "Begin",
         N::Feed { .. } => "Feed",
