@@ -133,7 +133,7 @@ pub fn check_letrec_causal(
 ///   step is a `Proj` or a pointwise-map `Lambda` (its body references no
 ///   *other* group binding — projections and record-rebuilding of its own
 ///   parameter only);
-/// - a **`⧺`-union** of causal slots ([`TypedExprNode::CollectionUnion`]) —
+/// - a **`⧺`-union** of causal slots ([`TypedExprNode::Copair`]) —
 ///   the merged per-key commit views of a multi-writer transactional key.
 ///
 /// In all of these the referenced bindings are consulted only at
@@ -159,7 +159,7 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
                     refs.is_empty()
                 })
         }
-        TypedExprNode::CollectionUnion(ops) => {
+        TypedExprNode::Copair(ops) => {
             !ops.is_empty() && ops.iter().all(|o| is_causal_history_slot(o, live))
         }
         // A **`zip` of causal slots** — `⟨causal, …⟩ ▷ zip` (a per-key commit
@@ -550,7 +550,7 @@ mod tests {
                 ),
             ])
         };
-        let merged = Expr::collection_union(vec![view("c1"), view("c2")]);
+        let merged = Expr::copair(vec![view("c1"), view("c2")]);
         let balance = Expr::lambda(
             "t",
             Type::Hole,

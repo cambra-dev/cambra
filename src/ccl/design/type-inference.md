@@ -660,7 +660,7 @@ Cambra carries features beyond plain algebraic subtyping (explicit refinements, 
 
 Cambra has **one** sum representation, the **tagged variant** — `Type::Variant(Vec<(FieldKey, Type)>)`. Since the solver works on `ccl::Type` directly, there is no second variant form to convert to: inference, coalescing, and the public AST all use this one type. (Internally, `compact_type` keys its transient `CompactType` bag by `FieldKey`, but that is an implementation detail of compaction, not a separate type.)
 
-Tags are [`FieldKey`]s — the same key type as records/tuples — so a sum can be **named** (`FieldKey::Name`, a source-level `.Tag(...)`) or **anonymous/positional** (`FieldKey::Index`, the dual of a tuple). A positional union `A | B` is simply `Variant([(Index 0, A), (Index 1, B)])`, and the surface `++`/CollectionUnion produces exactly that (see §2's `emit_collection_union`). One constructor, one coalesce path, one width-subtyping rule (the dual of records: a subtype has *fewer* tags).
+Tags are [`FieldKey`]s — the same key type as records/tuples — so a sum can be **named** (`FieldKey::Name`, a source-level `.Tag(...)`) or **anonymous/positional** (`FieldKey::Index`, the dual of a tuple). A positional union `A | B` is simply `Variant([(Index 0, A), (Index 1, B)])`, and the surface `++`/`Copair` produces exactly that (see §2's `emit_copair`). One constructor, one coalesce path, one width-subtyping rule (the dual of records: a subtype has *fewer* tags).
 
 Two senses of "union" remain distinct:
 
@@ -933,27 +933,28 @@ would claim positions the other branch does not produce.
 > **Landed — value-`Case` compilation at one domain.** `lambda_elim` compiles a
 > value-selecting `Case` to a union of **gated restricts**: one leg per arm, each the
 > arm's domain refined by that arm's branch predicate `π̂ᵢ` (compiled from the
-> original `if`/`elif` conditions), assembled as
-> `Fun{Data, Variant([{𝐷ᵢ | π̂ᵢ}]), 𝑐}`. The gates are exclusive and exhaustive, so
+> original `if`/`elif` conditions). The gates are exclusive and exhaustive, so
 > exactly one leg is non-empty at runtime — an invariant `lambda_elim` asserts at the
 > fan-out boundary (a non-exhaustive value-`Case` would realize an empty collection
 > on the uncovered path, a silent miscompile) rather than the solver re-proving.
 >
-> Where every arm shares one domain 𝐷 — the case the domain-join rule admits, and
-> the one loop-carried accumulators produce (`if p: acc := x else: acc := y`) — the
-> arms' join is the plain data function `𝐷 ⤇ 𝑐`, and the compiled partition subtypes
-> *that* directly: `is_index_partition_of` recognizes a `Variant` whose every
-> payload is 𝐷 under a gate, and relates each leg `{𝐷 | π̂ᵢ} <: 𝐷` by refinement
-> width — *covariant*, since this is an introduction rather than the function-domain
-> contravariance. It is guarded on the legs refining the same *concrete* target, so a
-> genuine heterogeneous `++` flowing into a fresh-var domain still takes the ordinary
-> contravariant arm (its domain var resolves to the `Variant`, iterating every leg).
+> Every arm shares one domain 𝐷 — the case the domain-join rule admits, and the one
+> loop-carried accumulators produce (`if p: acc := x else: acc := y`). The legs are
+> therefore partial maps over 𝐷 whose supports the gates keep disjoint, and the
+> fan-out assembles them with `DisjointJoin` as `𝐷 ⤇ 𝑐` — the arms' join, stated
+> where it is known rather than recovered downstream.
 >
-> Arms at *different* domains have no join to subtype against — see
+> Subtyping needs no rule of its own for this. Assembling the fan-out as a
+> copairing would give it a `Variant([{𝐷 | π̂ᵢ}])` domain — a claim that the legs
+> live over distinct index sets — against consumers that demand 𝐷, and the solver
+> would have to carry an arm recognizing a `Variant` of gated 𝐷s and relating each
+> leg `{𝐷 | π̂ᵢ} <: 𝐷` back to it. With the disjoint join the two domains are the
+> same type and the ordinary arms apply. See [ir.md](ir.md), "`Copair` and `DisjointJoin` — two collection-combining operations, not one".
+>
+> Arms at *different* domains have no join to assemble against — see
 > [The domain join is a Σ](#the-domain-join-is-a-σ) — so the fan-out is built
-> and reconciled only at one domain. Reconciling it against the lossless join of
-> several domains is the same dependent sum that rejection is standing in for, and
-> lands with it.
+> only at one domain. Merging at the lossless join of several domains is the same
+> dependent sum that rejection is standing in for, and lands with it.
 
 **`Case` arms join by the lattice.** `emit_case` constrains *every* arm into a
 fresh result variable (`require_sub`) instead of requiring equality. Homogeneous
@@ -1158,7 +1159,7 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
 
 ### `Case` inference
 
-For each `Branch { guard, body }`: the guard flows one-way into `Type::Base(BaseType::Bool)` (a refined boolean is still a boolean); every body flows one-way into one shared variable. The overall `Case` type is that variable — the arms' **join**. Two arms of incompatible base types therefore collide as `IncompatibleBounds` at coalesce, where a heterogeneous list literal or `CollectionUnion` reports it, rather than as an eager mismatch here. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
+For each `Branch { guard, body }`: the guard flows one-way into `Type::Base(BaseType::Bool)` (a refined boolean is still a boolean); every body flows one-way into one shared variable. The overall `Case` type is that variable — the arms' **join**. Two arms of incompatible base types therefore collide as `IncompatibleBounds` at coalesce, where a heterogeneous list literal or `Copair` reports it, rather than as an eager mismatch here. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
 
 The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [Data vs compute functions](#46-data-vs-compute-functions); the strict-equality behavior above is current until that lands.
 
@@ -1220,11 +1221,11 @@ N-ary `Compose([f₀, f₁, …, fₙ₋₁])` is inferred by chaining: each mor
 
 ### Variant (sum) semantic equality
 
-The post-inference structural checks decide type equality via the solver's `constrain_subtype` (bidirectionally, in `typecheck_compatible`), which compares `Type::Variant` tag sets structurally. Nested sums never reach this comparison: `TypedExpr::collection_union` flattens at construction (next section), so a `Var(y)` referencing a let-bound sum still contributes a single flat variant.
+The post-inference structural checks decide type equality via the solver's `constrain_subtype` (bidirectionally, in `typecheck_compatible`), which compares `Type::Variant` tag sets structurally. Nested sums never reach this comparison: `TypedExpr::copair` flattens at construction (next section), so a `Var(y)` referencing a let-bound sum still contributes a single flat variant.
 
 ### Union flattening (construction-time)
 
-`a ++ b ++ c` in CHL parses to right- or left-associated binary AST nodes. **`TypedExpr::collection_union` flattens at construction time**: any operand that is itself a `TypedExprNode::CollectionUnion` is spliced into the outer operand list, so the constructor always returns a flat N-ary node. This makes the invariant **"no operand of a `CollectionUnion` is itself a `CollectionUnion`"** hold from lowering onward — inference, lambda elimination, and operator conversion never need to look through nested AST. The flat AST flows naturally into a flat `Type::Variant` domain (each operand contributes one tag). `operator_conversion` compiles the N-ary node directly to a single `UnionOperator` with N inputs.
+`a ++ b ++ c` in CHL parses to right- or left-associated binary AST nodes. **`TypedExpr::copair` flattens at construction time**: any operand that is itself a `TypedExprNode::Copair` is spliced into the outer operand list, so the constructor always returns a flat N-ary node. This makes the invariant **"no operand of a `Copair` is itself a `Copair`"** hold from lowering onward — inference, lambda elimination, and operator conversion never need to look through nested AST. The flat AST flows naturally into a flat `Type::Variant` domain (each operand contributes one tag). `operator_conversion` compiles the N-ary node directly to a single `UnionOperator` with N inputs.
 
 ### `check_fully_typed` validation
 

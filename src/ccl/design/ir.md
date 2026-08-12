@@ -107,6 +107,22 @@ CHL `if/else`, `elif` chains, and ternary `if` expressions are all lowered to `C
 
 CHL `match` statements (planned) will desugar entirely at lowering time: the scrutinee is bound with a fresh `Let(__scrut)` node, then each arm produces a guard (`__scrut == lit` for literal patterns, `Lit(true)` for wildcard/structural) and a body (with `Let` bindings for any captured variable names). No IR changes are needed for `match` support.
 
+### `Copair` and `DisjointJoin` — two collection-combining operations, not one
+
+Combining collections is two different operations, and they were one node until they were separated. They differ in signature, in result domain, and in definedness:
+
+- **`Copair(Vec<TypedExpr>)`** — the copairing, `(A ⤇ V) × (B ⤇ V) → (A + B) ⤇ V`. This is the universal property of the coproduct, `Hom(A + B, V) ≅ Hom(A, V) × Hom(B, V)`, so concatenating collections *is* copairing their index functions. The tags keep the operands apart whatever their domains are, so it is **always defined** — including when they coincide. `x ++ x` is the case that pins this: `A + A` is not `A`, and tagging is exactly what stops it collapsing, so the result carries every row twice. Its domain is `Variant({Index(i): dᵢ})`. Born from surface `a ++ b`, from channelization's feed merge, and from the C-form `Case` dispatches. Renders `⊎`.
+
+- **`DisjointJoin(Vec<TypedExpr>)`** — the join in the partial-function order, `(D ⇀ V) × (D ⇀ V) → (D ⇀ V)`. The operands are partial maps over **one** domain and the result lands back on it, so it is **defined only where their domains are disjoint** (separation logic's `*` on heaps is the same operation; disjointness is the sufficient condition for compatibility). Born **post-inference**, by the `Case` fan-outs in [lambda_elim](optimization.md): the arms of one `Case` restrict the *same* fed domain — by a first-match guard, or by tag — so their results must merge back onto it. A writer decision, for instance, has to co-iterate with the sibling `commit` field of its own record. Renders `⊔`.
+
+Why they cannot be one node with a mode flag: a flag would mean one node with **two typing rules**, and the rules are what differ. `emit_copair` builds a coproduct domain; `emit_disjoint_join` requires one shared domain. The disjointness precondition belongs to the second alone, and is checked where it is relied on (`flat_merge`).
+
+Having both nodes is also what keeps the *solver* out of it. A `Case` fan-out assembled as a copairing would carry a `Variant({Index(i): {D | π̂ᵢ}})` domain, while every consumer of it demands `D` — so subtyping would need an arm recognizing a `Variant` of gated `D`s and relating each leg back to `D`, a rule whose only content is undoing a coproduct claim the fan-out had no reason to make. `lambda_elim` knows its arms partition one domain, so it says so with a disjoint join and the domains already agree. A producer that states what it built is what makes such a rule unnecessary.
+
+Neither is a "union", and the name matters: in type theory a *union type* is **untagged**, which neither of these is — one is a tagged sum, the other a merge of partial maps. One name for both invites op-conversion to *guess* which operation a node means from whether a fed input is present. That property correlates with the split without being it, and every construction site already knows which it built, so the node carries it.
+
+Op-conversion accordingly compiles a fed union as a flat merge — a disjoint join — and **rejects** a fed `Copair` rather than compiling it as the operation it is not. Nothing builds one today: `Builtin::Copair` needs a `++` inside a lambda over its parameter, which fails earlier. When something does, it needs a tagged fed form, not the flat merge.
+
 ### `Transact` — the domain-parameterized recurrence carrier
 
 CHL mutation-accumulation `for` loops **and** `with begin():` transactions share one carrier node, `Transact`, rather than recursive `Lambda`/`Let` combinations or a dedicated fold node. (For the lowering mechanics and the operator-graph realization, see [lowering.md](lowering.md#mutation-accumulation-loops) and [mutability.md](mutability.md).)

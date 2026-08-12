@@ -682,7 +682,7 @@ pub enum HistoryKind {
 }
 
 /// If every tag in `tags` is an anonymous positional [`FieldKey::Index`]
-/// tag (as produced by `++`/CollectionUnion and other unnamed sums),
+/// tag (as produced by `++`/`Copair` and other unnamed sums),
 /// return the payloads in order — recursively flattening nested
 /// all-positional variants so chained `a ++ b ++ c` renders flat as
 /// `A | B | C` rather than as nested `[._0: … | ._1: …]`. Returns `None`
@@ -755,7 +755,7 @@ impl fmt::Display for Type {
             }
             Type::Variant(tags) => {
                 // Anonymous positional variants (all tags are
-                // `FieldKey::Index`, as `++`/CollectionUnion produces) are
+                // `FieldKey::Index`, as `++`/`Copair` produces) are
                 // rendered as a flat `A | B` join — the positional tags
                 // carry no user-meaningful information. Nested
                 // all-positional variants flatten recursively so
@@ -1402,7 +1402,8 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
         | (N::Compose(x), N::Compose(y))
-        | (N::CollectionUnion(x), N::CollectionUnion(y)) => all_eq(x, y),
+        | (N::Copair(x), N::Copair(y))
+        | (N::DisjointJoin(x), N::DisjointJoin(y)) => all_eq(x, y),
         (
             N::Case {
                 scrutinee: s1,
@@ -1616,7 +1617,7 @@ mod tests {
     }
 
     /// An **anonymous positional** sum is not a tagged variant and keeps its own
-    /// rendering: `++`/`CollectionUnion` produces `Index` keys that carry no
+    /// rendering: `++`/`Copair` produces `Index` keys that carry no
     /// user-meaningful information, so the arms print as a flat `A | B` join
     /// rather than being dressed up as surface arms nobody wrote.
     #[test]

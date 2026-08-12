@@ -437,10 +437,28 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // string) but a single symbol would still confuse readers of dumps.
         // Precedence matches `And` so that arithmetic and comparisons bind
         // tighter — same level used by the historical `BinOp` form.
-        TypedExprNode::CollectionUnion(operands) => {
+        // N-ary disjoint join: `c₀ ⊔ c₁ ⊔ …`. `⊔` is the join in the
+        // partial-function order — the operands are partial maps over one domain,
+        // merged where their domains are disjoint — as against `⊎` above, which
+        // copairs operands over *distinct* domains into their coproduct.
+        TypedExprNode::DisjointJoin(operands) => {
             let mut it = operands.iter();
             let first = fmt(
-                it.next().expect("CollectionUnion is non-empty"),
+                it.next().expect("DisjointJoin is non-empty"),
+                Precedence::And,
+                opts,
+            );
+            let rest = it
+                .map(|e| fmt(e, Precedence::And.next_highest(), opts))
+                .collect::<Vec<_>>()
+                .join(" ⊔ ");
+            (Precedence::And, format!("{first} ⊔ {rest}"))
+        }
+
+        TypedExprNode::Copair(operands) => {
+            let mut it = operands.iter();
+            let first = fmt(
+                it.next().expect("Copair is non-empty"),
                 Precedence::And,
                 opts,
             );

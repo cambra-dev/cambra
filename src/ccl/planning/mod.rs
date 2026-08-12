@@ -57,7 +57,7 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// an efficient implementation strategy at each one.
 ///
 /// At each iteration site (aggregate arguments, mutation-loop sources,
-/// `FinalOrDefault` streams, value-position `Record` fields, `CollectionUnion`
+/// `FinalOrDefault` streams, value-position `Record` fields, `Copair`
 /// operands, the program's top-level function-valued result, top-level
 /// let-bound function values, and a few other shapes enumerated by
 /// [`iterate::insert_iterate_recurse`]), [`iterate::insert_iterate_markers`]
