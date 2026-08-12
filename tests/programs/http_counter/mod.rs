@@ -13,11 +13,11 @@
 
 use std::{sync::mpsc, thread, time::Duration};
 
-use super::common::{SharedHttpServer, compile_sink, drive_until, http_get, http_post};
+use super::common::{compile_sink, drive_until, http_get, http_post, reserve_test_port};
 
 #[test]
 fn http_counter() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
     let mut ctx = compile_sink(&source);
 
@@ -45,7 +45,7 @@ fn http_counter() {
 /// `Strings` — with a non-identity map, the point being the map, not the value.)
 #[test]
 fn http_computed_live_read() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let source = format!(
         "set_reqs, set_resps = http_serve(\"{port}\", \"POST\", \"/set\")\n\
          get_reqs, get_resps = http_serve(\"{port}\", \"GET\", \"/get\")\n\
@@ -75,7 +75,7 @@ fn http_computed_live_read() {
 /// /set` writes both registers, so `a + b` reflects the latest committed values.
 #[test]
 fn http_multi_register_live_read() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let source = format!(
         "set_reqs, set_resps = http_serve(\"{port}\", \"POST\", \"/set\")\n\
          get_reqs, get_resps = http_serve(\"{port}\", \"GET\", \"/get\")\n\

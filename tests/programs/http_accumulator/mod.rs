@@ -8,11 +8,11 @@
 
 use std::{sync::mpsc, thread, time::Duration};
 
-use super::common::{SharedHttpServer, compile_sink, drive_until, http_post};
+use super::common::{compile_sink, drive_until, http_post, reserve_test_port};
 
 #[test]
 fn http_accumulator() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
     let mut ctx = compile_sink(&source);
 

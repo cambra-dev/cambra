@@ -50,11 +50,11 @@
 //! Sink program (HTTP / long-lived):
 //!
 //! ```ignore
-//! use super::common::{SharedHttpServer, compile_sink, drive_until, http_get, http_post};
+//! use super::common::{compile_sink, drive_until, http_get, http_post, reserve_test_port};
 //!
 //! #[test]
 //! fn http_greeter() {
-//!     let port = SharedHttpServer::reserve_test_port();
+//!     let port = reserve_test_port();
 //!     let source = include_str!("program.cambra").replace("{PORT}", &port.to_string());
 //!     let mut ctx = compile_sink(&source);
 //!     // …send requests on a background thread, drive_until the responses arrive…
@@ -247,9 +247,9 @@ pub fn compile_sink(source: &str) -> GlobalContext {
 
 /// Port allocation for the `{PORT}` placeholder in sink programs.  Lives in the
 /// library, behind `test-helpers`, so this crate and `tests/http_server.rs`
-/// share one implementation — see [`SharedHttpServer::reserve_test_port`] for
-/// why the naive "bind `:0` and close" allocator is not safe here.
-pub use cambra::interpreter::http_server::SharedHttpServer;
+/// share one implementation — see [`reserve_test_port`] for why the naive
+/// "bind `:0` and close" allocator is not safe here.
+pub use cambra::interpreter::http_server::reserve_test_port;
 
 /// Send a raw HTTP/1.1 GET request and return the response body.  Uses a
 /// plain `TcpStream` so we don't need an HTTP-client crate as a dev

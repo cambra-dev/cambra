@@ -19,7 +19,7 @@ use cambra::{
         lower::{LoweringContext, LoweringError, lower_stmts},
     },
     chl_parser,
-    interpreter::{Consumer, http_server::SharedHttpServer},
+    interpreter::{Consumer, http_server::reserve_test_port},
 };
 use rstest_log::rstest;
 use test_log::test;
@@ -122,7 +122,7 @@ fn drive_until<T>(ctx: &mut GlobalContext, rx: &mpsc::Receiver<T>, timeout: Dura
 /// A CHL program echoes each POST body back with a "Received: " prefix.
 #[rstest]
 fn test_http_serve_echo() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let code = format!(
         "requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
          for req in requests:\n\
@@ -148,7 +148,7 @@ fn test_http_serve_echo() {
 
 #[rstest]
 fn test_http_serve_const() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let code = format!(
         "requests, responses = http_serve(\"{port}\", \"GET\", \"/static\")\n\
          for req in requests:\n\
@@ -176,7 +176,7 @@ fn test_http_serve_const() {
 /// its own prefixed response.
 #[rstest]
 fn test_http_serve_two_sequential_requests() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let code = format!(
         "requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
          for req in requests:\n\
@@ -208,7 +208,7 @@ fn test_http_serve_two_sequential_requests() {
 /// must fire and produce the expected responses.
 #[rstest]
 fn test_http_serve_two_paths() {
-    let port1 = SharedHttpServer::reserve_test_port();
+    let port1 = reserve_test_port();
     let code = format!(
         "reqs1, resps1 = http_serve(\"{port1}\", \"GET\", \"/greet\")\n\
          for req in reqs1:\n\
@@ -243,7 +243,7 @@ fn test_http_serve_two_paths() {
 /// inside both for-loop bodies after the trailing-Record lowering.
 #[rstest]
 fn test_http_serve_two_paths_shared_outer_let() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let code = format!(
         "prefix = \"greeting: \"\n\
          reqs1, resps1 = http_serve(\"{port}\", \"POST\", \"/a\")\n\
@@ -275,7 +275,7 @@ fn test_http_serve_two_paths_shared_outer_let() {
 /// chained outer lets must remain visible to the for-loop body.
 #[rstest]
 fn test_http_serve_echo_with_outer_let() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let code = format!(
         "prefix = \"Echo: \"\n\
          requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
@@ -301,7 +301,7 @@ fn test_http_serve_echo_with_outer_let() {
 /// `http_serve` inside an if/else branch is rejected at lowering time.
 #[test]
 fn test_http_serve_in_if_branch_is_error() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let code = format!(
         "if True:\n\
          \trequests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
@@ -327,7 +327,7 @@ fn test_http_serve_in_if_branch_is_error() {
 /// `http_serve` inside a function body is rejected at lowering time.
 #[test]
 fn test_http_serve_in_function_body_is_error() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let code = format!(
         "def handler():\n\
          \trequests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
@@ -354,7 +354,7 @@ fn test_http_serve_in_function_body_is_error() {
 /// Non-matching paths receive a 404 and do not produce a domain element.
 #[rstest]
 fn test_http_serve_wrong_path_gets_404() {
-    let port = SharedHttpServer::reserve_test_port();
+    let port = reserve_test_port();
     let code = format!(
         "requests, responses = http_serve(\"{port}\", \"POST\", \"/echo\")\n\
          for req in requests:\n\
