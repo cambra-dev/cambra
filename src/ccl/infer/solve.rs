@@ -2532,7 +2532,7 @@ mod tests {
                     user_annotation: None,
                 },
             }),
-            guard: TypedExpr::lit(crate::ccl::Lit::Bool(true)),
+            guard: TypedExpr::lit(Lit::Bool(true)),
             body: TypedExpr::var(b),
         };
         let f = TypedExpr::lambda(
