@@ -225,7 +225,7 @@ impl TileProducer for ConverseProducer {
                         .release(TileGuard::Function(FunctionGuard::Domain(p.clone())))
                 }
             }
-            _ => {}
+            g => panic!("Converse cannot honor the release guard {g:?}"),
         }
     }
 }
@@ -326,7 +326,7 @@ impl TileProducer for MapDomainProducer {
             TileGuard::Function(FunctionGuard::Domain(p)) => {
                 TileGuard::Function(FunctionGuard::Domain(p))
             }
-            _ => todo!(),
+            g => todo!("Restrict cannot honor the release guard {g:?}"),
         });
     }
 }
@@ -492,7 +492,7 @@ impl TileProducer for UncurryProducer {
                 }
                 domain_guard
             }
-            g => panic!("Unsupported obsolete guard: {g:?}"),
+            g => panic!("Filter cannot honor the release guard {g:?}"),
         };
         trace!("{} releasing up with: {input_guard:?}", self.name());
         self.input.release(input_guard);

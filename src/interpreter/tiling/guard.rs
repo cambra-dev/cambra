@@ -140,6 +140,21 @@ impl TileGuard {
         }
     }
 
+    /// Returns whether this guard is universal, panicking unless it is universal
+    /// or empty — for producers that can only reclaim all or nothing. Quietly
+    /// dropping a partial guard would leave them free to re-emit the released
+    /// region, since a producer records the guard either way. `context` names the
+    /// producer in the panic message.
+    pub fn expect_universal_or_empty(&self, context: &str) -> bool {
+        if self.is_empty() {
+            false
+        } else if self.is_universal() {
+            true
+        } else {
+            panic!("{context} cannot honor the partial release guard {self:?}")
+        }
+    }
+
     /// Check whether this guard is structurally compatible with `tiling`.
     ///
     /// A guard is compatible when its variant matches the shape of the tiling

@@ -440,7 +440,7 @@ impl TileProducer for FanInProducer {
                 TileGuard::Function(FunctionGuard::Codomain(g)) => {
                     TileGuard::Function(FunctionGuard::Codomain(g.clone()))
                 }
-                g => unimplemented!("Unexpected guard {g:?}"),
+                g => unimplemented!("FanIn cannot honor the release guard {g:?}"),
             })
         });
     }
@@ -573,7 +573,7 @@ impl TileProducer for ScalarFanInProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.is_universal() {
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.inputs
                 .iter_mut()
                 .for_each(|i| i.release(i.tiling().universal_guard()));
@@ -639,6 +639,41 @@ mod tests {
             log.borrow().is_empty(),
             "an empty release names nothing to free, so nothing is forwarded"
         );
+    }
+
+    /// A guard between the two extremes is **rejected, not ignored**. A
+    /// `ScalarFanIn` re-reads every operand on every pull, so it cannot stop
+    /// requesting one released field; silently dropping the guard would leave it
+    /// re-emitting that field, which the producer has already promised not to do.
+    #[test]
+    #[should_panic(expected = "cannot honor the partial release guard")]
+    fn scalar_fan_in_rejects_a_partial_record_release() {
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let mut inputs: Vec<Box<dyn TileProducer>> = Vec::new();
+        for _ in 0..2 {
+            let (spy, _log) =
+                ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
+            inputs.push(Box::new(spy));
+        }
+        let names: Vec<String> = (0..2).map(tuple_field).collect();
+        let out_tiling =
+            Tiling::Record(names.iter().map(|n| (n.clone(), tiling.clone())).collect());
+        let mut producer = ScalarFanInProducer {
+            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &out_tiling),
+            names: names.clone(),
+            inputs,
+        };
+
+        // Field `_0` released, `_1` still live — neither empty nor universal.
+        let partial = TileGuard::Record(
+            [
+                (names[0].clone(), TileGuard::Scalar(true)),
+                (names[1].clone(), TileGuard::Scalar(false)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        producer.release(partial);
     }
 
     // ── FanInProducer: asymmetric per-branch presence ────────────────────────

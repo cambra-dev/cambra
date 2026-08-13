@@ -90,7 +90,7 @@ impl TileProducer for ConstantProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.is_universal() {
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.released = true;
         }
     }
@@ -558,9 +558,9 @@ impl TileProducer for VariantProjectProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // The scrutinee is always read in full (universal guard); only a
-        // universal release propagates meaningfully.
-        if obsolete_guard.is_universal() {
+        // The scrutinee is always read in full, so there is no sub-region of it
+        // this producer could stop requesting.
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.input.release(self.input.tiling().universal_guard());
         }
     }
@@ -592,9 +592,9 @@ impl TileProducer for ToScalarProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // The input is always read in full (universal guard), so only a universal
-        // release can be propagated meaningfully.
-        if obsolete_guard.is_universal() {
+        // The input is always read in full, so there is no sub-region of it this
+        // producer could stop requesting.
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.input.release(self.input.tiling().universal_guard());
         }
     }
@@ -876,6 +876,22 @@ mod tests {
             fields["_1"],
             Tile::Scalar(ColumnValue::Ints(vec![100, 120]))
         );
+    }
+
+    /// A partial domain release is **rejected, not ignored**. `VariantProject`
+    /// reads its scrutinee in full on every pull, so it cannot stop requesting
+    /// the released rows; dropping the guard silently would leave it re-emitting
+    /// them, against the promise the producer has already recorded.
+    #[test]
+    #[should_panic(expected = "cannot honor the partial release guard")]
+    fn variant_project_rejects_a_partial_domain_release() {
+        let scrut = Box::new(commit_abort_scrutinee());
+        let mut op = VariantProject::new(scrut, FieldKey::Index(0));
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(0)),
+        )));
     }
 
     /// `VariantWrap` is domain-preserving, so output position `d` is payload

@@ -153,6 +153,8 @@ Every operator must obey it in both directions, because a violation yields **wro
 
 `TileProducer::get` checks the producer's half in debug builds: the returned tile must carry no live data inside the accumulated `obsolete_guard`. What an operator can forward depends on how it reads its input, so it is specified per operator below.
 
+An operator must therefore **reject a guard it cannot honor rather than ignore it**. The guard accumulates in `obsolete_guard` whether or not `release_impl` acts on it, so dropping one silently leaves the operator free to re-emit that region — from its own state, or by re-reading an input it never passed the release to. Every `release_impl` is exhaustive; an operator with no sub-region to reclaim piecewise checks the guard with `TileGuard::expect_universal_or_empty`. Rejecting fires where the guard arrives, which does not depend on anything pulling afterwards — the `get` post-condition only fires if something does.
+
 ## Tile Operators
 
 Each `TileOperator` is a static (compile-time) node in the dataflow graph. It knows its output

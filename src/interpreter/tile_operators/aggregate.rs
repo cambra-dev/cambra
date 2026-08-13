@@ -152,7 +152,7 @@ impl TileProducer for AggregateProducer {
         // each delivery as it folds it in, so whatever the input never delivered
         // — this aggregate being done before its source ran dry — would stay
         // stranded upstream.
-        if obsolete_guard.is_universal() {
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.released = true;
             self.input.release(self.input.tiling().universal_guard());
         }
@@ -253,7 +253,7 @@ impl TileProducer for ExtractAggregateProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.is_universal() {
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.input.release(self.input.tiling().universal_guard());
         }
     }
@@ -383,7 +383,7 @@ impl TileProducer for MapExtractAggregateProducer {
             TileGuard::Function(FunctionGuard::Domain(p)) => {
                 TileGuard::Function(FunctionGuard::Domain(p))
             }
-            _ => todo!(),
+            g => todo!("MapExtractAggregate cannot honor the release guard {g:?}"),
         });
     }
 }
