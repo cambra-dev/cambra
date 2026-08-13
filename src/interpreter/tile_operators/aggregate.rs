@@ -73,6 +73,10 @@ struct AggregateProducer {
     kind: AggregateKind,
     /// Running accumulation state; updated in place on each `get`.
     accumulator: Tile,
+    /// Set once the consumer has released this output universally, after which
+    /// the accumulator must never be handed back — it *is* the whole output, so
+    /// re-emitting it returns released data.
+    released: bool,
 }
 
 impl AggregateProducer {
@@ -97,6 +101,7 @@ impl AggregateProducer {
             input,
             kind,
             accumulator,
+            released: false,
         }
     }
 }
@@ -109,6 +114,9 @@ impl TileProducer for AggregateProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        if self.released {
+            return self.tiling().empty_tile();
+        }
         let i_tiling = self.input.tiling().clone();
         let mut input_result = self.input.get(i_tiling.universal_guard());
         let upstream_guard = input_result.to_guard();
@@ -137,9 +145,17 @@ impl TileProducer for AggregateProducer {
         self.accumulator.clone()
     }
 
-    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
-        // Nothing to do. We could consider sanity checking that get is not called
-        // after a universal release.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // An `Aggregation` guard is all-or-nothing — the accumulator has no
+        // sub-regions — so the only release that can arrive is the universal one.
+        // Releasing the input in full is what `get_impl` cannot do: it releases
+        // each delivery as it folds it in, so whatever the input never delivered
+        // — this aggregate being done before its source ran dry — would stay
+        // stranded upstream.
+        if obsolete_guard.is_universal() {
+            self.released = true;
+            self.input.release(self.input.tiling().universal_guard());
+        }
     }
 }
 
@@ -219,6 +235,12 @@ impl TileProducer for ExtractAggregateProducer {
                 self.input.tiling()
             );
         };
+        // An empty accumulator is `⊥`, not a finished aggregation of nothing: the
+        // input has either not produced yet, or has released what it produced and
+        // gone quiet. Either way there is no terminal flag to read.
+        if terminal.is_empty() {
+            return self.tiling().empty_tile();
+        }
         if self.only_terminal {
             if terminal.index_at(0).as_bool() {
                 Tile::Scalar(self.kind.extract(accumulator))
@@ -520,9 +542,161 @@ impl TileProducer for MapAggregateProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.is_universal() {
-            self.accumulators.clear();
-            self.input.release(self.input.tiling().universal_guard());
+        // The output domain *is* this producer's accumulator key set, and the
+        // input's `domain1` is that same key set, so a domain release names
+        // exactly which accumulators to drop and forwards verbatim. Keeping a
+        // released key would re-emit it on the next pull, since `get_impl` builds
+        // its output from every accumulator it holds.
+        match obsolete_guard {
+            g if g.is_empty() => {}
+            g if g.is_universal() => {
+                self.accumulators.clear();
+                self.input.release(self.input.tiling().universal_guard());
+            }
+            TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                self.accumulators.retain(|key, _| !pred.contains(key));
+                self.input
+                    .release(TileGuard::Function(FunctionGuard::Domain(pred)));
+            }
+            g => todo!("Unimplemented guard in MapAggregateProducer: {g:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{QuietSpy, ReleaseSpy};
+    use crate::interpreter::{BaseType, Extent, Predicate, Tile};
+    fn int_sealed(domain: Vec<usize>, values: Vec<i64>) -> Tile {
+        Tile::SealedFunction {
+            domain: ColumnValue::from_uints(domain),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        }
+    }
+
+    /// An `Aggregate`'s accumulator *is* its whole output, so once the consumer
+    /// has released it there is nothing left to hand back. Re-emitting it would
+    /// return released data, which a caching consumer merges into itself twice.
+    #[test]
+    fn aggregate_goes_quiet_after_a_universal_release() {
+        let in_tiling = Tiling::SealedFunction {
+            domain: Extent::uint_range(2),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        let (spy, _released) = ReleaseSpy::new(int_sealed(vec![0, 1], vec![10, 20]), in_tiling);
+        let tiling = Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: Extent::Base(BaseType::Int),
+        };
+        let mut producer = AggregateProducer::new(tiling.clone(), Box::new(spy));
+
+        let first = producer.get(tiling.universal_guard());
+        let Tile::Aggregation { accumulator, .. } = &first else {
+            panic!("expected an Aggregation tile, got {first:?}");
+        };
+        assert_eq!(accumulator.as_single().unwrap(), Value::Int(30));
+
+        producer.release(tiling.universal_guard());
+        assert_eq!(
+            producer.get(tiling.universal_guard()),
+            tiling.empty_tile(),
+            "a released accumulator must not be handed back"
+        );
+    }
+
+    /// The release also has to reach the input in full. `get_impl` only releases
+    /// what was actually delivered, so an aggregate finishing before its source
+    /// ran dry would otherwise strand the remainder upstream.
+    #[test]
+    fn aggregate_releases_its_input_universally() {
+        let in_tiling = Tiling::SealedFunction {
+            domain: Extent::uint_range(2),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        let (spy, released) = ReleaseSpy::new(int_sealed(vec![0], vec![10]), in_tiling.clone());
+        let tiling = Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: Extent::Base(BaseType::Int),
+        };
+        let mut producer = AggregateProducer::new(tiling.clone(), Box::new(spy));
+
+        producer.release(tiling.universal_guard());
+        assert!(
+            released.borrow().iter().any(TileGuard::is_universal),
+            "expected a universal release to reach the input, got {:?}",
+            released.borrow()
+        );
+        let _ = in_tiling;
+    }
+
+    /// A **per-key** release must drop exactly those accumulators and forward the
+    /// same domain predicate upstream. `get_impl` rebuilds its output from every
+    /// accumulator it holds, so a kept-but-released key is re-emitted; and the
+    /// input's `domain1` is the same key set, so nothing else would reclaim it.
+    #[test]
+    fn map_aggregate_drops_and_forwards_a_per_key_release() {
+        let key_extent = Extent::Base(BaseType::Int);
+        let in_tiling = Tiling::CurriedFunction {
+            domain1: key_extent.clone(),
+            domain2: Extent::Base(BaseType::Int),
+            codomain: Extent::Base(BaseType::Int),
+        };
+        // Keys 1 and 2, each with two values: 1 -> [10, 20], 2 -> [30, 40].
+        let tile = Tile::curried_function(
+            ColumnValue::Ints(vec![1, 2]),
+            ColumnValue::from_uints(vec![0, 2]),
+            ColumnValue::Ints(vec![0, 1, 0, 1]),
+            ColumnValue::Ints(vec![10, 20, 30, 40]),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let (spy, released) = QuietSpy::new(tile, in_tiling.clone());
+        let out_tiling = Tiling::SealedFunction {
+            domain: key_extent,
+            codomain: Box::new(Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Extent::Base(BaseType::Int),
+            }),
+        };
+        let mut producer = MapAggregateProducer {
+            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &out_tiling),
+            input: Box::new(spy),
+            kind: AggregateKind::Sum,
+            accumulators: HashMap::new(),
+        };
+
+        let first = producer.get(out_tiling.universal_guard());
+        let Tile::SealedFunction { domain, .. } = &first else {
+            panic!("expected a SealedFunction, got {first:?}");
+        };
+        assert_eq!(domain.len(), 2, "both keys aggregate on the first pull");
+
+        // Release key 1 only.
+        let key_one = TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(
+            intervalsets::IntervalSet::from(intervalsets::Interval::closed(
+                Value::Int(1),
+                Value::Int(1),
+            )),
+        )));
+        producer.release(key_one.clone());
+
+        assert!(
+            released.borrow().contains(&key_one),
+            "the per-key release must reach the input, got {:?}",
+            released.borrow()
+        );
+        let second = producer.get(out_tiling.universal_guard());
+        let Tile::SealedFunction { domain, .. } = &second else {
+            panic!("expected a SealedFunction, got {second:?}");
+        };
+        assert_eq!(
+            domain.index_at(0),
+            Value::Int(2),
+            "only the unreleased key may be emitted, got {second:?}"
+        );
+        assert_eq!(domain.len(), 1, "the released key must be gone: {second:?}");
     }
 }

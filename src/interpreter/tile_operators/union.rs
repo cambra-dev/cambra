@@ -322,7 +322,29 @@ impl TileProducer for UnionProducer {
         let tiles: Vec<Tile> = self
             .inputs
             .iter_mut()
-            .map(|p| p.get(p.tiling().universal_guard()))
+            .map(|p| {
+                // An arm the consumer has fully released contributes nothing.
+                // `release_impl` below splits a per-variant guard, so one arm can be
+                // universally released while its siblings are still producing — and
+                // released positions must never reappear in this operator's output.
+                // The arm still has to *appear* here, since the arms are
+                // positional, so it contributes an empty but **decided** tile: empty
+                // because its positions are released, decided because nothing more
+                // will ever arrive from it (the default `empty_tile` reads as "not
+                // ready", which would hold the union non-terminal forever).
+                if p.obsolete_guard().is_universal() {
+                    let mut released = p.tiling().empty_tile();
+                    if let Tile::SealedFunction {
+                        domain_predicate, ..
+                    } = &mut released
+                    {
+                        *domain_predicate = Predicate::True;
+                    }
+                    released
+                } else {
+                    p.get(p.tiling().universal_guard())
+                }
+            })
             .collect();
 
         if self.flat {
@@ -649,6 +671,68 @@ mod tests {
         let _ = flat_merge(
             vec![flat_arm(&[(0, 10), (1, 20)]), flat_arm(&[(1, 99)])],
             &Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+    }
+
+    /// `release_impl` splits a per-variant guard, so one arm can be fully released
+    /// while its siblings still produce. That arm must not be pulled again — the
+    /// release promised never to request those positions, and re-delivering
+    /// released data is exactly what a consumer that has moved on must not see.
+    ///
+    /// Both arms here hold data, so a pull that ignored the release would show arm
+    /// 0's rows in the output. (In a debug build the central pull-after-release
+    /// assertion in `TileProducer::get` catches it too.)
+    #[test]
+    fn a_fully_released_arm_is_not_pulled_again() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+
+        let arm_tiling = int_sealed_tiling();
+        let inputs: Vec<Box<dyn TileProducer>> = (0..2)
+            .map(|_| {
+                Box::new(TestTileProducer::new(int_sealed_tile(), arm_tiling.clone()))
+                    as Box<dyn TileProducer>
+            })
+            .collect();
+        let union_tiling = Tiling::SealedFunction {
+            domain: Extent::Union(TagMap::from_positional(vec![
+                Extent::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            ])),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        let mut producer = UnionProducer {
+            base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),
+            inputs,
+            // Tagged, not flat-merged: the assertions below read per-arm
+            // variants off a `ColumnValue::Union` domain.
+            flat: false,
+        };
+
+        // Release arm 0 in full, leaving arm 1 live.
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::Union(TagMap::from_positional(vec![
+                Predicate::True,
+                Predicate::False,
+            ])),
+        )));
+        let tile = producer.get(union_tiling.universal_guard());
+
+        let Tile::SealedFunction { domain, .. } = tile else {
+            panic!("union of sealed functions is a sealed function");
+        };
+        let ColumnValue::Union(arms) = domain else {
+            panic!("the union domain is a discriminated union, got {domain:?}");
+        };
+        let variants = arms.into_values();
+        assert_eq!(
+            variants[0].len(),
+            0,
+            "the released arm contributes nothing; it was not re-pulled"
+        );
+        assert_eq!(
+            variants[1].len(),
+            2,
+            "the live arm still contributes its rows"
         );
     }
 

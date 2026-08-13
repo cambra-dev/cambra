@@ -600,6 +600,22 @@ impl Tile {
         }
     }
 
+    /// Whether this tile still carries live data inside `guard`.
+    ///
+    /// Defined as "removing the guarded region would change the tile", so it
+    /// agrees with [`Self::remove_guarded`] by construction — including where
+    /// that deliberately keeps data, as a [`Tile::Store`] does for a released
+    /// tick prefix whose values still hold forward past the watermark. A row
+    /// already marked deleted is not live, so re-marking it reports nothing.
+    pub fn contains_guarded(&self, guard: &TileGuard) -> bool {
+        if guard.is_empty() {
+            return false;
+        }
+        let mut probe = self.clone();
+        probe.remove_guarded(guard.clone());
+        probe != *self
+    }
+
     /// Creates a TileGuard representing the contents of this Tile.
     /// For Scalar: universal if the scalar is known and empty otherwise
     /// For Aggregation: universal if terminal and empty otherwise

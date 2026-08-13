@@ -312,9 +312,24 @@ impl TileProducer for VariantWrapProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.is_universal() {
-            self.input.release(self.input.tiling().universal_guard());
-        }
+        // Wrapping is element-wise and **domain-preserving**: output position `d`
+        // is payload position `d`. So a domain release translates verbatim — and
+        // it has to, since this producer re-emits whatever the payload answers
+        // with. Swallowing it (as a whole-input reader may) would leave the
+        // payload producing released positions and this operator handing them
+        // back, which is the one thing a release forbids.
+        let upstream_guard = match obsolete_guard {
+            g if g.is_empty() => self.input.tiling().empty_guard(),
+            g if g.is_universal() => self.input.tiling().universal_guard(),
+            TileGuard::Function(FunctionGuard::Domain(p)) => {
+                TileGuard::Function(FunctionGuard::Domain(p))
+            }
+            // A codomain guard is shaped against the *wrapped* union extent, not
+            // the payload's, so it cannot be forwarded as-is; no consumer builds
+            // one over a variant today.
+            g => todo!("Unimplemented guard in VariantWrapProducer: {g:?}"),
+        };
+        self.input.release(upstream_guard);
     }
 }
 
@@ -588,7 +603,7 @@ impl TileProducer for ToScalarProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+    use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
 
     /// A test operator that yields one fixed tile, so a `VariantProject`/union
     /// chain can be `subscribe`d and driven end-to-end.
@@ -860,6 +875,54 @@ mod tests {
         assert_eq!(
             fields["_1"],
             Tile::Scalar(ColumnValue::Ints(vec![100, 120]))
+        );
+    }
+
+    /// `VariantWrap` is domain-preserving, so output position `d` is payload
+    /// position `d` and a **partial** domain release forwards verbatim. This is
+    /// the shape a writer's decision stream has: the commit operator releases
+    /// one committed position at a time, and if the wrap swallows that, the
+    /// payload keeps producing the released position and the wrap hands it back
+    /// — the one thing a release forbids.
+    #[test]
+    fn variant_wrap_forwards_a_partial_domain_release_to_its_payload() {
+        let commit = FieldKey::Name("commit".into());
+        let payload_tiling = Tiling::SealedFunction {
+            domain: Extent::uint_range(2),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        let (spy, released) = ReleaseSpy::new(
+            Tile::SealedFunction {
+                domain: ColumnValue::from_uints(vec![0, 1]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+                domain_predicate: Predicate::False,
+                deleted: BitSet::new(),
+            },
+            payload_tiling.clone(),
+        );
+        let out_tiling = Tiling::SealedFunction {
+            domain: Extent::uint_range(2),
+            codomain: Box::new(Tiling::Scalar(Extent::Union(TagMap::from_arms(vec![(
+                commit.clone(),
+                Extent::Base(BaseType::Int),
+            )])))),
+        };
+        let mut producer = VariantWrapProducer {
+            base: ProducerBase::new(VariantWrapProducer::alloc_id(), &out_tiling),
+            input: Box::new(spy),
+            tag: commit.clone(),
+            variant_extents: TagMap::from_arms(vec![(commit, Extent::Base(BaseType::Int))]),
+        };
+
+        let prefix =
+            TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(0))));
+        producer.release(prefix.clone());
+
+        assert_eq!(
+            released.borrow().as_slice(),
+            &[prefix],
+            "a domain release must reach the payload unchanged, not be swallowed \
+             as a whole-input read would"
         );
     }
 }
