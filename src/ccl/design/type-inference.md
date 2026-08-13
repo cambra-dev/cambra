@@ -789,7 +789,7 @@ Both kinds apply at both binder positions, `let` and function parameter, with on
 
 The bounded column is the *only* behaviour that existed before the split, at both positions: a binder annotation contributed one upper bound and nothing else, because `bind_annotation` is one-way (`inferred <: ann` — an annotation has to admit the value, not equal it). A parameter's type was therefore the **meet** of its annotation and whatever its body demanded, which is worth stating plainly because it is neither of the two readings one expects: in `def f(v <: {a: Int}): v.b`, the annotation admits the argument and the projection widens the demand, so `𝑣` ends up at `{a: Int, b: 𝑇}` and callers must supply both fields. That is still what the bounded form means; the split gave it its own spelling and gave `:` the exact reading.
 
-Neither rule needs a mode test at its binder. A parameter binds at `normalize(annotation)`: exact normalizes to `𝑇` itself, bounded to a variable bounded by `𝑇`, and the old two-step (bind at a fresh variable, *then* reconcile against the annotation) is what made an exact annotation behave as neither reading — it contributed one upper bound among several instead of being the type. A `let` binds at the same normalization of its (completed) annotation, and two special cases fall out as consequences rather than tests: a **deref-copy** (`y: Int = x` off a register) binds at the annotation because that is what exact *means*, and a bare `_` completes to the initializer's type — so it stays a register, and the mutable-alias rule still rejects `y: _ = x`.
+Neither rule needs a mode test at its binder. A parameter binds at `normalize(annotation)`: exact normalizes to `𝑇` itself, bounded to a variable bounded by `𝑇`, and the old two-step (bind at a fresh variable, *then* reconcile against the annotation) is what made an exact annotation behave as neither reading — it contributed one upper bound among several instead of being the type. A `let` binds at the same normalization of its (completed) annotation, and two special cases fall out as consequences rather than tests: a **deref-copy** (`y: Int = x` off a mutable variable) binds at the annotation because that is what exact *means*, and a bare `_` completes to the initializer's type — so it stays a mutable variable, and the mutable-alias rule still rejects `y: _ = x`.
 
 #### Below is a marker in a type slot, not a type
 
@@ -815,9 +815,9 @@ An exact annotation may be partly unspecified — `x: List(_) = [1, 2, 3]`, or t
 
 The filling is a structural function on the two types, deliberately not a constraint: binding at a normalized annotation and relying on the one-way `rhs <: ann` edge to drive the annotation's fresh variables does *not* work — those variables are minted at the outer level, after the RHS's level has been popped, and escape inference unresolved. Shape disagreements need no handling here, because a `rhs` that cannot flow into `ann` at all is already an `AnnotationMismatch`.
 
-#### A bound on a register bounds its value type
+#### A bound on a mutable variable bounds its value type
 
-`𝑥 <: Mut(𝑉) := 𝑒` declares a register whose **value type is inferred, subject to
+`𝑥 <: Mut(𝑉) := 𝑒` declares a mutable variable whose **value type is inferred, subject to
 `<: 𝑉`** — the same declaration as `𝑥 <: 𝑉 := 𝑒`, and the same as writing no
 annotation whenever the inferred type already satisfies `𝑉`. Lowering applies the
 binder's mode to the value type it extracts from the annotation
@@ -825,21 +825,21 @@ binder's mode to the value type it extracts from the annotation
 `Mut(Below(𝑉), 𝐷)` and the bound is consumed in the value position like any other.
 
 The value position is the only place the bound can go, and that is a fact about the
-pipeline rather than about variance. A register binder's slot must stay structurally
-a `History`: `as_register`, the deref coercion in `constrain`, `mut_elim`, and
+pipeline rather than about variance. A mutable variable binder's slot must stay structurally
+a `History`: `mut_value_type`, the deref coercion in `constrain`, `mut_elim`, and
 `transact_phase` all dispatch on that shape, and a variable standing for the whole
-handle would skip a write's `value <: 𝑉` edge, so the register would never receive
+handle would skip a write's `value <: 𝑉` edge, so the mutable variable would never receive
 its writes. The value position carries no such requirement — a variable there is the
 *ordinary* case, since an unannotated `x := 5` binds at `Mut(?v, ?d)` — and it is
 where a strict subtype can differ at all.
 
-Distributing is also what makes the bound mean *bounded*. A register's value type is
-invariant in **subtyping between two registers** — the call-site rule relating a
-caller's register to a `Mut` parameter, where covariance would let a callee narrow a
+Distributing is also what makes the bound mean *bounded*. A mutable variable's value type is
+invariant in **subtyping between two mutable variables** — the call-site rule relating a
+caller's mutable variable to a `Mut` parameter, where covariance would let a callee narrow a
 value the caller's declaration still promises. That is a different question from
-bounding one register's own value, and treating them as the same made
+bounding one mutable variable's own value, and treating them as the same made
 `x <: Mut(Int) := 5` bind at `Mut(Int)`: it discarded the singleton that the wholly
-unannotated `x := 5` keeps — a register's value type is the join over its seed and
+unannotated `x := 5` keeps — a mutable variable's value type is the join over its seed and
 every write, so a single contribution keeps its refinement and `x := 1` is a
 `Mut(1)`. The bound *lost* information rather than admitting it.
 

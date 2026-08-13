@@ -963,7 +963,7 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
 /// Whether a binder annotation is a pass-by-reference `Mut(…)` form.
 ///
 /// Reads the annotation's *type* only: the mode is orthogonal to whether the
-/// binder names a register (`x <: Mut(V) := e` introduces one just as
+/// binder names a mutable variable (`x <: Mut(V) := e` introduces one just as
 /// `x: Mut(V) := e` does).
 fn is_mut_annotation(annotation: &TypeAnnotation) -> bool {
     mut_annotation_parts(&annotation.ty).is_some()
@@ -989,7 +989,7 @@ pub(super) fn lower_type_annotation(annotation: &TypeAnnotation) -> Result<Type,
 /// Separate from [`lower_type_annotation`] because a `Mut(…)` annotation is not
 /// lowered as one type: `mut_annotation_parts` splits it into a *value* type and a
 /// domain, and the binder's mode belongs to the value — `x <: Mut(V) := e` bounds
-/// the register's value type, exactly as `x <: V := e` does. Applying the mode in
+/// the mutable variable's value type, exactly as `x <: V := e` does. Applying the mode in
 /// one place is what keeps those two spellings from disagreeing, which is how the
 /// `Mut` form came to silently drop its mode and read as exact.
 pub(super) fn apply_annotation_mode(mode: AnnotationMode, ty: Type) -> Type {

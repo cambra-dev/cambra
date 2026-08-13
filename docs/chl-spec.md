@@ -635,8 +635,8 @@ while `x <: Int = 5` leaves `x` at `5` (a bounded annotation only has to admit
 the value) — see
 [Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded). Any
 operation that computes a *new* value drops it, since it is a fact about one
-value and not about the operation: `x + x` is an `Int`, and a mutable register
-never takes it (a register is the sequence its writes produce, so no one write's
+value and not about the operation: `x + x` is an `Int`, and a mutable variable
+never takes it (a mutable variable is the sequence its writes produce, so no one write's
 value describes it). Unit is the exception with nothing to say: it has one
 inhabitant, so pinning it would add nothing to the base.
 

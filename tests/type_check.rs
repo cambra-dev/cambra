@@ -991,9 +991,23 @@ fn test_def_param_annotation_enforced() {
     // The parameter binds *at* `Int` (exact), so the argument's singleton does not
     // flow through it — that erasure is what makes an annotated parameter a
     // monomorphization boundary (see `test_exact_param_shares_one_specialization`).
-    assert_eq!(infer_program("def g(a: Int):\n    a\ng(1)"), int());
+    assert_eq!(
+        infer_program(indoc! {r#"
+        def g(a: Int):
+            a
+        g(1)
+    "#}),
+        int()
+    );
     // The bounded form keeps it: `a` is inferred, bounded above by `Int`.
-    assert_eq!(infer_program("def g(a <: Int):\n    a\ng(1)"), int_lit(1));
+    assert_eq!(
+        infer_program(indoc! {r#"
+        def g(a <: Int):
+            a
+        g(1)
+    "#}),
+        int_lit(1)
+    );
     assert!(!infer_program_err("def g(a: Int):\n    a\ng(\"x\")").is_empty());
     // A `List(Int)` annotation enforces the element type through the annotation.
     assert_eq!(
@@ -1014,7 +1028,11 @@ fn test_multiarg_def_param_annotation_enforced() {
     );
     // Per-position modes inside the one tupled annotation: `a` exact, `b` bounded.
     assert_eq!(
-        infer_program("def g(a <: Int, b: String):\n    a\ng(1, \"x\")"),
+        infer_program(indoc! {r#"
+            def g(a <: Int, b: String):
+                a
+            g(1, "x")
+        "#}),
         int_lit(1)
     );
     // Wrong type on `a` is rejected.
@@ -2030,12 +2048,36 @@ fn positional_and_named_projection_compose() {
 /// directly). The keying is what is at issue here, not the precision.
 #[test]
 fn brace_type_annotations_project_by_their_keying() {
-    assert_eq!(infer_program("t: {Int, Bool} = (1, True)\nt.0"), int());
-    assert_eq!(infer_program("r: {a: Int} = (a=1)\nr.a"), int());
+    assert_eq!(
+        infer_program(indoc! {r#"
+        t: {Int, Bool} = (1, True)
+        t.0
+    "#}),
+        int()
+    );
+    assert_eq!(
+        infer_program(indoc! {r#"
+        r: {a: Int} = (a=1)
+        r.a
+    "#}),
+        int()
+    );
     // A *one*-element tuple type carries the trailing comma, like the `(e,)` term.
-    assert_eq!(infer_program("t: {Int,} = (1,)\nt.0"), int());
+    assert_eq!(
+        infer_program(indoc! {r#"
+        t: {Int,} = (1,)
+        t.0
+    "#}),
+        int()
+    );
     // A one-*field* record type needs no comma — `a: Int` already marks the form.
-    assert_eq!(infer_program("r: {a: Int,} = (a=1)\nr.a"), int());
+    assert_eq!(
+        infer_program(indoc! {r#"
+        r: {a: Int,} = (a=1)
+        r.a
+    "#}),
+        int()
+    );
 }
 
 /// The empty product is `Unit`, and it is the *only* empty product: `{}` in an
@@ -2609,10 +2651,20 @@ mod annotation_kinds {
     #[test]
     fn exact_narrows_record_width_and_bounded_does_not() {
         assert!(
-            !infer_program_err("x: {a: Int} = (a=1, b=2)\nx.b").is_empty(),
+            !infer_program_err(indoc! {r#"
+                x: {a: Int} = (a=1, b=2)
+                x.b
+            "#})
+            .is_empty(),
             "an exact annotation is the binder's type, so `b` is not reachable"
         );
-        assert_eq!(infer_program("x <: {a: Int} = (a=1, b=2)\nx.b"), int_lit(2));
+        assert_eq!(
+            infer_program(indoc! {r#"
+            x <: {a: Int} = (a=1, b=2)
+            x.b
+        "#}),
+            int_lit(2)
+        );
     }
 
     /// Same at a parameter, which is the asymmetry that motivated the split: the
@@ -2620,11 +2672,20 @@ mod annotation_kinds {
     #[test]
     fn the_two_binder_positions_agree() {
         assert!(
-            !infer_program_err("def f(v: {a: Int}):\n    v.b\nf((a=1, b=2))").is_empty(),
+            !infer_program_err(indoc! {r#"
+                def f(v: {a: Int}):
+                    v.b
+                f((a=1, b=2))
+            "#})
+            .is_empty(),
             "an exact parameter is the annotation, so `v.b` is not typeable"
         );
         assert_eq!(
-            infer_program("def f(v <: {a: Int}):\n    v.b\nf((a=1, b=2))"),
+            infer_program(indoc! {r#"
+                def f(v <: {a: Int}):
+                    v.b
+                f((a=1, b=2))
+            "#}),
             int_lit(2)
         );
     }
@@ -2639,8 +2700,20 @@ mod annotation_kinds {
     /// here yet.
     #[test]
     fn only_bounded_keeps_a_literals_singleton() {
-        assert_eq!(infer_program("i: Int = 0\ni"), int());
-        assert_eq!(infer_program("i <: Int = 0\ni"), int_lit(0));
+        assert_eq!(
+            infer_program(indoc! {r#"
+            i: Int = 0
+            i
+        "#}),
+            int()
+        );
+        assert_eq!(
+            infer_program(indoc! {r#"
+            i <: Int = 0
+            i
+        "#}),
+            int_lit(0)
+        );
     }
 
     /// An unspecified position declares nothing and is completed from the
@@ -2648,11 +2721,25 @@ mod annotation_kinds {
     /// nested inside a compound annotation.
     #[test]
     fn an_unspecified_position_is_completed_from_the_initializer() {
-        assert_eq!(infer_program("x: _ = 2\nx"), infer_program("x = 2\nx"));
-        assert_eq!(infer_program("x: _ = 2\nx"), int_lit(2));
+        let unspecified = indoc! {r#"
+            x: _ = 2
+            x
+        "#};
+        let bare = indoc! {r#"
+            x = 2
+            x
+        "#};
+        assert_eq!(infer_program(unspecified), infer_program(bare));
+        assert_eq!(infer_program(unspecified), int_lit(2));
         // `List(_)` completes its element type rather than leaving a variable that
         // nothing resolves.
-        assert_eq!(infer_program("x: List(_) = [1, 2, 3]\nsum(x)"), int());
+        assert_eq!(
+            infer_program(indoc! {r#"
+            x: List(_) = [1, 2, 3]
+            sum(x)
+        "#}),
+            int()
+        );
     }
 
     /// An exact parameter annotation is a **monomorphization boundary**: it binds
@@ -2671,7 +2758,15 @@ mod annotation_kinds {
             infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
             symbolic(&expr).matches("let __mono").count()
         }
-        let body = "\n    v + 1\n\na = f(1)\nb = f(2)\na\n";
+        let body = indoc! {r#"
+
+                v + 1
+
+            a = f(1)
+            b = f(2)
+            a
+
+        "#};
         assert_eq!(
             clones(&format!("def f(v <: Int):{body}")),
             2,
@@ -2689,20 +2784,28 @@ mod annotation_kinds {
         // annotation, same literal — so a split here would be two clones of
         // identical code.
         assert_eq!(
-            clones("def f(v: Int):\n    v + 1\nf(1) + f(1)"),
+            clones(indoc! {r#"
+                def f(v: Int):
+                    v + 1
+                f(1) + f(1)
+            "#}),
             1,
             "which operand slot a use lands in is not information about the use"
         );
         // The bounded form still splits under the same consumer: there the argument
         // reaches the *domain*, which is a real difference between the clones.
         assert_eq!(
-            clones("def f(v <: Int):\n    v + 1\nf(1) + f(2)"),
+            clones(indoc! {r#"
+                def f(v <: Int):
+                    v + 1
+                f(1) + f(2)
+            "#}),
             2,
             "a bounded param still splits per argument, operator consumer or not"
         );
     }
 
-    /// A binder's mode applies to a register's **value** type, so `a <: Mut(V)` and
+    /// A binder's mode applies to a mutable variable's **value** type, so `a <: Mut(V)` and
     /// `a <: V` are the same declaration — and both agree with writing no annotation
     /// at all, since a bound the inferred type already satisfies admits it rather
     /// than replacing it.
@@ -2712,37 +2815,78 @@ mod annotation_kinds {
     /// form discarded the singleton that the unannotated form keeps — a bound that
     /// lost information.
     #[test]
-    fn a_bound_on_a_register_bounds_its_value_type() {
-        // Compared by register *value* type. Each program ends in a bare read, and a
-        // tail denotes the register's *value*, so the program type is that value type
+    fn a_bound_on_a_mut_var_bounds_its_value_type() {
+        // Compared by mutable variable *value* type. Each program ends in a bare read, and a
+        // tail denotes the mutable variable's *value*, so the program type is that value type
         // directly — which also keeps the per-run domain variable, whose id differs
         // every time, out of the comparison.
-        let register_value = |code: &str| {
+        let mut_value = |code: &str| {
             let ty = infer_program(code);
             assert!(
-                ty.as_register().is_none(),
-                "a tail read denotes the register's value, got the handle {ty}"
+                ty.mut_value_type().is_none(),
+                "a tail read denotes the mutable variable's value, got the handle {ty}"
             );
             ty
         };
         // No writes, so the value type is the seed's — the bound admits `5`.
-        let bare = register_value("a := 5\na");
-        assert_eq!(register_value("a <: Mut(Int) := 5\na"), bare);
-        assert_eq!(register_value("a <: Int := 5\na"), bare);
+        let bare = mut_value(indoc! {r#"
+            a := 5
+            a
+        "#});
+        assert_eq!(
+            mut_value(indoc! {r#"
+            a <: Mut(Int) := 5
+            a
+        "#}),
+            bare
+        );
+        assert_eq!(
+            mut_value(indoc! {r#"
+            a <: Int := 5
+            a
+        "#}),
+            bare
+        );
         // The exact form is what discards the singleton.
-        assert_eq!(register_value("a: Mut(Int) := 5\na"), int());
-        assert_ne!(register_value("a <: Mut(Int) := 5\na"), int());
+        assert_eq!(
+            mut_value(indoc! {r#"
+            a: Mut(Int) := 5
+            a
+        "#}),
+            int()
+        );
+        assert_ne!(
+            mut_value(indoc! {r#"
+            a <: Mut(Int) := 5
+            a
+        "#}),
+            int()
+        );
         // With a write, the value type is the join over seed and writes, so both
         // modes land on `Int` — the bound is satisfied, not doing the widening.
-        assert_eq!(register_value("a <: Mut(Int) := 0\na += 1\na"), int());
+        assert_eq!(
+            mut_value(indoc! {r#"
+            a <: Mut(Int) := 0
+            a += 1
+            a
+        "#}),
+            int()
+        );
         // And it is still a *declaration*, so the deref-copy below it is a read.
-        assert_eq!(infer_program("a <: Mut(Int) := 0\nb: Int = a\nb"), int());
+        assert_eq!(
+            infer_program(indoc! {r#"
+            a <: Mut(Int) := 0
+            b: Int = a
+            b
+        "#}),
+            int()
+        );
     }
 
-    /// The bound is a real obligation on a bounded register, discharged against both
+    /// The bound is a real obligation on a bounded mutable variable, discharged against both
     /// contributions to its value type: the seed and every write.
     #[test]
-    fn a_bounded_registers_bound_constrains_seed_and_writes() {
+    fn a_bounded_mut_vars_bound_constrains_seed_and_writes() {
         let rejects = |code: &str, needle: &str| {
             let errs = infer_program_err(code);
             let rendered = format!("{errs:?}");
@@ -2751,9 +2895,20 @@ mod annotation_kinds {
                 "expected an error mentioning {needle:?}, got: {rendered}"
             );
         };
-        rejects("a <: Mut(Int) := \"s\"\na", "initializer of mutable `a`");
         rejects(
-            "a <: Mut(Int) := 0\nfor i in [1, 2]:\n    a := \"s\"\na",
+            indoc! {r#"
+            a <: Mut(Int) := "s"
+            a
+        "#},
+            "initializer of mutable `a`",
+        );
+        rejects(
+            indoc! {r#"
+                a <: Mut(Int) := 0
+                for i in [1, 2]:
+                    a := "s"
+                a
+            "#},
             "write to mutable variable `a`",
         );
     }

@@ -190,10 +190,10 @@ impl InferCtx {
             // consumed by the value position below.
             //
             // That is not merely where it happens to sit — it is the only place it
-            // can. A register binder's slot must stay structurally a `History`:
-            // `as_register`, the deref coercion, `mut_elim`, and `transact_phase` all
+            // can. A mutable variable binder's slot must stay structurally a `History`:
+            // `mut_value_type`, the deref coercion, `mut_elim`, and `transact_phase` all
             // dispatch on the shape, and a variable standing for the whole history
-            // would skip a write's `value <: V` edge, so the register would never
+            // would skip a write's `value <: V` edge, so the mutable variable would never
             // receive its writes. The value position has no such constraint — a
             // variable there is the ordinary case, since an unannotated `x := 5` binds
             // at `Mut(?v, ?d)` too — and it is where a strict subtype can differ at
