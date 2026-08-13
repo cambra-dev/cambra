@@ -1,6 +1,7 @@
 //! Transactional stores (`Mut(V, Txn)` + `with begin():`) — the commit-operator
 //! path. Batch (finite-loop and standalone) single-variable transactions run
-//! end-to-end: `x: Mut(V, Txn)` folds into one shared commit store, each `with
+//! end-to-end: `x: Mut(V, Txn)` folds into a commit store shared with the mutable variables
+//! some block relates it to, each `with
 //! begin():` block is a writer. A transactional mutable variable is read only inside a
 //! `with begin():` block; the batch tests read a value with a trailing standalone
 //! read-only transaction (`out = defer(); …; with begin(): out << x`) and assert
@@ -1064,6 +1065,306 @@ fn sustained_contention_conserves_pool() {
         out
     "};
     check_tile(&code, commit_stream(&[0], &[980]));
+}
+
+// ---------------------------------------------------------------------------
+// Commit-store partitioning
+//
+// A program gets one commit store per set of mutable variables some `with begin():`
+// block relates — not one store for the whole program. These assert the
+// partition end to end, on the planned graph rather than only on values: two
+// programs can agree on every number and differ in how many stores they built.
+// ---------------------------------------------------------------------------
+
+/// The `Transact` carriers in a planned program, as `domain[keys]`, **outermost
+/// first**. Reads the *structure* the value tests cannot see — a `Txn` domain is a
+/// commit store, an extent domain an induction loop, and the order is the nesting.
+fn stores_in(ast: &cambra::ccl::Expr) -> Vec<String> {
+    fn walk(e: &cambra::ccl::Expr, out: &mut Vec<String>) {
+        if let cambra::ccl::TypedExprNode::Transact { keys, domain, .. } = &e.node {
+            out.push(format!(
+                "{domain}[{}]",
+                keys.iter()
+                    .map(|k| k.name.base().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        e.walk_children(|c| walk(c, out));
+    }
+    let mut out = Vec::new();
+    walk(ast, &mut out);
+    out
+}
+
+/// [`stores_in`] for a program that registers no data source.
+fn commit_stores(code: &str) -> Vec<String> {
+    let mut ctx = GlobalContext::default();
+    let (ast, _) = run_pipeline_with_ctx(&mut ctx, code);
+    stores_in(&ast)
+}
+
+/// Two mutable variables written by separate blocks and read separately have no
+/// operation relating them, so they get their own stores — and their own commit clocks,
+/// and their own completion.
+#[test]
+fn unrelated_mut_vars_get_separate_stores() {
+    let code = indoc! {r#"
+        oa = defer()
+        ob = defer()
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                a := a + x
+        for y in [10, 20]:
+            with begin():
+                b := b + y
+        with begin():
+            oa << a
+        with begin():
+            ob << b
+        (sum(oa), sum(ob))
+    "#};
+    assert_eq!(commit_stores(code), vec!["Txn[a]", "Txn[b]"]);
+    check_tile(
+        code,
+        Tile::Record(std::collections::HashMap::from([
+            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
+            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
+        ])),
+    );
+}
+
+/// **Atomicity holds the store together.** One block writing both keys means they
+/// advance at one commit tick, so they stay one store however the program is
+/// otherwise shaped.
+#[test]
+fn registers_written_in_one_block_share_a_store() {
+    let code = indoc! {r#"
+        out = defer()
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                a := a + x
+                b := b - x
+        with begin():
+            out << a * 100 + b
+        out
+    "#};
+    assert_eq!(commit_stores(code), vec!["Txn[a,b]"]);
+    check_tile(code, commit_stream(&[0], &[297]));
+}
+
+/// **Snapshot consistency** holds a store together too, and writes alone do not show
+/// it: nothing writes both mutable variables, but the trailing read latches them at one
+/// frontier, so they must come from one mutable variable record. The writers are exactly
+/// those of `unrelated_mut_vars_get_separate_stores` — only the read differs.
+#[test]
+fn mut_vars_read_together_share_a_store() {
+    let code = indoc! {r#"
+        out = defer()
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                a := a + x
+        for y in [10, 20]:
+            with begin():
+                b := b + y
+        with begin():
+            out << a * 100 + b
+        out
+    "#};
+    assert_eq!(commit_stores(code), vec!["Txn[a,b]"]);
+    check_tile(code, commit_stream(&[0], &[330]));
+}
+
+/// A register a *writing* block reads to decide its commit is read at that commit's
+/// snapshot, so the read alone pulls it into the store — no write to `limit` is
+/// needed. (`limit` is never written, so it is a read-only key of the store. The key
+/// order is the block's footprint order, which is where the guard reads them, not the
+/// declaration order.)
+#[test]
+fn a_mut_var_read_by_a_writing_block_joins_its_store() {
+    let code = indoc! {r#"
+        out = defer()
+        limit: Mut(Int, Txn) := 25
+        total: Mut(Int, Txn) := 0
+        for x in [10, 20]:
+            with begin():
+                if total + x <= limit:
+                    total := total + x
+        with begin():
+            out << total
+        out
+    "#};
+    assert_eq!(commit_stores(code), vec!["Txn[total,limit]"]);
+    check_tile(code, commit_stream(&[0], &[10]));
+}
+
+/// A mutable variable **no block writes** is not a store key. Nothing can advance it, so its
+/// history is constant at its seed and reading it costs a key to learn what the
+/// declaration already says — it keeps its introduction on the spine and relates
+/// nothing, which is why `lim` neither joins `tot`'s store nor forms one of its own.
+/// (Contrast `a_mut_var_read_by_a_writing_block_joins_its_store`, whose unwritten
+/// `limit` *is* a key: a **writing** block reads it, so it is read at that block's
+/// commit snapshot.)
+#[test]
+fn a_mut_var_no_block_writes_is_not_a_store_key() {
+    let code = indoc! {r#"
+        out = defer()
+        lim: Mut(Int, Txn) := 5
+        tot: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                tot := tot + x
+        with begin():
+            out << tot + lim
+        out
+    "#};
+    assert_eq!(commit_stores(code), vec!["Txn[tot]"]);
+    check_tile(code, commit_stream(&[0], &[8]));
+}
+
+/// A defer fed **inside** a store is consumed inside it. The tap that carries `out`
+/// is bound by the store's own body, so a consumer left above the letrec would name a
+/// binding that does not exist there. The consumption is a `let` rather than the tail
+/// expression on purpose: a tail is placed by the walk's base case, so only a
+/// statement exercises the level assignment.
+#[test]
+fn a_defer_fed_inside_a_store_is_consumed_inside_it() {
+    let code = indoc! {r#"
+        out = defer()
+        a: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                a := a + x
+                out << a
+        t = sum(out)
+        t
+    "#};
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![4])));
+}
+
+/// The same, for the feed of a **read-only** block. That block is unwrapped onto the
+/// spine, so its feed survives as an effect statement and is carried into the store it
+/// reads — and an effect statement that feeds a defer is therefore something a later
+/// statement can depend on, even though it binds nothing.
+#[test]
+fn a_defer_fed_by_a_read_only_block_is_consumed_inside_its_store() {
+    let code = indoc! {r#"
+        out = defer()
+        a: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                a := a + x
+        with begin():
+            out << a
+        t = sum(out)
+        t
+    "#};
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3])));
+}
+
+/// A **cross-domain induction read** alongside a second, unrelated store, pinning the
+/// nesting: `cnt` is an induction accumulator a commit decision reads, so its letrec has
+/// to be outside the store that reads it. With two stores to be outside of, the fold
+/// stays **outermost**, wrapping the whole nest rather than interleaving — which is why
+/// the carriers come out induction-first. `a` accumulates 1 + 2 = 3 as `cnt` reaches 2;
+/// `b` is untouched by any of it.
+#[test]
+fn a_cross_domain_read_coexists_with_a_second_store() {
+    let code = indoc! {r#"
+        oa = defer()
+        ob = defer()
+        cnt := 0
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            cnt := cnt + 1
+            with begin():
+                a := a + cnt
+        for y in [10, 20]:
+            with begin():
+                b := b + y
+        with begin():
+            oa << a
+        with begin():
+            ob << b
+        (sum(oa), sum(ob))
+    "#};
+    assert_eq!(commit_stores(code), vec!["[0, 1][acc]", "Txn[a]", "Txn[b]"]);
+    check_tile(
+        code,
+        Tile::Record(std::collections::HashMap::from([
+            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
+            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
+        ])),
+    );
+}
+
+/// A finite mutable variable completes even though an unrelated one never does.
+///
+/// `b` is driven by a live source that never ends, so its store never reports terminal.
+/// `a`'s writers are a finite loop, and nothing relates the two — so `a`'s store is its
+/// own, and the trailing read of `a` resolves. A store is terminal only when *every* one
+/// of its writers has drained, and `AsOf` stays non-terminal until its store is, so this
+/// read would not settle if `b` were a key of the same store.
+#[test]
+fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
+    let code = indoc! {r#"
+        oa = defer()
+        ob = defer()
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                a := a + x
+        for req in source1():
+            with begin():
+                b := b + req
+        with begin():
+            oa << a
+        with begin():
+            ob << b
+        (sum(oa), sum(ob))
+    "#};
+
+    let mut ctx = GlobalContext::default();
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(src.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    assert_eq!(stores_in(&compiled.ast), vec!["Txn[a]", "Txn[b]"]);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let ug = producer.tiling().universal_guard();
+
+    // One request arrives, and the source is left **open** — no
+    // terminal yield predicate — so `b`'s writer never drains.
+    src.borrow_mut()
+        .add_data(&[(Value::UInt(0), Value::Int(100))]);
+    ctx.scheduler().check_for_notifications();
+    let mut result = producer.get(ug.clone());
+    for _ in 0..64 {
+        result = producer.get(ug.clone());
+    }
+
+    // `a`'s half is settled at its final 1 + 2 = 3 even though the program as a whole
+    // cannot be terminal — `b`'s store is still open.
+    let Tile::Record(fields) = &result else {
+        panic!("expected a record of both replies, got {result:?}");
+    };
+    assert_eq!(
+        fields.get("_0"),
+        Some(&Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        "the finite mutable variable's read must settle; got {result:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
