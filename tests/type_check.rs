@@ -491,7 +491,6 @@ fn dead_code(defs: &str) -> String {
 #[case::conflicting_projections_nested("f = \\r -> (r.x.0, r.x.foo)")]
 #[case::conflicting_projections_curried("f = \\a -> \\b -> a.0 + a.foo")]
 #[case::monomorphic_param_at_two_types("f = \\g -> g(1) + g(\"s\")")]
-#[case::conflicting_operand_types("f = \\a -> (a + 1, a + \"s\")")]
 #[case::through_a_call_in_dead_code(indoc! {r#"
     g = \x -> x + 1
     f = \a -> g("s")
@@ -538,15 +537,36 @@ fn dead_code(defs: &str) -> String {
     f = \a -> a.0 + a.foo
     f = 3
 "#})]
-#[case::annotated_param(indoc! {r#"
-    def f(x: Int):
-        x + "s"
-"#})]
 fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
     assert!(
         !infer_program_err(&dead_code(defs)).is_empty(),
         "an ill-typed definition must be rejected whether or not it is called"
     );
+}
+
+/// The gap the previous test stops at, and the reason it is a gap: an obligation
+/// narrows as bases are *delivered* to it, and a never-called definition delivers
+/// nothing, so a conflict that is only a trait conflict is not reached — see
+/// `src/ccl/design/type-inference.md`, "Typechecking a never-called definition".
+///
+/// Both bodies are rejected the moment they are called (`f(1)` on either names the
+/// operand, its type, and what the position accepts), so this is about *when* the
+/// conflict is found, not whether. What makes them unreachable here is that neither
+/// asks any one delivery to be impossible: the first places two requirements on `a`
+/// — `a + 1` fixes it at `Int`, `a + "s"` at `String` — each satisfiable alone and
+/// jointly not, and the second sets a requirement against an annotation. Reading a
+/// value's requirements together is what closes both, and that is a property of the
+/// obligation machinery rather than of the discard walk.
+#[rstest]
+#[case::conflicting_operand_types("f = \\a -> (a + 1, a + \"s\")")]
+#[case::annotated_param(indoc! {r#"
+    def f(x: Int):
+        x + "s"
+"#})]
+fn a_never_called_function_whose_conflict_is_only_a_trait_conflict_is_not_reached(
+    #[case] defs: &str,
+) {
+    assert_eq!(infer_program(&dead_code(defs)), int_lit(1));
 }
 
 /// The complement, and the guard against the walk over-rejecting: typechecking a

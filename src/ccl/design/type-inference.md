@@ -1218,6 +1218,12 @@ That the list is closed is an argument about today's code, not something the com
 
 Obligations ride variables through `freshen_above`, so a generalized function carries its operators' requirements into its scheme. Each use instantiates and discharges its **own** copy — sharing one would let a `String` use empty an `Int` use's candidate set.
 
+### A definition nobody calls delivers nothing
+
+Narrowing is driven by delivery, so an obligation whose operands never receive a base narrows nothing and rejects nothing. That is exactly the residual gap named in [Typechecking a never-called definition](#typechecking-a-never-called-definition), and stating operator requirements rather than operand equality is what makes it observable: `f = λ𝑎 → (𝑎 + 1, 𝑎 + "s")` places two requirements on `𝑎`, each satisfiable alone and jointly not, and no delivery reaches either while `f` is uncalled. Under an equality rule the two `+`s collided structurally instead, so the conflict was a bound conflict and resolution found it.
+
+The requirements are still *recorded*, and jointly reading them is what would reject it — an unsatisfiable **intersection** of the requirements on one variable is visible with no delivery at all. That belongs to the obligation machinery rather than to the discard walk, and is not part of this change; `a_never_called_function_whose_conflict_is_only_a_trait_conflict_is_not_reached` holds the two cases so the gap has a name and a test rather than being an absence. Called, both are rejected, and with a better message than the equality rule gave: the trait, the operand position, and what that position accepts.
+
 ---
 
 ## 5. CCL-specific inference rules
