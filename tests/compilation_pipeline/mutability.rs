@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bit_set::BitSet;
+use indoc::indoc;
+
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program, render_errors};
 use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use rstest_log::rstest;
@@ -571,7 +573,12 @@ fn augmented_assignment_to_non_mutable_rejected() {
 #[test]
 fn write_of_the_wrong_type_is_rejected_against_the_registers_value_type() {
     expect_compile_error(
-        "x: Mut(Int) := 0\nfor i in [1]:\n    x := \"s\"\nx",
+        indoc! {r#"
+            x: Mut(Int) := 0
+            for i in [1]:
+                x := "s"
+            x
+        "#},
         "write to mutable variable `x`",
     );
 }
@@ -887,9 +894,24 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
 /// refinement — the use demands `Int`, which widens it — so a future narrowing of the
 /// read shows up as a difference between the cases rather than as silence.
 #[rstest]
-#[case::unannotated("def id(v):\n    v\nx := 5\nid(x)")]
-#[case::annotated("def id(v: Int):\n    v\nx := 5\nid(x)")]
-#[case::widened_by_use("def inc(v):\n    v + 1\nx := 4\ninc(x)")]
+#[case::unannotated(indoc! {r#"
+    def id(v):
+        v
+    x := 5
+    id(x)
+"#})]
+#[case::annotated(indoc! {r#"
+    def id(v: Int):
+        v
+    x := 5
+    id(x)
+"#})]
+#[case::widened_by_use(indoc! {r#"
+    def inc(v):
+        v + 1
+    x := 4
+    inc(x)
+"#})]
 fn a_register_passed_to_a_value_parameter_reads_its_value(#[case] code: &str) {
     check_scalar(code, cambra::interpreter::Value::Int(5));
 }
@@ -901,7 +923,14 @@ fn a_register_passed_to_a_value_parameter_reads_its_value(#[case] code: &str) {
 #[test]
 fn a_register_read_through_a_udf_inside_its_own_loop() {
     check_scalar(
-        "def id(v):\n    v\nx := 5\nfor i in [1, 2, 3]:\n    x += id(x)\nx",
+        indoc! {r#"
+            def id(v):
+                v
+            x := 5
+            for i in [1, 2, 3]:
+                x += id(x)
+            x
+        "#},
         cambra::interpreter::Value::Int(40),
     );
 }
