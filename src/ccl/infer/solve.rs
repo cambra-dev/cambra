@@ -1897,15 +1897,13 @@ mod tests {
     fn a_handle_agrees_with_its_read_view_through_refinements() {
         use super::types_agree_modulo_unread;
         use crate::ccl::{HistoryKind, Refinement};
-        let refined = refined_int(TypedExpr::lit(crate::ccl::Lit::Int(8)));
+        let refined = refined_int(TypedExpr::lit(Lit::Int(8)));
         let register = |value: Type| Type::History {
             value: Box::new(value),
             domain: Box::new(Type::Txn),
             kind: HistoryKind::Overwrite,
         };
-        let claim = Refinement::born(std::rc::Rc::new(TypedExpr::lit(crate::ccl::Lit::Bool(
-            true,
-        ))));
+        let claim = Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true))));
         let on_the_handle =
             |t: Type| Type::Refinement(Box::new(t), Refinement::sharing(&claim.predicate));
 
