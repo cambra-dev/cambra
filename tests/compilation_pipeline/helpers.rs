@@ -81,6 +81,14 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
         result = producer.get(universal.clone());
     }
     result.compact();
+    // Release everything, then pull once more: a released region must never come
+    // back out, so this answers empty or trips the contract assertion.
+    producer.release(universal.clone());
+    let after = producer.get(universal.clone());
+    assert!(
+        after.is_empty(),
+        "pull after a universal release returned {after:?}"
+    );
     (compiled.ast, result)
 }
 

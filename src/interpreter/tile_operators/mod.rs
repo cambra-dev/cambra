@@ -222,6 +222,25 @@ pub trait TileProducer {
     /// Fetch the current tile value.  Contains generic logic for all producers
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
         let result = self.get_impl(projection_guard);
+        // A release says that data is never requested and never returned again.
+        // Being pulled afterwards is fine — the answer is whatever lies outside
+        // the released region, which after a universal release is nothing at all
+        // — so what has to hold is this post-condition, at every granularity
+        // rather than only the universal one.
+        //
+        // Returning released data breaks things *silently*, which is why it is
+        // checked centrally rather than left to each operator: a consumer that
+        // has already taken delivery merges the same values a second time, and a
+        // `Tile::Scalar`'s positions are implicit, so merge cannot tell "this
+        // position again" from "one more position" and appends. One value becomes
+        // two, and it surfaces at whichever downstream consumer broadcasts the
+        // result rather than here.
+        debug_assert!(
+            !result.contains_guarded(self.obsolete_guard()),
+            "{} returned data it had released: {result:?} overlaps {:?}",
+            self.name(),
+            self.obsolete_guard(),
+        );
         trace!(
             "{} produced {:?} for tiling {}",
             self.name(),
@@ -340,6 +359,47 @@ pub(crate) mod test_helpers {
         }
     }
 
+    /// A [`TileProducer`] that answers with a fixed tile and records every release
+    /// guard it is handed, for asserting that a release *propagates*.
+    pub(crate) struct ReleaseSpy {
+        pub(crate) base: ProducerBase,
+        pub(crate) tile: Tile,
+        pub(crate) released: std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>,
+    }
+
+    impl ReleaseSpy {
+        pub(crate) fn new(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>) {
+            let released = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            (
+                Self {
+                    base: ProducerBase::new(Self::alloc_id(), &tiling),
+                    tile,
+                    released: released.clone(),
+                },
+                released,
+            )
+        }
+    }
+
+    impl TileProducer for ReleaseSpy {
+        impl_producer_base!();
+
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.tile.clone()
+        }
+
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.released.borrow_mut().push(obsolete_guard);
+        }
+    }
+
     impl TileProducer for TestTileProducer {
         impl_producer_base!();
 
@@ -352,5 +412,55 @@ pub(crate) mod test_helpers {
         }
 
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// A [`TileProducer`] that **honors** the release contract: it answers with a
+    /// fixed tile minus everything released so far, and logs each guard handed to
+    /// it.
+    ///
+    /// Use this over [`ReleaseSpy`] whenever a test pulls again *after* releasing.
+    /// A double that re-answers released rows is itself the contract violation, so
+    /// the assertion in [`TileProducer::get`] fires on the double before the
+    /// behavior under test is ever reached.
+    pub(crate) struct QuietSpy {
+        pub(crate) base: ProducerBase,
+        pub(crate) tile: Tile,
+        pub(crate) released: std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>,
+    }
+
+    impl QuietSpy {
+        pub(crate) fn new(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>) {
+            let released = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            (
+                Self {
+                    base: ProducerBase::new(Self::alloc_id(), &tiling),
+                    tile,
+                    released: released.clone(),
+                },
+                released,
+            )
+        }
+    }
+
+    impl TileProducer for QuietSpy {
+        impl_producer_base!();
+
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            let mut tile = self.tile.clone();
+            tile.remove_guarded(self.obsolete_guard().clone());
+            tile.compact();
+            tile
+        }
+
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.released.borrow_mut().push(obsolete_guard);
+        }
     }
 }

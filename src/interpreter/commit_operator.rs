@@ -1342,13 +1342,44 @@ struct InductionStoreProducer {
     /// Whether the whole source has been released (`True`) after the loop reached
     /// its terminal end-state — the finite loop's `get_released_predicate() == True`
     /// invariant; issued once.
+    ///
+    /// It also *ends the drive*: the release is only issued when the source is
+    /// complete and every arrived position has been decided, so there is nothing
+    /// left to read — a source honoring the release answers empty, and one that
+    /// re-answers would have the drive re-fold positions it already decided.
+    /// Later pulls serve the accumulated store, which is already the whole answer
+    /// (the same promise the dense `Recurse` path kept once its recurrence
+    /// converged).
     source_fully_released: bool,
+}
+
+impl InductionStoreProducer {
+    /// The engine's accumulated store as a tile, marked `terminal` once the
+    /// recurrence is final (the accumulator can no longer change, so a downstream
+    /// `ExtractLast` / `final_or_default` resolves).
+    fn render_store(&self, recurrence_final: bool) -> Tile {
+        let mut store = self.engine.render_full_store_tile();
+        if recurrence_final && let Tile::Store { terminal, .. } = &mut store {
+            *terminal = true;
+        }
+        debug_assert!(
+            store.check_from(&self.output_tiling),
+            "rendered induction store tile does not match the full-store tiling"
+        );
+        store
+    }
 }
 
 impl TileProducer for InductionStoreProducer {
     impl_producer_base!();
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        // The drive is over once the source has been universally released: pulling
+        // it again would break that release's promise, and every position is already
+        // decided, so the accumulated store is the whole answer.
+        if self.source_fully_released {
+            return self.render_store(true);
+        }
         let src = self
             .source_producer
             .get(self.source_producer.tiling().universal_guard());
@@ -1461,7 +1492,6 @@ impl TileProducer for InductionStoreProducer {
             self.engine.step(pos + 1, write_set);
             self.processed = pos + 1;
         }
-        let mut store = self.engine.render_full_store_tile();
         // Incrementally reclaim the processed prefix of the source. The drive only
         // ever pulls position `processed` forward and never re-reads a position
         // `< processed`, so `[0, processed)` is obsolete to *this* producer;
@@ -1491,9 +1521,6 @@ impl TileProducer for InductionStoreProducer {
         // decided — robust to the incremental prefix release above shrinking
         // `by_pos`.
         let done = self.source_complete && !by_pos.contains_key(&self.processed);
-        if done && let Tile::Store { terminal, .. } = &mut store {
-            *terminal = true;
-        }
         // Final reclamation: once terminal, release the *whole* source (`True`) so a
         // finite loop reaches the `get_released_predicate() == True` end-state (the
         // incremental prefix release above stops one short of a `True` predicate).
@@ -1502,11 +1529,7 @@ impl TileProducer for InductionStoreProducer {
                 .release(TileGuard::Function(FunctionGuard::Domain(Predicate::True)));
             self.source_fully_released = true;
         }
-        debug_assert!(
-            store.check_from(&self.output_tiling),
-            "rendered induction store tile does not match the full-store tiling"
-        );
-        store
+        self.render_store(done)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -4365,7 +4388,7 @@ mod tests {
         fn new(proposals: &[EmittedProposal]) -> Self {
             Self {
                 tiling: proposal_stream_tiling(&key_extent(), &value_extent()),
-                tile: proposal_tile(proposals, true),
+                tile: proposal_tile(proposals, 0, true),
             }
         }
     }
@@ -4508,7 +4531,7 @@ mod tests {
                 base: ProducerBase::new(CounterBodyProducer::alloc_id(), &self.tiling),
                 store_producer,
                 key: self.key.clone(),
-                emitted: Vec::new(),
+                window: ProposalWindow::new(),
                 n: self.n,
             })
         }
@@ -4518,8 +4541,8 @@ mod tests {
         base: ProducerBase,
         store_producer: Box<dyn TileProducer>,
         key: Value,
-        /// Accumulated proposals, append-only.
-        emitted: Vec<EmittedProposal>,
+        /// Proposals appended and not yet committed-and-released.
+        window: ProposalWindow,
         n: usize,
     }
 
@@ -4531,7 +4554,7 @@ mod tests {
             &mut self.base
         }
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-            if self.emitted.len() < self.n {
+            if self.window.next_position() < self.n {
                 let store = store_at(
                     &self
                         .store_producer
@@ -4539,16 +4562,18 @@ mod tests {
                     &self.key,
                 );
                 if let Some((frontier, v)) = store {
-                    self.emitted.push((
+                    self.window.push((
                         frontier,
                         HashMap::from([(self.key.clone(), int(v))]),
                         HashMap::from([(self.key.clone(), int(v + 1))]),
                     ));
                 }
             }
-            proposal_tile(&self.emitted, self.emitted.len() == self.n)
+            self.window.tile(self.window.next_position() == self.n)
         }
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.window.release(&obsolete_guard);
+        }
     }
 
     /// A single writer reads the store and proposes increments through the
@@ -4580,12 +4605,65 @@ mod tests {
     /// One accumulated proposal: `(snapshot, read set, write set)`.
     type EmittedProposal = (usize, HashMap<Value, Value>, HashMap<Value, Value>);
 
-    /// Build a proposal-stream tile `step → {snap, reads, writes}` from
-    /// accumulated grants, with the map-valued read/write sets riding `Variants`
-    /// columns ([`map_to_value`]).
-    fn proposal_tile(emitted: &[EmittedProposal], terminal: bool) -> Tile {
+    /// A writer's live proposal window: the proposals it has appended and not
+    /// yet had committed-and-released, together with the absolute position of
+    /// the first of them.
+    ///
+    /// The test writers share the offset window that [`TransactWriterProducer`]
+    /// implements for real, because they are subject to the same release
+    /// contract: the commit acknowledgment releases a position, and a released
+    /// position must never appear in a later tile. Positions are absolute and
+    /// never shift — the released prefix is dropped, the live suffix keeps its
+    /// numbering — which is what lets `CommitProducer` read them by value.
+    struct ProposalWindow {
+        /// Absolute position of `emitted[0]`: how many proposals have been
+        /// committed and released out of the front of the window.
+        committed_base: usize,
+        emitted: Vec<EmittedProposal>,
+    }
+
+    impl ProposalWindow {
+        fn new() -> Self {
+            Self {
+                committed_base: 0,
+                emitted: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, proposal: EmittedProposal) {
+            self.emitted.push(proposal);
+        }
+
+        /// The absolute position the next appended proposal would take — also
+        /// the number of proposals ever emitted, which survives compaction.
+        fn next_position(&self) -> usize {
+            self.committed_base + self.emitted.len()
+        }
+
+        fn tile(&self, terminal: bool) -> Tile {
+            proposal_tile(&self.emitted, self.committed_base, terminal)
+        }
+
+        /// Drop the released prefix. Only a leading run can go: the window is
+        /// contiguous, and a release of a later position with an earlier one
+        /// still live would leave a hole the absolute numbering cannot express.
+        fn release(&mut self, obsolete_guard: &TileGuard) {
+            let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
+                panic!("proposal stream released with a non-domain guard: {obsolete_guard:?}")
+            };
+            while !self.emitted.is_empty() && pred.contains(&Value::UInt(self.committed_base)) {
+                self.emitted.remove(0);
+                self.committed_base += 1;
+            }
+        }
+    }
+
+    /// Build a proposal-stream tile `step → {snap, reads, writes}` from a live
+    /// window of grants starting at absolute position `base`, with the
+    /// map-valued read/write sets riding `Variants` columns ([`map_to_value`]).
+    fn proposal_tile(emitted: &[EmittedProposal], base: usize, terminal: bool) -> Tile {
         Tile::SealedFunction {
-            domain: ColumnValue::from_uints((0..emitted.len()).collect()),
+            domain: ColumnValue::from_uints((base..base + emitted.len()).collect()),
             codomain: Box::new(Tile::Record(HashMap::from([
                 (
                     F_SNAP.to_string(),
@@ -4660,7 +4738,7 @@ mod tests {
                 key: self.key.clone(),
                 costs: self.costs.clone(),
                 current: 0,
-                emitted: Vec::new(),
+                window: ProposalWindow::new(),
             })
         }
     }
@@ -4672,7 +4750,7 @@ mod tests {
         costs: Vec<i64>,
         /// Index of the request currently being attempted.
         current: usize,
-        emitted: Vec<EmittedProposal>,
+        window: ProposalWindow,
     }
 
     impl TileProducer for TokenWriterProducer {
@@ -4693,7 +4771,7 @@ mod tests {
                         self.current += 1; // deny — a local read-only decision
                     } else {
                         // grant: read pool, write pool - cost
-                        self.emitted.push((
+                        self.window.push((
                             frontier,
                             HashMap::from([(self.key.clone(), int(pool))]),
                             HashMap::from([(self.key.clone(), int(pool - cost))]),
@@ -4702,12 +4780,14 @@ mod tests {
                 }
             }
             let done = self.current >= self.costs.len();
-            proposal_tile(&self.emitted, done)
+            self.window.tile(done)
         }
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
             // The operator released our outstanding grant → the current request
-            // committed → advance to the next request.
+            // committed → advance to the next request, and drop the committed
+            // proposal out of the live window.
             self.current += 1;
+            self.window.release(&obsolete_guard);
         }
     }
 
@@ -4951,7 +5031,7 @@ mod tests {
                 store_producer,
                 transfers: self.transfers.clone(),
                 current: 0,
-                emitted: Vec::new(),
+                window: ProposalWindow::new(),
             })
         }
     }
@@ -4961,7 +5041,7 @@ mod tests {
         store_producer: Box<dyn TileProducer>,
         transfers: Vec<(Value, Value, i64)>,
         current: usize,
-        emitted: Vec<EmittedProposal>,
+        window: ProposalWindow,
     }
 
     impl TileProducer for BankWriterProducer {
@@ -4983,7 +5063,7 @@ mod tests {
                         (state.get(from), state.get(to))
                     {
                         if *fb >= *amount {
-                            self.emitted.push((
+                            self.window.push((
                                 frontier,
                                 HashMap::from([(from.clone(), int(*fb)), (to.clone(), int(*tb))]),
                                 HashMap::from([
@@ -4998,10 +5078,11 @@ mod tests {
                 }
             }
             let done = self.current >= self.transfers.len();
-            proposal_tile(&self.emitted, done)
+            self.window.tile(done)
         }
-        fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
             self.current += 1;
+            self.window.release(&obsolete_guard);
         }
     }
 

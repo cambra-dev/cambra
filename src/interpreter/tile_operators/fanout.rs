@@ -456,6 +456,7 @@ impl TileOperator for Memo {
             base: ProducerBase::new(MemoProducer::alloc_id(), &self.tiling),
             input: self.input.subscribe(intent_guard, consumer, scheduler),
             cached_tile: self.tiling().empty_tile(),
+            upstream_drained: false,
         })
     }
 
@@ -468,6 +469,14 @@ struct MemoProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     cached_tile: Tile,
+    /// Set once this producer has released its input **universally**, which it
+    /// does as soon as the input hands over a complete tile.
+    ///
+    /// Once everything the input will ever produce is cached, pulling it again
+    /// is pointless work: a conforming input answers empty for a region it has
+    /// released, which merges to nothing. So skipping the pull is an
+    /// *optimization*, and only release builds take it — see [`Self::get_impl`].
+    upstream_drained: bool,
 }
 
 impl TileProducer for MemoProducer {
@@ -478,11 +487,31 @@ impl TileProducer for MemoProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        // Everything the input will ever produce is already cached, so the pull
+        // below can only return what was released — which a conforming input
+        // answers empty, merging to nothing. Skipping it saves the work.
+        //
+        // Debug builds deliberately do *not* skip it. A `Memo` sits above most
+        // scalar producers, so short-circuiting here would shield every one of
+        // them from ever being pulled after a universal release — the exact
+        // state the release-contract assertion in `TileProducer::get` exists to
+        // check. Keeping the pull in debug turns this cache from a shield into a
+        // probe: an input that answers with released data trips the assertion at
+        // the input, where the defect is, instead of corrupting the cache here.
+        //
+        // `cfg!` rather than `#[cfg]` so both configurations stay compiled.
+        if self.upstream_drained && !cfg!(debug_assertions) {
+            return self.cached_tile.clone();
+        }
         let mut input = self.input.get(projection_guard);
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
         input.compact();
         trace!("{} releasing {upstream_obsolete:?}", self.name());
+        // Latch: once the input has handed over everything, a later pull answering
+        // empty (as a conforming input does for a region it released) must not
+        // read as "not drained after all".
+        self.upstream_drained |= upstream_obsolete.is_universal();
         self.input.release(upstream_obsolete);
         trace!(
             "{} merging {input:?} into {:?}",
@@ -503,5 +532,49 @@ impl TileProducer for MemoProducer {
         // data that was never produced.
         self.input.release(obsolete_guard.clone());
         trace!("{} now has cached {:?}", self.name(), self.cached_tile);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::QuietSpy;
+    use crate::interpreter::{BaseType, ColumnValue, Extent};
+
+    /// A `Memo` releases its input universally as soon as the input hands over a
+    /// complete tile, and from then on the cache is the value: repeated pulls
+    /// answer the same single scalar.
+    ///
+    /// This has to hold in both build configurations, because only release builds
+    /// skip the upstream pull (see [`MemoProducer::get_impl`]). A debug build
+    /// re-pulls, and the input — honoring the release it was just handed — answers
+    /// empty, which merges to nothing. Were the input to answer with the released
+    /// value again, `merge` would append it: a `Tile::Scalar`'s positions are
+    /// implicit, so it cannot tell "this position again" from "one more position",
+    /// and one value would silently become two, then three.
+    #[test]
+    fn memo_holds_one_value_across_repeated_pulls() {
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let (upstream, _released) =
+            QuietSpy::new(Tile::Scalar(ColumnValue::Ints(vec![-5])), tiling.clone());
+        let mut memo = MemoProducer {
+            base: ProducerBase::new(MemoProducer::alloc_id(), &tiling),
+            input: Box::new(upstream),
+            cached_tile: tiling.empty_tile(),
+            upstream_drained: false,
+        };
+
+        for pull in 1..=3 {
+            let tile = memo.get(tiling.universal_guard());
+            assert_eq!(
+                tile,
+                Tile::Scalar(ColumnValue::Ints(vec![-5])),
+                "pull {pull}: the cache holds the one drained value, not one copy per pull"
+            );
+        }
+        assert!(
+            memo.upstream_drained,
+            "the complete tile should have been released universally on the first pull"
+        );
     }
 }
