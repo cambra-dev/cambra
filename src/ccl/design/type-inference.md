@@ -1153,28 +1153,29 @@ An operator's signature is therefore `𝐴₁ → … → 𝐴ₙ → 𝑅` plus
 
 Mechanism: `src/ccl/infer/solver/traits.rs`.
 
-Because an associated position like `𝑂` is an ordinary variable rather than a marker standing for a computation, information flows *backwards* through an operator's result and misusing that result is an ordinary diagnostic — `(1 + 2) and True` fails as a bound conflict. A computed-type marker cannot have this property: the solver cannot compare an unreduced computation against anything, so a function could not be typechecked without seeing its call sites.
+An associated position like `𝑂` is an ordinary inference variable, not a marker standing for a computation. So information flows *backwards* through an operator's result, and misusing that result is an ordinary diagnostic: `(1 + 2) and True` fails as a bound conflict. A marker could not do this — the solver cannot compare an unreduced computation against anything — and a function could then not be typechecked without seeing its call sites.
 
 ### A trait is a relation, and today it relates only types
 
-The notation is a relation because a trait *is* one. A trait over `𝑁` operand
-positions, `𝐴` associated types and `𝐹` associated **functions** is an
-`(𝑁 + 𝐴 + 𝐹)`-ary relation in which the `𝑁` operand types functionally determine the
-`𝐴` types and the `𝐹` functions — which is what the `⇝` separates. An implementation
-is one hyper-edge of that relation, and discharge is the search for a hyper-edge
-consistent with what inference has determined about the operand positions.
+A trait over `𝑁` operand positions, `𝐴` associated types and `𝐹` associated
+**functions** is an `(𝑁 + 𝐴 + 𝐹)`-ary relation in which the `𝑁` operand types
+functionally determine the `𝐴` types and the `𝐹` functions; `⇝` separates the
+determining side from the determined one. An implementation is one hyper-edge, and
+discharge is the search for a hyper-edge consistent with what inference has determined
+about the operand positions.
 
 Cambra implements `𝑁 ∈ {1, 2}`, `𝐴 ∈ {0, 1}` (`Output`, or nothing) and **`𝐹 = 0`**,
-with the relation built into the compiler rather than declared in CHL. Read `𝐹 = 0` as
-a gap and not as the design: an implementation's rows *have* distinct functions, and a
-trait that cannot associate one cannot say which. `Addable` is the example — the row
-`Addable(String, String ⇝ String)` denotes string concatenation and
-`Addable(Int, Int ⇝ Int)` denotes integer addition, and because the obligation carries
-neither, the function is recovered twice over outside the trait: `simplify.rs` rewrites
-the `String` case to `Concat` (see [BinOp type rules](#binop-type-rules)), and the
-interpreter then picks the machine operation from the operand column's runtime
-representation (`apply_binop_column`, in `src/interpreter/binop.rs`). The type system
-narrows to a row of types and then declines to name the code.
+with the relation built into the compiler rather than declared in CHL.
+
+`𝐹 = 0` is a gap rather than a decision. An implementation's rows *do* denote distinct
+functions — `Addable(String, String ⇝ String)` is concatenation and
+`Addable(Int, Int ⇝ Int)` is integer addition — and a trait that cannot associate a
+function cannot say which. The function is therefore recovered twice outside the trait:
+`simplify.rs` rewrites the `String` case to `Concat` (see
+[BinOp type rules](#binop-type-rules)), and the interpreter picks the machine operation
+from the operand column's runtime representation (`apply_binop_column`, in
+`src/interpreter/binop.rs`). The type system narrows to a row of types and then declines
+to name the code.
 
 Associating functions, and a CHL surface for declaring the relation, are the two
 extensions this shape exists to take: the implementations are already *data*
@@ -1182,37 +1183,49 @@ extensions this shape exists to take: the implementations are already *data*
 
 ### Refinements are transparent
 
-`{𝑇 | 𝑝}` satisfies a trait exactly when `𝑇` does. This holds *by construction*: satisfaction is judged on each bound contribution as it arrives, with refinements peeled at that moment — when the base actually exists. An operand is usually still an inference variable at emission, so a peel performed *there* would have nothing to work on.
+`{𝑇 | 𝑝}` satisfies a trait exactly when `𝑇` does. This holds by construction: satisfaction is judged on each bound contribution as it arrives, and refinements are peeled at that moment, when the base exists. Peeling at emission instead would have nothing to work on, an operand usually being still a variable there.
 
-Transparency is permanent, and it is a consequence of incremental discharge rather than a simplification on top of it. A candidate set only ever shrinks (see [Discharge is incremental](#discharge-is-incremental)), and a refinement is one of the things a bound can deliver *late*. If `{𝑇 | 𝑝}` could satisfy a requirement `𝑇` does not, a refinement arriving after the base would have to re-admit a candidate already dropped, and discharge would stop being monotone — order would start to matter. Growing `𝐹` above zero does not change this: choosing between two functions by `𝑝` is dispatch on a fact about a *value*, which a table keyed on types cannot express and which no refinement survives anyway (`𝑥 + 𝑥` where `𝑥` is `2` produces `4`).
+Transparency follows from incremental discharge and is permanent. A candidate set only ever shrinks ([Discharge is incremental](#discharge-is-incremental)), and a refinement is one of the things a bound can deliver late; if `{𝑇 | 𝑝}` could satisfy a requirement `𝑇` does not, a refinement arriving after the base would have to re-admit a dropped candidate, and order would start to matter.
+
+Growing `𝐹` above zero would not change this. Choosing between two functions by `𝑝` is dispatch on a fact about a *value*, which a table keyed on types cannot express — and which no refinement survives in any case: `𝑥 + 𝑥` where `𝑥` is `2` produces `4`.
 
 ### Discharge is incremental
 
-An obligation is a monotone fact discharged as the graph fills in, the shape [`FunKindVar`](#46-data-vs-compute-functions) already uses for kinds — not a sweep at the end of solving. Each operand position carries a **candidate set** of implementations that only ever shrinks; each associated type is deposited on its position as an ordinary lower bound as soon as every surviving candidate agrees on it. Order therefore does not matter.
+An obligation is a monotone fact, discharged as the graph fills in rather than by a sweep at the end of solving — the shape [`FunKindVar`](#46-data-vs-compute-functions) already uses for kinds. Each operand position carries a **candidate set** of implementations that only ever shrinks; each associated type is deposited on its position as an ordinary lower bound once every surviving candidate agrees on it. Order therefore does not matter.
 
-What arrives at a position is classified three ways, and the third is easy to miss: a contribution either offers a **base**, is **not determined yet** (an inference variable, a hole, a transient `Feed` handle whose payload arrives separately), or is **determined and not a base** (a tuple, record, variant or function). The first narrows; the third is rejected outright, because no implementation can ever accept it; only the second is genuinely "nothing to say".
+A contribution arriving at a position is one of three things, and each has its own outcome:
 
-Collapsing the last two is a live hazard rather than a hypothetical. While "no base here" meant "no information", `(1, 2) == (3, 4)` type-checked as `Bool`: a tuple narrowed nothing, and a comparison has no associated position to leave unresolved, so no later wall saw it either. The same hole let `max` accept a tuple codomain.
+| contribution | example | outcome |
+|---|---|---|
+| a **base** | `Int` | narrows the candidate set |
+| **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately | nothing to say |
+| **determined and not a base** | a tuple, record, variant, function | rejected — no implementation can accept it |
 
-What narrowing cannot reject is a position the program never determines — which is the honest outcome, reported as an unresolved variable rather than as a missing implementation.
+The third is a rejection and not silence, because "no base here" is true of both it and the second. A tuple that merely failed to narrow would leave `(1, 2) == (3, 4)` well-typed: a comparison has no associated position to strand, so nothing downstream would object either.
 
-### What an obligation determines, and what it leaves alone
+A position the program never determines is not a rejection: it is reported as an unresolved variable rather than as a missing implementation.
 
-The deposit rule is *whatever every surviving implementation agrees on*, applied to the **associated positions only**. Nothing is ever deposited onto an operand.
+### What an obligation determines
 
-The asymmetry is not soundness — with one candidate left, its operand types are implied exactly as its associated types are. It is that the obligation is an associated position's **only** source of information and never an operand's: an associated position is a fresh variable nothing else constrains from below, while an operand always has the program's own `operandᵢ <: 𝐴ᵢ` edge. Determining an operand from the table would be recovering information the program was supposed to supply, which hides an under-connected lowering instead of fixing it.
+A deposit records what every surviving implementation agrees on, and reaches the **associated positions only**. Nothing is written back onto an operand.
 
-How much gets determined is therefore a property of the table, and shrinks as the table grows — **for the output too**. Today `λ 𝑥 → 𝑥 + 1` is `∀𝐴 𝑂. (𝐴 : Addable(𝐴, Int ⇝ 𝑂)) ⇒ 𝐴 → 𝑂` with `𝑂` resolving to `Int`, because `Int` in the second position leaves only `Addable(Int, Int ⇝ Int)`. Adding `Addable(Float, Int ⇝ Float)` would leave two candidates whose outputs disagree, and the result would become as open as the parameter already is. That is the type honestly tracking a language that has become more permissive, and it is why the deposit waits for *agreement* rather than firing on a unique candidate.
+The asymmetry is about where information comes from, not about soundness — with one candidate left, its operand types are implied exactly as its associated types are. An associated position is a fresh variable nothing else constrains from below, so the obligation is its only source. An operand always has the program's own `operandᵢ <: 𝐴ᵢ` edge. Determining an operand from the table would supply information the program was meant to supply, which hides an under-connected lowering rather than exposing it.
+
+How much is determined follows from the table, associated positions included. `λ 𝑥 → 𝑥 + 1` is `∀𝐴 𝑂. (𝐴 : Addable(𝐴, Int ⇝ 𝑂)) ⇒ 𝐴 → 𝑂` with `𝑂` resolving to `Int`, because `Int` at the second position leaves only `Addable(Int, Int ⇝ Int)`. Adding `Addable(Float, Int ⇝ Float)` would leave two rows whose outputs disagree, and `𝑂` would be as open as `𝐴` already is — which is why a deposit waits for agreement rather than firing on a unique candidate.
 
 ### Delivery: the watch follows the edge
 
-An obligation is attached to each operand variable as a *watch* (`InferVar::watches`), and everything the invariant rests on is **delivery** — a concrete type reaching an operand variable has to reach the obligation watching it.
+An obligation is attached to each operand variable as a *watch* (`InferVar::watches`). The invariant is **delivery**: a concrete type reaching an operand variable must reach the obligation watching it.
 
-The bound closure does not deliver on its own. When two variables sit at different polymorphism levels — which is what a `let` RHS produces, being emitted one level deeper — their edge is recorded by the arm whose closure runs against the *other* side's bounds, so a type already sitting on the lower variable is never re-offered. The graph is still correct, but only *transitively* readable, which is something coalesce does and emission does not.
+The bound closure does not deliver on its own. Where two variables sit at different polymorphism levels — as a `let` RHS produces, being emitted one level deeper — their edge is recorded by the arm whose closure runs against the *other* side's bounds, so a type already on the lower variable is never re-offered. The graph stays correct but is only *transitively* readable, which coalesce does and emission does not.
 
-A variable's lower bounds are written in exactly four places, and delivery is wired into every one: `constrain_go`'s two variable arms (a concrete contribution is delivered directly; a var-var edge propagates the watch *downward*, toward the variables feeding the watched one, and delivers what they already know), `extrude`'s proxy seeding, and `freshen_above`'s clone — the latter two because both seed bounds by direct writes rather than through `constrain_go`.
+A variable's lower bounds are written in exactly four places, and delivery is wired into each:
 
-That the list is closed is an argument about today's code, not something the compiler enforces, and a missed delivery is quiet: the obligation simply never narrows, so a type is left undetermined and surfaces phases later on an interior node. `verify_narrowing_is_complete` therefore checks the argument rather than trusting it — after emission, every watched operand is resolved against the completed graph, and a resolved base must already have narrowed its obligation. `a_concrete_operand_reaches_its_obligation` covers the four writers with a case per mechanism.
+* `constrain_go`'s concrete arm — delivers the contribution directly.
+* `constrain_go`'s var-var arm — propagates the watch *downward*, toward the variables feeding the watched one, and delivers what they already know.
+* `extrude`'s proxy seeding, and `freshen_above`'s clone — both seed bounds by direct writes rather than through `constrain_go`.
+
+That the list is closed is an argument about today's code, not something the compiler enforces, and a missed delivery is quiet: the obligation never narrows, so a type is left undetermined and surfaces phases later on an interior node. `verify_narrowing_is_complete` checks the argument instead of trusting it — after emission, every watched operand is resolved against the completed graph, and a resolved base must already have narrowed its obligation. `a_concrete_operand_reaches_its_obligation` covers the four writers, a case per mechanism.
 
 ### Requirements are generalized
 
