@@ -243,7 +243,7 @@ impl TileProducer for ExtractFinalProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.is_universal() {
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.released = true;
             self.source.release(self.source.tiling().universal_guard());
             self.default

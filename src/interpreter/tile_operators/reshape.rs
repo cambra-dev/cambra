@@ -158,9 +158,7 @@ impl TileProducer for PermuteRecordDomainProducer {
                     &self.permutation,
                 ))))
             }
-            _ => {
-                unreachable!();
-            }
+            g => unreachable!("PermuteRecordDomain cannot honor the release guard {g:?}"),
         };
         self.input.release(upstream_guard);
     }
