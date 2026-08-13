@@ -1986,9 +1986,7 @@ mod tests {
         let refined = |inner: Type| {
             Type::Refinement(
                 Box::new(inner),
-                Refinement::born(std::rc::Rc::new(TypedExpr::lit(crate::ccl::Lit::Bool(
-                    true,
-                )))),
+                Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true)))),
             )
         };
         let int = Type::Base(BaseType::Int);
