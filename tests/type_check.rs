@@ -181,8 +181,15 @@ fn test_binary_op(#[case] code: &str, #[case] expected: BaseType) {
 /// `x` is `2` claimed the sum was `2`. Distinct singletons intersect to nothing,
 /// which is why the other two cases pass either way.
 #[rstest]
-#[case::same_variable_twice("x = 2\nx + x")]
-#[case::distinct_singletons("x = 2\ny = 3\nx + y")]
+#[case::same_variable_twice(indoc! {r#"
+    x = 2
+    x + x
+"#})]
+#[case::distinct_singletons(indoc! {r#"
+    x = 2
+    y = 3
+    x + y
+"#})]
 #[case::literals("2 + 2")]
 fn an_operator_result_carries_no_operand_refinement(#[case] code: &str) {
     assert_eq!(infer_program(code), int());
@@ -322,13 +329,13 @@ fn misusing_an_operator_result_is_an_ordinary_diagnostic(#[case] code: &str) {
 /// candidate set.
 #[test]
 fn a_generalized_function_instantiates_its_operator_requirements() {
-    assert_eq!(infer_program("f = \\a, b -> a + b\nf(1, 2)"), int());
+    // One definition, three programs: only the uses differ, so only the uses are
+    // written out.
+    let using = |uses: &str| format!("f = \\a, b -> a + b\n{uses}");
+    assert_eq!(infer_program(&using("f(1, 2)")), int());
+    assert_eq!(infer_program(&using(r#"f("x", "y")"#)), string());
     assert_eq!(
-        infer_program("f = \\a, b -> a + b\nf(\"x\", \"y\")"),
-        string()
-    );
-    assert_eq!(
-        infer_program("f = \\a, b -> a + b\n(f(1, 2), f(\"x\", \"y\"))"),
+        infer_program(&using(r#"(f(1, 2), f("x", "y"))"#)),
         Type::Tuple(vec![int(), string()])
     );
 }
@@ -348,16 +355,28 @@ fn a_generalized_function_instantiates_its_operator_requirements() {
 // one level deeper than the loop binder, so `⟨binder⟩ <: A` is recorded by the arm
 // that closes against `A`'s uppers and never re-offers the `Int` already sitting on
 // the binder. Delivery has to follow the var-var edge downward instead.
-#[case::across_a_level_boundary("s := 0\nfor i in [1, 2, 3]:\n    y = s + i\n    s := y\ns")]
+#[case::across_a_level_boundary(indoc! {r#"
+    s := 0
+    for i in [1, 2, 3]:
+        y = s + i
+        s := y
+    s
+"#})]
 // `extrude`: a generalized multi-argument function is emitted a level deeper than its
 // use, so constraining its tuple parameter down to the use's level mints proxies
 // whose bounds are seeded by *direct writes* rather than through `constrain_go`. The
 // nesting matters — the outer operator's operand is the inner operator's output, and
 // that is the variable that gets approximated.
-#[case::through_an_extrusion_proxy("m = \\a, b -> a * b + 1\nm(3, 4)")]
+#[case::through_an_extrusion_proxy(indoc! {r#"
+    m = \a, b -> a * b + 1
+    m(3, 4)
+"#})]
 // `freshen_above`: each use of a generalized function instantiates its own copy of
 // the obligation, which has to be reachable from the freshened operand variables.
-#[case::through_a_freshened_instantiation("k = \\a, b -> a + b\nk(k(1, 2), 3)")]
+#[case::through_a_freshened_instantiation(indoc! {r#"
+    k = \a, b -> a + b
+    k(k(1, 2), 3)
+"#})]
 fn a_concrete_operand_reaches_its_obligation(#[case] code: &str) {
     // The wall, not the root type: a missed delivery can leave an *interior* node
     // undetermined while the program's own type resolves fine — which is exactly how
@@ -391,29 +410,86 @@ fn register_value_type(code: &str) -> Type {
 // registers, and a non-`Int` base.
 #[rstest]
 // One cyclic operand, the shape every accumulator has.
-#[case::self_add("x := 0\nx := x + 1\nx", "Int")]
+#[case::self_add(indoc! {r#"
+    x := 0
+    x := x + 1
+    x
+"#}, "Int")]
 // **Both** operands cyclic: only the seed offers a base.
-#[case::self_multiply("x := 2\nx := x * x\nx", "Int")]
-#[case::self_subtract("x := 10\nx := x - x\nx", "Int")]
+#[case::self_multiply(indoc! {r#"
+    x := 2
+    x := x * x
+    x
+"#}, "Int")]
+#[case::self_subtract(indoc! {r#"
+    x := 10
+    x := x - x
+    x
+"#}, "Int")]
 // Nested, so an inner operator's output is itself an operand of an outer one.
-#[case::nested("x := 0\nx := (x + 1) * (x + 2)\nx", "Int")]
-#[case::deeply_nested("x := 1\nx := ((x + x) * (x + x)) + ((x * x) + (x + x))\nx", "Int")]
+#[case::nested(indoc! {r#"
+    x := 0
+    x := (x + 1) * (x + 2)
+    x
+"#}, "Int")]
+#[case::deeply_nested(indoc! {r#"
+    x := 1
+    x := ((x + x) * (x + x)) + ((x * x) + (x + x))
+    x
+"#}, "Int")]
 // Routed through user functions, so the cycle crosses a call boundary — and the
 // obligations are the *freshened* copies of the callee's.
-#[case::through_functions(
-    "def f(a):\n    a + 1\ndef g(a):\n    a * 2\nx := 0\nx := f(x) + g(x)\nx",
-    "Int"
-)]
-#[case::through_nested_calls("def f(a):\n    a + 1\nx := 0\nx := f(f(x))\nx", "Int")]
+#[case::through_functions(indoc! {r#"
+    def f(a):
+        a + 1
+    def g(a):
+        a * 2
+    x := 0
+    x := f(x) + g(x)
+    x
+"#}, "Int")]
+#[case::through_nested_calls(indoc! {r#"
+    def f(a):
+        a + 1
+    x := 0
+    x := f(f(x))
+    x
+"#}, "Int")]
 // Two registers each defined in terms of the other: the cycle spans two equations.
-#[case::mutual("x := 0\ny := 0\nx := y + 1\ny := x + 1\nx", "Int")]
-#[case::three_way("x := 0\ny := 0\nz := 0\nx := z + 1\ny := x + 1\nz := y + 1\nz", "Int")]
+#[case::mutual(indoc! {r#"
+    x := 0
+    y := 0
+    x := y + 1
+    y := x + 1
+    x
+"#}, "Int")]
+#[case::three_way(indoc! {r#"
+    x := 0
+    y := 0
+    z := 0
+    x := z + 1
+    y := x + 1
+    z := y + 1
+    z
+"#}, "Int")]
 // A non-`Int` base, so the answer comes from the operands rather than a hardcoded row.
-#[case::string_accumulator("s := \"a\"\ns := s + \"b\"\ns", "String")]
+#[case::string_accumulator(indoc! {r#"
+    s := "a"
+    s := s + "b"
+    s
+"#}, "String")]
 // A comparison cycle: its output is `Bool` for every implementation, so it is settled
 // at birth and the cycle costs it nothing. Nothing else in the suite writes one.
-#[case::self_comparison("b := True\nb := (b == True)\nb", "Bool")]
-#[case::conditional("x := 0\nx := x + 1 if x == 0 else x - 1\nx", "Int")]
+#[case::self_comparison(indoc! {r#"
+    b := True
+    b := (b == True)
+    b
+"#}, "Bool")]
+#[case::conditional(indoc! {r#"
+    x := 0
+    x := x + 1 if x == 0 else x - 1
+    x
+"#}, "Int")]
 fn a_register_that_reads_itself_still_gets_a_type(#[case] code: &str, #[case] base: &str) {
     assert_eq!(register_value_type(code).to_string(), base);
 }
@@ -423,7 +499,12 @@ fn a_register_that_reads_itself_still_gets_a_type(#[case] code: &str, #[case] ba
 #[test]
 fn a_cycle_does_not_hide_an_operand_conflict() {
     assert!(
-        !infer_program_err("x := 0\nx := x + \"a\"\nx").is_empty(),
+        !infer_program_err(indoc! {r#"
+            x := 0
+            x := x + "a"
+            x
+        "#})
+        .is_empty(),
         "a conflict reachable only through a cyclic operand must still be a diagnostic"
     );
 }
@@ -432,7 +513,10 @@ fn a_cycle_does_not_hide_an_operand_conflict() {
 /// implementation accepts is rejected at the call site.
 #[test]
 fn a_generalized_function_rejects_a_use_its_trait_forbids() {
-    let errs = infer_program_err("f = \\a, b -> a - b\nf(\"x\", \"y\")");
+    let errs = infer_program_err(indoc! {r#"
+        f = \a, b -> a - b
+        f("x", "y")
+    "#});
     assert!(
         errs.iter().any(
             |e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == "Subtractable")
