@@ -148,21 +148,22 @@ pub(super) struct CoalesceCtx {
     /// [`coalesce_node`] on both exit paths. The same discipline `emit_node` and
     /// `check_node` use; seeded with the tree's root at construction.
     current_node: NodeId,
-    /// While a **discarded** subtree is being walked — a dead generalized
+    /// Whether a **discarded** subtree is being walked — a dead generalized
     /// definition, resolved for its diagnostics and then dropped
-    /// ([`typecheck_discarded_definition`]) — the `scope` depth at which that
-    /// walk began; `None` outside one. Frames at or above the boundary were
-    /// pushed *inside* the discarded subtree and go away with it, so a
-    /// specialization minted on one is registered as usual. A frame *below* it
-    /// belongs to a binding that survives, and registering there would splice a
-    /// specialization into the surviving program whose only use is about to be
-    /// discarded — so [`specialize_use`] typechecks such a use and drops it
-    /// (see [`SpecializeFrame::specs`], "The remaining gap", for the same
-    /// liveness question on the sharing path).
+    /// ([`typecheck_discarded_definition`]).
     ///
-    /// The *outermost* discarded walk owns the boundary: everything a nested one
-    /// could register is already inside a subtree being dropped.
-    discard_boundary: Option<usize>,
+    /// A specialization minted while this holds serves a use that is about to be
+    /// dropped, so it is registered — the memo is what stops the walk re-cloning —
+    /// but marked unreferenced ([`Specialization::referenced`]) unless its own
+    /// frame is being dropped too ([`SpecializeFrame::inside_discarded`]).
+    ///
+    /// Deliberately *not* a `scope` depth. A depth answers "is this frame outside
+    /// the discarded subtree" only while the stack grows monotonically, and
+    /// [`specialize_use`] truncates it (`split_off(frame_idx)`) for the re-entrant
+    /// clone walk: frames the clone's own body pushes then land at indices below
+    /// the mark and read as surviving, though they die with the clone. Asking each
+    /// frame what it is, at the moment it is created, is immune to that.
+    discarding: bool,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
@@ -460,14 +461,28 @@ struct SpecializeFrame {
     /// The binding's polymorphism level — the freshen cutoff: variables
     /// deeper than this are the quantified ones.
     cutoff: Level,
+    /// Whether this binding is itself inside a subtree being discarded — recorded
+    /// from [`CoalesceCtx::discarding`] when the frame is pushed, the one moment
+    /// the answer is unambiguous.
+    ///
+    /// A specialization minted on such a frame is spliced as usual: the `let` it
+    /// splices into is going away with the subtree, so liveness there is moot. It
+    /// is the frames that **outlive** a discarded walk whose splices need filtering.
+    inside_discarded: bool,
     /// Whether the body demanded this binding at all — set by [`specialize_use`]
-    /// on entry, before anything can go wrong.
+    /// on entry, before anything can go wrong, and so **including uses that sit in
+    /// dead code**.
+    ///
+    /// That is deliberate: such a binding is not discard-walked, and does not need
+    /// to be. It was already checked through the clone the dead use pinned, which
+    /// is a *stricter* reading than the generic one a discard walk would take — a
+    /// specialization only adds bounds. Walking it again would report whatever that
+    /// clone already reported (`through_a_call_in_dead_code` covers the case).
     ///
     /// This is *not* `!specs.is_empty()`, and the difference is exactly the case
     /// where a use exists but produced no specialization: a use whose
-    /// instantiation fails to resolve reports and returns before minting one, and
-    /// a use inside a discarded subtree deliberately does not register (see
-    /// [`CoalesceCtx::discard_boundary`]). Only *this* flag answers "is the
+    /// instantiation fails to resolve reports and returns before minting one. Only
+    /// *this* flag answers "is the
     /// definition dead code", which is what decides whether it is typechecked on
     /// the way out ([`typecheck_discarded_definition`]) — asking `specs` instead
     /// re-walks a definition whose uses merely failed, and reports its body's
@@ -565,8 +580,22 @@ struct Specialization {
     name: Name,
     /// The specialized, fully-coalesced definition. Spliced as a `let`
     /// binding around the generalized `let`'s body once that body's walk
-    /// completes.
+    /// completes — if [`referenced`](Self::referenced).
     def: Expr,
+    /// Whether a use that **survives** refers to this specialization.
+    ///
+    /// A use inside a discarded subtree still needs a clone — pinning and
+    /// coalescing it is what typechecks the call — but the `let` it would splice
+    /// outlives the subtree its only use is in, so splicing would leave the
+    /// program a definition nothing references. Splitting that from the memo is
+    /// what lets the clone be *shared*: declining to register instead made every
+    /// dead use re-clone and re-coalesce its callee, which compounds through a
+    /// call chain (see [`SpecializeFrame::specs`], "The remaining gap", where the
+    /// same split is what reference-liveness filtering asks for).
+    ///
+    /// False at mint for a discarded use; a later surviving use that *hits* this
+    /// entry sets it, because sharing the clone is exactly what makes it live.
+    referenced: bool,
 }
 
 /// Find the scope entry a free use of `name` refers to: scanning innermost-
@@ -604,7 +633,7 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
         current_node: expr.node_id(),
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
-        discard_boundary: None,
+        discarding: false,
         #[cfg(debug_assertions)]
         reads: Vec::new(),
     };
@@ -1367,6 +1396,19 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     };
     if let Some(spec) = frame.specs.iter().find(|s| s.key == key) {
         let (name, ty) = (spec.name.clone(), spec.def.ty.clone());
+        // Sharing is what makes an entry live: an entry minted for a discarded use
+        // is spliced after all once a surviving use adopts it.
+        if surviving_use(ctx, frame_idx) {
+            let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
+                unreachable!("lookup_generalized returns indices of Generalized entries only");
+            };
+            let spec = frame
+                .specs
+                .iter_mut()
+                .find(|s| s.key == key)
+                .expect("the entry just found is still there");
+            spec.referenced = true;
+        }
         // A hit is *not* re-pinned, and the reason is worth recording because
         // pinning here looks like the obvious way to make the key's faithfulness
         // checked rather than argued. It is not available: a miss pins a
@@ -1455,14 +1497,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
 
     use_expr.node = TypedExprNode::Var(spec_name.clone());
     use_expr.ty = clone.ty.clone();
-    // This use lives in a subtree that is about to be dropped, while the binding
-    // it specializes outlives that subtree: the clone was built for its
-    // diagnostics, which the walk above has already collected, and registering it
-    // would leave the surviving program a definition nothing references. Drop it
-    // instead — see [`CoalesceCtx::discard_boundary`].
-    if ctx.discard_boundary.is_some_and(|depth| frame_idx < depth) {
-        return;
-    }
+    let referenced = surviving_use(ctx, frame_idx);
     let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
         unreachable!("suspended entries were restored above the frame");
     };
@@ -1481,7 +1516,22 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         key,
         name: spec_name,
         def: clone,
+        referenced,
     });
+}
+
+/// Whether a use being specialized on `frame_idx` will still be in the program
+/// when the walk finishes — the predicate deciding whether its specialization is
+/// spliced ([`Specialization::referenced`]).
+///
+/// It is not, exactly when the use sits in a discarded subtree that its binding
+/// outlives. A binding *inside* that subtree is dropped along with the use, so
+/// what it splices is moot and this reads `true`.
+fn surviving_use(ctx: &CoalesceCtx, frame_idx: usize) -> bool {
+    let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+        unreachable!("lookup_generalized returns indices of Generalized entries only");
+    };
+    !ctx.discarding || frame.inside_discarded
 }
 
 /// Coalesce a generalized `let`: walk the body under a specialization frame
@@ -1515,6 +1565,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             name: binding.name,
             def: *bound_expr,
             cutoff: level,
+            inside_discarded: ctx.discarding,
             demanded: false,
             specs: Vec::new(),
         })));
@@ -1546,7 +1597,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // "Typechecking a never-called definition", for why that dangling reference is
     // unobservable today and what fixes it.
     let mut result = body;
-    for spec in frame.specs.into_iter().rev() {
+    for spec in frame.specs.into_iter().rev().filter(|s| s.referenced) {
         // The discharge only does work when the specialization binder is free
         // in the body type's refinement predicates; skip cloning `spec.def`
         // otherwise (it is still moved into the rebuilt `let` below).
@@ -1599,13 +1650,33 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
 /// written. `level` is the enclosing `let`'s level, and the definition — like
 /// every `let` RHS — was emitted one deeper (`in_let_rhs`).
 fn typecheck_discarded_definition(def: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
-    let outer_boundary = ctx.discard_boundary;
-    // The outermost discarded walk owns the boundary; a nested one changes
-    // nothing, since every frame it could reach is already inside a dropped
-    // subtree.
-    ctx.discard_boundary.get_or_insert(ctx.scope.len());
+    let before = ctx.errors.len();
+    let was_discarding = std::mem::replace(&mut ctx.discarding, true);
     coalesce_node(def, level + 1, ctx);
-    ctx.discard_boundary = outer_boundary;
+    ctx.discarding = was_discarding;
+
+    // A dead definition nested inside a *live* generalized one sits inside each of
+    // its clones, so it is walked once per specialization of the enclosing binding
+    // — and one defect would be reported once per clone (five uses of the enclosing
+    // function, fifteen diagnostics for one bug). Walking per clone is right, since
+    // the body can depend on the enclosing instantiation and so can fail in one and
+    // not another; reporting the *same* diagnostic again is not. Drop a new error
+    // that repeats one already reported.
+    //
+    // Compared only against what preceded this walk, never within it: a walk's own
+    // shape — one report per node whose type carries the defect — is what coalesce
+    // does everywhere, and dead code should read the same as live code.
+    let mut i = before;
+    while i < ctx.errors.len() {
+        if ctx.errors[..before]
+            .iter()
+            .any(|seen| seen.error == ctx.errors[i].error)
+        {
+            ctx.errors.remove(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Specialize a projection morphism to the value flowing into it — the
@@ -1970,18 +2041,20 @@ mod tests {
         );
     }
 
-    /// The boundary is a *line*, not a switch: a frame pushed **inside** the
-    /// discarded subtree registers as usual (it is dropped along with it), while one
-    /// below the line does not.
+    /// Splice-liveness is a property of the *frame*, not of a position in the scope
+    /// stack: a binding created inside the discarded subtree is dropped with it, so
+    /// its splices are moot, while one that outlives the subtree must not gain a
+    /// binding nothing references.
     ///
-    /// Dead `f` contains `h`, used inside `f`, which calls the live `g`. `h`'s frame
-    /// is inside the discarded walk, so its specialization is registered — which is
-    /// what carries the `g` call into a clone at all; `g`'s frame is below the line,
-    /// so the specialization minted there is dropped. `g` is separately live at one
-    /// type, so exactly one specialization survives. Suppressing at `h`'s level too
-    /// would leave `h` looking dead and get its definition walked a second time.
+    /// Dead `f` contains `h`, used inside `f`, which calls the live `g`. `h` is
+    /// created inside the discarded walk, so its specialization splices as usual —
+    /// which is what carries the `g` call into a clone at all; `g` outlives the walk,
+    /// so the specialization minted there is registered but not spliced. `g` is
+    /// separately live at one type, so exactly one specialization survives. Marking
+    /// `h`'s level unreferenced too would leave `h` looking dead and get its
+    /// definition walked a second time.
     #[test]
-    fn the_discard_boundary_only_suppresses_surviving_frames() {
+    fn splice_liveness_follows_the_frame_not_the_scope_depth() {
         // let g = λx. x + 1 in let f = λa. (let h = λb. g(b) in h(2)) in g(5)
         let g = TypedExpr::lambda(
             "x",

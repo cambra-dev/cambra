@@ -276,12 +276,14 @@ no strict check ever sees, because the resolved definition is discarded either w
 The walk descends through uses, so it also typechecks what dead code *calls*: a use
 inside it of a generalized binding declared further out specializes normally, which is
 what makes the call's argument meet the callee's demands. That specialization must not
-be *registered*, though — its enclosing `let` survives the dead definition and would
-splice a binding nothing references. The walk records the scope depth it began at
-(`CoalesceCtx::discard_boundary`) and drops any specialization it mints on a frame
-below that line, so dead code is checked without re-entering the program. The boundary
-is a line rather than a switch: a frame pushed *inside* the discarded subtree registers
-as usual, because it is dropped along with it.
+be *spliced*, though — its enclosing `let` survives the dead definition and would
+gain a binding nothing references. It is still registered, which is what shares the
+clone with the next dead use, and marked unreferenced instead
+(`Specialization::referenced`), so dead code is checked without re-entering the
+program. Which frames that applies to is asked of each frame when it is pushed
+(`SpecializeFrame::inside_discarded`) rather than computed from a scope depth: a frame
+created *inside* the discarded subtree dies with it, so what it splices is moot, and
+the re-entrant clone walk truncates the scope stack, which a depth cannot survive.
 
 **Deadness is the absence of a demand, not of a specialization.** The two come apart
 in both directions — a use whose instantiation fails to resolve reports and returns
@@ -297,6 +299,21 @@ in the tree a failed pass leaves behind. It is unobservable while an inference e
 discards the tree, and the fix is a node meaning "could not be built, errors pending"
 (today's `TypedExprNode::Error` is contracted to lowering recovery), which would also
 let the rebuild stay unconditional.
+
+**What it costs.** The walk runs unconditionally, in release, on every definition
+nothing calls — so the specialization blowup documented under
+`SpecializeFrame::specs`, "The remaining gap" (one clone per distinct argument
+tuple, compounding through a call chain) is now reachable from code no one calls,
+where before dead code cost nothing. Two things keep that bounded rather than
+multiplied. A use inside the discarded subtree still *registers* its
+specialization, so the memo shares clones exactly as a live use does — declining to
+register instead made every dead use re-clone its callee, which measured ~5× the
+shared cost at a call-chain depth of six; splice-liveness is decided separately, at
+the rebuild (`Specialization::referenced`). And a dead definition nested inside a
+*live* generalized one is walked once per clone of its enclosing binding — which is
+correct, since its body can depend on the instantiation — but a diagnostic it
+repeats is dropped, so one defect stays one diagnostic however many specializations
+enclose it.
 
 **What this does not reach.** Resolution reads the bounds a body *recorded*, so a
 requirement that only takes effect when a concrete type is **delivered** is not

@@ -371,9 +371,10 @@ fn a_never_called_function_over_a_source_is_typechecked(
 ///
 /// Here the demand comes from **dead code**: `g` is dropped, so the walk over it
 /// specializes `f` — which is what checks the call, and reports `f`'s defect once,
-/// through the clone — but registers nothing on `f`'s frame, deliberately
-/// (`CoalesceCtx::discard_boundary`). The defect is a record/tuple key conflict,
-/// which neither the Σ work nor the trait rework changes, so this stays a rejection.
+/// through the clone — but that specialization is marked unreferenced rather than
+/// spliced, so nothing about it reaches the program. The defect is a record/tuple key
+/// conflict, which neither the Σ work nor the trait rework changes, so this stays a
+/// rejection.
 ///
 /// The exact count is the assertion: three diagnostics for one defect, not six.
 #[test]
@@ -387,6 +388,39 @@ fn a_suppressed_specialization_does_not_get_its_definition_re_walked() {
         3,
         "one defect, reported once per site that met it — a definition demanded \
          without registering must not also be walked as dead code: {errs:?}"
+    );
+}
+
+/// A dead definition nested inside a *live* generalized one sits inside each of that
+/// binding's clones, so it is discard-walked once per specialization. Walking it per
+/// clone is right — its body can reference the enclosing parameter, so it can be
+/// ill-typed at one instantiation and fine at another — but the *diagnostics* must not
+/// multiply: a dead helper inside a function used at five types is one bug, not
+/// fifteen.
+///
+/// The count is therefore held fixed while the number of enclosing specializations
+/// varies. `h` is dead inside `g`, and `g` is live at one, two, and three distinct
+/// types.
+#[rstest]
+#[case::one_enclosing_specialization("live1 = g(1)")]
+#[case::two_enclosing_specializations("live1 = g(1)\nlive2 = g(\"s\")")]
+#[case::three_enclosing_specializations("live1 = g(1)\nlive2 = g(\"s\")\nlive3 = g(True)")]
+fn one_defect_does_not_multiply_by_the_enclosing_specialization_count(#[case] uses: &str) {
+    let code = dead_code(&format!(
+        "{}\n{uses}",
+        indoc! {r#"
+            def g(x):
+                h = \y -> (y.0, y.foo)
+                x
+        "#}
+        .trim_end()
+    ));
+    let errs = infer_program_err(&code);
+    assert_eq!(
+        errs.len(),
+        3,
+        "one defect in a dead helper, however many clones of its enclosing \
+         definition contain it: {errs:?}"
     );
 }
 
