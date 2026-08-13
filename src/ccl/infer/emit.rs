@@ -214,7 +214,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // mutable variable rule; naming `V` here is the whole of it.
             let mut_value = var_ty.mut_value_type();
             // The *target* is a handle, resolved by name above. The written **value** is
-            // an ordinary value operand, so a mutable variable mention there reads: `b := a`
+            // an ordinary value position, so a mutable variable mention there reads: `b := a`
             // between two mutable variables writes `a`'s current value into `b`.
             let value_ty = emit_value_read(value, ctx)?;
             let write_label = name.clone();
@@ -617,7 +617,7 @@ pub(super) fn emit_apply<C: Typing>(
     // mutable variable the argument is passed *by reference* and the handle must reach the
     // parameter, so the invariance rule relates the two value types directly — that is
     // what makes the callee's writes and the caller's declaration one constraint rather
-    // than two edges that have to agree. Every other argument is a value operand, so a
+    // than two edges that have to agree. Every other argument is a value position, so a
     // mutable variable mention there reads.
     //
     // Deciding it here is sound because the parameter is read off the *head of the
@@ -654,7 +654,7 @@ pub(super) fn emit_apply<C: Typing>(
             })?;
             param
         }
-        // Every other position is a value operand, so a mutable variable mention reads.
+        // Every other position is a value position, so a mutable variable mention reads.
         _ => read_through(&raw_arg_ty),
     };
     // The application's type is the function's codomain with its Pi binder
@@ -858,7 +858,7 @@ fn denoted_expr(e: &Expr) -> &Expr {
     }
 }
 
-/// Emit a **value operand**: a mutable variable mention here is a *read*, so its handle
+/// Emit a **value read**: a mutable variable mention here is a *read*, so its handle
 /// derefs to the value it holds.
 ///
 /// This is the ordinary case. A mutable variable's handle survives in exactly two positions —

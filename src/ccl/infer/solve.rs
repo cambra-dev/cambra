@@ -1220,7 +1220,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // hole in that composition.)
         //
         // Through the **deref**, because that is what the node's rule reports: an
-        // effect statement emits its continuation as a value operand
+        // effect statement emits its continuation in a value position
         // (`emit_expr_stmt`'s `emit_value_read`), so a tail that reads a mutable variable denotes
         // the mutable variable's *value*. Lifting `body.ty` verbatim would re-stamp the node
         // with the handle the read just looked through, contradicting the rule that
@@ -1248,7 +1248,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 );
             }
             // Dereffed for the same reason as `ExprStmt`: `emit_mut_decl` reports its
-            // body as a value operand, so `x := 0; …; x` denotes `x`'s value.
+            // body in a value position, so `x := 0; …; x` denotes `x`'s value.
             Some(read_through(&body.ty))
         }
         _ => None,
@@ -1973,7 +1973,7 @@ mod tests {
     /// wrong answer is silent in both directions — a value parameter retyped as a
     /// mutable variable, or a pass-by-reference parameter degraded to a value copy.
     #[test]
-    fn a_recovery_reads_a_register_unless_the_position_is_a_handle() {
+    fn a_recovery_reads_a_mut_var_unless_the_position_is_a_handle() {
         use super::recovered_input;
         use crate::ccl::{HistoryKind, Refinement};
         let mut_var = |value: Type| Type::History {

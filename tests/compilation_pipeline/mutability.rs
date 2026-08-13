@@ -917,13 +917,42 @@ fn rule2_function_returning_mut_is_rejected() {
 /// to a compiler panic, since the lambda's stamped codomain (`Int`) then disagreed
 /// with its body's own type (`Mut(Int, ?d)`) at the post-inference consistency wall.
 #[rstest]
-#[case::through_a_binding("def f(c: Mut(Int)):\n    y = 1\n    c\nx := 0\nf(x)")]
-#[case::through_a_statement("def f(c: Mut(Int)):\n    c += 1\n    c\nx := 0\nf(x)")]
-#[case::through_a_register_introduction("def f(c: Mut(Int)):\n    z := 1\n    c\nx := 0\nf(x)")]
+#[case::through_a_binding(indoc! {r#"
+    def f(c: Mut(Int)):
+        y = 1
+        c
+    x := 0
+    f(x)
+"#})]
+#[case::through_a_statement(indoc! {r#"
+    def f(c: Mut(Int)):
+        c += 1
+        c
+    x := 0
+    f(x)
+"#})]
+#[case::through_a_mut_var_introduction(indoc! {r#"
+    def f(c: Mut(Int)):
+        z := 1
+        c
+    x := 0
+    f(x)
+"#})]
 // A mutable variable does not escape its own introduction either: returning one declared
 // *inside* the function is the same escape as returning a parameter.
-#[case::its_own_register("def g(n):\n    z := n\n    z\ng(5)")]
-#[case::its_own_register_through_a_binding("def g(n):\n    z := n\n    y = 2\n    z\ng(5)")]
+#[case::its_own_mut_var(indoc! {r#"
+    def g(n):
+        z := n
+        z
+    g(5)
+"#})]
+#[case::its_own_mut_var_through_a_binding(indoc! {r#"
+    def g(n):
+        z := n
+        y = 2
+        z
+    g(5)
+"#})]
 fn rule2_is_not_evaded_by_a_tail_position(#[case] code: &str) {
     expect_mut_discipline_error(code, "inside a composite type");
 }
@@ -935,7 +964,13 @@ fn rule2_is_not_evaded_by_a_tail_position(#[case] code: &str) {
 #[test]
 fn a_programs_tail_read_of_its_accumulator_is_a_value() {
     check_scalar(
-        "x := 0\nfor i in [1, 2, 3]:\n    x += i\ny = 1\nx",
+        indoc! {r#"
+            x := 0
+            for i in [1, 2, 3]:
+                x += i
+            y = 1
+            x
+        "#},
         cambra::interpreter::Value::Int(6),
     );
 }

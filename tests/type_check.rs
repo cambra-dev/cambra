@@ -399,7 +399,9 @@ fn a_concrete_operand_reaches_its_obligation(#[case] code: &str) {
 fn mut_var_value_type(code: &str) -> Type {
     match infer_program(code) {
         ty @ Type::History { .. } => {
-            panic!("a tail read must denote the mutable variable's value, got the handle {ty} for `{code}`")
+            panic!(
+                "a tail read must denote the mutable variable's value, got the handle {ty} for `{code}`"
+            )
         }
         value => value,
     }
@@ -2463,13 +2465,27 @@ fn a_single_type_fault_prints_no_demand() {
 /// that same ordering is what made a pass-by-reference argument indistinguishable from
 /// a read, since it too meets a fresh variable.
 #[test]
-fn a_register_read_yields_its_value_in_an_operand_position() {
-    assert_eq!(infer_program("x := 5\nx + 1\n"), int());
+fn a_mut_var_read_yields_its_value_in_a_value_position() {
+    assert_eq!(
+        infer_program(indoc! {r#"
+        x := 5
+        x + 1
+
+    "#}),
+        int()
+    );
     // The value still has to satisfy the operand's demand: what reaches the operator's
     // obligation is `String`, the *value* the read yielded, so the implementation table
     // rejects it at that operand position. A handle arriving here instead would offer no
     // base at all and the obligation would have nothing to reject.
-    let errs = format!("{:?}", infer_program_err("x := 5\nx + \"s\"\n"));
+    let errs = format!(
+        "{:?}",
+        infer_program_err(indoc! {r#"
+        x := 5
+        x + "s"
+
+    "#})
+    );
     assert!(
         errs.contains("Addable") && errs.contains("String"),
         "a read's value type is still checked against the operator, got: {errs}"
@@ -2480,18 +2496,40 @@ fn a_register_read_yields_its_value_in_an_operand_position() {
 /// read of its mutable variable denotes that mutable variable's value rather than the handle.
 ///
 /// The type a node reports and the type its rule derives have to agree, and a tail's
-/// rule emits its continuation as a value operand (`emit_expr_stmt` / `emit_mut_decl`).
+/// rule emits its continuation in a value position (`emit_expr_stmt` / `emit_mut_decl`).
 /// A lift that copied the continuation's type verbatim would re-stamp the node with the
 /// handle the read just looked through, and the wall that re-runs the rule would then be
 /// asked to accept a value against a handle — which is not a subtyping fact.
 #[test]
-fn a_tail_read_denotes_the_registers_value() {
-    assert_eq!(infer_program("a := 0\na := a + 5\na"), int());
+fn a_tail_read_denotes_the_mut_vars_value() {
+    assert_eq!(
+        infer_program(indoc! {r#"
+        a := 0
+        a := a + 5
+        a
+    "#}),
+        int()
+    );
     // Through an intervening statement too — that is the spine link the lift follows.
-    assert_eq!(infer_program("a := 0\na := a + 5\nb = 1\na"), int());
+    assert_eq!(
+        infer_program(indoc! {r#"
+        a := 0
+        a := a + 5
+        b = 1
+        a
+    "#}),
+        int()
+    );
     // With no write at all the value is the seed's singleton, and the tail reports
     // *that* — still the value, not the handle.
-    assert_eq!(infer_program("a := 7\na").to_string(), "7");
+    assert_eq!(
+        infer_program(indoc! {r#"
+        a := 7
+        a
+    "#})
+        .to_string(),
+        "7"
+    );
 }
 
 /// A `Case` arm is a **value** position: rule 2 keeps `Mut` out of every composite and a
@@ -2499,11 +2537,16 @@ fn a_tail_read_denotes_the_registers_value() {
 /// A handle surviving the join would be a `Mut` with no traceable writer — and it would
 /// reach positions rule 2 exists to keep it out of, which is what the tuple here pins.
 #[test]
-fn a_conditional_over_two_registers_denotes_their_values() {
+fn a_conditional_over_two_mut_vars_denotes_their_values() {
     // `Int` in the first slot is the join of the two mutable variables' values (`1` ⊔ `2`); a
     // surviving handle would render `Mut(…)` there. The literal keeps its singleton.
     assert_eq!(
-        infer_program("x := 1\ny := 2\n(x if True else y, 0)").to_string(),
+        infer_program(indoc! {r#"
+            x := 1
+            y := 2
+            (x if True else y, 0)
+        "#})
+        .to_string(),
         "(Int, 0)"
     );
 }

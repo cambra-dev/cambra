@@ -660,7 +660,7 @@ pub enum Type {
     /// assembled from an application edge plus a compensating write contribution — the
     /// shape this needed while a deref coercion erased the handle before invariance
     /// could see it. The property is still pinned by test
-    /// (`a_registers_value_type_is_invariant_across_a_mut_parameter`), which is what
+    /// (`a_mut_vars_value_type_is_invariant_across_a_mut_parameter`), which is what
     /// would catch a future consolidation quietly dropping one direction.
     ///
     /// It is also a **transient** variant like `Hole` / `Infer`: it exists only between type

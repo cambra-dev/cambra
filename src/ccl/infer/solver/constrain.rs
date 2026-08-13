@@ -1907,7 +1907,7 @@ mod tests {
     // `Mut(V) <: V` is no longer a subtyping fact and there is nothing to assert here.
     // The property they protected — `cnt + 1` yields `Int` rather than leaving a `Mut`
     // on an inference variable — is now pinned where it is decided:
-    // `a_register_read_yields_its_value_in_an_operand_position` in `tests/type_check.rs`,
+    // `a_mut_var_read_yields_its_value_in_a_value_position` in `tests/type_check.rs`,
     // and the `mutability` integration suite end to end.
 
     #[test]

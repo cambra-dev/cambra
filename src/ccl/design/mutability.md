@@ -111,7 +111,7 @@ about to constrain is a handle position.
   the head of the application spine. The handle reaches the parameter, so the invariance
   rule relates the two value types directly.
 - A **write's target**, which is resolved by name rather than as a subexpression. The
-  written *value* is an ordinary operand and reads.
+  written *value* is an ordinary value position and reads.
 
 A lambda's result is deliberately *not* dereffed: that is where rule 2 catches a function
 returning a `Mut`, and dereffing would silently accept the escape by turning it into a
@@ -140,7 +140,7 @@ would put a mutable variable *below* its value and `𝑉 <: Mut(𝑉, 𝐷)` wou
 and — because both fire against a fresh inference variable — neither can distinguish a
 read from a handle being passed along. The relation therefore relates a mutable variable only to
 another mutable variable, by invariance, and every position that means the *value* says so in the
-rule that emits it: `emit::emit_value_read` for an ordinary operand, and `emit_apply` reading
+rule that emits it: `emit::emit_value_read` for an ordinary value position, and `emit_apply` reading
 through the parameter's handle for the one position where a `Mut` parameter is given
 something that is not a mutable variable (a program the second-class discipline rejects, but which
 still has to be typed to be reported well).
@@ -319,7 +319,7 @@ introduction every write targets. The discipline:
    parameter is a variable, never a conditional or computed expression. The two halves catch
    different things, because a *conditional* over two mutable variables is not itself `Mut`-typed: a
    mutable read derefs into the arms' join exactly as it derefs into a tuple element (each is a
-   value operand, above), so `x if c else y` reads their values and types as a plain `V`.
+   value position, above), so `x if c else y` reads their values and types as a plain `V`.
    What the rule is protecting is the write capability travelling somewhere its target can't be
    traced, and that is the **argument** half: `bump(x if c else y)` is rejected on the argument's
    node, not its type.
