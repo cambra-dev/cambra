@@ -654,13 +654,13 @@ pub enum Type {
     ///
     /// **The rule is not what currently enforces that across a function boundary.**
     /// At an argument position the deref arm fires first — `Typing::apply` records
-    /// `arg <: ?d` against a fresh variable, so a register meets an `Infer` and reads
+    /// `arg <: ?d` against a fresh variable, so a mutable variable meets an `Infer` and reads
     /// through — so the `(History, History)` arm never runs there. Invariance at a
     /// pass-by-reference call is assembled from two other edges instead: the
     /// application edge supplies `caller <: callee`, and `emit::contribute_pbr_writes`
     /// supplies `callee <: caller`. Equal in strength to the rule, spread across two
     /// mechanisms — which is why the property is pinned by test
-    /// (`a_registers_value_type_is_invariant_across_a_mut_parameter`) rather than
+    /// (`a_mut_vars_value_type_is_invariant_across_a_mut_parameter`) rather than
     /// argued from this paragraph.
     ///
     /// It is also a **transient** variant like `Hole` / `Infer`: it exists only between type

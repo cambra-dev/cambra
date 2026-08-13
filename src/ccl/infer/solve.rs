@@ -1218,8 +1218,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // *body's* already-coalesced type; a spine link that does not propagate is a
         // hole in that composition.)
         TypedExprNode::ExprStmt { body, .. } => Some(body.ty.clone()),
-        // A register introduction lifts its body's type the same way, but has no
-        // discharge available *here*: the term that names a register's value is minted
+        // A mutable variable introduction lifts its body's type the same way, but has no
+        // discharge available *here*: the term that names a mutable variable's value is minted
         // by `mut_elim`, several passes after closure is demanded. So a refinement that
         // mentions the binder cannot be closed at this point, and the program is
         // rejected with a source position rather than left to trip the debug-only scope

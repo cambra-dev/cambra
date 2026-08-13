@@ -2394,15 +2394,22 @@ mod binder_slot_records_the_bound_at_type {
 fn a_mismatch_names_the_demand_as_expected() {
     let rendered = |code: &str| format!("{:?}", infer_program_err(code));
 
-    // A register's seed: the bound/annotation is the demand, the seed is the value.
-    let seed = rendered("x: Mut(Int) := \"s\"\nx");
+    // A mutable variable's seed: the bound/annotation is the demand, the seed is the value.
+    let seed = rendered(indoc! {r#"
+        x: Mut(Int) := "s"
+        x
+    "#});
     assert!(
         seed.contains("expected Int, found String"),
         "the annotation is the demand and the seed is the value, got: {seed}"
     );
 
     // An argument against a declared parameter, the same way round.
-    let arg = rendered("def f(a: Int):\n    a\nf(\"x\")");
+    let arg = rendered(indoc! {r#"
+        def f(a: Int):
+            a
+        f("x")
+    "#});
     assert!(
         arg.contains("expected Int, found String"),
         "the parameter is the demand and the argument is the value, got: {arg}"
@@ -2421,7 +2428,13 @@ fn a_mismatch_names_the_demand_as_expected() {
 /// demand — rather than either one's wording.
 #[test]
 fn a_single_type_fault_prints_no_demand() {
-    let missing = format!("{:?}", infer_program_err("r = (a=1)\nr.b"));
+    let missing = format!(
+        "{:?}",
+        infer_program_err(indoc! {r#"
+        r = (a=1)
+        r.b
+    "#})
+    );
     assert!(
         missing.contains(".b") && missing.contains("{a: 1}"),
         "expected a fault naming the absent field and the record, got: {missing}"
