@@ -774,6 +774,9 @@ The two coincide only where the value's type already *is* the annotation, leavin
 
 * **Width.** `x : {a: Int} = (a=1, b=2)` binds `x` at `{a: Int}`, so `x.b` is an error. `x <: {a: Int} = (a=1, b=2)` binds `x` at `{a: 1, b: 2}`, and `x.b` is `2`.
 * **Refinements.** A literal is typed by its own value ([A literal is refined by its own value](#a-literal-is-refined-by-its-own-value)), so `x : Int = 5` binds `x` at `Int` — the annotation is precisely what discards the singleton — while `x <: Int = 5` leaves it at `5`. Only the second still discharges `arr[x]`'s index-range obligation.
+* **Delivery.** Trait narrowing consumes bases that *arrive* at an operand ([Delivery: the watch follows the edge](#delivery-the-watch-follows-the-edge)), and only the exact form puts one there — it binds at `Int`, while the bounded form binds at a variable that `Int` sits above. So `def f(x: Int): x + "s"` is rejected with no call site and `def f(x <: Int): x + "s"` is not, though both are ill-typed and both fail at the first call.
+
+  This last one is a difference in *reach*, not in meaning, and it is the only bullet here that is: reading the requirements on a value together with its bounds — rather than one delivery at a time — catches the bounded program too, which is the residual gap [Typechecking a never-called definition](#typechecking-a-never-called-definition) already names and locates in the obligation machinery. Do not read it as the split saying that `x <: Int` promises less; what it promises is stated above, and this row is about which mechanism happens to notice.
 
 The refinement case is worth reading twice: the annotation is a bare `Int` and the forms still differ, because `5` is a strict subtype of `Int`. A "simple" annotation is no guarantee that the two agree — only a value that knows nothing beyond the annotation is.
 

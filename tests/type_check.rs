@@ -635,6 +635,15 @@ fn dead_code(defs: &str) -> String {
     f = \a -> a.0 + a.foo
     f = 3
 "#})]
+// An *exact* annotation is a delivery, which is what brings this case back within
+// reach: `x: Int` puts a base on the operand rather than a bound above it, so the
+// obligation narrows to `{(Int, Int)}` and `"s"` empties it, with no call site
+// needed. Its bounded twin below is equally ill-typed and is *not* caught here, and
+// the difference is in the mechanism, not in the programs.
+#[case::annotated_param(indoc! {r#"
+    def f(x: Int):
+        x + "s"
+"#})]
 fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
     assert!(
         !infer_program_err(&dead_code(defs)).is_empty(),
@@ -647,18 +656,27 @@ fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
 /// nothing, so a conflict that is only a trait conflict is not reached — see
 /// `src/ccl/design/type-inference.md`, "Typechecking a never-called definition".
 ///
-/// Both bodies are rejected the moment they are called (`f(1)` on either names the
-/// operand, its type, and what the position accepts), so this is about *when* the
-/// conflict is found, not whether. What makes them unreachable here is that neither
-/// asks any one delivery to be impossible: the first places two requirements on `a`
-/// — `a + 1` fixes it at `Int`, `a + "s"` at `String` — each satisfiable alone and
-/// jointly not, and the second sets a requirement against an annotation. Reading a
-/// value's requirements together is what closes both, and that is a property of the
-/// obligation machinery rather than of the discard walk.
+/// The body is rejected the moment it is called (`f(1)` names the operand, its type,
+/// and what the position accepts), so this is about *when* the conflict is found, not
+/// whether. What makes it unreachable here is that no single delivery is impossible:
+/// two requirements land on `a` — `a + 1` fixes it at `Int`, `a + "s"` at `String` —
+/// each satisfiable alone and jointly not. Reading a value's requirements together is
+/// what closes it, and that is a property of the obligation machinery rather than of
+/// the discard walk.
+///
+/// The bounded parameter pairs with the exact one in the previous test and is here
+/// for the same reason as the case above it, not a different one: `x <: Int` bounds
+/// the operand from above without putting a base on it, so nothing is delivered and
+/// the obligation never narrows, while `x: Int` delivers and rejects. Both programs
+/// are ill-typed and both are rejected at a call; what differs is only whether
+/// today's narrowing has anything to consume. Reading `x`'s requirements together
+/// alongside its `Int` bound closes this one too — measured, it is rejected once the
+/// requirement sweep is in the same tree — so this is a gap in reach, not a
+/// consequence of the exact/bounded split.
 #[rstest]
 #[case::conflicting_operand_types("f = \\a -> (a + 1, a + \"s\")")]
-#[case::annotated_param(indoc! {r#"
-    def f(x: Int):
+#[case::bounded_annotated_param(indoc! {r#"
+    def f(x <: Int):
         x + "s"
 "#})]
 fn a_never_called_function_whose_conflict_is_only_a_trait_conflict_is_not_reached(
