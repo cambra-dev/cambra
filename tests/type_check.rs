@@ -187,6 +187,272 @@ fn test_let(#[case] code: &str, #[case] expected: Type) {
 }
 
 // ---------------------------------------------------------------------------
+// Never-called definitions
+// ---------------------------------------------------------------------------
+
+/// Close a program over definitions nothing calls: `defs` followed by the program
+/// value they are dead with respect to.
+///
+/// Cases below carry the definitions alone, so a one-line definition stays a plain
+/// string and only a genuinely multi-line one reaches for `indoc!`. A case that
+/// needs a *live* use of one of its definitions binds it (`live = f(1)`) rather
+/// than ending the program with it — a monomorphic binding's RHS is walked whether
+/// or not the binding is read, so the use specializes exactly as a trailing call
+/// would.
+fn dead_code(defs: &str) -> String {
+    format!("{}\n1", defs.trim_end())
+}
+
+/// A function nobody calls is still typechecked. Monomorphization drops such a
+/// definition as dead code, but it resolves it first, which is what makes the
+/// errors only *resolution* sees reachable in it.
+///
+/// Every case here is a body whose demands are jointly unsatisfiable while no
+/// single demand is a conflict on its own, so emission — which visits the body
+/// whether or not it is called — records them all without judging. `a` is asked to
+/// be a tuple *and* a record; a parameter to be `Int` *and* `String`. Only reading
+/// the bounds together rejects it, and that is resolution's job.
+///
+/// The cases fan out over *how the demand reaches the definition*, because the walk
+/// has to descend the same way a live specialization's walk does: through a call
+/// chain of dead definitions, into a lambda handed to a callee, and into a
+/// definition nested inside another (dead *or* live) one.
+#[rstest]
+#[case::conflicting_projections("f = \\a -> (a.0, a.foo)")]
+#[case::conflicting_projections_nested("f = \\r -> (r.x.0, r.x.foo)")]
+#[case::conflicting_projections_curried("f = \\a -> \\b -> a.0 + a.foo")]
+#[case::monomorphic_param_at_two_types("f = \\g -> g(1) + g(\"s\")")]
+#[case::conflicting_operand_types("f = \\a -> (a + 1, a + \"s\")")]
+#[case::through_a_call_in_dead_code(indoc! {r#"
+    g = \x -> x + 1
+    f = \a -> g("s")
+"#})]
+#[case::through_a_two_level_dead_chain(indoc! {r#"
+    g = \x -> x + 1
+    h = \y -> g(y)
+    f = \a -> h("s")
+"#})]
+#[case::through_a_three_level_dead_chain(indoc! {r#"
+    a1 = \x -> x + 1
+    a2 = \y -> a1(y)
+    a3 = \z -> a2(z)
+    f = \q -> a3("s")
+"#})]
+#[case::lambda_argument_to_a_dead_callee(indoc! {r#"
+    apply = \k -> k(1)
+    f = \a -> apply(\x -> x + "s")
+"#})]
+#[case::lambda_argument_to_a_live_callee(indoc! {r#"
+    apply = \k -> k(1)
+    f = \a -> apply(\x -> x + "s")
+    live = apply(\x -> x + 1)
+"#})]
+#[case::nested_in_a_dead_definition(indoc! {r#"
+    def f(a):
+        h = \y -> (y.0, y.foo)
+        1
+"#})]
+#[case::nested_in_a_live_definition(indoc! {r#"
+    def g(x):
+        h = \y -> (y.0, y.foo)
+        x
+    live = g(1)
+"#})]
+#[case::nested_call_out_of_a_dead_definition(indoc! {r#"
+    g = \x -> x + 1
+    def f(a):
+        h = \b -> g("s")
+        h(2)
+    live = g(5)
+"#})]
+#[case::shadowed_by_a_later_binding(indoc! {r#"
+    f = \a -> a.0 + a.foo
+    f = 3
+"#})]
+#[case::annotated_param(indoc! {r#"
+    def f(x: Int):
+        x + "s"
+"#})]
+fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
+    assert!(
+        !infer_program_err(&dead_code(defs)).is_empty(),
+        "an ill-typed definition must be rejected whether or not it is called"
+    );
+}
+
+/// The complement, and the guard against the walk over-rejecting: typechecking a
+/// never-called definition is not the same as demanding it be *monomorphic*. Its
+/// quantified variables have no use-site bounds, so it resolves under-determined —
+/// which inference tolerates, and which no later pass sees, because the definition
+/// is dropped either way.
+///
+/// The cases are the constructs whose types a live use-site pin would normally
+/// settle — a collection parameter's element type and domain, a comprehension's
+/// arrow kind, an induction accumulator, a generator's feed, a mutable register —
+/// each of which must resolve to *under-determined*, not to a conflict, when
+/// nothing calls the definition.
+#[rstest]
+#[case::generic_identity("f = \\a -> a")]
+#[case::higher_order("f = \\g -> g(1)")]
+#[case::curried("f = \\a -> \\b -> a + b")]
+#[case::multi_param("f = \\a, b -> a * b + 1")]
+#[case::record_param("f = \\r -> (r.name, r.age + 1)")]
+#[case::tuple_param("f = \\t -> t.0 + t.1")]
+#[case::collection_param("f = \\xs -> [x + 1 for x in xs]")]
+#[case::filter_over_param("f = \\xs -> [x for x in xs if x > 0]")]
+#[case::aggregate_over_param("f = \\xs -> sum([x for x in xs])")]
+#[case::groupby_over_param("f = \\xs -> groupby(xs, \\x -> x)")]
+#[case::calls_a_generic(indoc! {r#"
+    g = \x -> x
+    f = \a -> g(a)
+"#})]
+#[case::annotated_param(indoc! {r#"
+    def f(x: Int):
+        x + 1
+"#})]
+#[case::induction_loop(indoc! {r#"
+    def f(a):
+        s := 0
+        for i in [1, 2, 3]:
+            s := s + i
+        s
+"#})]
+#[case::generator(indoc! {r#"
+    def f(a):
+        for x in [1, 2]:
+            yield x
+"#})]
+#[case::mut_param(indoc! {r#"
+    def f(x: Mut(Int)):
+        x := 1
+        x
+"#})]
+#[case::equal_length_conditional_collections(indoc! {r#"
+    def f(a):
+        if a > 0:
+            [1, 2]
+        else:
+            [3, 4]
+"#})]
+fn a_never_called_generic_function_is_accepted(#[case] defs: &str) {
+    assert_eq!(infer_program(&dead_code(defs)), int_lit(1));
+}
+
+/// A never-called definition that reads a *source* is checked against the source's
+/// element type, and accepted when it uses it consistently. The rejection case is
+/// the discriminating one: its live counterpart — same body, with `f(1)` appended —
+/// fails identically, so the walk is reporting the definition's own conflict rather
+/// than anything a caller would have supplied.
+#[rstest]
+#[case::consistent_use("f = \\a -> [x + 1 for x in nums()]", false)]
+#[case::aggregate("f = \\a -> sum([x for x in nums()])", false)]
+#[case::element_type_conflict("f = \\a -> [x + \"s\" for x in nums()]", true)]
+#[case::via_a_derived_binding(indoc! {r#"
+    ys = [x for x in nums()]
+    f = \a -> [y + "s" for y in ys]
+"#}, true)]
+fn a_never_called_function_over_a_source_is_typechecked(
+    #[case] defs: &str,
+    #[case] rejected: bool,
+) {
+    let code = dead_code(defs);
+    let sources = &[("nums", int())][..];
+    if rejected {
+        assert!(!infer_program_with_sources_err(&code, sources).is_empty());
+    } else {
+        assert_eq!(infer_program_with_sources(&code, sources), int_lit(1));
+    }
+}
+
+/// Deadness is the absence of a *demand*, not of a specialization: a use can be
+/// reached and still register nothing. Registering nothing is what the memo records,
+/// so reading deadness off the memo walks the definition of a binding that is very
+/// much used — reporting its body's defect a second time, from its own nodes.
+///
+/// Here the demand comes from **dead code**: `g` is dropped, so the walk over it
+/// specializes `f` — which is what checks the call, and reports `f`'s defect once,
+/// through the clone — but that specialization is marked unreferenced rather than
+/// spliced, so nothing about it reaches the program. The defect is a record/tuple key
+/// conflict, which neither the Σ work nor the trait rework changes, so this stays a
+/// rejection.
+///
+/// The exact count is the assertion: three diagnostics for one defect, not six.
+#[test]
+fn a_suppressed_specialization_does_not_get_its_definition_re_walked() {
+    let errs = infer_program_err(&dead_code(indoc! {r#"
+        f = \a -> (a.0, a.foo)
+        g = \q -> f(q)
+    "#}));
+    assert_eq!(
+        errs.len(),
+        3,
+        "one defect, reported once per site that met it — a definition demanded \
+         without registering must not also be walked as dead code: {errs:?}"
+    );
+}
+
+/// A dead definition nested inside a *live* generalized one sits inside each of that
+/// binding's clones, so it is discard-walked once per specialization. Walking it per
+/// clone is right — its body can reference the enclosing parameter, so it can be
+/// ill-typed at one instantiation and fine at another — but the *diagnostics* must not
+/// multiply: a dead helper inside a function used at five types is one bug, not
+/// fifteen.
+///
+/// The count is therefore held fixed while the number of enclosing specializations
+/// varies. `h` is dead inside `g`, and `g` is live at one, two, and three distinct
+/// types.
+#[rstest]
+#[case::one_enclosing_specialization("live1 = g(1)")]
+#[case::two_enclosing_specializations("live1 = g(1)\nlive2 = g(\"s\")")]
+#[case::three_enclosing_specializations("live1 = g(1)\nlive2 = g(\"s\")\nlive3 = g(True)")]
+fn one_defect_does_not_multiply_by_the_enclosing_specialization_count(#[case] uses: &str) {
+    let code = dead_code(&format!(
+        "{}\n{uses}",
+        indoc! {r#"
+            def g(x):
+                h = \y -> (y.0, y.foo)
+                x
+        "#}
+        .trim_end()
+    ));
+    let errs = infer_program_err(&code);
+    assert_eq!(
+        errs.len(),
+        3,
+        "one defect in a dead helper, however many clones of its enclosing \
+         definition contain it: {errs:?}"
+    );
+}
+
+/// The same distinction reached by the other route: a use that *fails to resolve* its
+/// instantiation reports and returns before minting, so it too leaves the memo empty
+/// without the definition being dead. Here the domain join inside `f` is unsupported.
+///
+/// **This program is legal under Σ.** When the dependent sum lands
+/// ([type-inference.md, "The domain join is a Σ"](../src/ccl/design/type-inference.md#the-domain-join-is-a-σ)),
+/// `f` type-checks and this test fails for a reason that has nothing to do with what
+/// it guards — re-anchor it on another program that reaches
+/// `specialize_use`'s early return, or drop it: the sibling test above covers the
+/// same distinction with a defect Σ does not touch.
+#[test]
+fn a_failed_use_does_not_get_its_definition_re_walked() {
+    let errs = infer_program_err(indoc! {r#"
+        def f(a):
+            if a > 0:
+                [1, 2]
+            else:
+                [3]
+        f(1)
+    "#});
+    assert_eq!(
+        errs.len(),
+        2,
+        "one defect, reported once per site that met it — a definition whose use \
+         failed must not also be walked as dead code: {errs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Unary operator tests
 // ---------------------------------------------------------------------------
 

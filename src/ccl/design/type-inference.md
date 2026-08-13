@@ -118,7 +118,7 @@ def identity(x):
 * **Inference:** The parameter `x` is a fresh variable `α`; since the body just returns `x`, the type is `α → α`.
 * **Bounds:** `x` is never passed to another function (no upper bounds) and never assigned a concrete value (no lower bounds): `α.lower = []`, `α.upper = []`.
 * **Coalesce:** `α` has no concrete atoms. In pure algebraic subtyping this is fine — it is the principal, universally quantified type `∀α. α → α`.
-* **The Cambra position:** Cambra's public `ccl::Type` has no `Type::ForAll`. It uses level-based type variables for *implicit* polymorphism because that is efficient and meshes with the solver, and it lowers that polymorphism to concrete code by monomorphizing at use sites — the natural fit for an engine that wants concrete types on every node for codegen. An `identity` that is *let-bound and used at several types* is generalized, then specialized per distinct use type during the coalesce walk (see the roadmap above); one that is *never applied* is dropped (its definition is dead code). At every applied call site the function's domain is fixed to the value flowing in, pinning the type to that site — the monomorphic coalescing rule (see §2, Pass 1). This is a pragmatic choice, not a commitment never to *represent* polymorphism: explicit `∀`/Π types could coexist (the `cast`/`iterate` signatures already point that way — see §1, *Roadmap*).
+* **The Cambra position:** Cambra's public `ccl::Type` has no `Type::ForAll`. It uses level-based type variables for *implicit* polymorphism because that is efficient and meshes with the solver, and it lowers that polymorphism to concrete code by monomorphizing at use sites — the natural fit for an engine that wants concrete types on every node for codegen. An `identity` that is *let-bound and used at several types* is generalized, then specialized per distinct use type during the coalesce walk (see the roadmap above); one that is *never applied* is typechecked and then dropped (its definition is dead code — see [Typechecking a never-called definition](#typechecking-a-never-called-definition)). At every applied call site the function's domain is fixed to the value flowing in, pinning the type to that site — the monomorphic coalescing rule (see §2, Pass 1). This is a pragmatic choice, not a commitment never to *represent* polymorphism: explicit `∀`/Π types could coexist (the `cast`/`iterate` signatures already point that way — see §1, *Roadmap*).
 
 ### Roadmap and Current Prototype Status
 
@@ -249,9 +249,93 @@ Because the algorithm drops HM's union-find equality engine, it behaves in ways 
 
 Vanilla algebraic subtyping makes a `let`-bound function polymorphic by **freshening**: every time a generalized binding is used, the solver copies its type graph, minting fresh variables for that use site. This is ordinary let-generalization/instantiation — the same idea as HM's `∀`-quantification — applied to the bound graph rather than to a syntactic type scheme.
 
-**How Cambra applies this — and then lowers it.** A `let` binding a *function definition* (`should_generalize`) is typed one level deeper (`in_let_rhs`) and generalized into a `PolyScheme` at the binding level (`scoped_let`); each `Var` use then `instantiate`s a fresh copy, exactly the freshening above. Because every pass after inference is monomorphic, the generalized binding is lowered to concrete code **inside the coalesce walk** (integrated monomorphization): the walk carries a scope of *specialization frames* — one per in-scope generalized `let`, plus shadow markers for every other binder — and a use of a generalized binding specializes at first visit (`specialize_use`). By coalesce time the constraint graph is *complete* (emission saw the whole program), so a use's instantiation is fully determined when the bottom-up walk reaches it: the walk resolves it off the live graph, and on a memo miss clones the definition (`freshen_expr_type_slots` freshens an independent copy — uniformly over terms and types, so a refinement predicate's slots and the suspended-substitution payloads riding the copied bound edges are renamed in the same traversal as every other slot), **pins the clone two-way to the use's live instantiation type**, coalesces the clone re-entrantly *in the definition site's scope* (entries pushed between definition and use are suspended, so a same-named binder introduced in between cannot capture the clone's references), renames the use to a synthetic `Mono` name (`Name::mono`) carrying the source binding plus a globally-fresh uid, and stamps the specialization's resolved type on it. When the `let`'s body walk completes, the node rebuilds itself as the chain of demanded specializations (`coalesce_generalized_let`), running the §6.2 `let`-closing discharge per spliced layer; a binding never demanded is dropped as dead code. Uses that instantiate the definition identically share one clone — the memo is keyed on a `SpecKey`, taken from the use's live type before its pin, and an entry stores the key of the use that minted it (see [Keying a specialization](#keying-a-specialization)). The definition's own subtree is never coalesced in place: its quantified variables have no use-site bounds, so coalescing it would both produce an under-determined type and overwrite the bound-bearing `InferVar`s the clones freshen from.
+**How Cambra applies this — and then lowers it.** A `let` binding a *function definition* (`should_generalize`) is typed one level deeper (`in_let_rhs`) and generalized into a `PolyScheme` at the binding level (`scoped_let`); each `Var` use then `instantiate`s a fresh copy, exactly the freshening above. Because every pass after inference is monomorphic, the generalized binding is lowered to concrete code **inside the coalesce walk** (integrated monomorphization): the walk carries a scope of *specialization frames* — one per in-scope generalized `let`, plus shadow markers for every other binder — and a use of a generalized binding specializes at first visit (`specialize_use`). By coalesce time the constraint graph is *complete* (emission saw the whole program), so a use's instantiation is fully determined when the bottom-up walk reaches it: the walk resolves it off the live graph, and on a memo miss clones the definition (`freshen_expr_type_slots` freshens an independent copy — uniformly over terms and types, so a refinement predicate's slots and the suspended-substitution payloads riding the copied bound edges are renamed in the same traversal as every other slot), **pins the clone two-way to the use's live instantiation type**, coalesces the clone re-entrantly *in the definition site's scope* (entries pushed between definition and use are suspended, so a same-named binder introduced in between cannot capture the clone's references), renames the use to a synthetic `Mono` name (`Name::mono`) carrying the source binding plus a globally-fresh uid, and stamps the specialization's resolved type on it. When the `let`'s body walk completes, the node rebuilds itself as the chain of demanded specializations (`coalesce_generalized_let`), running the §6.2 `let`-closing discharge per spliced layer; a binding never demanded is resolved for its diagnostics and then dropped as dead code (see [Typechecking a never-called definition](#typechecking-a-never-called-definition)). Uses that instantiate the definition identically share one clone — the memo is keyed on a `SpecKey`, taken from the use's live type before its pin, and an entry stores the key of the use that minted it (see [Keying a specialization](#keying-a-specialization)). The definition's own subtree is never coalesced in place *while it has clones*: its quantified variables have no use-site bounds, so coalescing it would both produce an under-determined type and overwrite the bound-bearing `InferVar`s the clones freshen from. A definition with no clones is the never-called case above, where neither objection applies.
 
 Specializing *during* the walk — rather than splicing after it — is load-bearing twice over. First, every parent derives its type from concrete children on the first pass: in particular a parent `Apply`'s dependent-codomain discharge forces against the specialization's resolved predicate terms, so parent types are never re-derived from a second, graph-unreachable copy of the discharge logic. Second, chained polymorphism (a generalized UDF used only inside *another* generalized definition, poly-calls-poly) needs no special ordering: the inner use is reached only inside an outer clone's re-entrant walk, after that clone's pin has driven the use's instantiation concrete, and the inner binding's frame is still in scope below the outer's. The ordering invariant that makes in-walk specialization sound: **specialization may only add bounds to variables the walk has not yet read** — a use's pin touches its own instantiation variables (read right after, at its own stamp), the clone's fresh variables (read only inside the clone's walk), and otherwise deposits only α-copies of demands the instantiation already made at emit; `coalesce_node`'s `Apply` arm coalesces function before argument to keep even those copies behind the read front. The invariant is **checked explicitly, not just argued**: the walk logs every graph read as a `(var-laden type, resolution)` pair (the snapshot shares the live `InferVar`s), and `assert_reads_stable` re-resolves each against the *final* graph at end of pass, requiring the structural skeleton — bases, ranges, shapes, refinement-layer count, with under-determined positions wildcarded and predicate *content* deferred to `check_scope_valid` / the post-inference reconcile — to be unchanged. A pin that retroactively altered an already-read variable's resolution trips it by name (debug builds; free in release). Refinement layers count because a refinement is lattice content like a record field, so a bound determines it as much as it determines the base; the **one** read that excludes them is a use's own instantiation resolution, where the pin that immediately follows the read is itself what moves the refinements (`ReadPurpose::Instantiation`). That is sound because the read's consumers are refinement-insensitive — it seeds the clone's channel-domain pairings and blames a resolution failure — and, in particular, *sharing does not ride on it*: that is the `SpecKey`'s job, and a key consults both bound directions precisely so it does not depend on which polarity a rendering would have picked. The read's *skeleton* is still held fixed — a stale one would pair channel domains wrong. The contravariant-domain coalescing of §2 — the opposite-polarity fallback plus `coalesce_node`'s per-morphism domain specialization (projections and lambdas) — is the monomorphic coalescing rule for those vars; it is sound because every variable reaching coalesce is monomorphically determined (§1).
+
+#### Typechecking a never-called definition
+
+Dropping a never-demanded binding as dead code is a decision about what to *lower*,
+not about what to *check*. A definition body is emitted whether or not it is called,
+so any demand that conflicts with a concrete type is already reported (`f = \a -> a
+and 3` is rejected with no call site). What emission records without judging is a
+demand on a **quantified** variable: one bound among several, a conflict only when
+the bounds are read together. Reading them together is what resolution does — so a
+definition like `f = \a -> (a.0, a.foo)`, which asks `𝑎` to be both a tuple and a
+record, was accepted for exactly as long as nobody called it. `coalesce_generalized_let`
+therefore resolves an undemanded definition (`typecheck_discarded_definition`) before
+dropping it, and keeps only the diagnostics.
+
+The general prohibition on coalescing a definition in place is about definitions with
+clones, and neither half of it survives their absence: nothing was freshened from this
+definition, and its binding leaves scope at the `let`, so nothing can freshen from it
+later. What remains is the under-determination — its quantified variables never
+received use-site bounds — which inference tolerates (`Type::Infer`'s invariant) and
+no strict check ever sees, because the resolved definition is discarded either way.
+
+The walk descends through uses, so it also typechecks what dead code *calls*: a use
+inside it of a generalized binding declared further out specializes normally, which is
+what makes the call's argument meet the callee's demands. That specialization must not
+be *spliced*, though — its enclosing `let` survives the dead definition and would
+gain a binding nothing references. It is still registered, which is what shares the
+clone with the next dead use, and marked unreferenced instead
+(`Specialization::referenced`), so dead code is checked without re-entering the
+program. Which frames that applies to is asked of each frame when it is pushed
+(`SpecializeFrame::inside_discarded`) rather than computed from a scope depth: a frame
+created *inside* the discarded subtree dies with it, so what it splices is moot, and
+the re-entrant clone walk truncates the scope stack, which a depth cannot survive.
+
+**Deadness is the absence of a demand, not of a specialization.** The two come apart
+in both directions — a use whose instantiation fails to resolve reports and returns
+before minting anything, and a use inside a discarded subtree deliberately does not
+register — so `specs.is_empty()` cannot decide this. `SpecializeFrame::demanded`,
+set on entry to `specialize_use`, is what does. Reading the memo instead re-walks the
+definition of a binding whose uses merely *failed*, which reports that body's conflict
+a second time from its own nodes: one defect, four diagnostics.
+
+*Known gap, not fixed:* a use that fails to resolve is never renamed, so it still
+names a binding whose `let` the rebuild then drops — leaving that reference dangling
+in the tree a failed pass leaves behind. It is unobservable while an inference error
+discards the tree, and the fix is a node meaning "could not be built, errors pending"
+(today's `TypedExprNode::Error` is contracted to lowering recovery), which would also
+let the rebuild stay unconditional.
+
+**What it costs.** The walk runs unconditionally, in release, on every definition
+nothing calls — so the specialization blowup documented under
+`SpecializeFrame::specs`, "The remaining gap" (one clone per distinct argument
+tuple, compounding through a call chain) is now reachable from code no one calls,
+where before dead code cost nothing. Two things keep that bounded rather than
+multiplied. A use inside the discarded subtree still *registers* its
+specialization, so the memo shares clones exactly as a live use does — declining to
+register instead made every dead use re-clone its callee, which measured ~5× the
+shared cost at a call-chain depth of six; splice-liveness is decided separately, at
+the rebuild (`Specialization::referenced`). And a dead definition nested inside a
+*live* generalized one is walked once per clone of its enclosing binding — which is
+correct, since its body can depend on the instantiation — but a diagnostic it
+repeats is dropped, so one defect stays one diagnostic however many specializations
+enclose it.
+
+**What this does not reach.** Resolution reads the bounds a body *recorded*, so a
+requirement that only takes effect when a concrete type is **delivered** is not
+evaluated here and cannot fail here. Trait obligations are the case: an obligation
+narrows its candidate set as bases arrive, and one whose operand never receives a base
+narrows nothing and so rejects nothing, however few implementations could ever satisfy
+it. Closing that is a property of the obligation machinery — an unsatisfiable
+*intersection* of the requirements on one variable is visible without any delivery — not
+of this walk, which only decides whether the definition's copies are resolved at all.
+
+**A shape that looks like an escape and is not.** `if 𝑝: [x for x in xs if 𝑞] else: xs`
+is accepted with no call site, and rejected at one. That is not laxity: both arms'
+domains are the *same* variable (`xs`'s), so the filter is recorded as a refinement on
+it rather than as a second domain alternative, and the definition types as
+`(…, {𝐷 | 𝑞} ⤇ 𝑉) ⇒ …` — *give me a collection whose domain already satisfies the
+filter*, which is exactly the condition under which the two arms share a domain and the
+join loses nothing. The requirement is in the type, not dropped. Supplying a concrete
+domain at a call site re-materializes the arms as two distinct domains and meets the
+interim Σ diagnosis ([The domain join is a Σ](#the-domain-join-is-a-σ)) — which is also
+why the same body over a *literal* or *source* collection is diagnosed either way: those
+domains are concrete in the body already, so there is no shared variable for the
+refinement to land on.
 
 #### Keying a specialization
 

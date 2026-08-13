@@ -70,6 +70,23 @@ Comment when the *why* is non-obvious — a hidden constraint, a load-bearing in
 
 Avoid comments that describe the history of the codebase.  Comments should explain how and why the code works.  If there is an alternative approach that seems reasonable but doesn't work, it's ok to describe that, but the comments should always fully make sense just by looking at the current version of the code.
 
+### Embedded source in tests: use `indoc!`, never `\n`
+
+A test's CHL (or any embedded source) program must read as the program it is. Write
+multi-line programs with `indoc! {r#"…"#}` (already used in
+`tests/compilation_pipeline/transactions.rs` and `tests/chl_parser_roundtrip.rs`),
+**never** as a single string with embedded `\n`: escaped newlines hide the
+indentation an off-side-rule language depends on, and a one-line diff on such a case
+touches the whole program.
+
+Two corollaries:
+
+- **A genuinely one-line program stays a plain string.** `indoc!` is for programs
+  with line structure, not a uniform wrapper.
+- **Don't let boilerplate force `indoc!` on a one-liner.** If cases share a fixed
+  trailing line (a program value, a call that makes something live), append it in
+  the test body and let each case carry only its own content.
+
 ### Referencing docs and sections
 
 Cross-references into the docs are checked by `./ci.sh doc_refs` (Markdown
