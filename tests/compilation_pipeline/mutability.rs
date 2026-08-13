@@ -583,7 +583,15 @@ fn augmented_assignment_to_non_mutable_rejected() {
 /// check runs at all.
 #[test]
 fn a_write_to_a_binder_monomorphization_dropped_is_rejected() {
-    expect_mut_discipline_error("def f(v):\n    v + 1\nf := 10\n1", "not a mutable variable");
+    expect_mut_discipline_error(
+        indoc! {r#"
+        def f(v):
+            v + 1
+        f := 10
+        1
+    "#},
+        "not a mutable variable",
+    );
 }
 
 /// The other half: when the target *is* a mutable variable, the write is demanded
@@ -633,9 +641,24 @@ fn mut_annotation_with_non_txn_domain_rejected() {
 /// per-iteration shadowing `let`, silently discarding each update at the iteration
 /// boundary, the very thing `:=` exists to avoid.
 #[rstest]
-#[case::annotated_mut("for i in [1, 2, 3]:\n    y: Mut(Int) := 0\n    y += i\ny")]
-#[case::annotated_value("for i in [1, 2, 3]:\n    y: Int := 0\n    y += i\ny")]
-#[case::bare("for i in [1, 2, 3]:\n    y := 0\n    y += i\ny")]
+#[case::annotated_mut(indoc! {r#"
+    for i in [1, 2, 3]:
+        y: Mut(Int) := 0
+        y += i
+    y
+"#})]
+#[case::annotated_value(indoc! {r#"
+    for i in [1, 2, 3]:
+        y: Int := 0
+        y += i
+    y
+"#})]
+#[case::bare(indoc! {r#"
+    for i in [1, 2, 3]:
+        y := 0
+        y += i
+    y
+"#})]
 fn mut_var_declared_inside_loop_rejected(#[case] code: &str) {
     expect_compile_error(code, "introduced inside a for-loop body");
 }
@@ -645,7 +668,13 @@ fn mut_var_declared_inside_loop_rejected(#[case] code: &str) {
 #[test]
 fn per_iteration_value_binding_inside_a_loop_is_allowed() {
     check_scalar(
-        "t := 0\nfor i in [1, 2, 3]:\n    y = i\n    t += y\nt",
+        indoc! {r#"
+            t := 0
+            for i in [1, 2, 3]:
+                y = i
+                t += y
+            t
+        "#},
         cambra::interpreter::Value::Int(6),
     );
 }
@@ -685,7 +714,12 @@ fn cross_channel_cycle_is_rejected() {
 #[test]
 fn plain_assignment_off_a_mutable_is_a_value_read() {
     check_scalar(
-        "a := 0\na += 5\nb = a\nb",
+        indoc! {r#"
+            a := 0
+            a += 5
+            b = a
+            b
+        "#},
         cambra::interpreter::Value::Int(5),
     );
 }
@@ -695,7 +729,15 @@ fn plain_assignment_off_a_mutable_is_a_value_read() {
 /// error names the write (the actual mistake) rather than the binding.
 #[test]
 fn writing_through_a_value_copy_of_a_mutable_is_rejected() {
-    expect_mut_discipline_error("a := 0\nb = a\nb += 1\nb", "not a mutable variable");
+    expect_mut_discipline_error(
+        indoc! {r#"
+        a := 0
+        b = a
+        b += 1
+        b
+    "#},
+        "not a mutable variable",
+    );
 }
 
 /// Rule 2: a function may not return a `Mut` — the mutable-variable reference would
@@ -876,11 +918,21 @@ fn pass_by_ref_writer_with_intermediates_bare_statement_loop() {
 #[test]
 fn wildcard_annotated_copy_of_a_mutable_is_a_value_read() {
     check_scalar(
-        "a: Mut(Int) := 0\na += 5\nb: _ = a\nb",
+        indoc! {r#"
+            a: Mut(Int) := 0
+            a += 5
+            b: _ = a
+            b
+        "#},
         cambra::interpreter::Value::Int(5),
     );
     expect_mut_discipline_error(
-        "a: Mut(Int) := 0\nb: _ = a\nb += 1\nb",
+        indoc! {r#"
+            a: Mut(Int) := 0
+            b: _ = a
+            b += 1
+            b
+        "#},
         "not a mutable variable",
     );
 }
@@ -1176,7 +1228,13 @@ acc",
 #[test]
 fn nested_for_loops_stay_rejected() {
     expect_compile_error(
-        "s := 0\nfor x in [1, 2]:\n    for y in [10, 20]:\n        s += y\ns",
+        indoc! {r#"
+            s := 0
+            for x in [1, 2]:
+                for y in [10, 20]:
+                    s += y
+            s
+        "#},
         "for-loop body",
     );
 }
@@ -1189,7 +1247,13 @@ fn nested_for_loops_stay_rejected() {
 #[test]
 fn a_mut_param_still_binds_a_mut_var() {
     check_scalar(
-        "def bump(c: Mut(Int)):\n    c += 1\nx := 0\nbump(x)\nx",
+        indoc! {r#"
+            def bump(c: Mut(Int)):
+                c += 1
+            x := 0
+            bump(x)
+            x
+        "#},
         cambra::interpreter::Value::Int(1),
     );
 }

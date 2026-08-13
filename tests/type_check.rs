@@ -2245,7 +2245,13 @@ mod binder_slot_records_the_bound_at_type {
     /// `collect_txn_mut_vars` fall back to the annotation.
     #[test]
     fn mut_var_introduction_binds_at_the_history() {
-        let b = binder_of("a: Mut(Int) := 0\na", "a");
+        let b = binder_of(
+            indoc! {r#"
+            a: Mut(Int) := 0
+            a
+        "#},
+            "a",
+        );
         assert!(
             b.ty.mut_value_type().is_some(),
             "mutable variable binder bound at {} — expected a history",
@@ -2268,7 +2274,14 @@ mod binder_slot_records_the_bound_at_type {
     /// mutable variable in the type system.
     #[test]
     fn deref_copy_binds_at_the_value_type() {
-        let b = binder_of("a: Mut(Int) := 0\nb: Int = a\nb", "b");
+        let b = binder_of(
+            indoc! {r#"
+                a: Mut(Int) := 0
+                b: Int = a
+                b
+            "#},
+            "b",
+        );
         assert_eq!(b.ty, int(), "deref-copy binder bound at {}", b.ty);
     }
 
@@ -2279,8 +2292,16 @@ mod binder_slot_records_the_bound_at_type {
     #[test]
     fn a_let_never_binds_a_mut_var() {
         for code in [
-            "a: Mut(Int) := 0\nb = a\nb",
-            "a: Mut(Int) := 0\nb: _ = a\nb",
+            indoc! {r#"
+                a: Mut(Int) := 0
+                b = a
+                b
+            "#},
+            indoc! {r#"
+                a: Mut(Int) := 0
+                b: _ = a
+                b
+            "#},
         ] {
             let b = binder_of(code, "b");
             assert_eq!(b.ty, int(), "`{code}` bound `b` at {}", b.ty);
@@ -2291,9 +2312,28 @@ mod binder_slot_records_the_bound_at_type {
     #[test]
     fn annotations_do_not_survive_inference() {
         for (code, name) in [
-            ("a: Mut(Int) := 0\nb: Int = a\nb", "b"),
-            ("x: _ = 5\nx", "x"),
-            ("y: Int = 5\ny", "y"),
+            (
+                indoc! {r#"
+                    a: Mut(Int) := 0
+                    b: Int = a
+                    b
+                "#},
+                "b",
+            ),
+            (
+                indoc! {r#"
+                x: _ = 5
+                x
+            "#},
+                "x",
+            ),
+            (
+                indoc! {r#"
+                y: Int = 5
+                y
+            "#},
+                "y",
+            ),
         ] {
             let b = binder_of(code, name);
             assert!(
