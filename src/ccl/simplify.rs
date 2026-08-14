@@ -568,7 +568,7 @@ fn try_product_beta_fst(expr: &mut Expr) -> bool {
 /// equationally sound anywhere the pattern appears.
 ///
 /// In practice this fires on uncurried multi-arg UDF call sites: after
-/// `inline_non_iterable_lambdas` beta-reduces the outer user-parameter lambda,
+/// `inline_capability_lambdas` beta-reduces the outer user-parameter lambda,
 /// references like `__arg_pair.0` are left as `Apply(Tuple([list, n]),
 /// Proj(0))`.  Operator conversion's list-element path needs the projection
 /// folded, so this rule must fire before `operator_conversion` runs.

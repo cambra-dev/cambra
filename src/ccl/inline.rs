@@ -1,22 +1,23 @@
-//! A single pre-lambda-elim inlining pass that substitutes `Let` bindings at
-//! their call sites for UDFs with non-iterable domains.
+//! A single pre-lambda-elim inlining pass that substitutes `Let`-bound
+//! **capabilities** at their call sites.
 //!
-//! # [`inline_non_iterable_lambdas`] — inlines `Let` bindings for functions with non-iterable domains
+//! # [`inline_capability_lambdas`] — inlines `Let` bindings that are not collections
 //!
-//! Runs **before** [`crate::ccl::lambda_elim`].  Inlines any `Let` binding
-//! (selected by [`should_inline`]) whose domain is not natively iterable by the
-//! operator graph.  This covers:
+//! Runs **before** [`crate::ccl::lambda_elim`]. A capability has no data behind
+//! it: nothing to share, and inlining is how it reaches its call sites to be
+//! specialized and beta-reduced there. A **collection** is left bound, because
+//! the binding *is* the data and op-conversion compiles it once behind a `Memo`
+//! that every use branches off. [`should_inline`] is the whole rule, and it is
+//! the [`FunKind`](crate::ccl::ty::FunKind).
 //!
-//! - **Scalar UDFs**: `Fun(non_iterable_domain, codomain)`.  These have a
-//!   non-iterable (non-enumerable) domain.  Syntactic multi-arg Python lambdas
-//!   (`\x, y -> …`) are uncurried at lowering to `Tuple([…]) → T`, so they
-//!   match this rule too.
+//! What that covers, by shape rather than by rule:
 //!
-//! - **List-producing UDFs**: `Fun(Fun(iterable_domain, _), _)`.  Functions
-//!   whose domain is itself a function type — generator functions and
+//! - **Scalar UDFs**: `Fun(D, C)` over any scalar domain. Syntactic multi-arg
+//!   lambdas (`\x, y -> …`) are uncurried at lowering to `Tuple([…]) → T`, so
+//!   they are the same case.
+//! - **List-producing UDFs**: `Fun(Fun(_, _), _)` — generator functions and
 //!   list-returning `def`s lowered to `λ user_arg → λ __iter_record → body`.
-//!   A `Fun` domain has no iterable domain, so these are covered by the same
-//!   non-iterable-domain rule.
+//!   A function *of* a collection is still a capability.
 //!
 //! After substituting the bound lambda at each call site, the resulting
 //! `Apply(arg, Lambda(x, body))` nodes are beta-reduced so that downstream
@@ -39,7 +40,7 @@
 //! - **Recursive UDFs** are not supported (already noted in operator conversion).
 //! - **Body duplication**: if a scalar UDF is called N times, its body appears N
 //!   times in the operator graph. Acceptable for now; caching is only needed for
-//!   collection-typed UDFs (iterable domain), which are not inlined.
+//!   collections, which are not inlined.
 //!
 //! # Alias inlining
 //!
@@ -74,22 +75,20 @@ use crate::ccl::{
 // Public entry points
 // ---------------------------------------------------------------------------
 
-/// Inline `Let` bindings for UDFs with non-iterable domains and beta-reduce
-/// their call sites.
+/// Inline `Let`-bound capabilities and beta-reduce their call sites.
 ///
 /// Runs **before** [`crate::ccl::lambda_elim`].  Walks the expression tree and
 /// substitutes each matching UDF at every free occurrence of its binding name
 /// in the body, beta-reducing at each call site, then drops the `Let` wrapper.
 ///
-/// Inlines any function whose domain is not natively iterable (see
-/// [`should_inline`]): scalar UDFs, list-producing UDFs, and curried functions
-/// all qualify.  Only bindings whose domain is natively iterable (`UIntRange`,
-/// `DataSource`) are left intact.
+/// Inlines any binding that is a capability (see [`should_inline`]): scalar
+/// UDFs, list-producing UDFs, and curried functions all qualify. A collection is
+/// left intact.
 ///
 /// Literal tuple projections that arise from uncurried multi-arg call sites
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
-pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
+pub fn inline_capability_lambdas(expr: Expr) -> Expr {
     let mut expr = inline_impl(expr);
     // Beta-reduction rebuilds predicates on `expr.ty` (immutable terms); keep
     // each `Cast`'s `target` slot in step so the post-pass typecheck matches.
@@ -614,9 +613,9 @@ mod tests {
 
     #[test]
     fn should_inline_curried_fun() {
-        // Int → (Int → Int): domain is non-iterable (Int), so the curried
-        // function is now inlined. Beta-reduction at concrete call sites
-        // eliminates the nested lambda before any `curry` combinator is produced.
+        // Int → (Int → Int): a capability, so inlined. Beta-reduction at
+        // concrete call sites eliminates the nested lambda before any `curry`
+        // combinator is produced.
         let ty = Type::Fun {
             name: None,
             kind: FunKind::Compute,
@@ -633,8 +632,8 @@ mod tests {
 
     #[test]
     fn should_inline_refined_fun_codomain() {
-        // Int → Refinement(Int → Int, pred): domain is non-iterable (Int),
-        // so the function is inlined regardless of the refined codomain.
+        // Int → Refinement(Int → Int, pred): a capability, so inlined —
+        // the refined codomain makes no difference.
         use crate::ccl::Refinement;
         use std::rc::Rc;
         let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
@@ -683,8 +682,8 @@ mod tests {
     }
 
     #[test]
-    fn should_inline_all_non_iterable_tuple_domain() {
-        // (Int, Int) → Int: both components non-iterable, should inline.
+    fn should_inline_tuple_domain() {
+        // (Int, Int) → Int: an uncurried multi-arg capability, so inlined.
         let ty = Type::Fun {
             name: None,
             kind: FunKind::Compute,
@@ -699,8 +698,8 @@ mod tests {
 
     #[test]
     fn should_inline_mixed_tuple_domain() {
-        // (UIntRange(3), Int) → Int: any non-iterable component makes the tuple
-        // non-iterable, so this is inlined.
+        // (UIntRange(3), Int) → Int: a capability over a tuple, so inlined — the
+        // enumerable first component makes no difference.
         let ty = Type::Fun {
             name: None,
             kind: FunKind::Compute,
@@ -739,8 +738,8 @@ mod tests {
     #[test]
     fn should_inline_list_to_scalar_udf() {
         // Fun(Fun(UIntRange, Int), Int): takes a list, returns a scalar (e.g. a
-        // user-defined sum/fold). The domain is a Fun type — non-iterable —
-        // so this is inlined just like any other non-iterable-domain function.
+        // user-defined sum/fold). A function *of* a collection is still a
+        // capability, so it is inlined like any other.
         let int = Type::Base(BaseType::Int);
         let list = fn_ty(Type::UIntRange(3), int.clone());
         assert!(should_inline(&fn_ty(list, int)));
@@ -766,14 +765,14 @@ mod tests {
     #[test]
     fn scalar_let_unchanged() {
         let expr = scalar_let();
-        let result = inline_non_iterable_lambdas(expr.clone());
+        let result = inline_capability_lambdas(expr.clone());
         assert_eq!(result, expr);
     }
 
     #[test]
     fn collection_let_alias_is_inlined() {
         // let f: UIntRange(3) → Int = id in f
-        // Even though the domain is iterable (so should_inline returns false), the bound
+        // Even though it is a collection (so should_inline returns false), the bound
         // expression is a plain Var — alias inlining eliminates the let unconditionally.
         let domain = Type::UIntRange(3);
         let codomain = Type::Base(BaseType::Int);
@@ -781,7 +780,7 @@ mod tests {
         let id_expr = TypedExpr::var("id").with_ty(fun_ty.clone());
         let body = TypedExpr::var("f").with_ty(fun_ty.clone());
         let expr = TypedExpr::let_bind("f", id_expr.clone(), body);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
         // Alias `f → id` is substituted; result is just `id`.
         assert_eq!(result, id_expr);
     }
@@ -789,14 +788,14 @@ mod tests {
     #[test]
     fn curried_let_is_inlined() {
         // let f: Int → (Int → Int) = curry_add in f
-        // Domain is Int (non-iterable), so the curried Let IS inlined.
-        // After inline_non_iterable_lambdas: the Let is dropped and the result is Var("curry_add").
+        // A capability, so the curried Let IS inlined.
+        // After inline_capability_lambdas: the Let is dropped and the result is Var("curry_add").
         let int = Type::Base(BaseType::Int);
         let curried_ty = Type::fun(int.clone(), Type::fun(int.clone(), int.clone()));
         let curry_expr = TypedExpr::var("curry_add").with_ty(curried_ty.clone());
         let body = TypedExpr::var("f").with_ty(curried_ty.clone());
         let expr = TypedExpr::let_bind("f", curry_expr.clone(), body);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
         assert_eq!(result, curry_expr);
     }
 
@@ -814,7 +813,7 @@ mod tests {
         .with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", id_expr.clone(), apply);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
 
         // The Let wrapper should be gone; Var(f) replaced by id_expr.
         // Note: id_expr is Var("id"), not a Lambda, so Apply(Lit(3), id_expr)
@@ -849,7 +848,7 @@ mod tests {
             .with_ty(Type::Tuple(vec![int.clone(), int.clone()]));
         let expr = TypedExpr::let_bind("f", id_expr.clone(), body);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
 
         let expected_call3 = TypedExpr::new(TypedExprNode::Apply {
             argument: Box::new(TypedExpr::lit(Lit::Int(3)).with_ty(int.clone())),
@@ -876,7 +875,7 @@ mod tests {
         let body = TypedExpr::lit(Lit::Int(42)).with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", id_expr, body);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
         let expected = TypedExpr::lit(Lit::Int(42)).with_ty(int);
         assert_eq!(result, expected);
     }
@@ -904,7 +903,7 @@ mod tests {
         let inner_let = TypedExpr::let_bind("g", id_g.clone(), outer_apply);
         let expr = TypedExpr::let_bind("f", id_f.clone(), inner_let);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
 
         // Both f and g should be substituted with id.
         let expected_inner = TypedExpr::new(TypedExprNode::Apply {
@@ -1088,7 +1087,7 @@ mod tests {
             .with_ty(list.clone());
         let expr = TypedExpr::let_bind("rep", outer, call);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
 
         let expected = TypedExpr::lambda("__iter_record", range, arg).with_ty(list);
         assert_eq!(result, expected);
@@ -1116,44 +1115,44 @@ mod tests {
         let call = TypedExpr::apply(arg, TypedExpr::var("f").with_ty(udf_ty)).with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", lambda, call);
 
-        let _ = inline_non_iterable_lambdas(expr);
+        let _ = inline_capability_lambdas(expr);
     }
 
-    // inline_non_iterable_lambdas — end-to-end pass behaviour
+    // inline_capability_lambdas — end-to-end pass behaviour
     // -----------------------------------------------------------------------
 
     #[test]
-    fn inline_non_iterable_lambdas_inlines_scalar_let() {
+    fn inline_capability_lambdas_inlines_scalar_let() {
         // Scalar UDF: `let f: Int → Int = id in Var("f")`.
-        // After inline_non_iterable_lambdas: the Let is dropped and the result is Var("id").
+        // After inline_capability_lambdas: the Let is dropped and the result is Var("id").
         let int = Type::Base(BaseType::Int);
         let ident = TypedExpr::var("id").with_ty(fn_ty(int.clone(), int.clone()));
         let body = TypedExpr::var("f").with_ty(fn_ty(int.clone(), int.clone()));
         let expr = TypedExpr::let_bind("f", ident.clone(), body);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
         assert_eq!(result, ident);
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_inlines_user_curried_let() {
+    fn inline_capability_lambdas_inlines_user_curried_let() {
         // `let f: Int → (Int → Int) = g in f` — user-curried scalar.
-        // Domain is Int (non-iterable), so `should_inline` returns true and
-        // the Let IS inlined. After inline_non_iterable_lambdas: the result is Var("g").
+        // A capability, so `should_inline` returns true and
+        // the Let IS inlined. After inline_capability_lambdas: the result is Var("g").
         let int = Type::Base(BaseType::Int);
         let curried = fn_ty(int.clone(), fn_ty(int.clone(), int.clone()));
         let ident = TypedExpr::var("g").with_ty(curried.clone());
         let body = TypedExpr::var("f").with_ty(curried);
         let expr = TypedExpr::let_bind("f", ident.clone(), body);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
         assert_eq!(result, ident);
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_inlines_and_beta_reduces_list_udf() {
+    fn inline_capability_lambdas_inlines_and_beta_reduces_list_udf() {
         // Mirror the simplest generator-function lowering:
         //   let doubles = λ xs → λ __iter_record → __iter_record ▷ xs ▷ (λ x → x)
         //   in [1, 2, 3] ▷ doubles
-        // After inline_non_iterable_lambdas: the outer `λ xs` is substituted and beta-reduced,
+        // After inline_capability_lambdas: the outer `λ xs` is substituted and beta-reduced,
         // leaving `λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ x → x)`.
         let int = Type::Base(BaseType::Int);
         let range = Type::UIntRange(3);
@@ -1189,7 +1188,7 @@ mod tests {
         .with_ty(list.clone());
         let expr = TypedExpr::let_bind("doubles", outer_lambda, call);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
 
         // Expected: the top-level node is the inner Lambda (no more Let, no
         // more outer `λ xs`), with `xs` substituted by the concrete list.
@@ -1208,11 +1207,11 @@ mod tests {
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_substitutes_arg_pair_into_multi_arg_body() {
+    fn inline_capability_lambdas_substitutes_arg_pair_into_multi_arg_body() {
         // Mirror the uncurried multi-arg shape:
         //   let f = λ __arg_pair → λ __iter_record → … __arg_pair.0 …
         //   in ([1, 2, 3], 10) ▷ f
-        // After inline_non_iterable_lambdas: the outer `λ __arg_pair` is
+        // After inline_capability_lambdas: the outer `λ __arg_pair` is
         // beta-reduced, leaving `Tuple([1,2,3], 10).0` in the body. The
         // literal-tuple-projection fold lives in `crate::ccl::simplify` and
         // is *not* applied here — this test asserts only the substitution +
@@ -1261,7 +1260,7 @@ mod tests {
             .with_ty(list.clone());
         let expr = TypedExpr::let_bind("f", outer_lambda, call);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
 
         // Expected: outer Let / outer `λ __arg_pair` are gone; references to
         // `__arg_pair` are rewritten to the concrete tuple literal, so the
@@ -1282,9 +1281,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_beta_reduces_scalar_lambda_call() {
+    fn inline_capability_lambdas_beta_reduces_scalar_lambda_call() {
         // let f: Int → Int = λ x → Lit(42) in Apply(Lit(3), Var("f"))
-        // After inline_non_iterable_lambdas: Lit(42) (the constant lambda is beta-reduced,
+        // After inline_capability_lambdas: Lit(42) (the constant lambda is beta-reduced,
         // discarding the argument Lit(3)).
         let int = Type::Base(BaseType::Int);
         let lambda = TypedExpr::lambda(
@@ -1300,17 +1299,17 @@ mod tests {
         .with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", lambda, call);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
         let expected = TypedExpr::lit(Lit::Int(42)).with_ty(int);
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_substitutes_pair_into_multi_arg_scalar_body() {
+    fn inline_capability_lambdas_substitutes_pair_into_multi_arg_scalar_body() {
         // let add: Tuple(Int, Int) → Int = λ __pair → __pair.0 + __pair.1
         // in add(Tuple(Lit(1), Lit(2)))
         //
-        // After inline_non_iterable_lambdas: the body becomes
+        // After inline_capability_lambdas: the body becomes
         //   Tuple(1, 2).0 + Tuple(1, 2).1
         // — the literal-tuple projections survive here and are folded later
         // by `crate::ccl::simplify::try_literal_tuple_projection`.
@@ -1361,7 +1360,7 @@ mod tests {
         .with_ty(int.clone());
 
         let expr = TypedExpr::let_bind("add", lambda, call);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_capability_lambdas(expr);
 
         // Expected: Tuple(1,2).0 + Tuple(1,2).1 — projections unfolded here.
         let expected_left = TypedExpr::new(TypedExprNode::Apply {

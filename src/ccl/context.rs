@@ -509,7 +509,7 @@ pub struct CompiledProgram {
     /// The post-inference IR snapshot — the program inspector's anchor.
     ///
     /// This is `expr` captured **right after `infer`/`typecheck` and before
-    /// `inline::inline_non_iterable_lambdas` consumes it**: fully typed, but
+    /// `inline::inline_capability_lambdas` consumes it**: fully typed, but
     /// still *source-shaped* (lambdas intact, not yet point-free — `inline`,
     /// `lambda_elim`, and `planning` have not run).
     ///
@@ -884,7 +884,7 @@ pub fn compile_program(
     // See `CompiledProgram::post_inference_ir`.
     let post_inference_ir = expr.clone();
 
-    expr = inline::inline_non_iterable_lambdas(expr);
+    expr = inline::inline_capability_lambdas(expr);
     debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).map_err(|errs| {
         if errs
