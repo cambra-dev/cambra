@@ -556,12 +556,15 @@ it too, and that is not cosmetic: several passes *skip work* when `is_free` says
 no, so a slot the free-variable walk cannot see is a slot those passes decline to
 rewrite.
 
-A binder's **annotation** is the subtle member of that set: it is where lowering
-writes a mutable variable's `Mut(V, D)` history (`x := e` lowers via
-`let_bind_annotated`), and `infer::api::binder_is_mut` reads it as authoritative
-over the binder's `ty`. A walk covering only `b.ty` skips every mutable binder in
-the program, and — because an erasure and its own post-condition would share that
-walk — the check could not report what the erasure missed.
+A binder's **annotation** is the subtle member of that set, and it is the only one
+with a bounded lifetime: it is where lowering writes a mutable variable's
+`Mut(V, D)` history (`x := e` lowers via `let_bind_annotated`), and it exists only
+*until inference consumes it* — see [The binder slot, and why annotations do not
+outlive inference](#the-binder-slot-and-why-annotations-do-not-outlive-inference).
+A walk over the slot set must still cover it, because the passes that use
+`walk_type_slots` include ones that run before and during inference (`uniquify`,
+`subst`), and — because an erasure and its own post-condition share that walk — a
+slot the walk misses is a slot the check cannot report on.
 
 The claim is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
 stamps a distinct marker into every directly-carried `Type` in the AST and pins
@@ -742,6 +745,21 @@ Invariance has no MLsub-blessed polar story, so the two polarity-sensitive mecha
 * **Transparent read at joins** (`dissolve_read_feeds`): rule 2 covers a feed handle meeting a concrete consumer *directly*, but a read can also meet other contributions through a shared join variable (`x + 1` flows `Feed(Int)` and `Int` into the binop's `∀α.(α,α)→α`). At coalesce, a position carrying a `Feed`-kind `history_slot` **alongside** non-feed contributions dissolves the handle into its channel before the contribution count; a feed handle alone (or two handles merged) keeps its constructor. Feeding-then-scalar-reading still errors correctly: the dissolved channel is `Fun(?, T)`, which genuinely collides with a scalar.
 
 Freshening (`freshen_above`) is polarity-free and recurses through the payload like any position, so a generalized DI function (`λ𝑛 → let 𝑥 = Defer in …`) instantiates a fresh feed handle per use site — the "fresh defer per call" semantics.
+
+### The binder slot, and why annotations do not outlive inference
+
+A binder's `ty` records **the type the binder is bound at** — the type its references have. For an unannotated binder that is its initializer's type, but the two are not the same thing, and every binder position resolves the slot the same way: emit writes the type it bound the variable at, coalesce resolves it in place. `let` was once the exception, reconstructing its slot afterwards as a copy of the coalesced RHS type, and that is what made annotations look load-bearing after inference.
+
+Two annotated forms are where the initializer's type and the bound-at type diverge, in opposite directions:
+
+* A **deref-copy** `y : 𝑉 = 𝑥` off a mutable variable `𝑥` binds `y` at the value type `𝑉`, while its initializer is a *history*. Recording the initializer's type made `y` an alias of `𝑥` in the type system — so the second-class `Mut` discipline, which keys on types, then misfired on a variable the user declared immutable: `z = y` was rejected as an unannotated `Mut` alias, and `y += 1` was *accepted* as a write.
+* A **mutable variable introduction** `𝑥 : Mut(𝑉) := init` binds `𝑥` at the history `Mut(𝑉, 𝐷)`, while its initializer is a plain value. Recording the initializer's type left the mutable variable's own slot reading `𝑉`, so the transaction-mutable variable scan could not classify it from the slot.
+
+Both readers compensated by consulting `user_annotation`, which held the user's declaration and so happened to answer correctly. That is the proxy the slot's honesty removes, and removing it matters because **an annotation is a pre-inference input**: it is a raw type from lowering, never normalized and never coalesced. A pass that pattern-matches one is reading a shape from before inference ran. So `infer` **clears every annotation on success**, and both post-inference walls pin the emptiness (`debug_assert_annotations_cleared`) — an invariant worth checking rather than asserting, since a stale annotation is only *read* by whichever pass thinks to look, and a leak surfaces as a wrong answer somewhere else entirely.
+
+**Both the clearing and the check follow type slots, not just children.** An annotation does not only ride the expression tree: `groupby` stamps the relation tying its key parameter to its key function onto a node inside the cast target's *refinement predicate*, and a predicate hangs off a type slot, which no `walk_children` reaches. A walk over children alone therefore clears every annotation it can see and then certifies the tree clean while a live one sits in a type — the leak and the check blind in exactly the same place, which is why the check could not report it. Both walks compose `walk_type_slots` with `walk_refined_predicates`, so they cover the same ground inference does when it *reads* an annotation.
+
+Nothing has to outlive the annotation. The one fact a later pass used to need from it — *is this binder a mutable variable?* — is answered structurally instead: only `MutDecl` (a `:=` introduction) and a pass-by-reference `Lambda` param bind one, and a `Let` cannot, because `emit_let` reads through an initializer that is a mutable variable. That retired the `Mut` discipline's rule 3 along with the bit that stood in for the declaration (see `src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class (downward-only)").
 
 ### Flowing In: normalizing annotations
 

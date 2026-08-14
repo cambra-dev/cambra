@@ -409,6 +409,29 @@ fn rewrite(mut expr: Expr) -> Expr {
         };
         return expr;
     }
+    // A mutable variable introduction becomes an ordinary value binding. After
+    // elimination the mutable variable *is* its seed: every read and write in the body
+    // has been rewritten into the recurrence (inside a loop) or a shadowing
+    // advance (sequentially), so nothing is left that needs the mutable variable to be
+    // distinguishable from a `let`. `erase_mut` then strips the history off the
+    // binder slot.
+    //
+    // This is where the surface marker dies, and it is the whole reason the
+    // introduction is a node: recognizing it used to mean asking whether a `Let`
+    // carried a `Mut` annotation.
+    if let TypedExprNode::MutDecl {
+        binding,
+        init,
+        body,
+    } = expr.node
+    {
+        expr.node = TypedExprNode::Let {
+            binding,
+            bound_expr: Box::new(rewrite(*init)),
+            body: Box::new(rewrite(*body)),
+        };
+        return expr;
+    }
     // A bare `MutWrite` never reaches value position here: `flatten_spine`
     // (run first in `run`) commutes every mutable write onto the spine as a
     // direct `ExprStmt` effect, terminalizing a value-position write to
@@ -1608,13 +1631,13 @@ mod tests {
     use crate::ccl::BaseType;
     use crate::ccl::provenance::NodeId;
 
-    /// Whether any *binder annotation* still carries a mutable history.
+    /// Whether any *binder slot* still carries a mutable history.
     ///
     /// Deliberately independent of [`contains_mut_type`]: the post-condition and
     /// the erasure share one walk, so a slot that walk misses is a slot the
     /// post-condition cannot report. A guard has to enumerate the slot itself or
     /// it inherits the same blind spot.
-    fn binder_annotation_has_mut(expr: &Expr) -> bool {
+    fn binder_ty_has_mut(expr: &Expr) -> bool {
         fn ty_has_mut(ty: &Type) -> bool {
             matches!(
                 ty,
@@ -1625,36 +1648,30 @@ mod tests {
             ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
         }
         let mut found = false;
-        expr.walk_binders(|b| {
-            if let Some(ann) = &b.user_annotation {
-                found |= ty_has_mut(ann);
-            }
-        });
-        found || expr.any_child(binder_annotation_has_mut)
+        expr.walk_binders(|b| found |= ty_has_mut(&b.ty));
+        found || expr.any_child(binder_ty_has_mut)
     }
 
-    /// A mutable variable's history rides the binder's **annotation**, not its
-    /// `ty`: `x := e` lowers to `let_bind_annotated(.., Mut(V, _))`, and
-    /// `infer::api::binder_is_mut` reads the annotation as authoritative. So the
-    /// phase's erasure has to reach that slot.
+    /// A mutable variable's history rides the **binder's `ty`** — that is what a `MutDecl`
+    /// binder is bound at — so the phase's erasure has to reach that slot, not just
+    /// the node `ty` slots a bottom-up walk visits.
+    ///
+    /// Checked on the slot rather than argued from the walk: a binder `ty` is
+    /// unreachable by `walk_children`, which is exactly the shape of blind spot the
+    /// erasure could acquire silently.
     #[test]
-    fn phase_erases_mut_from_a_binder_annotation() {
-        let (mut tree, _, _) = direct_mirror_sum();
-        let TypedExprNode::Let { binding, .. } = &mut tree.node else {
-            panic!("fixture is a let");
-        };
-        binding.user_annotation = Some(Type::History {
-            value: Box::new(Type::Base(BaseType::Int)),
-            domain: Box::new(Type::Hole),
-            kind: HistoryKind::Overwrite,
-        });
-        assert!(binder_annotation_has_mut(&tree), "sanity: fixture has one");
+    fn phase_erases_mut_from_a_binder_ty() {
+        let (tree, _, _) = direct_mirror_sum();
+        assert!(
+            binder_ty_has_mut(&tree),
+            "sanity: the mutable variable introduction is bound at its history"
+        );
 
         let out = run(tree);
 
         assert!(
-            !binder_annotation_has_mut(&out),
-            "a history survived on a binder annotation: {}",
+            !binder_ty_has_mut(&out),
+            "a history survived on a binder slot: {}",
             symbolic(&out)
         );
     }
@@ -1708,7 +1725,21 @@ mod tests {
         stmt.ty = int.clone();
         let mut init = Expr::new(TypedExprNode::Lit(Lit::Int(0)));
         init.ty = int.clone();
-        let mut tree = Expr::let_bind(x.clone(), init, stmt);
+        // The accumulator is a mutable variable *introduction*, so it is a `MutDecl` bound
+        // at its history — the shape lowering produces. Building it as a plain
+        // `let` would drive the phase from a tree inference cannot emit
+        // (`debug_assert_no_mut_var_let`), and would leave the binder slot the
+        // erasure has to reach carrying no history at all.
+        let mut tree = Expr::mut_decl(
+            x.clone(),
+            Type::History {
+                value: Box::new(int.clone()),
+                domain: Box::new(Type::Hole),
+                kind: HistoryKind::Overwrite,
+            },
+            init,
+            stmt,
+        );
         tree.ty = int;
         (tree, x, i)
     }

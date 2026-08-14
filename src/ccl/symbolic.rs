@@ -236,6 +236,26 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Lowest, format!("{kind:?}({input_str})"))
         }
 
+        // `x := init` — the mutable variable introduction, rendered with the operator
+        // that produced it so it is distinguishable from a `let` at a glance.
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => {
+            let ty_str = if !matches!(binding.ty, Type::Hole | Type::Infer(_)) {
+                format!(" : {}", binding.ty)
+            } else {
+                String::new()
+            };
+            let init_str = fmt(init, Precedence::Lowest, opts);
+            let body_str = fmt(body, Precedence::Lowest, opts);
+            (
+                Precedence::Lowest,
+                format!("{}{ty_str} := {init_str}\nin {body_str}", binding.name),
+            )
+        }
+
         TypedExprNode::Let {
             binding,
             bound_expr: value,

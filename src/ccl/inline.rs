@@ -628,7 +628,7 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
     if demanded.is_empty() {
         return true;
     }
-    // A mutable variable mention at a value position is a *read*, so what the argument denotes is
+    // A mutable variable mention in a value position is a *read*, so what the argument denotes is
     // the value the mutable variable holds and the refinements it supplies are the ones on that
     // value type. The two sides are otherwise recorded at different levels: the deref
     // decides what the operand was *constrained* against, so the parameter holds the
@@ -1236,7 +1236,7 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    /// A **mutable variable** argument at a value position: the demanded refinement rides the
+    /// A **mutable variable** argument in a value position: the demanded refinement rides the
     /// value the mutable variable holds, not the handle stamped on the `Var`.
     ///
     /// `def id(v): v` called as `x := 5; id(x)` is the surface shape. The read derefs
