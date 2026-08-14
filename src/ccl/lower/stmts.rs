@@ -37,9 +37,9 @@ pub(super) fn lower_stmts_recovering(
         return None;
     }
     let outer_bindings = HashSet::new();
-    // Pre-register transactional registers and `Mut`-parameter `def`s in this
+    // Pre-register transactional mutable variables and `Mut`-parameter `def`s in this
     // (top-level) block before lowering right-to-left: a call site or a
-    // register-writing loop is lowered before the `:=` / `def` that precedes it
+    // variable-writing loop is lowered before the `:=` / `def` that precedes it
     // textually. (No transactional-registry snapshot here — the top level is the
     // outermost scope, so nothing to restore to.)
     pre_register_txn_decls(stmts, ctx);
@@ -182,11 +182,11 @@ pub(super) fn lower_stmts_inner(
 
     // A nested block is its own scope: snapshot *both* the transactional
     // registry and the `mut_param_fns` set so declarations local to this block —
-    // a `Mut(…, Txn)` register, or a `Mut`-param `def`'s curried call shape —
+    // a `Mut(…, Txn)` mutable variable, or a `Mut`-param `def`'s curried call shape —
     // revert on exit and do not leak into an enclosing or sibling scope.
     // Induction mutability carries no lowering-time registry (it is the
     // `Type::History` on the binding, checked post-inference). This block's
-    // `def`s still shadow outer same-named ones *within* the block (pre-register
+    // `def`s still shadow outer same-named ones *within* the block (pre-registration
     // overwrites them here; the restore reinstates the outer ones on exit).
     // Restored on both the success and error paths below.
     let snapshot = ctx.snapshot_transactional();
@@ -408,7 +408,7 @@ pub(super) fn lower_middle_stmt(
             }
             let (req_name, resp_name) = extract_http_serve_names(target)?;
             let (port, method, path) = extract_http_serve_args(value)?;
-            // Create and register the source now; the caller drains new_sources
+            // Create and mutable variable the source now; the caller drains new_sources
             // via take_new_sources() after lower_stmts returns, before type inference.
             let port_u16: u16 = port.parse().map_err(|_| {
                 LoweringError::unsupported(
@@ -527,7 +527,7 @@ pub(super) fn lower_middle_stmt(
             let name = extract_name_target(target, "mutable assignment")?;
             // A *bare* `x := e` (no annotation) to an already-live mutable variable is a
             // write / sequential re-bind, not a declaration: gate it like any
-            // mutable write. A transactional register written here (outside a
+            // mutable write. A transactional mutable variable written here (outside a
             // `with begin():` block) is rejected; an induction accumulator re-bind
             // passes (`check_mut_write_context` is a no-op for it). An
             // *annotated* `:=` is the introduction and needs no gate.
@@ -539,8 +539,8 @@ pub(super) fn lower_middle_stmt(
             // declaration: emit a `MutWrite` marker (mutability checked
             // post-inference; the unified phase turns it into a recurrence in a
             // loop or a shadowing advance at the top level). A transactional
-            // register write here was already rejected by
-            // `check_mut_write_context` above (a register write must sit inside
+            // mutable variable write here was already rejected by
+            // `check_mut_write_context` above (a mutable variable write must sit inside
             // a `with begin():` block).
             if annotation.is_none() {
                 let mut scope = outer_bindings.clone();
@@ -563,7 +563,7 @@ pub(super) fn lower_middle_stmt(
             // annotation to `(value type, transactional?)`:
             //   (none)             → induction accumulator, value type inferred
             //   `x: Mut(V) := e`   → induction accumulator at value type `V`
-            //   `x: Mut(V, Txn)`   → transactional register at value type `V`
+            //   `x: Mut(V, Txn)`   → transactional mutable variable at value type `V`
             //   `x: T := e`        → induction accumulator at value type `T`
             let (value_ty, is_txn) = match annotation {
                 None => (Type::Hole, false),
@@ -573,8 +573,8 @@ pub(super) fn lower_middle_stmt(
                 },
             };
             // Stamp the binding `Mut(V, D)` (so inference binds `x` at `Mut` and
-            // its references deref to `V`). `D = Txn` for a transactional register
-            // (fixed here, never inferred), which also registers `x` so its
+            // its references deref to `V`). `D = Txn` for a transactional mutable variable
+            // (fixed here, never inferred), which also mutable variables `x` so its
             // `with begin():` writes lower to `MutWrite` and its bare reads are
             // gated. An induction accumulator gets `D = Hole` and carries *no* lowering
             // registry — its mutability is this `Mut` type, checked
@@ -600,8 +600,8 @@ pub(super) fn lower_middle_stmt(
         // targets are supported; tuple-destructuring `(a, b) += …` is Unsupported.
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
-            // A `+=` to a transactional register outside a `with begin():` block
-            // is rejected here (a register write must commit inside a block);
+            // A `+=` to a transactional mutable variable outside a `with begin():` block
+            // is rejected here (a mutable variable write must commit inside a block);
             // otherwise it is a bare mutable write whose target-is-a-mutable check
             // runs post-inference.
             check_mut_write_context(&name, stmt.span, ctx)?;
@@ -790,22 +790,22 @@ pub(super) fn name_target_as_name(target: &Spanned<AssignTarget>) -> Option<&str
     }
 }
 
-/// Reject a `Mut(V, Txn)` **register** write that lands *outside* a `with
+/// Reject a `Mut(V, Txn)` **mutable variable** write that lands *outside* a `with
 /// begin():` block — the write-side mirror of the out-of-block read gate in
-/// [`super::lower_expr`]. A register's history is the commit order, so a bare
+/// [`super::lower_expr`]. A mutable variable's history is the commit order, so a bare
 /// write outside a block would become a plain sequential `let` shadow that
 /// silently hides every committed value from subsequent reads; require the
 /// write to sit inside a block.
 ///
 /// A name shadowed by an inner local binder is a genuine local (its α-unique
-/// binder wins), not the register, so it is never gated — mirroring the read
+/// binder wins), not the mutable variable, so it is never gated — mirroring the read
 /// gate's `is_shadowed` guard against the base-name registry.
 ///
 /// The dual case — an induction `Mut(V)` mutable variable written *inside* a block, which
 /// `transact_phase` would silently swallow — is rejected at the block-body write
 /// site in [`super::transactions::write_or_let`]; that check needs no induction
 /// registry, because inside a block the only legal `:=` / `+=` target is a
-/// transactional register.
+/// transactional mutable variable.
 pub(super) fn check_mut_write_context(
     name: &str,
     span: Span,
@@ -814,7 +814,7 @@ pub(super) fn check_mut_write_context(
     if ctx.is_shadowed(name) {
         return Ok(());
     }
-    if ctx.is_transactional_register(name) && !ctx.in_tx_body {
+    if ctx.is_transactional_mut_var(name) && !ctx.in_tx_body {
         return Err(LoweringError::unsupported(
             span,
             format!("write transactional variable `{name}` inside a `with begin():` block"),
@@ -829,7 +829,7 @@ pub(super) fn check_mut_write_context(
 /// - `Mut(V)` / `Mut(_)` → `(V, false)` — an induction-domain accumulator whose
 ///   sequencing domain is inferred from its writing loop (`Mut(_)` → `(Hole,
 ///   false)`, value type inferred).
-/// - `Mut(V, Txn)` → `(V, true)` — a transactional register over the commit
+/// - `Mut(V, Txn)` → `(V, true)` — a transactional mutable variable over the commit
 ///   order.
 ///
 /// `Txn` is the only explicit sequencing domain supported; any other second
@@ -871,16 +871,16 @@ pub(super) fn mut_annotation_parts(
     }
 }
 
-/// Pre-register every `x: Mut(V, Txn) := e` transactional-register introduction
+/// Pre-register every `x: Mut(V, Txn) := e` transactional-variable introduction
 /// (and every pass-by-reference-`Mut` `def`) in `stmts` with the lowering
 /// context.
 ///
 /// for-loop is lowered *before* the `:=` introduction that precedes it
-/// textually; pre-registering per block makes a transactional register visible
+/// textually; pre-registering per block makes a transactional mutable variable visible
 /// (for the read/write gate) when the loop that writes it inside a `with
 /// begin():` block is lowered. Induction accumulators carry no lowering registry —
 /// their mutability is the `Type::History` on the binding, checked post-inference —
-/// so only transactional registers and `Mut`-parameter `def`s are pre-registered
+/// so only transactional mutable variables and `Mut`-parameter `def`s are pre-registered
 /// here.
 ///
 /// The `Mut`-param `def` registration is per-name and **last definition wins**:
@@ -892,7 +892,7 @@ pub(super) fn mut_annotation_parts(
 pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) {
     for stmt in stmts {
         match &stmt.node {
-            // `x: Mut(V, Txn) := e` — a transactional-register introduction.
+            // `x: Mut(V, Txn) := e` — a transactional-variable introduction.
             // Register `x` so a following loop's `with begin(): x := …` write is
             // recognised as a commit and a bare read of `x` is gated. A bare
             // `:=`, `x: T := e`, or `x: Mut(V) := e` is an induction accumulator and is
@@ -916,7 +916,7 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
             // A `def` with a pass-by-reference `Mut` parameter is lowered and
             // applied curried. Blocks lower right-to-left, so a call site is
             // lowered *before* the `def` preceding it textually — pre-register
-            // the name here so [`lower_call`] picks the curried shape. Register
+            // the name here so [`lower_call`] picks the curried shape. Mutable variable
             // or unregister per the definition's mut-ness so the last `def` of a
             // name in the block wins (a non-`Mut` redefinition clears an earlier
             // `Mut` one, so its calls lower tupled).

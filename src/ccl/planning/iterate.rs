@@ -144,7 +144,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         }
         // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
         // iteration site (op-conversion compiles it with `input=None`), so wrap
-        // it; the `source` is a register read (`__reg.k`), not an iteration source,
+        // it; the `source` is a mutable variable read (`__reg.k`), not an iteration source,
         // and is left alone. A `Var` trigger is already iterate-wrapped at its
         // let-site, so `wrap_with_iterate`'s `is_iteration_bearing` check makes
         // this a no-op there; a raw `[unit]` singleton (the standalone terminal
@@ -188,7 +188,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
             wrap_with_iterate(argument);
         }
         // Each transaction writer's source is iterated internally by the
-        // register engine (`Recurse` for an induction accumulator); op-conversion
+        // mutable variable engine (`Recurse` for an induction accumulator); op-conversion
         // compiles it with `input=None`, so wrap it like a loop source.
         TypedExprNode::Transact { writers, .. } => {
             for w in writers.iter_mut() {
@@ -1029,7 +1029,7 @@ mod tests {
     #[test]
     fn test_insert_iterate_recurse_transact_wraps_writer_source() {
         use crate::ccl::{TransactKey, WriterSite};
-        // A `Transact` writer's `source` is iterated by the register engine at
+        // A `Transact` writer's `source` is iterated by the mutable variable engine at
         // runtime (op-conversion compiles it with `input=None`), so it must be
         // iterate-wrapped here — the same as a loop source was.
         let int = int_ty();

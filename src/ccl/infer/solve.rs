@@ -337,7 +337,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
     // transparent, and the value behind it may itself be refined, so peeling first
     // would compare a refined value's layer count (`{Int | __elem == 0}`, one layer)
     // against the handle's own (`Mut({Int | __elem == 0}, d)`, zero) and reject a pair
-    // that is in fact the same type. That is what made a register with a refined value
+    // that is in fact the same type. That is what made a mutable variable with a refined value
     // look like drift. The test is [`Type::is_handle`] rather than a bare `matches!`
     // for the same reason every other shape test peels: a refined handle is still a
     // handle, and a *handle-versus-its-read-view* pair is exactly the asymmetry this
@@ -1884,13 +1884,13 @@ mod tests {
     }
 
     /// A **handle reads through** before any layer is counted, and the two sides of
-    /// that read are legally at different depths: a register whose value is refined
+    /// that read are legally at different depths: a mutable variable whose value is refined
     /// agrees with the refined value itself. Counting first compares one layer against
-    /// the handle's own zero and calls the pair drift — which is what made a register
+    /// the handle's own zero and calls the pair drift — which is what made a mutable variable
     /// with a refined value look unsound.
     ///
     /// A refinement on the handle *itself* is looked through for the same reason every
-    /// other shape test looks through one: a refined register is still a register. The
+    /// other shape test looks through one: a refined mutable variable is still a mutable variable. The
     /// value behind it is still compared layer for layer, so real drift there is caught.
     #[cfg(debug_assertions)]
     #[test]
@@ -1898,7 +1898,7 @@ mod tests {
         use super::types_agree_modulo_unread;
         use crate::ccl::{HistoryKind, Refinement};
         let refined = refined_int(TypedExpr::lit(Lit::Int(8)));
-        let register = |value: Type| Type::History {
+        let mut_var = |value: Type| Type::History {
             value: Box::new(value),
             domain: Box::new(Type::Txn),
             kind: HistoryKind::Overwrite,
@@ -1909,13 +1909,13 @@ mod tests {
 
         for (read, now) in [
             // handle vs its read view: the refined value sits one layer deeper.
-            (register(refined.clone()), refined.clone()),
-            (refined.clone(), register(refined.clone())),
+            (mut_var(refined.clone()), refined.clone()),
+            (refined.clone(), mut_var(refined.clone())),
             // a claim on the handle is transparent, on either side.
-            (on_the_handle(register(refined.clone())), refined.clone()),
+            (on_the_handle(mut_var(refined.clone())), refined.clone()),
             (
-                on_the_handle(register(refined.clone())),
-                register(refined.clone()),
+                on_the_handle(mut_var(refined.clone())),
+                mut_var(refined.clone()),
             ),
         ] {
             assert!(
@@ -1927,12 +1927,12 @@ mod tests {
         // Drift *behind* the handle is still drift, and the two kinds still never
         // agree — reading through must not have relaxed either.
         assert!(!types_agree_modulo_unread(
-            &register(refined.clone()),
-            &register(Type::Base(BaseType::Int)),
+            &mut_var(refined.clone()),
+            &mut_var(Type::Base(BaseType::Int)),
             true
         ));
         assert!(!types_agree_modulo_unread(
-            &register(refined.clone()),
+            &mut_var(refined.clone()),
             &Type::History {
                 value: Box::new(refined),
                 domain: Box::new(Type::Txn),

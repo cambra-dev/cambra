@@ -778,7 +778,7 @@ pub(crate) fn refine_with(base: Type, predicate: &Expr) -> Type {
 /// whole crate. Consequently [`TypedExprNode::Feed`] / [`TypedExprNode::Define`]
 /// / [`TypedExprNode::MutWrite`] target names count as occurrences (they are
 /// *uses* of the handle / mutable variable), while a
-/// [`TypedExprNode::Transact`] register key does not (it is a field label).
+/// [`TypedExprNode::Transact`] mutable variable key does not (it is a field label).
 ///
 /// A [`Type::Refinement`] is a binding form too — it binds
 /// [`crate::ccl::REFINEMENT_BINDER`] (`__elem`) in its predicate — so occurrences
@@ -824,7 +824,7 @@ fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<Predi
     expr.walk_type_slots(|ty| in_type += count_free_in_type_with_visited(name, ty, visited));
     // The term spine is a fold over the shared scoping walk: a child whose
     // binder list mentions `name` is shadowed and contributes nothing;
-    // everything else recurses. Register-key labels (`KeyRef`) are not variable
+    // everything else recurses. Variable-key labels (`KeyRef`) are not variable
     // occurrences, so they do not count.
     let mut in_node = 0;
     for_each_scoped_item(expr, &mut |item| match item {

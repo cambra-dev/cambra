@@ -19,10 +19,10 @@ use crate::{
 /// introduction (`lower/stmts.rs :: mut_annotation_parts`).
 ///
 /// The sequencing domain is left inferred (`D = Hole` → a fresh variable,
-/// generalized per call site) even for a `Txn` register param: the call-site
+/// generalized per call site) even for a `Txn` mutable variable param: the call-site
 /// argument's `Mut(_, Txn)` type pins `D = Txn` by the invariant `(Mut, Mut)`
 /// edge, and leaving it open lets one `def bump(c: Mut(Int))` serve both an
-/// induction accumulator and a register. The transactional flag *is* returned
+/// induction accumulator and a mutable variable. The transactional flag *is* returned
 /// so the body's `with begin():` writes register as transactional at lowering
 /// time (the block-classification decision runs before inference).
 fn mut_param_history_type(param: &Param) -> Option<Result<(Type, bool), LoweringError>> {
@@ -228,7 +228,7 @@ pub(super) fn lower_lambda(
     // Mutability of a `Mut(…)`-annotated parameter is its *type* (stamped by
     // `uncurry_params`), checked post-inference — there is no induction registry
     // to mask here. But a plain parameter spelled like an outer transactional
-    // register is a genuine local, so SHADOW every parameter over the body
+    // mutable variable is a genuine local, so SHADOW every parameter over the body
     // (popped on exit) to skip the out-of-block read gate for it — mirroring how
     // `uniquify` threads its env stack so a shadowed name reverts to its outer
     // meaning. The shadow set is keyed by pre-uniquify base name.
@@ -298,7 +298,7 @@ pub(super) fn lower_function_body(
     // binding could reuse.
     //
     //  - A `Mut(_, Txn)`-annotated parameter is a pass-by-reference transactional
-    //    register: register it so a body `x := …` / `x += …` inside a `with
+    //    mutable variable: register it so a body `x := …` / `x += …` inside a `with
     //    begin():` block is classified as a commit (the cross-function writer
     //    `def transfer(src, dst: Mut(_, Txn), …)`), and a bare read of it is gated.
     //  - An induction `Mut(V)` parameter needs no registry — its mutability is
@@ -326,7 +326,7 @@ pub(super) fn lower_function_body(
     }
 
     // Shadow only the *non*-`Mut` parameters over the body: a plain param
-    // spelled like an outer transactional register is a genuine local, so the
+    // spelled like an outer transactional mutable variable is a genuine local, so the
     // out-of-block read gate must skip it. A `Mut` param is a mutable variable in its own
     // right, so it keeps its gate — reading a `Mut(_, Txn)` param outside a `with
     // begin():` block in the body is still an error.

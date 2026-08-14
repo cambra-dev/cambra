@@ -281,22 +281,22 @@ pub struct LoweringContext {
 
     /// Names declared **transactional** via a `Mut(V, Txn)` annotation. A write
     /// to such a variable is only legal inside
-    /// a `with begin():` block, and so is a *read*: a transactional register may
+    /// a `with begin():` block, and so is a *read*: a transactional mutable variable may
     /// be read only inside a `with begin():` block, which pins a
     /// snapshot-consistent view (a bare read outside one is rejected — the
     /// scope-aware read gate in [`lower_expr`], which skips a name a local binder
     /// shadows via `shadow_depth`).
     ///
     /// Base-name keyed, and used *only* at lowering time: it decides the `with
-    /// begin():` register-write shape (a `MutWrite` marker) and the out-of-block
-    /// read diagnostic. Downstream register *identity* — which registers
+    /// begin():` variable-write shape (a `MutWrite` marker) and the out-of-block
+    /// read diagnostic. Downstream mutable variable *identity* — which mutable variables
     /// `transact_phase` folds — is instead the `Mut(_, Txn)` type on the
-    /// α-unique binding (see [`crate::ccl::transact_phase::collect_txn_registers`]),
+    /// α-unique binding (see [`crate::ccl::transact_phase::collect_txn_mut_vars`]),
     /// so this set is no longer handed to the phase.
     pub(super) transactional_vars: HashSet<String>,
 
     /// Whether lowering is currently inside a `with begin():` transaction block.
-    /// Inside one, a bare read of a transactional register is a snapshot read (fine)
+    /// Inside one, a bare read of a transactional mutable variable is a snapshot read (fine)
     /// and an assignment to one is a `MutWrite`; outside one, a bare read is a
     /// lowering error (reads must happen inside a `with begin():` block). Nested
     /// transactions are rejected by checking this flag before entering a block.
@@ -305,9 +305,9 @@ pub struct LoweringContext {
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
     /// currently bind each name. The `transactional_vars` set is keyed by base
-    /// name, so a local variable merely *spelled* like a register would wrongly
+    /// name, so a local variable merely *spelled* like a mutable variable would wrongly
     /// trip the out-of-block read gate (`for x in xs: … x …`); a name
-    /// with a positive shadow depth is a genuine local, not the register, so the
+    /// with a positive shadow depth is a genuine local, not the mutable variable, so the
     /// gate skips it. Mirrors `uniquify`'s env stack — push a binder's spelling
     /// on entering its body scope, pop on exit (see [`LoweringContext::with_shadowed`]).
     pub(super) shadow_depth: HashMap<String, usize>,
@@ -528,7 +528,7 @@ impl LoweringContext {
     }
 
     /// Whether `name` was declared transactional via a `Mut(V, Txn)` annotation.
-    pub(super) fn is_transactional_register(&self, name: &str) -> bool {
+    pub(super) fn is_transactional_mut_var(&self, name: &str) -> bool {
         self.transactional_vars.contains(name)
     }
 
@@ -557,7 +557,7 @@ impl LoweringContext {
     /// name is popped before returning, including when `f` short-circuits with an
     /// error, so the map stays scope-accurate. Used at every binder-introduction
     /// site (loop targets, comprehension generators, lambda/`def` params) so a
-    /// local spelled like a transactional register shadows it inside its body.
+    /// local spelled like a transactional mutable variable shadows it inside its body.
     pub(super) fn with_shadowed<T>(
         &mut self,
         binders: impl IntoIterator<Item = String>,
@@ -580,7 +580,7 @@ impl LoweringContext {
     }
 
     /// Whether `name` is currently shadowed by an enclosing local binder — so a
-    /// reference to it denotes that local, not a like-named transactional register.
+    /// reference to it denotes that local, not a like-named transactional mutable variable.
     pub(super) fn is_shadowed(&self, name: &str) -> bool {
         self.shadow_depth.get(name).is_some_and(|&depth| depth > 0)
     }
@@ -666,17 +666,17 @@ fn lower_expr_inner(
         ChlExpr::Lit(lit) => lower_constant(lit),
         ChlExpr::Name(id) => {
             let name = id.as_str();
-            // A transactional register may be read only inside a `with begin():`
+            // A transactional mutable variable may be read only inside a `with begin():`
             // block, which pins a snapshot-consistent view (all txn reads in one
             // block observe one commit snapshot). Inside a transaction
             // (`in_tx_body`) a bare read is that snapshot and is fine; outside
             // one it is rejected with a hint to wrap the read in a block.
             //
             // `is_shadowed` guards the base-name registry against a false match:
-            // a loop/comprehension/lambda binder spelled like a register (`for
-            // x in xs: … x …`) is a genuine local, not the register, so
+            // a loop/comprehension/lambda binder spelled like a mutable variable (`for
+            // x in xs: … x …`) is a genuine local, not the mutable variable, so
             // it is not gated (its α-unique binder wins).
-            if ctx.is_transactional_register(name) && !ctx.in_tx_body && !ctx.is_shadowed(name) {
+            if ctx.is_transactional_mut_var(name) && !ctx.in_tx_body && !ctx.is_shadowed(name) {
                 return Err(LoweringError::unsupported(
                     expr.span,
                     format!("read transactional variable `{name}` inside a `with begin():` block"),

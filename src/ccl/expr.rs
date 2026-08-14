@@ -39,10 +39,10 @@ pub const F_FIRE_SUFFIX: &str = "__fire";
 // history bindings of the write-set keys (`write_targets`, so recognition can
 // recover the writer's `write_keys` without a per-key merge), and the writer's
 // verbatim `` {`commit{writes, to_<defer>*} | `abort} `` decision variant applied to
-// the register snapshot at that time (`decision`). Only `write_targets`/`decision`
+// the mutable variable snapshot at that time (`decision`). Only `write_targets`/`decision`
 // reach recognition; `time` records the commit clock for the model's honesty.
 /// The `time` field of a commit-record binding — the transaction's commit time
-/// `begin(r)`, at which the writer's register snapshots are read.
+/// `begin(r)`, at which the writer's mutable variable snapshots are read.
 pub const F_TIME: &str = "time";
 /// The `write_targets` field of a commit-record binding — a positional tuple of
 /// the write-set keys' history bindings (`write_targets.i` is the history of
@@ -50,10 +50,10 @@ pub const F_TIME: &str = "time";
 pub const F_WRITE_TARGETS: &str = "write_targets";
 /// The `decision` field of a commit-record binding — the writer's verbatim
 /// `` {`commit{writes, to_<defer>*} | `abort} `` decision variant, applied to the
-/// register snapshot at the commit time. Recognition lifts the writer body out of it.
+/// mutable variable snapshot at the commit time. Recognition lifts the writer body out of it.
 pub const F_DECISION: &str = "decision";
 /// The `write` field of a **per-key commit view** — the single value a site's
-/// commit proposes for one register key (`decision ▷ variant_project(`commit) ▷
+/// commit proposes for one mutable variable key (`decision ▷ variant_project(`commit) ▷
 /// .writes.i`, re-projected). A key's history binding searches the `⧺`-merged
 /// per-key views of every site writing it: `{time, write}` per *committing*
 /// transaction (the ``variant_project(`commit)`` eliminator drops `` `abort ``
@@ -329,16 +329,16 @@ pub enum TypedExprNode {
         payload: Box<TypedExpr>,
     },
 
-    /// A transactional register: a set of scalar-register **keys** sharing one
+    /// A transactional mutable variable: a set of scalar-variable **keys** sharing one
     /// sequencing domain, driven by concurrent **writers** that read the
-    /// shared registers and propose per-position writes.
+    /// shared mutable variables and propose per-position writes.
     ///
     /// The **domain-parameterized recurrence carrier**, born in
     /// [`crate::ccl::planning::plan_loops`] and consumed at operator
-    /// conversion. It denotes a pure value — the register **record** `{key:
+    /// conversion. It denotes a pure value — the mutable variable **record** `{key:
     /// ⟦key⟧}`, each field a key's history `Fun(domain, V)` — so a variable
     /// read is the record projection `__reg.key` (an `Apply` of `Proj(field)`
-    /// to the `__reg` binder). Serialization and the register↔writer cycle are
+    /// to the `__reg` binder). Serialization and the mutable variable↔writer cycle are
     /// the *operator's* runtime behaviour (a cyclic `FanOut`), not the node's
     /// denotation — exactly as the induction/commit store realizes the recurrence.
     ///
@@ -348,10 +348,10 @@ pub enum TypedExprNode {
     /// no-conflict dual of the commit store); [`Type::Txn`] → the concurrent
     /// commit operator (multiple writers, serialize + retry).
     Transact {
-        /// The register keys — one per scalar register sharing this carrier's
+        /// The mutable variable keys — one per scalar mutable variable sharing this carrier's
         /// sequencing domain. Each carries its position-0 `init` (the seed,
         /// evaluated once outside every writer's parameter scope). The node
-        /// denotes the register **record** `{key.field_key(): Fun(domain, V)}`; a
+        /// denotes the mutable variable **record** `{key.field_key(): Fun(domain, V)}`; a
         /// variable read is a projection `__reg.key`. A single-key carrier is
         /// the one-accumulator case.
         keys: Vec<TransactKey>,
@@ -386,7 +386,7 @@ pub enum TypedExprNode {
     /// stream, and feed output into one letrec, and operator conversion
     /// *recognizes patterns* in the group (a `get_prev_seq`-guarded
     /// self-cycle is a fold; a commit-record binding read through
-    /// `get_prev_txn` is a transactional register) to pick the engine.
+    /// `get_prev_txn` is a transactional mutable variable) to pick the engine.
     /// The induction `mut_elim` emits it for every mutation loop, and
     /// `transact_phase` emits it for every `Mut(V, Txn)` transaction block, both
     /// as causal groups. The group then travels — bodies point-freed — through
@@ -1010,7 +1010,7 @@ impl TypedExpr {
 
     /// `let binding = def in body`, typed as `body` — the pre-built-binding form
     /// of [`let_bind`](Self::let_bind), for passes that already hold a
-    /// [`TypedBinding`] (a synthesized register, a rebuilt spine slot).
+    /// [`TypedBinding`] (a synthesized mutable variable, a rebuilt spine slot).
     ///
     /// As with [`expr_stmt`](Self::expr_stmt), the node's type is its body's: a
     /// `let` evaluates to its continuation.
@@ -1769,32 +1769,32 @@ impl Default for TypedExpr {
     }
 }
 
-/// One key of a [`TypedExprNode::Transact`] — a single scalar register sharing
-/// the register's sequencing domain.
+/// One key of a [`TypedExprNode::Transact`] — a single scalar mutable variable sharing
+/// the mutable variable's sequencing domain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransactKey {
-    /// The key — the (α-uniquified) `Name` of the register. A read of the
-    /// variable projects [`Name::field_key`] of the register record (`__reg.k`).
+    /// The key — the (α-uniquified) `Name` of the mutable variable. A read of the
+    /// variable projects [`Name::field_key`] of the mutable variable record (`__reg.k`).
     pub name: Name,
     /// The position-0 initial value (the scalar seed), evaluated once outside
     /// every writer's scope. The key's history is `Fun(domain, V)`; a read is
     /// its latest value `V` (`final_or_default(history, init)`, defaulting to
-    /// `init` when the register ran zero positions).
+    /// `init` when the mutable variable ran zero positions).
     pub init: TypedExpr,
 }
 
 /// One writer of a [`TypedExprNode::Transact`] — loop-shaped, mirroring a
-/// mutation-loop accumulator arm but reading the *shared* registers rather than a
+/// mutation-loop accumulator arm but reading the *shared* mutable variables rather than a
 /// private accumulator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriterSite {
-    /// The writer's **read-set**: the register keys whose snapshot value the body
+    /// The writer's **read-set**: the mutable variable keys whose snapshot value the body
     /// reads, in body-parameter order. The body is fed `(snap_{k₀}, …,
     /// snap_{k_{r-1}}, item)` — each `read_keys[i]` bound as position `i` — so
-    /// an in-body read of a register variable resolves to its snapshot by lexical
+    /// an in-body read of a mutable variable resolves to its snapshot by lexical
     /// shadowing (the accumulator pattern, generalized to several keys).
     pub read_keys: Vec<Name>,
-    /// The writer's **write-set**: the register keys the body proposes new values
+    /// The writer's **write-set**: the mutable variable keys the body proposes new values
     /// for, in the order of the decision's `writes` tuple (`writes.i` is the
     /// new value for `write_keys[i]`).
     pub write_keys: Vec<Name>,
@@ -1802,7 +1802,7 @@ pub struct WriterSite {
     /// whose codomain elements are passed to [`Self::body`]. Sits *outside* the
     /// snapshot-parameter scope.
     pub source: TypedExpr,
-    /// The per-position decision — ``Fun(Tuple(snap…, item), {`commit{writes: Tuple(new…), to_<defer>*} | `abort})``: reads the register snapshot and returns
+    /// The per-position decision — ``Fun(Tuple(snap…, item), {`commit{writes: Tuple(new…), to_<defer>*} | `abort})``: reads the mutable variable snapshot and returns
     /// a grant/deny variant — `` `commit `` carries the (dense) per-key write set and
     /// any per-position `to_<defer>` feed taps; `` `abort `` is the whole-transaction
     /// deny (carry, no proposal). An induction (`mut`-loop) position `` `commit ``s

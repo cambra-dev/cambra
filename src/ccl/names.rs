@@ -213,12 +213,12 @@ impl Name {
         }
     }
 
-    /// A globally-distinct string key for this name, suitable as a **register
+    /// A globally-distinct string key for this name, suitable as a **mutable variable
     /// record field label** for a [`crate::ccl::TypedExprNode::Transact`] key.
     /// Unlike [`base`](Self::base) it folds the `uid` in, so two distinct
     /// binders sharing a spelling (e.g. accumulators in sibling loops) get
-    /// distinct keys. A variable read of a register key projects this field of
-    /// the register record (`__reg.field_key`).
+    /// distinct keys. A variable read of a mutable variable key projects this field of
+    /// the mutable variable record (`__reg.field_key`).
     pub fn field_key(&self) -> String {
         match self {
             Name::Raw(s) => s.clone(),

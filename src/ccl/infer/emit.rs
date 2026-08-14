@@ -204,32 +204,32 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             };
             // The written value flows into the mutable variable's *value* type, not
             // the `Mut` handle itself. (The `(_, Mut)` lenient coercion arm would
-            // deref anyway, but naming the register's value type says what a write
+            // deref anyway, but naming the mutable variable's value type says what a write
             // means — it updates `V`.)
-            let register_value = var_ty.as_register();
+            let mut_value = var_ty.mut_value_type();
             let value_ty = ctx.subexpr(value)?;
             let write_label = name.clone();
             // The written value flows in **verbatim**, as one contribution to the
-            // register's value type. A refinement is a fact about *a value*, and a
-            // register is not one value — it is the sequence its seed and every write
+            // mutable variable's value type. A refinement is a fact about *a value*, and a
+            // mutable variable is not one value — it is the sequence its seed and every write
             // produce — so its value type is the join over all of them, and the
             // lattice already *is* that join: every contribution is a lower bound of
-            // the register's value variable, and a positive-position read intersects
+            // the mutable variable's value variable, and a positive-position read intersects
             // refinement sets. A refinement therefore survives exactly when every
             // contribution establishes it, which is the rule, and nothing here has to
             // pre-emptively weaken a contribution to get it.
             //
-            // The target is **not** relaxed. When `name` is not a register at all
+            // The target is **not** relaxed. When `name` is not a mutable variable at all
             // (`x = 0; x += 1`) the constraint is skipped outright and
             // `check_mut_write_targets` owns the diagnosis — that is a
             // mutability-discipline error, and a type error raised here would
             // pre-empt it with a worse message. Relaxing the demand to buy that
-            // ordering instead would weaken a check that should hold: a register
+            // ordering instead would weaken a check that should hold: a mutable variable
             // annotated `Mut({Int | p})` genuinely does demand `{Int | p}` of its
             // writes. (That case has no surface syntax yet — a refinement is not
             // writable in a type annotation — so what a program can exercise today is
-            // the demand on an unrefined annotation and the skip on a non-register.)
-            if let Some(mut_val) = register_value {
+            // the demand on an unrefined annotation and the skip on a non-mutable one.)
+            if let Some(mut_val) = mut_value {
                 ctx.require_sub(&value_ty, mut_val, &|| {
                     format!("write to mutable variable `{write_label}`")
                 })?;
@@ -599,7 +599,7 @@ pub(super) fn emit_apply<C: Typing>(
     // A morphism's contravariant domain, left under-determined by the one-way
     // edges, is recovered structurally at coalesce
     // (`specialize_projection_domain` / `specialize_lambda_domain`).
-    // A mutable argument is a *contribution* to its register, not just a value
+    // A mutable argument is a *contribution* to its mutable variable, not just a value
     // flowing in — record that before the ordinary edges (below).
     contribute_pbr_writes(function, &fn_ty, &arg_ty, ctx)?;
     ctx.apply(&fn_ty, &arg_ty, argument, &|| "Apply".to_string())
@@ -628,17 +628,17 @@ fn require_single_obligation<C: Typing>(
     }
 }
 
-/// Passing a register to a `Mut(V)` parameter contributes `V` to the register's value
+/// Passing a mutable variable to a `Mut(V)` parameter contributes `V` to the mutable variable's value
 /// type, because that is what the call *means*: the callee may write any `V` here.
 ///
-/// Without this the contribution is simply missing, and the register's value type is
+/// Without this the contribution is simply missing, and the mutable variable's value type is
 /// left claiming whatever its lexically-visible writes agree on. The ordinary
 /// application edges cannot supply it: `Typing::apply` records `arg <: d` against a
 /// **fresh variable** `d`, so a `Mut` argument meets an `Infer` rather than the
 /// parameter's `Mut(V)` — and `(History, Infer)` is deliberately the *deref* arm, since
 /// a bare read like `cnt + 1` must read through the handle. The handle is dereffed, the
 /// invariance rule that would relate the two value types never runs, and `V` arrives
-/// only as an *upper* bound. So the register's value variable ends up with the seed as
+/// only as an *upper* bound. So the mutable variable's value variable ends up with the seed as
 /// its sole lower bound: `x := 0` passed to `Mut(Int)` typed as `{Int | __elem == 0}`,
 /// which the invariance check then rejected against the parameter.
 ///
@@ -646,7 +646,7 @@ fn require_single_obligation<C: Typing>(
 /// immediately-applied type ([`parameter_type`]) — otherwise only a call's *first*
 /// argument is ever seen.
 ///
-/// A register can only ever be the parameter itself, never nested inside one: rule 2 of
+/// A mutable variable can only ever be the parameter itself, never nested inside one: rule 2 of
 /// the mutability discipline (`check_no_nested_mut`) rejects a `Mut` at every position
 /// but a function domain's root, so there is no composite to walk into.
 ///
@@ -661,10 +661,10 @@ fn contribute_pbr_writes<C: Typing>(
     arg_ty: &Type,
     ctx: &mut C,
 ) -> Result<(), LocatedInferError> {
-    let Some(arg_value) = arg_ty.as_register() else {
+    let Some(arg_value) = arg_ty.mut_value_type() else {
         return Ok(());
     };
-    let Some(param_value) = parameter_type(function, fn_ty).and_then(Type::as_register) else {
+    let Some(param_value) = parameter_type(function, fn_ty).and_then(Type::mut_value_type) else {
         return Ok(());
     };
     ctx.require_sub(param_value, arg_value, &|| {
@@ -752,7 +752,7 @@ pub(super) fn emit_tuple<C: Typing>(
         // carrying `Mut` (rule 1 accepts it; the phase erases the type later) —
         // only the *composite type* is dereferenced, so a `Mut` never appears
         // nested in it. A non-`Mut` element is unchanged.
-        fields.insert(FieldKey::Index(i), deref_mut(&ctx.subexpr(e)?));
+        fields.insert(FieldKey::Index(i), read_through(&ctx.subexpr(e)?));
     }
     Ok(product(fields))
 }
@@ -768,7 +768,7 @@ pub(super) fn emit_record<C: Typing>(
         // takes the dereferenced type so no `Mut` appears in the record type.
         fields.insert(
             FieldKey::Name(SmolStr::from(n.as_str())),
-            deref_mut(&ctx.subexpr(e)?),
+            read_through(&ctx.subexpr(e)?),
         );
     }
     Ok(product(fields))
@@ -812,9 +812,9 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
 
 /// Deref a mutable variable reference to its value type. A no-op on every other
 /// type — a feed channel included, since reading one yields its whole stream
-/// rather than a scalar value ([`Type::as_register`]).
-fn deref_mut(ty: &Type) -> Type {
-    ty.as_register().unwrap_or(ty).clone()
+/// rather than a scalar value ([`Type::mut_value_type`]).
+fn read_through(ty: &Type) -> Type {
+    ty.mut_value_type().unwrap_or(ty).clone()
 }
 
 /// Type a `Feed { name, value }`: the fed value contributes one element to
@@ -840,7 +840,7 @@ pub(super) fn emit_feed<C: Typing>(
     // channel become `Fun` lower bounds that are *joined* (codomains lub'd),
     // not constrained against a demand, so an undereferenced `Mut(V, D)` would
     // collide with a plain-`V` feed to the same channel instead of dereffing.
-    let value_ty = deref_mut(&ctx.subexpr(value)?);
+    let value_ty = read_through(&ctx.subexpr(value)?);
     let contribution = fun(ctx.fresh(), value_ty);
     constrain_into_feed(target_ty, &contribution, label, ctx)
 }
@@ -1055,17 +1055,17 @@ pub(super) fn emit_let<C: Typing>(
         // so it falls through to the generic `Some(ann)` arm below (there is no
         // `Feed(…)` initializer surface today, but gating on `Overwrite` keeps this
         // arm honest rather than silently mis-typing a channel as a value).
-        Some(ann) if ann.as_register().is_some() => {
+        Some(ann) if ann.mut_value_type().is_some() => {
             let hist_ty = ctx.normalize(ann);
-            if let Some(value) = hist_ty.as_register()
+            if let Some(value) = hist_ty.mut_value_type()
                 && !matches!(value, Type::Hole)
             {
                 let value_ty = value.clone();
                 let label = binding.name.clone();
-                // The initializer is one contribution to the register's value type,
+                // The initializer is one contribution to the mutable variable's value type,
                 // not its definition (see the `MutWrite` arm), and it flows in
-                // verbatim: the join with the register's writes is what keeps `x := 0`
-                // from pinning the register to `{Int | __elem == 0}`. A register with
+                // verbatim: the join with the mutable variable's writes is what keeps `x := 0`
+                // from pinning the mutable variable to `{Int | __elem == 0}`. A mutable variable with
                 // *no* writes keeps its seed's refinement, and that is correct — it
                 // really does hold that value at every position.
                 ctx.require_sub(&bound_ty, &value_ty, &|| {
@@ -1208,7 +1208,7 @@ pub(super) fn emit_for<C: Typing>(
 
 /// Type a `Begin { body }` transaction-block marker: emit the per-transaction
 /// body chain and give the block itself type `Unit`. The block introduces no
-/// binder or scope — in-block register reads/writes/feeds are typed by their own
+/// binder or scope — in-block mutable variable reads/writes/feeds are typed by their own
 /// `Var`/`MutWrite`/`Feed` rules. Shared by Emit and Check via [`Typing`], like
 /// [`emit_for`].
 pub(super) fn emit_begin<C: Typing>(
@@ -1286,7 +1286,7 @@ pub(super) fn emit_list<C: Typing>(
     // appears in the list type. A list literal is a **data** function — its
     // domain is the index set, so a join with another collection may not narrow
     // it — see `src/ccl/design/type-inference.md`, "The domain join is a Σ".
-    Ok(Type::data_fun(Type::UIntRange(n), deref_mut(&first_ty)))
+    Ok(Type::data_fun(Type::UIntRange(n), read_through(&first_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified
@@ -1344,9 +1344,9 @@ pub(super) fn emit_case<C: Typing>(
     // them is deferred; see `coalesce`.)
     //
     // A `Mut` arm needs no special case: it derefs into the join like any other
-    // read, so a `Case` over two registers types as their *value*. The
+    // read, so a `Case` over two mutable variables types as their *value*. The
     // second-class discipline is unaffected — what it forbids is a selected
-    // register reaching a position that writes through it, and that rule reads
+    // mutable variable reaching a position that writes through it, and that rule reads
     // the argument *node*, not its type (mutability.md, "No aliasing: `Mut`
     // values are second-class (downward-only)").
     let result_ty = ctx.fresh();
@@ -1471,7 +1471,7 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 
 /// The per-position `to_<defer>` output fields a writer's decision carries beyond
 /// `writes`, read off the writer body's codomain — `(field, value_ty)`. Each
-/// becomes a virtual register-record key `to_<defer>: Fun(domain, value_ty)` (the
+/// becomes a virtual variable-record key `to_<defer>: Fun(domain, value_ty)` (the
 /// per-position feed output stream). The decision codomain is the variant
 /// `` {`commit{𝑃} | `abort} ``; the taps live inside the (dense) `commit` payload
 /// record `𝑃`, so peel `commit` and drop the `writes` field.
@@ -1498,9 +1498,9 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
         .collect()
 }
 
-/// Type one transaction writer against the register's per-key value types.
+/// Type one transaction writer against the mutable variable's per-key value types.
 ///
-/// `key_types` maps each register key to the type of one committed value. The body
+/// `key_types` maps each mutable variable key to the type of one committed value. The body
 /// is ``Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {`commit{writes:
 /// Tuple(new_{w₀}, …), to_<defer>*} | `abort})``, where snapshot position `i` is
 /// `read_keys[i]`'s value type and each `writes` entry `new_j <: write_keys[j]`'s
@@ -1518,7 +1518,7 @@ fn emit_transact_writer<C: Typing>(
     for rk in &writer.read_keys {
         let snap = key_types.get(rk).cloned().ok_or_else(|| {
             ctx.raise(InferError::Unsupported(format!(
-                "read key {rk} is not a register key"
+                "read key {rk} is not a mutable variable key"
             )))
         })?;
         snaps.push(snap);
@@ -1535,7 +1535,7 @@ fn emit_transact_writer<C: Typing>(
         let new = ctx.fresh();
         let bound = key_types.get(wk).cloned().ok_or_else(|| {
             ctx.raise(InferError::Unsupported(format!(
-                "write key {wk} is not a register key"
+                "write key {wk} is not a mutable variable key"
             )))
         })?;
         new_tys.push(new.clone());
@@ -1570,14 +1570,14 @@ fn emit_transact_writer<C: Typing>(
 
 /// Type a [`TypedExprNode::Transact`] (Check-pass rule).
 ///
-/// The node denotes the register **record** `{key: ⟦key⟧}` — each key's read type
-/// `Fun(domain, α)` (the value's history over the register's sequencing domain),
+/// The node denotes the mutable variable **record** `{key: ⟦key⟧}` — each key's read type
+/// `Fun(domain, α)` (the value's history over the mutable variable's sequencing domain),
 /// what a variable projection `__reg.key` yields; a read reduces it to the
 /// latest `α` via `final_or_default(history, init)`. The init is the position-0
 /// value, so it bounds the codomain `α` (`init <: α`), not the whole stream.
-/// There is no recurrence *fixpoint* over a step type — the register↔writer cycle
+/// There is no recurrence *fixpoint* over a step type — the mutable variable↔writer cycle
 /// is realized operationally at op-conversion — so no `σ <: α` constraint, just
-/// each writer's per-key register round-trip.
+/// each writer's per-key mutable variable round-trip.
 ///
 /// `Transact` is born by `planning::plan_loops` after inference, so this
 /// rule runs only in the Check pass; it never mints constraints that must
@@ -1594,14 +1594,14 @@ pub(super) fn emit_transact<C: Typing>(
     // bound) — the codomain of the key's history.
     let mut key_types: HashMap<Name, Type> = HashMap::with_capacity(keys.len());
     for k in keys.iter_mut() {
-        // The register-record field is the value's history `Fun(domain, α)` over
-        // the register's sequencing domain; `final_or_default` reads it back to the
+        // The variable-record field is the value's history `Fun(domain, α)` over
+        // the mutable variable's sequencing domain; `final_or_default` reads it back to the
         // latest `α`.
         let value_ty = ctx.fresh();
         let read_ty = fun(domain.clone(), value_ty.clone());
         let init_ty = ctx.subexpr(&mut k.init)?;
-        // The seed is one contribution to the register's value type, same as on the
-        // `MutWrite` path, and flows in verbatim. A transactional register's writes
+        // The seed is one contribution to the mutable variable's value type, same as on the
+        // `MutWrite` path, and flows in verbatim. A transactional mutable variable's writes
         // reach this variable too — each `with begin(): flag := True` is an ordinary
         // `MutWrite` against it — so `flag := False` written `True` joins to `Bool`
         // rather than claiming `False`.
@@ -1612,11 +1612,11 @@ pub(super) fn emit_transact<C: Typing>(
     for w in writers.iter_mut() {
         emit_transact_writer(w, &key_types, ctx)?;
         // A `to_<defer>` field on the writer's decision record becomes a
-        // virtual register key the consumer reads as `__reg.to_…`. Its stream
+        // virtual mutable variable key the consumer reads as `__reg.to_…`. Its stream
         // is **site-domained** — one tap value per iteration of *this
         // writer's* source (the channel unions channelize assembled reference
         // it at that type) — unlike the key histories, which live over the
-        // register's sequencing domain.
+        // mutable variable's sequencing domain.
         let site_dom = w.source.ty.domain().unwrap_or_else(|| domain.clone());
         for (field, value_ty) in writer_tap_fields(&w.body.ty) {
             fields.push((field, fun(site_dom.clone(), value_ty)));

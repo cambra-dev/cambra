@@ -628,8 +628,8 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
     if demanded.is_empty() {
         return true;
     }
-    // A register mention at a value operand is a *read*, so what the argument denotes is
-    // the value the register holds and the refinements it supplies are the ones on that
+    // A mutable variable mention at a value position is a *read*, so what the argument denotes is
+    // the value the mutable variable holds and the refinements it supplies are the ones on that
     // value type. The two sides are otherwise recorded at different levels: the deref
     // decides what the operand was *constrained* against, so the parameter holds the
     // value type, while the argument node keeps its `Mut` stamp — the handle has to
@@ -637,7 +637,7 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
     // against the parameter would ask a handle to entail a fact about a value. See
     // `src/ccl/design/mutability.md`, "`Mut` is a CCL type".
     let mut supplied = layers(arg_ty);
-    if let Some(value) = arg_ty.as_register() {
+    if let Some(value) = arg_ty.mut_value_type() {
         supplied.extend(layers(value));
     }
     demanded.iter().all(|d| supplied.contains(d))
@@ -1236,8 +1236,8 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    /// A **register** argument at a value operand: the demanded refinement rides the
-    /// value the register holds, not the handle stamped on the `Var`.
+    /// A **mutable variable** argument at a value position: the demanded refinement rides the
+    /// value the mutable variable holds, not the handle stamped on the `Var`.
     ///
     /// `def id(v): v` called as `x := 5; id(x)` is the surface shape. The read derefs
     /// the *constraint*, so the parameter acquires the dereferenced
@@ -1246,7 +1246,7 @@ mod tests {
     /// two sides therefore sit at different levels, and only reading through the handle
     /// compares them at the same one.
     #[test]
-    fn refined_outer_param_discharged_by_register_argument() {
+    fn refined_outer_param_discharged_by_mut_var_argument() {
         let int = Type::Base(BaseType::Int);
         let singleton = crate::ccl::infer::lit_singleton(&Lit::Int(5));
         let handle = Type::History {
@@ -1265,11 +1265,11 @@ mod tests {
         assert_eq!(inline_non_iterable_lambdas(expr), arg);
     }
 
-    /// Reading through the handle does not weaken the guard: a register whose *value*
+    /// Reading through the handle does not weaken the guard: a mutable variable whose *value*
     /// carries a different refinement than the parameter demands still asserts.
     #[test]
     #[should_panic(expected = "does not entail")]
-    fn register_argument_with_other_refinement_still_asserts() {
+    fn mut_var_argument_with_other_refinement_still_asserts() {
         let int = Type::Base(BaseType::Int);
         let demanded = crate::ccl::infer::lit_singleton(&Lit::Int(5));
         let handle = Type::History {

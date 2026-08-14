@@ -49,7 +49,7 @@ impl ExtractFinal {
         // live:
         //
         // - **Tiling shape.** A record/tuple value is `Scalar(Record)` coming from a
-        //   register history but `Record({_0: Scalar, …})` (struct-of-arrays) from a
+        //   mutable variable history but `Record({_0: Scalar, …})` (struct-of-arrays) from a
         //   literal. `get_impl` normalizes both through `scalar_tile_to_column_value`,
         //   so the structural tilings need not agree — only the value-spaces.
         // - **Width.** A tag `match`/conditional whose arms carry different tags

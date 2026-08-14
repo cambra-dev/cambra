@@ -78,7 +78,7 @@ impl UnionOperator {
             // `UnionProducer` can build (it concatenates like columns, or
             // materialises `Value` rows into a `Variants` column). So an arm's
             // tiling is admissible here exactly when its values fit in one column:
-            // a `Scalar`, or a `Record` of them — a compound register's arms are
+            // a `Scalar`, or a `Record` of them — a compound mutable variable's arms are
             // the latter, and disagree on *layout* rather than on type (a
             // constructed tuple arrives as a record of columns, the carried
             // snapshot as one column of record values), which is precisely what
@@ -188,7 +188,7 @@ fn flat_merge(tiles: Vec<Tile>, codomain_tiling: &Tiling) -> Tile {
         // (tuple/record) accumulator carries a struct-of-arrays `Tile::Record`
         // codomain; box it to a single record-valued column so each row extracts
         // as one `Value`. `scalar_tile_to_column_value` is identity on a scalar.
-        // A function-valued codomain (a collection-valued register) is out of
+        // A function-valued codomain (a collection-valued mutable variable) is out of
         // scope and would panic generically inside the helper — name the boundary.
         debug_assert!(
             matches!(codomain.as_ref(), Tile::Scalar(_) | Tile::Record(_)),

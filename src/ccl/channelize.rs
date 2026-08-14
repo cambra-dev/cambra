@@ -1847,7 +1847,7 @@ fn collection_union_type(feeds: &[Expr]) -> Type {
                     // contributions, so a refinement only survives if every one of them
                     // establishes it: `c << 1` and `c << 2` contribute
                     // `{Int | __elem == 1}` and `{Int | __elem == 2}` and the channel
-                    // is a plain `Int`. This is the register law (`emit`'s `MutWrite`
+                    // is a plain `Int`. This is the mutable variable law (`emit`'s `MutWrite`
                     // rule) for the append-kind history: a channel is not one value
                     // but the sequence its contributions produce.
                     Some(c) if c != &**codomain => {
@@ -2076,8 +2076,8 @@ fn extract_for_defer_impl(
                 // is bound (a generator body inlined out) needs it carried
                 // along; a channel that doesn't mention it must *not* be
                 // wrapped, or every channel drags in an unused binding — a whole
-                // register record, in the worst case (each `http_serve` reply re-emitting
-                // a register it never reads). The reference test is
+                // mutable variable record, in the worst case (each `http_serve` reply re-emitting
+                // a mutable variable it never reads). The reference test is
                 // `collect_free_vars` rather than `count_free` because the
                 // binding may be referenced only through a `user_annotation` /
                 // refinement predicate (a filter-feed guard); `collect_free_vars`

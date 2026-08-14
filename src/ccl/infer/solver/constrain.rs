@@ -1589,7 +1589,7 @@ mod tests {
         // Setup: α has upper Int. Then β <: α.
         //
         // Note: the solver's constrain_subtype rule, when both sides are
-        // variables, fires the Var-on-lhs branch first and registers
+        // variables, fires the Var-on-lhs branch first and mutable variables
         // rhs (α) directly in lhs (β)'s upper bounds. α's existing
         // uppers are NOT eagerly transferred to β — that transitive
         // chain (β <: Int) is recovered at simplification time by

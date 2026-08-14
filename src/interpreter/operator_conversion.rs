@@ -250,7 +250,7 @@ struct KeyReadInfo {
     /// `.writes.(index)` off the store body stream (`Induction` stores).
     index: usize,
     /// Whether the key's value carries forward across commit ticks that don't
-    /// write it (`commit` stores): `true` for a register (persistent value),
+    /// write it (`commit` stores): `true` for a mutable variable (persistent value),
     /// `false` for a reply tap (a per-commit event). See
     /// [`StoreValueStream::carry_forward`].
     carry_forward: bool,
@@ -288,7 +288,7 @@ pub struct OpConversionContext {
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
     /// Transactional stores in scope, keyed by their `__reg` binder. A
-    /// `let __reg = Transact{…}` builds the shared store once and registers
+    /// `let __reg = Transact{…}` builds the shared store once and mutable variables
     /// it here; each variable read `__reg.k` projects key `k` off the shared
     /// store fan (see [`StoreReadInfo`]). Names are α-unique, so a flat
     /// (unscoped) map suffices.
@@ -744,7 +744,7 @@ fn convert_impl_inner(
         // `transact_phase::rewrite_live_reads`. `AsOf` folds the raw `Tile::Store`
         // fan directly (via `store_current`), so no `StoreValueStream`
         // intermediary. Two source shapes:
-        //   - `__reg.k` (a bare register read) → a scalar `AsOf` sampling key `k`;
+        //   - `__reg.k` (a bare mutable variable read) → a scalar `AsOf` sampling key `k`;
         //   - `__reg` (the whole store) → a snapshot `AsOf` sampling every field
         //     of the reply's record type at one commit frontier (§I-c), which the
         //     reply then projects.
@@ -1399,7 +1399,7 @@ fn build_commit_store(
                 runtime_key,
                 value_extent: key_value_extent,
                 index: 0,            // unused for `commit` reads (keyed by `runtime_key`)
-                carry_forward: true, // register: value persists across commits
+                carry_forward: true, // mutable variable: value persists across commits
             },
         );
     }
@@ -1449,7 +1449,7 @@ fn build_commit_store(
         let body_input = BodyInputSource::new(buffer.clone(), read_extents, item_extent);
         let body_op = convert_impl(&w.body, Some(Box::new(body_input)), ctx)?;
         // A reply (`out << e`) rides this writer body as `to_<defer>` decision
-        // taps. Each commits as a write-only key (appended after the register write
+        // taps. Each commits as a write-only key (appended after the mutable variable write
         // keys), so the reply rides this transaction's commit and is read back as a
         // `Fun(Txn, V)` value-stream off the shared log. A tap takes no `init_op` —
         // it has no tick-0 value, so its stream starts at the first reply.
@@ -1551,7 +1551,7 @@ fn build_induction_store_single(
     let key_extent = Extent::Base(BaseType::String);
     let runtime_key = |n: &Name| Value::String(n.field_key().into());
 
-    // Each accumulator becomes a register key: its init op (the fold default, read
+    // Each accumulator becomes a mutable variable key: its init op (the fold default, read
     // once at subscribe) plus a dense-read entry carrying the init as the
     // leading-carry fold default.
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
@@ -1622,7 +1622,7 @@ fn build_induction_store_single(
     // the same shape a commit writer carries (see `build_commit_store`). Each tap
     // becomes a write-only changelog key (appended after the accumulator keys), so
     // its per-position value rides the committing change and is read back densely.
-    // A tap is a per-position event, not a carried register (`carry_forward:
+    // A tap is a per-position event, not a carried mutable variable (`carry_forward:
     // false`): it appears only at the position that fired it. Under a conditional
     // feed the decision also carries a `to_<defer>__fire` gate, which the producer
     // reads to omit a non-fired tap from the delta.
@@ -1672,7 +1672,7 @@ fn build_induction_store_single(
     })
 }
 
-/// Resolve an `as_of` live read's `source` — a bare register read `__reg.k`
+/// Resolve an `as_of` live read's `source` — a bare mutable variable read `__reg.k`
 /// off a registered commit store — to the raw store fan branch, its runtime key,
 /// and the key's value extent. `AsOf` folds the [`Tile::Store`] fan directly (via
 /// `store_current`), so the live-read path takes the fan + key rather than
@@ -1683,7 +1683,7 @@ fn as_of_store_source(
 ) -> Result<(Box<dyn TileOperator>, Value, Extent), ConversionError> {
     let bad = || {
         ConversionError::Unsupported(format!(
-            "as_of source must be a bare store register read `__reg.k`, got {:?}",
+            "as_of source must be a bare store mutable variable read `__reg.k`, got {:?}",
             source.node
         ))
     };
@@ -1701,11 +1701,11 @@ fn as_of_store_source(
     let key = info.keys.get(field).ok_or_else(|| {
         ConversionError::Unsupported(format!("as_of reads unknown store key {field}"))
     })?;
-    // A live cross-endpoint read samples a register (a persistent `Txn` value),
+    // A live cross-endpoint read samples a mutable variable (a persistent `Txn` value),
     // never a per-commit reply tap — the tap has no `keys` entry.
     debug_assert!(
         matches!(info.kind, StoreReadKind::Commit),
-        "as_of live read must sample a commit-store register"
+        "as_of live read must sample a commit-store mutable variable"
     );
     let runtime_key = key.runtime_key.clone();
     let value_extent = key.value_extent.clone();
@@ -1779,7 +1779,7 @@ fn convert_store_read(
     match (kind, key) {
         // A `Txn` store key: the raw commit history `Fun(Txn, V)` as a
         // [`StoreValueStream`] over the commit-log map, keyed by `runtime_key`.
-        // A register carries forward; a reply tap emits only at its write tick.
+        // A mutable variable carries forward; a reply tap emits only at its write tick.
         // `transact_phase` wraps a read in `final_or_default(stream, init)`, which
         // the `FinalOrDefault` arm compiles to `ExtractFinal` — not special-cased here.
         (StoreReadKind::Commit, Some((runtime_key, value_extent, _, carry_forward))) => {

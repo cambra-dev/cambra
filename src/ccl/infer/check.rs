@@ -268,7 +268,7 @@ impl Typing for CheckCtx {
         // when it destructures the same position, so Check and Emit agree at the
         // consistency wall; post-desugar/-erasure trees carry neither type.
         let mut peeled = t.peel_refinements();
-        while let Some(value) = peeled.as_register() {
+        while let Some(value) = peeled.mut_value_type() {
             peeled = value.peel_refinements();
         }
         if let Type::Fun {
@@ -494,7 +494,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // recorded on a `__txp.0 + 1`, say). Comparing modulo refinements here would
         // hide exactly that class of bug, and it is the one this check is best placed
         // to catch: every merge point in the pipeline — a `Case`'s arms, a list's
-        // elements, a register's seed and writes, a channel's contributions — joins,
+        // elements, a mutable variable's seed and writes, a channel's contributions — joins,
         // and the wall is what holds them to it.
         ctx.require_sub(&ty, &expr.ty, &|| format!("type of {label}"))?;
     }

@@ -716,7 +716,7 @@ impl Subst {
                     *name = to;
                 }
             }
-            // A register key is a field label, not a variable occurrence:
+            // A mutable variable key is a field label, not a variable occurrence:
             // nothing a term substitution acts on.
             ScopedItemMut::KeyRef(_) => {}
         });
@@ -1200,7 +1200,7 @@ fn collect_expr_fv(
                 out.insert(n.clone());
             }
         }
-        // A register key is a field label, not a variable occurrence.
+        // A mutable variable key is a field label, not a variable occurrence.
         ScopedItem::KeyRef(_) => {}
         ScopedItem::Child {
             expr: child,

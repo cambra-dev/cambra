@@ -386,22 +386,22 @@ fn a_concrete_operand_reaches_its_obligation(#[case] code: &str) {
     infer_and_check(code);
 }
 
-// The value type of a register, ignoring the sequencing domain — an `Infer` until the
+// The value type of a mutable variable, ignoring the sequencing domain — an `Infer` until the
 // mutability-elimination phases resolve it, so it cannot be asserted on here.
-fn register_value_type(code: &str) -> Type {
+fn mut_var_value_type(code: &str) -> Type {
     match infer_program(code) {
         Type::History { value, .. } => *value,
-        other => panic!("expected a register type for `{code}`, got {other}"),
+        other => panic!("expected a mutable variable type for `{code}`, got {other}"),
     }
 }
 
-// A register that reads itself in its own write is a **cycle**: `value(x)` is defined
+// A mutable variable that reads itself in its own write is a **cycle**: `value(x)` is defined
 // by an equation mentioning `value(x)`. These pin that an operator inside one still
 // gets a type — and, more precisely, *why* it needs no cycle machinery to do so.
 //
 // Narrowing consumes a bound at the moment it is recorded, not a resolved type, so an
 // obligation never enters the recurrence at all. The base it needs is on the
-// register's **seed**, which is an ordinary lower bound of the value variable and
+// mutable variable's **seed**, which is an ordinary lower bound of the value variable and
 // reaches the operand positions like any other. That holds even when *both* operands
 // are the cycle (`x := x * x`), where a rule that resolved its operands would have
 // nothing to work from.
@@ -409,7 +409,7 @@ fn register_value_type(code: &str) -> Type {
 // The loop-carried accumulator is covered end-to-end in
 // `compilation_pipeline::mutability`; these are the harder shapes no test reached —
 // both operands cyclic, a cycle crossing a call boundary, mutual recursion between
-// registers, and a non-`Int` base.
+// mutable variables, and a non-`Int` base.
 #[rstest]
 // One cyclic operand, the shape every accumulator has.
 #[case::self_add(indoc! {r#"
@@ -457,7 +457,7 @@ fn register_value_type(code: &str) -> Type {
     x := f(f(x))
     x
 "#}, "Int")]
-// Two registers each defined in terms of the other: the cycle spans two equations.
+// Two mutable variables each defined in terms of the other: the cycle spans two equations.
 #[case::mutual(indoc! {r#"
     x := 0
     y := 0
@@ -492,8 +492,8 @@ fn register_value_type(code: &str) -> Type {
     x := x + 1 if x == 0 else x - 1
     x
 "#}, "Int")]
-fn a_register_that_reads_itself_still_gets_a_type(#[case] code: &str, #[case] base: &str) {
-    assert_eq!(register_value_type(code).to_string(), base);
+fn a_mut_var_that_reads_itself_still_gets_a_type(#[case] code: &str, #[case] base: &str) {
+    assert_eq!(mut_var_value_type(code).to_string(), base);
 }
 
 /// A cycle must not hide a conflict: the seed and the write have to agree, and the
@@ -663,7 +663,7 @@ fn a_never_called_function_whose_conflict_is_only_a_trait_conflict_is_not_reache
 ///
 /// The cases are the constructs whose types a live use-site pin would normally
 /// settle — a collection parameter's element type and domain, a comprehension's
-/// arrow kind, an induction accumulator, a generator's feed, a mutable register —
+/// arrow kind, an induction accumulator, a generator's feed, a mutable variable —
 /// each of which must resolve to *under-determined*, not to a conflict, when
 /// nothing calls the definition.
 #[rstest]
@@ -740,7 +740,7 @@ fn a_never_called_function_over_a_source_is_typechecked(
 }
 
 /// Deadness is the absence of a *demand*, not of a specialization: a use can be
-/// reached and still register nothing. Registering nothing is what the memo records,
+/// reached and still mutable variable nothing. Registering nothing is what the memo records,
 /// so reading deadness off the memo walks the definition of a binding that is very
 /// much used — reporting its body's defect a second time, from its own nodes.
 ///

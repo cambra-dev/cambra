@@ -37,7 +37,7 @@
 //! ([`crate::ccl::letrec::check_letrec_causal`]).
 //!
 //! `Transact` is recognition's **output** carrier, born post-elim and spanning
-//! recognition → planning → op-conversion: it separates the register's *keys*
+//! recognition → planning → op-conversion: it separates the mutable variable's *keys*
 //! (each with its `init`) from the *writer body*, which is what lets `planning`
 //! iterate-wrap the writer source and op-conversion build the engine. (Retiring
 //! the node entirely would mean teaching planning's iteration staging to find
@@ -612,15 +612,15 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
 fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
     // Every reference to an accumulator is either in the loop (a read-your-writes
     // read) or downstream of it (the trailing final read), so these two trees
-    // carry every `Mut(V, D)` this loop's registers have.
-    let reg_vtys = register_value_tys([&loop_body, &cont]);
+    // carry every `Mut(V, D)` this loop's mutable variables have.
+    let reg_vtys = mut_var_value_tys([&loop_body, &cont]);
     // Accumulators in first-write order, with their value types.
     let mut accs: Vec<(Name, Type)> = Vec::new();
     collect_writes(&loop_body, &reg_vtys, &mut accs);
     if accs.is_empty() {
         // A loop with no accumulator. If its body feeds — a stateless generator,
         // or a `with begin():` read-only transaction (`for r in iter: with
-        // begin(): out << balance` reads a register and feeds it, writing nothing) —
+        // begin(): out << balance` reads a mutable variable and feeds it, writing nothing) —
         // it's the design's "plain map" path: each in-block feed becomes an
         // ordinary map of the loop source. Otherwise the body inlined to neither
         // a write nor a feed (a `for x: pure_call()` whose call didn't mutate) —
@@ -632,7 +632,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
             // plain-map hoist below (`transform_feed_only_loop`) only handles
             // straight-line feeds, so re-emit a conditional-feed loop as a generator
             // `iter ≫ (λ target → body)` `Compose` for `channelize` to fan out,
-            // rather than flattening it here. (A register read in the feed value stays
+            // rather than flattening it here. (A mutable variable read in the feed value stays
             // in the arm value; `rewrite_live_reads` handles it post-channelize, as
             // for the straight-line read-only reply.)
             if body_has_statement_case(&loop_body) {
@@ -743,8 +743,8 @@ impl InductionFold {
 /// See [`InductionFold`]. Caller must guard on a non-empty accumulator set
 /// (an accumulator-free loop is a feed-only/no-op loop, handled separately).
 ///
-/// `reg_vtys` supplies each accumulator's value type ([`register_value_tys`]);
-/// the caller builds it over the widest tree it holds, so that a register read
+/// `reg_vtys` supplies each accumulator's value type ([`mut_var_value_tys`]);
+/// the caller builds it over the widest tree it holds, so that a mutable variable read
 /// only *downstream* of the loop still contributes its `Mut(V, D)`.
 pub(crate) fn fold_induction_loop(
     target: &TypedBinding,
@@ -924,11 +924,11 @@ pub(crate) fn fold_induction_loop(
 /// for `channelize` to route as an ordinary channel contribution. There is
 /// no history binding and no letrec.
 ///
-/// When `value` is a read of a transactional register (a `Var` `transact_phase`
+/// When `value` is a read of a transactional mutable variable (a `Var` `transact_phase`
 /// rebound to `final_or_default(__reg.k, init)`, constant in `target`), the map
-/// broadcasts the register's terminal render to every loop position;
+/// broadcasts the mutable variable's terminal render to every loop position;
 /// `transact_phase::rewrite_live_reads` (post-`channelize`, pre-lambda-elim)
-/// then turns that broadcast over a live (non-enumerable `Txn`) register into an
+/// then turns that broadcast over a live (non-enumerable `Txn`) mutable variable into an
 /// outer-indexed as-of join — the request-loop-indexed live cross-endpoint read.
 fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
     let (domain_ty, _item_ty) = fun_parts(&iter.ty);
@@ -993,42 +993,29 @@ fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<
     }
 }
 
-/// The value type `V` of every mutable register referenced anywhere in `roots`.
+/// The value type `V` of every mutable variable referenced anywhere in `roots`.
 ///
-/// A register's `V` is the **join** over its seed and all of its writes, and
+/// A mutable variable's `V` is the **join** over its seed and all of its writes, and
 /// inference has already computed it: it is the `V` of the `Mut(V, D)` that each
-/// *reference* to the register carries. (The mutability rides reference types
+/// *reference* to the mutable variable carries. (The mutability rides reference types
 /// rather than the binding slot — see [`emit_let`](crate::ccl::infer)'s `Mut`
 /// arm — so the seed binding records only the seed's own type.) Reading it here
-/// is what keeps this phase's view of a register identical to the one the
+/// is what keeps this phase's view of a mutable variable identical to the one the
 /// `Transact` rule derives, instead of each rebuilding a value type from
 /// whichever single contribution it happens to hold.
 ///
 /// Binders are α-unique by this point (`uniquify` runs before inference), so one
-/// map over the whole tree cannot conflate two registers.
-pub(crate) fn register_value_tys<'a>(
+/// map over the whole tree cannot conflate two mutable variables.
+pub(crate) fn mut_var_value_tys<'a>(
     roots: impl IntoIterator<Item = &'a Expr>,
 ) -> HashMap<Name, Type> {
-    /// The register value a reference type denotes, if it is a register at all.
-    /// A mutable variable is never wrapped in anything but `Refinement` before
-    /// this phase, and only an *overwrite* history is a register — a `Feed`
-    /// channel reads as its whole stream rather than as a value.
-    fn as_register_value(mut ty: &Type) -> Option<&Type> {
-        while let Type::Refinement(inner, _) = ty {
-            ty = inner;
-        }
-        match ty {
-            Type::History {
-                value,
-                kind: HistoryKind::Overwrite,
-                ..
-            } => Some(value),
-            _ => None,
-        }
-    }
     fn walk(e: &Expr, out: &mut HashMap<Name, Type>) {
+        // A mutable variable is never wrapped in anything but `Refinement` before this
+        // phase, and only an *overwrite* history is one — a `Feed` channel reads as its
+        // whole stream rather than as a value, which is why `mut_value_type` and not
+        // `is_handle` is the test.
         if let TypedExprNode::Var(name) = &e.node
-            && let Some(value) = as_register_value(&e.ty)
+            && let Some(value) = e.ty.mut_value_type()
         {
             out.insert(name.clone(), value.clone());
         }
@@ -1042,13 +1029,13 @@ pub(crate) fn register_value_tys<'a>(
 }
 
 /// Collect `MutWrite` targets in first-write order with their value types, taken
-/// from `reg_vtys` — the join inference recorded on the register's `Mut(V, D)`.
+/// from `reg_vtys` — the join inference recorded on the mutable variable's `Mut(V, D)`.
 ///
-/// A register with no entry is one no reference types as a `Mut`: either nothing
+/// A mutable variable with no entry is one no reference types as a `Mut`: either nothing
 /// reads it (only writes mention it, so its value type is unobservable), or the
 /// tree records reads at the deref'd value directly, as the phase's own
 /// hand-built test trees do. The written type then stands in, **stripped** — a
-/// register takes no refinement from any single contribution, and an unstripped
+/// mutable variable takes no refinement from any single contribution, and an unstripped
 /// one would be a refinement acquired by erasure rather than by `cast`
 /// (`src/ccl/design/type-inference.md`, "Refinements on the lattice").
 fn collect_writes(expr: &Expr, reg_vtys: &HashMap<Name, Type>, out: &mut Vec<(Name, Type)>) {
@@ -1747,7 +1734,7 @@ mod tests {
     /// carrier: `let __reg = transact (x = x) { [x]⇒[x] over … do λ __p → …
     /// `commit(⟨writes: (x)⟩) | `abort } in (__reg.x, x) ▷ final_or_default``, with
     /// the key `init` read from the pre-loop binding and each accumulator read
-    /// rewritten to a register-record projection.
+    /// rewritten to a variable-record projection.
     #[test]
     fn recognition_builds_the_transact_carrier() {
         let (tree, _, _) = direct_mirror_sum();
@@ -1770,7 +1757,7 @@ mod tests {
         );
         assert!(
             s.contains("__reg.") && s.contains("final_or_default"),
-            "trailing read must project the register record and reduce it: {s}"
+            "trailing read must project the mutable variable record and reduce it: {s}"
         );
     }
 

@@ -203,20 +203,20 @@ TODOs for implementing hash joins:
 
 ## The commit operator (`interpreter/commit_operator.rs`)
 
-The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key register, and the operator serializes them onto one monotonic `CommitTs` clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
+The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic `CommitTs` clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
 
 - **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ (Key ⇀ Value)`, held as per-tick write-set deltas with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
 - **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
 - **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per `with begin():` site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, feeds `(snap…, item)` to the decision body, and — keyed on `(item, frontier)`, so a retry is idempotent — appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
 - **`BodyInputSource` / `BodyInputSourceProducer`** — serves the writer body its `(snapshot…, item)` input. **Release-aware**: the body fans this source through `FanOut`/`Memo`, which pull it repeatedly per round, so it emits only positions past its released cursor — re-emitting a released position would make the `Memo`'s append-merge duplicate a domain position (an invalid tile). Delta-producing, like the induction body's `fan_in` input.
-- **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream `CommitTs ⇀ V` out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `SealedFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes register carry (`carry_forward: true`).
-- **`AsOf` / `AsOfProducer`** — the **as-of (temporal) join**, the cross-endpoint read. Given a `trigger` stream (the positions to sample at, e.g. an HTTP request stream) and the store, it latches the store's current value for each trigger position the first time that position is observed — indexed by the *trigger*, not the commit clock. Reading several registers latches them all from one store render, so a multi-register read is one snapshot. The dual of the changelog store's own drive: the store latches a private accumulator per *source* step, `AsOf` latches the store per *trigger* step.
+- **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream `CommitTs ⇀ V` out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `SealedFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).
+- **`AsOf` / `AsOfProducer`** — the **as-of (temporal) join**, the cross-endpoint read. Given a `trigger` stream (the positions to sample at, e.g. an HTTP request stream) and the store, it latches the store's current value for each trigger position the first time that position is observed — indexed by the *trigger*, not the commit clock. Reading several mutable variables latches them all from one store render, so a multi-variable read is one snapshot. The dual of the changelog store's own drive: the store latches a private accumulator per *source* step, `AsOf` latches the store per *trigger* step.
 
 A single-writer induction store is the degenerate no-conflict case of this same contract, which is why one `Transact` carrier serves both engines.
 
 ### The store is a changelog, not a function
 
-`CommitOperator`'s output is a [`Tile::Store`], not a `SealedFunction`: each tick carries only *that tick's* write-set delta, and a tick absent from the changelog is **decided-absent** — its value holds from the latest earlier change. Consumers must therefore **fold** the store (`store_current` / `store_value_at`), never index it. That is what makes a register readable while its store is still live: the current value is defined at the decided frontier, with no need for the history to end. Terminality is a flag separate from the frontier watermark, so a terminal store with trailing carries is not undercounted.
+`CommitOperator`'s output is a [`Tile::Store`], not a `SealedFunction`: each tick carries only *that tick's* write-set delta, and a tick absent from the changelog is **decided-absent** — its value holds from the latest earlier change. Consumers must therefore **fold** the store (`store_current` / `store_value_at`), never index it. That is what makes a mutable variable readable while its store is still live: the current value is defined at the decided frontier, with no need for the history to end. Terminality is a flag separate from the frontier watermark, so a terminal store with trailing carries is not undercounted.
 
 ### The decision record
 
@@ -226,9 +226,9 @@ A writer body returns one **decision variant** per transaction, `` {`commit{𝑃
 
 A writer processes **one source item per pull** and re-arms itself on the scheduler's deferred-wakeup queue whenever an item remains, returning non-terminal — the same one-step-per-pull idiom the induction and commit stores share. That single re-arm covers every continuation uniformly: a **commit** (the commit-ack `release` advances it, so the next pull takes the next item), a **deny** (it advances locally with no commit — invisible in the store frontier, which a frontier-growth signal alone would miss), and a **not-ready** decision (it does not advance, and reuses the pending body-input row). It is the *writer's* re-arm, not any reader's, that converges the store: the wakeup fans through the cyclic `FanOut` to re-pull the `AsOf` / `StoreValueStream` readers as commits land, so no reader drives a store to fixpoint. A writer **drained but live** does not re-arm, so an idle live server does not busy-poll — a future arrival wakes it through its source-forwarding consumer.
 
-### Every fed-out register read is an as-of sample
+### Every fed-out mutable variable read is an as-of sample
 
-A register read outside its block compiles to `AsOf` (born in `transact_phase::rewrite_live_reads`) — a sample at an **arbitrary** position in the commit order — whatever the reading trigger's domain: a live `DataSource` request stream, a finite loop, or a standalone read's synthesized singleton. There is no static finiteness classification anywhere on this path; the read folds to `AsOf` purely because its history domain is `Type::Txn`. There is likewise **no terminal/"final" register read**: no term requests the store's final value (a future `await_final` would), so nothing routes a register read to `ExtractFinal`, which reduces only genuinely-terminating histories (a post-loop induction accumulator, a broadcast source). A trailing standalone read that observes the drained store did so by scheduling, not by promise. `AsOf` itself stays non-terminal until the store is terminal *and* every live trigger position is latched, so it cannot report "done" while a store no other consumer drives is still committing.
+A mutable variable read outside its block compiles to `AsOf` (born in `transact_phase::rewrite_live_reads`) — a sample at an **arbitrary** position in the commit order — whatever the reading trigger's domain: a live `DataSource` request stream, a finite loop, or a standalone read's synthesized singleton. There is no static finiteness classification anywhere on this path; the read folds to `AsOf` purely because its history domain is `Type::Txn`. There is likewise **no terminal/"final" mutable variable read**: no term requests the store's final value (a future `await_final` would), so nothing routes a mutable variable read to `ExtractFinal`, which reduces only genuinely-terminating histories (a post-loop induction accumulator, a broadcast source). A trailing standalone read that observes the drained store did so by scheduling, not by promise. `AsOf` itself stays non-terminal until the store is terminal *and* every live trigger position is latched, so it cannot report "done" while a store no other consumer drives is still committing.
 
 ### Bounding a long-lived store
 
@@ -400,17 +400,17 @@ folds a conditional write to one carry-complete writer (`writes = Case[ĝ → w;
 snapshot]`), so there is no multi-writer group and one realization serves every induction
 store.
 
-**Compound (tuple/record) accumulators.** A register holds one `Value`, so a tuple/record
+**Compound (tuple/record) accumulators.** A mutable variable holds one `Value`, so a tuple/record
 accumulator is stored *boxed* — a `Scalar(Record)` codomain (one column of record values) —
 while a tuple/record *literal* compiles to a struct-of-arrays `Record` tiling (a column per
-field). The two representations meet at the register boundaries and are reconciled there with
+field). The two representations meet at the mutable variable boundaries and are reconciled there with
 the existing `scalar_tile_to_column_value` (box: `Tile::Record` → `ColumnValue::Records`) and
 its inverse `column_value_to_tile` (unbox to a declared tiling shape): the `InductionStore`
 init seed (`read_initial_scalar`), the conditional-write decision merge (`flat_merge`), and
 the scalar-final read (`ExtractFinal`, which matches on *extent* not tiling shape). So a
 compound accumulator folds, reads-its-own-writes, carries, and conditionally writes like a
 scalar one. The **commit store** shares this: a `Mut[(int, int), Txn]` / `Mut[{x: int}, Txn]`
-transactional register threads through the same `read_initial_scalar` seed and value-Case
+transactional mutable variable threads through the same `read_initial_scalar` seed and value-Case
 decision merge, so unconditional, conditional (deny), `if`/`else`, record, and mixed
 scalar+compound multi-key stores all commit correctly. (Enabling the transactional form needed
 only the tuple/record *type annotation* syntax in `lower_type_annotation` — the store
@@ -461,7 +461,7 @@ an accumulator threaded into another store, e.g. `for r in …: cnt += 1; with b
 := store + cnt` — aligns by domain *value* via `fan_in`, so ordering is immaterial there;
 sorting is correct for both.) One reader serves both shapes, and a downstream release of loop
 positions is forwarded to the trigger so the source is reclaimed. Reading by fold rather
-than by indexed projection is what unifies induction reads with commit-register reads.
+than by indexed projection is what unifies induction reads with transactional-variable reads.
 
 Folding by position keeps the read independent of the store's own length — the positions
 come from the trigger, the values from the fold. And the trailing-carry undercount that

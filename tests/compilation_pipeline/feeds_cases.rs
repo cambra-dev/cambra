@@ -282,12 +282,12 @@ for i in [1, 2, 3]:
   fw(x, out)
 out"#, make_int_list(&[0, 1, 2]))]
 // The same writer with its parameters **swapped**, which is a different typing problem
-// rather than a different spelling. The register is now the second argument, and a call
+// rather than a different spelling. The mutable variable is now the second argument, and a call
 // is curried, so the applied function's type at that argument is the fresh variable
 // `apply` minted — the pass-by-reference contribution has to be read off the head of
 // the spine or it is never recorded, leaving `x` claiming its seed and failing the
 // invariance check against `Mut(Int)`.
-#[case::pbr_register_after_feed(
+#[case::pbr_mut_var_after_feed(
 r#"
 def fw(o: Feed(Int), c: Mut(Int)):
   o << c
@@ -384,7 +384,7 @@ o"#;
 /// `<<=` sets a channel's whole stream, so its RHS must be a collection
 /// (a `Fun`). A scalar RHS is rejected by typing — the discipline that keeps
 /// every feed history a genuine `domain ⇒ value` stream (scalar values belong
-/// in a plain `let` binding or a `:=` register, not a feed channel).
+/// in a plain `let` binding or a `:=` mutable variable, not a feed channel).
 #[rstest]
 #[timeout(Duration::from_secs(1))]
 fn scalar_define_into_defer_is_rejected() {
