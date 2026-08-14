@@ -197,15 +197,28 @@ fn blame_node_for_place(
             | Type::Txn => false,
         }
     }
+    /// The slots that make this node *itself* the place: its own type, an
+    /// annotation written on it, a cast's target. Deliberately **not** the
+    /// binder slots [`Expr::walk_type_slots`] also visits — a binder's type is
+    /// always mirrored either in the node's own type (a lambda's domain is its
+    /// type's domain) or in a child's (a `let` binder's type is the
+    /// definition's), so a binder slot never reaches a variable the walk would
+    /// otherwise miss. It only lets an enclosing node answer for a type its
+    /// child owns, which costs the span its precision: with the binder slot
+    /// counted, `f = \a -> …` shadows the `\a -> …` that actually carries the
+    /// conflicting requirements.
+    fn owns(e: &Expr, uid: crate::ccl::InferVarId) -> bool {
+        let own = mentions(&e.ty, uid);
+        let annotated = e.user_annotation.as_ref().is_some_and(|a| mentions(a, uid));
+        let cast = matches!(
+            &e.node,
+            crate::ccl::TypedExprNode::Cast { target, .. } if mentions(target, uid)
+        );
+        own || annotated || cast
+    }
     fn go(e: &Expr, uid: crate::ccl::InferVarId) -> Option<crate::ccl::provenance::NodeId> {
-        let mut hit = None;
-        e.walk_type_slots(|ty| {
-            if hit.is_none() && mentions(ty, uid) {
-                hit = Some(e.node_id());
-            }
-        });
-        if hit.is_some() {
-            return hit;
+        if owns(e, uid) {
+            return Some(e.node_id());
         }
         let mut found = None;
         e.walk_children(|child| {
