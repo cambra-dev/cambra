@@ -127,19 +127,24 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
 
     expr.walk_children_mut(insert_iterate_recurse);
     match &mut expr.node {
-        // `FinalOrDefault` takes `Tuple([stream, default])` — only `stream`
-        // is iterated; the `default` is a scalar consumed when the stream
-        // is empty.
+        // `FinalOrDefault`'s stream argument is the iteration site. Two argument
+        // shapes: `Tuple([stream, default])`, where only `stream` is iterated (the
+        // `default` is a scalar consumed when the stream is empty), and a **bare
+        // stream** for a source known total (an exhaustive tag partition), which is
+        // the whole argument.
         TypedExprNode::Apply { argument, function }
             if matches!(
                 &function.node,
                 TypedExprNode::Builtin(Builtin::FinalOrDefault)
             ) =>
         {
-            if let TypedExprNode::Tuple(elts) = &mut argument.node
-                && let Some(stream) = elts.first_mut()
-            {
-                wrap_with_iterate(stream);
+            match &mut argument.node {
+                TypedExprNode::Tuple(elts) => {
+                    if let Some(stream) = elts.first_mut() {
+                        wrap_with_iterate(stream);
+                    }
+                }
+                _ => wrap_with_iterate(argument),
             }
         }
         // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
@@ -1022,7 +1027,7 @@ mod tests {
         let int = int_ty();
         let mut expr =
             Expr::new(TypedExprNode::Copair(vec![list_123(), list_123()])).with_ty(fun_ty(
-                Type::Variant(vec![
+                Type::variant(vec![
                     (FieldKey::Index(0), Type::UIntRange(3)),
                     (FieldKey::Index(1), Type::UIntRange(3)),
                 ]),

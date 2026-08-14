@@ -76,16 +76,23 @@
 //! - Version dispatch across a branch point — no isolating program yet
 //!   (deferred with the still-open versioning surface).
 //!
-//! This pins the variant-tag lex failure on both files — the `` ` `` prefix on
-//! `` `some ``/`` `none `` (`docs/chl-spec.md`, "6.5 Variants") is not lexed,
-//! and it precedes the `match`-block indentation
-//! failure behind it.  When the tag lexes, the test goes red and the next
-//! blocker gets pinned.
+//! This pins a **layout** failure on both files.  The variant tags lex and parse
+//! now (`docs/chl-spec.md`, "3.15 Variant constructors"), so the first blocker is
+//! the one that was behind them, and it is not about variants at all: both
+//! handlers write a multi-line `if`/`else` **expression** whose `else:` sits at a
+//! shallower indent than the then-branch body it follows.  The off-side rule
+//! dedents to a level that was never opened, and the lexer reports inconsistent
+//! indentation at the `else:`.  The `match` in the branch is incidental — the
+//! same layout fails with any body, and a `match` under a consistently-indented
+//! `if`/`else` lexes fine.  What is missing is a continuation rule for a
+//! bracket-less multi-line expression: `docs/chl-spec.md`, "1.4 Implicit line
+//! continuation" covers only bracketed forms.  Behind it: everything listed
+//! above.
 
 use super::common::expect_compile_error;
 
 #[test]
 fn storefront_currently_blocked_at_lexing() {
-    expect_compile_error(include_str!("v0.cambra"), "invalid token");
-    expect_compile_error(include_str!("v1.cambra"), "invalid token");
+    expect_compile_error(include_str!("v0.cambra"), "inconsistent indentation");
+    expect_compile_error(include_str!("v1.cambra"), "inconsistent indentation");
 }

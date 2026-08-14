@@ -328,7 +328,7 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), L
             }
             Ok(())
         }
-        Type::Variant(tags) => {
+        Type::Variant(tags, _) => {
             for (_, t) in tags.iter_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
@@ -1249,7 +1249,31 @@ pub(super) fn emit_case<C: Typing>(
                 expected_tags.insert(FieldKey::Name(SmolStr::from(p.tag.as_str())), alpha);
             }
         }
-        let expected = variant_type(expected_tags);
+        // One constraint, always the same shape: the scrutinee flows into the arms'
+        // variant. That is what carries each tag's payload *into* its arm's binder
+        // slot `αᵢ` — the scrutinee is on the **left**, so the width rule recurses
+        // `scrut.cᵢ <: αᵢ` per shared tag.
+        //
+        // A default arm changes only whether the arms' tag set is **closed**:
+        //
+        // - **No default arm**: closed. The arms must cover everything the scrutinee
+        //   can carry, and a tag they do not name is the `ExtraTag` error — this
+        //   *is* the exhaustiveness check.
+        // - **With a default arm**: open. The scrutinee may carry tags no arm names,
+        //   which is what the default is for, so the missing-tag rejection is
+        //   dropped. Every shared tag still constrains its payload.
+        //
+        // Relating both sides to a fresh variable *above* them instead would drop the
+        // payload edge with the subset requirement: a common supertype constrains
+        // neither of its subtypes against the other, so `αᵢ` would take no bound from
+        // the scrutinee and get decided by whatever else touched it (in practice the
+        // sibling arms' join — i.e. the *default arm's* type). See [`Openness`].
+        let has_default = branches.iter().any(|b| b.pattern.is_none());
+        let expected = if has_default {
+            Type::open_variant(expected_tags.into_iter().collect())
+        } else {
+            variant_type(expected_tags)
+        };
         ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
     }
 
@@ -1404,7 +1428,7 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
-    let Type::Variant(tags) = peel_refinements_outer(&codom) else {
+    let Type::Variant(tags, _) = peel_refinements_outer(&codom) else {
         return Vec::new();
     };
     let Some((_, commit_payload)) = tags
@@ -1478,7 +1502,7 @@ fn emit_transact_writer<C: Typing>(
         FieldKey::Name(SmolStr::from(crate::ccl::F_WRITES)),
         Type::Tuple(new_tys),
     );
-    let decision_codom = Type::Variant(vec![
+    let decision_codom = Type::variant(vec![
         (FieldKey::Name(SmolStr::from(V_COMMIT)), product(payload)),
         (FieldKey::Name(SmolStr::from(V_ABORT)), prim(BaseType::Unit)),
     ]);

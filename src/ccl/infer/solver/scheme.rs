@@ -278,10 +278,11 @@ pub fn freshen_above(
                 .map(|(n, t)| (n.clone(), freshen_above(lim, t, target, cache)))
                 .collect(),
         ),
-        Type::Variant(tags) => Type::Variant(
+        Type::Variant(tags, openness) => Type::Variant(
             tags.iter()
                 .map(|(k, t)| (k.clone(), freshen_above(lim, t, target, cache)))
                 .collect(),
+            *openness,
         ),
         // Freshening is polarity-free (it copies structure, not constraints),
         // so the invariant payload recurses like any other position.
@@ -515,7 +516,10 @@ fn seed_pairings_go(
                 }
             }
         }
-        (Type::Variant(us), Type::Variant(ds)) => {
+        // Openness plays no part in *pairing* payloads: this walks two structurally
+        // corresponding types and matches arms by tag, which is the same work whether
+        // either side commits to further arms.
+        (Type::Variant(us, _), Type::Variant(ds, _)) => {
             for ((uk, u), (dk, d)) in us.iter().zip(ds) {
                 if uk == dk {
                     seed_pairings_go(u, d, lim, out, seen);

@@ -13,13 +13,18 @@ cargo clippy --all-targets -- -D warnings            # Lint (debug) — fast inn
 cargo clippy --release --all-targets -- -D warnings  # Lint (release) — CI runs this too; catches debug-only (cfg(debug_assertions)) breakage the debug pass misses
 ./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + tests. Skips the release clippy pass, doc, shellcheck, doc-refs. ~1/3 the time of the full gate — use this while iterating.
 ./ci.sh --fix    # Authoritative gate: fmt + ALL FOUR clippy passes + doc + tests, auto-formatting first. Must pass before pushing a PR.
+DEEP_TYPECHECK=1 ./ci.sh test   # Occasional: adds the `deep-typecheck` feature. Not part of the pre-push routine — see below.
 cargo test -q --no-fail-fast      # Run all tests
 cargo test <name>  # Run a specific test by name
 ```
 
 For the tight edit→check loop, prefer `./ci.sh fast` (or a bare `cargo test <name>`) over the full `./ci.sh`; run the full gate before pushing.
 
-CI lints in **four configurations**, because each one compiles code the others do not. Passing the plain debug `cargo clippy` is **not** sufficient; run `./ci.sh` to catch all four.
+**One thing `./ci.sh` does not cover: the `deep-typecheck` feature.** CI runs `DEEP_TYPECHECK=1 ./ci.sh test`, and `ci_test()` expands to `cargo test -q ${DEEP_TYPECHECK:+--features deep-typecheck}` — so with the variable unset that feature is never compiled. It typechecks after *every* rewrite and descends into **refinement predicates**, which the always-on pass-boundary checks do not look inside; an ill-typed predicate is therefore invisible to a fully green `./ci.sh`.
+
+**It is not a pre-push ritual** — CI runs it regardless, so a local run before pushing buys nothing on a change that touches no predicate, and it is not cheap (superlinear on nested comprehensions; ~7× the suite's runtime here, and toggling the variable invalidates the build cache both ways). Its value is *shortening the loop*: run it when a change constructs, rewrites, or retypes a predicate — planning, `lambda_elim`, `substitute`, anything touching `PredMemo` — and when CI fails in that step, to reproduce. A failure there is not evidence the feature is implicated, though: the whole suite runs in that step.
+
+CI lints in **four configurations**, because each one compiles code the others do not. Passing the plain debug `cargo clippy` is **not** sufficient; run `./ci.sh` to catch all four. (Those four are the *lint* configurations; the `deep-typecheck` test feature above is a fifth thing CI compiles that a bare `./ci.sh` does not.)
 
 | Pass | What only it compiles |
 |---|---|
@@ -191,7 +196,7 @@ Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k
 
 ### Workflow
 
-After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. While iterating, `./ci.sh fast` (fmt + debug clippy + tests) is the quick check — roughly a third of the full gate's time. **Before creating or pushing a PR, run the full `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers and that `fast` skips: the other three clippy configurations (release, `serde`, lib-only) plus the doc build. A green debug `cargo clippy` (or `./ci.sh fast`) is not enough (see Build Commands above).
+After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. While iterating, `./ci.sh fast` (fmt + debug clippy + tests) is the quick check — roughly a third of the full gate's time. **Before creating or pushing a PR, run the full `./ci.sh` and confirm it is clean** — it runs the parts no single `cargo` command covers and that `fast` skips: the other three clippy configurations (release, `serde`, lib-only) plus the doc build. A green debug `cargo clippy` (or `./ci.sh fast`) is not enough. It is not quite everything CI runs either — the `deep-typecheck` test feature needs `DEEP_TYPECHECK=1`, deliberately outside this routine (see Build Commands above).
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
 
@@ -205,7 +210,7 @@ When you are using compact, focus on test output and code changes.
 - When making changes, verify the freshness of the local repo by fetching and comparing the diff. The following commands do this, if there are differences, warn the user and ask the user whether they would like to pull or rebase.
    1. `git fetch origin`
    2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
-- Writing a PR description — or a commit description, which `gh pr create --fill` copies into the body verbatim — is the `pr-description` skill's job (`.claude/skills/pr-description/SKILL.md`): summary first, then a review guide, sub-linear length, the Markdown mechanics, and the `gh api` workaround for editing a posted body. Load it rather than working from memory.
+- Writing a PR description — and the commit description, which this repo's squash-merge turns into the `main` commit message — is the `pr-description` skill's job (`.claude/skills/pr-description/SKILL.md`): summary first, then a review guide, sub-linear length, the Markdown mechanics, and the `gh api` workaround for editing a posted body. Load it rather than working from memory. Author the body deliberately and pass it with `--title`/`--body`; do not let a `--fill` flag derive it from whatever the commit happens to say.
 
 ### Stack Management & Rebasing (jj vs git-spice)
 
@@ -221,7 +226,7 @@ This repo uses [git-spice](https://abhinav.github.io/git-spice/) (`gs`) for stac
 
 ```bash
 gs branch create -m "commit message"   # creates branch + commit in one step
-gs branch submit --fill --no-draft     # submit to GitHub
+gs branch submit --title "…" --body "$(cat body.md)" --draft   # or --no-draft
 gs stack submit --update-only          # add nav comments to all PRs in stack
 ```
 
@@ -231,15 +236,18 @@ gs stack submit --update-only          # add nav comments to all PRs in stack
 git checkout -b <branch-name>
 git add <files> && git commit -m "..."
 gs branch track --base <parent-branch>   # register with git-spice
-gs branch submit --fill --no-draft
+gs branch submit --title "…" --body "$(cat body.md)" --draft
 gs stack submit --update-only
 ```
 
 Notes:
 
 - Prefer `gs branch create` over `git checkout -b` for branch creation — if `spice.branchCreate.prefix` is configured, git-spice will apply it automatically, avoiding manual prefix guessing.
+- **Pass the draft flag explicitly, and never submit a PR readier than its base.** `--no-draft` onto a draft base produces a PR that cannot be reviewed: its diff is against a branch nobody has opened for review. A draft stacked on a ready PR is fine — the base merges first and the drafts are readied in turn. Check with `gh pr view <base-pr> --json isDraft`; to correct one after the fact, `gh pr ready --undo <n>`. Readying a PR is outward-facing, so it is the author's call, not a side effect of creating one.
+- **Do not use `--fill`.** It derives the title and body from the commit message, which silently ships whatever happens to be there — and for a multi-commit branch it is not even the description you wrote. Pass `--title` and `--body` from a description authored with the `pr-description` skill. (`gs branch submit` prompts when neither is given, which a non-interactive session cannot answer.)
 - For a PR stacked on `main`, `--base main` is implicit; for stacked PRs use `--base <parent-branch>`.
 - `gs stack submit` discovers existing PRs by branch name and adds navigation comments. Use `--update-only` to skip prompts for branches without PRs yet.
+- Editing a posted body later goes through the `gh api … --method PATCH` form in the `pr-description` skill, not `gh pr edit --body`.
 - To view the current stack: `gs log long`
 
 #### Option B: Rebasing a stack with jujutsu (jj)

@@ -658,9 +658,15 @@ Cambra carries features beyond plain algebraic subtyping (explicit refinements, 
 
 #### The unified tagged sum
 
-Cambra has **one** sum representation, the **tagged variant** — `Type::Variant(Vec<(FieldKey, Type)>)`. Since the solver works on `ccl::Type` directly, there is no second variant form to convert to: inference, coalescing, and the public AST all use this one type. (Internally, `compact_type` keys its transient `CompactType` bag by `FieldKey`, but that is an implementation detail of compaction, not a separate type.)
+Cambra has **one** sum representation, the **tagged variant** — `Type::Variant(Vec<(FieldKey, Type)>, Openness)`. Since the solver works on `ccl::Type` directly, there is no second variant form to convert to: inference, coalescing, and the public AST all use this one type. (Internally, `compact_type` keys its transient `CompactType` bag by `FieldKey`, but that is an implementation detail of compaction, not a separate type.)
 
 Tags are [`FieldKey`]s — the same key type as records/tuples — so a sum can be **named** (`FieldKey::Name`, a source-level `.Tag(...)`) or **anonymous/positional** (`FieldKey::Index`, the dual of a tuple). A positional union `A | B` is simply `Variant([(Index 0, A), (Index 1, B)])`, and the surface `++`/`Copair` produces exactly that (see §2's `emit_copair`). One constructor, one coalesce path, one width-subtyping rule (the dual of records: a subtype has *fewer* tags).
+
+That one rule does **two** jobs, and the [`Openness`] marker is what separates them. Recursing into a tag both sides carry is what pushes the payload into the supertype's slot — how a `match` arm's binder learns its type from the scrutinee. Rejecting a subtype tag the supertype lacks is the exhaustiveness check. A **closed** arm set does both; an **open** one keeps the payload recursion and drops the rejection, which is what a `match` with a `case _:` needs and what no closed judgment can express (on the tag axis the scrutinee is the supertype, on the payload axis its payload is the subtype, and one edge cannot point both ways).
+
+Openness is a property of a *demand*, never of a value: every producer of a sum is closed, and `Open` appears only on the right of a subtyping edge. Compaction and coalescing **carry** it (`CompactVariant` pairs the tag map with its openness) rather than flattening it, because a type *error* naming that demand is resolved through the same round-trip — closing the arm set there would report that the scrutinee failed to be an exact sum, when what it failed was to be a subtype of a partial one, and only the rendered `| …` tells those apart. Nothing else reads it: the runtime `Extent` has no counterpart, and no node's coalesced type comes out open. That last is an invariant, not a theorem, so `types_agree_modulo_unread` compares openness and an escape shows up there as a disagreement.
+
+Two arm sets meeting at one position meet their openness — `Open` survives only if both sides are open, since a closed side is the one contributing a requirement on the tag set. The tag *map* still merges by the ordinary intersect/union rule; that is an approximation when exactly one side is open, and no program reaches it (a scrutinee takes one `Case` demand per `match`).
 
 Two senses of "union" remain distinct:
 

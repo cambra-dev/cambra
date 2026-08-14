@@ -516,12 +516,32 @@ fn constrain_go_impl(
             Ok(())
         }
 
-        // Variant: width-subtyping is the dual. lhs's tags must all appear
-        // in rhs (with a payload subtype check). Payload depth is covariant.
-        (Type::Variant(a), Type::Variant(b)) => {
+        // Variant: width-subtyping is the dual of records — lhs's tags must all
+        // appear in rhs, each with a payload subtype check. Payload depth is
+        // covariant.
+        //
+        // The loop does **two** jobs, and they are separable only by rhs's
+        // [`Openness`]. Recursing into a shared tag is what carries the payload
+        // *into* rhs's slot — how a `match` arm's binder learns its type from the
+        // scrutinee. Rejecting an lhs tag that rhs lacks is the exhaustiveness
+        // check. An **open** rhs keeps the first and drops the second: it commits
+        // to the arms it lists and says nothing about the rest, which is what a
+        // `case _:` needs (the default arm handles the tags no arm names, so the
+        // scrutinee must stay free to carry them).
+        //
+        // Skipping — rather than returning early — is the whole point: `Ok(())` on
+        // a missing tag would abandon every *shared* tag ordered after it, so the
+        // payloads that do need constraining would be lost by tag order.
+        (Type::Variant(a, lhs_openness), Type::Variant(b, openness)) => {
+            debug_assert!(
+                !lhs_openness.permits_extra_tags(),
+                "an open arm set reached the left of a subtyping edge: openness is a \
+                 property of a demand, so only the right-hand side may be open"
+            );
             for (k, t0) in a {
                 match b.iter().find(|(bk, _)| bk == k) {
                     Some((_, t1)) => constrain_go(t0, t1, sl, sr, cache)?,
+                    None if openness.permits_extra_tags() => continue,
                     None => {
                         return Err(ConstrainError::ExtraTag {
                             tag: k.clone(),
@@ -760,7 +780,7 @@ fn constrain_go_impl(
             Type::ChanDom(..),
             Type::UIntRange(_)
             | Type::DataSource(_)
-            | Type::Variant(_)
+            | Type::Variant(..)
             | Type::Refinement(..)
             | Type::ChanDom(..)
             | Type::Hole,
@@ -768,7 +788,7 @@ fn constrain_go_impl(
         | (
             Type::UIntRange(_)
             | Type::DataSource(_)
-            | Type::Variant(_)
+            | Type::Variant(..)
             | Type::Refinement(..)
             | Type::Hole,
             Type::ChanDom(..),
@@ -917,11 +937,12 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 .map(|(n, t)| (n.clone(), extrude(t, pol, target_level, cache)))
                 .collect(),
         ),
-        Type::Variant(tags) => Type::Variant(
+        Type::Variant(tags, openness) => Type::Variant(
             tags.iter()
                 // Variant payloads are covariant — same polarity, no flip.
                 .map(|(k, t)| (k.clone(), extrude(t, pol, target_level, cache)))
                 .collect(),
+            *openness,
         ),
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(extrude(inner, pol, target_level, cache)),

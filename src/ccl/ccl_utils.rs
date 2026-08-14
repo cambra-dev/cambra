@@ -92,7 +92,7 @@ pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(String, Expr
 /// — the positions [`wrap_decision_variant`] injects and `body_decision_at`
 /// decodes.
 pub fn decision_variant_ty(payload_ty: Type) -> Type {
-    Type::Variant(vec![
+    Type::variant(vec![
         (FieldKey::Name(V_COMMIT.into()), payload_ty),
         (FieldKey::Name(V_ABORT.into()), Type::Base(BaseType::Unit)),
     ])
@@ -106,7 +106,7 @@ pub fn commit_payload_ty(decision_ty: &Type) -> Type {
         t = inner;
     }
     match t {
-        Type::Variant(tags) => tags
+        Type::Variant(tags, _) => tags
             .iter()
             .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
             .unwrap_or_else(|| panic!("decision variant lacks a `commit` tag: {decision_ty}"))
@@ -682,10 +682,11 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
                 .map(|(n, t)| (n.clone(), strip_refinements(t)))
                 .collect(),
         ),
-        Type::Variant(tags) => Type::Variant(
+        Type::Variant(tags, openness) => Type::Variant(
             tags.iter()
                 .map(|(k, t)| (k.clone(), strip_refinements(t)))
                 .collect(),
+            *openness,
         ),
         Type::History {
             value,

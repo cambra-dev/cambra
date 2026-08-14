@@ -20,6 +20,7 @@
 // live in a single module.
 
 use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
@@ -28,7 +29,7 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
-use crate::ccl::{Expr, Level, Name, Pattern, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{Expr, FieldKey, Level, Name, Pattern, Type, TypedBinding, TypedExprNode};
 
 use super::context::should_generalize;
 use super::typing::peel_refinements_outer;
@@ -380,8 +381,15 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                     nx == ny && types_agree_modulo_unread(x, y, refinements)
                 })
         }
-        (Type::Variant(xs), Type::Variant(ys)) => {
-            xs.len() == ys.len()
+        // Openness is compared, not ignored: two variants differing only in it are
+        // different *demands*. Nothing should reach this check open at all — it runs
+        // on post-phase trees, and a demand is never an expression's own type — but
+        // coalesce does *carry* openness (a diagnostic naming a demand has to render
+        // it), so nothing upstream forces the closure. Comparing it here is what
+        // makes an `Open` that escaped onto a node show up as a disagreement.
+        (Type::Variant(xs, ox), Type::Variant(ys, oy)) => {
+            ox == oy
+                && xs.len() == ys.len()
                 && xs.iter().zip(ys).all(|((kx, x), (ky, y))| {
                     kx == ky && types_agree_modulo_unread(x, y, refinements)
                 })
@@ -650,8 +658,15 @@ fn with_shadows<R>(
 ///   being resolved. And a `Lambda` resolves `param.ty` from its coalesced domain
 ///   *after* its body, so the pin still reaches the parameter type — but only if it
 ///   precedes the branch walk.
+///
+/// `scrut_tags` is the scrutinee's resolved tag set, when it has one. Unbound means
+/// *unreachable*, and that is checked rather than assumed: a **live** arm's binder
+/// takes its bound from the scrutinee (`scrut.c <: αᵢ`, the width rule with the
+/// scrutinee on the left), so an unbound binder on a tag the scrutinee *does* carry
+/// would mean that edge went missing — which is exactly the bug the `Openness`
+/// marker exists to prevent recurring.
 #[allow(clippy::mutable_key_type)]
-fn pin_unobservable_arm_payload(p: &Pattern) {
+fn pin_unobservable_arm_payload(p: &Pattern, scrut_tags: Option<&[FieldKey]>) {
     // Unobservability is *transitive*: the variable's bound list is rarely empty
     // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
     // a lower bound — and what matters is whether anything concrete reaches it
@@ -661,6 +676,12 @@ fn pin_unobservable_arm_payload(p: &Pattern) {
     if !matches!(resolve_var_type(&p.binding.ty), Ok(Type::Infer(_))) {
         return;
     }
+    debug_assert!(
+        scrut_tags.is_none_or(|tags| !tags.contains(&FieldKey::Name(p.tag.as_str().into()))),
+        "Case arm `{}` has an unbound payload type, but the scrutinee carries that \
+         tag — the width rule should have constrained it from the scrutinee",
+        p.tag
+    );
     let unit = Type::Base(crate::ccl::BaseType::Unit);
     let mut cache = ConstrainCache::new();
     let pinned = constrain_subtype(&unit, &p.binding.ty, &mut cache)
@@ -1054,13 +1075,25 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             if let Some(s) = scrutinee {
                 coalesce_node(s, level, ctx);
             }
+            // The scrutinee's *resolved* tag set. Taken after coalescing it, so the
+            // tags are concrete, and used to check that an unbound payload really is
+            // an unreachable arm's.
+            let scrut_tags: Option<Vec<FieldKey>> =
+                scrutinee
+                    .as_ref()
+                    .and_then(|s| match strip_refinements(&s.ty) {
+                        Type::Variant(tags, _) => {
+                            Some(tags.iter().map(|(k, _)| k.clone()).collect())
+                        }
+                        _ => None,
+                    });
             // Before any occurrence of an arm's payload variable is read: an arm
             // nothing reaches and whose body ignores its binder has no bound at
             // all, and needs one recorded on the *variable* to resolve
             // consistently everywhere it appears.
             for b in branches.iter() {
                 if let Some(p) = &b.pattern {
-                    pin_unobservable_arm_payload(p);
+                    pin_unobservable_arm_payload(p, scrut_tags.as_deref());
                 }
             }
             for b in branches.iter_mut() {
@@ -1309,7 +1342,7 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
         Type::Record(fs) => fs
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
-        Type::Variant(tags) => tags
+        Type::Variant(tags, _) => tags
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
         Type::History { value, domain, .. } => {

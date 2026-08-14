@@ -211,6 +211,19 @@ pub enum Stmt {
         else_body: Option<Vec<Spanned<Stmt>>>,
     },
 
+    /// ``match scrutinee: case `tag(binder): … case `tag2: …`` — tag dispatch over
+    /// a [`crate::ccl::Type::Variant`].
+    ///
+    /// A block statement mirroring [`Stmt::If`], and value-yielding by the same
+    /// rule: in a position that requires a value, every arm's block must end in
+    /// a value-yielding statement (`docs/chl-spec.md`, "4.5 `if` / `elif` / `else`").
+    /// `arms` is non-empty and in source order; first match wins, though the
+    /// arms are tag-disjoint so order is not observable.
+    Match {
+        scrutinee: Spanned<Expr>,
+        arms: Vec<MatchArm>,
+    },
+
     /// `for target in iter: body`.
     For {
         target: Spanned<AssignTarget>,
@@ -261,6 +274,33 @@ pub struct IfBranch {
     pub body: Vec<Spanned<Stmt>>,
 }
 
+/// One arm of a [`Stmt::Match`]: ``case `tag(binder): body``.
+///
+/// The pattern spells its tag exactly as [`Expr::VariantCtor`] does — the
+/// backtick and the parenthesised payload — so destructuring reads as the
+/// inverse of the construction it matches.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    /// The tag this arm matches, or `None` for the **default arm** `case _:`,
+    /// which matches whatever the tagged arms did not.
+    ///
+    /// Mirrors [`crate::ccl::Branch`]'s `pattern: Option<Pattern>`, which is
+    /// the shape this lowers to: a tag-less branch in a scrutinee-`Case`.
+    pub pattern: Option<MatchPattern>,
+    pub body: Vec<Spanned<Stmt>>,
+}
+
+/// The tag a [`MatchArm`] matches, and the name its payload binds to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchPattern {
+    pub tag: SmolStr,
+    pub tag_span: Span,
+    /// Name bound to the tag's payload for the arm's body. `None` for the
+    /// binder-less form `case tag:`, which discards a payload it does not read
+    /// (and is the natural spelling for a `Unit` payload such as `none`).
+    pub binder: Option<SmolStr>,
+}
+
 /// A function parameter: a name with an optional type annotation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
@@ -288,10 +328,33 @@ pub enum AssignTarget {
 // Expressions
 // ---------------------------------------------------------------------------
 
+/// What a [`Expr::VariantCtor`] carries, and which bracket wrote it.
+///
+/// A tag's payload is a term in term position and a field list in type
+/// position, and the bracket says which: `` `some(1) `` against
+/// `` `some{Int} ``. Keeping the bracket rather than normalising both to "the
+/// payload" is what lets lowering name the *right* form when an author writes
+/// the other one — the two are never interchangeable, so a plain "unsupported
+/// payload" would leave the fix to be guessed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VariantPayload {
+    /// `` `tag(𝑒) `` — a term payload, in a constructor or a pattern.
+    Term(Box<Spanned<Expr>>),
+    /// `` `tag{…} `` — the tag's payload **type**, in a type position.
+    ///
+    /// A tag's braces are the payload type's own braces, elided, so this holds
+    /// the payload type as the parser resolved it: the braced type itself for
+    /// `` `pair{Int, Bool} `` (an [`Expr::BraceGroup`]) or `` `pair{a: Int} ``
+    /// (an [`Expr::BraceRecord`]), and the bare inner type for `` `some{Int} ``,
+    /// whose braces belong to the tag because a lone comma-free `{T}` is not a
+    /// product (§2.4).
+    Fields(Box<Spanned<Expr>>),
+}
+
 /// A CHL expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    /// A literal value: integer, string, bool, or `None`.
+    /// A literal value: integer, string, or bool.
     Lit(Lit),
 
     /// A bare identifier — variable or function name.
@@ -401,6 +464,32 @@ pub enum Expr {
         attr_span: Span,
     },
 
+    /// A backtick-introduced variant arm: `` `tag(payload) `` in a term,
+    /// `` `tag{fields} `` in a type, and bare `` `tag `` for a tag that carries
+    /// nothing.
+    ///
+    /// The backtick is what distinguishes a tag from a name, in every position:
+    /// without it `some(1)` would be a [`Expr::Call`] to a function named
+    /// `some`, and `` {some{Int}} `` a type application. Tags need no
+    /// declaration — [`crate::ccl::Type::Variant`] is structural, so
+    /// `` `tag(𝑒) `` synthesises the singleton variant `` {`tag{𝑇}} `` and width
+    /// subtyping flows it into any consumer whose tag set contains it. See
+    /// `docs/chl-spec.md`, "3.15 Variant constructors".
+    ///
+    /// One node covers the term and the type because the two differ only in
+    /// their payload bracket; [`VariantPayload`] records which was written, and
+    /// lowering rejects the bracket that does not belong in its position.
+    VariantCtor {
+        /// The tag name.
+        tag: SmolStr,
+        tag_span: Span,
+        /// The payload, or `None` for the bare form `` `tag ``. A term's bare
+        /// form lowers to a `Unit` payload — a nullary constructor is not a
+        /// *distinct* kind of tag, just one whose payload carries no
+        /// information.
+        payload: Option<VariantPayload>,
+    },
+
     /// Lambda: `\params -> body`.
     Lambda {
         params: Vec<Param>,
@@ -441,6 +530,34 @@ pub enum Expr {
     /// unreachable. See [`Stmt::Error`] for the matching statement-level
     /// placeholder.
     Error,
+}
+
+impl Expr {
+    /// Whether this expression in type position reads as variant **arms**: a
+    /// backticked tag, or a `|`-chain whose every leaf is one.
+    ///
+    /// `|` lexes as the logical-or operator, so a chain arrives as nested
+    /// [`Expr::BinOp`] nodes. This is what tells a variant type from the tuple
+    /// type it shares a bracket with, and the backtick is the whole test: the
+    /// two readings never collide, because in *type* position there is no
+    /// boolean to disjoin. So the arm count carries no syntactic weight —
+    /// `` {`a} `` is a one-arm variant with no comma, while the one-element
+    /// tuple type needs the `{T,}` that says so.
+    ///
+    /// Requiring *every* leaf to be a tag (rather than any) keeps a mixed
+    /// `` {`a | Int} `` out of the variant path, so it fails as the tuple-type
+    /// element it looks like rather than as a malformed arm.
+    pub fn is_variant_arms(&self) -> bool {
+        match self {
+            Expr::VariantCtor { .. } => true,
+            Expr::BinOp {
+                left,
+                op: BinOp::LogicalOr,
+                right,
+            } => left.node.is_variant_arms() && right.node.is_variant_arms(),
+            _ => false,
+        }
+    }
 }
 
 /// A literal value.

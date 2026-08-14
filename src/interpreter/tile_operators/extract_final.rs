@@ -23,11 +23,15 @@ use crate::{
 pub struct ExtractFinal {
     /// Operator producing the `SealedFunction` tiling to extract from.
     source: Box<dyn TileOperator>,
-    /// Fallback scalar operator, pulled when `source` is terminal and
-    /// emits zero values.  Must have a `Scalar` tiling whose extent the
-    /// output extent *includes* — a width-narrower variant is admitted and
-    /// widened on emission.
-    default: Box<dyn TileOperator>,
+    /// Fallback scalar operator, pulled when `source` is terminal and emits zero
+    /// values.  Must have a `Scalar` tiling whose extent the output extent
+    /// *includes* — a width-narrower variant is admitted and widened on emission.
+    ///
+    /// `None` when the source is known to be **total** — a tag partition over an
+    /// exhaustive `match` always yields exactly one value, so there is no empty
+    /// case to fall back from and no default value has to be invented. An empty
+    /// source with no default is an invariant violation, not a fallback.
+    default: Option<Box<dyn TileOperator>>,
     /// Output tiling — the codomain of the source SealedFunction (always `Scalar`).
     tiling: Tiling,
 }
@@ -40,10 +44,7 @@ impl ExtractFinal {
     /// tiling whose extent that codomain includes. The output tiling becomes
     /// the scalar codomain.
     pub fn new(source: Box<dyn TileOperator>, default: Box<dyn TileOperator>) -> Self {
-        let tiling = match source.tiling() {
-            Tiling::SealedFunction { codomain, .. } => *codomain.clone(),
-            other => panic!("ExtractFinal source must have SealedFunction tiling, got {other}"),
-        };
+        let tiling = Self::source_codomain_tiling(source.as_ref());
         // The default has to be *representable* in the output value space — neither
         // identically tiled nor even the same extent. Two independent reasons, both
         // live:
@@ -65,8 +66,30 @@ impl ExtractFinal {
         );
         Self {
             source,
-            default,
+            default: Some(default),
             tiling,
+        }
+    }
+
+    /// Construct an `ExtractFinal` over a source known to be **total**.
+    ///
+    /// Used where the stream is a partition that always covers exactly one
+    /// position — an exhaustive tag `match` — so the empty case cannot arise and
+    /// no default value has to be fabricated. If the source does turn out empty,
+    /// [`ExtractFinalProducer`] fails loudly rather than inventing a value.
+    pub fn without_default(source: Box<dyn TileOperator>) -> Self {
+        let tiling = Self::source_codomain_tiling(source.as_ref());
+        Self {
+            source,
+            default: None,
+            tiling,
+        }
+    }
+
+    fn source_codomain_tiling(source: &dyn TileOperator) -> Tiling {
+        match source.tiling() {
+            Tiling::SealedFunction { codomain, .. } => *codomain.clone(),
+            other => panic!("ExtractFinal source must have SealedFunction tiling, got {other}"),
         }
     }
 }
@@ -77,8 +100,11 @@ impl TileOperator for ExtractFinal {
     }
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("source", self.source.inspect(opts))
-            .child("default", self.default.inspect(opts))
+        let node = node.child("source", self.source.inspect(opts));
+        match &self.default {
+            Some(d) => node.child("default", d.inspect(opts)),
+            None => node.annotate("total (no default)".to_string()),
+        }
     }
 
     fn subscribe(
@@ -97,11 +123,10 @@ impl TileOperator for ExtractFinal {
         let source_producer =
             self.source
                 .subscribe(self.source.tiling().universal_guard(), consumer, scheduler);
-        let default_producer = self.default.subscribe(
-            self.default.tiling().universal_guard(),
-            Box::new(|| {}),
-            scheduler,
-        );
+        let default_producer = self
+            .default
+            .as_mut()
+            .map(|d| d.subscribe(d.tiling().universal_guard(), Box::new(|| {}), scheduler));
         Box::new(ExtractFinalProducer {
             base: ProducerBase::new(ExtractFinalProducer::alloc_id(), &self.tiling),
             source: source_producer,
@@ -118,7 +143,7 @@ struct ExtractFinalProducer {
     /// Default-value producer, pulled when `source` becomes terminal
     /// and emits zero values.  Subscribed eagerly alongside `source`;
     /// `get` is deferred until we know we need it.
-    default: Box<dyn TileProducer>,
+    default: Option<Box<dyn TileProducer>>,
     /// Cached final scalar value.  `None` until the source becomes
     /// terminal; `Some(_)` thereafter.  Every subsequent `get` returns
     /// this same value until the consumer releases us with a universal
@@ -140,8 +165,11 @@ impl TileProducer for ExtractFinalProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("source", self.source.inspect(opts))
-            .child("default", self.default.inspect(opts))
+        let node = node.child("source", self.source.inspect(opts));
+        match &self.default {
+            Some(d) => node.child("default", d.inspect(opts)),
+            None => node.annotate("total (no default)".to_string()),
+        }
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -225,14 +253,23 @@ impl TileProducer for ExtractFinalProducer {
             self.final_value = Some(value.clone());
             return Tile::Scalar(ColumnValue::from_values(vec![value], &extent));
         }
-        // Source is terminal *and* empty (the loop body ran zero
-        // times).  Pull the default scalar and emit that instead, then
-        // release the default so its upstream chain can release too.
-        let default_tiling = self.default.tiling().clone();
-        let default_tile = self.default.get(default_tiling.universal_guard());
+        // Source is terminal *and* empty (the loop body ran zero times).  Pull the
+        // default scalar and emit that instead, then release the default so its
+        // upstream chain can release too.
+        let Some(default) = self.default.as_mut() else {
+            // No default means the source was declared total — an exhaustive tag
+            // partition always covers exactly one position. An empty source here is
+            // that invariant being wrong, so fail rather than invent a value.
+            panic!(
+                "ExtractFinal over a source declared total emitted no value; the \
+                 partition feeding it was not exhaustive"
+            );
+        };
+        let default_tiling = default.tiling().clone();
+        let default_tile = default.get(default_tiling.universal_guard());
         match scalar_tile_to_column_value(default_tile).as_single() {
             Some(value) => {
-                self.default.release(default_tiling.universal_guard());
+                default.release(default_tiling.universal_guard());
                 self.final_value = Some(value.clone());
                 Tile::Scalar(ColumnValue::from_values(vec![value], &extent))
             }
@@ -246,8 +283,9 @@ impl TileProducer for ExtractFinalProducer {
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.released = true;
             self.source.release(self.source.tiling().universal_guard());
-            self.default
-                .release(self.default.tiling().universal_guard());
+            if let Some(d) = self.default.as_mut() {
+                d.release(d.tiling().universal_guard());
+            }
         }
     }
 }
