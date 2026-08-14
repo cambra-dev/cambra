@@ -71,6 +71,65 @@ shares a few incidentally (`pred_sources = gen_sources.clone()`), but the nodes
 actually blamed for guard errors are minted fresh in predicate position and have
 no main-tree twin.
 
+### Duplication discipline
+
+**Every pass yields unique `NodeId`s.** `Clone` is derived, so it copies
+`node_id`: a bare `.clone()` of a subtree that lands at two live positions emits
+two nodes with one identity. That collapses them to one entry in every
+`NodeId`-keyed walk, gives the `SourceProjection` one attribution for two nodes,
+and makes a `NodeId → OperatorId` map non-functional — so uniqueness is what makes
+an id an *identity* rather than a label.
+
+`assert_unique_node_ids` enforces it at every pass boundary in `compile_program`
+(post-lowering, -inline, -transact, -letrec-run, -desugar, -lambda-elim,
+-planning), gated on `cfg!(any(debug_assertions, test))` — the walk is `O(nodes)`
+per boundary and buys nothing in a release compile, where the fold's leak classes
+cover the same ground. A boundary check is a *tree* invariant and encodes no pass
+order, so a reordered pass carries its check with it. It also means a pass is only
+implicated at a boundary that looks at it: a clean run is evidence about the
+gates, not about the passes between them.
+
+Two primitives, and the choice between them is about what the copy *denotes*:
+
+- **`Expr::fresh_copy`** — duplication. The copy is a *sibling*: same value,
+  distinct identity, `annot(p) = annot(o)`. Use it wherever one subtree reaches
+  the output at more than one position.
+- **Root-carry** (`freshen_interior_node_ids` + `re_root`) — substitution. The
+  replacement for a `Var(𝑥)` occurrence denotes what the occurrence denoted — the
+  value of 𝑥 *at that position* — so the occurrence keeps its own id, and with it
+  its source span, while only the interior is freshened. N reads give N distinct
+  roots, so uniqueness holds without deleting the read sites from the output.
+  `Subst`'s compound-replacement arm is the engine; every phase-local
+  substitution takes the same shape.
+
+Both fire `on_copy` on every re-minted node, so a freshen is captured as
+`Op::Copy` the moment a session is installed and is a no-op before that. No call
+site needs to know whether recording is on.
+
+**Freshen every copy, not all-but-one-by-position.** Which copy retains the
+original id is a *fate* question, and keep-first guesses it wrong exactly when
+position 0 is the copy that later dies. Freshening needs no knowledge of
+downstream fates: the original either survives in place and keeps its id, or dies
+and is consumed by the rewrite that dropped it. (Lowering's `fan_out_copy` is
+keep-first on purpose — it is the pass that *mints* the originals, so position 0
+is the source image by construction.)
+
+**Freshen at placement, not at construction.** Most passes build intermediate
+structures — guard vectors, path conjunctions, per-branch environments — whose
+entries are aliased and then copied into the output. Freshening where a node is
+*placed* in the output tree is what the invariant needs; freshening eagerly into
+an intermediate manufactures nodes that never reach the output and must then be
+declared dead by whoever claims the region.
+
+**A term crossing out of the predicate domain must not land aliased ids.**
+Predicate interiors are outside the checked domain (above) and may already alias
+main-tree ids, so a pass that lifts one into the term tree owes a freshen at the
+point of entry — `planning::iterate`'s `fn_of_bare_predicate` lift does exactly
+that. A lift that *rebuilds* the term is already safe:
+`planning::groupby`'s key extraction goes through `lambda_elim::run`, which
+re-mints every node. That is the mechanism, not the requirement; the requirement
+is that nothing aliased arrives, and each site pins it with a test.
+
 ## The lineage model (`src/ccl/lineage.rs`)
 
 Recording is a **byproduct of performing a rewrite**, never a post-pass diff. As
