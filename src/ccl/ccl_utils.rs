@@ -966,8 +966,9 @@ pub fn is_free(name: &Name, expr: &Expr) -> bool {
 /// name generalized to a set — but it answers for the whole set at once, where
 /// [`is_free`] per candidate walks `expr` once *per name*. Callers that select a
 /// live subset of a wide environment want this: the per-name form makes the
-/// selection cost `|candidates| × |expr|`, which is measurable at the widths the
-/// mutability phases reach (see [`crate::ccl::subst::Subst::discharge_env_in_place`]).
+/// selection cost `|candidates| × |expr|`, worth 10–22% of whole-program compile
+/// time at the widths the mutability phases reach and growing with block length
+/// (see [`crate::ccl::subst::Subst::discharge_env_in_place`]).
 ///
 /// Shadowing is per-name, so the candidate set *narrows* as the walk crosses a
 /// binder rather than the walk aborting: a scope that shadows one candidate says

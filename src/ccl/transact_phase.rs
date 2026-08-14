@@ -354,7 +354,7 @@ fn build_zip_read(
             reads.insert(r.name.clone(), field_read);
         }
     }
-    let body = Subst::discharge_env(lam_body.clone(), &reads);
+    let body = Subst::discharge_env_in_place(lam_body.clone(), &reads);
     let reply = Expr::lambda(p, pair_ty, body);
     Some(Expr::compose(vec![zip, reply]).with_ty(out_ty))
 }
@@ -2098,7 +2098,7 @@ fn walk_block(
             bound_expr,
             body,
         } => {
-            let bound = Subst::discharge_env((**bound_expr).clone(), env);
+            let bound = Subst::discharge_env_in_place((**bound_expr).clone(), env);
             env.insert(binding.name.clone(), bound);
             walk_block(
                 body,
@@ -2138,7 +2138,7 @@ fn walk_block(
                          block is not a recorded transactional write key — its write \
                          would be silently dropped from the decision record"
                     );
-                    let val = Subst::discharge_env(value.as_ref().clone(), env);
+                    let val = Subst::discharge_env_in_place(value.as_ref().clone(), env);
                     env.insert(name.clone(), val);
                     // This write commits on the current path (a spine write's path
                     // is `true`); the disjunction over all writes is the commit.
@@ -2176,7 +2176,7 @@ fn walk_block(
                 // assembler emits a per-tap `__fire` field (this path) the engine
                 // checks, unless the path *is* the commit (then it always fires).
                 TypedExprNode::Feed { name, value } => {
-                    let val = Subst::discharge_env(value.as_ref().clone(), env);
+                    let val = Subst::discharge_env_in_place(value.as_ref().clone(), env);
                     let field = format!("to_{}_{}", name.base(), *feed_counter);
                     *feed_counter += 1;
                     feeds.push((name.clone(), field, val, path.clone()));
@@ -2238,7 +2238,7 @@ fn walk_case(
     let mut arm_results: Vec<(Expr, HashMap<Name, Expr>)> = Vec::with_capacity(branches.len());
     let mut priors: Vec<Expr> = Vec::new();
     for br in branches {
-        let guard = Subst::discharge_env(br.guard.clone(), &snapshot);
+        let guard = Subst::discharge_env_in_place(br.guard.clone(), &snapshot);
         let pi = synthesize_arm_predicate(&guard, &priors);
         priors.push(guard.clone());
         let arm_path = and_path(path, &pi);

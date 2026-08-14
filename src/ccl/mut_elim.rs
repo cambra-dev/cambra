@@ -1025,14 +1025,14 @@ fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<
             bound_expr,
             body,
         } => {
-            let bound = Subst::discharge_env(*bound_expr, env);
+            let bound = Subst::discharge_env_in_place(*bound_expr, env);
             env.insert(binding.name, bound);
             collect_feed_only(*body, env, feeds);
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
             match effect.node {
                 TypedExprNode::Feed { name, value } => {
-                    let val = Subst::discharge_env(*value, env);
+                    let val = Subst::discharge_env_in_place(*value, env);
                     feeds.push((name, val));
                 }
                 other => panic!(
@@ -1228,7 +1228,7 @@ fn transform_chain(
             bound_expr,
             body,
         } => {
-            let bound = Subst::discharge_env(*bound_expr, env);
+            let bound = Subst::discharge_env_in_place(*bound_expr, env);
             let rest = transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
             Expr::let_in(b, bound, rest)
         }
@@ -1267,7 +1267,10 @@ fn transform_chain(
                 // loop item / accumulators read their writer-body snapshot slots
                 // (`__p.k` / `__p.i`) rather than the raw loop binder — the
                 // `commit` field must be point-free like `writes`.
-                let pi = Subst::discharge_env(synthesize_arm_predicate(&br.guard, &priors), env);
+                let pi = Subst::discharge_env_in_place(
+                    synthesize_arm_predicate(&br.guard, &priors),
+                    env,
+                );
                 priors.push(br.guard.clone());
                 let spliced = splice_after_unit(br.body, rest.clone());
                 let mut branch_env = env.clone();
@@ -1324,7 +1327,7 @@ fn transform_chain(
                     // branch-local `let` binder (`fresh` unbound at the top). The
                     // shared inlined normal form is what lets induction and
                     // transaction writers recognize identically.
-                    let val = Subst::discharge_env(*value, env);
+                    let val = Subst::discharge_env_in_place(*value, env);
                     // The value is inlined into `env`, not `let`-bound: a writer's
                     // decision body reads it (via `decision_writes`), and a
                     // `let`-bound name would escape the writer lambda.
@@ -1337,7 +1340,7 @@ fn transform_chain(
                 // `fire` is the current control-flow path — `true` on the spine, a
                 // guard conjunction inside an `if`.
                 TypedExprNode::Feed { name, value } => {
-                    let val = Subst::discharge_env(*value, env);
+                    let val = Subst::discharge_env_in_place(*value, env);
                     let field = format!("to_{}_{}", name.base(), feeds.len());
                     feeds.push(FeedSite {
                         defer: name,
@@ -1426,7 +1429,7 @@ fn decision_writes(dec: &Expr) -> Vec<Expr> {
                 bound_expr,
                 body,
             } => {
-                let bound = Subst::discharge_env((**bound_expr).clone(), &env);
+                let bound = Subst::discharge_env_in_place((**bound_expr).clone(), &env);
                 env.insert(binding.name.clone(), bound);
                 cur = body;
             }
@@ -1441,7 +1444,7 @@ fn decision_writes(dec: &Expr) -> Vec<Expr> {
                 };
                 return elts
                     .iter()
-                    .map(|e| Subst::discharge_env(e.clone(), &env))
+                    .map(|e| Subst::discharge_env_in_place(e.clone(), &env))
                     .collect();
             }
             _ => panic!(

@@ -706,8 +706,8 @@ impl Subst {
         Subst::discharge(binder.clone(), term.clone()).rewrite_expr(e);
     }
 
-    /// Discharge a whole **environment** `{name ↦ term, …}` over `e` in place —
-    /// every name at once, in one traversal.
+    /// Discharge a whole **environment** `{name ↦ term, …}` over `e` — every name
+    /// at once, in one traversal.
     ///
     /// The env-shaped sibling of [`Self::discharge_in_place`], for the
     /// read-your-writes environments the mutability-elimination phases thread
@@ -715,62 +715,40 @@ impl Subst {
     /// applied to a whole subtree.
     ///
     /// **Simultaneous, not a fold of single-name discharges.** [`Subst`] is
-    /// already a simultaneous map, so this is a constructor, not a second
-    /// engine. The distinction is load-bearing rather than notional: a
-    /// sequential fold would re-substitute into a replacement that happens to
-    /// mention another env key, so `{a ↦ b, b ↦ 0}` would send `a` to `0`
+    /// already a simultaneous map, so this is a constructor over it rather than a
+    /// second engine. A sequential fold would re-substitute into a replacement
+    /// that mentions another env key, sending `{a ↦ b, b ↦ 0}`'s `a` to `0`
     /// instead of to `b`. A read-your-writes environment resolves each value
-    /// against the environment *before* storing it, so its range is key-free
-    /// today — but that is a property of the callers, not of the operation, and
-    /// the simultaneous reading is the one that stays right if a caller stores
-    /// an unresolved value.
+    /// against the environment before storing it, so caller ranges are key-free
+    /// today — a property of the callers, not of the operation.
     ///
-    /// **Root-carry.** Each replaced occurrence keeps its **own** `NodeId`: the
-    /// replacement's root is built at the occurrence's id (so it inherits the
-    /// read site's span and attribution) and only its *interior* is freshened,
-    /// giving every read site a distinct identity. That contract lives in
-    /// [`Mapping::as_expr_preserving`] and [`Self::rewrite_expr_go`]; it is the
-    /// property a hand-rolled copy gets wrong by reaching for a whole-subtree
-    /// freshen, which discards the read site's identity along with the source
-    /// span the projection needs.
+    /// Each replaced occurrence keeps its own `NodeId`, so N reads give N distinct
+    /// roots; the contract is in [`Mapping::as_expr_preserving`] and
+    /// [`Self::rewrite_expr_go`], and its rationale in
+    /// `src/ccl/design/provenance.md`, "Duplication".
     ///
-    /// Only the entries that actually occur free in `e` are cloned into the
-    /// substitution — the same "vacuous costs no clone" discipline as the
-    /// single-name sibling, and it pays more here: a writer's environment holds
-    /// one fully-inlined value per register, and most subtrees mention none of
-    /// them.
+    /// Only the entries free in `e` are cloned into the substitution — the same
+    /// "vacuous costs no clone" discipline as the single-name sibling, and it
+    /// pays more here, since a writer's environment holds one fully-inlined value
+    /// per register and most subtrees mention none of them. The selection is one
+    /// traversal ([`free_among`], which carries the cost argument), not one per
+    /// entry.
     ///
-    /// The selection is **one** traversal ([`free_among`]), not one per entry.
-    /// That is a measured distinction, not a stylistic one: the per-entry form
-    /// costs `|env| × |e|`, and at a fixed block length, doubling the register
-    /// count from 8 to 16 doubled whole-program compile time. Block *length*
-    /// measured linear over the same range, so [`Self::rewrite_expr_go`]'s
-    /// per-node inertness test is not the cost here and does not want
-    /// "optimizing" on suspicion.
-    ///
-    /// Two hard `assert!`s ride this path, and callers should know they are
-    /// release-live rather than debug tripwires:
-    /// [`assert_preserves_typedness`] fires if an environment value is untyped
-    /// against a typed occurrence, and [`Self::assert_no_capture`] fires if the
-    /// environment's *range* mentions a binder the walk passes under. The
+    /// Two hard `assert!`s ride this path, release-live rather than debug
+    /// tripwires: [`assert_preserves_typedness`] fires if an environment value is
+    /// untyped against a typed occurrence, and [`Self::assert_no_capture`] fires
+    /// if the environment's range mentions a binder the walk passes under. The
     /// mutability phases satisfy both — they run post-inference over α-unique
-    /// names — and the asserts are what makes that an enforced precondition
-    /// instead of a comment, which is what the hand-rolled predecessors had.
-    pub fn discharge_env_in_place(e: &mut TypedExpr, env: &HashMap<Name, TypedExpr>) {
-        let live: BTreeMap<Binder, Mapping> = free_among(env.keys(), e)
-            .into_iter()
-            .map(|name| {
-                let term = env[&name].clone();
-                (name, Mapping::Discharge(Box::new(term)))
-            })
+    /// names — and the asserts make that an enforced precondition rather than a
+    /// comment.
+    pub fn discharge_env_in_place(mut e: TypedExpr, env: &HashMap<Name, TypedExpr>) -> TypedExpr {
+        let live_names = free_among(env.keys(), &e);
+        let live: BTreeMap<Binder, Mapping> = env
+            .iter()
+            .filter(|(name, _)| live_names.contains(*name))
+            .map(|(name, term)| (name.clone(), Mapping::Discharge(Box::new(term.clone()))))
             .collect();
-        Subst(live).rewrite_expr(e);
-    }
-
-    /// [`Self::discharge_env_in_place`] by value, for the callers that own (or
-    /// clone) the subtree and want the result back.
-    pub fn discharge_env(mut e: TypedExpr, env: &HashMap<Name, TypedExpr>) -> TypedExpr {
-        Self::discharge_env_in_place(&mut e, env);
+        Subst(live).rewrite_expr(&mut e);
         e
     }
 
@@ -1611,21 +1589,17 @@ mod tests {
         assert_eq!(*r2.predicate, gt(var("i"), var("k")));
     }
 
-    /// Root-carry, the property the mutability phases' read-your-writes
-    /// environments depend on. A replaced occurrence keeps its **own** `NodeId`,
-    /// so the inlined value inherits the *read site's* span and attribution,
-    /// while only the replacement's interior is freshened. N reads of one
-    /// environment value therefore become N subtrees with disjoint ids, which is
-    /// what lets a phase assemble them into a tree the pipeline's uniqueness
-    /// invariant still accepts.
+    /// The identity property the mutability phases' read-your-writes environments
+    /// depend on: a replaced occurrence keeps its own `NodeId`, and the value's
+    /// interior arrives under fresh ids. N reads of one environment value therefore
+    /// become N subtrees with disjoint ids — what lets a phase assemble them into a
+    /// tree the pipeline's uniqueness invariant accepts — each inheriting its read
+    /// site's span and attribution.
     ///
-    /// A whole-subtree freshen would also be unique, but it discards the read
-    /// site's identity; a bare clone would be neither. Both halves are asserted.
-    ///
-    /// This lives here rather than in `mut_elim` and `transact_phase` because it
-    /// is a property of the *engine*: those phases each carried a copy of this
-    /// test that called `Subst::discharge_env` directly and exercised no phase
-    /// code, so one engine gets one test.
+    /// This lives here rather than in `mut_elim` and `transact_phase` because it is
+    /// a property of the *engine*: those phases each carried a copy of this test,
+    /// which called the discharge directly and exercised no phase code, so one
+    /// engine gets one test.
     #[test]
     fn discharge_env_root_carries_and_freshens_interiors() {
         let int_ty = Type::Base(crate::ccl::BaseType::Int);
@@ -1651,7 +1625,7 @@ mod tests {
         let mut scaffold = TypedExpr::tuple(vec![read0, read1]);
         scaffold.ty = Type::Tuple(vec![int_ty.clone(), int_ty]);
 
-        let out = Subst::discharge_env(scaffold, &env);
+        let out = Subst::discharge_env_in_place(scaffold, &env);
 
         let TypedExprNode::Tuple(replaced) = &out.node else {
             unreachable!("the scaffolding tuple survives")
@@ -1659,7 +1633,7 @@ mod tests {
         assert_eq!(
             (replaced[0].node_id, replaced[1].node_id),
             (id0, id1),
-            "root-carry: a replaced read keeps its own id, so the inlined value \
+            "a replaced read keeps its own id, so the inlined value \
              inherits the read site's span"
         );
         for copy in replaced {
@@ -1676,7 +1650,7 @@ mod tests {
         }
         // Assert through the real checker rather than a local copy of its walk:
         // uniqueness within a tree is one invariant with one implementation.
-        crate::ccl::context::assert_unique_node_ids(&out, "discharge_env");
+        crate::ccl::context::assert_unique_node_ids(&out, "discharge_env_in_place");
     }
 
     /// A `Compose`'s arrow *ends* are derived from its elements, so a
@@ -1699,7 +1673,7 @@ mod tests {
         let replacement = var("h").with_ty(arrow);
         let env: HashMap<Name, TypedExpr> = HashMap::from([(Name::raw("f"), replacement)]);
 
-        let out = Subst::discharge_env(compose, &env);
+        let out = Subst::discharge_env_in_place(compose, &env);
 
         let Type::Fun { name, kind, .. } = &out.ty else {
             panic!("a `Compose` over function elements types as a function")
@@ -1728,7 +1702,7 @@ mod tests {
         let env: HashMap<Name, TypedExpr> =
             HashMap::from([(Name::raw("f"), var("h").with_ty(arrow))]);
 
-        let out = Subst::discharge_env(compose, &env);
+        let out = Subst::discharge_env_in_place(compose, &env);
 
         assert!(
             matches!(
