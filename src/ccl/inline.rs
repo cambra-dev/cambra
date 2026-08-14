@@ -97,79 +97,26 @@ pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
     expr
 }
 
-// ---------------------------------------------------------------------------
-// Domain predicates
-// ---------------------------------------------------------------------------
-
-/// Returns `true` when `ty` has a finite, enumerable domain — i.e., when the
-/// operator graph can natively schedule a function over this domain as
-/// `IterateExtent` without inlining.
-///
-/// | Type | Iterable? | Reason |
-/// |------|-----------|--------|
-/// | `Base(_)` | no | No finite enumeration of all integers / strings / bools |
-/// | `Tuple(ts)` | yes only if ALL `t` are iterable | A tuple can only be iterated if every component can |
-/// | `Record(fields)` | yes only if ALL fields are iterable | Same logic as tuples: a record with an unbounded field has no finite domain |
-/// | `Variant(tags, _)` | yes only if ALL payloads are iterable | Enumerating a sum means enumerating each arm in turn |
-/// | `Refinement(inner, _)` | same as `inner` | Refinement doesn't add iterability |
-/// | `UIntRange(_)` | yes | Finite, bounded range |
-/// | `DataSource(_)` | yes | Externally-backed finite collection |
-/// | `Fun(_, _)` as domain | no | Infinitely many possible functions; cannot enumerate |
-/// | anything else | yes | Conservative default: assume iterable so unknown types are not inlined |
-fn is_iterable_domain(ty: &Type) -> bool {
-    match ty {
-        Type::Base(_) => false,
-        // A tuple domain is iterable only if ALL components are iterable; you
-        // can't enumerate (UIntRange(3), Int) because Int is unbounded.
-        Type::Tuple(ts) => ts.iter().all(is_iterable_domain),
-        // Records are structurally equivalent to tuples for domain purposes.
-        Type::Record(fields) => fields.iter().all(|(_, t)| is_iterable_domain(t)),
-        // A sum is enumerable exactly when every arm's payload is — enumerating it
-        // means enumerating each arm in turn, which is what `iterate_union` does.
-        // Same rule as the product cases above, and the reason it has to be stated:
-        // the `_ => true` fallthrough would call ``{`a{Int} | `b{Int}}`` iterable, so a
-        // `def` matching on a variant parameter would not be inlined, and
-        // op-conversion would try to tabulate it by enumerating `Int`.
-        Type::Variant(tags, _) => tags.iter().all(|(_, t)| is_iterable_domain(t)),
-        // Refinement inherits the iterability of its base type.
-        Type::Refinement(inner, _) => is_iterable_domain(inner),
-        // Natively iterable types.
-        Type::UIntRange(_) | Type::DataSource(_) => true,
-        // There are infinitely many possible functions for any given function
-        // type, so function-typed domains cannot be enumerated.
-        Type::Fun { .. } => false,
-        // A history-typed domain has no enumerable domain — treat it
-        // non-iterable like a function so a history-param UDF is inlined; the
-        // `_ => true` fallthrough would otherwise strand it. Two cases reach
-        // here, both pre-erasure (inlining runs before `channelize` and the
-        // unified phase): a `Feed` defer-handle domain (a defer-mediating UDF
-        // `λ out → out << e` has domain `feed(ρ)`; its call sites beta-reduce,
-        // renaming the fed-to handle — see `Subst::handle_target`), and a
-        // `Overwrite` pass-by-ref param domain.
-        Type::History { .. } => false,
-        _ => true,
-    }
-}
-
 /// Returns `true` when a `Let` binding of type `bound_ty` should be inlined.
 ///
-/// Inlines `Let` bindings for functions whose domain is not iterable — i.e.,
-/// domains the operator graph cannot natively schedule as `IterateExtent`.
-/// This covers scalar UDFs (`Fun(Int, Int)`, `Fun(Tuple(Int,Int), Int)`, …),
-/// list-producing UDFs (`Fun(Fun(UIntRange,Int), Fun(UIntRange,Int))`, …), and
-/// curried functions (`Fun(Int, Fun(Int, Int))`, …): all of them have
-/// non-iterable domains and cannot be compiled as standalone operators by
-/// operator conversion.
+/// A **capability** is inlined: a scalar UDF, a list-producing UDF, a curried
+/// function. There is no data behind it, so there is nothing to share, and
+/// inlining is how it reaches its call sites to be specialized there.
 ///
-/// # What is NOT inlined
+/// A **collection** is not. The binding is the data, so op-conversion compiles
+/// it once behind a `Memo` and hands every use a `FanOut` branch; inlining it
+/// would rebuild the whole collection per use. That is the entire rule, and
+/// [`FunKind`](crate::ccl::ty::FunKind) is exactly the distinction — see
+/// `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions".
 ///
-/// Functions over natively iterable domains (`UIntRange`, `DataSource`) have a
-/// domain the operator graph can natively schedule and iterate.  They compile
-/// correctly as standalone `Let` bindings via `Memo + Splitter` and benefit
-/// from sharing, so they are left intact.
+/// This used to ask whether the *domain* was finitely enumerable, which is a
+/// different question: it is about what planning and op-conversion can compile,
+/// not about what the value is. The two coincided everywhere planning was
+/// complete and diverged where it was not — a `groupby`'s key domain is an
+/// unbounded `Int`, so a grouping was inlined and rebuilt at every use.
 fn should_inline(bound_ty: &Type) -> bool {
     match bound_ty {
-        Type::Fun { domain, .. } => !is_iterable_domain(domain),
+        Type::Fun { kind, .. } => !matches!(kind, crate::ccl::ty::FunKind::Data),
         _ => false,
     }
 }
@@ -647,110 +594,8 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::ty::FunKind;
     use crate::ccl::{BaseType, Lit, Type, TypedExpr, TypedExprNode};
-
-    // -----------------------------------------------------------------------
-    // is_iterable_domain predicate
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn non_iterable_domain_base_int() {
-        assert!(!is_iterable_domain(&Type::Base(BaseType::Int)));
-    }
-
-    #[test]
-    fn non_iterable_domain_base_string() {
-        assert!(!is_iterable_domain(&Type::Base(BaseType::String)));
-    }
-
-    #[test]
-    fn iterable_domain_uint_range() {
-        assert!(is_iterable_domain(&Type::UIntRange(3)));
-    }
-
-    #[test]
-    fn iterable_domain_datasource() {
-        assert!(is_iterable_domain(&Type::DataSource("s".to_string())));
-    }
-
-    #[test]
-    fn non_iterable_domain_tuple_all_non_iterable() {
-        let ty = Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)]);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_tuple_mixed() {
-        // Any non-iterable component makes the whole tuple non-iterable.
-        let ty = Type::Tuple(vec![Type::UIntRange(3), Type::Base(BaseType::Int)]);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn iterable_domain_tuple_all_iterable() {
-        let ty = Type::Tuple(vec![Type::UIntRange(3), Type::UIntRange(3)]);
-        assert!(is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_record_any_non_iterable() {
-        let ty = Type::Record(vec![
-            ("x".to_string(), Type::Base(BaseType::Int)),
-            ("n".to_string(), Type::UIntRange(3)),
-        ]);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn iterable_domain_record_all_iterable() {
-        let ty = Type::Record(vec![
-            ("a".to_string(), Type::UIntRange(2)),
-            ("b".to_string(), Type::UIntRange(5)),
-        ]);
-        assert!(is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_record_all_non_iterable() {
-        let ty = Type::Record(vec![
-            ("x".to_string(), Type::Base(BaseType::Int)),
-            ("y".to_string(), Type::Base(BaseType::String)),
-        ]);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_refinement_wraps_non_iterable() {
-        use crate::ccl::Refinement;
-        use std::rc::Rc;
-        let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement::born(pred);
-        let ty = Type::Refinement(Box::new(Type::Base(BaseType::Int)), refinement);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn iterable_domain_refinement_wraps_iterable() {
-        use crate::ccl::Refinement;
-        use std::rc::Rc;
-        let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement::born(pred);
-        let ty = Type::Refinement(Box::new(Type::UIntRange(3)), refinement);
-        assert!(is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_fun() {
-        // There are infinitely many possible Int → Int functions, so Fun-as-domain
-        // has no finite, enumerable domain.
-        let ty = Type::Fun {
-            name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
-            domain: Box::new(Type::Base(BaseType::Int)),
-            codomain: Box::new(Type::Base(BaseType::Int)),
-        };
-        assert!(!is_iterable_domain(&ty));
-    }
 
     // -----------------------------------------------------------------------
     // should_inline predicate
@@ -760,7 +605,7 @@ mod tests {
     fn should_inline_scalar_to_scalar() {
         let ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -774,11 +619,11 @@ mod tests {
         // eliminates the nested lambda before any `curry` combinator is produced.
         let ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Fun {
                 name: None,
-                kind: crate::ccl::ty::FunKind::Compute,
+                kind: FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
             }),
@@ -796,29 +641,45 @@ mod tests {
         let refinement = Refinement::born(pred);
         let inner_fun = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
         let ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Refinement(Box::new(inner_fun), refinement)),
         };
         assert!(should_inline(&ty));
     }
 
+    /// A **collection** is not inlined — it is the data, so it is bound once and
+    /// shared. The domain is deliberately the same `[0, 3)` a list has: what
+    /// decides this is the kind, not the shape of the domain.
     #[test]
-    fn should_not_inline_iterable_domain() {
-        // UIntRange(3) → Int: iterable domain, don't inline.
+    fn should_not_inline_a_collection() {
         let ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Data,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
         assert!(!should_inline(&ty));
+    }
+
+    /// The same domain at the **capability** kind is inlined. A `Compute` arrow
+    /// over `[0, 3)` is a function that happens to accept those inputs, not a
+    /// collection of them, and there is nothing behind it to share.
+    #[test]
+    fn should_inline_a_capability_over_an_enumerable_domain() {
+        let ty = Type::Fun {
+            name: None,
+            kind: FunKind::Compute,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
+        assert!(should_inline(&ty));
     }
 
     #[test]
@@ -826,7 +687,7 @@ mod tests {
         // (Int, Int) → Int: both components non-iterable, should inline.
         let ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::Base(BaseType::Int),
                 Type::Base(BaseType::Int),
@@ -842,7 +703,7 @@ mod tests {
         // non-iterable, so this is inlined.
         let ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::UIntRange(3),
                 Type::Base(BaseType::Int),
@@ -1067,7 +928,7 @@ mod tests {
     fn fn_ty(domain: Type, codomain: Type) -> Type {
         Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }

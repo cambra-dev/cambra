@@ -572,3 +572,49 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
         sort_sealed_function_by_domain(expected_result)
     );
 }
+
+/// A **shared grouping**: bound once, used many times.
+///
+/// A `groupby` is a collection, so it is `let`-bound and compiled once behind a
+/// `Memo`, with each use taking a `FanOut` branch — the same treatment any other
+/// collection gets. It used to be inlined instead, which rebuilt the whole
+/// grouping at every use; iterating one twice did not compile at all, because
+/// inlining a grouping into an iteration site produces a shape op-conversion
+/// cannot take.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Two iterations of one grouping, aggregating differently.
+#[case(
+    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])",
+    Value::Int(18)
+)]
+// Three, including a repeat of the first.
+#[case(
+    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])",
+    Value::Int(28)
+)]
+// A grouping iterated *and* looked up.
+#[case(
+    "g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))",
+    Value::Int(13)
+)]
+fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A key with **no group**, and one whose group is a single element.
+///
+/// A lookup walks the grouping for the key and slices out its rows; a key the
+/// grouping settled without ever seeing yields the empty group, which sums to
+/// zero rather than failing.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(3))", Value::Int(3))]
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(9))", Value::Int(0))]
+#[case(
+    "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(9))",
+    Value::Int(2)
+)]
+fn test_grouping_lookup_edges(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}

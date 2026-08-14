@@ -67,10 +67,28 @@ fn emit_groupby(
 /// replaced and the tail (the per-group aggregate) kept. Returns `None` if the
 /// shape doesn't match.
 fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
-    let TypedExprNode::Compose(elts) = &expr.node else {
-        return None;
-    };
-    let head = elts.first()?;
+    match &expr.node {
+        // Consumed in place: `groupby(c, key) ≫ <per-group aggregate>`. Replace
+        // the head and keep the tail.
+        TypedExprNode::Compose(elts) => {
+            let grouped = rewrite_groupby_source(elts.first()?)?;
+            let mut new_elts = vec![grouped];
+            new_elts.extend(elts.iter().skip(1).cloned());
+            Some(typed_compose(new_elts).with_ty(expr.ty.clone()))
+        }
+        // **Not** consumed in place — a `let`-bound grouping, whose uses are
+        // per-key lookups or iterations of the grouping itself. Matching it here
+        // is what lets it stay bound and be shared: the generic fallback would
+        // try to iterate its *key* domain, which is an element type rather than
+        // an index set, so before this the only way to compile a grouping was to
+        // inline it at each use and rebuild the whole grouping per use.
+        _ => rewrite_groupby_source(expr),
+    }
+}
+
+/// The group-by source rewrite: match `const(cast(c)) : (k) ⇒ ({i: I | i ▷ c ▷ key == k} ⇒ V)`
+/// and return the equivalent bucketize chain. See [`convert_groupby_pointful`].
+fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     let TypedExprNode::Apply {
         argument: cast_expr,
         function: const_fn,
@@ -160,9 +178,7 @@ fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
         (**value_ty).clone(),
     );
 
-    let mut new_elts = vec![grouped_values];
-    new_elts.extend(elts.iter().skip(1).cloned());
-    Some(typed_compose(new_elts).with_ty(expr.ty.clone()))
+    Some(grouped_values)
 }
 
 /// Is `e` the element-extraction `__elem ▷ c ▷ key` — an application whose

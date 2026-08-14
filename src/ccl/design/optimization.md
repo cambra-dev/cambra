@@ -27,20 +27,11 @@ Performing this before `lambda_elim` prevents the let-in-lambda rule from hoisti
 
 ### What is inlined (UDF step)
 
-A `Let { binding, bound_expr, body }` is inlined when `should_inline(bound_expr.ty)` returns `true`:
+A `Let { binding, bound_expr, body }` is inlined when `bound_expr.ty` is a **capability** — a `Fun` whose [`FunKind`](type-inference.md#46-data-vs-compute-functions) is not `Data`. That is the whole rule.
 
-- `bound_expr.ty` is `Fun(domain, codomain)`
-- `domain` is **not** iterable — i.e. `is_iterable_domain(domain)` is `false`
+A capability has no data behind it, so there is nothing to share and inlining is how it reaches its call sites to be specialized there: scalar UDFs, list-producing UDFs, curried functions. A **collection** is the opposite — the binding *is* the data, so op-conversion compiles it once behind a `Memo` and hands each use a `FanOut` branch. Inlining one rebuilds the whole collection per use.
 
-`is_iterable_domain` returns `true` for:
-- `UIntRange(_)`, `DataSource(_)` — finite, enumerable
-- `Tuple(ts)` where **all** components are iterable
-- `Record(fields)` where **all** fields are iterable
-- `Refinement(inner, _)` inheriting the iterability of `inner`
-
-And `false` for:
-- `Base(_)` (Int, String, Bool, etc.) — no finite enumeration of all values
-- `Fun(_, _)` as domain — there are infinitely many possible functions of any given function type, so it cannot be enumerated. This case covers list-producing UDFs whose domain is itself a list-shaped function type.
+> **This used to ask whether the `domain` was finitely enumerable** (`is_iterable_domain`: `true` for `UIntRange`/`DataSource` and products of them, `false` for `Base` and `Fun`). That is a different question — it is about what planning and op-conversion can *compile*, not about what the value *is*. The two agree everywhere planning is complete, and diverged where it was not: a `groupby`'s key domain is an unbounded `Int`, so a grouping counted as non-iterable and was inlined, rebuilding the entire grouping at every use, and iterating one twice did not compile at all. Closing that gap (a `groupby` source is now recognized when it is `let`-bound, not only when consumed in place) is what let the predicate become the kind.
 
 ### Substitution and beta-reduction
 
