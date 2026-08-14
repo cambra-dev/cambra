@@ -642,25 +642,69 @@ fn mut_annotation_with_non_txn_domain_rejected() {
 /// boundary, the very thing `:=` exists to avoid.
 #[rstest]
 #[case::annotated_mut(indoc! {r#"
+    t := 0
     for i in [1, 2, 3]:
-        y: Mut(Int) := 0
-        y += i
-    y
+        y: Mut(Int) := i
+        t += y
+    t
 "#})]
 #[case::annotated_value(indoc! {r#"
+    t := 0
     for i in [1, 2, 3]:
-        y: Int := 0
-        y += i
-    y
+        y: Int := i
+        t += y
+    t
 "#})]
 #[case::bare(indoc! {r#"
+    t := 0
     for i in [1, 2, 3]:
-        y := 0
-        y += i
-    y
+        y := i
+        t += y
+    t
 "#})]
 fn mut_var_declared_inside_loop_rejected(#[case] code: &str) {
     expect_compile_error(code, "introduced inside a for-loop body");
+}
+
+/// `op=` inside a for-loop body is a **mutable write**, so a target that is not a
+/// mutable variable declared before the loop is a type error rather than a rebind —
+/// the spec's *"a `+=` to an immutable binding is a type error, not a silent
+/// rebind"*.
+///
+/// The fallback this replaces was a per-iteration shadowing `let`, wrong twice over:
+/// the update is discarded at the iteration boundary, and since `op=` reads the old
+/// value, each iteration read the binding's *initial* value rather than the running
+/// one. It is the `op=` half of the same hole the `:=` rejection above closes.
+#[rstest]
+#[case::body_local(indoc! {r#"
+    t := 0
+    for i in [1, 2, 3]:
+        y = 0
+        y += i
+        t += y
+    t
+"#})]
+#[case::iteration_variable(indoc! {r#"
+    t := 0
+    for i in [1, 2, 3]:
+        i += 1
+        t += i
+    t
+"#})]
+// The generator path (a `yield` body with no loop-carried writes) reaches its own
+// statement lowering, and had the same fallback.
+#[case::generator_body(
+    indoc! {r#"
+        def g(xs):
+            for x in xs:
+                y = 0
+                y += x
+                yield y
+        g([1, 2, 3])
+    "#}
+)]
+fn aug_assign_to_a_non_mutable_inside_a_loop_is_rejected(#[case] code: &str) {
+    expect_compile_error(code, "is not a mutable variable");
 }
 
 /// The immutable counterpart still works, and is what the rejection above points
@@ -738,6 +782,122 @@ fn writing_through_a_value_copy_of_a_mutable_is_rejected() {
     "#},
         "not a mutable variable",
     );
+}
+
+/// A mutable variable's **value type is invariant** across a pass-by-reference boundary:
+/// the callee's declared value type may be neither narrower nor wider than the
+/// caller's mutable variable.
+///
+/// Narrowing is the unsound direction and the reason invariance exists. If
+/// `Mut({a: Int, b: Int})` could flow into a `Mut({a: Int})` parameter, the callee's
+/// `r := (a=5)` would drop a field the caller's declaration still promises, and the
+/// caller's later `x.b` would type-check against a value that no longer has it.
+///
+/// Both directions are rejected today, but *not* by one rule. At an argument position
+/// the deref coercion fires first — `apply` records `arg <: ?d` against a fresh
+/// variable, so a mutable variable meets an `Infer` and reads through — which means the
+/// `(History, History)` invariance rule never runs there. Narrowing is caught instead
+/// by the write contribution (`emit::contribute_pbr_writes`, `param_value <:
+/// arg_value`) and widening by the ordinary application edge. These tests pin the
+/// *property* so that consolidating those mechanisms cannot quietly drop it.
+#[test]
+fn a_mut_vars_value_type_is_invariant_across_a_mut_parameter() {
+    // Narrowing: the callee would drop `b`, and the diagnostic names that field —
+    // `.b` is the whole of what makes this unsound, so it is a sharper needle than
+    // the kind of error it happens to be reported as.
+    expect_compile_error(
+        indoc! {r#"
+            def narrow(r: Mut({a: Int})):
+                r := (a=5)
+            x: Mut({a: Int, b: Int}) := (a=1, b=2)
+            for i in [1]:
+                narrow(x)
+            x.b
+        "#},
+        ".b",
+    );
+    // Widening: the callee would demand a field the mutable variable does not have — again
+    // `.b`, from the other side.
+    expect_compile_error(
+        indoc! {r#"
+            def wide(r: Mut({a: Int, b: Int})):
+                r := (a=5, b=6)
+            x: Mut({a: Int}) := (a=1)
+            for i in [1]:
+                wide(x)
+            x.a
+        "#},
+        ".b",
+    );
+}
+
+/// The equal-width case still works, which is what makes the two rejections above a
+/// statement about *variance* rather than about pass-by-reference being broken.
+#[test]
+fn an_equal_width_mut_parameter_still_accepts_a_mut_var() {
+    check_scalar(
+        indoc! {r#"
+            def bump(r: Mut(Int)):
+                r += 1
+            x: Mut(Int) := 0
+            for i in [1, 2, 3]:
+                bump(x)
+            x
+        "#},
+        cambra::interpreter::Value::Int(3),
+    );
+}
+
+/// A type refinement cannot depend on a mutable variable — a **staging** limitation,
+/// deliberately reported rather than worked around.
+///
+/// A comprehension filter's predicate rides the domain type as a refinement, so
+/// filtering on a mutable variable produces a type mentioning it. A `let` binder can be
+/// discharged into the type it is lifted out of, because the binder *is* its bound
+/// expression; a mutable variable has no such term *at the point closure is demanded*. That is
+/// the whole obstacle: closure is required during coalesce, and `mut_elim` — several
+/// passes later — is what compiles a write-free mutable variable into a `let` and a written one
+/// into trailing `let x_final = final_or_default(…)` bindings. The naming exists; it
+/// just arrives too late to discharge with.
+///
+/// Lifting it is scoped rather than impossible (see
+/// [`InferError::MutableInRefinedType`](cambra::ccl::infer::InferError)), with one
+/// genuinely hard sub-case left over: a comprehension inside the loop that writes the
+/// mutable variable, where the value is per-iteration and a predicate — riding a type — has no
+/// position to depend on.
+///
+/// Reading it into an immutable first does **not** help today, which is why the message
+/// offers no workaround: discharging `[k ↦ x]` puts the mutable variable's name straight back
+/// into the predicate.
+///
+/// Before this was reported here it tripped `check_scope_valid`, a debug-only
+/// regression net documented as never firing on a well-typed program — so a *release*
+/// build had no check at all and reached the pre-desugar wall with a surviving mutable
+/// type.
+#[rstest]
+#[case::direct(indoc! {r#"
+    x := 2
+    ys = [i for i in [1, 2, 3] if i < x]
+    ys
+"#})]
+#[case::through_a_copy(indoc! {r#"
+    x := 2
+    k = x
+    ys = [i for i in [1, 2, 3] if i < k]
+    ys
+"#})]
+#[case::after_writes(
+    indoc! {r#"
+        x := 0
+        for i in [1, 2]:
+            x += i
+        k = x
+        ys = [j for j in [1, 2, 3] if j < k]
+        ys
+    "#}
+)]
+fn a_refinement_cannot_depend_on_a_mutable(#[case] code: &str) {
+    expect_compile_error(code, "depends on the mutable variable");
 }
 
 /// Rule 2: a function may not return a `Mut` — the mutable-variable reference would

@@ -1211,6 +1211,34 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 Some(body.ty.clone())
             }
         }
+        // An effect statement carries its continuation's type, so the lifted type has
+        // to follow it too: without this the chain breaks at every `ExprStmt`, and a
+        // discharge performed by a `let` below one never reaches the binder above it.
+        // (The `Let` arm above composes to fixpoint precisely because it reads its
+        // *body's* already-coalesced type; a spine link that does not propagate is a
+        // hole in that composition.)
+        TypedExprNode::ExprStmt { body, .. } => Some(body.ty.clone()),
+        // A mutable variable introduction lifts its body's type the same way, but has no
+        // discharge available *here*: the term that names a mutable variable's value is minted
+        // by `mut_elim`, several passes after closure is demanded. So a refinement that
+        // mentions the binder cannot be closed at this point, and the program is
+        // rejected with a source position rather than left to trip the debug-only scope
+        // net or, in release, to reach the pre-desugar wall as a surviving mutable type.
+        // Why that is staging rather than impossibility, and what lifting it would take:
+        // see `InferError::MutableInRefinedType`.
+        TypedExprNode::MutDecl { binding, body, .. } => {
+            if crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name) {
+                let label = format!("mutable `{}`", binding.name);
+                ctx.push_error(
+                    InferError::MutableInRefinedType {
+                        name: binding.name.base().to_string(),
+                        ty: body.ty.clone(),
+                    },
+                    label,
+                );
+            }
+            Some(body.ty.clone())
+        }
         _ => None,
     };
     if let Some(closed) = let_closed {
