@@ -83,10 +83,7 @@ pub enum ConstrainError {
     /// collection (`⤇`) is demanded. `Data <: Compute` is the safe
     /// upcast — a collection is callable at any index in its domain — but the
     /// reverse would iterate a *declared* domain the value does not actually
-    /// cover, silently dropping rows. Raised only when the cache is
-    /// kind-aware (constraint emission); the post-inference check is kind-blind
-    /// (see [`ConstrainCache`]), since elimination preserves denotation but not
-    /// kind representation.
+    /// cover, silently dropping rows.
     ComputeWhereDataRequired {
         /// The supplied compute function.
         lhs: Type,
@@ -145,40 +142,15 @@ pub enum ConstrainError {
 /// (var⇄var) edges are renames over the episode's finite binder set, whose
 /// composites saturate; discharges ride acyclic content edges only (their
 /// composites grow along lexical nesting depth, not around cycles).
-///
-/// Carries the `kind_aware` mode flag alongside the edge map. The
-/// `Compute <: Data` kind rejection (a capability supplied where a collection is
-/// demanded — see [`ConstrainError::ComputeWhereDataRequired`]) fires only
-/// during constraint **emission** (inference), where kinds are being inferred
-/// and a mismatch is a real domain-loss bug. The post-inference structural
-/// check is **kind-blind**: lambda elimination is denotation-preserving but not
-/// kind-preserving (`Type::without_pi_names` canonicalizes every reconstructed
-/// arrow to `Compute`), so a point-free map flowing into a `Data` argument is
-/// well-denoted and must not be re-rejected on kind. FunKind is an inference-time
-/// property, so the flag rides the cache that is already threaded through the
-/// whole recursion.
 pub struct ConstrainCache {
     edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
-    kind_aware: bool,
 }
 
 impl ConstrainCache {
-    /// A kind-aware cache (constraint emission / inference): the
-    /// `Compute <: Data` rejection is live.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             edges: HashMap::new(),
-            kind_aware: true,
-        }
-    }
-
-    /// A kind-blind cache (the post-inference structural check): kind
-    /// mismatches are ignored (see the type doc).
-    pub fn new_kind_blind() -> Self {
-        Self {
-            edges: HashMap::new(),
-            kind_aware: false,
         }
     }
 
@@ -217,7 +189,7 @@ pub fn constrain_subtype(
 /// Concrete edges: `Data <: κ` and `κ <: Compute` always hold; `Compute <: Data`
 /// is the sole failure — returned as `true` (the caller raises
 /// [`ConstrainError::ComputeWhereDataRequired`], having the full function types
-/// for the diagnostic) **iff** `kind_aware` (emission mode).
+/// for the diagnostic).
 ///
 /// Variable edges set `forced_*` flags, resolved at coalesce
 /// ([`super::compact::KindMerge`]): a compute value flowing *into* a var forces
@@ -226,13 +198,13 @@ pub fn constrain_subtype(
 /// links as they arrive, so ordering does not matter (a force after its link
 /// still reaches the far end). A var that ends up with both flags is the
 /// conflict — surfaced loudly at coalesce, never here.
-fn constrain_kind(k0: &FunKind, k1: &FunKind, kind_aware: bool) -> bool {
+fn constrain_kind(k0: &FunKind, k1: &FunKind) -> bool {
     use FunKind::*;
     match (k0, k1) {
         // `Data` is bottom, `Compute` is top: these edges always hold.
         (Data, _) | (_, Compute) => false,
         // The one rejection — a capability supplied where a collection is demanded.
-        (Compute, Data) => kind_aware,
+        (Compute, Data) => true,
         // A compute value flows into this var: it cannot be `Data`. The force
         // propagates up any `<:` links already drawn to this var.
         (Compute, Var(v1)) => {
@@ -508,12 +480,10 @@ fn constrain_go_impl(
         ) => {
             // The kind edge over the lattice `Data ⊑ Compute` (see
             // `constrain_kind`): `Data <: κ` and `κ <: Compute` always hold; a
-            // concrete `Compute <: Data` is the rejection (a capability where an
-            // domain is demanded → silent row loss), live only when the cache is
-            // kind-aware (emission, not the kind-blind post-inference check).
-            // FunKind vars accumulate `forced_*` flags here and resolve at coalesce.
-            let kind_aware = cache.kind_aware;
-            if constrain_kind(k0, k1, kind_aware) {
+            // concrete `Compute <: Data` is the rejection (a capability where a
+            // domain is demanded → silent row loss). FunKind vars accumulate
+            // `forced_*` flags here and resolve at coalesce.
+            if constrain_kind(k0, k1) {
                 return Err(ConstrainError::ComputeWhereDataRequired {
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
@@ -539,7 +509,7 @@ fn constrain_go_impl(
             // exactly as at a `Case` result. Until Σ is representable that join has
             // no answer, which is the error below; the same fact reaches coalesce as
             // `CoalesceError::DomainJoinConflict` when no edge forces it earlier.
-            if kind_aware && matches!(k0, FunKind::Data) && matches!(k1, FunKind::Data) {
+            if matches!(k0, FunKind::Data) && matches!(k1, FunKind::Data) {
                 if constrain_go(d1, d0, sr, sl, cache).is_err()
                     || constrain_go(d0, d1, sl, sr, cache).is_err()
                 {
@@ -2312,19 +2282,20 @@ mod tests {
     }
 
     #[test]
-    fn kind_rejection_is_off_in_the_kind_blind_check() {
-        // The post-inference check is kind-blind: the very `Compute <: Data`
-        // edge the emission cache rejects is accepted here (elimination
-        // preserves denotation, not kind representation).
-        let mut cache = ConstrainCache::new_kind_blind();
-        assert!(
+    fn kind_rejection_is_live_in_every_cache() {
+        // There is one mode: a `Compute <: Data` edge is a rejection wherever it
+        // is drawn. The post-inference structural check runs the same cache, so a
+        // capability reaching a collection position is caught there too rather
+        // than being waved through as an elimination artifact.
+        let mut cache = ConstrainCache::new();
+        assert!(matches!(
             constrain_subtype(
                 &fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &mut cache,
-            )
-            .is_ok()
-        );
+            ),
+            Err(ConstrainError::ComputeWhereDataRequired { .. })
+        ));
     }
 
     #[test]

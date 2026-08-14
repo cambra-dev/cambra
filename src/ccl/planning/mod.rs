@@ -18,7 +18,7 @@
 use log::trace;
 
 use crate::ccl::ccl_utils::{
-    self, PredMemo, apply_function, make_iterate, make_restrict, refine_codomain, set_codomain,
+    self, PredMemo, apply_function, make_iterate, make_restrict, refine_extent, set_codomain,
     trivially_true_predicate, typed_compose,
 };
 // Re-exported so the `planning` submodules (`groupby`, `join`) can keep calling
@@ -280,6 +280,12 @@ pub(crate) mod test_helpers {
         }
     }
 
+    /// A **collection** arrow — what a let-bound list or comprehension has, and
+    /// what distinguishes an iteration source from a capability of the same shape.
+    pub(crate) fn data_fun_ty(domain: Type, codomain: Type) -> Type {
+        Type::data_fun(domain, codomain)
+    }
+
     pub(crate) fn tuple_ty(tys: Vec<Type>) -> Type {
         Type::Tuple(tys)
     }
@@ -312,7 +318,8 @@ pub(crate) mod test_helpers {
         Expr::apply(argument, Expr::builtin(builtin).with_ty(function_ty)).with_ty(result_ty)
     }
 
-    /// Build a finite list literal `[1, 2, 3]` typed `[0, 2] ⇒ Int`.
+    /// Build a finite list literal `[1, 2, 3]` typed `[0, 2] ⤇ Int` — a list
+    /// literal is a collection, so its arrow is `Data`.
     pub(crate) fn list_123() -> Expr {
         let int = int_ty();
         Expr::list(vec![
@@ -320,7 +327,7 @@ pub(crate) mod test_helpers {
             Expr::lit(Lit::Int(2)).with_ty(int.clone()),
             Expr::lit(Lit::Int(3)).with_ty(int.clone()),
         ])
-        .with_ty(fun_ty(Type::UIntRange(3), int))
+        .with_ty(data_fun_ty(Type::UIntRange(3), int))
     }
 
     /// Returns `true` if `expr` is `Apply { function: Builtin::Iterate, .. }`
@@ -652,10 +659,10 @@ mod tests {
         // top-level wrap should reach the bound list (compiled with
         // `input=None` by op-conversion's `Let` arm) and the body's
         // compose head (also `input=None` from the same arm).  The
-        // function-typed Var inside the body is already iteration-
+        // collection-typed Var inside the body is already iteration-
         // bearing, so it doesn't get a second wrap.
         let int = int_ty();
-        let list_ty = fun_ty(Type::UIntRange(3), int.clone());
+        let list_ty = data_fun_ty(Type::UIntRange(3), int.clone());
         let body_chain = compose(vec![
             var("xs").with_ty(list_ty.clone()),
             Expr::builtin(Builtin::Id).with_ty(fun_ty(int.clone(), int)),

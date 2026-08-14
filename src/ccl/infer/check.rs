@@ -43,8 +43,8 @@ use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
 ///
 /// There is no cast escape in the adjacency rule: a producer must already
 /// carry the refinement its consumer demands. Join planning makes this hold by
-/// surfacing each iterated/join-satisfying domain on the *producing* morphism's
-/// codomain (`planning`'s `refine_codomain` / iteration-source `set_codomain`),
+/// surfacing each iterated/join-satisfying extent on the *producing* morphism
+/// (`planning`'s `refine_extent` / iteration-source `set_extent`),
 /// so a `… ≫ (id ≫ cast({D | r} ⇒ V))` chain composes because the upstream
 /// genuinely supplies `{D | r}`. Because planning re-mints a fresh refinement
 /// `Rc` at every marker, the producer's `{D | r}` and the consumer's contract
@@ -193,7 +193,7 @@ impl Typing for CheckCtx {
         // truth for width/variance and (since refinements ride the lattice as
         // restriction refinements) refinement subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
-        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new_kind_blind()) {
+        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new()) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }
@@ -367,6 +367,9 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
 /// recorded `Type`.
 fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferError> {
     let label = symbolic(expr);
+    // The `Lambda` rule reads the node's own arrow for its kind (see
+    // `emit_lambda`), taken before the walk borrows the node.
+    let recorded_ty = expr.ty.clone();
     let ty = match &mut expr.node {
         // Verify the **base**, trust the refinement. A literal's singleton predicate
         // (`{Int | __elem == 5}`) is a resolved predicate like any other, and by the
@@ -397,7 +400,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             expr.ty.clone()
         }
 
-        TypedExprNode::Lambda { param, body } => emit_lambda(param, body, ctx)?,
+        TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
 
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
 
@@ -448,7 +451,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::VariantCtor { tag, payload } => emit_variant_ctor(tag, payload, ctx)?,
 
-        TypedExprNode::Compose(elts) => emit_compose(elts, ctx)?,
+        TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, ctx)?,
 
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 

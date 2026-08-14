@@ -7,6 +7,7 @@
 //! [`emit_groupby`].
 
 use super::*;
+use crate::ccl::ty::FunKind;
 
 /// Recognize group-by sites and rewrite them to the bucketize chain.
 ///
@@ -32,25 +33,41 @@ pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
 fn emit_groupby(
     keys: Expr,
     values: Expr,
-    value_idx_ty: Type,
+    group_idx_ty: Type,
+    key_binder: Option<Name>,
     key_ty: Type,
     value_ty: Type,
 ) -> Expr {
-    let converse_ty = Type::fun(
-        key_ty.clone(),
-        Type::fun(value_idx_ty.clone(), value_idx_ty.clone()),
-    );
+    // A partition is a **collection of collections**: keyed by `K`, each group the
+    // index set of its members. Both arrows are data — the transformer arrow
+    // (`map`, taking one collection to another) stays a capability.
+    //
+    // `group_idx_ty` is the group's *refined* index set `{I | key(i) == k}`, and
+    // `key_binder` the `k` its predicate closes over, both taken from the source
+    // this chain replaces. A group holds the members sharing one key, and for a
+    // data function the domain *is* the data, so typing the group as the bare `I`
+    // would claim every element belongs to every group. Consumers demand the
+    // refined form (a per-group aggregate casts to it), and the bare one is only
+    // readable as its supertype under the contravariant reading of an arrow —
+    // wrong for a collection. The binder must ride the arrow as a Pi for the
+    // predicate's `k` to stay bound.
+    let partition = |codomain: Type| Type::Fun {
+        name: key_binder.clone(),
+        kind: FunKind::Data,
+        domain: Box::new(key_ty.clone()),
+        codomain: Box::new(codomain),
+    };
+    let group_of = |codomain: Type| Type::data_fun(group_idx_ty.clone(), codomain);
+
+    let converse_ty = partition(group_of(group_idx_ty.clone()));
     let grouped = apply_primitive(keys, Builtin::Converse, converse_ty);
     typecheck(&grouped).expect("Bad group expr");
     let values_fn = apply_primitive(
         values,
         Builtin::Map,
-        Type::fun(
-            Type::fun(value_idx_ty.clone(), value_idx_ty.clone()),
-            Type::fun(value_idx_ty.clone(), value_ty.clone()),
-        ),
+        Type::fun(group_of(group_idx_ty.clone()), group_of(value_ty.clone())),
     );
-    let grouped_values_ty = Type::fun(key_ty, Type::fun(value_idx_ty, value_ty));
+    let grouped_values_ty = partition(group_of(value_ty));
     typecheck(&values_fn).expect("Bad values_fn expr");
     let grouped_values = compose(grouped, values_fn).with_ty(grouped_values_ty);
     typecheck(&grouped_values).expect("Bad grouped_values expr");
@@ -67,10 +84,27 @@ fn emit_groupby(
 /// replaced and the tail (the per-group aggregate) kept. Returns `None` if the
 /// shape doesn't match.
 fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
-    let TypedExprNode::Compose(elts) = &expr.node else {
-        return None;
-    };
-    let head = elts.first()?;
+    match &expr.node {
+        // Consumed in place: `groupby(c, key) ≫ <per-group aggregate>`. Replace
+        // the head and keep the tail.
+        TypedExprNode::Compose(elts) => {
+            let grouped = rewrite_groupby_source(elts.first()?)?;
+            let mut new_elts = vec![grouped];
+            new_elts.extend(elts.iter().skip(1).cloned());
+            Some(typed_compose(new_elts).with_ty(expr.ty.clone()))
+        }
+        // **Not** consumed in place — a `let`-bound grouping, whose uses are
+        // per-key lookups or iterations of the grouping itself. Matching it here
+        // is what lets it stay bound and be shared: the generic fallback would
+        // try to iterate its *key* domain, which is an element type rather than
+        // an index set.
+        _ => rewrite_groupby_source(expr),
+    }
+}
+
+/// The group-by source rewrite: match `const(cast(c)) : (k) ⇒ ({i: I | i ▷ c ▷ key == k} ⇒ V)`
+/// and return the equivalent bucketize chain. See [`convert_groupby_pointful`].
+fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     let TypedExprNode::Apply {
         argument: cast_expr,
         function: const_fn,
@@ -152,17 +186,20 @@ fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
     let value_idx_ty = (**idx_ty).clone();
     let keys =
         compose((**c).clone(), key_pf).with_ty(Type::fun(value_idx_ty.clone(), (**key_ty).clone()));
+    let key_binder = match &head.ty {
+        Type::Fun { name, .. } => name.clone(),
+        _ => None,
+    };
     let grouped_values = emit_groupby(
         keys,
         (**c).clone(),
-        value_idx_ty,
+        (**refined_dom).clone(),
+        key_binder,
         (**key_ty).clone(),
         (**value_ty).clone(),
     );
 
-    let mut new_elts = vec![grouped_values];
-    new_elts.extend(elts.iter().skip(1).cloned());
-    Some(typed_compose(new_elts).with_ty(expr.ty.clone()))
+    Some(grouped_values)
 }
 
 /// Is `e` the element-extraction `__elem ▷ c ▷ key` — an application whose

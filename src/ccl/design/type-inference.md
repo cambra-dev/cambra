@@ -124,7 +124,23 @@ def identity(x):
 
 **Implemented today:**
 
-* **Let-polymorphism (functions).** A `let` whose RHS is a *function definition* is generalized: the RHS is typed one level deeper, generalized into a `PolyScheme` at the binding site, and instantiated freshly per use. Because Cambra targets fully-monomorphized output, generalization is paired with **monomorphization**, integrated into the coalesce walk (`infer::specialize_use`): a use of a generalized binding is specialized at first visit — clone + `freshen_expr_type_slots`, a two-way pin against the use's *live* instantiation type, and a re-entrant coalesce of the clone — and the binding's `let` rebuilds itself as the chain of demanded specializations. Specialization is keyed on the use's **instantiation identity** (a `SpecKey`, not a resolved type — see [Keying a specialization](#keying-a-specialization)), so uses that instantiate the definition identically **share** one definition. So `def f(x): x == x; f(1); f("foo")` type-checks and runs, a generator used at two element types compiles to two cached specializations (see F2), and a generalized UDF used only inside *another* generalized definition (poly-calls-poly) specializes by plain recursion — its use becomes concrete inside each wrapper clone's re-entrant walk. Levels are live (extrude fires on a genuine level mismatch).
+* **Let-polymorphism (functions).** A `let` whose RHS is a *function definition* is generalized:
+  the RHS is typed one level deeper, generalized into a `PolyScheme` at the binding site, and
+  instantiated freshly per use. Because Cambra targets fully-monomorphized output, generalization
+  is paired with **monomorphization**, integrated into the coalesce walk (`infer::specialize_use`):
+  a use of a generalized binding is specialized at first visit — clone +
+  `freshen_expr_type_slots`, a two-way pin against the use's *live* instantiation type, and a
+  re-entrant coalesce of the clone — and the binding's `let` rebuilds itself as the chain of
+  demanded specializations. Specialization is keyed on the use's **instantiation identity** (a
+  `SpecKey`, not a resolved type — see [Keying a specialization](#keying-a-specialization)), so
+  uses that instantiate the definition identically **share** one definition. So
+  `def f(x): x == x; f(1); f("foo")` type-checks and runs, a generator used at two element types
+  compiles to two cached specializations (see F2), and a generalized UDF used only inside
+  *another* generalized definition (poly-calls-poly) specializes by plain recursion — its use
+  becomes concrete inside each wrapper clone's re-entrant walk. Levels are live (extrude fires on
+  a genuine level mismatch). A `let` bound to a **collection** is not generalized, whatever its
+  RHS looks like — see
+  [Generalizing a collection is filter pushdown](#generalizing-a-collection-is-filter-pushdown).
 * **Two binder-annotation forms.** Exact `𝑥 : 𝑇` fixes the binder's type; bounded `𝑥 <: 𝑇` infers it under an upper bound. Both apply at `let` and at a function parameter, carried by `Type::BoundedHole` in annotation position and erased by `normalize_annotation`. See [Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded).
 * **Tagged variants.** The dual of records, natively supporting sum types and pattern-match exhaustiveness inside the structural solver (see §4). Both named (`.Tag(...)`) and positional (`++`-style) sums are handled.
 * **Lattice-carried refinements.** Refinements ride the lattice natively (compared by structural predicate equality) rather than being stitched on by a post-pass; see §4 and [`crate::ccl::infer::solver`]'s `# Refinements`.
@@ -721,9 +737,9 @@ A refinement is **required**, so `constrain_subtype` is strict for *concrete* ba
 
 For the reconcile to hold, the passes that *introduce* refined types post-inference (lambda-elim, join-planning) must leave each node's recorded type **reconstructable** — consistent with what the bottom-up rules rebuild from its children. These sites were emitting internally-inconsistent or under-refined nodes and are now fixed at the source rather than papered over by relaxing the check:
 
-* **Iterated / join-satisfying domains on producer codomains** (`planning`'s `set_codomain` / `refine_codomain`). An iteration source produces the refined domain it iterates, so its codomain is the site's refined domain `{D | p} ⇒ {D | p}` (mirroring `make_iterate`'s symmetry); a hash join folds its equi-conditions into the key structure with no residual `Restrict`, so the domain it yields would otherwise reach the body's `cast` *bare*. Surfacing `{D | p}` on the codomain — threaded down the combinator's whole function spine so the leaf builtin the Check pass rebuilds from agrees — keeps the `producer ≫ cast` adjacency refined-to-refined. Reconstructable because a combinator node carries its own function type and `emit_apply` returns *that* codomain verbatim. This is the post-inference counterpart of the inference-time `make_iterate`/`make_restrict`/`refine_with` refinements; trivially-true layers (`if True`) are dropped by the latter but reintroduced from the site domain so the body's `{D | true}` cast still matches.
+* **Iterated / join-satisfying extents on producers** (`planning`'s `set_extent` / `refine_extent`). An iteration source produces the refined domain it iterates, so it is symmetric `{D | p} ⇒ {D | p}` (`make_iterate`); a hash join folds its equi-conditions into the key structure with no residual `Restrict`, so the extent it yields would otherwise reach the body's `cast` *bare*. `refine_extent` refines **both sides** for that reason: a data function's domain *is* its data, so refining only the codomain would leave the domain claiming rows the join never produces — readable as a supertype under the contravariant reading of an arrow, but wrong for a collection, and it puts every enclosing type at odds with the site. Threaded down the combinator's whole function spine so the leaf builtin the Check pass rebuilds from agrees. Reconstructable because a combinator node carries its own function type and `emit_apply` returns *that* codomain verbatim. `make_restrict` builds its refinement directly rather than through `refine_with`, whose trivially-true degeneracy is right for `make_iterate` (an unrefined site should not print `{D | true}`) but wrong here: the caller emits one `restrict` per layer the *site* declared, so dropping a vacuous one leaves the source producing a bare extent while the site — and the body's `{D | true}` cast — still demand the refined one.
 
-* **Dependent groupby refinement** (`lambda_elim`'s cast-wrapped-lambda arm). `groupby` lowers to `λ k → cast({I | key(i) == k} ⇒ A, λ i → c(i))`. Because the key binder `k` is now a genuine **Pi binder** (the refinement closes over it but the *value* does not mention it), lambda-elim emits the Pi-const form `const(cast(c)) : (k) ⇒ ({I | i ▷ c ▷ key == k} ⇒ A)` — the `k`-dependence rides the refinement and is materialized as a `Restrict` at the iteration boundary (the dependent-application model, §4.5). Planning's pointful recogniser (`recognize_groupby_sites` / `convert_groupby_pointful`) matches that Pi-const source directly — identifying the key binder structurally as the free variable on one side of the predicate's equality — and emits the bucketize chain `converse(c ≫ key) ≫ map(c)`.
+* **Dependent groupby refinement** (`lambda_elim`'s cast-wrapped-lambda arm). `groupby` lowers to `λ k → cast({I | key(i) == k} ⇒ A, λ i → c(i))`. Because the key binder `k` is now a genuine **Pi binder** (the refinement closes over it but the *value* does not mention it), lambda-elim emits the Pi-const form `const(cast(c)) : (k) ⇒ ({I | i ▷ c ▷ key == k} ⇒ A)` — the `k`-dependence rides the refinement and is materialized as a `Restrict` at the iteration boundary (the dependent-application model, §4.5). Planning's pointful recogniser (`recognize_groupby_sites` / `convert_groupby_pointful`) matches that Pi-const source directly — identifying the key binder structurally as the free variable on one side of the predicate's equality — and emits the bucketize chain `converse(c ≫ key) ≫ map(c)` **at the source's own type** — `(k: K) ⤇ ({I | key(i) == k} ⤇ V)`, group refinement and Pi binder intact. A group holds the members sharing one key, and a data function's domain *is* its data, so typing a group as the bare `I` would claim every element belongs to every group; the binder has to ride the arrow as a Pi or the predicate's `k` dangles.
 * **`permute_domain` over a refined morphism** (`join_plan::convert_loop_join`). The combinator is polymorphic in the morphism it rearranges; its declared input type is the morphism's *actual* type (which may carry the join-condition refinement), not a bare `actual ⇒ actual`. Otherwise `apply_function` re-stamps the partially-applied combinator's recorded type to `fun(expr.ty, …)` (carrying the refinement) while its inner `PermuteDomain` builtin keeps the bare declaration — an inconsistent node the reconstruction can't rebuild, because the refinement rides the morphism's *invariant* domain⇒codomain position (where subtyping would demand `T <: {T|p}` *and* `{T|p} <: T` at once).
 
 #### Feed handles as an invariant `History` constructor (`Type::History { kind: Feed }`)
@@ -945,7 +961,7 @@ carriers (a `letrec` binder declared `Data` — an accumulator indexed by the
 iteration domain — whose declared type stamps the accumulator lambda's kind,
 same `stamp_kind_from` mechanism), aggregate consumers, and every `History`
 erasure. `Compute`: scalar/combinator builtins and ordinary user lambdas
-(capabilities) — a bare `λ` is built **concrete `Compute`** (`emit_lambda`),
+(capabilities) — a bare `λ` is built **concrete `Compute`** (`Expr::lambda`),
 because a lambda that denotes a collection is not born bare, it is one of the
 stamped `Data` forms above. A `FunKind::Var` is minted only where the kind is
 genuinely *inferred* — a function parameter or a freshened polymorphic scheme —
@@ -979,15 +995,28 @@ sets `kind` explicitly.
 > var that ends with `forced_compute ∧ forced_data` is the same `Compute <: Data`
 > error, surfaced at coalesce as `CoalesceError::ComputeWhereDataRequired`; a var
 > with only `forced_data` resolves to `Data` (a parameter used only as a collection).
-> The rejection is **emission-only**: the
-> post-inference check runs a *kind-blind* `ConstrainCache` (`new_kind_blind`),
-> because elimination canonicalizes a map's reconstructed kind to `Compute`
-> (`without_pi_names`) — denotation is preserved, kind representation is not, so
-> a kind-aware re-check would false-reject. `sum([x for x in xs])`,
-> comprehensions, and `groupby` type fine because they are stamped concrete
-> `Data` at construction (the provenance annotation / `refined_data_fun` cast
-> target). The same arm carries the data-domain invariance guard — see
+> The same arm carries the data-domain invariance guard — see
 > [Data domains are invariant](#data-domains-are-invariant) below.
+
+### Generalizing a collection is filter pushdown
+
+`should_generalize` requires a **capability**: a `Lambda` whose kind is not `Data`. The node test
+alone does not get there, because `groupby` lowers to a `Lambda` and its type where that predicate
+runs is still `(__gb_k: ?𝑘) ⤇ ((__gb_i: {?𝑖 | __elem ▷ xs ▷ key == __gb_k}) ⤇ ?𝑣)` — variables
+deeper than the binding level, so the level test admits it. Only the kind catches the one
+collection written as a function.
+
+Note *what* that domain refinement is: the dependent group-key predicate of
+[Dependent refinements via Pi types](#45-dependent-refinements-via-pi-types). Lookups at different
+keys pin `__gb_k` differently, and a `SpecKey`'s negative read follows exactly that
+`arg <: domain` edge — so specializing a grouping per use means **one copy of the source filtered
+to each reader's key**, which is filter pushdown. That wins when the predicates are selective and
+loses when readers are many and overlapping: `sum(g(1)) + sum(g(2)) + sum(g(3))` rebuilds the whole
+partition three times where one `Memo` serves all three. The choice is selectivity against reader
+count, and inference cannot make it — it runs before planning knows an extent, so the blanket
+refusal is the bounded-worst-case side until there is a cost model to consult. The same decision
+waits on the term side, where inlining a collection is
+[loop fusion](optimization.md#inlining-a-collection-is-loop-fusion).
 
 ### The domain join is a Σ
 

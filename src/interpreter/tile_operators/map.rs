@@ -41,6 +41,26 @@ impl MapResult {
         } = function_tiling
         {
             let input_tiling = input.tiling();
+            // A **scalar** input consumes `domain1`: applying a keyed collection
+            // at one key yields that key's collection, not a family of them, so
+            // the result is one currying level shallower than the stream cases
+            // below. This is the same hole `change_tiling_result` does not have
+            // on the non-curried side, where a `Scalar` input simply takes the
+            // function's codomain.
+            if let Tiling::Scalar(e) = input_tiling {
+                assert_eq!(
+                    e, fn_domain1,
+                    "a single-key lookup's key extent must match the collection's key extent"
+                );
+                return Self {
+                    tiling: Tiling::SealedFunction {
+                        domain: fn_domain2.clone(),
+                        codomain: Box::new(Tiling::Scalar(fn_codomain.clone())),
+                    },
+                    input,
+                    function,
+                };
+            }
             let input_domain = match input_tiling {
                 Tiling::SealedFunction {
                     domain: d,
@@ -206,6 +226,66 @@ impl TileProducer for MapResultProducer {
             ..
         } = function_tile
         {
+            // Get the correct extents from the CurriedFunction tiling.
+            // For CurriedFunction(A, B, C), domain2 is B and codomain is C.
+            let (f_domain2_extent, f_codomain_extent) = if let Tiling::CurriedFunction {
+                domain2: d2_extent,
+                codomain: c_extent,
+                ..
+            } = &f_tiling
+            {
+                (d2_extent.clone(), c_extent.clone())
+            } else {
+                panic!("Expected CurriedFunction tiling for CurriedFunction tile")
+            };
+
+            // A **scalar** input is a single-key lookup — `groupby(c, k)(v)`. It is
+            // the walk below at one key, yielding that key's group directly rather
+            // than a family of groups keyed by the input's domain.
+            if let Tile::Scalar(key_col) = input_tile {
+                let mut out_domain = ColumnValue::from_values(Vec::new(), &f_domain2_extent);
+                let mut out_codomain = ColumnValue::from_values(Vec::new(), &f_codomain_extent);
+                // A key absent from a **settled** grouping is a genuinely empty
+                // group; one absent from an unsettled grouping is simply not
+                // answered yet. Only `domain_predicate` separates those, which is
+                // the same thing the stream case's incomplete-domain set records.
+                let key = (key_col.len() == 1).then(|| key_col.index_at(0));
+                let settled = key.as_ref().is_some_and(|k| f_domain_predicate.contains(k));
+                if let Some(k) = key.filter(|_| settled) {
+                    for f_idx in 0..f_domain.len() {
+                        if f_domain.index_at(f_idx) != k {
+                            continue;
+                        }
+                        let group_start = offsets.index_at(f_idx).as_uint();
+                        let group_end = if f_idx + 1 < f_domain.len() {
+                            offsets.index_at(f_idx + 1).as_uint()
+                        } else {
+                            f_domain2.len()
+                        };
+                        for g in group_start..group_end {
+                            out_domain.append(ColumnValue::from_values(
+                                vec![f_domain2.index_at(g)],
+                                &f_domain2_extent,
+                            ));
+                            out_codomain.append(ColumnValue::from_values(
+                                vec![f_codomain.index_at(g)],
+                                &f_codomain_extent,
+                            ));
+                        }
+                    }
+                }
+                return Tile::SealedFunction {
+                    domain: out_domain,
+                    codomain: Box::new(Tile::Scalar(out_codomain)),
+                    domain_predicate: if settled {
+                        Predicate::True
+                    } else {
+                        Predicate::False
+                    },
+                    deleted: BitSet::new(),
+                };
+            }
+
             let Tile::SealedFunction {
                 domain,
                 codomain: input_codomain,
@@ -221,19 +301,6 @@ impl TileProducer for MapResultProducer {
             let codomain_values = match *input_codomain {
                 Tile::Scalar(ref cv) => cv.clone(),
                 _ => panic!("MapResult with CurriedFunction only supports Scalar codomains"),
-            };
-
-            // Get the correct extents from the CurriedFunction tiling
-            // For CurriedFunction(A, B, C), we need B and C extents for domain2 and codomain
-            let (f_domain2_extent, f_codomain_extent) = if let Tiling::CurriedFunction {
-                domain2: d2_extent,
-                codomain: c_extent,
-                ..
-            } = &f_tiling
-            {
-                (d2_extent.clone(), c_extent.clone())
-            } else {
-                panic!("Expected CurriedFunction tiling for CurriedFunction tile")
             };
 
             // Sort domain to ensure consistent ordering

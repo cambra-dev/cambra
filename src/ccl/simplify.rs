@@ -50,6 +50,7 @@
 use crate::ccl::ccl_utils::{PredMemo, is_builtin, walk_refined_predicates_mut};
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
+use crate::ccl::ty::FunKind;
 use crate::ccl::{
     ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, Lit, ProjKey, Type, TypedExpr,
     TypedExprNode,
@@ -417,13 +418,24 @@ fn compose_split_last(expr: &Expr) -> Option<(&[Expr], &Expr)> {
 ///
 /// Iterates over consecutive pairs `(elts[i], elts[i+1])` calling `detect`.
 /// On the first match, takes ownership of the compose, removes those two
-/// elements, calls `apply(left, right)` to produce replacement elements, and
-/// splices them back.  A single-element result is unwrapped to a bare
-/// expression. Returns `true` if a rule fired.
+/// elements, calls `apply(left, right, mint_kind)` to produce replacement
+/// elements, and splices them back.  A single-element result is unwrapped to a
+/// bare expression. Returns `true` if a rule fired.
+///
+/// `mint_kind` is the [`FunKind`] a rule should give a morphism it *mints* (as
+/// opposed to one it destructured out and returns unchanged). A replacement takes
+/// `left`'s domain, so at the **head** of the chain it spans the chain's own
+/// domain and is a collection exactly when the chain is; deeper in, it spans
+/// `left`'s and takes `left`'s kind.
+///
+/// The head case is the one that matters: `left` there is routinely `id`, the unit
+/// of composition, which contributes no kind of its own (`id ≫ xs` is `xs`, a
+/// collection). Reading the kind off `id` is what flattens a comprehension's
+/// columns to capabilities.
 fn try_pairwise_in_compose(
     expr: &mut Expr,
     detect: impl Fn(&Expr, &Expr) -> bool,
-    apply: impl FnOnce(Expr, Expr) -> Vec<Expr>,
+    apply: impl FnOnce(Expr, Expr, &FunKind) -> Vec<Expr>,
 ) -> bool {
     let TypedExprNode::Compose(elts) = &expr.node else {
         return false;
@@ -442,7 +454,16 @@ fn try_pairwise_in_compose(
     };
     let right = elts.remove(i + 1);
     let left = elts.remove(i);
-    let mut replacements = apply(left, right);
+    let kind_of = |t: &Type| match t {
+        Type::Fun { kind, .. } => kind.clone(),
+        _ => FunKind::Compute,
+    };
+    let mint_kind = if i == 0 {
+        kind_of(&ty)
+    } else {
+        kind_of(&left.ty)
+    };
+    let mut replacements = apply(left, right, &mint_kind);
     for (j, r) in replacements.drain(..).enumerate() {
         elts.insert(i + j, r);
     }
@@ -465,7 +486,7 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         |left, right| is_id(left) || is_id(right),
-        |left, right| {
+        |left, right, _mint_kind| {
             if is_id(&left) {
                 vec![right]
             } else {
@@ -519,12 +540,19 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
         // domain — sound only when `left` is a pure reshaping, which is exactly what
         // `narrows_domain_irrecoverably` rules out.
         |left, right| as_const(right).is_some() && !narrows_domain_irrecoverably(left),
-        |left, right| {
+        |left, right, mint_kind| {
             let Some(g) = as_const(&right) else {
                 unreachable!()
             };
+            // The collapsed constant takes `left`'s domain (see
+            // `try_pairwise_in_compose` for which kind that makes it).
             let new_const_ty = match (left.ty.domain(), right.ty.codomain()) {
-                (Some(dom), Some(cod)) => Type::fun(dom, cod),
+                (Some(dom), Some(cod)) => Type::Fun {
+                    name: None,
+                    kind: mint_kind.clone(),
+                    domain: Box::new(dom),
+                    codomain: Box::new(cod),
+                },
                 _ => Type::Hole,
             };
             let const_var_ty = fun_ty_or_hole(&g.ty, &new_const_ty);
@@ -540,7 +568,7 @@ fn try_product_beta_fst(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         |left, right| is_proj_idx(right, 0) && as_zip(left).is_some(),
-        |left, _proj| {
+        |left, _proj, _mint_kind| {
             let TypedExpr {
                 node: TypedExprNode::Apply { argument, .. },
                 ..
@@ -568,7 +596,7 @@ fn try_product_beta_fst(expr: &mut Expr) -> bool {
 /// equationally sound anywhere the pattern appears.
 ///
 /// In practice this fires on uncurried multi-arg UDF call sites: after
-/// `inline_non_iterable_lambdas` beta-reduces the outer user-parameter lambda,
+/// `inline_capability_lambdas` beta-reduces the outer user-parameter lambda,
 /// references like `__arg_pair.0` are left as `Apply(Tuple([list, n]),
 /// Proj(0))`.  Operator conversion's list-element path needs the projection
 /// folded, so this rule must fire before `operator_conversion` runs.
@@ -612,7 +640,7 @@ fn try_product_beta_snd(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         |left, right| is_proj_idx(right, 1) && as_zip(left).is_some(),
-        |left, _proj| {
+        |left, _proj, _mint_kind| {
             let TypedExpr {
                 node: TypedExprNode::Apply { argument, .. },
                 ..
@@ -644,7 +672,7 @@ fn try_ccc_universal(expr: &mut Expr) -> bool {
                             .is_some_and(|(cl, cr)| is_proj_idx(cl, 0) && as_curry(cr).is_some())
                 })
         },
-        |left, _apply| {
+        |left, _apply, _mint_kind| {
             let TypedExpr {
                 node: TypedExprNode::Apply { argument, .. },
                 ..
@@ -688,7 +716,7 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             is_builtin(right, Builtin::Apply)
                 && as_zip(left).is_some_and(|(_, r)| as_curry(r).is_some())
         },
-        |left, _apply| {
+        |left, _apply, mint_kind| {
             let TypedExpr {
                 node: TypedExprNode::Apply { argument, .. },
                 ..
@@ -714,14 +742,27 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             };
             // Type id: A → A where A = domain(g).  Type zip(id, g): A → (A, B)
             // where g: A → B.  Both fall back to Hole if g has no concrete type.
+            //
+            // Both are minted, and both span `g`'s domain, so they take
+            // `mint_kind` (see `try_pairwise_in_compose`). This is the site that
+            // makes `id`'s kind matter: `zip_pair_ty` reads the *first* operand's
+            // arrow, so a bare `Compute` here would propagate out through the zip
+            // to every consumer of the rewritten chain — `id` is the unit of
+            // composition and has no kind of its own to lend.
             let g_dom = g.ty.domain();
             let g_cod = g.ty.codomain();
+            let mint = |d: Type, c: Type| Type::Fun {
+                name: None,
+                kind: mint_kind.clone(),
+                domain: Box::new(d),
+                codomain: Box::new(c),
+            };
             let id_ty = g_dom
                 .as_ref()
-                .map(|a| Type::fun(a.clone(), a.clone()))
+                .map(|a| mint(a.clone(), a.clone()))
                 .unwrap_or(Type::Hole);
             let zip_ty = match (g_dom.as_ref(), g_cod.as_ref()) {
-                (Some(a), Some(c)) => Type::fun(a.clone(), Type::Tuple(vec![a.clone(), c.clone()])),
+                (Some(a), Some(c)) => mint(a.clone(), Type::Tuple(vec![a.clone(), c.clone()])),
                 _ => Type::Hole,
             };
             let id_node = id().with_ty(id_ty);
@@ -739,7 +780,7 @@ fn try_const_apply(expr: &mut Expr) -> bool {
             is_builtin(right, Builtin::Apply)
                 && as_zip(left).is_some_and(|(_, r)| as_const(r).is_some())
         },
-        |left, _apply| {
+        |left, _apply, _mint_kind| {
             let TypedExpr {
                 node: TypedExprNode::Apply { argument, .. },
                 ..
@@ -883,13 +924,14 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             // But don't match if both arms are just id (which would create unnecessary complexity)
             as_zip(left).is_some() && is_simplifying_zip(right)
         },
-        |left, right| {
+        |left, right, mint_kind| {
             let Some((g, h)) = as_zip(&right) else {
                 unreachable!()
             };
 
-            // Compute types for the composed expressions
-            let g_ty = match (&left.ty, &g.ty) {
+            // Each distributed arm is `left ≫ arm`, taking `left`'s domain (see
+            // `try_pairwise_in_compose` for which kind that makes it).
+            let arm_ty = |arm: &Expr| match (&left.ty, &arm.ty) {
                 (
                     Type::Fun { domain: dom, .. },
                     Type::Fun {
@@ -897,20 +939,16 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
                         codomain: cod,
                         ..
                     },
-                ) => Type::fun(dom.as_ref().clone(), cod.as_ref().clone()),
+                ) => Type::Fun {
+                    name: None,
+                    kind: mint_kind.clone(),
+                    domain: Box::new(dom.as_ref().clone()),
+                    codomain: Box::new(cod.as_ref().clone()),
+                },
                 _ => Type::Hole,
             };
-            let h_ty = match (&left.ty, &h.ty) {
-                (
-                    Type::Fun { domain: dom, .. },
-                    Type::Fun {
-                        domain: _,
-                        codomain: cod,
-                        ..
-                    },
-                ) => Type::fun(dom.as_ref().clone(), cod.as_ref().clone()),
-                _ => Type::Hole,
-            };
+            let g_ty = arm_ty(g);
+            let h_ty = arm_ty(h);
 
             let g_compose = Expr::compose(vec![left.clone(), g.clone()]).with_ty(g_ty);
             let h_compose = Expr::compose(vec![left.clone(), h.clone()]).with_ty(h_ty);
@@ -1026,7 +1064,7 @@ mod tests {
     use crate::ccl::ccl_utils::{
         apply_primitive, make_iterate, make_restrict, trivially_true_predicate,
     };
-    use crate::ccl::lambda_elim::{curry, zip_pair};
+    use crate::ccl::lambda_elim::{curry_at, zip_pair};
     use crate::ccl::{BaseType, Expr};
 
     fn var(s: &str) -> Expr {
@@ -1050,7 +1088,7 @@ mod tests {
     fn fun_ty(a: Type, b: Type) -> Type {
         Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
         }
@@ -1072,7 +1110,7 @@ mod tests {
         }
         let ty = Type::Fun {
             name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
+            kind: FunKind::Compute,
             domain: fun_tys.first().unwrap().0.clone(),
             codomain: fun_tys.last().unwrap().1.clone(),
         };
@@ -1301,7 +1339,7 @@ mod tests {
 
         let g = var("g").with_ty(g_ty.clone());
         let h = var("h").with_ty(h_ty.clone());
-        let curry_h = curry(h.clone()).with_ty(curry_h_ty.clone());
+        let curry_h = curry_at(h.clone(), curry_h_ty.clone());
 
         let zip = zip_pair(g.clone(), curry_h);
         let apply_ty = fun_ty(
@@ -1337,7 +1375,7 @@ mod tests {
 
         let g = var("g").with_ty(g_ty.clone());
         let h = var("h").with_ty(h_ty.clone());
-        let curry_h = curry(h.clone()).with_ty(curry_h_ty.clone());
+        let curry_h = curry_at(h.clone(), curry_h_ty.clone());
 
         let zip = zip_pair(g.clone(), curry_h);
         let apply_ty = fun_ty(

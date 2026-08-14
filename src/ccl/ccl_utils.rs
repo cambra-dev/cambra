@@ -393,10 +393,26 @@ pub fn flatten_trailing_value_case(mut branches: Vec<Branch>) -> Vec<Branch> {
 /// Builds a composition of expressions, setting the types based on the input
 /// expressions' types. The first expression's domain type is used as the domain type of the
 /// composition, and the last expression's codomain type is used as the codomain type of the composition.
+///
+/// The chain's **kind** is the head morphism's, matching the inference rule
+/// (`emit_compose`): a chain's domain is the head's domain, so the chain denotes
+/// a collection exactly when the head does. Mapping a function over a collection
+/// (`xs ≫ f`) leaves a collection; a chain of capabilities stays a capability.
 pub fn typed_compose(elts: Vec<Expr>) -> Expr {
     let d_ty = elts[0].ty.domain().unwrap().clone();
     let c_ty = elts[elts.len() - 1].ty.codomain().unwrap().clone();
-    Expr::compose(elts).with_ty(Type::fun(d_ty, c_ty))
+    // Not `fun_like`: only the *kind* comes from the head. A Pi binder belongs to
+    // the morphism that binds it, and the chain's codomain is the last morphism's.
+    let kind = match &elts[0].ty {
+        Type::Fun { kind, .. } => kind.clone(),
+        _ => crate::ccl::ty::FunKind::Compute,
+    };
+    Expr::compose(elts).with_ty(Type::Fun {
+        name: None,
+        kind,
+        domain: Box::new(d_ty),
+        codomain: Box::new(c_ty),
+    })
 }
 
 /// Construct the trivially-true predicate `λ _ → true` over the given domain,
@@ -451,10 +467,16 @@ pub fn make_iterate(predicate: Expr) -> Expr {
         .expect("iterate predicate must have a function type")
         .clone();
     let refined = refine_with(domain, &predicate);
+    // A **data** arrow, by the audit rule *an arrow is data iff it denotes a
+    // collection*: `iterate(p)` is the identity on the extent, so the extent
+    // *is* its data. This is what makes the kind decide whether iterating is
+    // acceptable at all — every chain led by an iteration source inherits `Data`
+    // from here (`typed_compose`), so a site whose value-producer is a mere
+    // capability is a kind error rather than something a later stamp papers over.
     apply_primitive(
         predicate,
         Builtin::Iterate,
-        Type::fun(refined.clone(), refined),
+        Type::data_fun(refined.clone(), refined),
     )
 }
 
@@ -505,7 +527,20 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
         "restrict upstream domain {upstream_dom} must match predicate domain {domain}",
     );
     // `{d : D | p(d)} ⇒ T` — refinement on the domain, value preserved.
-    let refined_stream = Type::fun(refine_with(domain, &predicate), value_ty);
+    // Narrowing an extent leaves it an extent, so the kind rides through from
+    // `upstream`: restricting a collection yields a collection, restricting a
+    // capability yields a capability.
+    //
+    // The refinement is built **without** `refine_with`'s trivially-true
+    // degeneracy: the caller emits one `restrict` per refinement layer the site
+    // declared, so dropping a layer here would leave the source producing a bare
+    // extent while the site — and the body's `cast` — still demand the refined
+    // one. A layer that is vacuous is the site's business, not this constructor's.
+    let refined_dom = Type::Refinement(
+        Box::new(domain.clone()),
+        Refinement::born(Rc::new(bare_predicate_of_fn(&domain, predicate.clone()))),
+    );
+    let refined_stream = Type::fun_like(&upstream_ty, refined_dom, value_ty);
     // The transformer node `restrict(p) : (D ⇒ T) ⇒ ({d : D | p(d)} ⇒ T)`.
     let restrict = apply_primitive(
         predicate,
@@ -515,44 +550,47 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
     apply_function(upstream, restrict, refined_stream)
 }
 
-/// Wrap a join morphism `D ⇒ C`'s **codomain** in a refinement carrying
-/// `predicate`, yielding `D ⇒ {C | predicate}` (the morphism unchanged when
-/// `predicate` is trivially true).
+/// Refine a join morphism's **extent** — both sides — with `predicate`, taking
+/// `D ⇒ C` to `{D | predicate} ⇒ {C | predicate}`.
 ///
-/// A hash join consumes its equi-join conditions structurally — into the
-/// key-lookup shape, with no residual `Restrict` — so the extent it produces
-/// reaches downstream consumers *bare* even though every element it yields
-/// satisfies the join condition. A `cast({C | predicate} ⇒ …)` that consumes
-/// the extent then sees `C ⊀ {C | predicate}` at the adjacency. Re-stamping
-/// the produced codomain with the join condition keeps both sides aligned —
-/// this is what a [`make_restrict`] residual does for the loop-join arm, made
-/// explicit for the equi-join case that has no residual to carry it.
+/// A hash join consumes its equi-join conditions structurally, into the key-lookup
+/// shape with no residual `Restrict`, so nothing in the term says which rows it
+/// yields. What it yields is nonetheless exactly the join-satisfying extent, and
+/// that is what the type must say: a data function's domain *is* its data, so the
+/// domain of this morphism is the refined extent, not the full product. Refining
+/// only the codomain would leave the domain claiming rows the join never produces
+/// — readable as a supertype under the contravariant reading of an arrow, but
+/// wrong for a collection, and it puts every enclosing type at odds with the site.
 ///
-/// A thin wrapper over [`set_codomain`] that refines the existing codomain in
-/// place rather than replacing it; see there for how the rewrite is threaded
-/// down the combinator's function spine so the post-planning `typecheck`
-/// reconstructs it. No runtime node is added (the combinators are type-level).
-pub fn refine_codomain(morphism: Expr, bare_predicate: &Expr) -> Expr {
-    let codomain = morphism
-        .ty
-        .codomain()
-        .expect("join morphism must be a function type")
-        .clone();
+/// The symmetric `{D | p} ⇒ {D | p}` shape is the same one [`make_iterate`] gives
+/// an iteration source, for the same reason: both denote the extent they sweep.
+///
+/// A thin wrapper over [`set_extent`] that refines the existing types in place
+/// rather than replacing them; see there for how the rewrite is threaded down the
+/// combinator's function spine so the post-planning `typecheck` reconstructs it.
+/// No runtime node is added (the combinators are type-level).
+pub fn refine_extent(morphism: Expr, bare_predicate: &Expr) -> Expr {
+    let Type::Fun {
+        domain, codomain, ..
+    } = &morphism.ty
+    else {
+        panic!("join morphism must be a function type, got {}", morphism.ty);
+    };
     // `bare_predicate` is already the bare `Bool`-over-`__elem` form (the extent's
     // membership condition, the same predicate the body's `cast` demands), so it
     // is stored directly — *not* via `refine_with`, which wraps a predicate
-    // *function*. Storing the identical bare term keeps the producer codomain
-    // structurally equal to the cast demand.
-    let refined = Type::Refinement(
-        Box::new(codomain),
-        Refinement::born(Rc::new(bare_predicate.clone())),
+    // *function*. Storing the identical bare term keeps the producer structurally
+    // equal to the cast demand.
+    let (d, c) = (
+        refine_with_bare((**domain).clone(), bare_predicate),
+        refine_with_bare((**codomain).clone(), bare_predicate),
     );
-    set_codomain(morphism, refined)
+    set_extent(morphism, d, c)
 }
 
 /// Re-stamp a morphism `D ⇒ _`'s codomain to `new_codomain`, yielding
 /// `D ⇒ new_codomain`. Used by join planning to surface the refined extent a
-/// producer yields (see [`refine_codomain`], and `wrap_with_iterate`'s
+/// producer yields (see [`refine_extent`], and `wrap_with_iterate`'s
 /// iteration source, whose codomain is its own refined domain).
 ///
 /// The morphism's result type is the trailing codomain of *every* node on its
@@ -563,13 +601,23 @@ pub fn refine_codomain(morphism: Expr, bare_predicate: &Expr) -> Expr {
 /// the new result must be threaded all the way down the spine, not just onto
 /// the outermost node — otherwise the post-planning `typecheck` sees an
 /// internally-inconsistent node it cannot reconstruct.
-pub fn set_codomain(mut morphism: Expr, new_codomain: Type) -> Expr {
+pub fn set_codomain(morphism: Expr, new_codomain: Type) -> Expr {
     let domain = morphism
         .ty
         .domain()
         .expect("morphism must be a function type")
         .clone();
-    let new_ty = Type::fun(domain, new_codomain);
+    set_extent(morphism, domain, new_codomain)
+}
+
+/// Re-stamp a morphism's whole extent — domain and codomain — threading the new
+/// type down the combinator's function spine. See [`set_codomain`], which fixes
+/// the domain, and [`refine_extent`], which refines both.
+pub fn set_extent(mut morphism: Expr, domain: Type, new_codomain: Type) -> Expr {
+    // `fun_like`: a codomain-only rewrite must not flip the arrow's kind or drop
+    // its Pi binder — restamping an iteration source's codomain leaves it the
+    // same collection.
+    let new_ty = Type::fun_like(&morphism.ty, domain, new_codomain);
     // Construction-time contract, not a user error: a non-`Apply` morphism
     // has no spine to restamp, and silently restamping only the outer type
     // would hand the post-planning typecheck an internally-inconsistent node
@@ -592,7 +640,7 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
         .domain()
         .expect("combinator node must be a function type")
         .clone();
-    let new_ty = Type::fun(domain, new_result);
+    let new_ty = Type::fun_like(&node.ty, domain, new_result);
     if let TypedExprNode::Apply { function, .. } = &mut node.node {
         restamp_spine_result(function, new_ty.clone());
     }
@@ -769,6 +817,35 @@ pub(crate) fn refine_with(base: Type, predicate: &Expr) -> Type {
     }
     let bare = bare_predicate_of_fn(&base, predicate.clone());
     Type::Refinement(Box::new(base), Refinement::born(Rc::new(bare)))
+}
+
+/// Is `bare` the trivially-true predicate in **bare** form, `__elem ▷ (true ▷ const)`?
+///
+/// [`is_trivially_true_predicate`] recognises the predicate *function*; a
+/// refinement stores it applied to the element binder, so it needs peeling first.
+pub fn is_trivially_true_bare_predicate(bare: &Expr) -> bool {
+    matches!(&bare.node, TypedExprNode::Apply { argument, function }
+        if matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
+            && is_trivially_true_predicate(function))
+}
+
+/// Refine `base` by an already-**bare** predicate (`__elem ▷ p`), degenerating to
+/// `base` when the predicate is trivially true.
+///
+/// The degeneracy is the same one [`refine_with`] applies to a predicate
+/// *function*, and it is not cosmetic: `{D | true}` and `D` describe the same
+/// extent, but they are distinct types, and a data domain is invariant — so a
+/// producer carrying the bare form cannot meet a consumer carrying the refined
+/// one. [`is_trivially_true_predicate`] only recognises the function `true ▷ const`;
+/// wrapped as `__elem ▷ (true ▷ const)` it needs peeling first.
+pub fn refine_with_bare(base: Type, bare_predicate: &Expr) -> Type {
+    if is_trivially_true_bare_predicate(bare_predicate) {
+        return base;
+    }
+    Type::Refinement(
+        Box::new(base),
+        Refinement::born(Rc::new(bare_predicate.clone())),
+    )
 }
 
 /// Count free occurrences of `name` in `expr`, including occurrences in

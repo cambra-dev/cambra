@@ -523,6 +523,11 @@ pub enum Type {
         /// collection (`Data`). See [`FunKind`]. The derived [`PartialEq`] compares it: a
         /// data function and a compute function over the same domain/codomain
         /// are genuinely different types (one carries data, one a capability).
+        ///
+        /// Nothing structural distinguishes the two — only the construction
+        /// site knows — so downstream the kind is *carried, never re-derived*:
+        /// a typing rule reads it off the node's own arrow and a rewrite copies
+        /// it from the arrow it replaces ([`Type::fun_like`]).
         kind: FunKind,
         /// The parameter (argument) type. Contravariant position.
         domain: Box<Type>,
@@ -1094,9 +1099,10 @@ impl Type {
                 domain, codomain, ..
             } => Type::Fun {
                 name: None,
-                // Canonicalize kind — elimination does not preserve it (see the
-                // doc above); comparing modulo it is what these structural asserts
-                // want.
+                // Canonicalize the kind so the comparison is about *shape*. Nothing
+                // here says elimination may lose it — `elim_lambda_kinded` carries a
+                // lambda's kind across — only that these asserts are checking
+                // domain/codomain structure and the Pi binder, not provenance.
                 kind: FunKind::Compute,
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),

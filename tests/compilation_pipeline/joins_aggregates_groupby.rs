@@ -347,9 +347,12 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     make_int_list(&[10, 20])
 )]
 #[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
+// The result arrow is **data** (`⤇`): a comprehension over a `groupby` is a
+// collection keyed by the group key, and elimination now carries that kind
+// across instead of rebuilding the arrow as a bare combinator `⇒`.
 #[case(
     "[sum(x) for x in groupby([1,2,3,4], \\y -> y // 2)]",
-    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⇒ Int)",
+    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Ints(vec![0, 1, 2]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))),
@@ -358,7 +361,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     })]
 #[case(
     "[x + y for x in [1,2,3] for y in [2,3,4,5] if x == y]",
-    "(iterate ≫ [1, 2, 3] ≫ (iterate ≫ [2, 3, 4, 5]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add):(([0, 2], [0, 3]) ⇒ Int)",
+    "(iterate ≫ [1, 2, 3] ≫ (iterate ≫ [2, 3, 4, 5]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add):({([0, 2], [0, 3]) | __elem ▷ ((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![1, 2])),
@@ -374,7 +377,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y for x in [1,2,3] for y in [2,3,4,5] if y == x]",
-    "(iterate ≫ [1, 2, 3] ≫ (iterate ≫ [2, 3, 4, 5]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add):(([0, 2], [0, 3]) ⇒ Int)",
+    "(iterate ≫ [1, 2, 3] ≫ (iterate ≫ [2, 3, 4, 5]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add):({([0, 2], [0, 3]) | __elem ▷ ((.1 ≫ [2, 3, 4, 5], .0 ≫ [1, 2, 3]) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![1, 2])),
@@ -390,7 +393,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y + 1 for x in [1,2,3] for y in [2,3,4,5] if y - 2 == x + 2]",
-    "(iterate ≫ ([1, 2, 3], 2 ▷ const) ▷ zip ≫ add ≫ (iterate ≫ ([2, 3, 4, 5], 2 ▷ const) ▷ zip ≫ sub) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast(((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add, 1 ▷ const) ▷ zip ≫ add):(([0, 2], [0, 3]) ⇒ Int)",
+    "(iterate ≫ ([1, 2, 3], 2 ▷ const) ▷ zip ≫ add ≫ (iterate ≫ ([2, 3, 4, 5], 2 ▷ const) ▷ zip ≫ sub) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast(((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add, 1 ▷ const) ▷ zip ≫ add):({([0, 2], [0, 3]) | __elem ▷ (((.1 ≫ [2, 3, 4, 5], 2 ▷ const) ▷ zip ≫ sub, (.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
@@ -406,7 +409,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == y and y == z]",
-    "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ (((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
@@ -426,7 +429,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 // The permute_domain step in convert_loop_join restores canonical domain order.
 #[case(
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z]",
-    "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2, 3] ≫ (iterate ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2, 3] ≫ (iterate ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ (((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
@@ -444,7 +447,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
-    "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):(([0, 0], {([0, 1], [0, 2]) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) ⇒ Int)",
+    "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):({([0, 0], {([0, 1], [0, 2]) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
@@ -463,7 +466,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and x + 1 == y]",
-    "((iterate ≫ [1] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .1 ≫ [1, 2, 3] ≫ (iterate ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ ([0] ▷ flatten_domain) ▷ map_domain ▷ (((.0 ≫ ([1], 1 ▷ const) ▷ zip ≫ add, .2 ≫ [1, 2]) ▷ zip ≫ eq) ▷ restrict) ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    "((iterate ≫ [1] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .1 ≫ [1, 2, 3] ≫ (iterate ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ ([0] ▷ flatten_domain) ▷ map_domain ▷ (((.0 ≫ ([1], 1 ▷ const) ▷ zip ≫ add, .2 ≫ [1, 2]) ▷ zip ≫ eq) ▷ restrict) ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ ((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], 1 ▷ const) ▷ zip ≫ add, .1 ≫ [1, 2]) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![])),
@@ -481,7 +484,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and y < 2]",
-    "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2, 3] ≫ (iterate ▷ ((([1, 2], 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2, 3] ≫ (iterate ▷ ((([1, 2], 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ ((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, (.1 ≫ [1, 2], 2 ▷ const) ▷ zip ≫ lt) ▷ zip ≫ and)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
@@ -522,7 +525,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 /// enabling both projections to type-check as `Int`.
 #[case(
     "[(x , z) for x in [1,2,3] for y in [(3, 30), (2, 20), (1, 10)] for z in [20, 10, 30] if z == y.1 and y.0 == x]",
-    "(iterate ≫ [1, 2, 3] ≫ ((iterate ≫ [(3, 30), (2, 20), (1, 10)] ≫ .1 ≫ (iterate ≫ [20, 10, 30]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [(3, 30), (2, 20), (1, 10)] ≫ .0) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .2 ≫ [20, 10, 30]) ▷ zip):(([0, 2], [0, 2], [0, 2]) ⇒ (Int, Int))",
+    "(iterate ≫ [1, 2, 3] ≫ ((iterate ≫ [(3, 30), (2, 20), (1, 10)] ≫ .1 ≫ (iterate ≫ [20, 10, 30]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [(3, 30), (2, 20), (1, 10)] ≫ .0) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .2 ≫ [20, 10, 30]) ▷ zip):({([0, 2], [0, 2], [0, 2]) | __elem ▷ (((.2 ≫ [20, 10, 30], .1 ≫ [(3, 30), (2, 20), (1, 10)] ≫ .1) ▷ zip ≫ eq, (.1 ≫ [(3, 30), (2, 20), (1, 10)] ≫ .0, .0 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ (Int, Int))",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 1, 2])),
@@ -567,5 +570,90 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
     assert_eq!(
         sort_sealed_function_by_domain(result),
         sort_sealed_function_by_domain(expected_result)
+    );
+}
+
+/// A **shared grouping**: bound once, used many times.
+///
+/// A `groupby` is a collection, so it is `let`-bound and compiled once behind a
+/// `Memo`, with each use taking a `FanOut` branch — the same treatment any other
+/// collection gets. Every case here uses one grouping more than once, which is
+/// what the sharing is for: the partition is built once however many keys are
+/// looked up or iterations run over it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Two iterations of one grouping, aggregating differently.
+#[case(
+    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])",
+    Value::Int(18)
+)]
+// Three, including a repeat of the first.
+#[case(
+    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])",
+    Value::Int(28)
+)]
+// A grouping iterated *and* looked up.
+#[case(
+    "g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))",
+    Value::Int(13)
+)]
+// Several lookups into one grouping, all served by the one partition.
+#[case(
+    "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))",
+    Value::Int(9)
+)]
+fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A key with **no group**, and one whose group is a single element.
+///
+/// A lookup walks the grouping for the key and slices out its rows; a key the
+/// grouping settled without ever seeing yields the empty group, which sums to
+/// zero rather than failing.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(3))", Value::Int(3))]
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(9))", Value::Int(0))]
+#[case(
+    "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(9))",
+    Value::Int(2)
+)]
+fn test_grouping_lookup_edges(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// The sharing [`test_shared_grouping`] *describes*, pinned.
+///
+/// Those value assertions hold whether the partition is bucketized once or
+/// rebuilt per use — a rebuild is slower, not wrong — so on their own they
+/// leave the property untested. One `converse` is the bucketize step, so one
+/// per program is the claim.
+///
+/// Note what this does **not** separate. Two routes deliver the sharing: a
+/// `groupby` is a value binding rather than a generalized function
+/// (`should_generalize`'s `FunKind::Data` arm), and, were it generalized,
+/// `SpecKey` dedup would collapse identically-instantiated uses to one
+/// specialization anyway. Every case here instantiates its uses identically,
+/// so it passes on either route and holds only the user-visible property. A
+/// case that told them apart would need uses that instantiate *differently*;
+/// no such shape is reachable while a grouping's type is fully monomorphic.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))")]
+#[case(
+    "g = groupby([1,2,3,4], \\y -> y // 2)\nsum([sum(x) for x in g]) + sum([max(x) for x in g])"
+)]
+#[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))")]
+fn test_grouping_built_once(#[case] code: &str) {
+    use cambra::ccl::symbolic::symbolic;
+
+    let mut ctx = GlobalContext::default();
+    let (expr, _result) = run_pipeline_with_ctx(&mut ctx, code);
+    let ccl = symbolic(&expr);
+    assert_eq!(
+        ccl.matches("converse").count(),
+        1,
+        "the grouping should be bucketized once however many uses it has; got:\n{ccl}"
     );
 }

@@ -47,6 +47,15 @@ pub(super) struct Binding {
 ///   *shared* — specializing a value would duplicate it, which breaks
 ///   structures that rely on sharing (e.g. a deferred-feed value used in
 ///   `y ++ y`).
+/// - **A capability, not a collection.** The rule above by *node*, restated by
+///   [`FunKind`](crate::ccl::ty::FunKind): a data function is a value binding
+///   however it is spelled. A `groupby` lowers to a `Lambda` whose type still
+///   carries variables deeper than `level` here, so the node-and-level test alone
+///   admits it — only the kind catches the one collection written as a function.
+///   Specializing a grouping per use is *filter pushdown* (its domain refinement
+///   is the dependent group-key predicate), so refusing it is a cost decision
+///   inference cannot make; see `src/ccl/design/type-inference.md`,
+///   "Generalizing a collection is filter pushdown".
 /// - **A genuinely polymorphic type** — some variable deeper than `level` to
 ///   quantify. A function with no quantifiable variable is already monomorphic,
 ///   so generalizing it would be a no-op.
@@ -60,7 +69,15 @@ pub(super) struct Binding {
 /// *per distinct element type*, which `inline` then leaves shared (cached)
 /// rather than duplicated.
 pub(super) fn should_generalize(def: &Expr, level: Level) -> bool {
-    matches!(def.node, TypedExprNode::Lambda { .. }) && type_level(&def.ty) > level
+    matches!(def.node, TypedExprNode::Lambda { .. })
+        && !matches!(
+            def.ty,
+            Type::Fun {
+                kind: crate::ccl::ty::FunKind::Data,
+                ..
+            }
+        )
+        && type_level(&def.ty) > level
 }
 
 /// Emission context for Cambra's inference algorithm (Pass 1).

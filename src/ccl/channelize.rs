@@ -110,6 +110,7 @@ use std::fmt;
 
 use std::rc::Rc;
 
+use crate::ccl::ccl_utils::make_cast;
 use crate::ccl::{
     BaseType, Branch, Expr, HistoryKind, Lit, Name, Pattern, Refinement, Type, TypedBinding,
     TypedExpr, TypedExprNode,
@@ -823,6 +824,15 @@ fn assert_no_type_residue(expr: &Expr) {
 /// Attach the filter-feed guard refinement to a channel source's *domain*,
 /// stamping the refined function type directly on `source.ty`.
 ///
+/// The refinement rides a **`cast`** wrapping the source: inference has already
+/// run, so nothing would consume an annotation, and the refinement needs a term
+/// to carry it. Planning reifies a domain refinement into the source's
+/// `restrict`, but only where it recognizes the site as not-yet-materialized,
+/// which is a question about the *term* ([`crate::ccl::planning`]'s
+/// `is_iteration_bearing`); refining `source.ty` in place would answer it with
+/// whatever node sits underneath, dropping the guard for a source that already
+/// reads as iterating.
+///
 /// A channel source is always a concrete function type by the time this runs, so
 /// the non-`Fun` case is a compiler bug rather than a shape to handle: the
 /// refinement has nowhere to go and the filter would be **silently dropped**
@@ -833,9 +843,14 @@ fn refine_source_domain(source: &mut Expr, refinement: Refinement) {
         domain, codomain, ..
     } = &source.ty
     {
-        let refined_domain = Type::Refinement(domain.clone(), refinement);
+        let refined_domain =
+            crate::ccl::ccl_utils::refine_with_bare((**domain).clone(), &refinement.predicate);
         let codomain = (**codomain).clone();
-        source.ty = Type::fun_like(&source.ty, refined_domain, codomain);
+        let target = Type::fun_like(&source.ty, refined_domain, codomain);
+        // `take` rather than clone: the source subtree can be arbitrarily large and
+        // the placeholder is overwritten on the next line.
+        let inner = std::mem::replace(source, Expr::lit(Lit::Unit));
+        *source = make_cast(inner, target.clone()).with_ty(target);
         return;
     }
     // Not a `debug_assert!`: the failure this guards is a *dropped filter*, which is
@@ -1886,7 +1901,7 @@ fn copair_type(feeds: &[Expr]) -> Type {
         }
     }
     match cod {
-        Some(c) => Type::fun(Type::Variant(tags), c),
+        Some(c) => Type::data_fun(Type::Variant(tags), c),
         None => Type::Hole,
     }
 }

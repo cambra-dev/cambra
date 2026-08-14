@@ -126,6 +126,16 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
     }
 
     expr.walk_children_mut(insert_iterate_recurse);
+    // Read before the match takes `expr.node` mutably. A `Data` domain is one the
+    // runtime sweeps, which is what makes a node an iteration site rather than a
+    // morphism waiting for an input.
+    let is_collection = matches!(
+        &expr.ty,
+        Type::Fun {
+            kind: crate::ccl::ty::FunKind::Data,
+            ..
+        }
+    );
     match &mut expr.node {
         // `FinalOrDefault` takes `Tuple([stream, default])` — only `stream`
         // is iterated; the `default` is a scalar consumed when the stream
@@ -173,16 +183,15 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         // The value forms of both collection merges: op-conversion compiles every
         // operand with `input=None`, so each is its own iteration site.
         //
-        // A disjoint join comes in two forms, and only this one is unfed. The fed
-        // form — the in-lambda `Case` fan-out — leads each arm with a **bare**
-        // restrictor builtin (`filter_values ≫ eᵢ`, ``variant_project(`c) ≫ eᵢ``),
-        // a morphism that op-conversion wires to the fanned-out input; the unfed
-        // form's arms are concrete collections. Wrapping a fed arm would hand
-        // `iterate` an input it rejects, so read the form off the arms.
+        // A merge comes in two forms, and only the **collection** one is unfed.
+        // The other — the in-lambda `Case` fan-out — is a *morphism* out of the
+        // eliminated binder, which op-conversion wires to the fanned-out input;
+        // wrapping one of its arms would hand `iterate` an input it rejects. The
+        // [`FunKind`](crate::ccl::ty::FunKind) is exactly that distinction, so ask
+        // it: a `Data` domain is one the runtime sweeps, which is what an
+        // iteration site is.
         TypedExprNode::Copair(operands) | TypedExprNode::DisjointJoin(operands)
-            if !operands
-                .iter()
-                .any(|o| matches!(head_of(o).node, TypedExprNode::Builtin(_))) =>
+            if is_collection =>
         {
             for operand in operands.iter_mut() {
                 wrap_with_iterate(operand);
@@ -422,28 +431,41 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     // re-mints (each rebuilt as a fresh `Rc`) compare equal structurally,
     // and nothing downstream depends on which term instance the codomain
     // holds.
-    //
-    // Stamp the site's kind `Data`: a `wrap_with_iterate` result is, by
-    // construction, an *iterated collection* — the runtime sweeps its domain
-    // extent — whatever (possibly `Compute`/var) kind the value-producer body
-    // inferred. This is what gives an identity comprehension `[x for x in xs]`
-    // display parity (`⤇`) with the bare list `xs` it denotes: both are the
-    // same collection, so both render the data arrow.
-    let site_ty = match site_ty {
-        Type::Fun {
+    let chain = typed_compose(elts);
+    // The site's kind is the chain's, which `typed_compose` took from the
+    // iteration source at its head — `Data`, because `make_iterate` builds the
+    // extent as a collection. Nothing is stamped here: the kind is what says the
+    // site may be iterated, so overwriting it would erase the very fact this
+    // rewrite depends on. It is also what gives an identity comprehension
+    // `[x for x in xs]` display parity (`⤇`) with the bare list it denotes.
+    let site_ty = match (site_ty, &chain.ty) {
+        (
+            Type::Fun {
+                name,
+                domain,
+                codomain,
+                ..
+            },
+            Type::Fun { kind, .. },
+        ) => Type::Fun {
             name,
-            domain,
-            codomain,
-            ..
-        } => Type::Fun {
-            name,
-            kind: crate::ccl::ty::FunKind::Data,
+            kind: kind.clone(),
             domain,
             codomain,
         },
-        other => other,
+        (other, _) => other,
     };
-    *expr = typed_compose(elts).with_ty(site_ty);
+    debug_assert!(
+        matches!(
+            site_ty,
+            Type::Fun {
+                kind: crate::ccl::ty::FunKind::Data,
+                ..
+            }
+        ),
+        "an iteration site is a collection: {site_ty}",
+    );
+    *expr = chain.with_ty(site_ty);
 }
 
 /// The morphism a `Compose` chain leads with, or the expression itself when it is
@@ -478,9 +500,11 @@ fn head_of(expr: &Expr) -> &Expr {
 ///    curried `Apply`, …) — op-conversion's catch-all arm rejects
 ///    `input=Some`.  Plus value-position `Tuple` / `Record` literals
 ///    (also reject `input=Some`).
-/// 3. Function-typed `Var` references — op-conversion's `Var` arm
-///    returns its bound op directly under `input=None`, and that bound
-///    op was itself iterate-wrapped at its let-bind site.
+/// 3. `Var` references bound to a **collection** ([`FunKind::Data`]) —
+///    op-conversion's `Var` arm returns its bound op directly under
+///    `input=None`, and that bound op was itself iterate-wrapped at its
+///    let-bind site. A capability-typed `Var` has no such wrapping behind it,
+///    so the kind is what distinguishes them rather than mere `Fun`-ness.
 pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
     let head = head_of(expr);
     match &head.node {
@@ -488,7 +512,17 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
         | TypedExprNode::DisjointJoin(_)
         | TypedExprNode::Tuple(_)
         | TypedExprNode::Record(_) => true,
-        TypedExprNode::Var(_) if matches!(&head.ty, Type::Fun { .. }) => true,
+        TypedExprNode::Var(_)
+            if matches!(
+                &head.ty,
+                Type::Fun {
+                    kind: crate::ccl::ty::FunKind::Data,
+                    ..
+                }
+            ) =>
+        {
+            true
+        }
         TypedExprNode::Apply { function, .. } => match builtin_at_function_position(function) {
             // `Iterate` is the canonical head marker; `Restrict` heads a
             // refined site whose upstream is itself iteration-bearing
@@ -627,11 +661,14 @@ mod tests {
 
     #[test]
     fn test_is_iteration_bearing_var_function_typed() {
-        // A function-typed `Var` references a let-bound iteration source
+        // A **collection**-typed `Var` references a let-bound iteration source
         // that was already iterate-wrapped at its bind site, so the
-        // dereference itself doesn't need another wrap.
-        let var_expr = var("xs").with_ty(fun_ty(Type::UIntRange(3), int_ty()));
-        assert!(is_iteration_bearing(&var_expr));
+        // dereference itself doesn't need another wrap. A capability-typed `Var`
+        // has no such wrapping behind it and is not iteration-bearing.
+        let coll = var("xs").with_ty(data_fun_ty(Type::UIntRange(3), int_ty()));
+        assert!(is_iteration_bearing(&coll));
+        let capability = var("f").with_ty(fun_ty(Type::UIntRange(3), int_ty()));
+        assert!(!is_iteration_bearing(&capability));
     }
 
     #[test]
@@ -845,13 +882,13 @@ mod tests {
     #[test]
     fn test_wrap_with_iterate_recurses_into_let() {
         // For a `Let { bound_expr: list, body: var }`, the helper should
-        // descend: wrap the bound list (function-typed) and walk into the
-        // body (the function-typed Var is already iteration-bearing, so
-        // no wrap there).  Critically, the Let itself is *not* prefixed
+        // descend: wrap the bound list and walk into the body (the
+        // collection-typed Var is already iteration-bearing, so no wrap
+        // there).  Critically, the Let itself is *not* prefixed
         // with iterate — that would force op-conversion's Let arm to
         // feed an unwanted input through to its bound expression.
         let int = int_ty();
-        let list_ty = fun_ty(Type::UIntRange(3), int);
+        let list_ty = data_fun_ty(Type::UIntRange(3), int);
         let mut expr = Expr::let_bind(
             "xs".to_string(),
             list_123(),
@@ -874,7 +911,7 @@ mod tests {
             "bound list should be iterate-led, got: {}",
             symbolic(bound_expr)
         );
-        // Body is a function-typed Var (iteration-bearing) ⇒ unchanged.
+        // Body is a collection-typed Var (iteration-bearing) ⇒ unchanged.
         assert!(matches!(body.node, TypedExprNode::Var(_)));
     }
 
@@ -1021,7 +1058,7 @@ mod tests {
         // iteration site.
         let int = int_ty();
         let mut expr =
-            Expr::new(TypedExprNode::Copair(vec![list_123(), list_123()])).with_ty(fun_ty(
+            Expr::new(TypedExprNode::Copair(vec![list_123(), list_123()])).with_ty(Type::data_fun(
                 Type::Variant(vec![
                     (FieldKey::Index(0), Type::UIntRange(3)),
                     (FieldKey::Index(1), Type::UIntRange(3)),
@@ -1036,6 +1073,34 @@ mod tests {
             assert!(
                 is_iterate_apply(chain_head(operand)),
                 "operand {i} should be iterate-led, got: {}",
+                symbolic(operand)
+            );
+        }
+    }
+
+    /// The **morphism** form of a merge is left alone.
+    ///
+    /// A `Case` fan-out eliminated inside a lambda is a morphism out of the
+    /// eliminated binder — op-conversion wires it to the fanned-out input — so
+    /// wrapping an arm would hand `iterate` an input it rejects. The
+    /// [`FunKind`](crate::ccl::ty::FunKind) is what says which form this is: a
+    /// `Data` domain is one the runtime sweeps, a `Compute` one is an argument
+    /// still to be supplied. The domains are indistinguishable structurally —
+    /// both are just types — which is why the kind has to carry it.
+    #[test]
+    fn test_insert_iterate_recurse_leaves_a_compute_kinded_merge_alone() {
+        let int = int_ty();
+        // Same shape as the collection case above, differing only in kind.
+        let mut expr = Expr::new(TypedExprNode::DisjointJoin(vec![list_123(), list_123()]))
+            .with_ty(Type::fun(int.clone(), int));
+        insert_iterate_recurse(&mut expr);
+        let TypedExprNode::DisjointJoin(operands) = &expr.node else {
+            panic!("expected DisjointJoin, got: {}", symbolic(&expr));
+        };
+        for (i, operand) in operands.iter().enumerate() {
+            assert!(
+                !is_iterate_apply(chain_head(operand)),
+                "operand {i} of a morphism-kinded merge must not be iterate-led, got: {}",
                 symbolic(operand)
             );
         }

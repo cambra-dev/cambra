@@ -956,15 +956,21 @@ The value-`Case` positions ride the same union-of-restricts:
 - **Data-typed selection** (`zs = xs if c else ys`) — *implemented*
   (`lambda_elim::build_value_case_fanout`): each arm's whole collection restricted by a
   constant-in-element gate, then assembled with `DisjointJoin` over the one domain the arms
-  share (see `design/type-inference.md`, "4.6 Data vs compute functions"). The join lands on
-  that domain and carries the type the type system gave the `Case`, so the strict `typecheck`
-  pass has no coproduct claim to undo. Arms at differing domains have no shared domain to land
-  on and inference rejects them, so the fan-out is only built at one domain; `Σ` is the recorded
-  design for the differing case (`design/type-inference.md`, "The domain join is a Σ"), where
+  share (see `design/type-inference.md`, "4.6 Data vs compute functions"). The gate rides a
+  **`cast`** whose target refines the arm's domain — the same shape a comprehension filter lowers
+  to — rather than being written onto the arm's type in place. Planning reifies a domain
+  refinement into the arm's `restrict`, but only at a site it recognizes as not-yet-materialized,
+  which is a question about the *term* (`is_iteration_bearing`); refining the type alone answers
+  it with whatever node sits underneath, so a literal arm would keep its gate while an arm naming
+  a collection (`xs`) would silently lose it and contribute its rows unconditionally. A refinement
+  no term carries is one nothing downstream is obliged to honour. The join lands on that domain
+  and carries the type the type system gave the `Case`, so the strict `typecheck` pass has no
+  coproduct claim to undo. Arms at differing domains have no shared domain to land on and
+  inference rejects them, so the fan-out is only built at one domain; `Σ` is the recorded design
+  for the differing case (`design/type-inference.md`, "The domain join is a Σ"), where
   **Σ-introduction** relates a structural `Variant`-domain type to the Σ — the compiled gated
   partition realizes the whole sum, by the finite-Σ = gated-coproduct iso with the legs' base
-  domains set-equal to the candidates. `elif`
-  chains flatten to one N-choice
+  domains set-equal to the candidates. `elif` chains flatten to one N-choice
   partition first. A conditional collection is *consumed* (aggregate, program result) via the
   `Σ <: Fun` subtyping rule, and *through a comprehension* by floating the source `Case` out of the
   map (see the comprehension bullet below).

@@ -13,6 +13,19 @@ use crate::{
     chl_parser::ast::{AssignTarget, CompClause, Comprehension, Expr as ChlExpr, Spanned},
 };
 
+/// The [`Type::SharedHole`] a source annotation uses to *name* its domain, if it
+/// does. Only a name is adoptable: a `Hole` domain is anonymous (nothing else can
+/// refer to it) and a concrete one is already settled.
+fn named_data_domain(ann: &Type) -> Option<Type> {
+    match ann {
+        Type::Fun { domain, .. } => match domain.as_ref() {
+            d @ Type::SharedHole(_) => Some(d.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Lower a CHL list comprehension to the CCL Lambda/Apply encoding.
 ///
 /// Handles three cases based on the number of generators and predicates:
@@ -212,6 +225,32 @@ pub(super) fn lower_list_comp(
     //   body = Apply(Lambda(iter_var_i, body), Apply(source_i, idx_arg_i))
     // All chain plumbing is manufactured encoding of the comprehension rule,
     // spanned to its generator's iterable.
+    // An **unfiltered single-generator** comprehension iterates *exactly* its
+    // source's domain, and nothing in the lowered shape says so: the `▷` records
+    // only `__iter_record <: dom(source)`, the direction an argument flows. One
+    // `SharedHole` states the equality, on the two positions the claim is about —
+    // the comprehension's own `data_fun` domain and the source's. Both are
+    // concrete `Data`, and a data domain is *invariant*
+    // (`src/ccl/design/type-inference.md`, "Data domains are invariant"), so the
+    // one-way `inferred <: ann` edge each annotation records becomes two and the
+    // two domains are identified rather than merely ordered.
+    //
+    // Restricted to this shape because it is the only one where the equality
+    // holds: a *filtered* comprehension's domain is `{D | pred}`, a strict subset
+    // of its source's, and a *multi-generator* one's is a product of all of them.
+    // Those keep their `Hole` and stay ordered by the argument edge alone.
+    //
+    // A source that already *names* its domain keeps that name: `groupby` stamps
+    // its own key `SharedHole` there (`lower_call`), and adopting it says the
+    // stronger, truer thing — this comprehension iterates the partition's keys —
+    // where minting a second id would overwrite the annotation carrying it.
+    let iter_dom = (single_gen && pred_op.is_none()).then(|| {
+        gen_sources[0]
+            .user_annotation
+            .as_ref()
+            .and_then(named_data_domain)
+            .unwrap_or_else(|| ctx.fresh_shared_hole())
+    });
     let lc = "lower.comprehension";
     let mut body_expr: Expr = body;
     for (i, (iter_var, source)) in gen_iter_vars
@@ -227,6 +266,14 @@ pub(super) fn lower_list_comp(
             let vref = ctx.tag_machinery(Expr::var(Name::raw(outer_var)), gspan, lc);
             let proj = ctx.tag_machinery(Expr::proj_index(i), gspan, lc);
             ctx.tag_machinery(Expr::apply(vref, proj), gspan, lc)
+        };
+        // Only stamp a source that did not already name its domain — otherwise the
+        // id came *from* its annotation and re-stamping would discard it.
+        let source = match &iter_dom {
+            Some(d) if source.user_annotation.is_none() => {
+                source.with_user_annotation(Type::data_fun(d.clone(), Type::Hole))
+            }
+            _ => source,
         };
         let indexed_source = ctx.tag_machinery(Expr::apply(idx_arg, source), gspan, lc);
         let per_elem = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body_expr), gspan, lc);
@@ -277,7 +324,7 @@ pub(super) fn lower_list_comp(
         // comprehensions above already get `Data` from their cast.)
         Ok(ctx.tag_machinery(
             Expr::lambda(outer_var, Type::Hole, body_expr)
-                .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
+                .with_user_annotation(Type::data_fun(iter_dom.unwrap_or(Type::Hole), Type::Hole)),
             comp.element.span,
             lc,
         ))
