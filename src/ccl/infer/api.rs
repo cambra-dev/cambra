@@ -344,7 +344,7 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
-    /// An operator was used at operand types no implementation of its trait
+    /// An operator was used at operand types no instance of its trait
     /// accepts — `1 > "a"`, `"a" - "b"`, or a polymorphic function applied at a type
     /// its body's operators cannot handle.
     ///
@@ -353,8 +353,8 @@ pub enum InferError {
     /// operator's requirement about the pair, so the message names the trait and
     /// what the position could have accepted rather than showing two types that
     /// "don't match".
-    NoTraitImpl {
-        /// The trait with no implementation left, e.g. `Addable`.
+    NoTraitInstance {
+        /// The trait with no instance left, e.g. `Addable`.
         trait_: String,
         /// The operand position (0-based) whose type ruled the last one out.
         position: u8,
@@ -552,7 +552,7 @@ impl std::fmt::Debug for InferError {
                 }
                 Ok(())
             }
-            InferError::NoTraitImpl {
+            InferError::NoTraitInstance {
                 trait_,
                 position,
                 found,
@@ -566,7 +566,7 @@ impl std::fmt::Debug for InferError {
                     .join(" or ");
                 write!(
                     f,
-                    "No {trait_} implementation for {at}: operand {} is {found}, but \
+                    "No {trait_} instance for {at}: operand {} is {found}, but \
                      the only type accepted there is {accepted}",
                     position + 1,
                 )
@@ -2034,7 +2034,7 @@ mod tests {
         // whose results are then added.
         //
         // The rejection comes from the `+`, and names the actual problem: no
-        // `Addable` implementation takes an `Int` and a `String`. It arrives during
+        // `Addable` instance takes an `Int` and a `String`. It arrives during
         // emission, as soon as both operand types are known — the operator states a
         // requirement about the *pair*, so it need not wait for the two to collide on
         // a shared variable at coalesce.
@@ -2048,10 +2048,10 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::NoTraitImpl { trait_, found, .. }
+                InferError::NoTraitInstance { trait_, found, .. }
                     if trait_ == "Addable" && **found == Type::Base(BaseType::String)
             )),
-            "expected NoTraitImpl for Addable at a String operand, got {errs:?}"
+            "expected NoTraitInstance for Addable at a String operand, got {errs:?}"
         );
     }
 
@@ -2619,12 +2619,12 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::NoTraitImpl { trait_, position, found, .. }
+                InferError::NoTraitInstance { trait_, position, found, .. }
                     if trait_ == "Negatable"
                         && *position == 0
                         && **found == Type::Base(BaseType::Bool)
             )),
-            "expected NoTraitImpl for Negatable at a Bool operand, got {errs:?}"
+            "expected NoTraitInstance for Negatable at a Bool operand, got {errs:?}"
         );
     }
 

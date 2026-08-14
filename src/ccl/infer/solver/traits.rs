@@ -7,7 +7,7 @@
 //!   `Addable`, `Orderable`. It is **not a type**: nothing here adds a [`Type`]
 //!   variant, a lattice point or a subtyping edge, and the type grammar and
 //!   `constrain_go`'s rules are untouched.
-//! - An **implementation** ([`TraitImpl`]) is one row of a trait's table: the types it
+//! - An **instance** ([`TraitInstance`]) is one row of a trait's table: the types it
 //!   accepts, and the types it associates with them — written
 //!   `Addable(Int, Int ⇝ Int)`, accepted types then `⇝` then associated ones.
 //! - An **associated type** ([`Assoc`]) is a type a trait *names* — `Output`, the type
@@ -15,14 +15,14 @@
 //!   none**: only a type that *depends* on the types satisfying the trait belongs here,
 //!   so `Equatable` associates nothing and its `Bool` rides the operator's signature
 //!   instead (`OperatorResult::Fixed`, in `src/ccl/infer/schemes.rs`).
-//! - An **obligation** ([`TraitObligation`]) is one recorded instance of a trait at
-//!   specific type positions: one **operand position** per argument the trait takes,
-//!   and one **associated position** per type it names — `Addable(𝐴, 𝐵 ⇝ 𝑂)` is the
-//!   shape to picture, though the arity and the association count are both the trait's.
-//!   It is a single claim with two halves, and neither alone is "the obligation": *the
-//!   operand positions are types some implementation accepts*, **and** *each associated
-//!   position is what that implementation associates*. Every position is an ordinary
-//!   inference variable, unrelated to the others.
+//! - An **obligation** ([`TraitObligation`]) is what one *use* of a trait records: the
+//!   demand that some instance fit the type positions at that use — one **operand
+//!   position** per argument the trait takes, and one **associated position** per type
+//!   it names. `Addable(𝐴, 𝐵 ⇝ 𝑂)` is the shape to picture, though the arity and the
+//!   association count are both the trait's. It is a single claim with two halves, and
+//!   neither alone is "the obligation": *the operand positions are types some instance
+//!   accepts*, **and** *each associated position is what that instance associates*.
+//!   Every position is an ordinary inference variable, unrelated to the others.
 //! - A **watch** is an obligation's attachment to an operand variable
 //!   ([`TraitObligation::watch`]), which is how a bound landing anywhere in the program
 //!   reaches it.
@@ -32,12 +32,12 @@
 //! operator's result, and so what lets a function be typechecked without consulting its
 //! call sites.
 //!
-//! # Discharge is incremental
+//! # Resolution is incremental
 //!
-//! An obligation is a monotone fact discharged as the graph fills in, the shape
+//! An obligation is a monotone fact resolved as the graph fills in, the shape
 //! [`FunKindVar`](crate::ccl::ty::FunKindVar) already uses for kinds; no phase runs
 //! "once everything is known". Each operand position carries a **candidate set** of
-//! implementations that only ever shrinks ([`TraitObligation::narrow`]), and each
+//! instances that only ever shrinks ([`TraitObligation::narrow`]), and each
 //! associated type is deposited on its position as an ordinary lower bound once every
 //! surviving candidate *agrees* on it ([`TraitObligation::try_deposit`]) — agreement,
 //! not a lone survivor. A deposit reaches **associated positions only**; nothing is
@@ -52,10 +52,11 @@
 //! `src/ccl/design/type-inference.md`, "Traits" is the design of record, and carries
 //! the arguments this module only acts on: why the constraint lattice cannot state an
 //! operator's requirement on its own, why a deposit is one-way and waits for agreement,
-//! why refinement transparency is permanent rather than a convenience, and what a trait
-//! would relate beyond types — associated *functions*, which the shape here allows and
-//! does not yet have. Which operators state which requirement, and which take a fixed
-//! result rather than an associated one, is `schemes.rs`'s business, not this module's.
+//! why refinement transparency is permanent rather than a convenience, what the tables
+//! hold and what that does *not* say about resolution, and what a trait would relate
+//! beyond types — associated *functions*, which the shape here allows and does not yet
+//! have. Which operators state which requirement, and which take a fixed result rather
+//! than an associated one, is `schemes.rs`'s business, not this module's.
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -70,7 +71,7 @@ use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
 /// with them.
 ///
 /// Closed and built-in. The set is the operators the language has, not a user
-/// vocabulary — but the implementations are already *data* ([`Trait::impls`]), so a
+/// vocabulary — but the instances are already *data* ([`Trait::instances`]), so a
 /// user-declared trait is a table extension rather than a new mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Trait {
@@ -112,20 +113,20 @@ pub enum Assoc {
     Output,
 }
 
-/// One implementation: the types it accepts, and what it associates with them.
+/// One instance: the types it accepts, and what it associates with them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraitImpl {
+pub struct TraitInstance {
     /// The accepted types, positionally. A slice rather than a fixed array because
     /// arity is the trait's business — every operator trait is binary today, and an
     /// `Orderable` over one type is the obvious next one.
     pub args: &'static [BaseType],
-    /// The types this implementation associates, by name. Empty for a trait that is
+    /// The types this instance associates, by name. Empty for a trait that is
     /// a pure requirement.
     pub assoc: &'static [(Assoc, BaseType)],
 }
 
-impl TraitImpl {
-    /// The type this implementation associates with `name`, if any.
+impl TraitInstance {
+    /// The type this instance associates with `name`, if any.
     pub fn assoc_ty(&self, name: Assoc) -> Option<&BaseType> {
         self.assoc.iter().find(|(n, _)| *n == name).map(|(_, t)| t)
     }
@@ -133,28 +134,28 @@ impl TraitImpl {
 
 /// `(Int, Int) ⇝ Int` and `(UInt, UInt) ⇝ UInt` — the numeric arithmetic rows every
 /// arithmetic trait shares.
-const NUMERIC: &[TraitImpl] = &[
-    TraitImpl {
+const NUMERIC: &[TraitInstance] = &[
+    TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
         assoc: &[(Assoc::Output, BaseType::Int)],
     },
-    TraitImpl {
+    TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
         assoc: &[(Assoc::Output, BaseType::UInt)],
     },
 ];
 
 /// The numeric rows plus `(String, String) ⇝ String`.
-const NUMERIC_OR_STRING: &[TraitImpl] = &[
-    TraitImpl {
+const NUMERIC_OR_STRING: &[TraitInstance] = &[
+    TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
         assoc: &[(Assoc::Output, BaseType::Int)],
     },
-    TraitImpl {
+    TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
         assoc: &[(Assoc::Output, BaseType::UInt)],
     },
-    TraitImpl {
+    TraitInstance {
         args: &[BaseType::String, BaseType::String],
         assoc: &[(Assoc::Output, BaseType::String)],
     },
@@ -167,20 +168,20 @@ const NUMERIC_OR_STRING: &[TraitImpl] = &[
 /// types the trait accepts, so it carries no information about them. Recording it as
 /// an associated type would state that the trait determines something it does not —
 /// the same mistake as an operator inheriting an operand's refinement, one level up.
-const COMPARABLE: &[TraitImpl] = &[
-    TraitImpl {
+const COMPARABLE: &[TraitInstance] = &[
+    TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
         assoc: &[],
     },
-    TraitImpl {
+    TraitInstance {
         args: &[BaseType::UInt, BaseType::UInt],
         assoc: &[],
     },
-    TraitImpl {
+    TraitInstance {
         args: &[BaseType::String, BaseType::String],
         assoc: &[],
     },
-    TraitImpl {
+    TraitInstance {
         args: &[BaseType::Bool, BaseType::Bool],
         assoc: &[],
     },
@@ -188,39 +189,40 @@ const COMPARABLE: &[TraitImpl] = &[
 
 /// Unary negation. One operand, and an `Output` that genuinely depends on it — the
 /// arity and association shape `Addable` and `Equatable` between them do not have.
-const NEGATABLE: &[TraitImpl] = &[TraitImpl {
+const NEGATABLE: &[TraitInstance] = &[TraitInstance {
     args: &[BaseType::Int],
     assoc: &[(Assoc::Output, BaseType::Int)],
 }];
 
 /// The bases an aggregate can order, matching `max`'s merge in `ccl/mod.rs`. Unary
 /// and associating nothing — the fourth shape, and a pure requirement.
-const ORDERED: &[TraitImpl] = &[
-    TraitImpl {
+const ORDERED: &[TraitInstance] = &[
+    TraitInstance {
         args: &[BaseType::Int],
         assoc: &[],
     },
-    TraitImpl {
+    TraitInstance {
         args: &[BaseType::UInt],
         assoc: &[],
     },
-    TraitImpl {
+    TraitInstance {
         args: &[BaseType::String],
         assoc: &[],
     },
 ];
 
 impl Trait {
-    /// This trait's implementations.
+    /// This trait's instances.
     ///
-    /// Every table is **homogeneous** — both operand positions accept the same base
-    /// — which is a fact about today's rows, not about the mechanism: nothing in
-    /// narrowing or deposit assumes it. The tables mirror
-    /// `interpreter::binop::apply_binop_column`, so a program this accepts is one
-    /// the interpreter can actually run. In particular there is no `Unit` row (the
-    /// interpreter cannot compare units) and no cross-base row, since `Int` and
-    /// `UInt` are unrelated leaves in the lattice and never join.
-    pub fn impls(self) -> &'static [TraitImpl] {
+    /// Every table holds base types only, and every row is **homogeneous** — both
+    /// operand positions accept the same base. Nothing in narrowing or deposit
+    /// assumes either, and both are answerable to
+    /// `interpreter::binop::apply_binop_column`, which these tables mirror so that a
+    /// program inference accepts is one the interpreter can run: hence no `Unit` row
+    /// (it cannot compare units) and no cross-base row (`Int` and `UInt` are
+    /// unrelated leaves that never join). What that does and does not say about the
+    /// mechanism is `src/ccl/design/type-inference.md`, "What the tables hold".
+    pub fn instances(self) -> &'static [TraitInstance] {
         match self {
             Trait::Addable => NUMERIC_OR_STRING,
             Trait::Subtractable | Trait::Multipliable | Trait::Divisible => NUMERIC,
@@ -247,9 +249,9 @@ impl Trait {
     /// The `(arity, associated names)` its first row declares.
     fn rows_agree_on(self) -> (usize, Vec<Assoc>) {
         let first = self
-            .impls()
+            .instances()
             .first()
-            .expect("every trait has at least one implementation");
+            .expect("every trait has at least one instance");
         (
             first.args.len(),
             first.assoc.iter().map(|(n, _)| *n).collect(),
@@ -283,9 +285,10 @@ pub struct TraitObligationId(pub(crate) u32);
 
 static OBLIGATION_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// One recorded instance of a trait at specific type positions, carrying both halves
-/// of the claim: that the operand positions are types some implementation accepts, and
-/// that each associated position is what that implementation associates. Arity and
+/// What one use of a trait records: the demand that some instance fit the type
+/// positions at that use. It carries both halves of the claim — that the operand
+/// positions are types some instance accepts, and that each associated position is
+/// what that same instance associates. Arity and
 /// association count are the trait's — `Addable(𝐴, 𝐵 ⇝ 𝑂)` is one shape,
 /// `Negatable(𝐴 ⇝ 𝑂)` and `Equatable(𝐴, 𝐵)` are the others.
 /// See this module's *Vocabulary*.
@@ -303,9 +306,9 @@ pub struct TraitObligation {
     pub uid: TraitObligationId,
     /// The trait being required.
     pub trait_: Trait,
-    /// The implementations still consistent with everything seen so far.
+    /// The instances still consistent with everything seen so far.
     /// Monotonically shrinking; empty is unrepresentable (it is the error).
-    candidates: RefCell<Vec<TraitImpl>>,
+    candidates: RefCell<Vec<TraitInstance>>,
     /// The type positions this obligation associates, one per name the trait
     /// declares. Empty for a trait that is a pure requirement — the mechanism then
     /// still narrows and still rejects, it simply determines nothing.
@@ -327,12 +330,12 @@ struct AssocPosition {
 
 impl TraitObligation {
     /// Record an instance of `trait_` whose associated names stand at the given type
-    /// positions, with every implementation still a candidate.
+    /// positions, with every instance still a candidate.
     pub fn new(trait_: Trait, assoc: Vec<(Assoc, Type)>) -> Rc<TraitObligation> {
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_,
-            candidates: RefCell::new(trait_.impls().to_vec()),
+            candidates: RefCell::new(trait_.instances().to_vec()),
             assoc: assoc
                 .into_iter()
                 .map(|(name, ty)| AssocPosition {
@@ -395,7 +398,7 @@ impl TraitObligation {
     }
 
     /// The candidates still live, for diagnostics and tests.
-    pub fn candidates(&self) -> Vec<TraitImpl> {
+    pub fn candidates(&self) -> Vec<TraitInstance> {
         self.candidates.borrow().clone()
     }
 
@@ -419,13 +422,13 @@ impl TraitObligation {
         }
     }
 
-    /// Reject a shape no implementation can accept at position `pos`.
+    /// Reject a shape no instance can accept at position `pos`.
     ///
     /// Distinct from [`narrow`](Self::narrow) failing: nothing is *ruled out* here,
     /// because there was never a candidate to rule out. The contribution is simply
     /// outside the vocabulary the trait is defined over.
     fn reject(self: &Rc<Self>, pos: u8, found: &Type) -> Result<(), ConstrainError> {
-        Err(ConstrainError::NoTraitImpl {
+        Err(ConstrainError::NoTraitInstance {
             trait_: self.trait_,
             position: pos,
             found: found.clone(),
@@ -438,7 +441,7 @@ impl TraitObligation {
         })
     }
 
-    /// Restrict position `pos` to implementations accepting `base`, then deposit the
+    /// Restrict position `pos` to instances accepting `base`, then deposit the
     /// output if that settles it.
     ///
     /// Monotone and idempotent: narrowing by a base already consistent with every
@@ -460,7 +463,7 @@ impl TraitObligation {
             // reach; it cannot accept the contribution, so it drops out too.
             candidates.retain(|i| i.args.get(pos as usize) == Some(base));
             if candidates.is_empty() {
-                return Err(ConstrainError::NoTraitImpl {
+                return Err(ConstrainError::NoTraitInstance {
                     trait_: self.trait_,
                     position: pos,
                     found: Type::Base(base.clone()),
@@ -493,7 +496,7 @@ impl TraitObligation {
         Ok(())
     }
 
-    /// The type every surviving implementation associates with `name`, or `None` if
+    /// The type every surviving instance associates with `name`, or `None` if
     /// they disagree — the condition a deposit waits on.
     fn agreed_assoc(&self, name: Assoc) -> Option<BaseType> {
         let candidates = self.candidates.borrow();
@@ -609,7 +612,7 @@ pub fn verify_narrowing_is_complete(resolve: impl Fn(&Type) -> Option<Type>) {
 ///
 /// The distinction between the last two variants is the whole point. Both narrow
 /// nothing, but for opposite reasons: one is a position the program has not
-/// determined *yet*, and one is a shape no implementation can *ever* accept.
+/// determined *yet*, and one is determined, at a type no instance accepts.
 /// Treating them alike is what let `(1, 2) == (3, 4)` type-check — a tuple narrows
 /// nothing, and a trait with no associated type has nothing left unresolved for a
 /// later wall to catch, so the program passed.
@@ -620,9 +623,15 @@ pub enum Offered<'a> {
     /// whose payload arrives separately (a `Feed`; a `Mut` is dereferenced before the
     /// variable arms, so it never reaches a watch).
     Unknown,
-    /// A concrete shape that is not a base and never will be. No implementation
-    /// accepts it, so the requirement fails here rather than silently going
-    /// undischarged.
+    /// A determined type that is not a base leaf — a tuple, record, variant or
+    /// function.
+    ///
+    /// Every instance is keyed on a base ([`TraitInstance::args`]), so nothing in
+    /// any table accepts it and the requirement fails here rather than silently
+    /// going unresolved. That the tables hold only bases is their *content*, not a
+    /// property of resolution: giving `Equatable` a variant would add rows, and
+    /// would split this variant into the shapes a row can key on — it would not
+    /// change how narrowing works.
     NotABase,
 }
 
@@ -780,7 +789,7 @@ mod tests {
     use crate::ccl::infer::solver::fresh_var;
 
     /// Both narrowing orders reach the same answer — the property that lets the
-    /// obligation be discharged incrementally instead of by a final sweep.
+    /// obligation be resolved incrementally instead of by a final sweep.
     #[rstest::rstest]
     #[case(&[(0, BaseType::Int), (1, BaseType::Int)])]
     #[case(&[(1, BaseType::Int), (0, BaseType::Int)])]
@@ -807,8 +816,8 @@ mod tests {
     }
 
     /// One known operand is enough to settle the output when every remaining
-    /// implementation agrees on it — without concluding anything about the *other*
-    /// operand, which stays open for a future heterogeneous implementation.
+    /// instance agrees on it — without concluding anything about the *other*
+    /// operand, which stays open for a future heterogeneous instance.
     #[test]
     fn one_known_operand_settles_an_agreed_output() {
         let out = fresh_var(0);
@@ -825,7 +834,7 @@ mod tests {
         );
         assert_eq!(
             ob.candidates(),
-            vec![TraitImpl {
+            vec![TraitInstance {
                 args: &[BaseType::Int, BaseType::Int],
                 assoc: &[(Assoc::Output, BaseType::Int)],
             }]
@@ -856,10 +865,10 @@ mod tests {
         );
     }
 
-    /// Operands that no implementation accepts together are rejected, and the error
+    /// Operands that no instance accepts together are rejected, and the error
     /// says what the position could still have taken.
     #[test]
-    fn incompatible_operands_have_no_implementation() {
+    fn incompatible_operands_have_no_instance() {
         let out = fresh_var(0);
         let ob = TraitObligation::new(Trait::Orderable, vec![(Assoc::Output, out)]);
         let mut cache = ConstrainCache::new();
@@ -870,14 +879,14 @@ mod tests {
             .narrow(1, &BaseType::String, &mut cache)
             .expect_err("nothing compares an Int to a String");
 
-        let ConstrainError::NoTraitImpl {
+        let ConstrainError::NoTraitInstance {
             trait_,
             position,
             found,
             accepted,
         } = err
         else {
-            panic!("expected NoTraitImpl, got {err:?}");
+            panic!("expected NoTraitInstance, got {err:?}");
         };
         assert_eq!(trait_, Trait::Orderable);
         assert_eq!(position, 1);
@@ -885,7 +894,7 @@ mod tests {
         assert_eq!(accepted, vec![BaseType::Int]);
     }
 
-    /// Every implementation of a trait agrees on its **shape** — how many types it is
+    /// Every instance of a trait agrees on its **shape** — how many types it is
     /// over, and which types it associates.
     ///
     /// [`Trait::arity`] and [`Trait::assocs`] read that shape off the first row, and
@@ -905,7 +914,7 @@ mod tests {
             Trait::Comparable,
         ] {
             let (arity, assocs) = (trait_.arity(), trait_.assocs());
-            for row in trait_.impls() {
+            for row in trait_.instances() {
                 assert_eq!(
                     row.args.len(),
                     arity,

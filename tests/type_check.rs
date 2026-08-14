@@ -217,15 +217,16 @@ fn each_trait_shape_types_a_real_program(#[case] code: &str, #[case] expected: T
     assert_eq!(infer_program(code), expected);
 }
 
-/// Negation is a trait, so an operand it has no implementation for is rejected as a
-/// missing implementation rather than as a mismatch against a hardcoded domain.
+/// Negation is a trait, so an operand it has no instance for is rejected as a
+/// missing instance rather than as a mismatch against a hardcoded domain.
 #[test]
-fn negation_rejects_an_operand_with_no_implementation() {
+fn negation_rejects_an_operand_with_no_instance() {
     let errs = infer_program_err(r#"-"a""#);
     assert!(
-        errs.iter()
-            .any(|e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == "Negatable")),
-        "expected NoTraitImpl for Negatable, got {errs:?}"
+        errs.iter().any(
+            |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Negatable")
+        ),
+        "expected NoTraitInstance for Negatable, got {errs:?}"
     );
 }
 
@@ -247,8 +248,8 @@ fn a_composite_satisfies_no_trait(#[case] code: &str, #[case] expected: &str) {
     let errs = infer_program_err(code);
     assert!(
         errs.iter()
-            .any(|e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == expected)),
-        "expected NoTraitImpl for {expected}, got {errs:?}"
+            .any(|e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == expected)),
+        "expected NoTraitInstance for {expected}, got {errs:?}"
     );
 }
 
@@ -259,9 +260,10 @@ fn a_composite_satisfies_no_trait(#[case] code: &str, #[case] expected: &str) {
 fn a_base_outside_the_table_is_rejected() {
     let errs = infer_program_err("() == ()");
     assert!(
-        errs.iter()
-            .any(|e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == "Equatable")),
-        "expected NoTraitImpl for Equatable, got {errs:?}"
+        errs.iter().any(
+            |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Equatable")
+        ),
+        "expected NoTraitInstance for Equatable, got {errs:?}"
     );
 }
 
@@ -276,13 +278,13 @@ fn a_refinement_does_not_make_a_type_satisfy_a_trait() {
     let errs = infer_program_err(r#""a" - "b""#);
     assert!(
         errs.iter().any(
-            |e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == "Subtractable")
+            |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Subtractable")
         ),
-        "expected NoTraitImpl for Subtractable, got {errs:?}"
+        "expected NoTraitInstance for Subtractable, got {errs:?}"
     );
 }
 
-/// Operands no implementation accepts together are rejected — including for a
+/// Operands no instance accepts together are rejected — including for a
 /// **comparison**, whose result type is `Bool` whatever the operands are.
 ///
 /// That last part is the whole reason the requirement is recorded as an obligation
@@ -293,12 +295,12 @@ fn a_refinement_does_not_make_a_type_satisfy_a_trait() {
 #[case::compare_int_string(r#"1 > "a""#)]
 #[case::equate_int_bool("1 == True")]
 #[case::add_int_bool("1 + True")]
-fn operands_no_implementation_accepts_are_rejected(#[case] code: &str) {
+fn operands_no_instance_accepts_are_rejected(#[case] code: &str) {
     let errs = infer_program_err(code);
     assert!(
         errs.iter()
-            .any(|e| matches!(e, InferError::NoTraitImpl { .. })),
-        "expected NoTraitImpl, got {errs:?}"
+            .any(|e| matches!(e, InferError::NoTraitInstance { .. })),
+        "expected NoTraitInstance, got {errs:?}"
     );
 }
 
@@ -321,7 +323,7 @@ fn misusing_an_operator_result_is_an_ordinary_diagnostic(#[case] code: &str) {
 }
 
 /// A generalized function carries its operators' requirements into its scheme, so it
-/// typechecks on its own and each use discharges its **own** copy.
+/// typechecks on its own and each use resolves its **own** copy.
 ///
 /// `f = \a -> \b -> a + b` is `∀A B O. (Addable(A, B) ⇝ O) ⇒ A → B → O`. Two uses at
 /// different types both succeed, which is the property that fails if instantiations
@@ -340,7 +342,7 @@ fn a_generalized_function_instantiates_its_operator_requirements() {
     );
 }
 
-// An obligation is discharged by *delivery*: a concrete type reaching an operand
+// An obligation is resolved by *delivery*: a concrete type reaching an operand
 // variable has to reach the obligation watching it. Production code writes a
 // variable's lower bounds in exactly four places — `constrain_go`'s two variable
 // arms, `extrude`'s proxy seeding, and `freshen_above`'s clone — and there is a case
@@ -478,7 +480,7 @@ fn register_value_type(code: &str) -> Type {
     s := s + "b"
     s
 "#}, "String")]
-// A comparison cycle: its output is `Bool` for every implementation, so it is settled
+// A comparison cycle: its output is `Bool` for every instance, so it is settled
 // at birth and the cycle costs it nothing. Nothing else in the suite writes one.
 #[case::self_comparison(indoc! {r#"
     b := True
@@ -510,7 +512,7 @@ fn a_cycle_does_not_hide_an_operand_conflict() {
 }
 
 /// The requirement travels with the function, so applying it at a type no
-/// implementation accepts is rejected at the call site.
+/// instance accepts is rejected at the call site.
 #[test]
 fn a_generalized_function_rejects_a_use_its_trait_forbids() {
     let errs = infer_program_err(indoc! {r#"
@@ -519,9 +521,9 @@ fn a_generalized_function_rejects_a_use_its_trait_forbids() {
     "#});
     assert!(
         errs.iter().any(
-            |e| matches!(e, InferError::NoTraitImpl { trait_, .. } if trait_ == "Subtractable")
+            |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Subtractable")
         ),
-        "expected NoTraitImpl for Subtractable, got {errs:?}"
+        "expected NoTraitInstance for Subtractable, got {errs:?}"
     );
 }
 
@@ -1523,7 +1525,7 @@ fn test_self_application_types() {
 /// information is the program's to supply.
 ///
 /// `O` is a different matter: the obligation is its only source, and every
-/// implementation whose second operand is `Int` returns `Int`, so it resolves. That
+/// instance whose second operand is `Int` returns `Int`, so it resolves. That
 /// is a fact about today's table rather than a stable property — adding
 /// `Addable(Float, Int) ⇝ Float` would leave two candidates whose outputs disagree
 /// and open the result too, which is why this asserts the codomain per case rather

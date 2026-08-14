@@ -297,7 +297,7 @@ impl Typing for InferCtx {
         for (i, position) in positions.iter().enumerate() {
             obligation.watch(position, i as u8);
         }
-        // A trait whose implementations already agree settles here, before any
+        // A trait whose instances already agree settles here, before any
         // operand is known — the ordinary "all candidates agree" rule reaching its
         // condition immediately, not a special case.
         obligation

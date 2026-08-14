@@ -94,8 +94,8 @@ pub struct FreshenCache {
     /// Original trait obligation → its per-instantiation copy, for the same reason
     /// as [`kind_vars`](Self::kind_vars): a generalized function's operator
     /// requirements are quantified along with the variables they constrain, so each
-    /// use discharges *its own* copy. `λ 𝑥 → 𝑥 + 1` generalizes to
-    /// `∀A O. (A : Addable(A, Int)) ⇒ A → O`; sharing one obligation across uses
+    /// use resolves *its own* copy. `λ 𝑥 → 𝑥 + 1` generalizes to
+    /// `∀A O. A ⇒ O requires Addable(A, Int ⇝ O)`; sharing one obligation across uses
     /// would let a `String` use narrow the `Int` use's candidate set to nothing.
     pub obligations: HashMap<TraitObligationId, Rc<TraitObligation>>,
 }

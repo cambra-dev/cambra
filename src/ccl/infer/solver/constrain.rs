@@ -109,18 +109,18 @@ pub enum ConstrainError {
         /// The domain demanded at the position.
         rhs: Type,
     },
-    /// An operand's type ruled out the last implementation of a trait an operator
+    /// An operand's type ruled out the last instance of a trait an operator
     /// requires — `1 > "a"`, or `\x -> x + 1` applied to a string.
     ///
     /// Raised from the bound-recording arm that delivered the offending type, so it
     /// fires the moment the program states the conflict rather than at a later phase
     /// that goes looking for it.
-    NoTraitImpl {
-        /// The trait with no implementation left.
+    NoTraitInstance {
+        /// The trait with no instance left.
         trait_: Trait,
         /// The operand position whose type ruled the last one out.
         position: u8,
-        /// The type that arrived there — a base no implementation accepts, or a
+        /// The type that arrived there — a base no instance accepts, or a
         /// shape that is not a base at all.
         found: Type,
         /// What that position could still have accepted, given everything already

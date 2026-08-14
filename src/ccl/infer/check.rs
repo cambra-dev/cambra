@@ -135,7 +135,7 @@ impl Typing for CheckCtx {
         // corrupt types**, which is why a Check error that is not `UnresolvedInfer`
         // panics at the wall rather than being reported. So this firing means
         // inference has a hole or a later pass rewrote the tree into something
-        // ill-typed — and it reuses `NoTraitImpl` for the same reason
+        // ill-typed — and it reuses `NoTraitInstance` for the same reason
         // [`Typing::require_sub`] reuses `TypeMismatch` here: the error vocabulary
         // describes the inconsistency, the wall supplies the interpretation. Measured
         // across the suite: it never fires.
@@ -148,7 +148,7 @@ impl Typing for CheckCtx {
             return Ok(assoc.map(|_| self.fresh()));
         };
         let matched = trait_
-            .impls()
+            .instances()
             .iter()
             .find(|i| i.args.len() == bases.len() && i.args.iter().eq(bases.iter().copied()));
         match matched {
@@ -160,17 +160,17 @@ impl Typing for CheckCtx {
             })),
             None => {
                 // Blame the last position: with the earlier ones fixed, it is the one
-                // whose type ruled the implementation out.
+                // whose type ruled the instance out.
                 let position = bases.len().saturating_sub(1);
                 let prefix: Vec<BaseType> =
                     bases[..position].iter().map(|b| (*b).clone()).collect();
                 let accepted: Vec<Type> = trait_
-                    .impls()
+                    .instances()
                     .iter()
                     .filter(|i| i.args.len() == bases.len() && i.args[..position] == prefix[..])
                     .filter_map(|i| i.args.get(position).cloned().map(Type::Base))
                     .collect();
-                let located = self.raise(InferError::NoTraitImpl {
+                let located = self.raise(InferError::NoTraitInstance {
                     trait_: trait_.to_string(),
                     position: position as u8,
                     found: Box::new(Type::Base(bases[position].clone())),

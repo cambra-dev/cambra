@@ -374,7 +374,7 @@ mod tests {
     /// `Comparable(γ)` says it — a **pure requirement**, associating nothing, since
     /// the scheme already supplies the result type. A codomain the program never
     /// determines is still accepted here, as an unresolved variable rather than a
-    /// missing implementation; that is the ordinary limit of narrowing, not a gap
+    /// missing instance; that is the ordinary limit of narrowing, not a gap
     /// specific to `max`.
     ///
     /// Closes `type-checker-traits-comparability` (P3) in the project vault.
@@ -402,10 +402,10 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                crate::ccl::infer::InferError::NoTraitImpl { trait_, .. }
+                crate::ccl::infer::InferError::NoTraitInstance { trait_, .. }
                     if trait_ == "Comparable"
             )),
-            "expected NoTraitImpl for Comparable, got {errs:?}"
+            "expected NoTraitInstance for Comparable, got {errs:?}"
         );
     }
 }

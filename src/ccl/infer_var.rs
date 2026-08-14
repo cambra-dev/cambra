@@ -307,7 +307,7 @@ pub struct InferVar {
     /// Trait obligations this variable is an operand of, with the position it
     /// occupies in each. Every lower bound recorded here is delivered to them by
     /// `notify_lower` (`src/ccl/infer/solver/traits.rs`), which is how an operator's
-    /// requirement is discharged incrementally rather than by a pass that goes
+    /// requirement is resolved incrementally rather than by a pass that goes
     /// looking for obligations once solving has stopped.
     ///
     /// The list lives on the variable rather than in a side map on the inference

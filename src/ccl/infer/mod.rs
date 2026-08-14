@@ -199,12 +199,12 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             type_a: Box::new(coalesce_for_error(&lhs)),
             type_b: Box::new(coalesce_for_error(&rhs)),
         },
-        ConstrainError::NoTraitImpl {
+        ConstrainError::NoTraitInstance {
             trait_,
             position,
             found,
             accepted,
-        } => InferError::NoTraitImpl {
+        } => InferError::NoTraitInstance {
             trait_: trait_.to_string(),
             position,
             found: Box::new(found),
