@@ -114,10 +114,16 @@ impl MapResult {
         });
         let input_tiling = input.tiling();
         let tiling = change_tiling_result(input.tiling(), move |codomain_extent| {
-            assert_eq!(
-                function_domain_extent, *codomain_extent,
-                "Cannot apply {} to {}",
-                function_tiling, input_tiling
+            // Subtyping, not equality: an argument whose extent is a *width
+            // subtype* of the function's domain applies soundly. A variant with
+            // fewer tags is the case that makes this observable — the function
+            // handles tags this argument never carries, and projecting one of
+            // those simply yields nothing — but the same holds for a record with
+            // extra fields. `Extent::includes` is the runtime statement of that
+            // rule, so use it rather than re-deriving a narrower one here.
+            assert!(
+                function_domain_extent.includes(codomain_extent),
+                "Cannot apply {function_tiling} to {input_tiling}"
             );
             output_tiling
         });

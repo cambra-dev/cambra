@@ -692,9 +692,15 @@ Cambra carries features beyond plain algebraic subtyping (explicit refinements, 
 
 #### The unified tagged sum
 
-Cambra has **one** sum representation, the **tagged variant** — `Type::Variant(Vec<(FieldKey, Type)>)`. Since the solver works on `ccl::Type` directly, there is no second variant form to convert to: inference, coalescing, and the public AST all use this one type. (Internally, `compact_type` keys its transient `CompactType` bag by `FieldKey`, but that is an implementation detail of compaction, not a separate type.)
+Cambra has **one** sum representation, the **tagged variant** — `Type::Variant(Vec<(FieldKey, Type)>, Openness)`. Since the solver works on `ccl::Type` directly, there is no second variant form to convert to: inference, coalescing, and the public AST all use this one type. (Internally, `compact_type` keys its transient `CompactType` bag by `FieldKey`, but that is an implementation detail of compaction, not a separate type.)
 
 Tags are [`FieldKey`]s — the same key type as records/tuples — so a sum can be **named** (`FieldKey::Name`, a source-level `.Tag(...)`) or **anonymous/positional** (`FieldKey::Index`, the dual of a tuple). A positional union `A | B` is simply `Variant([(Index 0, A), (Index 1, B)])`, and the surface `++`/`Copair` produces exactly that (see §2's `emit_copair`). One constructor, one coalesce path, one width-subtyping rule (the dual of records: a subtype has *fewer* tags).
+
+That one rule does **two** jobs, and the [`Openness`] marker is what separates them. Recursing into a tag both sides carry is what pushes the payload into the supertype's slot — how a `match` arm's binder learns its type from the scrutinee. Rejecting a subtype tag the supertype lacks is the exhaustiveness check. A **closed** arm set does both; an **open** one keeps the payload recursion and drops the rejection, which is what a `match` with a `case _:` needs and what no closed judgment can express (on the tag axis the scrutinee is the supertype, on the payload axis its payload is the subtype, and one edge cannot point both ways).
+
+Openness is a property of a *demand*, never of a value: every producer of a sum is closed, and `Open` appears only on the right of a subtyping edge. Compaction and coalescing **carry** it (`CompactVariant` pairs the tag map with its openness) rather than flattening it, because a type *error* naming that demand is resolved through the same round-trip — closing the arm set there would report that the scrutinee failed to be an exact sum, when what it failed was to be a subtype of a partial one, and only the rendered `| …` tells those apart. Nothing else reads it: the runtime `Extent` has no counterpart, and no node's coalesced type comes out open. That last is an invariant, not a theorem, so `types_agree_modulo_unread` compares openness and an escape shows up there as a disagreement.
+
+Two arm sets meeting at one position meet their openness — `Open` survives only if both sides are open, since a closed side is the one contributing a requirement on the tag set. The tag *map* still merges by the ordinary intersect/union rule; that is an approximation when exactly one side is open, and no program reaches it (a scrutinee takes one `Case` demand per `match`).
 
 Two senses of "union" remain distinct:
 
@@ -1405,6 +1411,10 @@ Both rejections say no argument could work, and they differ in what collides. An
 
 Placement is forced at both ends. **After emission**, because that is when a definition's requirements are all recorded. **Before coalesce**, because a generalized definition's subtree is never coalesced in place, so a walk of the tree would see only use-site clones — and a clone that goes unsatisfiable already fails by delivery. The pass repeats **to a fixpoint**: determining one value can leave a neighbouring obligation with a single row, determining another.
 
+**One write lands after the sweep, and it only selects.** An unreachable `match` arm's payload is a position no value reaches, so nothing but a demand on it or its own reads can say what it is — and only coalesce can tell that nothing did. `pin_unobservable_arm_payload` types it there, adopting the base the sweep's write-back already deposited when there is one and otherwise choosing from the intersection of what the arm body's reads accept, which is this pass's own question. Both are *selections* from a set the sweep read, never a restriction past it, and `assert_post_emission_narrowing_selects` checks that rather than arguing it. The pin constrains in **both** directions, which is the point: the sweep's deposit is an upper bound, and an upper bound does not participate in a merge — the `Case`'s join would read the position as contributing nothing and settle on a type narrower than the arm's own slot, which the post-inference check catches as a merge that took one input's refinement.
+
+A delivery also tightens what the obligation's *other* positions accept — `Addable` pinned to `Int` at position 0 accepts only `Int` at position 1 — and nothing re-reads a variable standing there against the requirements this pass already intersected for it. That the verdict survives anyway rests on the two bases a pin can choose. A base the sweep *deposited* was narrowed into the obligations by the sweep itself, at fixpoint, so the sibling tightening is not new. A base from `payload_default` is `Int`, because every trait table contains `Int` and so does every intersection of them — which is also why the sibling's own intersection still accepts it. Both are properties of the tables rather than of this code, so a future table with no `Int` row is what would open the gap.
+
 This is the gap [Typechecking a never-called definition](#typechecking-a-never-called-definition) names. The two are complementary. That walk resolves a dead definition's recorded bounds, which catches `λ 𝑎 → (𝑎.0, 𝑎.foo)`; this pass needs no delivery, and does not depend on whether anything calls the definition.
 
 #### The unit is a place, not a variable
@@ -1490,7 +1500,7 @@ The in-flight conditionals stack replaces the arm unification with a genuine lat
 
 #### An unobservable arm payload is pinned to what its uses require
 
-An arm naming a tag the scrutinee cannot carry receives no lower bound — nothing determines that payload's type, and nothing can. Such an arm is ordinary code rather than an error (a `match` written for the whole `Option` over a scrutinee inference has pinned to one tag), so inference chooses a type for it rather than reaching the post-inference wall with an unresolved variable.
+An arm naming a tag the scrutinee cannot carry receives no lower bound: no value reaches that payload, and nothing else determines it unless a use of it says something. Such an arm is ordinary code rather than an error (a `match` written for the whole `Option` over a scrutinee inference has pinned to one tag), so inference chooses a type for it rather than reaching the post-inference wall with an unresolved variable. Unobservability is read off the **lower** side alone — a bound *above* the position is a use's requirement, which is what the choice below reads, not evidence that a value arrived.
 
 The rule is **pin to a type the payload's requirements accept**, and a requirement reaches the payload in one of two recorded forms:
 

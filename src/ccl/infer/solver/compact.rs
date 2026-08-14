@@ -12,7 +12,9 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::{BaseType, HistoryKind, InferVarId, Name, Refinement, Type, fresh_infer_var_id};
+use crate::ccl::{
+    BaseType, HistoryKind, InferVarId, Name, Openness, Refinement, Type, fresh_infer_var_id,
+};
 
 use crate::ccl::FieldKey;
 
@@ -270,7 +272,7 @@ pub struct CompactType {
     /// [`rec`](Self::rec) — `None` is the merge identity, `Some(empty)`
     /// the absorbing element (here from intersecting disjoint tag sets at
     /// negative polarity).
-    pub var: Option<BTreeMap<FieldKey, CompactType>>,
+    pub var: Option<CompactVariant>,
     /// Function shape, if any: see [`CompactFun`]. Carries the Pi binder, the
     /// merged [`KindMerge`], the domain alternatives (one, unless a positive
     /// `Data ⊔ Data` join accumulated alternatives via [`union_domains`]), and the
@@ -296,6 +298,51 @@ pub struct CompactType {
     /// onto each child's variables, and compaction only needs a deterministic
     /// materialization, not a second polarity analysis.
     pub history_slot: Option<(Box<CompactType>, Box<CompactType>, HistoryKind)>,
+}
+
+/// A variant contribution: the tag map, and whether the arm set is the whole one.
+///
+/// The two travel together because they are one fact — "which tags, and is that
+/// all of them" — and every operation that reshapes the map has to say what
+/// becomes of the [`Openness`]. Compaction is the only place an `Open` demand can
+/// be dropped silently (a lost marker turns a `case _:`'s scrutinee demand back
+/// into an exact sum), so the coupling is structural rather than by convention.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactVariant {
+    pub tags: BTreeMap<FieldKey, CompactType>,
+    pub openness: Openness,
+}
+
+impl CompactVariant {
+    /// A **closed** arm set — every producer of a sum, and every variant
+    /// contribution that did not come from an open demand.
+    pub fn closed(tags: BTreeMap<FieldKey, CompactType>) -> Self {
+        Self {
+            tags,
+            openness: Openness::Closed,
+        }
+    }
+
+    /// The openness of two arm sets meeting at one position.
+    ///
+    /// `Open` survives only when *both* sides are open: an open arm set imposes
+    /// no requirement on the tag set, so a closed side meeting it contributes the
+    /// requirement and the result is closed. Nothing else could be right at either
+    /// polarity — a *producer* is always closed, so a positive merge is closed by
+    /// construction.
+    ///
+    /// The tag *map* still merges by the ordinary rule below. That is an
+    /// approximation when exactly one side is open: an exact meet would keep the
+    /// closed side's tag set whole rather than intersecting the two. No program
+    /// reaches it — a scrutinee takes one `Case` demand per `match`, and two open
+    /// demands on one variable meet as `Open`/`Open` — so the exact rule is left
+    /// unstated rather than written and untested.
+    fn meet_openness(a: Openness, b: Openness) -> Openness {
+        match (a, b) {
+            (Openness::Open, Openness::Open) => Openness::Open,
+            _ => Openness::Closed,
+        }
+    }
 }
 
 impl CompactType {
@@ -439,15 +486,14 @@ impl CompactType {
     /// reliably handles `[B]`). Payload depth at matching tags is
     /// covariant — payloads recurse at the outer polarity `pol`, not
     /// flipped.
-    fn merge_variants(
-        pol: bool,
-        lhs: BTreeMap<FieldKey, CompactType>,
-        rhs: BTreeMap<FieldKey, CompactType>,
-    ) -> BTreeMap<FieldKey, CompactType> {
+    fn merge_variants(pol: bool, lhs: CompactVariant, rhs: CompactVariant) -> CompactVariant {
         // Variants invert the set-op vs records (so `!pol` selects
         // intersect-vs-union) but keep payload polarity at the outer
         // `pol` (covariant depth, same as records).
-        Self::merge_keyed(!pol, pol, lhs, rhs)
+        CompactVariant {
+            openness: CompactVariant::meet_openness(lhs.openness, rhs.openness),
+            tags: Self::merge_keyed(!pol, pol, lhs.tags, rhs.tags),
+        }
     }
 
     /// Merge two record-field maps. At positive polarity fields are
@@ -777,7 +823,7 @@ fn compact_go(
                 ..Default::default()
             }
         }
-        Type::Variant(tags) => {
+        Type::Variant(tags, openness) => {
             // Variant payloads are covariant — recurse at the same
             // polarity (no flip, unlike Fun's domain). The merge rule
             // for variants flips records' polarity behaviour, but
@@ -787,7 +833,10 @@ fn compact_go(
                 compacted.insert(k.clone(), compact_go(v, pol, subst_acc, None, st));
             }
             CompactType {
-                var: Some(compacted),
+                var: Some(CompactVariant {
+                    tags: compacted,
+                    openness: *openness,
+                }),
                 ..Default::default()
             }
         }
@@ -1014,57 +1063,114 @@ mod tests {
     #[test]
     fn compact_merge_variants_positive_unions() {
         let int_a = CompactType {
-            var: Some(
+            var: Some(CompactVariant::closed(
                 [(FieldKey::Name(SmolStr::from("A")), CompactType::default())]
                     .into_iter()
                     .collect(),
-            ),
+            )),
             ..Default::default()
         };
         let int_b = CompactType {
-            var: Some(
+            var: Some(CompactVariant::closed(
                 [(FieldKey::Name(SmolStr::from("B")), CompactType::default())]
                     .into_iter()
                     .collect(),
-            ),
+            )),
             ..Default::default()
         };
         let merged = CompactType::merge(true, int_a, int_b);
         let var = merged.var.expect("variant present");
-        assert!(var.contains_key(&FieldKey::Name(SmolStr::from("A"))));
-        assert!(var.contains_key(&FieldKey::Name(SmolStr::from("B"))));
+        assert!(var.tags.contains_key(&FieldKey::Name(SmolStr::from("A"))));
+        assert!(var.tags.contains_key(&FieldKey::Name(SmolStr::from("B"))));
     }
 
     /// Compact merge at negative polarity intersects tags.
     #[test]
     fn compact_merge_variants_negative_intersects() {
         let int_ab = CompactType {
-            var: Some(
+            var: Some(CompactVariant::closed(
                 [
                     (FieldKey::Name(SmolStr::from("A")), CompactType::default()),
                     (FieldKey::Name(SmolStr::from("B")), CompactType::default()),
                 ]
                 .into_iter()
                 .collect(),
-            ),
+            )),
             ..Default::default()
         };
         let int_bc = CompactType {
-            var: Some(
+            var: Some(CompactVariant::closed(
                 [
                     (FieldKey::Name(SmolStr::from("B")), CompactType::default()),
                     (FieldKey::Name(SmolStr::from("C")), CompactType::default()),
                 ]
                 .into_iter()
                 .collect(),
-            ),
+            )),
             ..Default::default()
         };
         let merged = CompactType::merge(false, int_ab, int_bc);
         let var = merged.var.expect("variant present");
-        assert!(!var.contains_key(&FieldKey::Name(SmolStr::from("A"))));
-        assert!(var.contains_key(&FieldKey::Name(SmolStr::from("B"))));
-        assert!(!var.contains_key(&FieldKey::Name(SmolStr::from("C"))));
+        assert!(!var.tags.contains_key(&FieldKey::Name(SmolStr::from("A"))));
+        assert!(var.tags.contains_key(&FieldKey::Name(SmolStr::from("B"))));
+        assert!(!var.tags.contains_key(&FieldKey::Name(SmolStr::from("C"))));
+    }
+
+    /// Openness meets: `Open` survives only when both sides are open.
+    ///
+    /// An open arm set imposes no requirement on the tag set, so a closed side
+    /// meeting it contributes the requirement and the result is closed. A
+    /// *producer* is always closed, which is why a positive merge cannot come out
+    /// open however the tags combine.
+    #[test]
+    fn compact_merge_variants_meets_openness() {
+        let arms = |openness| CompactType {
+            var: Some(CompactVariant {
+                tags: [(FieldKey::Name(SmolStr::from("A")), CompactType::default())]
+                    .into_iter()
+                    .collect(),
+                openness,
+            }),
+            ..Default::default()
+        };
+        let openness_of = |ct: CompactType| ct.var.expect("variant present").openness;
+        for pol in [true, false] {
+            assert_eq!(
+                openness_of(CompactType::merge(
+                    pol,
+                    arms(Openness::Open),
+                    arms(Openness::Open)
+                )),
+                Openness::Open
+            );
+            assert_eq!(
+                openness_of(CompactType::merge(
+                    pol,
+                    arms(Openness::Open),
+                    arms(Openness::Closed)
+                )),
+                Openness::Closed
+            );
+            assert_eq!(
+                openness_of(CompactType::merge(
+                    pol,
+                    arms(Openness::Closed),
+                    arms(Openness::Open)
+                )),
+                Openness::Closed
+            );
+        }
+        // `None` is the merge identity for the whole variant component, openness
+        // included: an absent arm set has no openness to contribute, so the
+        // present side passes through rather than being closed by a default.
+        assert_eq!(
+            openness_of(CompactType::merge(
+                true,
+                CompactType::default(),
+                arms(Openness::Open)
+            )),
+            Openness::Open
+        );
     }
 
     /// Payload-depth polarity for variant merge: payloads at matching
@@ -1098,19 +1204,19 @@ mod tests {
             ..Default::default()
         };
         let lhs = CompactType {
-            var: Some(
+            var: Some(CompactVariant::closed(
                 [(FieldKey::Name(SmolStr::from("A")), payload_a)]
                     .into_iter()
                     .collect(),
-            ),
+            )),
             ..Default::default()
         };
         let rhs = CompactType {
-            var: Some(
+            var: Some(CompactVariant::closed(
                 [(FieldKey::Name(SmolStr::from("A")), payload_b)]
                     .into_iter()
                     .collect(),
-            ),
+            )),
             ..Default::default()
         };
         // Outer positive variant merge: tags union (one tag A here).
@@ -1118,7 +1224,10 @@ mod tests {
         // fields intersect → empty rec map (no field in both).
         let merged = CompactType::merge(true, lhs, rhs);
         let var = merged.var.expect("variant present");
-        let payload = var.get(&FieldKey::Name(SmolStr::from("A"))).expect("tag A");
+        let payload = var
+            .tags
+            .get(&FieldKey::Name(SmolStr::from("A")))
+            .expect("tag A");
         let rec = payload.rec.as_ref().expect("payload rec present");
         assert!(
             rec.is_empty(),

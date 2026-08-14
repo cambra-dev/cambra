@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ccl::InferVarId;
 
-use super::compact::{AtomKey, CompactFun, CompactGraph, CompactType};
+use super::compact::{AtomKey, CompactFun, CompactGraph, CompactType, CompactVariant};
 
 // ---------------------------------------------------------------------------
 // Type simplification: co-occurrence analysis
@@ -235,7 +235,7 @@ fn simplify_analyze(
     // Variant payloads recurse at the same polarity (covariant depth),
     // matching how records' payloads behave.
     if let Some(tags) = &ct.var {
-        for v in tags.values() {
+        for v in tags.tags.values() {
             simplify_analyze(
                 v,
                 pol,
@@ -311,10 +311,15 @@ fn simplify_reconstruct(
             .collect()
     });
 
-    let new_var = ct.var.map(|tags| {
-        tags.into_iter()
-            .map(|(k, v)| (k, simplify_reconstruct(v, var_subst)))
-            .collect()
+    // Rebuilding the payloads leaves the arm set's shape — and so its
+    // [`Openness`] — untouched.
+    let new_var = ct.var.map(|v| CompactVariant {
+        tags: v
+            .tags
+            .into_iter()
+            .map(|(k, t)| (k, simplify_reconstruct(t, var_subst)))
+            .collect(),
+        openness: v.openness,
     });
 
     let new_fun = ct.fun.map(|cf| CompactFun {

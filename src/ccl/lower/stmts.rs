@@ -5,9 +5,10 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
 
 use super::*;
 use crate::{
-    ccl::{BaseType, Branch, Expr, Lit, Type, TypedExprNode},
+    ccl::{BaseType, Branch, Expr, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExprNode},
     chl_parser::ast::{
-        AnnotationMode, AssignTarget, IfBranch, Span, Spanned, Stmt as ChlStmt, TypeAnnotation,
+        AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, Span, Spanned,
+        Stmt as ChlStmt, TypeAnnotation,
     },
     interpreter::{DataSink, HttpServerDataSource, http_server::SharedHttpServer},
 };
@@ -248,6 +249,11 @@ pub(super) fn lower_final_stmt(
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
             lower_if(last.span, branches, else_body.as_deref(), &scope, ctx)
+        }
+        ChlStmt::Match { scrutinee, arms } => {
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(preceding, &mut scope);
+            lower_match(last.span, scrutinee, arms, &scope, ctx)
         }
         ChlStmt::For {
             target,
@@ -734,7 +740,7 @@ pub(super) fn lower_middle_stmt(
             let for_expr = lower_generator_for(target, iter, for_body, &scope, stmt.span, ctx)?;
             Ok(ctx.tag_machinery(Expr::expr_stmt(for_expr, body), stmt.span, "lower.stmt_seq"))
         }
-        ChlStmt::Expr { .. } | ChlStmt::If { .. } => {
+        ChlStmt::Expr { .. } | ChlStmt::If { .. } | ChlStmt::Match { .. } => {
             let effect = lower_final_stmt(stmt, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_machinery(Expr::expr_stmt(effect, body), stmt.span, "lower.stmt_seq"))
         }
@@ -1064,9 +1070,13 @@ pub(super) fn lower_type_annotation(annotation: &TypeAnnotation) -> Result<Type,
 ///   (`Expr::BraceGroup`), including the one-element `{T,}` — the trailing
 ///   comma is what makes it a product, and the parser rejects a comma-free
 ///   `{T}`.
+/// - A variant type `` {`a | `b{Int}} `` — the same brace group, told apart from
+///   a tuple type by its arms' backticks.
 /// - The empty group `{}` — the unit type, `Unit`.
 pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
+        // A primitive (`Int`) or the wildcard `_`. A lone name is never a variant:
+        // a tag is written with its backtick wherever it appears.
         ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
             LoweringError::unsupported(annotation.span, format!("unknown type annotation: {id}"))
         }),
@@ -1074,8 +1084,7 @@ pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, Low
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
         ChlExpr::Call { func, args } => {
-            let head = type_ctor_head(func)?;
-            lower_type_application(annotation.span, head, args)
+            lower_type_application(annotation.span, type_ctor_head(func)?, args)
         }
         // Record type `{name: T, …}`.
         ChlExpr::BraceRecord(fields) => {
@@ -1088,18 +1097,47 @@ pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, Low
             }
             Ok(Type::Record(out))
         }
-        // Tuple type `{T, U}` — and `{T,}` for one element, the trailing comma
-        // being what makes it a product (the parser rejects a comma-free
-        // `{T}`). The **empty** group `{}` is the **unit type** — not a
-        // zero-field product, of which there is none: a product with no fields
-        // is unit, and `Tuple([])` is not a valid type (see
-        // `docs/chl-spec.md`, "6.6 The empty product is unit").
+        // The **empty** group `{}` is the **unit type** — not a zero-field
+        // product, of which there is none: a product with no fields is unit,
+        // and `Tuple([])` is not a valid type (see `docs/chl-spec.md`, "6.6 The
+        // empty product is unit").
         ChlExpr::BraceGroup(parts) if parts.is_empty() => Ok(Type::Base(BaseType::Unit)),
-        ChlExpr::BraceGroup(parts) => Ok(Type::Tuple(
-            parts
-                .iter()
-                .map(lower_type_expr)
-                .collect::<Result<_, _>>()?,
+        // A colon-free brace group is a tuple type `{T, U}` — and `{T,}` for one
+        // element, the trailing comma being what makes it a product — unless its
+        // content is a `|`-chain of tags, which makes it the variant type
+        // `` {`a | `b} ``. The two forms share a bracket and are told apart by
+        // the backtick, the same marker that makes a tag a tag everywhere else.
+        //
+        // `|` lexes as the logical-or operator, so a chain arrives as nested
+        // `BinOp` nodes. The readings never collide: in *type* position there is
+        // no boolean to disjoin, and the arms are backticked.
+        ChlExpr::BraceGroup(parts) => match parts.as_slice() {
+            [only] if only.node.is_variant_arms() => lower_variant_type(only),
+            // Arms are `|`-separated; a comma would make this a tuple *of*
+            // variant types, which is a different type and almost never meant.
+            _ if parts.iter().any(|p| p.node.is_variant_arms()) => Err(LoweringError::unsupported(
+                annotation.span,
+                "a variant type separates its arms with `|`: `` {`a | `b{Int}} ``",
+            )),
+            _ => Ok(Type::Tuple(
+                parts
+                    .iter()
+                    .map(lower_type_expr)
+                    .collect::<Result<_, _>>()?,
+            )),
+        },
+        // A variant type is delimited, so its arms are never bare: without the
+        // braces there is nothing to say where the `|`-chain ends. A `|` in type
+        // position has no other reading — CHL has no union *of types* — so the
+        // same message serves whether or not the operands are tags.
+        ChlExpr::VariantCtor { .. }
+        | ChlExpr::BinOp {
+            op: ChlBinOp::LogicalOr,
+            ..
+        } => Err(LoweringError::unsupported(
+            annotation.span,
+            "a variant type is written in braces, and its arms are backticked tags: \
+             `` {`a | `b{Int}} ``",
         )),
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple
         // *type* is written with braces `{T, U}` (`docs/chl-spec.md`).
@@ -1110,6 +1148,76 @@ pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, Low
         _ => Err(LoweringError::unsupported(
             annotation.span,
             format!("unsupported type annotation form: {:?}", annotation.node),
+        )),
+    }
+}
+
+/// Lower a variant type — **one arm, or a `|`-chain of them** — into a
+/// [`Type::Variant`].
+///
+/// Arms are canonicalized into **name order**, matching [`Type::option_of`] and the
+/// order the solver materializes a coalesced variant in. Without that, a
+/// hand-written `` `some{T} | `none `` would be a distinct type from `Option(T)`
+/// that merely happens to carry the same arms, and an annotation written in the
+/// other order would not compare equal to what inference produced.
+fn lower_variant_type(ann: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
+    let mut arms: Vec<(FieldKey, Type)> = Vec::new();
+    collect_variant_arms(ann, &mut arms)?;
+    arms.sort_by(|(a, _), (b, _)| a.cmp(b));
+    if let Some(dup) = arms.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(LoweringError::unsupported(
+            ann.span,
+            format!(
+                "variant type names the tag `{}` twice; each tag carries one payload type",
+                dup[0].0
+            ),
+        ));
+    }
+    Ok(Type::variant(arms))
+}
+
+/// Flatten one arm (or a nested `|`) of a variant type into `arms`.
+fn collect_variant_arms(
+    ann: &Spanned<ChlExpr>,
+    arms: &mut Vec<(FieldKey, Type)>,
+) -> Result<(), LoweringError> {
+    match &ann.node {
+        ChlExpr::BinOp {
+            left,
+            op: ChlBinOp::LogicalOr,
+            right,
+        } => {
+            collect_variant_arms(left, arms)?;
+            collect_variant_arms(right, arms)
+        }
+        ChlExpr::VariantCtor { tag, payload, .. } => {
+            let payload = match payload {
+                // A bare tag carries no payload, so its payload type is `Unit` —
+                // the same type the bare constructor `` `tag `` injects.
+                None => Type::Base(BaseType::Unit),
+                // The tag's braces are the payload type's own, so the parser has
+                // already resolved the elision and this is an ordinary type
+                // expression — `Int` from `` `a{Int} ``, the one-tuple `{Int,}`
+                // from `` `a{Int,} ``.
+                Some(ChlVariantPayload::Fields(ty)) => lower_type_expr(ty)?,
+                // Parens carry a *value*; an arm in a type names the type its
+                // tag stores.
+                Some(ChlVariantPayload::Term(_)) => {
+                    return Err(LoweringError::unsupported(
+                        ann.span,
+                        format!(
+                            "`(…)` after a tag carries a value; a variant arm's payload \
+                             is a type in braces: `` `{tag}{{T}} ``"
+                        ),
+                    ));
+                }
+            };
+            arms.push((FieldKey::Name(tag.as_str().into()), payload));
+            Ok(())
+        }
+        _ => Err(LoweringError::unsupported(
+            ann.span,
+            "a variant type's arms are backticked tags: `` `some{Int} | `none ``",
         )),
     }
 }
@@ -1174,6 +1282,18 @@ fn lower_type_application(
                 codomain: Box::new(lower_type_expr(elem)?),
             })
         }
+        // `Option(T)` abbreviates the two-tag variant `{some: T, none: Unit}` —
+        // a peer of `List(T)` here, not a distinguished type. Its constructors
+        // are the ordinary `` `some(e) `` / `` `none ``, which no pass special-cases.
+        "Option" => {
+            let [payload] = args else {
+                return Err(LoweringError::unsupported(
+                    span,
+                    "`Option` takes one type argument: `Option(T)`",
+                ));
+            };
+            Ok(Type::option_of(lower_type_expr(payload)?))
+        }
         // `Mut(…)` in a nested position is handled by `mut_annotation_parts`
         // before this function is reached; seeing it here means a `Mut` inside
         // another type, which is not supported yet.
@@ -1182,6 +1302,150 @@ fn lower_type_application(
             format!("unknown type application: `{other}(…)`"),
         )),
     }
+}
+
+/// Lower a [`ChlStmt::Match`] to a scrutinee-[`TypedExprNode::Case`].
+///
+/// Each `` case `tag(binder): `` arm becomes one [`Branch`] carrying a
+/// [`Pattern`] — so `match` needs no IR node of its own: the pattern-`Case`
+/// that variant elimination already compiles *is* `match`. Every arm's guard is
+/// the literal `true`, which is what makes tag dispatch and the guarded
+/// `if`/`elif` chain the same first-match rule over one node
+/// (see `src/ccl/design/lowering.md`, "Variants and match").
+///
+/// Exhaustiveness is not checked here and needs no check: inference builds the
+/// expected scrutinee type *from* the arm tags and requires the scrutinee to be
+/// a subtype of it, so a `match` cannot be non-exhaustive with respect to its
+/// own arms. It fails only when the scrutinee's type is pinned independently
+/// (an annotation, or a compiler-produced `Option`) and carries a tag no arm
+/// handles — reported as an extra-tag subtyping failure.
+///
+/// The payload binder is shadowed over the arm body, so an arm binder spelled
+/// like an outer transactional register is treated as the genuine local it is.
+/// A binder-less `case tag:` still binds — to a reserved name the body cannot
+/// mention — because [`Pattern`] always names the payload it narrows; only the
+/// arm's ability to *read* it differs.
+///
+/// A `match` whose **only** arm is `case _:` names no tag at all, so it does not
+/// dispatch: its value is the default arm's, whatever the scrutinee is. It lowers
+/// to that body under an [`TypedExprNode::ExprStmt`] keeping the scrutinee, which
+/// is what still *types* the scrutinee (an unbound or ill-typed one is an error
+/// here as anywhere) while denoting a value that does not depend on it.
+/// `channelize` drops the `ExprStmt` with the rest of them.
+pub(super) fn lower_match(
+    match_span: Span,
+    scrutinee: &Spanned<ChlExpr>,
+    arms: &[MatchArm],
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    // The parser's `.at_least(1)` guarantees this; a zero-arm `match` would
+    // lower to a `Case` with no branches, which has no value to denote.
+    assert!(
+        !arms.is_empty(),
+        "lower_match: `match` with no `case` arms (parser invariant violated)"
+    );
+    if let Some(dup) = first_duplicate_tag(arms) {
+        return Err(LoweringError::unsupported(
+            match_span,
+            format!(
+                "`match` has two `case {dup}` arms; each tag is handled by exactly \
+                 one arm (the arms partition the scrutinee's tags)"
+            ),
+        ));
+    }
+    // The default arm must be last and unique. It matches whatever the tagged arms
+    // did not, so an arm after it could never be selected, and two of them would
+    // make the second unreachable.
+    let defaults = arms.iter().filter(|a| a.pattern.is_none()).count();
+    if defaults > 1 {
+        return Err(LoweringError::unsupported(
+            match_span,
+            "`match` has more than one `case _:` arm; the first would match \
+             everything the tagged arms did not, leaving the rest unreachable",
+        ));
+    }
+    if defaults == 1 && arms.last().is_some_and(|a| a.pattern.is_some()) {
+        return Err(LoweringError::unsupported(
+            match_span,
+            "`case _:` must be the last arm: it matches whatever the tagged arms \
+             did not, so an arm after it could never be selected",
+        ));
+    }
+    let scrutinee_expr = lower_expr(scrutinee, ctx)?;
+    // Only a default arm: nothing is dispatched on, so there is no `Case` to
+    // build — a tag-less `Branch` is a *fallback*, and with no tagged arm to fall
+    // back from it is simply the value. Sequencing it after the scrutinee keeps
+    // the scrutinee typed without letting it decide anything.
+    if arms.len() == 1 && defaults == 1 {
+        let body = lower_stmts_inner(&arms[0].body, outer_bindings, ctx, false)?;
+        return Ok(ctx.tag_image(Expr::expr_stmt(scrutinee_expr, body), match_span));
+    }
+    let mut branches = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let Some(pat) = &arm.pattern else {
+            // The default arm binds nothing — the tags it covers have different
+            // payload types, so there is no single thing to bind — and lowers to a
+            // tag-less `Branch`, which is what makes it the fallback.
+            let body = lower_stmts_inner(&arm.body, outer_bindings, ctx, false)?;
+            branches.push(Branch {
+                pattern: None,
+                // Tag dispatch carries no boolean test, so every arm's guard is
+                // manufactured encoding — what makes `match` and the guarded
+                // `if`/`elif` chain one first-match rule over one node.
+                guard: ctx.tag_machinery(
+                    Expr::lit(Lit::Bool(true)),
+                    match_span,
+                    "lower.match_guard",
+                ),
+                body,
+            });
+            continue;
+        };
+        // A binder-less arm still needs a payload name for `Pattern`. Use a
+        // reserved spelling so the body cannot read what it declined to name.
+        let binder = match &pat.binder {
+            Some(name) => name.as_str().to_string(),
+            None => ctx.fresh_ignored_payload(),
+        };
+        let mut arm_scope = outer_bindings.clone();
+        arm_scope.insert(binder.clone());
+        let body = ctx.with_shadowed(vec![binder.clone()], |ctx| {
+            lower_stmts_inner(&arm.body, &arm_scope, ctx, false)
+        })?;
+        branches.push(Branch {
+            pattern: Some(Pattern {
+                tag: pat.tag.as_str().to_string(),
+                binding: TypedBinding {
+                    name: binder.into(),
+                    ty: Type::Hole,
+                    user_annotation: None,
+                },
+            }),
+            guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), match_span, "lower.match_guard"),
+            body,
+        });
+    }
+    // The `Case` images the `match` statement. A statement is not a
+    // `Spanned<ChlExpr>`, so it has no `Source` node — `tag_image` is the image
+    // marker at `Nature::Machinery` (`src/ccl/design/provenance.md`, "The seam
+    // (`src/ccl/context.rs`)").
+    Ok(ctx.tag_image(
+        Expr::new(TypedExprNode::Case {
+            scrutinee: Some(Box::new(scrutinee_expr)),
+            branches,
+        }),
+        match_span,
+    ))
+}
+
+/// The first tag appearing on more than one arm, if any.
+fn first_duplicate_tag(arms: &[MatchArm]) -> Option<&str> {
+    let mut seen = HashSet::new();
+    arms.iter()
+        .filter_map(|arm| arm.pattern.as_ref())
+        .find(|pat| !seen.insert(pat.tag.as_str()))
+        .map(|pat| pat.tag.as_str())
 }
 
 /// Lower a [`ChlStmt::If`] (a flattened `if`/`elif`/`else` chain) to a

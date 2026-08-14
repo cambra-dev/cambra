@@ -81,6 +81,10 @@ pub enum Token {
     Pass,
     #[token("with", priority = 3)]
     With,
+    #[token("match", priority = 3)]
+    Match,
+    #[token("case", priority = 3)]
+    Case,
 
     // -- Multi-char operators (must precede their single-char prefixes) ---
     #[token("<<=")]
@@ -164,6 +168,11 @@ pub enum Token {
     ColonEq,
     #[token(".")]
     Dot,
+    /// Variant-arm introducer `` ` `` (`` `some(1) ``, `` { `some{Int} | `none } ``).
+    /// One token marks the form in every position — term, pattern and type —
+    /// so a tag never has to be told apart from a name by context.
+    #[token("`")]
+    Backtick,
     #[token(";")]
     Semi,
     /// Lambda binder introducer `\` (`\x -> body`).
@@ -222,6 +231,8 @@ impl fmt::Display for Token {
             Token::Yield => "yield",
             Token::Pass => "pass",
             Token::With => "with",
+            Token::Match => "match",
+            Token::Case => "case",
             // Operators (multi-char before single-char)
             Token::LShiftEq => "<<=",
             Token::LShift => "<<",
@@ -257,6 +268,7 @@ impl fmt::Display for Token {
             Token::Colon => ":",
             Token::ColonEq => ":=",
             Token::Dot => ".",
+            Token::Backtick => "`",
             Token::Semi => ";",
             Token::Backslash => "\\",
             // Value-carrying tokens — chumsky's `select!` matches the

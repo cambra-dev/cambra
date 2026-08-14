@@ -2208,7 +2208,7 @@ fn build_letrec(
                     let ty = tap.ty.clone();
                     (tap, ty)
                 } else {
-                    let dom = Type::Variant(
+                    let dom = Type::variant(
                         taps.iter()
                             .enumerate()
                             .map(|(i, tap)| {

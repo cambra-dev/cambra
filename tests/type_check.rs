@@ -1479,7 +1479,7 @@ fn test_copair_produces_variant_typed_domain() {
         panic!("expected Fun, got {ty}");
     };
     // Domain is a Variant with two anonymous positional (Index) tags.
-    if let Type::Variant(tags) = &**dom {
+    if let Type::Variant(tags, _) = &**dom {
         assert_eq!(tags.len(), 2, "expected 2-tag variant domain, got {ty}");
         assert!(
             tags.iter().all(|(k, _)| matches!(k, FieldKey::Index(_))),

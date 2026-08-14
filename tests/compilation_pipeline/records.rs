@@ -266,3 +266,36 @@ fn test_datasource_named_record_join() {
         ColumnValue::strings(&["x"]),
     );
 }
+
+/// A conditional whose arms are records of **different width**.
+///
+/// The arms' join is a record-width one — `{a: Int, b: Int} ⊔ {a: Int}` is
+/// `{a: Int}`, fields intersecting — and inference computes it, which is why
+/// `r.a` typechecks. Taking the union's codomain from that type rather than
+/// re-deriving one from the arms' extents gets the *declaration* right: the old
+/// derivation answered the positional sum `{`0{a: Int, b: Int} | `1{a: Int}}`, a
+/// shape no row holds and nothing downstream can project.
+///
+/// **Ignored**: the declaration is now right and the remaining gap is the merge
+/// itself. Each arm arrives as a struct-of-arrays `Tile::Record`, and
+/// `UnionProducer`'s heterogeneous path handles only `Tile::Scalar` arms — it
+/// materialises one `Value` per row into a `Variants` column, which a record
+/// column is not. Narrowing a wide arm's record column to the declared field set
+/// is the operation the merge does not have, and whether the merge should narrow
+/// at all (or the tile may stay wider than its tiling) is the open question —
+/// the same one `MapResult`'s `Extent::includes` assert asks from the other side.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// The wide arm is taken; the narrow arm's field set is what survives in the type.
+#[case("c = True\nr = (a=1, b=2) if c else (a=3)\nr.a", 1)]
+// The narrow arm is taken.
+#[case("c = False\nr = (a=1, b=2) if c else (a=3)\nr.a", 3)]
+// Three arms, narrowing twice.
+#[case(
+    "c = False\nd = True\nr = (a=1, b=2) if c else ((a=3, x=9) if d else (a=4))\nr.a",
+    3
+)]
+#[ignore = "UnionProducer cannot merge Tile::Record arms; needs record-width narrowing"]
+fn test_conditional_arms_at_different_record_widths(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}

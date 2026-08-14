@@ -399,7 +399,7 @@ fn build_value_case_cform(
     // Union domain = Variant({Index(i): {UIntRange(1)|π̂ᵢ}}) — the same tagged
     // union `emit_copair` produces, so op-conversion's `UnionOperator`
     // dispatches to the surviving arm.
-    let union_dom = Type::Variant(
+    let union_dom = Type::variant(
         arm_domains
             .into_iter()
             .enumerate()
@@ -419,12 +419,17 @@ fn build_value_case_cform(
 /// than from the enclosing `Case`.
 ///
 /// A `Compose`'s type has to *equal* the composition of its elements, so taking
-/// either end from the `Case` claims something the elements do not provide. The
-/// **codomain** is where they diverge: an arm's result can sit strictly below the
-/// arms' join — `case a(v): v` over a scrutinee pinned to `` `a(1) `` yields the
-/// singleton `{Int | __elem == 1}` where the join with a sibling `Int` arm is plain
-/// `Int`. The widening belongs on the enclosing merge node, which is a single node
-/// and so may record a supertype.
+/// either end from the `Case` claims something the elements do not provide. Each
+/// end has its own way of diverging:
+///
+/// - the **codomain**, because an arm's result can sit strictly below the arms'
+///   join — `case a(v): v` over a scrutinee pinned to `` `a(1) `` yields the
+///   singleton `{Int | __elem == 1}` where the join with a sibling `Int` arm is
+///   plain `Int`. The widening belongs on the enclosing merge node, which is a
+///   single node and so may record a supertype.
+/// - the **domain**, because it is not the lambda's parameter type: when the
+///   scrutinee *is* the parameter, the chain head is the projection, whose domain
+///   is the arms' tag set ([`arms_variant`]).
 ///
 /// The `Case`'s types serve only as fallbacks for a chain end that declares none.
 fn arm_compose(chain: Vec<Expr>, fallback_dom: Type, joined_cod: &Type) -> Expr {
@@ -437,6 +442,155 @@ fn arm_compose(chain: Vec<Expr>, fallback_dom: Type, joined_cod: &Type) -> Expr 
         .and_then(|e| e.ty.codomain())
         .unwrap_or_else(|| joined_cod.clone());
     typed_compose(chain).with_ty(Type::data_fun(dom, cod))
+}
+
+/// The variant the arms of a scrutinee-`Case` *consume*: every branch tag mapped to
+/// that branch's payload-binder type.
+///
+/// This — not the scrutinee's own type — is the domain of each
+/// `variant_project(cᵢ)`. A projection's declared domain must contain the tag it
+/// projects, and the scrutinee's type need not: it is a width-*subtype* of the arms'
+/// tag set, so it legitimately lacks tags some arm handles. Typing the projection
+/// against the scrutinee then yields incoherent nodes like
+/// ``variant_project(`b) : {`a{T}} ⇒ U`` — asking a variant with no `` `b `` arm for
+/// its `` `b ``. Deriving the domain from the arms makes "contains the projected tag" true
+/// by construction, and adjacency still holds, because `scrut_ty <: arms_variant` is
+/// exactly what inference required (`emit_case`'s `require_sub`).
+fn arms_variant(branches: &[Branch], scrut_ty: &Type) -> Type {
+    let mut tags: Vec<(FieldKey, Type)> = branches
+        .iter()
+        .filter_map(|b| b.pattern.as_ref())
+        .map(|p| (FieldKey::Name(p.tag.as_str().into()), p.binding.ty.clone()))
+        .collect();
+    // Join in the scrutinee's own tags. Without a default arm this adds nothing —
+    // the scrutinee's tags are a subset of the arms' (`emit_case`'s `require_sub`).
+    // *With* one, the scrutinee may carry tags no arm names, and the projections
+    // still have to accept it, so what they consume is the join of the arms' demand
+    // and the scrutinee's type — exactly what the open variable `emit_case` relates
+    // them both to coalesces to.
+    if let Type::Variant(scrut_tags, _) = strip_refinements(scrut_ty) {
+        for (k, t) in scrut_tags {
+            if !tags.iter().any(|(existing, _)| *existing == k) {
+                tags.push((k, t));
+            }
+        }
+    }
+    tags.sort_by(|(a, _), (b, _)| a.cmp(b));
+    Type::variant(tags)
+}
+
+/// Compile a **scalar** scrutinee-`Case` (`match` in value position, no enclosing
+/// lambda) to the C-form: gated one-shot lifts, unioned, then collapsed.
+///
+/// The same shape [`build_value_case_cform`] produces for a guard-`Case`, with the
+/// boolean gate replaced by the tag projection:
+///
+/// ```text
+/// guard:  ⧺ᵢ ( iterate ▷ restrict(π̂ᵢ)            ≫ const(eᵢ) ) ▷ final_or_default(…, eₙ)
+/// tag:    ⧺ᵢ ( iterate ▷ const(𝑠) ≫ variant_project(cᵢ) ≫ eᵢ ) ▷ final_or_default
+/// ```
+///
+/// Three things follow from lifting onto the synthetic one-shot driver rather than
+/// applying the arms to the scrutinee:
+///
+/// - **The scrutinee enters by `const`**, exactly as the guard form's arm *values*
+///   do. Planning prepends an `iterate` to the union (it is an iteration source),
+///   and that `iterate` takes no input — which is why the earlier eta-expansion
+///   `𝑠 ▷ (λ __scrut → match __scrut { … })` could not work: it made the union's
+///   domain the scrutinee's, so the scrutinee had to be *fed* to the `iterate`.
+/// - **No first-match predicate is synthesised.** Disjointness is structural here:
+///   `variant_project(cᵢ)` is empty on any position not carrying `cᵢ`, so the arms
+///   partition the driver without a gate. (Once an arm may carry *both* a tag and a
+///   guard, the gate returns — but complemented only against prior arms sharing its
+///   tag, not all prior arms.)
+/// - **The collapse needs no default.** The arms cover every tag the scrutinee can
+///   carry, so exactly one position survives and `final_or_default` is applied to
+///   the bare stream. The guard form's default is its trailing `true` arm's value;
+///   a tag partition has no such arm, and inventing a value would mean silently
+///   returning it if this totality argument were ever wrong.
+fn build_scrutinee_case_cform(
+    ctx: &mut ElimContext,
+    scrut: Expr,
+    branches: Vec<Branch>,
+    result_ty: Type,
+) -> Result<Expr, LambdaElimError> {
+    let scrut = elim_lambdas(ctx, scrut)?;
+    let scrut_ty = scrut.ty.clone();
+    let driver_dom = Type::UIntRange(1);
+    // const(𝑠) : UIntRange(1) ⤇ Union — the scrutinee as a one-element stream, so
+    // every arm reads it by composition instead of being applied to it.
+    let scrut_stream = apply_primitive(
+        scrut,
+        Builtin::Const,
+        Type::data_fun(driver_dom.clone(), scrut_ty.clone()),
+    );
+
+    // A trailing tag-less branch is the **default arm**. It needs no tag-complement
+    // predicate: it fires exactly when no tagged arm matched, which is precisely the
+    // empty-stream case `final_or_default` already handles — so it becomes that
+    // operator's default rather than an arm of the union.
+    let mut branches = branches;
+    let default_arm = match branches.last() {
+        Some(b) if b.pattern.is_none() => branches.pop().map(|b| b.body),
+        _ => None,
+    };
+    // What the arms consume: the projections' shared domain.
+    let consumed = arms_variant(&branches, &scrut_ty);
+    let mut arms: Vec<Expr> = Vec::with_capacity(branches.len());
+    for br in branches {
+        debug_assert!(
+            matches!(&br.guard.node, TypedExprNode::Lit(Lit::Bool(true))),
+            "scrutinee-Case branch carries a non-trivial guard; tag dispatch does \
+             not thread guards yet"
+        );
+        let pat = br
+            .pattern
+            .expect("guarded: scrutinee-Case branches all bind a pattern");
+        let payload_ty = pat.binding.ty.clone();
+        let vp = Expr::builtin(Builtin::VariantProject(FieldKey::Name(
+            pat.tag.as_str().into(),
+        )))
+        .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
+        // eᵢ as a point-free morphism `Pᵢ ⇒ Vᵢ`, reading the projected payload.
+        let arm_fn = elim_lambda(ctx, &pat.binding.name, &payload_ty, br.body)?;
+        arms.push(arm_compose(
+            vec![scrut_stream.clone(), vp, arm_fn],
+            driver_dom.clone(),
+            &result_ty,
+        ));
+    }
+
+    // The arms' static domains are identical (the driver); they are disjoint at
+    // *runtime* by tag, exactly as the in-lambda fan-out's arms are disjoint by
+    // first-match despite sharing one static domain.
+    let union_dom = Type::variant(
+        (0..arms.len())
+            .map(|i| (FieldKey::Index(i), driver_dom.clone()))
+            .collect(),
+    );
+    // A single arm needs no union: it already *is* the whole partition. Iteration
+    // does not come from the union either way — `final_or_default`'s stream argument
+    // is itself an iteration site, so planning materializes the driver there.
+    let union_ty = Type::data_fun(union_dom, result_ty.clone());
+    let stream = match arms.len() {
+        0 => unreachable!("a scrutinee-Case has at least one branch"),
+        1 => arms.pop().expect("len == 1"),
+        _ => Expr::copair(arms).with_ty(union_ty),
+    };
+    match default_arm {
+        // `(union, e_default) ▷ final_or_default` — the tuple form, exactly as the
+        // guard C-form uses for its trailing `true` arm.
+        Some(body) => {
+            let default = elim_lambdas(ctx, body)?;
+            let stream_ty = stream.ty.clone();
+            let tuple_ty = Type::Tuple(vec![stream_ty, result_ty.clone()]);
+            let arg = Expr::tuple(vec![stream, default]).with_ty(tuple_ty);
+            Ok(apply_primitive(arg, Builtin::FinalOrDefault, result_ty))
+        }
+        // No default arm: the tagged arms cover every tag the scrutinee can carry,
+        // so the union is never empty and the bare-stream form applies.
+        None => Ok(apply_primitive(stream, Builtin::FinalOrDefault, result_ty)),
+    }
 }
 
 /// The element (codomain) type a collection-valued `Case` produces — the codomain
@@ -1070,7 +1224,7 @@ fn elim_lambda_impl(
             // well-defined. (A position would have had to be resolved against that
             // full tag set — see `TagMap`, "Why keyed rather than positional".)
             debug_assert!(
-                matches!(strip_refinements(&body_ty), Type::Variant(_)),
+                matches!(strip_refinements(&body_ty), Type::Variant(..)),
                 "VariantCtor must have a Variant type, got {body_ty}"
             );
             let payload_ty = payload.ty.clone();
@@ -1143,7 +1297,7 @@ fn elim_lambda_impl(
             // Nothing here resolves a tag to a position — `variant_project` names
             // its tag — so this is the only reason the concrete type is needed.
             let variants = match strip_refinements(&scrut_ty) {
-                Type::Variant(v) => v,
+                Type::Variant(v, _) => v,
                 other => {
                     return Err(LambdaElimError::Unsupported(format!(
                         "scrutinee-Case over a non-variant type {other}"
@@ -1155,6 +1309,9 @@ fn elim_lambda_impl(
             // which is dropped from the compose chain.
             let scrut_pf = elim_lambda_kinded(ctx, param, param_ty, scrut, arrow_kind.clone())?;
             let scrut_is_id = matches!(&scrut_pf.node, TypedExprNode::Builtin(Builtin::Id));
+
+            // What the arms consume: the projections' shared domain.
+            let consumed = arms_variant(&branches, &scrut_ty);
 
             let mut arms: Vec<Expr> = Vec::with_capacity(branches.len());
             // Each branch's tag position, collected to check exhaustiveness and
@@ -1183,9 +1340,11 @@ fn elim_lambda_impl(
                 seen_tags.push(tag_key.clone());
                 let payload_ty = pat.binding.ty.clone();
                 let payload_name = pat.binding.name.clone();
-                // variant_project(cᵢ) : scrut_ty ⇒ Pᵢ (the tag-restricting projection).
+                // variant_project(cᵢ) : arms_variant ⇒ Pᵢ (the tag-restricting
+                // projection). Its domain is the arms' tag set, not the scrutinee's
+                // — see `arms_variant`.
                 let vp = Expr::builtin(Builtin::VariantProject(tag_key))
-                    .with_ty(Type::fun(scrut_ty.clone(), payload_ty.clone()));
+                    .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
                 // Does `eᵢ` close over the outer binder as well as its payload?
                 // (Checked on the raw body — the payload binder `wᵢ` shadows
                 // nothing, so a free `param` is genuinely the outer element.)
@@ -1274,6 +1433,26 @@ fn elim_lambda_impl(
                 _ => Ok(Expr::disjoint_join(arms).with_ty(Type::fun(param_ty.clone(), value_ty))),
             }
         }
+
+        // A scrutinee-`Case` with a **default arm** inside a lambda. The arm above
+        // handles the all-tagged fan-out; a tag-less branch has no `variant_project`
+        // to narrow with, so it would have to become a `final_or_default` default —
+        // and there is no scalar collapse in the fan-out shape to hang one on. The
+        // scalar C-form has that collapse and so supports the default arm there.
+        //
+        // Unreachable from source today: nothing puts a `match` inside a lambda that
+        // survives to here — a UDF body is inlined at its call sites, a comprehension
+        // element cannot hold a statement, and a for-loop body rejects `match` at
+        // lowering. Named rather than left to the catch-all below, so that whichever
+        // of those opens up first reports this instead of a debug dump.
+        TypedExprNode::Case {
+            scrutinee: Some(_),
+            branches,
+        } if branches.iter().any(|b| b.pattern.is_none()) => Err(LambdaElimError::Unsupported(
+            "a `match` with a `case _:` default arm inside a lambda body: the \
+                 tag fan-out has no scalar collapse to carry the default"
+                .to_string(),
+        )),
 
         // Unsupported constructs.
         body => Err(LambdaElimError::Unsupported(format!(
@@ -1470,6 +1649,21 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             };
             debug_typecheck(&result);
             Ok(result)
+        }
+
+        // A **scalar scrutinee-`Case`** — a `match` in value position with no
+        // enclosing lambda. Compiles to the same C-form the scalar *guard*-`Case`
+        // uses, with the boolean gate replaced by the tag projection.
+        TypedExprNode::Case {
+            scrutinee: Some(scrut),
+            branches,
+        } if branches
+            .iter()
+            .enumerate()
+            .all(|(i, b)| b.pattern.is_some() || i + 1 == branches.len()) =>
+        {
+            let result = build_scrutinee_case_cform(ctx, *scrut, branches, ty)?;
+            Ok(dbg_typecheck_mv(result))
         }
 
         // Control-flow constructs not yet supported.
@@ -1988,13 +2182,13 @@ mod tests {
 
     /// ``{`abort | `commit{Int}}``, the two-arm decision sum.
     fn commit_abort_ty() -> Type {
-        Type::Variant(vec![
+        Type::variant(vec![
             (FieldKey::Name("commit".into()), int_ty()),
             (FieldKey::Name("abort".into()), unit_ty()),
         ])
     }
 
-    /// A pattern-matching branch `.tag(binder: ty) → body` with the trivial
+    /// A pattern-matching branch `` `tag(binder: ty) → body `` with the trivial
     /// guard a scrutinee-`Case` always carries.
     fn arm(tag: &str, binder: &str, binder_ty: Type, body: Expr) -> Branch {
         use crate::ccl::{Pattern, TypedBinding};

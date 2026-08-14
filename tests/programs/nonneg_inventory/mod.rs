@@ -9,16 +9,13 @@
 //! This isolates the storefront's oversell invariant: same store type, same
 //! guard shape, no HTTP.
 //!
-//! **Currently blocked at lexing.**  The first unsupported construct is the
-//! `` ` `` prefix on the `` `some ``/`` `none `` variant tags
-//! (`docs/chl-spec.md`, "6.5 Variants"), which the lexer
-//! rejects outright; because lexing is a whole-file pass it precedes the
-//! `->` map-entry pair in the store literal, which is the next blocker and
-//! is a parse-level one.  Behind those: the refinement braces (`where` /
-//! `_` — "6.4 Refinement syntax") and `Mut(..., Txn)`
-//! as annotation forms, map lookup, `match`/`case`, `requires Transaction`,
-//! `with begin():`, and record terms.  This pins the variant-tag lex
-//! failure.
+//! **Currently blocked at parsing.**  The variant tags lex and parse now
+//! (`docs/chl-spec.md`, "3.15 Variant constructors"), so the first unsupported
+//! construct is the store type's refinement brace — `where` is lexed and
+//! reserved but the `{T where p}` form is not parsed ("6.4 Refinement syntax").
+//! Behind it: the `->` map-entry pair in the store literal, `Map(…)` as an
+//! annotation form, map lookup, `requires Transaction`, `with begin():`, and
+//! record terms.  This pins the refinement-brace parse failure.
 //!
 //! Expected output once fully unblocked: `` `some(1) `` (5 − 2 − 2, third
 //! reservation refused).
@@ -26,6 +23,6 @@
 use super::common::expect_compile_error;
 
 #[test]
-fn nonneg_inventory_currently_blocked_at_lexing() {
-    expect_compile_error(include_str!("program.cambra"), "invalid token");
+fn nonneg_inventory_currently_blocked_at_parsing() {
+    expect_compile_error(include_str!("program.cambra"), "found 'where'");
 }

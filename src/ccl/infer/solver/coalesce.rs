@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::ccl::{BaseType, HistoryKind, InferVar, InferVarId, Type};
 
-use super::compact::{CompactGraph, CompactType};
+use super::compact::{CompactGraph, CompactType, CompactVariant};
 use crate::ccl::FieldKey;
 
 // ---------------------------------------------------------------------------
@@ -330,18 +330,20 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
     ct
 }
 
-/// Materialize a variant-tag map into [`Type::Variant`], preserving tag
+/// Materialize a variant contribution into [`Type::Variant`], preserving tag
 /// order by name (BTreeMap iterates in key order, so output is stable).
 /// Payloads coalesce at the same polarity as the outer (covariant depth).
-fn materialize_variant(
-    tags: &BTreeMap<FieldKey, CompactType>,
-    polarity: bool,
-) -> Result<Type, CoalesceError> {
-    let mut out = Vec::with_capacity(tags.len());
-    for (k, v) in tags {
+///
+/// The [`Openness`] rides through unchanged. It reaches here only from a
+/// *demand* — the arm set of a `match` with a `case _:` — which is what makes a
+/// diagnostic naming that demand render it as the partial arm set it is
+/// (``{`a{Int} | …}``) rather than as an exact sum the scrutinee failed to be.
+fn materialize_variant(variant: &CompactVariant, polarity: bool) -> Result<Type, CoalesceError> {
+    let mut out = Vec::with_capacity(variant.tags.len());
+    for (k, v) in &variant.tags {
         out.push((k.clone(), coalesce_compact_go(v, polarity)?));
     }
-    Ok(Type::Variant(out))
+    Ok(Type::Variant(out, variant.openness))
 }
 
 fn materialize_record(
@@ -821,7 +823,7 @@ mod tests {
         let scheme = simplify_type(compact_type(&v));
         let ty = coalesce_compact(&scheme).expect("coalesce ok");
         match ty {
-            Type::Variant(tags) => {
+            Type::Variant(tags, _) => {
                 let names: Vec<String> = tags.iter().map(|(n, _)| n.to_string()).collect();
                 // BTreeMap iteration order is by FieldKey key — Name tags
                 // sort lexicographically.
