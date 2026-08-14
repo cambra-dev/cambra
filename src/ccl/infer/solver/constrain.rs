@@ -21,8 +21,9 @@ use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, FunKindVar};
-use crate::ccl::{Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
+use crate::ccl::{BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
 
+use super::traits::{Trait, link_watches, notify_lower};
 use super::type_level;
 use crate::ccl::FieldKey;
 use crate::ccl::ccl_utils::strip_refinements;
@@ -107,6 +108,24 @@ pub enum ConstrainError {
         lhs: Type,
         /// The domain demanded at the position.
         rhs: Type,
+    },
+    /// An operand's type ruled out the last instance of a trait an operator
+    /// requires — `1 > "a"`, or `\x -> x + 1` applied to a string.
+    ///
+    /// Raised from the bound-recording arm that delivered the offending type, so it
+    /// fires the moment the program states the conflict rather than at a later phase
+    /// that goes looking for it.
+    NoTraitInstance {
+        /// The trait with no instance left.
+        trait_: Trait,
+        /// The operand position whose type ruled the last one out.
+        position: u8,
+        /// The type that arrived there — a base no instance accepts, or a
+        /// shape that is not a base at all.
+        found: Type,
+        /// What that position could still have accepted, given everything already
+        /// known about the other operand.
+        accepted: Vec<BaseType>,
     },
 }
 
@@ -623,10 +642,12 @@ fn constrain_go_impl(
         }
         // Implicit deref (read): a `Mut` handle meeting any non-`Mut` demand —
         // concrete OR an inference variable — reads its value. This MUST precede
-        // the `Infer` arms below: `+`/`<` etc. are polymorphic (`∀α. α → α → α`),
-        // so `cnt + 1` emits `Mut(Int, D) <: ?α`; dereffing here flows `Int` onto
-        // `?α`, whereas the `(_, Infer)` arm would record the handle itself as a
-        // lower bound and coalesce `?α` to a `Mut`.
+        // the `Infer` arms below: an operator constrains its operand against a fresh
+        // variable (`cnt + 1` emits `Mut(Int, D) <: ?α` for `Addable`'s first operand
+        // position), and dereffing here flows `Int` onto `?α` — where the narrowing
+        // hook can read a base off it. The `(_, Infer)` arm would instead record the
+        // handle itself as a lower bound, offering the obligation nothing and
+        // coalescing `?α` to a `Mut`.
         (
             Type::History {
                 value,
@@ -648,6 +669,12 @@ fn constrain_go_impl(
                     .push(Bound::edge(sl.clone(), rhs.clone(), sr.clone()));
                 Rc::clone(s.lower())
             };
+            // A var-var edge carries the watch downward (see `link_watches`); the
+            // closure below only re-offers `lv`'s lowers to `rhs` when the levels let
+            // this arm run, which is precisely what a `let` RHS breaks.
+            if let Type::Infer(rv) = rhs {
+                link_watches(lv, rv, cache)?;
+            }
             for low in lows.iter() {
                 let (tau_l, tau_u) = bridge_holder_gap(&low.self_subst, sl);
                 constrain_go(
@@ -676,6 +703,19 @@ fn constrain_go_impl(
                     .push(Bound::edge(sr.clone(), lhs.clone(), sl.clone()));
                 Rc::clone(s.upper())
             };
+            // Deliver the contribution to any trait obligation this variable is an
+            // operand of. This arm is the *only* hook site needed: an operand type
+            // reaches an obligation as a lower bound, and the closure below plus its
+            // dual in the upper arm mean a bound reaching a variable that flows into
+            // a watched one is re-constrained *directly against* the watched
+            // variable — so both arrival orders (edge-then-bound, bound-then-edge)
+            // land the concrete type here. The one path that bypasses the closure is
+            // `extrude`, which seeds a proxy's bounds by direct writes; it copies the
+            // watch list instead.
+            notify_lower(rv, lhs, cache)?;
+            if let Type::Infer(lv) = lhs {
+                link_watches(lv, rv, cache)?;
+            }
             for up in ups.iter() {
                 let (tau_l, tau_u) = bridge_holder_gap(sr, &up.self_subst);
                 constrain_go(
@@ -927,6 +967,26 @@ fn wrap_refinements(base: &Type, refs: &[&Refinement]) -> Type {
     })
 }
 
+/// Give an extrusion proxy the same trait obligations as the variable it
+/// approximates.
+///
+/// Extrusion seeds a proxy's bounds by **direct writes** rather than through
+/// `constrain_go`, so it is the one path where a concrete type can reach a watched
+/// variable's stand-in without passing the narrowing hook. A bound recorded on the
+/// proxy afterwards would otherwise never reach the obligation, and the operand's
+/// type would silently fail to narrow it.
+///
+/// Copied unconditionally, at both polarities. The proxy and the original stay
+/// linked, so a fact can legitimately arrive at both — but narrowing is an
+/// idempotent set intersection, which makes the duplicate delivery a no-op rather
+/// than something to reason about per polarity.
+fn copy_watches(from: &Rc<InferVar>, to: &Rc<InferVar>) {
+    let watches = from.watches.borrow().clone();
+    if !watches.is_empty() {
+        to.watches.borrow_mut().extend(watches);
+    }
+}
+
 /// Lift `ty` so that all its variables live at level ≤ `target_level`.
 ///
 /// When a constraint crosses level boundaries (e.g. an outer-scope variable
@@ -1003,6 +1063,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // level, linked to the original by the appropriate bound.
             let nvs = InferVar::fresh(target_level);
             cache.insert((tv.uid, pol), Rc::clone(&nvs));
+            copy_watches(tv, &nvs);
 
             // Each branch snapshots only the list it does *not* push to — the
             // positive one seeds from `lower` and writes `upper`, the negative
@@ -1105,6 +1166,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             let has_neg_link = cached_neg.as_ref().is_some_and(|n| Rc::ptr_eq(n, &nvs));
             cache.insert((tv.uid, true), Rc::clone(&nvs));
             cache.insert((tv.uid, false), Rc::clone(&nvs));
+            copy_watches(tv, &nvs);
 
             // Snapshot the original's bounds, excluding any edge that already
             // points at this proxy (a polar extrusion pushed one such link into

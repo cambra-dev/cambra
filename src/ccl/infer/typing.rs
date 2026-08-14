@@ -4,6 +4,7 @@
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::PolyScheme;
+use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{Expr, Name, Type};
@@ -58,6 +59,35 @@ pub(super) trait Typing {
 
     /// Instantiate a polymorphic operator scheme at the current level.
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type;
+
+    /// Type an operator whose signature is a **trait** rather than a fixed scheme —
+    /// arithmetic, comparison, and negation. Returns the operator's result type.
+    ///
+    /// Arity is whatever `operands` says, so this serves the unary and binary
+    /// operators alike. The operand types enter *verbatim*, refinements included:
+    /// the rule mints one unrelated variable per operand, records `operandᵢ <: 𝐴ᵢ`,
+    /// and states the obligation. Refinements therefore cannot leak onto the result
+    /// the way they do through a shared variable — not because they are stripped, but
+    /// because nothing the result depends on is shared with an operand.
+    ///
+    /// `assoc` is the association the caller wants back, if any. `None` records a
+    /// pure requirement and yields nothing — which is what an operator whose result
+    /// is fixed (`==`) or supplied by its own scheme (`max`) needs.
+    ///
+    /// The two modes differ in *when* the requirement can be decided, which is the
+    /// whole reason this is a `Typing` method rather than a shared rule body. Emit's
+    /// operands are usually still unresolved variables, so it records an obligation
+    /// that discharges as bounds arrive. Check runs after inference on concrete
+    /// types, so it decides immediately — and must, because there is no
+    /// [`InferArena`](super::api::InferArena) there to break an obligation's
+    /// reference cycle.
+    fn require_trait(
+        &mut self,
+        trait_: Trait,
+        operands: &[&Type],
+        assoc: Option<Assoc>,
+        at: &dyn Fn() -> String,
+    ) -> Result<Option<Type>, LocatedInferError>;
 
     /// Normalize a user annotation / binder type into a solver-ready `Type`
     /// (holes → fresh vars; refinements kept). See

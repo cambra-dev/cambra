@@ -105,6 +105,11 @@ impl InferArena {
     /// [`crate::ccl::arena_enter`]).
     pub fn new() -> Self {
         crate::ccl::arena_enter();
+        // The trait-narrowing audit trail is per-run, exactly as the variable
+        // capture is: checking one run's obligations against another's graph would
+        // resolve variables that no longer have bounds.
+        #[cfg(debug_assertions)]
+        crate::ccl::infer::solver::traits::clear_watch_log();
         InferArena {
             _not_send_sync: std::marker::PhantomData,
         }
@@ -123,6 +128,10 @@ impl Drop for InferArena {
         // edges, so the (otherwise cyclic) refcounts can all reach zero.
         for var in crate::ccl::arena_exit() {
             var.bounds.borrow_mut().clear();
+            // A trait obligation holds its output `Type`, which holds a variable,
+            // which watches the obligation — a cycle of exactly the kind the bound
+            // lists make, and severed the same way.
+            var.watches.borrow_mut().clear();
         }
     }
 }
@@ -335,6 +344,29 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
+    /// An operator was used at operand types no instance of its trait
+    /// accepts — `1 > "a"`, `"a" - "b"`, or a polymorphic function applied at a type
+    /// its body's operators cannot handle.
+    ///
+    /// Distinct from [`InferError::TypeMismatch`] on purpose: the two operands did
+    /// not fail to *relate*, and neither is wrong on its own. What failed is the
+    /// operator's requirement about the pair, so the message names the trait and
+    /// what the position could have accepted rather than showing two types that
+    /// "don't match".
+    NoTraitInstance {
+        /// The trait with no instance left, e.g. `Addable`.
+        trait_: String,
+        /// The operand position (0-based) whose type ruled the last one out.
+        position: u8,
+        /// The base type found there. Boxed for the same reason
+        /// [`InferError::TypeMismatch`]'s types are — to keep `Result` small.
+        found: Box<Type>,
+        /// What that position could still have accepted, given what was already
+        /// known about the other operand.
+        accepted: Vec<Type>,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
     /// A partial tuple or partial record was not resolved to a concrete type.
     UnresolvedPartial {
         /// Display string of the partial type.
@@ -519,6 +551,25 @@ impl std::fmt::Debug for InferError {
                     write!(f, "\n  {hint}")?;
                 }
                 Ok(())
+            }
+            InferError::NoTraitInstance {
+                trait_,
+                position,
+                found,
+                accepted,
+                at,
+            } => {
+                let accepted = accepted
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                write!(
+                    f,
+                    "No {trait_} instance for {at}: operand {} is {found}, but \
+                     the only type accepted there is {accepted}",
+                    position + 1,
+                )
             }
             InferError::MissingField { key, found, at } => match (key, found) {
                 // A tuple's positions are its width, so that is the fact to state: the
@@ -1979,23 +2030,28 @@ mod tests {
     #[test]
     fn test_collect_multi_conflict() {
         // λ x → Apply(λ a:Int → a, Var(x)) + Apply(λ b:String → b, Var(x))
-        // `x` is the argument to both an Int-domain and a String-domain function.
-        // The sound one-way `arg <: domain` rule records `x <: Int` and
-        // `x <: String` — two upper bounds, with no eager cross-constraint — so
-        // the conflict surfaces structurally at coalesce when the bounds collide
-        // (`IncompatibleBounds`, an untagged-sum rejection) rather than as an
-        // eager `TypeMismatch` from the (retired) reverse `domain <: arg`. Both
-        // correctly reject the program.
+        // `x` is the argument to both an Int-domain and a String-domain function,
+        // whose results are then added.
+        //
+        // The rejection comes from the `+`, and names the actual problem: no
+        // `Addable` instance takes an `Int` and a `String`. It arrives during
+        // emission, as soon as both operand types are known — the operator states a
+        // requirement about the *pair*, so it need not wait for the two to collide on
+        // a shared variable at coalesce.
+        //
+        // The one-way `arg <: domain` rule that puts them there is what the
+        // `IncompatibleBounds` tests in `tests/type_check.rs` cover, joining two types
+        // without an operator in the way.
         let mut expr = double_apply_lambda(Type::Base(BaseType::Int), Type::Base(BaseType::String));
         let mut ctx = TypeInferenceContext::new();
         let errs = infer_bare(&mut expr, &mut ctx).expect_err("expected an Int/String conflict");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::IncompatibleBounds { conflicting, .. }
-                    if conflicting.contains("Int") && conflicting.contains("String")
+                InferError::NoTraitInstance { trait_, found, .. }
+                    if trait_ == "Addable" && **found == Type::Base(BaseType::String)
             )),
-            "expected IncompatibleBounds Int/String, got {errs:?}"
+            "expected NoTraitInstance for Addable at a String operand, got {errs:?}"
         );
     }
 
@@ -2555,20 +2611,20 @@ mod tests {
     fn test_unary_neg_wrong_type() {
         let mut ctx = TypeInferenceContext::new();
         use crate::ccl::UnaryOpKind;
-        // -true → TypeMismatch(Bool, Int).
+        // `-true`: negation states `Negatable`, so the rejection names the trait and
+        // the type it will not accept rather than reporting a mismatch against a
+        // hardcoded `Int` domain.
         let mut expr = Expr::unary(UnaryOpKind::Neg, Expr::lit(Lit::Bool(true)));
-        let errs = infer_bare(&mut expr, &mut ctx)
-            .expect_err("expected TypeMismatch Bool/Int under inference");
+        let errs = infer_bare(&mut expr, &mut ctx).expect_err("Bool is not negatable");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::TypeMismatch { type_a, type_b, .. }
-                    if matches!(
-                        (type_a.as_ref(), type_b.as_ref()),
-                        (Type::Base(BaseType::Bool), Type::Base(BaseType::Int))
-                    )
+                InferError::NoTraitInstance { trait_, position, found, .. }
+                    if trait_ == "Negatable"
+                        && *position == 0
+                        && **found == Type::Base(BaseType::Bool)
             )),
-            "expected TypeMismatch Bool/Int, got {errs:?}"
+            "expected NoTraitInstance for Negatable at a Bool operand, got {errs:?}"
         );
     }
 

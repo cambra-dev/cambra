@@ -20,6 +20,7 @@ use super::emit::emit_node;
 use super::schemes::OperatorSchemes;
 use super::typing::Typing;
 use super::{coalesce_for_error, map_constrain_err};
+use crate::ccl::infer::solver::traits::{Assoc, Trait, TraitObligation};
 
 /// A lexical-scope entry: the binder's polymorphic scheme.
 ///
@@ -273,6 +274,41 @@ impl Typing for InferCtx {
 
     fn normalize(&mut self, ann: &Type) -> Type {
         self.normalize_annotation(ann)
+    }
+
+    fn require_trait(
+        &mut self,
+        trait_: Trait,
+        operands: &[&Type],
+        assoc: Option<Assoc>,
+        at: &dyn Fn() -> String,
+    ) -> Result<Option<Type>, LocatedInferError> {
+        debug_assert_eq!(
+            operands.len(),
+            trait_.arity(),
+            "{trait_} is over {} type(s); an operator wired to it must supply that many",
+            trait_.arity(),
+        );
+        let positions: Vec<Type> = operands.iter().map(|_| self.fresh()).collect();
+        // Only a requested association gets a variable for the obligation to settle;
+        // a pure requirement determines nothing and mints none.
+        let wanted = assoc.map(|name| (name, self.fresh()));
+        let obligation = TraitObligation::new(trait_, wanted.clone().into_iter().collect());
+        for (i, position) in positions.iter().enumerate() {
+            obligation.watch(position, i as u8);
+        }
+        // A trait whose instances already agree settles here, before any
+        // operand is known — the ordinary "all candidates agree" rule reaching its
+        // condition immediately, not a special case.
+        obligation
+            .try_deposit(&mut self.cache)
+            .map_err(|e| self.raise(map_constrain_err(e, &at())))?;
+        // Operands flow in as ordinary lower bounds, refinements and all. The
+        // narrowing hook peels them where the base actually arrives.
+        for (operand, position) in operands.iter().zip(&positions) {
+            self.require_sub(operand, position, at)?;
+        }
+        Ok(wanted.map(|(_, ty)| ty))
     }
 
     fn require_sub(

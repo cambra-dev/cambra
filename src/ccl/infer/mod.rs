@@ -59,8 +59,12 @@
 //!
 //! The [`OperatorSchemes`] registry additionally contains [`PolyScheme`](crate::ccl::infer::solver::PolyScheme)s for
 //! the handful of operator/projection cases that are inherently polymorphic
-//! (`Compare : ∀α. α → α → Bool`, `Max : ∀α γ. (α → γ) → γ`, etc.). Each scheme
-//! is `instantiate`d at every use site, minting fresh vars per use.
+//! (`Max : ∀α γ. (α → γ) → γ`, etc.). Each scheme is `instantiate`d at every use
+//! site, minting fresh vars per use.
+//!
+//! Arithmetic and comparison have **no** scheme: their requirement is a trait
+//! rather than a signature, because a signature could only relate their operands
+//! by sharing a variable — see `src/ccl/design/type-inference.md`, "Traits".
 //!
 //! Most `Builtin` nodes are introduced post-inference by
 //! `lambda_elim`/`planning` with their type pre-stamped on the node, and
@@ -194,6 +198,18 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             ),
             type_a: Box::new(coalesce_for_error(&lhs)),
             type_b: Box::new(coalesce_for_error(&rhs)),
+        },
+        ConstrainError::NoTraitInstance {
+            trait_,
+            position,
+            found,
+            accepted,
+        } => InferError::NoTraitInstance {
+            trait_: trait_.to_string(),
+            position,
+            found: Box::new(found),
+            accepted: accepted.into_iter().map(Type::Base).collect(),
+            at: ctx_label.to_string(),
         },
         ConstrainError::DataDomainMismatch { lhs, rhs } => InferError::TypeMismatch {
             ctx: format!(
@@ -351,6 +367,12 @@ pub(crate) fn run(
     // Emission is fail-fast, so there is at most one error; it already carries
     // the node whose rule raised it (`Typing::raise`).
     emit_node(expr, &mut sub_ctx).map_err(|e| vec![e])?;
+
+    // The graph is complete here and nothing has been materialized yet — the one
+    // point at which eager trait narrowing can be checked against the ground truth
+    // it was approximating incrementally. Debug-only, and a pure read of the graph.
+    #[cfg(debug_assertions)]
+    solver::traits::verify_narrowing_is_complete(|ty| resolve_var_type(ty).ok());
 
     // Pass 2: resolve each node's inference variables in place into expr.ty,
     // fill the binder slots that aren't any node's expr.ty (the `Let` binding
