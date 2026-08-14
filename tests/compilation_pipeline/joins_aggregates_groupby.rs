@@ -598,6 +598,12 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
     "g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))",
     Value::Int(13)
 )]
+// Several lookups into one grouping. Each key used to re-derive the whole
+// partition; they now share it.
+#[case(
+    "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))",
+    Value::Int(9)
+)]
 fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

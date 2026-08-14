@@ -874,6 +874,10 @@ sets `kind` explicitly.
 
 **Elimination carries the kind.** A lambda's point-free form denotes what the lambda denoted, so it keeps its arrow kind. That is not automatic: elimination rebuilds arrows through combinator constructors (`fun_ty_or_hole`, `Type::pi`) that mint the capability kind, and a desugaring arm re-enters elimination on a rewritten body. `elim_lambda` takes the kind as an argument — `Compute` for its own recursive uses, which build morphisms out of the binder, and the enclosing `Lambda` node's own kind when that node is what is being eliminated. Without it a `groupby` binding arrives at planning as `(k: Int) ⇒ …`, a capability, having been a collection at inference.
 
+**Generalization asks it too.** A `let` is generalized only if it binds a *capability*. A collection is a value binding — specializing one duplicates the data — and that was already the rule, stated by node shape: a `Lambda` generalizes, a value does not. `groupby` is the case where the two disagree, because it lowers to a `Lambda` while denoting a collection, so it generalized and every use rebuilt the whole partition. The kind is what states the rule directly.
+
+Not generalizing a collection needs its domain **named**, not just ordered. A use site relates itself to the binding by the one-way argument edge `arg <: dom(source)`, which leaves an iteration binder with an upper bound and nothing below it; generalization used to hide that by splicing a fresh copy of the definition at each use. An unfiltered single-generator comprehension therefore states the equality outright — one `SharedHole` on its own `data_fun` domain and on its source's — and data-domain invariance turns the annotation's one-way edge into two, identifying them. A source that already names its domain (a `groupby` names its key type) keeps that name.
+
 **The stamp holds past inference, and planning reads it.** The audit rule — *an
 arrow is data iff it denotes a collection* — is not an inference-only invariant;
 every pass that mints a `Type::Fun` is bound by it. That matters because after
