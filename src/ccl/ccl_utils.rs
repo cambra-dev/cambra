@@ -1,7 +1,7 @@
 //! Miscellaneous utilities for working with CCL.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
@@ -958,6 +958,74 @@ fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<Predi
 /// shadowing rules.
 pub fn is_free(name: &Name, expr: &Expr) -> bool {
     count_free(name, expr) > 0
+}
+
+/// Which of `candidates` occur free in `expr`, in **one** traversal.
+///
+/// Same shadowing rules as [`count_free`] — this is that fold with the single
+/// name generalized to a set — but it answers for the whole set at once, where
+/// [`is_free`] per candidate walks `expr` once *per name*. Callers that select a
+/// live subset of a wide environment want this: the per-name form makes the
+/// selection cost `|candidates| × |expr|`, which is measurable at the widths the
+/// mutability phases reach (see [`crate::ccl::subst::Subst::discharge_env_in_place`]).
+///
+/// Shadowing is per-name, so the candidate set *narrows* as the walk crosses a
+/// binder rather than the walk aborting: a scope that shadows one candidate says
+/// nothing about the others.
+pub fn free_among<'a>(
+    candidates: impl IntoIterator<Item = &'a Name>,
+    expr: &Expr,
+) -> BTreeSet<Name> {
+    let live: BTreeSet<Name> = candidates.into_iter().cloned().collect();
+    let mut out = BTreeSet::new();
+    free_among_go(&live, expr, &mut out);
+    out
+}
+
+/// Recursive worker for [`free_among`]. `live` is the candidates not yet shadowed
+/// at this depth; `out` accumulates the ones found free.
+fn free_among_go(live: &BTreeSet<Name>, expr: &Expr, out: &mut BTreeSet<Name>) {
+    if live.is_empty() {
+        return;
+    }
+    // A binder's declared type is in the *enclosing* scope, so every candidate is
+    // unshadowed in a type slot — the same rule (and the same reason) as
+    // `count_free`, which walks slots before applying any shadowing. Each name
+    // gets its own `visited` set via `is_free_in_type`, which is what terminates
+    // on a self-referential refinement.
+    expr.walk_type_slots(|ty| {
+        for name in live {
+            if !out.contains(name) && is_free_in_type(name, ty) {
+                out.insert(name.clone());
+            }
+        }
+    });
+    for_each_scoped_item(expr, &mut |item| match item {
+        ScopedItem::VarRef(n) => {
+            if live.contains(n) {
+                out.insert(n.clone());
+            }
+        }
+        // A register key is a field label, not a variable occurrence.
+        ScopedItem::KeyRef(_) => {}
+        ScopedItem::Child {
+            expr: child,
+            binders,
+        } => {
+            // Narrow only when the scope actually shadows a candidate; the common
+            // case recurses on the borrowed set with no allocation.
+            if live.iter().any(|n| binders.shadows(n)) {
+                let inner: BTreeSet<Name> = live
+                    .iter()
+                    .filter(|n| !binders.shadows(n))
+                    .cloned()
+                    .collect();
+                free_among_go(&inner, child, out);
+            } else {
+                free_among_go(live, child, out);
+            }
+        }
+    });
 }
 
 /// Like [`is_free`] but considers only the **value** (the node tree), ignoring

@@ -3204,7 +3204,6 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::context::assert_unique_node_ids;
     use crate::ccl::{ArithmeticKind, BinOpKind, letrec::check_letrec_causal, symbolic::symbolic};
 
     /// A [`RawSite`] with only the fields [`partition_keys`] reads. The rest are
@@ -3425,59 +3424,5 @@ mod tests {
             Ok(()),
             "the emitted transaction letrec must be guarded"
         );
-    }
-
-    /// The transaction phase resolves every block read against the
-    /// read-your-writes environment through the one engine
-    /// ([`Subst::discharge_env`]), and every copy it makes must land at a
-    /// distinct identity: an environment value is inlined at each of its reads,
-    /// and the writer decision carries all of them in one record.
-    ///
-    /// Two properties, both load-bearing. **Root-carry** — the replacement root
-    /// takes the *read site's* `NodeId`, so the inlined value is attributed to
-    /// the read rather than to the binding it came from. **Interior freshening**
-    /// — every node below that root is re-minted, so two reads of one value do
-    /// not stamp the same ids twice.
-    #[test]
-    fn subst_env_copies_keep_ids_unique() {
-        let int = Type::Base(BaseType::Int);
-        let key = Name::fresh("balance");
-        let p = Name::fresh("__p");
-
-        // The environment value a write leaves behind: a compound, point-free
-        // read of the writer's snapshot (`__p.0`), so there is an interior.
-        let value = proj_pair(&p, &Type::Tuple(vec![int.clone()]), 0, &int);
-        let value_root = value.node_id();
-        let env: HashMap<Name, Expr> = HashMap::from([(key.clone(), value)]);
-
-        // Two reads of the register, as the decision record carries them.
-        let read0 = tvar(&key, int.clone());
-        let read1 = tvar(&key, int.clone());
-        let (id0, id1) = (read0.node_id(), read1.node_id());
-        let mut record = Expr::new(TypedExprNode::Record(vec![
-            (F_WRITES.to_string(), read0),
-            (F_WRITE.to_string(), read1),
-        ]));
-        record.ty = Type::Record(vec![
-            (F_WRITES.to_string(), int.clone()),
-            (F_WRITE.to_string(), int),
-        ]);
-
-        let out = Subst::discharge_env(record, &env);
-
-        let TypedExprNode::Record(fields) = &out.node else {
-            unreachable!("the decision record survives")
-        };
-        assert_eq!(
-            (fields[0].1.node_id(), fields[1].1.node_id()),
-            (id0, id1),
-            "root-carry: each read keeps its own id, so the inlined value is \
-             attributed to the read site"
-        );
-        assert!(
-            fields.iter().all(|(_, e)| e.node_id() != value_root),
-            "no copy carries the environment value's own root id"
-        );
-        assert_unique_node_ids(&out, "subst_env");
     }
 }

@@ -57,7 +57,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{PredMemo, is_free, strip_iterate_markers};
+use crate::ccl::ccl_utils::{PredMemo, free_among, is_free, strip_iterate_markers};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::scope::{
     ScopedItem, ScopedItemMut, for_each_scoped_item, for_each_scoped_item_mut,
@@ -680,10 +680,12 @@ impl Subst {
     /// [`Self::apply_expr`], but refinement predicates are *rebuilt* (fresh
     /// `Rc`s) rather than mutated; `memo` re-points every occurrence that
     /// shared one predicate term at the same rebuilt term, so the rewrite is
-    /// observed uniformly across the tree. `Compose` node types are recomputed from the
-    /// rewritten elements (substituting a `Var` whose type was an unresolved
-    /// placeholder can concretize the element types; the `Compose.ty ==
-    /// Fun(first_domain, last_codomain)` invariant must follow).
+    /// observed uniformly across the tree. `Compose` node types have their
+    /// **ends** recomputed from the rewritten elements (substituting a `Var` whose
+    /// type was an unresolved placeholder can concretize the element types; the
+    /// `Compose.ty == Fun(first_domain, last_codomain)` invariant must follow) —
+    /// the arrow's `FunKind` and Pi binder are preserved, since those belong to
+    /// the composition and not to its elements.
     pub fn rewrite_expr(&self, e: &mut TypedExpr) {
         if self.is_id() {
             return;
@@ -737,11 +739,30 @@ impl Subst {
     /// single-name sibling, and it pays more here: a writer's environment holds
     /// one fully-inlined value per register, and most subtrees mention none of
     /// them.
+    ///
+    /// The selection is **one** traversal ([`free_among`]), not one per entry.
+    /// That is a measured distinction, not a stylistic one: the per-entry form
+    /// costs `|env| × |e|`, and at a fixed block length, doubling the register
+    /// count from 8 to 16 doubled whole-program compile time. Block *length*
+    /// measured linear over the same range, so [`Self::rewrite_expr_go`]'s
+    /// per-node inertness test is not the cost here and does not want
+    /// "optimizing" on suspicion.
+    ///
+    /// Two hard `assert!`s ride this path, and callers should know they are
+    /// release-live rather than debug tripwires:
+    /// [`assert_preserves_typedness`] fires if an environment value is untyped
+    /// against a typed occurrence, and [`Self::assert_no_capture`] fires if the
+    /// environment's *range* mentions a binder the walk passes under. The
+    /// mutability phases satisfy both — they run post-inference over α-unique
+    /// names — and the asserts are what makes that an enforced precondition
+    /// instead of a comment, which is what the hand-rolled predecessors had.
     pub fn discharge_env_in_place(e: &mut TypedExpr, env: &HashMap<Name, TypedExpr>) {
-        let live: BTreeMap<Binder, Mapping> = env
-            .iter()
-            .filter(|(name, _)| is_free(name, e))
-            .map(|(name, term)| (name.clone(), Mapping::Discharge(Box::new(term.clone()))))
+        let live: BTreeMap<Binder, Mapping> = free_among(env.keys(), e)
+            .into_iter()
+            .map(|name| {
+                let term = env[&name].clone();
+                (name, Mapping::Discharge(Box::new(term)))
+            })
             .collect();
         Subst(live).rewrite_expr(e);
     }
@@ -830,9 +851,13 @@ impl Subst {
 
         // `Compose`'s type is derived from its elements, so rewriting them can
         // concretize it (substituting a `Var` whose type was a placeholder).
-        // Only the *domain and codomain* are derived that way: `fun_like` keeps
-        // the chain's own kind and Pi binder, which its elements do not carry and
-        // a bare function type would drop — rebuilding a collection as a capability
+        //
+        // `fun_like`, not `fun`: only the arrow's *ends* are derived from the
+        // elements. Its `FunKind` and any Pi binder are properties of the
+        // composition itself, and `Type::fun` answers `Compute`/`None` for both —
+        // so rebuilding with it silently downgrades a data collection `⤇` to a
+        // compute arrow `⇒` and drops a dependent binder, on every `Compose` a
+        // live substitution happens to reach
         // (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions").
         if let TypedExprNode::Compose(elts) = &e.node
             && let (Some(first), Some(last)) = (elts.first(), elts.last())
@@ -1584,6 +1609,138 @@ mod tests {
             panic!()
         };
         assert_eq!(*r2.predicate, gt(var("i"), var("k")));
+    }
+
+    /// Root-carry, the property the mutability phases' read-your-writes
+    /// environments depend on. A replaced occurrence keeps its **own** `NodeId`,
+    /// so the inlined value inherits the *read site's* span and attribution,
+    /// while only the replacement's interior is freshened. N reads of one
+    /// environment value therefore become N subtrees with disjoint ids, which is
+    /// what lets a phase assemble them into a tree the pipeline's uniqueness
+    /// invariant still accepts.
+    ///
+    /// A whole-subtree freshen would also be unique, but it discards the read
+    /// site's identity; a bare clone would be neither. Both halves are asserted.
+    ///
+    /// This lives here rather than in `mut_elim` and `transact_phase` because it
+    /// is a property of the *engine*: those phases each carried a copy of this
+    /// test that called `Subst::discharge_env` directly and exercised no phase
+    /// code, so one engine gets one test.
+    #[test]
+    fn discharge_env_root_carries_and_freshens_interiors() {
+        let int_ty = Type::Base(crate::ccl::BaseType::Int);
+        let acc = Name::fresh("acc");
+
+        // A *compound* environment value, so there is an interior to freshen.
+        let mut value = TypedExpr::tuple(vec![
+            var("x").with_ty(int_ty.clone()),
+            var("y").with_ty(int_ty.clone()),
+        ]);
+        value.ty = Type::Tuple(vec![int_ty.clone(), int_ty.clone()]);
+        let TypedExprNode::Tuple(elts) = &value.node else {
+            unreachable!("built as a tuple")
+        };
+        let value_interior: Vec<NodeId> = elts.iter().map(|e| e.node_id).collect();
+        let env: HashMap<Name, TypedExpr> = HashMap::from([(acc.clone(), value)]);
+
+        // Two reads of the accumulator, wrapped in the scaffolding a phase uses
+        // to carry them into one decision record.
+        let read0 = TypedExpr::var(acc.clone()).with_ty(int_ty.clone());
+        let read1 = TypedExpr::var(acc.clone()).with_ty(int_ty.clone());
+        let (id0, id1) = (read0.node_id, read1.node_id);
+        let mut scaffold = TypedExpr::tuple(vec![read0, read1]);
+        scaffold.ty = Type::Tuple(vec![int_ty.clone(), int_ty]);
+
+        let out = Subst::discharge_env(scaffold, &env);
+
+        let TypedExprNode::Tuple(replaced) = &out.node else {
+            unreachable!("the scaffolding tuple survives")
+        };
+        assert_eq!(
+            (replaced[0].node_id, replaced[1].node_id),
+            (id0, id1),
+            "root-carry: a replaced read keeps its own id, so the inlined value \
+             inherits the read site's span"
+        );
+        for copy in replaced {
+            let TypedExprNode::Tuple(elts) = &copy.node else {
+                unreachable!("the environment value is a tuple")
+            };
+            for e in elts {
+                assert!(
+                    !value_interior.contains(&e.node_id),
+                    "the replacement's interior is freshened, not shared with the \
+                     environment value"
+                );
+            }
+        }
+        // Assert through the real checker rather than a local copy of its walk:
+        // uniqueness within a tree is one invariant with one implementation.
+        crate::ccl::context::assert_unique_node_ids(&out, "discharge_env");
+    }
+
+    /// A `Compose`'s arrow *ends* are derived from its elements, so a
+    /// substitution recomputes them — but its `FunKind` and Pi binder are not,
+    /// and rebuilding with `Type::fun` would answer `Compute`/`None` for both.
+    /// A data collection `⤇` must survive a discharge that reaches it, or
+    /// op-conversion dispatches on a downgraded domain.
+    #[test]
+    fn a_compose_keeps_its_fun_kind_and_binder_across_a_discharge() {
+        let int_ty = Type::Base(crate::ccl::BaseType::Int);
+        let arrow = Type::data_fun(int_ty.clone(), int_ty.clone());
+
+        // (f ≫ g) : Int ⤇ Int, with `f` the substituted occurrence.
+        let mut compose = TypedExpr::compose(vec![
+            var("f").with_ty(arrow.clone()),
+            var("g").with_ty(arrow.clone()),
+        ]);
+        compose.ty = Type::pi("n", int_ty.clone(), int_ty.clone());
+        // A Pi arrow whose ends the elements will recompute; the binder must stay.
+        let replacement = var("h").with_ty(arrow);
+        let env: HashMap<Name, TypedExpr> = HashMap::from([(Name::raw("f"), replacement)]);
+
+        let out = Subst::discharge_env(compose, &env);
+
+        let Type::Fun { name, kind, .. } = &out.ty else {
+            panic!("a `Compose` over function elements types as a function")
+        };
+        assert_eq!(
+            (name.as_ref().map(Name::base), kind),
+            (Some("n"), &crate::ccl::FunKind::Compute),
+            "the arrow's species and binder are the composition's, not its \
+             elements' — `Type::fun` would have flattened both"
+        );
+    }
+
+    /// The dual of the above on the data side: a `Compose` *typed* as a data
+    /// collection stays one. This is the shape `mut_elim` discharges over when a
+    /// mutating block binds a comprehension.
+    #[test]
+    fn a_data_compose_is_not_downgraded_to_a_compute_arrow() {
+        let int_ty = Type::Base(crate::ccl::BaseType::Int);
+        let arrow = Type::data_fun(int_ty.clone(), int_ty.clone());
+
+        let mut compose = TypedExpr::compose(vec![
+            var("f").with_ty(arrow.clone()),
+            var("g").with_ty(arrow.clone()),
+        ]);
+        compose.ty = arrow.clone();
+        let env: HashMap<Name, TypedExpr> =
+            HashMap::from([(Name::raw("f"), var("h").with_ty(arrow))]);
+
+        let out = Subst::discharge_env(compose, &env);
+
+        assert!(
+            matches!(
+                &out.ty,
+                Type::Fun {
+                    kind: crate::ccl::FunKind::Data,
+                    ..
+                }
+            ),
+            "a discharge must not downgrade `⤇` to `⇒`; got `{}`",
+            out.ty
+        );
     }
 }
 
