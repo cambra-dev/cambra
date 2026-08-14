@@ -347,9 +347,12 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     make_int_list(&[10, 20])
 )]
 #[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
+// The result arrow is **data** (`⤇`): a comprehension over a `groupby` is a
+// collection keyed by the group key, and elimination now carries that kind
+// across instead of rebuilding the arrow as a bare combinator `⇒`.
 #[case(
     "[sum(x) for x in groupby([1,2,3,4], \\y -> y // 2)]",
-    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⇒ Int)",
+    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Ints(vec![0, 1, 2]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))),

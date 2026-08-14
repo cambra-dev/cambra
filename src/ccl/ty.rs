@@ -1080,9 +1080,10 @@ impl Type {
                 domain, codomain, ..
             } => Type::Fun {
                 name: None,
-                // Canonicalize kind — elimination does not preserve it (see the
-                // doc above); comparing modulo it is what these structural asserts
-                // want.
+                // Canonicalize the kind so the comparison is about *shape*. Nothing
+                // here says elimination may lose it — `elim_lambda_kinded` carries a
+                // lambda's kind across — only that these asserts are checking
+                // domain/codomain structure and the Pi binder, not provenance.
                 kind: FunKind::Compute,
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),

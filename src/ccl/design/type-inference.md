@@ -863,14 +863,16 @@ sets `kind` explicitly.
 > error, surfaced at coalesce as `CoalesceError::ComputeWhereDataRequired`; a var
 > with only `forced_data` resolves to `Data` (a parameter used only as a collection).
 > The rejection is **emission-only**: the
-> post-inference check runs a *kind-blind* `ConstrainCache` (`new_kind_blind`),
-> because elimination canonicalizes a map's reconstructed kind to `Compute`
-> (`without_pi_names`) — denotation is preserved, kind representation is not, so
-> a kind-aware re-check would false-reject. `sum([x for x in xs])`,
+> post-inference check runs a *kind-blind* `ConstrainCache` (`new_kind_blind`).
+> That dates from elimination canonicalizing a reconstructed arrow to `Compute`;
+> `elim_lambda_kinded` now carries a lambda's kind across instead, so the
+> blindness is a conservative leftover rather than a requirement. `sum([x for x in xs])`,
 > comprehensions, and `groupby` type fine because they are stamped concrete
 > `Data` at construction (the provenance annotation / `refined_data_fun` cast
 > target). The same arm carries the data-domain invariance guard — see
 > [Data domains are invariant](#data-domains-are-invariant) below.
+
+**Elimination carries the kind.** A lambda's point-free form denotes what the lambda denoted, so it keeps its arrow kind. That is not automatic: elimination rebuilds arrows through combinator constructors (`fun_ty_or_hole`, `Type::pi`) that mint the capability kind, and a desugaring arm re-enters elimination on a rewritten body. `elim_lambda` takes the kind as an argument — `Compute` for its own recursive uses, which build morphisms out of the binder, and the enclosing `Lambda` node's own kind when that node is what is being eliminated. Without it a `groupby` binding arrives at planning as `(k: Int) ⇒ …`, a capability, having been a collection at inference.
 
 **The stamp holds past inference, and planning reads it.** The audit rule — *an
 arrow is data iff it denotes a collection* — is not an inference-only invariant;
