@@ -2201,7 +2201,7 @@ fn build_letrec(
                             })
                             .collect(),
                     );
-                    let ty = Type::fun(dom, view_rec_ty.clone());
+                    let ty = Type::data_fun(dom, view_rec_ty.clone());
                     let mut union = Expr::copair(taps);
                     union.ty = ty.clone();
                     (union, ty)

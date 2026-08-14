@@ -1123,11 +1123,11 @@ fn elim_lambda_impl(
                 let filter = apply_primitive(
                     gate_fn,
                     Builtin::FilterValues,
-                    Type::data_fun(param_ty.clone(), param_ty.clone()),
+                    Type::fun(param_ty.clone(), param_ty.clone()),
                 );
                 arms.push(
                     typed_compose(vec![filter, value_fn])
-                        .with_ty(Type::data_fun(param_ty.clone(), value_ty.clone())),
+                        .with_ty(Type::fun(param_ty.clone(), value_ty.clone())),
                 );
             }
             match arms.len() {
@@ -1136,10 +1136,7 @@ fn elim_lambda_impl(
                 // A **disjoint join**, not a copairing: these arms restrict the
                 // *same* fed domain — by first-match, or by tag — so the result
                 // lands back on it rather than on a coproduct of per-arm domains.
-                _ => {
-                    Ok(Expr::disjoint_join(arms)
-                        .with_ty(Type::data_fun(param_ty.clone(), value_ty)))
-                }
+                _ => Ok(Expr::disjoint_join(arms).with_ty(Type::fun(param_ty.clone(), value_ty))),
             }
         }
 
@@ -1365,10 +1362,7 @@ fn elim_lambda_impl(
                 // A **disjoint join**, not a copairing: these arms restrict the
                 // *same* fed domain — by first-match, or by tag — so the result
                 // lands back on it rather than on a coproduct of per-arm domains.
-                _ => {
-                    Ok(Expr::disjoint_join(arms)
-                        .with_ty(Type::data_fun(param_ty.clone(), value_ty)))
-                }
+                _ => Ok(Expr::disjoint_join(arms).with_ty(Type::fun(param_ty.clone(), value_ty))),
             }
         }
 

@@ -872,6 +872,29 @@ sets `kind` explicitly.
 > target). The same arm carries the data-domain invariance guard — see
 > [Data domains are invariant](#data-domains-are-invariant) below.
 
+**The stamp holds past inference, and planning reads it.** The audit rule — *an
+arrow is data iff it denotes a collection* — is not an inference-only invariant;
+every pass that mints a `Type::Fun` is bound by it. That matters because after
+`lambda_elim` the *domain* alone stops saying which is which: a collection's
+domain is its **index set** (`[0, 2] ⤇ Int`) while a morphism's is its **element
+type** (`Int ⇒ Int`), and the two are just types. Only the kind separates them.
+
+`plan_loops`'s iteration walk is the consumer. `insert_iterate_recurse` has to
+tell a `Copair`/`DisjointJoin` that *is* a collection — each operand its own
+iteration site — from the in-lambda `Case` fan-out, which is a morphism
+op-conversion wires to the fanned-out input; wrapping an arm of the latter hands
+`iterate` an input it rejects. It asks the kind. `wrap_with_iterate` closes the
+loop by stamping `Data` on what it builds, which is the rule stated as code: the
+runtime sweeps that domain, so it is a collection.
+
+Before that, the walk read the form off the arms — "does an arm lead with a bare
+restrictor builtin" — which is a structural proxy for the kind and got one of the
+two fan-out shapes wrong. `variant_project(c)` is a bare `Builtin` and was
+excluded; `filter_values(π̂)` is an *application* of one and was not, so the
+value-`Case` fan-out was treated as a collection. Nothing miscompiled, because
+`is_iteration_bearing` recognises a `FilterValues`-led chain independently — but
+the guard that was documented as making the distinction was not making it.
+
 ### The domain join is a Σ
 
 A join of two data functions is **not** the contravariant meet of their domains. The

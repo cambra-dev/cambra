@@ -126,6 +126,16 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
     }
 
     expr.walk_children_mut(insert_iterate_recurse);
+    // Read before the match takes `expr.node` mutably. A `Data` domain is one the
+    // runtime sweeps, which is what makes a node an iteration site rather than a
+    // morphism waiting for an input.
+    let is_collection = matches!(
+        &expr.ty,
+        Type::Fun {
+            kind: crate::ccl::ty::FunKind::Data,
+            ..
+        }
+    );
     match &mut expr.node {
         // `FinalOrDefault`'s stream argument is the iteration site. Two argument
         // shapes: `Tuple([stream, default])`, where only `stream` is iterated (the
@@ -178,16 +188,15 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         // The value forms of both collection merges: op-conversion compiles every
         // operand with `input=None`, so each is its own iteration site.
         //
-        // A disjoint join comes in two forms, and only this one is unfed. The fed
-        // form — the in-lambda `Case` fan-out — leads each arm with a **bare**
-        // restrictor builtin (`filter_values ≫ eᵢ`, ``variant_project(`c) ≫ eᵢ``),
-        // a morphism that op-conversion wires to the fanned-out input; the unfed
-        // form's arms are concrete collections. Wrapping a fed arm would hand
-        // `iterate` an input it rejects, so read the form off the arms.
+        // A merge comes in two forms, and only the **collection** one is unfed.
+        // The other — the in-lambda `Case` fan-out — is a *morphism* out of the
+        // eliminated binder, which op-conversion wires to the fanned-out input;
+        // wrapping one of its arms would hand `iterate` an input it rejects. The
+        // [`FunKind`](crate::ccl::ty::FunKind) is exactly that distinction, so ask
+        // it: a `Data` domain is one the runtime sweeps, which is what an
+        // iteration site is.
         TypedExprNode::Copair(operands) | TypedExprNode::DisjointJoin(operands)
-            if !operands
-                .iter()
-                .any(|o| matches!(head_of(o).node, TypedExprNode::Builtin(_))) =>
+            if is_collection =>
         {
             for operand in operands.iter_mut() {
                 wrap_with_iterate(operand);
@@ -1026,7 +1035,7 @@ mod tests {
         // iteration site.
         let int = int_ty();
         let mut expr =
-            Expr::new(TypedExprNode::Copair(vec![list_123(), list_123()])).with_ty(fun_ty(
+            Expr::new(TypedExprNode::Copair(vec![list_123(), list_123()])).with_ty(Type::data_fun(
                 Type::variant(vec![
                     (FieldKey::Index(0), Type::UIntRange(3)),
                     (FieldKey::Index(1), Type::UIntRange(3)),
@@ -1041,6 +1050,34 @@ mod tests {
             assert!(
                 is_iterate_apply(chain_head(operand)),
                 "operand {i} should be iterate-led, got: {}",
+                symbolic(operand)
+            );
+        }
+    }
+
+    /// The **morphism** form of a merge is left alone.
+    ///
+    /// A `Case` fan-out eliminated inside a lambda is a morphism out of the
+    /// eliminated binder — op-conversion wires it to the fanned-out input — so
+    /// wrapping an arm would hand `iterate` an input it rejects. The
+    /// [`FunKind`](crate::ccl::ty::FunKind) is what says which form this is: a
+    /// `Data` domain is one the runtime sweeps, a `Compute` one is an argument
+    /// still to be supplied. The domains are indistinguishable structurally —
+    /// both are just types — which is why the kind has to carry it.
+    #[test]
+    fn test_insert_iterate_recurse_leaves_a_compute_kinded_merge_alone() {
+        let int = int_ty();
+        // Same shape as the collection case above, differing only in kind.
+        let mut expr = Expr::new(TypedExprNode::DisjointJoin(vec![list_123(), list_123()]))
+            .with_ty(Type::fun(int.clone(), int));
+        insert_iterate_recurse(&mut expr);
+        let TypedExprNode::DisjointJoin(operands) = &expr.node else {
+            panic!("expected DisjointJoin, got: {}", symbolic(&expr));
+        };
+        for (i, operand) in operands.iter().enumerate() {
+            assert!(
+                !is_iterate_apply(chain_head(operand)),
+                "operand {i} of a morphism-kinded merge must not be iterate-led, got: {}",
                 symbolic(operand)
             );
         }
