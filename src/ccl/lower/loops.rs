@@ -158,7 +158,7 @@ pub(super) fn lower_generator_for(
         let frame_introduced = HashSet::from([iter_var.clone()]);
         // Plain yield without loop-carried mutation: desugar yield → defer + feed.
         let defer_name = ctx.fresh_result_name();
-        // The loop target shadows a like-named transactional register in the body.
+        // The loop target shadows a like-named transactional mutable variable in the body.
         let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
             lower_for_body_stmts(
                 body,
@@ -183,7 +183,7 @@ pub(super) fn lower_generator_for(
     } else {
         let source = lower_expr(iter, ctx)?;
         let frame_introduced = HashSet::from([iter_var.clone()]);
-        // The loop target shadows a like-named transactional register in the body.
+        // The loop target shadows a like-named transactional mutable variable in the body.
         let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
             lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)
         })?;
@@ -502,7 +502,7 @@ fn lower_for_body_terminal(
             let mut inner_mutation_scope = mutation_scope.clone();
             inner_mutation_scope.extend(frame_introduced.iter().cloned());
             let inner_frame = HashSet::from([inner_var.clone()]);
-            // The inner loop target shadows a like-named transactional register.
+            // The inner loop target shadows a like-named transactional mutable variable.
             let inner_body = ctx.with_shadowed([inner_var.clone()], |ctx| {
                 lower_for_body_stmts(body, defer_name, &inner_mutation_scope, inner_frame, ctx)
             })?;
@@ -714,8 +714,8 @@ pub(super) fn lower_direct_mirror_loop(
 
     // Build the statement chain right-to-left, ending in Unit (the For's
     // body is a statement, not a value). The loop target is in scope over the
-    // body — shadow it so a body read of a like-named transactional register is
-    // read as the loop local, not gated as an out-of-block register read.
+    // body — shadow it so a body read of a like-named transactional mutable variable is
+    // read as the loop local, not gated as an out-of-block mutable variable read.
     let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
         lower_loop_body_chain(body_stmts, acc_names, yield_defer, false, for_span, ctx)
     })?;
@@ -1185,7 +1185,7 @@ in guarded_let"
     // Generator function negative / mutation-loop tests
     // -----------------------------------------------------------------------
 
-    /// A `with begin():` block that neither writes a transactional register nor
+    /// A `with begin():` block that neither writes a transactional mutable variable nor
     /// feeds a read does nothing observable and is rejected. Covers standalone,
     /// middle, and loop-body positions — here `x`/`y` are plain locals, not
     /// `Mut(_, Txn)` stores, and there is no feed.
@@ -1208,7 +1208,7 @@ in guarded_let"
 
     /// `store: Mut(Int, Txn) := 0` lowers as a plain `let store = 0`, registering
     /// `store` transactional. A *bare* trailing read is then rejected — a
-    /// transactional register may be read only inside a `with begin():` block.
+    /// transactional mutable variable may be read only inside a `with begin():` block.
     #[test]
     fn test_mut_txn_bare_read_rejected() {
         let stmts = parse_module("store: Mut(Int, Txn) := 0\nstore");

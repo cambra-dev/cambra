@@ -491,10 +491,10 @@ perform an **effect** when evaluated. The effecting forms:
 - **`yield`** (§3.13) appends its operand to the deferred collection the
   enclosing generator function returns.
 - **A call to an effecting function** — one that writes a `Mut(…)`
-  parameter (pass-by-reference, §6.2) or writes a transactional register
+  parameter (pass-by-reference, §6.2) or writes a transactional mutable variable
   inside a `with begin():` block (§8) — performs that function's writes.
   A function's effects are always visible in its signature (a `Mut(…)`
-  parameter, or a `Txn`-register write in its body); there are **no
+  parameter, or a write to a `Txn` variable in its body); there are **no
   implicit-effect functions**, so an inert expression statement (§4.9)
   stays detectable and rejected.
 
@@ -1017,7 +1017,7 @@ A CHL **program** is its top-level block (§2.1): a sequence of
 statements. Each non-terminal statement either introduces a binding
 visible to the remainder of the block, or performs an effect (a feed
 into a deferred output). The block's *value* is the value of its final
-expression statement; if the program registers any sinks (e.g.
+expression statement; if the program mutable variables any sinks (e.g.
 `http_serve`), the program value is implicitly a record of those sinks
 instead.
 
@@ -1146,7 +1146,7 @@ executes, so it can be the source of an unbounded stream (e.g. when
 |---|---|
 | `target = value` | Evaluate `value`, bind it to `target` as an **immutable** binding for the rest of the enclosing scope. Never mutates. |
 | `target: T = value` | Same, additionally checking that `value` has type `T`. |
-| `target := value` | **Mutation** (§8.1): introduce (the first `:=`) or write a mutable variable. It is `:=`, not any annotation, that makes a variable mutable; transactional registers are always introduced this way (`x: Mut(V, Txn) := …`). |
+| `target := value` | **Mutation** (§8.1): introduce (the first `:=`) or write a mutable variable. It is `:=`, not any annotation, that makes a variable mutable; transactional mutable variables are always introduced this way (`x: Mut(V, Txn) := …`). |
 | `target op= value` | Compound mutation — `target := target op value`, for `op` ∈ `+ - * //`. The target **must** be a mutable variable (one introduced with `:=`); a `+=` to an immutable binding is a type error, not a silent rebind. |
 | `target <<= value` | Resolves a previously-deferred name to `value` (§4.4). |
 
@@ -1439,7 +1439,7 @@ A bare expression `e` is a statement. The expression is evaluated; if it
 appears as the **last statement** of a block, its value is the block's
 value. If it appears elsewhere, it must **have an effect** — a feed
 (`target << value`), or a call to an effecting function (one that writes a
-`Mut(…)` parameter or a transactional register, §8) — otherwise the
+`Mut(…)` parameter or a transactional mutable variable, §8) — otherwise the
 statement is inert and is rejected.
 
 This rules out Python's "expression for its side-effect" idiom for any
@@ -1524,7 +1524,7 @@ marked one carries its status per "How to read this document".)
   Not writable yet.
 - `{T where p(_)}` — refinement type (**[Decided]**, §6.4). Not writable
   yet.
-- `Mut(V)` / `Mut(V, Txn)` — mutable-variable / transactional-register
+- `Mut(V)` / `Mut(V, Txn)` — mutable-variable / transactional-variable
   type (§6.2, §8).
 - `Map(K, V)` — finite-map type. **[Planned]** — the map literal
   `[k -> v, …]` (§3.11) and `Map(…)` as an annotation are both
@@ -1995,7 +1995,7 @@ it is `:=`, not the annotation, that makes a variable mutable.
 ```python
 cnt := 0                       # loop accumulator; value type and domain inferred
 cnt: Mut(Int) := 0             # same, value type spelled explicitly
-balance: Mut(Int, Txn) := 0    # transactional register over the commit order
+balance: Mut(Int, Txn) := 0    # transactional mutable variable over the commit order
 ```
 
 - `:=` — the write operator, for the first introduction (`cnt := 0`) and
@@ -2008,7 +2008,7 @@ balance: Mut(Int, Txn) := 0    # transactional register over the commit order
   is the value type; `D` is the sequencing domain, inferred as the writing
   loop's domain when omitted or written `_`. **`Txn` is never inferred** —
   sharing a variable across concurrent writers or endpoints is a semantic
-  commitment the program must spell, so a transactional register is always
+  commitment the program must spell, so a transactional mutable variable is always
   introduced `balance: Mut(V, Txn) := …`.
 - `Mut(…)` is also legal as a function **parameter** annotation —
   pass-by-reference, so a callee can write the caller's variable
@@ -2037,7 +2037,7 @@ for req in incr_reqs:
 - `begin()` is the transaction marker. **All writes in one block commit
   atomically** — the whole block's writes become visible together or not
   at all. There is no partially-visible commit.
-- Writes to a `Txn`-domain register are legal **only** inside a `with
+- Writes to a `Txn`-domain mutable variable are legal **only** inside a `with
   begin():` block; a write outside one is rejected (§8.3), as is a write
   reached through a transactional-writer function *called* inside a block
   (a disguised nested transaction).
@@ -2068,20 +2068,20 @@ the transaction around `reserve` + `quote` + the feed).
 - **Trailing induction read** — after a `for` loop, a bare reference to an
   induction accumulator is its final value (or the pre-loop value if the
   source was empty). The loop has ended, so "latest" is unambiguous.
-- **A `Txn` register is read only inside a `with begin():` block.** A bare
+- **A `Txn` mutable variable is read only inside a `with begin():` block.** A bare
   read outside one is an error. Reading inside a block pins a
-  **snapshot-consistent** view: several register reads in one block see
+  **snapshot-consistent** view: several mutable variable reads in one block see
   one commit snapshot — the reason the block is required.
-- **As-of read.** A register read fed *out* of a block that does not
-  itself write that register is an **as-of read at an arbitrary commit
-  position** — the register's value as of wherever the reading transaction
+- **As-of read.** A mutable variable read fed *out* of a block that does not
+  itself write that mutable variable is an **as-of read at an arbitrary commit
+  position** — the mutable variable's value as of wherever the reading transaction
   lands in the commit order, replied indexed by the *reading* loop. This
   is uniform whether the reader is a live request stream, a finite loop,
   or the synthesized singleton of a standalone read.
 - **Terminal read — `await_final(x)` [Decided].** The one term that reads a
-  register's *final* committed value, waiting for its whole commit history
+  mutable variable's *final* committed value, waiting for its whole commit history
   to complete, is `await_final` (§8.6). There is deliberately no other
-  terminal register read; absent it, every fed-out register read is an
+  terminal mutable variable read; absent it, every fed-out mutable variable read is an
   arbitrary as-of sample, not a promised final.
 
 ### 8.4 Feeds are the second form of mutability
@@ -2126,8 +2126,8 @@ interleaved (or parallel) otherwise. The events:
   piece produces, the read depends on the write — read-your-writes in a
   block, a commit decision reading a snapshot, a reply consuming its own
   commit record.
-- **`await_final`.** The **completion event** of a transactional register
-  (§8.6): it is available only once every writer of the register has
+- **`await_final`.** The **completion event** of a transactional mutable variable
+  (§8.6): it is available only once every writer of the mutable variable has
   drained, and everything downstream depends on that completion.
 
 Consequences a program may rely on:
@@ -2144,7 +2144,7 @@ Consequences a program may rely on:
 - **Terminal vs. temporal reads.** `await_final` (and the trailing
   induction read) wait for a history's *completeness*; an as-of read waits
   only for the *frontier* (that no earlier-or-equal commit is still
-  outstanding) and samples the register as of the reader's own position.
+  outstanding) and samples the mutable variable as of the reader's own position.
 - **A shared program-start anchor gives no *relative* order — by design,
   not by omission.** A standalone `with begin():` or a literal-list loop
   depends on **program start** like everything else, but on nothing more.
@@ -2164,13 +2164,13 @@ Consequences a program may rely on:
 **Designed, not yet built** — a program that names `await_final` does not
 compile today.
 
-`await_final(x)` is a builtin call on a transactional register
-`x: Mut(V, Txn)`, an expression of type `V`: the register's **final
+`await_final(x)` is a builtin call on a transactional mutable variable
+`x: Mut(V, Txn)`, an expression of type `V`: the mutable variable's **final
 committed value**, once its entire commit history is complete (every
 writer source drained), or the initializer if it was never committed. It
-is the register-domain counterpart of the trailing induction read (§8.3)
+is the commit-domain counterpart of the trailing induction read (§8.3)
 and the completion event of the ordering model (§8.5) — the *only* read
-that waits for a `Txn` register's completeness rather than the frontier.
+that waits for a `Txn` mutable variable's completeness rather than the frontier.
 
 ```python
 pool: Mut(Int, Txn) := 100
@@ -2186,7 +2186,7 @@ the completion event well-defined: `await_final` declares `x`'s history
 complete, and a later write would extend a history already declared
 finished. Forbidding later references closes the writer set at the await
 point, so "final" names a fixed value. (A `for` loop's accumulator gets the
-same terminal read for free because the loop has a lexical end; a register
+same terminal read for free because the loop has a lexical end; a mutable variable
 has none, so the barrier is drawn explicitly by consuming it.)
 
 ### 8.7 Direction [Decided]: transactions as contextual parameters
@@ -2194,7 +2194,7 @@ has none, so the barrier is drawn explicitly by consuming it.)
 (2026-06-29 §6; the north-star `txn_kv` program is the worked example.)
 
 The implemented model above passes a transaction *implicitly by block
-scope* (`with begin():` establishes it; `Mut(…, Txn)` registers are the
+scope* (`with begin():` establishes it; `Mut(…, Txn)` mutable variables are the
 shared state). A **[Decided]** further direction adds an explicit
 contextual-parameter mechanism modeled on Scala 3's `given`/`using`/`summon`,
 so a transaction can be threaded into a called function without a `Mut`
@@ -2373,7 +2373,7 @@ with parser-level support that lowering rejects:
   (**[Decided]** as surface, unimplemented; the north-star
   `storefront` `/stats` rollup uses it).
 - **The target syntax at large** — the mutation and transaction
-  **core is implemented** (`:=`, `with begin():`, `Mut(…, Txn)` registers,
+  **core is implemented** (`:=`, `with begin():`, `Mut(…, Txn)` mutable variables,
   feeds — §8), now spelled in the canonical target syntax: parenthesised type
   application (`Mut(V, Txn)`, `List(T)`) and capitalized primitive names
   (`Int`, `Bool`, `String`), with record types `{name: T, …}` and tuple types

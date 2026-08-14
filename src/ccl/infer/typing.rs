@@ -258,14 +258,3 @@ pub(super) trait Typing {
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError>;
 }
-
-/// Peel every outer [`Type::Refinement`] layer off `t`, returning the bare
-/// structural type underneath. Non-allocating — only unwraps the outer refinements a
-/// node acquired during solving; nested refinements are left in place.
-pub(super) fn peel_refinements_outer(t: &Type) -> &Type {
-    let mut cur = t;
-    while let Type::Refinement(inner, _) = cur {
-        cur = inner;
-    }
-    cur
-}

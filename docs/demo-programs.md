@@ -121,7 +121,7 @@ Expected output once unblocked:
 Programs we want eventually but haven't written yet — these are good seeds for
 when you go to add more.
 
-- **Two-input join over HTTP** — register two `http_serve` endpoints, join
+- **Two-input join over HTTP** — mutable variable two `http_serve` endpoints, join
   their inputs by a shared key, return the combined response.  Needs:
   multi-way join planning (in progress) and a way to express the join over
   deferred collections.

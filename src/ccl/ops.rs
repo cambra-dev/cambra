@@ -411,7 +411,7 @@ pub enum Builtin {
     /// [`crate::ccl::TypedExprNode::LetRec`]: a binding whose reference to a
     /// commit-record binding is consumed only as the history argument depends
     /// only on strictly earlier commit times, which is what makes the
-    /// `register ↔ commits` cycle well-founded (see
+    /// `mutable variable ↔ commits` cycle well-founded (see
     /// `src/ccl/design/mutability.md`, "Builtins", and
     /// [`crate::ccl::letrec::check_letrec_causal`]).
     ///
@@ -424,7 +424,7 @@ pub enum Builtin {
     /// begin():` site: where the site's iteration `𝑟` lands in the global
     /// commit order. Applied as `begin(r)` (`Apply(Var(r), Builtin(BeginTxn))`)
     /// inside a commit-record binding, it produces the transaction's commit time
-    /// `t`, at which that writer's register snapshots are read (`balance(t)`).
+    /// `t`, at which that writer's mutable variable snapshots are read (`balance(t)`).
     ///
     /// Minted by [`crate::ccl::transact_phase`] — one application per site,
     /// *after* inference, so it carries no scheme in
@@ -451,18 +451,18 @@ pub enum Builtin {
     /// (temporal) join**, the live cross-endpoint read. Applied as a tupled
     /// argument `Apply(Tuple([trigger, source]), Builtin(AsOf))`: for each
     /// `trigger` (request-loop) position, latch `source`'s (a transactional
-    /// register's running render, `Fun(Txn, V)`) latest-decided value as of that
+    /// mutable variable's running render, `Fun(Txn, V)`) latest-decided value as of that
     /// position. The reply is indexed by the *trigger* (the enclosing request
     /// loop), not the commit clock — an outer-indexed read.
     ///
     /// Born in [`crate::ccl::transact_phase`]'s `rewrite_live_reads`, run
     /// **pre-lambda-elim** (after `channelize`): it recognizes a read-only
-    /// reply — a chain of live-register reads `let k₁ = final_or_default((balance.f₁, _))
+    /// reply — a chain of live-variable reads `let k₁ = final_or_default((balance.f₁, _))
     /// in … in trigger ≫ (λ r → e)` — and rewrites it, dropping the never-resolving
-    /// `final_or_default`s. Reading **one** register → `as_of((trigger, balance.f)) ≫
+    /// `final_or_default`s. Reading **one** mutable variable → `as_of((trigger, balance.f)) ≫
     /// (λ k → e)`; reading **several** → `as_of((trigger, balance)) ≫ (λ snap → e[kᵢ
     /// ↦ snap.fᵢ])`, a single snapshot record folded at one commit frontier so the
-    /// registers are read atomically (§I-c). Running before lambda elimination
+    /// mutable variables are read atomically (§I-c). Running before lambda elimination
     /// keeps a computed reply (`e = k + 1`) a lambda the elim pass point-frees,
     /// rather than a point-free `const` that could only be broadcast. Compiles to
     /// the [`crate::interpreter::commit_operator`] `AsOf` tile operator (scalar- or

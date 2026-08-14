@@ -58,7 +58,7 @@ interpreter/
 
 ## Per-port server sharing
 
-One `tiny_http::Server` is bound per TCP port, shared by all `http_serve` routes on that port.  `SharedHttpServer::register(method, path)` adds a route and returns an `mpsc::Receiver` channel.  The background dispatcher reads each incoming request, looks up the route in the `RouteMap`, and either delivers the request body to the matching channel or returns 404.
+One `tiny_http::Server` is bound per TCP port, shared by all `http_serve` routes on that port.  `SharedHttpServer::mut_var(method, path)` adds a route and returns an `mpsc::Receiver` channel.  The background dispatcher reads each incoming request, looks up the route in the `RouteMap`, and either delivers the request body to the matching channel or returns 404.
 
 Duplicate `(port, method, path)` registrations are rejected with a `LoweringError` at compile time.
 

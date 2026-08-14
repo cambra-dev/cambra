@@ -29,7 +29,7 @@
 //!   defer handle / mutable variable bound elsewhere, not a binder. It is
 //!   surfaced as a [`ScopedItem::VarRef`].
 //! - [`Transact`](TypedExprNode::Transact) — introduces **no** binder. Its
-//!   `keys` name register fields of the record the node denotes, and a writer's
+//!   `keys` name mutable variable fields of the record the node denotes, and a writer's
 //!   `read_keys`/`write_keys` are references to those fields; they are labels,
 //!   not variable occurrences, so they are surfaced as
 //!   [`ScopedItem::KeyRef`] — distinct from `VarRef` precisely so a
@@ -166,9 +166,9 @@ pub enum ScopedItem<'a> {
     /// [`Var`](TypedExprNode::Var), or the write target of a
     /// `Feed`/`Define`/`MutWrite`. Free-variable analyses count these.
     VarRef(&'a Name),
-    /// A register-key *label* occurrence — a [`Transact`](TypedExprNode::Transact)
+    /// A variable-key *label* occurrence — a [`Transact`](TypedExprNode::Transact)
     /// key or writer footprint entry. Not a variable use: it names a field of
-    /// the register record the node denotes, so free-variable analyses skip it
+    /// the mutable variable record the node denotes, so free-variable analyses skip it
     /// while a consumer that cares about every name a node mentions folds it in.
     KeyRef(&'a Name),
 }
@@ -299,7 +299,7 @@ where
         }
 
         // Post-planning carrier. No binder: a writer body is already point-free
-        // and receives its register snapshots positionally, so the keys are
+        // and receives its mutable variable snapshots positionally, so the keys are
         // field labels rather than binders (see the module docs).
         N::Transact { keys, writers, .. } => {
             for k in keys {
@@ -335,7 +335,7 @@ pub enum ScopedItemMut<'a> {
     /// Yielded before any `Scope`, since a node's own occurrences are resolved
     /// in the node's own scope, not under a binder it introduces.
     VarRef(&'a mut Name),
-    /// A register-key label occurrence — see [`ScopedItem::KeyRef`]. Every
+    /// A variable-key label occurrence — see [`ScopedItem::KeyRef`]. Every
     /// occurrence of a key is yielded (the `keys` entry and each writer
     /// footprint mention), so a consumer that rewrites one can keep them in
     /// step.

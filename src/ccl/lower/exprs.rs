@@ -163,7 +163,7 @@ pub(super) fn lower_call(
             // Single-arg call: direct application `f(a)` → `Apply(a, f)`. The
             // argument is an ordinary value, so it lowers through `lower_expr` —
             // where the out-of-block transactional read gate applies. (Only a
-            // `Mut`-param callee, handled above, accepts a bare register pass and
+            // `Mut`-param callee, handled above, accepts a bare mutable variable pass and
             // bypasses the gate.)
             if args.len() == 1 {
                 let arg = lower_expr(&args[0], ctx)?;

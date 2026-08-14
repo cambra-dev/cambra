@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use smol_str::SmolStr;
 
 use crate::ccl::FieldKey;
-use crate::ccl::ccl_utils::{cast_target_refinement, strip_refinements};
+use crate::ccl::ccl_utils::cast_target_refinement;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::symbolic::symbolic;
@@ -18,7 +18,7 @@ use crate::ccl::{
 
 use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
-use super::typing::{Typing, peel_refinements_outer};
+use super::typing::Typing;
 use super::{product, variant_type};
 use crate::ccl::infer::solver::traits::Trait;
 
@@ -202,32 +202,38 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(binding) => binding.scheme.instantiate(ctx.level),
             };
-            // The written value flows into the mutable variable's *value* type, not the
-            // `Mut` handle itself: peel `Mut(V, D)` to `V` before constraining.
-            // (The `(_, Mut)` lenient coercion arm would deref anyway, but the
-            // explicit peel names the write semantics — a write updates `V`.)
-            let mut_val = match peel_refinements_outer(&var_ty) {
-                Type::History { value, .. } => value.as_ref().clone(),
-                _ => var_ty.clone(),
-            };
+            // The written value flows into the mutable variable's *value* type, not
+            // the `Mut` handle itself. (The `(_, Mut)` lenient coercion arm would
+            // deref anyway, but naming the mutable variable's value type says what a write
+            // means — it updates `V`.)
+            let mut_value = var_ty.mut_value_type();
             let value_ty = ctx.subexpr(value)?;
             let write_label = name.clone();
-            // Both sides stripped of refinements. A refinement is a fact about *a
-            // value*, and a register is not one value — it is the sequence its
-            // initializer and every write produce, so its value type is the **join**
-            // over all of them, which no single contribution's refinement survives.
-            // Taking one would assert the register never changes, which is what
-            // declaring it mutable denies.
+            // The written value flows in **verbatim**, as one contribution to the
+            // mutable variable's value type. A refinement is a fact about *a value*, and a
+            // mutable variable is not one value — it is the sequence its seed and every write
+            // produce — so its value type is the join over all of them, and the
+            // lattice already *is* that join: every contribution is a lower bound of
+            // the mutable variable's value variable, and a positive-position read intersects
+            // refinement sets. A refinement therefore survives exactly when every
+            // contribution establishes it, which is the rule, and nothing here has to
+            // pre-emptively weaken a contribution to get it.
             //
-            // Stripping the *target* too keeps the diagnostic honest when
-            // `name` is not a register at all (`x = 0; x += 1`): that is a
-            // mutability-discipline error, and a spurious type error here would
-            // pre-empt it with a worse message.
-            ctx.require_sub(
-                &strip_refinements(&value_ty),
-                &strip_refinements(&mut_val),
-                &|| format!("write to mutable variable `{write_label}`"),
-            )?;
+            // The target is **not** relaxed. When `name` is not a mutable variable at all
+            // (`x = 0; x += 1`) the constraint is skipped outright and
+            // `check_mut_write_targets` owns the diagnosis — that is a
+            // mutability-discipline error, and a type error raised here would
+            // pre-empt it with a worse message. Relaxing the demand to buy that
+            // ordering instead would weaken a check that should hold: a mutable variable
+            // annotated `Mut({Int | p})` genuinely does demand `{Int | p}` of its
+            // writes. (That case has no surface syntax yet — a refinement is not
+            // writable in a type annotation — so what a program can exercise today is
+            // the demand on an unrefined annotation and the skip on a non-mutable one.)
+            if let Some(mut_val) = mut_value {
+                ctx.require_sub(&value_ty, mut_val, &|| {
+                    format!("write to mutable variable `{write_label}`")
+                })?;
+            }
             Type::Base(BaseType::Unit)
         }
 
@@ -286,7 +292,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 /// silently relabels a user's kind.
 fn stamp_kind_from(target: &mut Type, reference: &Type) {
     use crate::ccl::ty::FunKind;
-    if let Type::Fun { kind: ref_kind, .. } = peel_refinements_outer(reference)
+    if let Type::Fun { kind: ref_kind, .. } = reference.peel_refinements()
         && !matches!(ref_kind, FunKind::Var(_))
         && let Type::Fun { kind, .. } = target
     {
@@ -557,7 +563,7 @@ pub(super) fn emit_cast<C: Typing>(
     // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
     // still carries its arrow's kind, which a match on the raw target would drop
     // to the `Compute` default.
-    let kind = match peel_refinements_outer(target) {
+    let kind = match target.peel_refinements() {
         Type::Fun { kind, .. } => kind.clone(),
         _ => crate::ccl::ty::FunKind::Compute,
     };
@@ -566,7 +572,7 @@ pub(super) fn emit_cast<C: Typing>(
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
     // which is what keeps the O8 contravariant-domain discharge from leaving an
     // undischarged binder in the domain's refinement predicate (design §5.2, O8).
-    let name = match peel_refinements_outer(&value_ty) {
+    let name = match value_ty.peel_refinements() {
         Type::Fun { name: Some(k), .. } => Some(k.clone()),
         _ => None,
     };
@@ -593,6 +599,9 @@ pub(super) fn emit_apply<C: Typing>(
     // A morphism's contravariant domain, left under-determined by the one-way
     // edges, is recovered structurally at coalesce
     // (`specialize_projection_domain` / `specialize_lambda_domain`).
+    // A mutable argument is a *contribution* to its mutable variable, not just a value
+    // flowing in — record that before the ordinary edges (below).
+    contribute_pbr_writes(function, &fn_ty, &arg_ty, ctx)?;
     ctx.apply(&fn_ty, &arg_ty, argument, &|| "Apply".to_string())
 }
 
@@ -616,6 +625,85 @@ fn require_single_obligation<C: Typing>(
             ctx.require_trait(trait_, operands, None, at)?;
             Ok(Type::Base(base.clone()))
         }
+    }
+}
+
+/// Passing a mutable variable to a `Mut(V)` parameter contributes `V` to the mutable variable's value
+/// type, because that is what the call *means*: the callee may write any `V` here.
+///
+/// Without this the contribution is simply missing, and the mutable variable's value type is
+/// left claiming whatever its lexically-visible writes agree on. The ordinary
+/// application edges cannot supply it: `Typing::apply` records `arg <: d` against a
+/// **fresh variable** `d`, so a `Mut` argument meets an `Infer` rather than the
+/// parameter's `Mut(V)` — and `(History, Infer)` is deliberately the *deref* arm, since
+/// a bare read like `cnt + 1` must read through the handle. The handle is dereffed, the
+/// invariance rule that would relate the two value types never runs, and `V` arrives
+/// only as an *upper* bound. So the mutable variable's value variable ends up with the seed as
+/// its sole lower bound: `x := 0` passed to `Mut(Int)` typed as `{Int | __elem == 0}`,
+/// which the invariance check then rejected against the parameter.
+///
+/// The parameter is read off the head of the application spine rather than off the
+/// immediately-applied type ([`parameter_type`]) — otherwise only a call's *first*
+/// argument is ever seen.
+///
+/// A mutable variable can only ever be the parameter itself, never nested inside one: rule 2 of
+/// the mutability discipline (`check_no_nested_mut`) rejects a `Mut` at every position
+/// but a function domain's root, so there is no composite to walk into.
+///
+/// Reading the parameter's `Mut` syntactically is sound here, and it is the one place
+/// that is true of a `Mut`: the mutability discipline *requires* a pass-by-reference
+/// parameter to be annotated (`check_mut_discipline`'s rule 3 rejects an unannotated
+/// mut alias), so the domain is a `History` by construction at every call this needs to
+/// see.
+fn contribute_pbr_writes<C: Typing>(
+    function: &Expr,
+    fn_ty: &Type,
+    arg_ty: &Type,
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
+    let Some(arg_value) = arg_ty.mut_value_type() else {
+        return Ok(());
+    };
+    let Some(param_value) = parameter_type(function, fn_ty).and_then(Type::mut_value_type) else {
+        return Ok(());
+    };
+    ctx.require_sub(param_value, arg_value, &|| {
+        "writes through a mutable parameter".to_string()
+    })
+}
+
+/// The declared parameter type an argument is passed at, or `None` when the callee is
+/// opaque here.
+///
+/// An n-ary surface call lowers to a **curried** `Apply` spine — `f(a, b)` is
+/// `Apply(Apply(f, a), b)` — and [`Typing::apply`] types every application as a *fresh
+/// variable*, so the type of the function being applied is a bare `Infer` for every
+/// argument after the first. The head of the spine is the only node whose type spells
+/// the parameters out, so the spine's length is this argument's position and its
+/// parameter is the domain reached by peeling that many codomains.
+///
+/// `fn_ty` is the applied function's freshly-emitted type, used when `function` *is*
+/// the head, so this does not depend on the writeback having landed.
+fn parameter_type<'t>(function: &'t Expr, fn_ty: &'t Type) -> Option<&'t Type> {
+    let mut head = function;
+    let mut applied = 0usize;
+    while let TypedExprNode::Apply {
+        function: inner, ..
+    } = &head.node
+    {
+        head = inner;
+        applied += 1;
+    }
+    let mut ty = if applied == 0 { fn_ty } else { &head.ty };
+    for _ in 0..applied {
+        let Type::Fun { codomain, .. } = ty.peel_refinements() else {
+            return None;
+        };
+        ty = codomain;
+    }
+    match ty.peel_refinements() {
+        Type::Fun { domain, .. } => Some(domain),
+        _ => None,
     }
 }
 
@@ -664,7 +752,7 @@ pub(super) fn emit_tuple<C: Typing>(
         // carrying `Mut` (rule 1 accepts it; the phase erases the type later) —
         // only the *composite type* is dereferenced, so a `Mut` never appears
         // nested in it. A non-`Mut` element is unchanged.
-        fields.insert(FieldKey::Index(i), deref_mut(&ctx.subexpr(e)?));
+        fields.insert(FieldKey::Index(i), read_through(&ctx.subexpr(e)?));
     }
     Ok(product(fields))
 }
@@ -680,7 +768,7 @@ pub(super) fn emit_record<C: Typing>(
         // takes the dereferenced type so no `Mut` appears in the record type.
         fields.insert(
             FieldKey::Name(SmolStr::from(n.as_str())),
-            deref_mut(&ctx.subexpr(e)?),
+            read_through(&ctx.subexpr(e)?),
         );
     }
     Ok(product(fields))
@@ -722,19 +810,11 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
     }
 }
 
-/// Deref a mutable variable reference to its value type: peel a
-/// (refinement-wrapped) `Mut(V, D)` (a [`HistoryKind::Overwrite`] history) to `V`.
-/// A no-op on non-mutable types (including a feed channel, which reads as its
-/// whole stream, not a scalar value).
-fn deref_mut(ty: &Type) -> Type {
-    match peel_refinements_outer(ty) {
-        Type::History {
-            value,
-            kind: crate::ccl::HistoryKind::Overwrite,
-            ..
-        } => value.as_ref().clone(),
-        _ => ty.clone(),
-    }
+/// Deref a mutable variable reference to its value type. A no-op on every other
+/// type — a feed channel included, since reading one yields its whole stream
+/// rather than a scalar value ([`Type::mut_value_type`]).
+fn read_through(ty: &Type) -> Type {
+    ty.mut_value_type().unwrap_or(ty).clone()
 }
 
 /// Type a `Feed { name, value }`: the fed value contributes one element to
@@ -760,7 +840,7 @@ pub(super) fn emit_feed<C: Typing>(
     // channel become `Fun` lower bounds that are *joined* (codomains lub'd),
     // not constrained against a demand, so an undereferenced `Mut(V, D)` would
     // collide with a plain-`V` feed to the same channel instead of dereffing.
-    let value_ty = deref_mut(&ctx.subexpr(value)?);
+    let value_ty = read_through(&ctx.subexpr(value)?);
     let contribution = fun(ctx.fresh(), value_ty);
     constrain_into_feed(target_ty, &contribution, label, ctx)
 }
@@ -796,19 +876,15 @@ fn constrain_into_feed<C: Typing>(
     label: &str,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    match peel_refinements_outer(target_ty) {
-        Type::History {
-            value,
-            domain,
-            kind: crate::ccl::HistoryKind::Append,
-        } => {
+    match target_ty.as_feed() {
+        Some((domain, value)) => {
             // The channel is the history's `domain ⇒ value` stream; the
             // contribution flows into it (`Fun(δ, elem)` for a feed, the whole
             // collection for a define).
-            let rho = fun((**domain).clone(), (**value).clone());
+            let rho = fun(domain.clone(), value.clone());
             ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
         }
-        _ => {
+        None => {
             // Opaque target (a lambda parameter receiving the handle —
             // ParamAsTarget): *demand* it be a feed channel, then constrain the
             // contribution into that requirement's channel. The call-site
@@ -979,27 +1055,20 @@ pub(super) fn emit_let<C: Typing>(
         // so it falls through to the generic `Some(ann)` arm below (there is no
         // `Feed(…)` initializer surface today, but gating on `Overwrite` keeps this
         // arm honest rather than silently mis-typing a channel as a value).
-        Some(ann)
-            if matches!(
-                peel_refinements_outer(ann),
-                Type::History {
-                    kind: crate::ccl::HistoryKind::Overwrite,
-                    ..
-                }
-            ) =>
-        {
+        Some(ann) if ann.mut_value_type().is_some() => {
             let hist_ty = ctx.normalize(ann);
-            if let Type::History { value, .. } = peel_refinements_outer(&hist_ty)
-                && !matches!(value.as_ref(), Type::Hole)
+            if let Some(value) = hist_ty.mut_value_type()
+                && !matches!(value, Type::Hole)
             {
-                let value_ty = value.as_ref().clone();
+                let value_ty = value.clone();
                 let label = binding.name.clone();
-                // The initializer is one contribution to the register's value type,
-                // not its definition (see the `MutWrite` arm). Stripped so `x := 0`
-                // does not pin the register to `{Int | __elem == 0}` — which would
-                // reject every later write of a computed value, and fail the
-                // invariant `History` edge against a `Mut(Int)` parameter.
-                ctx.require_sub(&strip_refinements(&bound_ty), &value_ty, &|| {
+                // The initializer is one contribution to the mutable variable's value type,
+                // not its definition (see the `MutWrite` arm), and it flows in
+                // verbatim: the join with the mutable variable's writes is what keeps `x := 0`
+                // from pinning the mutable variable to `{Int | __elem == 0}`. A mutable variable with
+                // *no* writes keeps its seed's refinement, and that is correct — it
+                // really does hold that value at every position.
+                ctx.require_sub(&bound_ty, &value_ty, &|| {
                     format!("initializer of mutable `{label}`")
                 })?;
             }
@@ -1018,9 +1087,7 @@ pub(super) fn emit_let<C: Typing>(
             // coercion, so returning the normalized annotation is sound; for a
             // non-mutable bound expression annotation and inferred type agree, so
             // this stays `bound_ty`.
-            if matches!(peel_refinements_outer(&bound_ty), Type::History { .. })
-                && !matches!(peel_refinements_outer(ann), Type::History { .. })
-            {
+            if bound_ty.is_handle() && !ann.is_handle() {
                 ctx.normalize(ann)
             } else {
                 bound_ty
@@ -1141,7 +1208,7 @@ pub(super) fn emit_for<C: Typing>(
 
 /// Type a `Begin { body }` transaction-block marker: emit the per-transaction
 /// body chain and give the block itself type `Unit`. The block introduces no
-/// binder or scope — in-block register reads/writes/feeds are typed by their own
+/// binder or scope — in-block mutable variable reads/writes/feeds are typed by their own
 /// `Var`/`MutWrite`/`Feed` rules. Shared by Emit and Check via [`Typing`], like
 /// [`emit_for`].
 pub(super) fn emit_begin<C: Typing>(
@@ -1219,7 +1286,7 @@ pub(super) fn emit_list<C: Typing>(
     // appears in the list type. A list literal is a **data** function — its
     // domain is the index set, so a join with another collection may not narrow
     // it — see `src/ccl/design/type-inference.md`, "The domain join is a Σ".
-    Ok(Type::data_fun(Type::UIntRange(n), deref_mut(&first_ty)))
+    Ok(Type::data_fun(Type::UIntRange(n), read_through(&first_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified
@@ -1277,9 +1344,9 @@ pub(super) fn emit_case<C: Typing>(
     // them is deferred; see `coalesce`.)
     //
     // A `Mut` arm needs no special case: it derefs into the join like any other
-    // read, so a `Case` over two registers types as their *value*. The
+    // read, so a `Case` over two mutable variables types as their *value*. The
     // second-class discipline is unaffected — what it forbids is a selected
-    // register reaching a position that writes through it, and that rule reads
+    // mutable variable reaching a position that writes through it, and that rule reads
     // the argument *node*, not its type (mutability.md, "No aliasing: `Mut`
     // values are second-class (downward-only)").
     let result_ty = ctx.fresh();
@@ -1360,9 +1427,10 @@ pub(super) fn emit_compose<C: Typing>(
     // and the Pi-vs-Pi constraint arm α-aligns the two. (Closed-form only for
     // value-preserving prefixes — the same direct-vs-opaque boundary as the
     // dependent-apply discharge; nothing else reaches a dependent final
-    // morphism today.) In Emit the morphism types are bare inference vars, so
-    // this peels to `None` and the chain type is the plain arrow.
-    let last_name = match peel_refinements_outer(tys.last().expect("len >= 2")) {
+    // morphism today.) A morphism types as a function in both modes — Emit's
+    // `Proj`/`Lambda`/source rules all return an arrow — so the binder is read off
+    // directly; only the groupby shape puts a `Some` there.
+    let last_name = match tys.last().expect("len >= 2").peel_refinements() {
         Type::Fun { name, .. } => name.clone(),
         _ => None,
     };
@@ -1375,7 +1443,7 @@ pub(super) fn emit_compose<C: Typing>(
     // aggregate) forces it `Data` via `constrain_kind`, and it otherwise
     // resolves from its (now-concrete) domain at coalesce. Hardcoding `Compute`
     // here would reject every composed comprehension flowing into an aggregate.
-    let kind = match peel_refinements_outer(&tys[0]) {
+    let kind = match tys[0].peel_refinements() {
         Type::Fun { kind, .. } => kind.clone(),
         _ => crate::ccl::ty::FunKind::fresh_var(),
     };
@@ -1403,7 +1471,7 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 
 /// The per-position `to_<defer>` output fields a writer's decision carries beyond
 /// `writes`, read off the writer body's codomain — `(field, value_ty)`. Each
-/// becomes a virtual register-record key `to_<defer>: Fun(domain, value_ty)` (the
+/// becomes a virtual variable-record key `to_<defer>: Fun(domain, value_ty)` (the
 /// per-position feed output stream). The decision codomain is the variant
 /// `` {`commit{𝑃} | `abort} ``; the taps live inside the (dense) `commit` payload
 /// record `𝑃`, so peel `commit` and drop the `writes` field.
@@ -1411,7 +1479,7 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
-    let Type::Variant(tags) = peel_refinements_outer(&codom) else {
+    let Type::Variant(tags) = codom.peel_refinements() else {
         return Vec::new();
     };
     let Some((_, commit_payload)) = tags
@@ -1420,7 +1488,7 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     else {
         return Vec::new();
     };
-    let Type::Record(fields) = peel_refinements_outer(commit_payload) else {
+    let Type::Record(fields) = commit_payload.peel_refinements() else {
         return Vec::new();
     };
     fields
@@ -1430,9 +1498,9 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
         .collect()
 }
 
-/// Type one transaction writer against the register's per-key value types.
+/// Type one transaction writer against the mutable variable's per-key value types.
 ///
-/// `key_types` maps each register key to the type of one committed value. The body
+/// `key_types` maps each mutable variable key to the type of one committed value. The body
 /// is ``Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {`commit{writes:
 /// Tuple(new_{w₀}, …), to_<defer>*} | `abort})``, where snapshot position `i` is
 /// `read_keys[i]`'s value type and each `writes` entry `new_j <: write_keys[j]`'s
@@ -1450,7 +1518,7 @@ fn emit_transact_writer<C: Typing>(
     for rk in &writer.read_keys {
         let snap = key_types.get(rk).cloned().ok_or_else(|| {
             ctx.raise(InferError::Unsupported(format!(
-                "read key {rk} is not a register key"
+                "read key {rk} is not a mutable variable key"
             )))
         })?;
         snaps.push(snap);
@@ -1467,7 +1535,7 @@ fn emit_transact_writer<C: Typing>(
         let new = ctx.fresh();
         let bound = key_types.get(wk).cloned().ok_or_else(|| {
             ctx.raise(InferError::Unsupported(format!(
-                "write key {wk} is not a register key"
+                "write key {wk} is not a mutable variable key"
             )))
         })?;
         new_tys.push(new.clone());
@@ -1502,14 +1570,14 @@ fn emit_transact_writer<C: Typing>(
 
 /// Type a [`TypedExprNode::Transact`] (Check-pass rule).
 ///
-/// The node denotes the register **record** `{key: ⟦key⟧}` — each key's read type
-/// `Fun(domain, α)` (the value's history over the register's sequencing domain),
+/// The node denotes the mutable variable **record** `{key: ⟦key⟧}` — each key's read type
+/// `Fun(domain, α)` (the value's history over the mutable variable's sequencing domain),
 /// what a variable projection `__reg.key` yields; a read reduces it to the
 /// latest `α` via `final_or_default(history, init)`. The init is the position-0
 /// value, so it bounds the codomain `α` (`init <: α`), not the whole stream.
-/// There is no recurrence *fixpoint* over a step type — the register↔writer cycle
+/// There is no recurrence *fixpoint* over a step type — the mutable variable↔writer cycle
 /// is realized operationally at op-conversion — so no `σ <: α` constraint, just
-/// each writer's per-key register round-trip.
+/// each writer's per-key mutable variable round-trip.
 ///
 /// `Transact` is born by `planning::plan_loops` after inference, so this
 /// rule runs only in the Check pass; it never mints constraints that must
@@ -1526,33 +1594,29 @@ pub(super) fn emit_transact<C: Typing>(
     // bound) — the codomain of the key's history.
     let mut key_types: HashMap<Name, Type> = HashMap::with_capacity(keys.len());
     for k in keys.iter_mut() {
-        // The register-record field is the value's history `Fun(domain, α)` over
-        // the register's sequencing domain; `final_or_default` reads it back to the
+        // The variable-record field is the value's history `Fun(domain, α)` over
+        // the mutable variable's sequencing domain; `final_or_default` reads it back to the
         // latest `α`.
         let value_ty = ctx.fresh();
         let read_ty = fun(domain.clone(), value_ty.clone());
         let init_ty = ctx.subexpr(&mut k.init)?;
-        // Stripped, for the register law the `MutWrite` rule states: a register is
-        // not one value but the sequence its seed and every write produce, so its
-        // value type is the join over all of them and no single contribution's
-        // refinement survives. Here the seed is the value type's only *lower* bound
-        // (a writer's contribution is bounded above by it), so an unstripped seed
-        // would resolve the register — and every read of it — to the seed's
-        // singleton: `flag := False` would type the writers' `True` as `False`.
-        ctx.require_sub(&strip_refinements(&init_ty), &value_ty, &|| {
-            "transact init".to_string()
-        })?;
+        // The seed is one contribution to the mutable variable's value type, same as on the
+        // `MutWrite` path, and flows in verbatim. A transactional mutable variable's writes
+        // reach this variable too — each `with begin(): flag := True` is an ordinary
+        // `MutWrite` against it — so `flag := False` written `True` joins to `Bool`
+        // rather than claiming `False`.
+        ctx.require_sub(&init_ty, &value_ty, &|| "transact init".to_string())?;
         fields.push((k.name.field_key(), read_ty));
         key_types.insert(k.name.clone(), value_ty);
     }
     for w in writers.iter_mut() {
         emit_transact_writer(w, &key_types, ctx)?;
         // A `to_<defer>` field on the writer's decision record becomes a
-        // virtual register key the consumer reads as `__reg.to_…`. Its stream
+        // virtual mutable variable key the consumer reads as `__reg.to_…`. Its stream
         // is **site-domained** — one tap value per iteration of *this
         // writer's* source (the channel unions channelize assembled reference
         // it at that type) — unlike the key histories, which live over the
-        // register's sequencing domain.
+        // mutable variable's sequencing domain.
         let site_dom = w.source.ty.domain().unwrap_or_else(|| domain.clone());
         for (field, value_ty) in writer_tap_fields(&w.body.ty) {
             fields.push((field, fun(site_dom.clone(), value_ty)));

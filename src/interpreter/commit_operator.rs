@@ -437,11 +437,11 @@ pub fn store_delta_at(tile: &Tile, t: CommitTs, key: &Value) -> Option<Value> {
 }
 
 /// Fold `key`'s value at changelog tick `t` under the store's **carry policy** —
-/// the one place the register-vs-tap distinction lives, shared by both changelog
+/// the one place the carry-vs-tap distinction lives, shared by both changelog
 /// readers ([`StoreValueStream`] over commit ticks and [`StoreDenseRead`] over
 /// loop positions):
 ///
-/// - a **register / accumulator** (`carry_forward: true`) carries its latest write
+/// - a **carry** (`carry_forward: true`) holds its latest write
 ///   forward — the value as-of `t` is the latest write ≤ `t` ([`store_value_at`]);
 /// - a **reply tap** (`carry_forward: false`) is a per-tick event — a value only
 ///   at the tick that actually wrote it ([`store_delta_at`]), `None` elsewhere.
@@ -1202,7 +1202,7 @@ pub struct InductionStore {
     /// Accumulator keys the body reads a snapshot of, in body-parameter order
     /// (for an induction store these are exactly the accumulators it writes).
     read_keys: Vec<Value>,
-    /// Keys written, in decision-`writes` order: the accumulator registers, then
+    /// Keys written, in decision-`writes` order: the carry keys, then
     /// any reply-tap (`to_<defer>`) keys.
     write_keys: Vec<Value>,
     /// Reply-tap decision fields, appended to each write set (see
@@ -1451,15 +1451,15 @@ impl TileProducer for InductionStoreProducer {
                     self.write_keys.len(),
                     "the decision's write set aligns with the store's write keys"
                 );
-                // Register writes lead, taps follow (the layout `build_induction_
-                // store_single` sets). A committing position applies every register
+                // Carry writes lead, taps follow (the layout `build_induction_
+                // store_single` sets). A committing position applies every carry
                 // write but only the taps that *fired* on its route — a non-fired
                 // conditional feed is omitted from the delta, so its per-position
                 // read (`store_delta_at`) skips this position. `commit` is true
                 // whenever a tap fires (the letrec phase folds feed-fire paths into
                 // the commit gate), so a fired tap always rides an appended change.
                 // Layout invariant (as on the transaction side): `write_keys` =
-                // register keys ++ tap keys, so the subtraction never underflows —
+                // carry keys ++ tap keys, so the subtraction never underflows —
                 // a break would wrap `n_reg` to a huge value in release and
                 // mis-index `tap_fired`.
                 debug_assert!(
@@ -1565,9 +1565,9 @@ impl TileProducer for InductionStoreProducer {
 ///
 /// This backs the **in-block reply tap** (`out << e` inside a block —
 /// `carry_forward: false`, one entry per commit tick) and the **read-your-writes
-/// register carry** (`carry_forward: true`, the latest write ≤ each tick). A read
+/// carry** (`carry_forward: true`, the latest write ≤ each tick). A read
 /// fed *out* of a block does not reduce this stream — it folds the store as-of via
-/// [`AsOf`] instead — so there is no `ExtractFinal`-over-this-stream register-read
+/// [`AsOf`] instead — so there is no `ExtractFinal`-over-this-stream carry-read
 /// path; a fed-out read always samples an arbitrary commit position, never a
 /// "final".
 pub struct StoreValueStream {
@@ -1576,7 +1576,7 @@ pub struct StoreValueStream {
     key: Value,
     value_extent: Extent,
     /// Whether the key's value persists across commit ticks that don't write it.
-    /// A **register** (`true`) carries its latest committed value forward — reading
+    /// A **carry** (`true`) holds its latest committed value forward — reading
     /// it at any tick yields the latest write ≤ that tick. A **reply tap**
     /// (`false`) is a per-commit event: it appears only at the tick that wrote it,
     /// so two writers' taps to one defer don't smear each other's values across
@@ -1642,7 +1642,7 @@ struct StoreValueStreamProducer {
     store_producer: Box<dyn TileProducer>,
     key: Value,
     value_extent: Extent,
-    /// See [`StoreValueStream::carry_forward`]: register (carry the latest value
+    /// See [`StoreValueStream::carry_forward`]: carry (hold the latest value
     /// across ticks that don't write the key) vs. reply tap (emit only at the
     /// tick that wrote it).
     carry_forward: bool,
@@ -1693,7 +1693,7 @@ impl TileProducer for StoreValueStreamProducer {
         };
         // Fold the changelog to `key`'s value under the carry policy
         // ([`fold_changelog_key_ascending`], shared with the induction
-        // `StoreDenseRead`): a register carries the latest write ≤ the tick; a
+        // `StoreDenseRead`): a carry holds the latest write ≤ the tick; a
         // reply tap emits only the tick that wrote it (carrying it forward would
         // smear one writer's reply across another's commit ticks on the shared
         // clock). One O(changes) ascending pass folds every tick — the released
@@ -1765,7 +1765,7 @@ impl TileProducer for StoreValueStreamProducer {
 /// defaulting to `init` below the first change).
 ///
 /// This is the induction counterpart of [`StoreValueStream`] (a commit
-/// register's per-tick stream). The difference is the domain: a register stream
+/// carry's per-tick stream). The difference is the domain: a carry stream
 /// is indexed by *commit tick* (sparse change events), but an induction
 /// accumulator co-iterated into another store (e.g. `for r in …: cnt += 1; with
 /// begin(): store := store + cnt`) must present a *dense* function over the loop
@@ -1779,7 +1779,7 @@ impl TileProducer for StoreValueStreamProducer {
 /// A scalar-final read (`total` after the loop) is `ExtractFinal` over this dense
 /// stream; a co-iterated read is the stream itself — one reader serves both.
 ///
-/// The per-tick fold — register carries, tap is a delta event — is the shared
+/// The per-tick fold — a carry holds, a tap is a delta event — is the shared
 /// [`fold_changelog_key`]; this reader and [`StoreValueStream`] are the same
 /// changelog projection differing only on *which* ticks they fold (loop positions
 /// at `p + 1` here, commit ticks there) and how they emit (full re-emit here for
@@ -2048,7 +2048,7 @@ impl TileProducer for StoreDenseReadProducer {
 ///
 /// `trigger : Fun(B, _)` (e.g. an HTTP request stream), `source` the shared
 /// commit store (a [`Tile::Store`] fan branch), output `Fun(B, V)` — `key`'s
-/// value as of each trigger position. This is **every fed-out register read**, not
+/// value as of each trigger position. This is **every fed-out mutable variable read**, not
 /// only the live one: each reading transaction sees the store as of where it lands
 /// in the commit order. The HTTP case ("a request arriving now sees the store as
 /// committed by now" — the *live cross-endpoint read*) is the canonical instance,
@@ -2072,7 +2072,7 @@ impl TileProducer for StoreDenseReadProducer {
 /// (which the immutability invariant forbids). It is the dual of the commit
 /// `Recurse`: `Recurse` latches a private accumulator per *source* step; `AsOf`
 /// latches the store's current value per *trigger* step.
-/// One field of a multi-register [`AsOf`] snapshot: the record field the reply
+/// One field of a multi-variable [`AsOf`] snapshot: the record field the reply
 /// projects (`snap.field`), the store's runtime key it samples, and its value
 /// extent.
 #[derive(Clone)]
@@ -2085,12 +2085,12 @@ pub struct AsOfField {
 /// What an [`AsOf`] latches and emits per trigger position.
 #[derive(Clone)]
 enum AsOfOutput {
-    /// A single register → scalar codomain `Fun(B, Scalar(V))` — the bare or
-    /// computed single-register live read.
+    /// A single mutable variable → scalar codomain `Fun(B, Scalar(V))` — the bare or
+    /// computed single-variable live read.
     Scalar { key: Value, value_extent: Extent },
     /// A whole-snapshot record → `Fun(B, Record{field: Scalar(V)})` — the
-    /// multi-register live read. Every field is folded from **one** source render
-    /// at one commit frontier (§I-c), so a reply reading several registers sees a
+    /// multi-variable live read. Every field is folded from **one** source render
+    /// at one commit frontier (§I-c), so a reply reading several mutable variables sees a
     /// consistent snapshot.
     Record { fields: Vec<AsOfField> },
 }
@@ -2119,20 +2119,20 @@ impl AsOfOutput {
 
 pub struct AsOf {
     /// Output tiling: `SealedFunction { domain: B, codomain }` where `codomain`
-    /// is `Scalar(V)` (single register) or `Record{field: Scalar(V)}` (snapshot).
+    /// is `Scalar(V)` (single mutable variable) or `Record{field: Scalar(V)}` (snapshot).
     tiling: Tiling,
     /// The trigger stream `Fun(B, _)` — drives one output position each.
     trigger: Box<dyn TileOperator>,
     /// The shared commit store (a [`Tile::Store`] fan branch) — the sampled
     /// key(s)' current value(s) are latched per trigger position.
     source: Box<dyn TileOperator>,
-    /// What to sample and emit — a single register or a whole snapshot record.
+    /// What to sample and emit — a single mutable variable or a whole snapshot record.
     output: AsOfOutput,
 }
 
 impl AsOf {
     /// `trigger : Fun(B, _)`, `source` the shared commit store (`Tiling::Store`),
-    /// `key`/`value_extent` the register to sample → output
+    /// `key`/`value_extent` the mutable variable to sample → output
     /// `Fun(B, Scalar(value_extent))`.
     pub fn new(
         trigger: Box<dyn TileOperator>,
@@ -2143,9 +2143,9 @@ impl AsOf {
         Self::build(trigger, source, AsOfOutput::Scalar { key, value_extent })
     }
 
-    /// The multi-register **snapshot** read: sample every `field`'s register at
+    /// The multi-variable **snapshot** read: sample every `field`'s mutable variable at
     /// one commit snapshot → output `Fun(B, Record{field: Scalar(V)})`, from which
-    /// the reply projects each register. This is the §I-c snapshot-consistent
+    /// the reply projects each mutable variable. This is the §I-c snapshot-consistent
     /// live read.
     pub fn new_snapshot(
         trigger: Box<dyn TileOperator>,
@@ -2265,7 +2265,7 @@ impl AsOfProducer {
     /// Build the output tile from the currently-latched `(b ↦ snapshot)` pairs,
     /// under `domain_predicate`. The latched set is already compacted of released
     /// positions, so it emits exactly the live response window. The codomain is a
-    /// `Scalar` column (single register) or a `Record` of per-field `Scalar`
+    /// `Scalar` column (single mutable variable) or a `Record` of per-field `Scalar`
     /// columns (snapshot), each column indexed by the emitted domain position.
     fn emit_latched(&self, domain_predicate: Predicate) -> Tile {
         let n_keys = self.output.keys().len();
@@ -2326,13 +2326,13 @@ impl TileProducer for AsOfProducer {
         let sg = self.source.tiling().universal_guard();
         let source_tile = self.source.get(sg);
         // Fold the store snapshot **once**, at the current frontier, for every
-        // sampled key — so a multi-register read sees all its registers at one
+        // sampled key — so a multi-variable read sees all its mutable variables at one
         // commit time (§I-c). `None` if *any* key has no decided value yet, which
         // makes the read all-or-nothing: a single missing key withholds the whole
         // snapshot and re-pulls. This is safe for the shapes reached here because
-        // every scalar register is seeded at tick 0 (`init_ops`), so `store_current`
+        // every scalar mutable variable is seeded at tick 0 (`init_ops`), so `store_current`
         // always has a decided value once the store has committed its seeds — no
-        // register can be perpetually absent. (A future snapshot read that folds a
+        // mutable variable can be perpetually absent. (A future snapshot read that folds a
         // key with a genuinely-empty log — e.g. an append-only collection with no
         // writes — would stay non-terminal forever on the terminality gate below;
         // revisit the coupling then.) The frontier bound is the same for every key,
@@ -2651,10 +2651,10 @@ fn is_commit_tag(tag: &crate::ccl::FieldKey) -> bool {
 /// {writes: (new₀, …), to_<defer>*(, to_<defer>__fire)*}`.
 ///
 /// Returns `(commit, writes, tap_fired)`: `commit` gates grant vs deny; `writes[j]`
-/// is the new value for `write_keys[j]` (register writes then tap values, in that
+/// is the new value for `write_keys[j]` (carry writes then tap values, in that
 /// order); and `tap_fired[t]` says whether tap `tap_fields[t]` fires at this
 /// position (its `__fire` gate inside the payload, or `true` for an ungated tap).
-/// A committing decision applies a register write and a *fired* tap, but not a
+/// A committing decision applies a carry write and a *fired* tap, but not a
 /// non-fired tap.
 fn body_decision_at(
     tile: &Tile,
@@ -2687,7 +2687,7 @@ fn body_decision_at(
     };
     // The write set is the writes tuple `(_0, …, _{w-1})` in index order, followed
     // by each reply tap's value — the order the caller's `write_keys` aligns with
-    // (registers then taps).
+    // (carries then taps).
     let mut writes = Vec::with_capacity(tap_fields.len());
     match payload.get(F_WRITES)? {
         // The normal case: the writes tuple is a record `{_0, …, _{w-1}}`. Each
@@ -2698,7 +2698,7 @@ fn body_decision_at(
             }
         }
         // A read-only transaction's empty writes tuple `()` lowers to a unit
-        // value (not a record): zero register writes, only taps contribute.
+        // value (not a record): zero carry writes, only taps contribute.
         Value::Unit => {}
         _ => return None,
     }
@@ -3084,7 +3084,7 @@ impl TileProducer for TransactWriterProducer {
         //  - **Empty read set** (a collection-append / overwrite writer, e.g.
         //    `<<` or `latest = msg`): it reads no tick's value, only the frontier,
         //    so it releases the whole decided prefix.
-        //  - **Non-empty read set** (a register drawdown, e.g. `pool = pool - r`):
+        //  - **Non-empty read set** (a carry drawdown, e.g. `pool = pool - r`):
         //    it releases strictly *below* the oldest tick it read this pull. This
         //    is the load-bearing INVARIANT — a writer never releases a version it
         //    read — so backward validation's `read_as_of` at any pending
@@ -3176,12 +3176,12 @@ impl TileProducer for TransactWriterProducer {
                         new.len(),
                         self.write_keys.len()
                     );
-                    // Register writes lead; taps follow (the layout `build_commit_store`
-                    // sets). A committed transaction applies every register write but
+                    // Carry writes lead; taps follow (the layout `build_commit_store`
+                    // sets). A committed transaction applies every carry write but
                     // only the taps that *fired* on its route — a non-fired tap under
                     // cross-key routing is omitted from the delta, so it does not
                     // over-fire on a sibling route's commit.
-                    // Layout invariant: `write_keys` = register keys ++ tap keys, so
+                    // Layout invariant: `write_keys` = carry keys ++ tap keys, so
                     // the subtraction never underflows. Assert it — a break would wrap
                     // `n_reg` to a huge value in release and mis-index `tap_fired`.
                     debug_assert!(
@@ -5195,8 +5195,8 @@ mod tests {
     /// stream (`Txn ⇀ Value`), observable as it commits — no terminal gate — with
     /// terminality flowing through from the store. This checks the projection
     /// (both values visible while still committing) and that `ExtractFinal` *can*
-    /// compose over it once terminal — a stream-mechanism test, not the register
-    /// read path (a fed-out register read is `AsOf`, not `ExtractFinal`).
+    /// compose over it once terminal — a stream-mechanism test, not the mutable variable
+    /// read path (a fed-out mutable variable read is `AsOf`, not `ExtractFinal`).
     #[test]
     fn store_value_stream_projects_committed_values() {
         let value_ext = Extent::Base(BaseType::Int);
@@ -5218,7 +5218,7 @@ mod tests {
             }),
             Value::Unit,
             value_ext.clone(),
-            true, // register: carry the committed value forward
+            true, // carry: hold the committed value forward
         );
         let g = stream.tiling().universal_guard();
         let mut p = stream.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
@@ -5245,7 +5245,7 @@ mod tests {
             }),
             Value::Unit,
             value_ext.clone(),
-            true, // register: carry the committed value forward
+            true, // carry: hold the committed value forward
         );
         let default = Box::new(FixedSource {
             tiling: Tiling::Scalar(value_ext.clone()),

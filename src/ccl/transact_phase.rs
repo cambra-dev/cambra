@@ -1,5 +1,5 @@
 //! The transactional slice of the unified phase: rewrite every `with begin():`
-//! writer of a `Mut(V, Txn)` register into a **`get_prev_txn`-guarded `LetRec`** —
+//! writer of a `Mut(V, Txn)` mutable variable into a **`get_prev_txn`-guarded `LetRec`** —
 //! histories + commit records over the [`Type::Txn`] commit domain — which
 //! [`crate::ccl::planning::plan_loops`] then destructures into the
 //! `Transact{keys, writers, domain: Txn}` carrier the commit engine consumes.
@@ -10,8 +10,8 @@
 //! and *before* [`crate::ccl::mut_elim`], so the induction phase never sees a
 //! transaction loop. Lowering emits each `with begin():` block — standalone or
 //! as a `for` body — as a direct-mirror `ExprStmt(For{target, iter, block}, cont)`
-//! whose block writes transactional registers (recognized by their α-unique register
-//! [`Name`] — the `Mut(_, Txn)` bindings [`collect_txn_registers`] gathers from the
+//! whose block writes transactional variables (recognized by their α-unique binder
+//! [`Name`] — the `Mut(_, Txn)` bindings [`collect_txn_mut_vars`] gathers from the
 //! typed tree). This phase:
 //!
 //! 1. **strips** every such `For` site, building one [`WriterSite`] per site
@@ -25,12 +25,12 @@
 //!    its writing site's commit stream (or self-guarded for a read-only key) —
 //!    and one **commit-record** binding `commits_j : 𝐼 ⇒ {time, write_targets,
 //!    decision}` per site, whose `decision` is the writer body applied to the
-//!    register snapshot `(reg_rk(begin(r)) …, source(r))` at the site's commit
+//!    snapshot `(reg_rk(begin(r)) …, source(r))` of the variables it reads, at commit
 //!    time `begin(r)` (the [`Builtin::BeginTxn`] oracle). The `reg_k ↔
 //!    commits_j` cycle crosses `get_prev_txn` once, so it is guarded.
 //! 3. **rebinds** each key variable's `let x = init` to `let x =
 //!    final_or_default(reg_x, init)` over its history binding, so a read of the
-//!    register (only legal inside a `with begin():` block, where it is a bare
+//!    variable (only legal inside a `with begin():` block, where it is a bare
 //!    `Var(x)`) denotes the value at that snapshot; a read fed out of a block
 //!    that does not write `x` is broadcast over the reading loop and, after
 //!    `channelize`, rewritten to an `AsOf` (an as-of read at an arbitrary commit
@@ -44,21 +44,21 @@
 //! `TransactWriter`s in a cyclic `FanOut`). A read fed *out* of a block is
 //! rewritten to an `AsOf` (an as-of read at an arbitrary commit position) by
 //! [`rewrite_live_reads`] below — every such read, regardless of the reading
-//! loop's domain; there is no terminal/"final" register read (`ExtractFinal` is
-//! used only for a terminating induction accumulator, not a `Txn` register). Each
+//! loop's domain; there is no terminal/"final" read of a transactional variable
+//! (`ExtractFinal` serves a terminating induction accumulator only). Each
 //! `to_<defer>` tap compiles to a per-commit value-stream (`body_tap_fields`).
 //! The in-block feed mirrors the induction phase's in-loop feeds
 //! ([`crate::ccl::mut_elim`]).
 //!
-//! **Register-ness is the `Mut(_, Txn)` type; register identity is the α-unique
-//! binder [`Name`].** The type demarcates the *class* (every `Mut(_, Txn)` binding
-//! is a register); the binder name picks out *which* register.
-//! [`collect_txn_registers`] walks the inlined, typed tree for `Let` bindings whose
+//! **Being a transactional variable is the `Mut(_, Txn)` type; a variable's identity
+//! is its α-unique binder [`Name`].** The type demarcates the *class* (every
+//! `Mut(_, Txn)` binding is one); the binder name picks out *which*.
+//! [`collect_txn_mut_vars`] walks the inlined, typed tree for `Let` bindings whose
 //! type (or [`crate::ccl::TypedBinding::user_annotation`]) is `Mut(_, Txn)` and
 //! collects their α-unique [`Name`]s; every membership test here (footprint
 //! collection, `contains_txn_write`, `block_writes_txn`) is exact-`Name`. This
-//! is immune to shadowing — an unrelated local spelled like a register has a
-//! distinct binder identity — and sees cross-function registers whose writers were
+//! is immune to shadowing — an unrelated local spelled the same has a
+//! distinct binder identity — and sees cross-function variables whose writers were
 //! inlined to their call site (see `src/ccl/design/mutability.md`, "`Mut` is a
 //! CCL type").
 
@@ -69,32 +69,32 @@ use crate::ccl::{
     HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::{is_free_in_value, synthesize_arm_predicate},
     letrec::check_letrec_causal,
-    mut_elim::{fold_induction_loop, hoist_feeds, register_value_tys},
+    mut_elim::{fold_induction_loop, hoist_feeds, mut_var_value_tys},
 };
 
-/// Recognize a **fed-out register read** and rewrite it to an as-of join, *before*
+/// Recognize a **fed-out mutable variable read** and rewrite it to an as-of join, *before*
 /// lambda elimination. Run after `channelize`.
 ///
-/// After defer-desugaring, a read-only reply is a chain of register reads feeding a
+/// After defer-desugaring, a read-only reply is a chain of mutable variable reads feeding a
 /// broadcast over a reading loop:
 /// `let k₁ = final_or_default((balance.f₁, _)) in … let kₙ = … in trigger ≫ (λ r → e)`,
-/// where `e` reads the `kᵢ` and `register` is a commit log (`Txn`, a non-enumerable
+/// where `e` reads the `kᵢ` and `mutable variable` is a commit log (`Txn`, a non-enumerable
 /// domain). Every such read is an **as-of read at an arbitrary commit position** —
-/// the reading transaction sees the register as of where it lands in the commit
+/// the reading transaction sees the mutable variable as of where it lands in the commit
 /// order — so it folds to `AsOf` uniformly, whatever the reading loop's domain (a
 /// live request stream, a finite loop, or a standalone singleton). There is no
 /// finiteness or standalone-vs-loop split and no terminal/"final" alternative: a
-/// `Txn` register has no final-value term (a future `await_final` would be it). The
-/// rewrite depends on how many registers `e` reads:
+/// `Txn` mutable variable has no final-value term (a future `await_final` would be it). The
+/// rewrite depends on how many mutable variables `e` reads:
 ///
-/// - **one register** → `as_of((trigger, balance.f)) ≫ (λ k → e)`: the join latches
+/// - **one mutable variable** → `as_of((trigger, balance.f)) ≫ (λ k → e)`: the join latches
 ///   `f`'s current value per trigger position (a bare read `resp << balance` is the
 ///   identity reply, emitted as the `as_of` directly; a computed `resp << balance +
 ///   1` keeps the `≫ (λ k → e)` map for the elim pass to point-free).
-/// - **several registers** → `as_of((trigger, balance)) ≫ (λ snap → e[kᵢ ↦ snap.fᵢ])`:
-///   the join latches a whole-register **snapshot record** per request — every field
+/// - **several mutable variables** → `as_of((trigger, balance)) ≫ (λ snap → e[kᵢ ↦ snap.fᵢ])`:
+///   the join latches a whole-variable **snapshot record** per request — every field
 ///   folded at *one* commit frontier (§I-c snapshot consistency) — and the reply
-///   projects each register off it.
+///   projects each mutable variable off it.
 ///
 /// The reply is indexed by the *trigger* (the outer request loop), not the commit
 /// clock. Running **pre-lambda-elim** is what makes a computed reply work at all:
@@ -103,7 +103,7 @@ use crate::ccl::{
 pub fn rewrite_live_reads(expr: &mut Expr) {
     // Match the whole read-chain at its outermost `let` *before* recursing, so an
     // outer read binding captures the chain rather than the innermost `let` firing a
-    // single-register rewrite in isolation (which would strand the outer reads
+    // single-variable rewrite in isolation (which would strand the outer reads
     // unresolved).
     if let Some(rewritten) = as_live_read(expr) {
         *expr = rewritten;
@@ -111,11 +111,11 @@ pub fn rewrite_live_reads(expr: &mut Expr) {
     expr.walk_children_mut(rewrite_live_reads);
 }
 
-/// One live-register read in a reply chain: its `let` binder, the history-binding
-/// reference (the as-of source for a single-register read — recognition later
-/// rewrites it to a register-record projection), the register-record field its
+/// One live-variable read in a reply chain: its `let` binder, the history-binding
+/// reference (the as-of source for a single-variable read — recognition later
+/// rewrites it to a variable-record projection), the variable-record field its
 /// history will occupy (`hist.field_key()`, matching recognition's read map),
-/// and the register's value type.
+/// and the mutable variable's value type.
 struct LiveRead {
     name: Name,
     reg_read: Expr,
@@ -123,15 +123,15 @@ struct LiveRead {
     value_ty: Type,
 }
 
-/// Match a chain of live-register reads feeding a broadcast (see
+/// Match a chain of live-variable reads feeding a broadcast (see
 /// [`rewrite_live_reads`]) and return its as-of rewrite, or `None` if the shape /
 /// liveness / footprint guards don't hold.
 fn as_live_read(expr: &Expr) -> Option<Expr> {
     // Walk consecutive `let kᵢ = final_or_default((⟨histᵢ⟩, _))` bindings —
     // each a bare reference to a live history binding — down to the broadcast
-    // body. Pre-recognition there is no shared register record: several
-    // registers are several history bindings; the snapshot case rebuilds
-    // their record below and recognition collapses it onto the register.
+    // body. Pre-recognition there is no shared mutable variable record: several
+    // mutable variables are several history bindings; the snapshot case rebuilds
+    // their record below and recognition collapses it onto the mutable variable.
     let mut reads: Vec<LiveRead> = Vec::new();
     let mut cur = expr;
     while let TypedExprNode::Let {
@@ -140,7 +140,7 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
         body,
     } = &cur.node
     {
-        let Some((reg_read, field)) = live_register_read(bound_expr) else {
+        let Some((reg_read, field)) = live_mut_var_read(bound_expr) else {
             break;
         };
         reads.push(LiveRead {
@@ -161,12 +161,12 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
     let [trigger, lam] = celts.as_slice() else {
         return None;
     };
-    // Every fed-out read of a `Txn` register is an **as-of read at an arbitrary
-    // position** — the register's value as of wherever the reading transaction lands
+    // Every fed-out read of a `Txn` mutable variable is an **as-of read at an arbitrary
+    // position** — the mutable variable's value as of wherever the reading transaction lands
     // in the commit order, indexed by the reading loop. This holds regardless of
     // whether the reading loop is a live request stream, a finite literal, or the
     // synthesized singleton of a standalone read: there is no "final"/terminal
-    // read (a program cannot request the register's final value — a future
+    // read (a program cannot request the mutable variable's final value — a future
     // `await_final` builtin would, but does not exist). So no finiteness or
     // standalone-vs-loop classification here; all such reads fold to `AsOf`.
     let TypedExprNode::Lambda {
@@ -181,8 +181,8 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
         .filter(|r| is_free_in_value(&r.name, lam_body))
         .collect();
     // A reply that also reads the trigger element `r` (`e = f(r, balance)`) is a
-    // function of *both* the request and the register: `zip((trigger, as_of)) ≫ (λ p
-    // → e[r ↦ p.0, kᵢ ↦ p.1])` — the request rides alongside the register snapshot.
+    // function of *both* the request and the mutable variable: `zip((trigger, as_of)) ≫ (λ p
+    // → e[r ↦ p.0, kᵢ ↦ p.1])` — the request rides alongside the mutable variable snapshot.
     if is_free_in_value(&param.name, lam_body) {
         if used.is_empty() {
             return None;
@@ -196,12 +196,12 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
     }
 }
 
-/// A live read whose reply combines the **request element** with the register
+/// A live read whose reply combines the **request element** with the mutable variable
 /// read(s): `zip((trigger, as_of((trigger, source)))) ≫ (λ p → e[r ↦ p.0, kᵢ ↦
-/// p.1(.fᵢ)])`. The `zip` pairs each request with its register snapshot; the reply
-/// projects the request off `.0` and each register off `.1` (bare for one
-/// register, by field for several). Unlike [`build_single`]/[`build_snapshot`]
-/// (register-only replies), the request element survives into the reply. The `as_of`
+/// p.1(.fᵢ)])`. The `zip` pairs each request with its mutable variable snapshot; the reply
+/// projects the request off `.0` and each mutable variable off `.1` (bare for one
+/// mutable variable, by field for several). Unlike [`build_single`]/[`build_snapshot`]
+/// (variable-only replies), the request element survives into the reply. The `as_of`
 /// arm is a leaf source (its own domain), which op-conversion's `zip` co-iterates
 /// with the request stream (see `is_leaf_zip_arm`).
 fn build_zip_read(
@@ -212,7 +212,7 @@ fn build_zip_read(
     out_ty: Type,
 ) -> Option<Expr> {
     let req_ty = param.ty.clone();
-    // The as-of source and the register-snapshot value type: one register reads bare,
+    // The as-of source and the variable-snapshot value type: one mutable variable reads bare,
     // several fold into a record (as in `build_snapshot`).
     let (source, snap_ty) = if used.len() == 1 {
         (used[0].reg_read.clone(), used[0].value_ty.clone())
@@ -287,15 +287,15 @@ fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
 
 /// Match `final_or_default((⟨hist⟩, _))` over a **commit-log** history — a bare
 /// reference to a `Txn`-domained letrec history binding — returning the read
-/// and the register-record field its history will occupy. `None` for a
-/// non-matching bound expression or a non-`Txn` (induction-accumulator) register.
+/// and the variable-record field its history will occupy. `None` for a
+/// non-matching bound expression or a non-`Txn` (induction-accumulator) mutable variable.
 ///
 /// The domain test is the exact `Type::Txn` commit-sequencing domain, not a
-/// derived finiteness classification: a transactional register's history is
+/// derived finiteness classification: a transactional mutable variable's history is
 /// `Fun(Txn, V)` by construction, and only such a read folds to an as-of join.
 /// (An induction accumulator's history — over any iteration extent — is left for
 /// `mut_elim`'s `ExtractFinal` path.)
-fn live_register_read(bound_expr: &Expr) -> Option<(&Expr, String)> {
+fn live_mut_var_read(bound_expr: &Expr) -> Option<(&Expr, String)> {
     let TypedExprNode::Apply {
         function: lod_fn,
         argument: lod_arg,
@@ -335,7 +335,7 @@ fn build_as_of(trigger: &Expr, source: &Expr, codomain: Type) -> Option<Expr> {
     Some(Expr::apply(arg, as_of_fn).with_ty(out))
 }
 
-/// A single-register live read: `as_of((trigger, balance.f))`, bare when the reply
+/// A single-variable live read: `as_of((trigger, balance.f))`, bare when the reply
 /// is the identity `read`, else `≫ (λ read → e)`.
 fn build_single(trigger: &Expr, read: &LiveRead, lam_body: &Expr, out_ty: Type) -> Option<Expr> {
     let as_of = build_as_of(trigger, &read.reg_read, read.value_ty.clone())?;
@@ -346,13 +346,13 @@ fn build_single(trigger: &Expr, read: &LiveRead, lam_body: &Expr, out_ty: Type) 
     Some(Expr::compose(vec![as_of, reply]).with_ty(out_ty))
 }
 
-/// A multi-register live read: `as_of((trigger, (f_a: ⟨a-hist⟩, f_b:
+/// A multi-variable live read: `as_of((trigger, (f_a: ⟨a-hist⟩, f_b:
 /// ⟨b-hist⟩))) ≫ (λ snap → e[kᵢ ↦ snap.fᵢ])` — one snapshot record per
-/// request (§I-c), the reply projecting each register off it. The source is a
-/// record *literal* of the history-binding reads (the shared register record
+/// request (§I-c), the reply projecting each mutable variable off it. The source is a
+/// record *literal* of the history-binding reads (the shared mutable variable record
 /// does not exist pre-recognition); recognition rewrites each field to
-/// `__reg.f` and then collapses the literal onto the register variable itself,
-/// so the engine latches one whole-register snapshot per request.
+/// `__reg.f` and then collapses the literal onto the mutable variable itself,
+/// so the engine latches one whole-variable snapshot per request.
 fn build_snapshot(
     trigger: &Expr,
     used: &[&LiveRead],
@@ -384,7 +384,7 @@ fn build_snapshot(
 }
 
 /// Replace each `Var(read.name)` in `e` with `snap.read.field` — the projection
-/// of that register off the latched snapshot record.
+/// of that mutable variable off the latched snapshot record.
 fn project_reads(e: &mut Expr, used: &[&LiveRead], snap: &Name, snap_ty: &Type) {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(r) = used.iter().find(|r| &r.name == n)
@@ -398,26 +398,26 @@ fn project_reads(e: &mut Expr, used: &[&LiveRead], snap: &Name, snap_ty: &Type) 
     e.walk_children_mut(|c| project_reads(c, used, snap, snap_ty));
 }
 
-/// Collect the α-unique [`Name`]s of every transactional register — a `Let`
+/// Collect the α-unique [`Name`]s of every transactional mutable variable — a `Let`
 /// binding whose type or [`crate::ccl::TypedBinding::user_annotation`] is
-/// `Mut(_, Txn)`. The type classifies a binding as a register; the binder `Name`
+/// `Mut(_, Txn)`. The type classifies a binding as a mutable variable; the binder `Name`
 /// *is* its identity — this is the source of truth [`run`] keys on (replacing the
 /// lowering-time base-name registry).
 ///
 /// Run on the **inlined, typed** tree: a cross-function writer
 /// (`def transfer(src: Mut(Int, Txn), …)`) has already been beta-reduced to its
-/// call site, so its writes name the caller's register binding (`a`/`b`), and the
+/// call site, so its writes name the caller's mutable variable binding (`a`/`b`), and the
 /// stores themselves are the caller's top-level `Mut(_, Txn)` `let`s — which
-/// this finds. A register's value slot (`binding.ty`) coalesces to the value
+/// this finds. A mutable variable's value slot (`binding.ty`) coalesces to the value
 /// type `V`, with the `Mut(_, Txn)` carried on the annotation and the
 /// references; either position is checked, so detection does not depend on which
 /// one holds the wrapper.
-pub fn collect_txn_registers(expr: &Expr) -> HashSet<Name> {
+pub fn collect_txn_mut_vars(expr: &Expr) -> HashSet<Name> {
     /// Whether `ty` is (a refinement of) `Mut(_, Txn)`.
-    fn is_txn_register(ty: &Type) -> bool {
+    fn is_txn_mut_var(ty: &Type) -> bool {
         match ty {
             Type::History { domain, .. } => is_txn_domain(domain),
-            Type::Refinement(inner, _) => is_txn_register(inner),
+            Type::Refinement(inner, _) => is_txn_mut_var(inner),
             _ => false,
         }
     }
@@ -430,11 +430,8 @@ pub fn collect_txn_registers(expr: &Expr) -> HashSet<Name> {
     }
     fn go(expr: &Expr, out: &mut HashSet<Name>) {
         if let TypedExprNode::Let { binding, .. } = &expr.node
-            && (is_txn_register(&binding.ty)
-                || binding
-                    .user_annotation
-                    .as_ref()
-                    .is_some_and(is_txn_register))
+            && (is_txn_mut_var(&binding.ty)
+                || binding.user_annotation.as_ref().is_some_and(is_txn_mut_var))
         {
             out.insert(binding.name.clone());
         }
@@ -445,7 +442,7 @@ pub fn collect_txn_registers(expr: &Expr) -> HashSet<Name> {
     out
 }
 
-/// The value type `V` of a register reference. A transactional register's binding and
+/// The value type `V` of a mutable variable reference. A transactional mutable variable's binding and
 /// its in-block references are `Mut(V, Txn)`-typed after inference, but the
 /// histories and commit records this phase emits — and the `final_or_default`
 /// reads it rebinds — are over `V`. Peel a `Mut` wrapper (through transparent
@@ -456,11 +453,11 @@ pub fn collect_txn_registers(expr: &Expr) -> HashSet<Name> {
 /// value-type reads, so the emitted `LetRec` (and the `Transact` recognition
 /// derives from it) is `Mut`-free by construction, never feeding a `Mut` type
 /// into the commit engine.
-fn register_value_ty(ty: &Type) -> Type {
+fn mut_var_value_ty(ty: &Type) -> Type {
     fn under_mut(ty: &Type) -> Option<&Type> {
         match ty {
             // Only a mutable variable peels to its value; a feed history reads as
-            // its whole stream and is never a transactional register target.
+            // its whole stream and is never a transactional mutable variable target.
             Type::History {
                 value,
                 kind: HistoryKind::Overwrite,
@@ -471,7 +468,7 @@ fn register_value_ty(ty: &Type) -> Type {
         }
     }
     match under_mut(ty) {
-        Some(v) => register_value_ty(v),
+        Some(v) => mut_var_value_ty(v),
         None => crate::ccl::ccl_utils::strip_refinements(ty),
     }
 }
@@ -488,10 +485,10 @@ struct RawSite {
     /// ending in `Unit`, from which the decision lambda is built (feeds become
     /// `to_<defer>` taps).
     block: Expr,
-    /// Register keys read (snapshot) in the block, first-read order — the body's
+    /// Variable keys read (snapshot) in the block, first-read order — the body's
     /// snapshot parameters.
     read_keys: Vec<Name>,
-    /// Register keys written in the block, first-write order — the `writes` tuple.
+    /// Variable keys written in the block, first-write order — the `writes` tuple.
     write_keys: Vec<Name>,
     /// Induction accumulators written by this site's **enclosing loop** (siblings
     /// of the block, and induction writes lifted out of it). An accumulator the
@@ -508,7 +505,7 @@ struct RawSite {
 /// `` `commit `` payload carries beside `writes`, and the tap value's type. The writer
 /// decision computes the tap value alongside the write set (read-your-writes at
 /// the feed's position); the phase hoists `Feed(defer, __reg ▷ .to_<defer>)`
-/// into the register body so `channelize` routes it as an ordinary channel
+/// into the mutable variable body so `channelize` routes it as an ordinary channel
 /// contribution — mirroring `mut_elim`'s in-loop induction feeds. The tap
 /// commits with the transaction (a denied `` `abort `` contributes no reply, since
 /// the engine appends nothing for an aborted decision).
@@ -518,30 +515,30 @@ struct FeedSite {
     value_ty: Type,
 }
 
-/// Rewrite every `with begin():` writer of a `Mut(_, Txn)` register into one shared
+/// Rewrite every `with begin():` writer of a `Mut(_, Txn)` mutable variable into one shared
 /// commit `Transact`. A no-op (returns the input untouched) on programs that
-/// write no transactional register.
+/// write no transactional mutable variable.
 ///
-/// `txn_registers` is the set of α-unique register [`Name`]s — the `Mut(_, Txn)`
+/// `txn_mut_vars` is the set of α-unique mutable variable [`Name`]s — the `Mut(_, Txn)`
 /// bindings on the inlined, typed tree (see
-/// [`collect_txn_registers`]). Keying on the exact binder identity (not the surface
+/// [`collect_txn_mut_vars`]). Keying on the exact binder identity (not the surface
 /// base name) makes the fold immune to an unrelated local variable merely
-/// *spelled* like a register.
-pub fn run(expr: Expr, txn_registers: &HashSet<Name>) -> Expr {
+/// *spelled* like a mutable variable.
+pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
     // Strip whenever a `with begin():` block is present. A block need not write a
-    // transactional register — a read-only block (`out << balance`) has no write
+    // transactional mutable variable — a read-only block (`out << balance`) has no write
     // yet must still be unwrapped off the loop spine — so we cannot short-circuit
-    // on `txn_registers` alone; but with neither a register nor a block there is
+    // on `txn_mut_vars` alone; but with neither a mutable variable nor a block there is
     // nothing to do.
-    if txn_registers.is_empty() && !contains_begin(&expr) {
+    if txn_mut_vars.is_empty() && !contains_begin(&expr) {
         return expr;
     }
     let mut sites: Vec<RawSite> = Vec::new();
-    let stripped = strip(expr, txn_registers, None, &mut sites);
+    let stripped = strip(expr, txn_mut_vars, None, &mut sites);
     // Post-strip invariants (release asserts, like the letrec-phase
     // post-conditions): every `Begin` was consumed (stripped into a site or
     // unwrapped), and no transactional write survives outside a block — a
-    // survivor is a register write outside a block that the lowering write gate
+    // survivor is a mutable variable write outside a block that the lowering write gate
     // (`check_mut_write_context`) should have rejected, and must never
     // silently become a shadowing `let` that hides committed values.
     assert!(
@@ -549,15 +546,15 @@ pub fn run(expr: Expr, txn_registers: &HashSet<Name>) -> Expr {
         "transact_phase: a `with begin():` block (`Begin`) survived stripping"
     );
     assert!(
-        !contains_txn_write(&stripped, txn_registers),
-        "transact_phase: a `MutWrite` to a transactional register survived stripping — an \
-         out-of-block register write the lowering write gate should have rejected"
+        !contains_txn_write(&stripped, txn_mut_vars),
+        "transact_phase: a `MutWrite` to a transactional mutable variable survived stripping — an \
+         out-of-block mutable variable write the lowering write gate should have rejected"
     );
     if sites.is_empty() {
         return stripped;
     }
 
-    // Register keys: the union of every writer's footprint (read ∪ write), in
+    // Variable keys: the union of every writer's footprint (read ∪ write), in
     // first-occurrence order. These are exact (α-unique) `Name`s.
     let mut key_names: Vec<Name> = Vec::new();
     for s in &sites {
@@ -569,13 +566,13 @@ pub fn run(expr: Expr, txn_registers: &HashSet<Name>) -> Expr {
     }
 
     // Each key's tick-0 `init`, located at its `let` binding (the value type is
-    // the init's type — the snapshot/write element type of that register).
+    // the init's type — the snapshot/write element type of that mutable variable).
     let mut key_init: HashMap<Name, Expr> = HashMap::new();
     collect_key_inits(&stripped, &key_names, &mut key_init);
     for k in &key_names {
         assert!(
             key_init.contains_key(k),
-            "transact_phase: register key `{k}` has no `let` binding to fold (its `Mut(_, Txn)` \
+            "transact_phase: mutable variable key `{k}` has no `let` binding to fold (its `Mut(_, Txn)` \
              declaration must be a top-level `let`)"
         );
     }
@@ -590,12 +587,12 @@ pub fn run(expr: Expr, txn_registers: &HashSet<Name>) -> Expr {
     // `zip` of the loop iter and the accumulator's per-position view), which the
     // commit engine co-iterates. A non-entangled induction loop is left for
     // `mut_elim`.
-    let cross_reads = cross_domain_reads(&sites, txn_registers);
+    let cross_reads = cross_domain_reads(&sites, txn_mut_vars);
     let mut cross = CrossDomain::default();
     let stripped = fold_cross_domain_loops(stripped, &cross_reads, &mut cross);
 
     // A monotone counter across all sites gives each tap field a name unique
-    // within the shared register — two writers feeding the same defer contribute
+    // within the shared mutable variable — two writers feeding the same defer contribute
     // distinct `to_<defer>_k` keys, unioned by `channelize`. Feeds are kept
     // *per site* (parallel to `writers`) so each tap binding reads its own
     // commit-record stream.
@@ -642,22 +639,22 @@ struct CrossAcc {
     final_var: Name,
 }
 
-/// Every non-transactional-register `Var` a commit-decision block reads — the
+/// Every `Var` a commit-decision block reads that is not a transactional variable — the
 /// candidate induction accumulators. [`fold_cross_domain_loops`] confirms each by
 /// intersecting with the actual loop-`MutWrite` targets (names are α-unique, so a
 /// match is the same variable).
-fn cross_domain_reads(sites: &[RawSite], txn_registers: &HashSet<Name>) -> HashSet<Name> {
-    fn collect(e: &Expr, txn_registers: &HashSet<Name>, out: &mut HashSet<Name>) {
+fn cross_domain_reads(sites: &[RawSite], txn_mut_vars: &HashSet<Name>) -> HashSet<Name> {
+    fn collect(e: &Expr, txn_mut_vars: &HashSet<Name>, out: &mut HashSet<Name>) {
         if let TypedExprNode::Var(n) = &e.node
-            && !txn_registers.contains(n)
+            && !txn_mut_vars.contains(n)
         {
             out.insert(n.clone());
         }
-        e.walk_children(|c| collect(c, txn_registers, out));
+        e.walk_children(|c| collect(c, txn_mut_vars, out));
     }
     let mut names = HashSet::new();
     for s in sites {
-        collect(&s.block, txn_registers, &mut names);
+        collect(&s.block, txn_mut_vars, &mut names);
     }
     names
 }
@@ -683,7 +680,7 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         // The loop body and the continuation between them carry every reference to
         // this loop's accumulators, so their `Mut(V, D)`s give each one the value
         // type inference joined for it.
-        let reg_vtys = register_value_tys([&*body, &*cont]);
+        let reg_vtys = mut_var_value_tys([&*body, &*cont]);
         let fold = fold_induction_loop(&target, &iter, *body, &reg_vtys);
         for (i, (acc, vty)) in fold.accs.iter().enumerate() {
             if cross_reads.contains(acc) {
@@ -718,22 +715,22 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
 }
 
 /// The induction accumulators a loop body writes: every `MutWrite` target that
-/// is not a transactional register (including induction writes lifted from inside a
+/// is not a transactional mutable variable (including induction writes lifted from inside a
 /// `with begin():` block, which `strip` moves onto the loop spine). Used to tell
 /// a *co-indexed* accumulator read in a commit decision (written per request by
 /// the txn's own loop → threaded through the writer source) from a *cross-domain*
 /// read (written by a different, completed loop → its final value broadcast).
-fn loop_induction_writes(body: &Expr, txn_registers: &HashSet<Name>) -> HashSet<Name> {
-    fn go(e: &Expr, txn_registers: &HashSet<Name>, out: &mut HashSet<Name>) {
+fn loop_induction_writes(body: &Expr, txn_mut_vars: &HashSet<Name>) -> HashSet<Name> {
+    fn go(e: &Expr, txn_mut_vars: &HashSet<Name>, out: &mut HashSet<Name>) {
         if let TypedExprNode::MutWrite { name, .. } = &e.node
-            && !txn_registers.contains(name)
+            && !txn_mut_vars.contains(name)
         {
             out.insert(name.clone());
         }
-        e.walk_children(|c| go(c, txn_registers, out));
+        e.walk_children(|c| go(c, txn_mut_vars, out));
     }
     let mut out = HashSet::new();
-    go(body, txn_registers, &mut out);
+    go(body, txn_mut_vars, &mut out);
     out
 }
 
@@ -759,14 +756,14 @@ fn rename_var_uses(e: &mut Expr, from: &Name, to: &Name) {
     e.walk_children_mut(|c| rename_var_uses(c, from, to));
 }
 
-/// Whether the subtree contains a `MutWrite` to a transactional register.
-fn contains_txn_write(expr: &Expr, txn_registers: &HashSet<Name>) -> bool {
+/// Whether the subtree contains a `MutWrite` to a transactional mutable variable.
+fn contains_txn_write(expr: &Expr, txn_mut_vars: &HashSet<Name>) -> bool {
     if let TypedExprNode::MutWrite { name, .. } = &expr.node
-        && txn_registers.contains(name)
+        && txn_mut_vars.contains(name)
     {
         return true;
     }
-    expr.any_child(|c| contains_txn_write(c, txn_registers))
+    expr.any_child(|c| contains_txn_write(c, txn_mut_vars))
 }
 
 /// Whether the subtree still contains a `with begin():` block marker.
@@ -775,11 +772,11 @@ fn contains_begin(expr: &Expr) -> bool {
 }
 
 /// Replace every transaction `For` site (`ExprStmt(For{…}, cont)` whose block
-/// writes a transactional register) with its stripped continuation, accumulating a
+/// writes a transactional mutable variable) with its stripped continuation, accumulating a
 /// [`RawSite`] per site in source order (the commit serialization order).
 fn strip(
     expr: Expr,
-    txn_registers: &HashSet<Name>,
+    txn_mut_vars: &HashSet<Name>,
     enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>)>,
     sites: &mut Vec<RawSite>,
 ) -> Expr {
@@ -797,9 +794,9 @@ fn strip(
         let TypedExprNode::Begin { body: block } = effect.node else {
             unreachable!("guarded above")
         };
-        if block_writes_txn(&block, txn_registers) {
+        if block_writes_txn(&block, txn_mut_vars) {
             // A writing block → a commit-record site keyed on the *enclosing*
-            // loop. Partition it by register domain: the transactional remainder is
+            // loop. Partition it by mutable variable domain: the transactional remainder is
             // the commit decision; each induction `MutWrite` is lifted onto the
             // loop body as a sibling (after the stripped block, same iteration
             // position), where `mut_elim` folds it into the loop recurrence.
@@ -809,8 +806,8 @@ fn strip(
                 "a writing `with begin():` block must be inside a loop (lowering wraps a \
                  standalone block in a singleton `For`)",
             );
-            let (txn_block, lifted) = partition_block(*block, txn_registers);
-            let (read_keys, write_keys) = collect_footprint(&txn_block, txn_registers);
+            let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
+            let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
             sites.push(RawSite {
                 target: target.clone(),
                 source: source.clone(),
@@ -820,13 +817,13 @@ fn strip(
                 enclosing_writes: enclosing_writes.clone(),
             });
             let new_rest = prepend_effects(lifted, *rest);
-            return strip(new_rest, txn_registers, enclosing, sites);
+            return strip(new_rest, txn_mut_vars, enclosing, sites);
         }
-        // A read-only block (feeds a register read, no txn write) → unwrap it onto
-        // the loop spine. The fed register read then flows to `mut_elim`'s
+        // A read-only block (feeds a mutable variable read, no txn write) → unwrap it onto
+        // the loop spine. The fed mutable variable read then flows to `mut_elim`'s
         // live/terminal as-of path unchanged (the shape a get-loop had before).
         let spliced = splice_block(*block, *rest);
-        return strip(spliced, txn_registers, enclosing, sites);
+        return strip(spliced, txn_mut_vars, enclosing, sites);
     }
     // A `For`: thread it as the enclosing loop for its body (its source is
     // evaluated in the outer scope, so it keeps the outer `enclosing`).
@@ -840,16 +837,16 @@ fn strip(
         let TypedExprNode::For { target, iter, body } = node else {
             unreachable!("guarded above")
         };
-        let source = strip(*iter, txn_registers, enclosing, sites);
+        let source = strip(*iter, txn_mut_vars, enclosing, sites);
         // The loop's own induction accumulators (direct writes + those lifted
         // from its `with begin():` blocks). A site inside this loop co-indexes a
         // read of one of these; a read of any other accumulator is a completed
         // sibling loop's final value (broadcast). Computed before recursing so it
         // is available to every site the body strips.
-        let enclosing_writes = loop_induction_writes(&body, txn_registers);
+        let enclosing_writes = loop_induction_writes(&body, txn_mut_vars);
         let body = strip(
             *body,
-            txn_registers,
+            txn_mut_vars,
             Some((&target, &source, &enclosing_writes)),
             sites,
         );
@@ -865,7 +862,7 @@ fn strip(
         };
     }
     let mut expr = expr;
-    expr.map_children(|c| strip(c, txn_registers, enclosing, sites));
+    expr.map_children(|c| strip(c, txn_mut_vars, enclosing, sites));
     expr
 }
 
@@ -930,9 +927,9 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
     }
 }
 
-/// Partition a writing block by register domain: remove each induction `MutWrite`
-/// (a target *not* in `txn_registers`) from the block spine and return it in the
-/// `Vec`, leaving the transactional remainder (register writes/reads, local
+/// Partition a writing block by mutable variable domain: remove each induction `MutWrite`
+/// (a target *not* in `txn_mut_vars`) from the block spine and return it in the
+/// `Vec`, leaving the transactional remainder (mutable variable writes/reads, local
 /// `let`s, feeds) as the block returned. The lifted induction writes become
 /// siblings on the enclosing loop body (see [`strip`]), keeping the induction
 /// accumulator out of the atomic commit. A bare top-level spine induction write is
@@ -940,13 +937,13 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
 /// top-level spine writes are lifted; a *guarded* induction write is rejected
 /// up front by [`check_no_guarded_induction_write_in_block`] (it would need commit-gated
 /// carry-forward), so it never reaches here.
-fn partition_block(block: Expr, txn_registers: &HashSet<Name>) -> (Expr, Vec<Expr>) {
+fn partition_block(block: Expr, txn_mut_vars: &HashSet<Name>) -> (Expr, Vec<Expr>) {
     let mut lifted = Vec::new();
-    let txn_block = partition_spine(block, txn_registers, &mut lifted);
+    let txn_block = partition_spine(block, txn_mut_vars, &mut lifted);
     (txn_block, lifted)
 }
 
-fn partition_spine(expr: Expr, txn_registers: &HashSet<Name>, lifted: &mut Vec<Expr>) -> Expr {
+fn partition_spine(expr: Expr, txn_mut_vars: &HashSet<Name>, lifted: &mut Vec<Expr>) -> Expr {
     let Expr {
         node,
         ty,
@@ -954,13 +951,13 @@ fn partition_spine(expr: Expr, txn_registers: &HashSet<Name>, lifted: &mut Vec<E
         node_id,
     } = expr;
     match node {
-        TypedExprNode::ExprStmt { expr: effect, body } if matches!(&effect.node, TypedExprNode::MutWrite { name, .. } if !txn_registers.contains(name)) =>
+        TypedExprNode::ExprStmt { expr: effect, body } if matches!(&effect.node, TypedExprNode::MutWrite { name, .. } if !txn_mut_vars.contains(name)) =>
         {
             lifted.push(*effect);
-            partition_spine(*body, txn_registers, lifted)
+            partition_spine(*body, txn_mut_vars, lifted)
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
-            let body = partition_spine(*body, txn_registers, lifted);
+            let body = partition_spine(*body, txn_mut_vars, lifted);
             Expr {
                 node: TypedExprNode::ExprStmt {
                     expr: effect,
@@ -976,7 +973,7 @@ fn partition_spine(expr: Expr, txn_registers: &HashSet<Name>, lifted: &mut Vec<E
             bound_expr,
             body,
         } => {
-            let body = partition_spine(*body, txn_registers, lifted);
+            let body = partition_spine(*body, txn_mut_vars, lifted);
             Expr {
                 node: TypedExprNode::Let {
                     binding,
@@ -1044,60 +1041,60 @@ pub fn check_no_nested_transactions(
 }
 
 /// Reject an **induction-only transaction**: a `with begin():` block that writes
-/// an induction accumulator (`Mut(…)`, non-`Txn`) but no transactional register.
+/// an induction accumulator (`Mut(…)`, non-`Txn`) but no transactional mutable variable.
 ///
 /// Such a block provides no atomicity — its only effect is an induction write
 /// that would be lifted onto the enclosing loop anyway (see [`partition_block`]),
-/// so the `with begin():` is either a misuse (the user believes the register is
+/// so the `with begin():` is either a misuse (the user believes the mutable variable is
 /// transactional) or dead syntax. An induction write is legal inside a block
-/// *only alongside* a register write (the mixed loop), where it rides its own
+/// *only alongside* a mutable variable write (the mixed loop), where it rides its own
 /// domain. Mutability is a type, so this cannot be caught at lowering; it is
 /// caught here, on the inlined, typed tree.
 pub fn check_no_induction_only_transactions(
     expr: &Expr,
-    txn_registers: &HashSet<Name>,
+    txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), String> {
     if let TypedExprNode::Begin { body } = &expr.node
-        && !block_writes_txn(body, txn_registers)
-        && let Some(name) = first_non_txn_write(body, txn_registers)
+        && !block_writes_txn(body, txn_mut_vars)
+        && let Some(name) = first_non_txn_write(body, txn_mut_vars)
     {
         // `name` is any non-transactional `MutWrite` target — an induction
         // accumulator, or a plain non-`Mut` binding (itself a type error caught
         // by the later `MutWrite`-target check). Either way the block commits no
-        // register, so keep the message neutral on which it is.
+        // mutable variable, so keep the message neutral on which it is.
         return Err(format!(
             "`{name}` is written inside a `with begin():` block that commits no transactional \
-             register, so the block provides no atomicity. If `{name}` is an induction \
+             mutable variable, so the block provides no atomicity. If `{name}` is an induction \
              accumulator, move its write outside the block; if it should be a transactional \
-             register, declare it `Mut(…, Txn)` and write it alongside a register in the block"
+             mutable variable, declare it `Mut(…, Txn)` and write it alongside a mutable variable in the block"
         ));
     }
     let mut result = Ok(());
     expr.walk_children(|c| {
         if result.is_ok() {
-            result = check_no_induction_only_transactions(c, txn_registers);
+            result = check_no_induction_only_transactions(c, txn_mut_vars);
         }
     });
     result
 }
 
 /// Reject a **guarded** induction write inside a `with begin():` block —
-/// `register := …; if p: cnt += 1`, where `cnt` is an induction accumulator, not a
-/// transactional register.
+/// `mutable variable := …; if p: cnt += 1`, where `cnt` is an induction accumulator, not a
+/// transactional mutable variable.
 ///
 /// [`partition_spine`] lifts only *top-level spine* induction writes out onto the
 /// enclosing loop; a write nested inside a statement-`Case` (an `if`) stays in the
 /// block. There, `walk_case` has no `write_key` for it (`allowed_writes` holds
-/// only the transactional registers), so its value would be folded into the env and
+/// only the transactional mutable variables), so its value would be folded into the env and
 /// **silently dropped** from the decision record — the worst failure for a DB
 /// substrate, and one a `debug_assert` alone would let through in release. Catch
 /// it here as a user-facing error before the phase runs.
 pub fn check_no_guarded_induction_write_in_block(
     expr: &Expr,
-    txn_registers: &HashSet<Name>,
+    txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), String> {
     if let TypedExprNode::Begin { body } = &expr.node
-        && let Some(name) = guarded_non_txn_write(body, txn_registers, false)
+        && let Some(name) = guarded_non_txn_write(body, txn_mut_vars, false)
     {
         return Err(format!(
             "`{name}` is written under an `if` inside a `with begin():` block. A guarded \
@@ -1109,7 +1106,7 @@ pub fn check_no_guarded_induction_write_in_block(
     let mut result = Ok(());
     expr.walk_children(|c| {
         if result.is_ok() {
-            result = check_no_guarded_induction_write_in_block(c, txn_registers);
+            result = check_no_guarded_induction_write_in_block(c, txn_mut_vars);
         }
     });
     result
@@ -1121,11 +1118,11 @@ pub fn check_no_guarded_induction_write_in_block(
 /// so only arm *bodies* set it.
 fn guarded_non_txn_write(
     block: &Expr,
-    txn_registers: &HashSet<Name>,
+    txn_mut_vars: &HashSet<Name>,
     in_case: bool,
 ) -> Option<Name> {
     match &block.node {
-        TypedExprNode::MutWrite { name, .. } if in_case && !txn_registers.contains(name) => {
+        TypedExprNode::MutWrite { name, .. } if in_case && !txn_mut_vars.contains(name) => {
             return Some(name.clone());
         }
         TypedExprNode::Case {
@@ -1133,7 +1130,7 @@ fn guarded_non_txn_write(
             branches,
         } => {
             for b in branches {
-                if let Some(n) = guarded_non_txn_write(&b.body, txn_registers, true) {
+                if let Some(n) = guarded_non_txn_write(&b.body, txn_mut_vars, true) {
                     return Some(n);
                 }
             }
@@ -1144,43 +1141,43 @@ fn guarded_non_txn_write(
     let mut found = None;
     block.walk_children(|c| {
         if found.is_none() {
-            found = guarded_non_txn_write(c, txn_registers, in_case);
+            found = guarded_non_txn_write(c, txn_mut_vars, in_case);
         }
     });
     found
 }
 
-/// The first `MutWrite` target in a block that is *not* a transactional register,
+/// The first `MutWrite` target in a block that is *not* a transactional mutable variable,
 /// in first-occurrence order — the induction accumulator to name in the error above.
-fn first_non_txn_write(block: &Expr, txn_registers: &HashSet<Name>) -> Option<Name> {
+fn first_non_txn_write(block: &Expr, txn_mut_vars: &HashSet<Name>) -> Option<Name> {
     if let TypedExprNode::MutWrite { name, .. } = &block.node
-        && !txn_registers.contains(name)
+        && !txn_mut_vars.contains(name)
     {
         return Some(name.clone());
     }
     let mut found = None;
     block.walk_children(|c| {
         if found.is_none() {
-            found = first_non_txn_write(c, txn_registers);
+            found = first_non_txn_write(c, txn_mut_vars);
         }
     });
     found
 }
 
-/// Whether a block (a `Begin` body) writes any transactional register — marks it a
+/// Whether a block (a `Begin` body) writes any transactional mutable variable — marks it a
 /// committing transaction site rather than a read-only block.
-fn block_writes_txn(block: &Expr, txn_registers: &HashSet<Name>) -> bool {
+fn block_writes_txn(block: &Expr, txn_mut_vars: &HashSet<Name>) -> bool {
     if let TypedExprNode::MutWrite { name, .. } = &block.node
-        && txn_registers.contains(name)
+        && txn_mut_vars.contains(name)
     {
         return true;
     }
-    block.any_child(|c| block_writes_txn(c, txn_registers))
+    block.any_child(|c| block_writes_txn(c, txn_mut_vars))
 }
 
-/// The block's transactional footprint: register keys read (snapshot) and written,
+/// The block's transactional footprint: mutable variable keys read (snapshot) and written,
 /// each in first-occurrence order. Reads are bare `Var`s of a transactional
-/// register; writes are `MutWrite` targets.
+/// mutable variable; writes are `MutWrite` targets.
 ///
 /// A key written **conditionally** — inside a statement-`Case` arm (`if p: k :=
 /// e`) — also joins the *read* set. On a control-flow path where that arm does
@@ -1190,29 +1187,29 @@ fn block_writes_txn(block: &Expr, txn_registers: &HashSet<Name>) -> bool {
 /// *absolute* conditional write (`k := e`) that would otherwise have no snapshot
 /// to carry. A purely spine (unconditional) write needs no carry, so it stays
 /// write-only — the peephole keeps unconditional programs snapshot-free.
-fn collect_footprint(block: &Expr, txn_registers: &HashSet<Name>) -> (Vec<Name>, Vec<Name>) {
+fn collect_footprint(block: &Expr, txn_mut_vars: &HashSet<Name>) -> (Vec<Name>, Vec<Name>) {
     let mut reads = Vec::new();
     let mut writes = Vec::new();
     fn walk(
         e: &Expr,
-        txn_registers: &HashSet<Name>,
+        txn_mut_vars: &HashSet<Name>,
         in_case: bool,
         reads: &mut Vec<Name>,
         writes: &mut Vec<Name>,
     ) {
         match &e.node {
             // Exact-`Name` membership: a comprehension/loop variable merely
-            // *spelled* like a register (`[register for register in …]`) has a distinct
+            // *spelled* like a mutable variable (`[mutable variable for mutable variable in …]`) has a distinct
             // α-unique `Name`, so it is not swept into the footprint (fixing the
-            // base-name panic where such a var had no register `let` to fold).
-            TypedExprNode::Var(n) if txn_registers.contains(n) && !reads.contains(n) => {
+            // base-name panic where such a var had no mutable variable `let` to fold).
+            TypedExprNode::Var(n) if txn_mut_vars.contains(n) && !reads.contains(n) => {
                 reads.push(n.clone());
             }
             TypedExprNode::MutWrite { name, value } => {
-                // The write's value is read first (its embedded register reads are
+                // The write's value is read first (its embedded mutable variable reads are
                 // snapshots), then the target joins the write set.
-                walk(value, txn_registers, in_case, reads, writes);
-                if txn_registers.contains(name) {
+                walk(value, txn_mut_vars, in_case, reads, writes);
+                if txn_mut_vars.contains(name) {
                     if !writes.contains(name) {
                         writes.push(name.clone());
                     }
@@ -1224,7 +1221,7 @@ fn collect_footprint(block: &Expr, txn_registers: &HashSet<Name>) -> (Vec<Name>,
                     // wholesale), and a spine-then-conditional key carries the
                     // literal spine value — yet both land in the read set. The cost
                     // is only a wider staleness footprint (more spurious
-                    // conflict-retries once several writers share a register), harmless
+                    // conflict-retries once several writers share a mutable variable), harmless
                     // for a single writer; a precise footprint is a later refinement.
                     if in_case && !reads.contains(name) {
                         reads.push(name.clone());
@@ -1241,16 +1238,16 @@ fn collect_footprint(block: &Expr, txn_registers: &HashSet<Name>) -> (Vec<Name>,
                 for b in branches {
                     // A guard is evaluated on the spine (its reads are unconditional
                     // snapshots), but arm bodies are conditional.
-                    walk(&b.guard, txn_registers, in_case, reads, writes);
-                    walk(&b.body, txn_registers, true, reads, writes);
+                    walk(&b.guard, txn_mut_vars, in_case, reads, writes);
+                    walk(&b.body, txn_mut_vars, true, reads, writes);
                 }
                 return;
             }
             _ => {}
         }
-        e.walk_children(|c| walk(c, txn_registers, in_case, reads, writes));
+        e.walk_children(|c| walk(c, txn_mut_vars, in_case, reads, writes));
     }
-    walk(block, txn_registers, false, &mut reads, &mut writes);
+    walk(block, txn_mut_vars, false, &mut reads, &mut writes);
     (reads, writes)
 }
 
@@ -1271,7 +1268,7 @@ fn proj_tuple(p: &Name, tuple_ty: &Type, i: usize, elt_ty: Type) -> Expr {
 }
 
 /// Build one [`WriterSite`] from a stripped site: its ``{`commit{writes} | `abort}`` decision lambda over the snapshot-tuple parameter, plus its footprint
-/// and source. The decision reads register snapshots and the loop item off the tuple,
+/// and source. The decision reads mutable variable snapshots and the loop item off the tuple,
 /// threads read-your-writes by substitution, and picks the `` `commit ``/`` `abort `` tag
 /// on the disjunction of any `if` guards' write paths.
 fn build_writer(
@@ -1283,8 +1280,8 @@ fn build_writer(
     let value_ty = |k: &Name| {
         key_init
             .get(k)
-            .map(|e| register_value_ty(&e.ty))
-            .expect("transact_phase: footprint key must be a register key")
+            .map(|e| mut_var_value_ty(&e.ty))
+            .expect("transact_phase: footprint key must be a mutable variable key")
     };
     let read_tys: Vec<Type> = site.read_keys.iter().map(value_ty).collect();
     let orig_item_ty = site
@@ -1380,7 +1377,7 @@ fn build_writer(
     // path)` — the control-flow path is the tap's fire condition.
     let mut collected_feeds: Vec<(Name, String, Expr, Expr)> = Vec::new();
     // The legal `MutWrite` targets inside this block: exactly the site's write
-    // keys (transactional registers `collect_footprint` recorded). `walk_block`
+    // keys (transactional mutable variables `collect_footprint` recorded). `walk_block`
     // asserts every write it sees is one of these — see its `MutWrite` arm.
     let allowed_writes: HashSet<Name> = site.write_keys.iter().cloned().collect();
     walk_block(
@@ -1505,7 +1502,7 @@ fn build_zip_source(source: &Expr, item_ty: &Type, accs: &[(Name, Expr, Type)]) 
 /// `commit` (a denied transaction proposes nothing). Each `<<` feed resolves its
 /// value in the current (post-write) `env` and records it into `feeds` as a
 /// `to_<defer>_k` tap contribution — `feed_counter` names it uniquely across the
-/// shared register's writers.
+/// shared mutable variable's writers.
 fn walk_block(
     block: &Expr,
     env: &mut HashMap<Name, Expr>,
@@ -1538,7 +1535,7 @@ fn walk_block(
             match &expr.node {
                 TypedExprNode::MutWrite { name, value } => {
                     // Every `MutWrite` in a stripped `with begin():` block must
-                    // target a transactional register the site records as a write
+                    // target a transactional mutable variable the site records as a write
                     // key. `build_writer` only emits `write_keys` into the
                     // decision `writes` tuple, so a write to any other name would
                     // be silently folded into `env` and dropped — the worst
@@ -1753,7 +1750,7 @@ fn subst_env(e: &Expr, env: &HashMap<Name, Expr>) -> Expr {
     out
 }
 
-/// Locate each register key's `let` binding and record its tick-0 `init` (keeping
+/// Locate each mutable variable key's `let` binding and record its tick-0 `init` (keeping
 /// the outermost when a key is bound more than once). The `init` carries the
 /// key's value type (its `.ty`).
 fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, Expr>) {
@@ -1770,7 +1767,7 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, Expr>) 
     expr.walk_children(|c| collect_key_inits(c, keys, out));
 }
 
-/// The commit history type of a register key — `Fun(Txn, V)`. A key's history
+/// The commit history type of a mutable variable key — `Fun(Txn, V)`. A key's history
 /// binding has this type; a variable read of the key reduces it with
 /// `final_or_default`.
 fn history_ty(value_ty: &Type) -> Type {
@@ -1835,7 +1832,7 @@ fn fun_parts(ty: &Type) -> (Type, Type) {
 }
 
 /// `final_or_default((stream, init)) : value_ty` — the current/final committed
-/// value of a scalar register's history, defaulting to `init`.
+/// value of a scalar mutable variable's history, defaulting to `init`.
 fn final_or_default_read(stream: Expr, init: Expr, value_ty: Type) -> Expr {
     let arg_ty = Type::Tuple(vec![stream.ty.clone(), init.ty.clone()]);
     let mut arg = Expr::tuple(vec![stream, init]);
@@ -1949,7 +1946,7 @@ fn record_field_ty(ty: &Type, field: &str) -> Type {
 
 /// A hoisted in-block feed: the target defer and the tap binding (`Fun(𝐼, V)`
 /// over its site's commit-record stream) whose per-commit values feed it.
-/// `recognize` maps a read of `tap` to the register record's tap field.
+/// `recognize` maps a read of `tap` to the mutable variable record's tap field.
 struct HoistedFeed {
     defer: Name,
     tap: Name,
@@ -1965,7 +1962,7 @@ struct HoistedFeed {
 ///   `reg_k` itself for a read-only key (a self-guarded constant);
 /// - one **commit-record** binding per `with begin():` site — `commits_j : 𝐼 ⇒
 ///   {time, write_targets, decision}`, whose `decision` is the writer body
-///   (verbatim) applied to the register snapshot `(reg_rk(begin(r)) …,
+///   (verbatim) applied to the mutable variable snapshot `(reg_rk(begin(r)) …,
 ///   source(r))` at the site's commit time, and whose `write_targets` names the
 ///   write-set keys' histories so recognition recovers the writer's write-set;
 /// - one **tap** binding per in-block feed — `commits_j ≫ .decision ≫ .field`.
@@ -2007,8 +2004,8 @@ fn build_letrec(
     let value_ty = |k: &Name| {
         key_init
             .get(k)
-            .map(|e| register_value_ty(&e.ty))
-            .expect("transact_phase: footprint key must be a register key")
+            .map(|e| mut_var_value_ty(&e.ty))
+            .expect("transact_phase: footprint key must be a mutable variable key")
     };
 
     // --- commit-record + tap bindings, one commit binding per writer site ---
@@ -2108,7 +2105,7 @@ fn build_letrec(
         // `commits_j ≫ .decision ≫ variant_project(`commit) ≫ .field`, the
         // per-commit tap stream — the tap rides the (dense) `commit` payload, so
         // eliminate the `` {`commit{𝑃} | `abort} `` decision before the field read.
-        // recognition maps its ref to the register record's `field` tap. Emitted in
+        // recognition maps its ref to the mutable variable record's `field` tap. Emitted in
         // feed (source) order across sites.
         let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(&decision_ty);
         for f in feeds {
@@ -2247,11 +2244,11 @@ fn build_letrec(
     )
 }
 
-/// Splice the register `letrec` into the continuation and rebind each register key to
+/// Splice the mutable variable `letrec` into the continuation and rebind each mutable variable key to
 /// a `final_or_default(reg_x, init)` read over its history binding.
 ///
 /// **Splice point** — the letrec is spliced at the *tail*: below every `let`
-/// binding kept from the continuation, above the trailing register reads. Register-key
+/// binding kept from the continuation, above the trailing mutable variable reads. Variable-key
 /// declarations (`let x: Mut(_, Txn) = init`, always top-level) are **dropped**
 /// (their inits ride `key_init` and are consumed by the history bindings) and
 /// each key is re-bound at the tail. This is what fixes a key declared *above* a
@@ -2282,7 +2279,7 @@ fn rebind_letrec(
             body,
         } => {
             if key_names.contains(&binding.name) {
-                // Register-key declaration: drop it (init captured in `key_init`),
+                // Variable-key declaration: drop it (init captured in `key_init`),
                 // recurse into the body — the key is re-bound at the tail splice.
                 rebind_letrec(*body, key_names, hist, key_init, hoisted, bindings, cross)
             } else {
@@ -2305,7 +2302,7 @@ fn rebind_letrec(
                 }
             }
         }
-        // The tail — below every source binding, above the trailing register reads.
+        // The tail — below every source binding, above the trailing mutable variable reads.
         other => splice_letrec(
             Expr {
                 node: other,
@@ -2352,9 +2349,9 @@ fn splice_letrec(
     let mut inner = tail;
     for k in key_names.iter().rev() {
         // The init's type is the mutable variable's value type `V` (the `Mut(V, Txn)` wrapper
-        // rode the binding/annotation, not the init RHS); `register_value_ty` peels
+        // rode the binding/annotation, not the init RHS); `mut_var_value_ty` peels
         // it defensively. `erase_mut` sweeps any surviving `Var(x)` reference type.
-        let v = register_value_ty(&key_init[k].ty);
+        let v = mut_var_value_ty(&key_init[k].ty);
         let stream = tvar(&hist[k], history_ty(&v));
         let init = key_init.get(k).cloned().expect("key init present");
         let bound = final_or_default_read(stream, init, v.clone());
@@ -2472,7 +2469,7 @@ mod tests {
 
     /// The phase turns a `with begin():` writer into a `get_prev_txn`-guarded
     /// letrec: a `Txn`-history binding read via `get_prev_txn`, a commit-record
-    /// binding minting `begin`, and a guarded `register ↔ commits` cycle.
+    /// binding minting `begin`, and a guarded `mutable variable ↔ commits` cycle.
     #[test]
     fn phase_emits_guarded_get_prev_txn_letrec() {
         let (tree, pool) = direct_mirror_txn();
@@ -2490,13 +2487,13 @@ mod tests {
         );
         assert!(
             s.contains("final_or_default"),
-            "the register read reduces its history: {s}"
+            "the mutable variable read reduces its history: {s}"
         );
 
         let mut bindings = None;
         find_letrec(&out, &mut bindings);
         let bindings = bindings.expect("phase emits a LetRec");
-        // The `register ↔ commits` cycle crosses `get_prev_txn` once, so the group
+        // The `mutable variable ↔ commits` cycle crosses `get_prev_txn` once, so the group
         // is well-founded.
         assert_eq!(
             check_letrec_causal(&bindings),

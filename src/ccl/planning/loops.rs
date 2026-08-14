@@ -42,7 +42,7 @@ use crate::ccl::{
 /// op-conversion picks the engine on the domain, both unchanged.
 ///
 /// Two shapes are recognized, dispatched on the guard: a **transaction**
-/// group (`get_prev_txn`-causal `register ↔ commits` cycles from
+/// group (`get_prev_txn`-causal `mutable variable ↔ commits` cycles from
 /// `transact_phase`) → `Transact{domain: Txn}`; a
 /// single-binding **induction** group (a `get_prev_seq`-causal self-cycle
 /// from [`crate::ccl::mut_elim::transform_loop`]) → `Transact{domain: iteration extent}`.
@@ -105,7 +105,7 @@ fn group_has_causal(bindings: &[(TypedBinding, Expr)]) -> bool {
 }
 
 /// Whether a `LetRec` group is a transaction group — some binding is guarded by
-/// [`Builtin::GetPrevTxn`] (the `register ↔ commits` cycle). Induction groups guard
+/// [`Builtin::GetPrevTxn`] (the `mutable variable ↔ commits` cycle). Induction groups guard
 /// with `get_prev_seq` instead, so the two shapes never overlap.
 fn is_txn_group(bindings: &[(TypedBinding, Expr)]) -> bool {
     bindings
@@ -323,7 +323,9 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
         .into_iter()
         .map(|e| match e.node {
             TypedExprNode::Var(n) => n,
-            _ => panic!("letrec recognition: write_targets element is not a register key var"),
+            _ => panic!(
+                "letrec recognition: write_targets element is not a mutable variable key var"
+            ),
         })
         .collect();
 
@@ -368,7 +370,9 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
         .map(|e| match e.node {
             TypedExprNode::Compose(elts) => match elts.last().map(|x| &x.node) {
                 Some(TypedExprNode::Var(n)) => n.clone(),
-                _ => panic!("letrec recognition: snapshot read does not end in a register key var"),
+                _ => panic!(
+                    "letrec recognition: snapshot read does not end in a mutable variable key var"
+                ),
             },
             _ => panic!("letrec recognition: snapshot read is not `__t ≫ reg_k`"),
         })
@@ -382,7 +386,7 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
     }
 }
 
-/// The register-record tap field a tap binding `commits_j ≫ .decision ≫ .field`
+/// The variable-record tap field a tap binding `commits_j ≫ .decision ≫ .field`
 /// projects — its trailing field projection.
 fn tap_field(def: &Expr) -> String {
     let TypedExprNode::Compose(elts) = &def.node else {
@@ -400,13 +404,13 @@ fn tap_field(def: &Expr) -> String {
 /// key (its `init` off the guard\'s default slot), one **commit-record** per
 /// `with begin():` site ([`recover_writer`] — writer body verbatim), one
 /// **tap** per in-block feed. A read of a history / tap binding in the
-/// continuation becomes a register-record projection `__reg.field`.
+/// continuation becomes a variable-record projection `__reg.field`.
 fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr {
     let mut keys: Vec<TransactKey> = Vec::new();
-    // Key history-binding name → value type (for the register record + read types).
+    // Key history-binding name → value type (for the mutable variable record + read types).
     let mut key_ty: Vec<(Name, Type)> = Vec::new();
     let mut writers: Vec<WriterSite> = Vec::new();
-    // Tap binding name → (register-record field, value type).
+    // Tap binding name → (variable-record field, value type).
     let mut taps: Vec<(Name, String, Type)> = Vec::new();
     // Every binding name, to assert the continuation has no dangling references.
     let mut binding_names: Vec<Name> = Vec::with_capacity(bindings.len());
@@ -430,9 +434,9 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 writers.push(recover_writer(&site_dom, def));
             }
             TxnBinding::Tap => {
-                // The tap's register field keeps the binding's own site-domained
+                // The tap's mutable variable field keeps the binding's own site-domained
                 // stream type (𝐼 ⇒ V): the channel union channelize already
-                // assembled references the taps at that type, and the register
+                // assembled references the taps at that type, and the mutable variable
                 // registration resolves the branch regardless of the field's
                 // domain.
                 taps.push((b.name.clone(), tap_field(&def), b.ty.clone()));
@@ -440,8 +444,8 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         }
     }
 
-    // Register record `{key.field_key(): Fun(Txn, V), …, to_<defer>: Fun(Txn, V)}`
-    // — register keys (key order) then tap virtual keys (feed order), the exact
+    // Variable record `{key.field_key(): Fun(Txn, V), …, to_<defer>: Fun(Txn, V)}`
+    // — mutable variable keys (key order) then tap virtual keys (feed order), the exact
     // field order op-conversion\'s `emit_transact`/`build_commit_store` produce.
     let mut reg_field_tys: Vec<(String, Type)> = key_ty
         .iter()
@@ -460,7 +464,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     transact.ty = reg_ty.clone();
 
     // Continuation reads: each history / tap binding reference is a
-    // register-record projection `__reg.field : Fun(Txn, V)`.
+    // variable-record projection `__reg.field : Fun(Txn, V)`.
     let mut read_map: HashMap<Name, (String, Type)> = HashMap::new();
     for (n, v) in &key_ty {
         read_map.insert(n.clone(), (n.field_key(), Type::fun(Type::Txn, v.clone())));
@@ -486,7 +490,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
 }
 
 /// Rewrite every history / tap binding reference in the continuation to a
-/// register-record projection `__reg.field`, then drop the letrec (its bindings
+/// variable-record projection `__reg.field`, then drop the letrec (its bindings
 /// are now carried by the `Transact`). Mirrors [`rewrite_hist_reads`].
 fn rewrite_txn_reads(
     e: &mut Expr,
@@ -503,12 +507,12 @@ fn rewrite_txn_reads(
     e.walk_children_mut(|c| rewrite_txn_reads(c, reg, reg_ty, read_map));
 }
 
-/// Collapse a multi-register live read\'s snapshot source: the pre-elim
+/// Collapse a multi-variable live read\'s snapshot source: the pre-elim
 /// live-read rewrite emits `as_of((trigger, (f_a: ⟨a-hist⟩, f_b: ⟨b-hist⟩)))`
-/// with a *record literal* of history reads (the register record does not exist
+/// with a *record literal* of history reads (the mutable variable record does not exist
 /// yet). After [`rewrite_txn_reads`] every field is `__reg.f`; replace the
-/// literal with the register variable itself, so op-conversion latches ONE
-/// whole-register snapshot per request (§I-c atomicity) instead of per-field
+/// literal with the mutable variable itself, so op-conversion latches ONE
+/// whole-variable snapshot per request (§I-c atomicity) instead of per-field
 /// reads.
 fn collapse_snapshot_sources(e: &mut Expr, reg: &Name, reg_ty: &Type) {
     if let TypedExprNode::Apply { argument, function } = &mut e.node
@@ -523,7 +527,7 @@ fn collapse_snapshot_sources(e: &mut Expr, reg: &Name, reg_ty: &Type) {
                         && matches!(&proj.node, TypedExprNode::Proj(ProjKey::Field(pf)) if pf == f))
         })
     {
-        // Stamp the source with the register's *own* type (all keys + taps), not
+        // Stamp the source with the mutable variable's *own* type (all keys + taps), not
         // just the read subset — the `Var(__reg)` must agree with its binder,
         // and op-conversion's snapshot read projects the fields it needs by name.
         *source = tvar(reg, reg_ty.clone());
@@ -549,7 +553,7 @@ fn collapse_snapshot_sources(e: &mut Expr, reg: &Name, reg_ty: &Type) {
 /// The writer `body` is lifted verbatim; keys\' inits come off the guard\'s
 /// defaults tuple; the source off the snapshot\'s trailing slot. Reads of
 /// `__hist` in the letrec body (`__hist ≫ .writes ≫ .i` extracts and
-/// `__hist ≫ .to_<feed>` taps) become register-record projections.
+/// `__hist ≫ .to_<feed>` taps) become variable-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let (domain_ty, decision_ty) = fun_parts(&h.ty);
     // The decision codomain is the variant `` {`commit{𝑃} | `abort} ``; the feed taps
@@ -598,7 +602,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         })
         .collect();
 
-    // One register key per accumulator. Names are fresh labels: every read is
+    // One mutable variable key per accumulator. Names are fresh labels: every read is
     // positional (`__hist ≫ .writes ≫ .i`), so only field order is
     // load-bearing.
     let keys: Vec<TransactKey> = inits
@@ -660,7 +664,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     Expr::let_in(binding(reg, reg_ty), transact, body)
 }
 
-/// `__reg.field = Apply(Var(__reg), Proj(Field(field)))` — a register-record
+/// `__reg.field = Apply(Var(__reg), Proj(Field(field)))` — a variable-record
 /// projection reading key `field`\'s history `Fun(D, V)`.
 fn reg_field_read(reg: &Name, reg_ty: &Type, field: String, field_ty: Type) -> Expr {
     let mut proj = Expr::proj_field(field);
@@ -670,7 +674,7 @@ fn reg_field_read(reg: &Name, reg_ty: &Type, field: String, field_ty: Type) -> E
     app
 }
 
-/// Rewrite every `__hist` view in the letrec body to a register-record
+/// Rewrite every `__hist` view in the letrec body to a variable-record
 /// projection `__reg.field`. The phase builds accumulator reads as the flat
 /// compose `__hist ≫ .writes ≫ .i` and feed reads as `__hist ≫ .to_<feed>`;
 /// downstream normalization may extend those composes (`__hist ≫ .to ≫ f`),
@@ -709,7 +713,7 @@ fn rewrite_hist_reads(
                 }
                 (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
                     // A tap read ``__hist ≫ variant_project(`commit) ≫ .to_<feed>``:
-                    // its stream type is the register record\'s field type.
+                    // its stream type is the mutable variable record\'s field type.
                     let field = f.clone();
                     let field_ty = reg_ty_field(reg_ty, &field);
                     Some((reg_field_read(reg, reg_ty, field, field_ty), 3))
@@ -735,14 +739,16 @@ fn rewrite_hist_reads(
     e.walk_children_mut(|c| rewrite_hist_reads(c, h, reg, reg_ty, keys, acc_tys, domain_ty));
 }
 
-/// The declared type of `field` on the register record.
+/// The declared type of `field` on the mutable variable record.
 fn reg_ty_field(reg_ty: &Type, field: &str) -> Type {
     let Type::Record(fs) = reg_ty else {
         panic!("letrec recognition: reg type is not a record");
     };
     fs.iter()
         .find(|(n, _)| n == field)
-        .unwrap_or_else(|| panic!("letrec recognition: register record lacks field `{field}`"))
+        .unwrap_or_else(|| {
+            panic!("letrec recognition: mutable variable record lacks field `{field}`")
+        })
         .1
         .clone()
 }

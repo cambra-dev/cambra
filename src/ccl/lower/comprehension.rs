@@ -84,8 +84,8 @@ pub(super) fn lower_list_comp(
 
     // ---- Phase 2: Lower body and all predicates to CCL -------------------------
     // The generator variables are in scope over the element and guards — shadow
-    // them so a body/guard read of a like-named transactional register is read
-    // as the comprehension local, not gated as an out-of-block register read
+    // them so a body/guard read of a like-named transactional mutable variable is read
+    // as the comprehension local, not gated as an out-of-block mutable variable read
     // (`[x for x in xs]`).
     let chl_preds: Vec<&Spanned<ChlExpr>> = generators
         .iter()

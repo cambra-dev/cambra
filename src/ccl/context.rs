@@ -898,7 +898,7 @@ pub fn compile_program(
     })?;
 
     // Transactional slice of the unified phase: rewrite every `with begin():`
-    // writer of a `Mut(_, Txn)` register into a `get_prev_txn`-guarded `LetRec`
+    // writer of a `Mut(_, Txn)` mutable variable into a `get_prev_txn`-guarded `LetRec`
     // (histories + commit records over the commit domain), which
     // `planning::plan_loops` destructures into the `Transact{…, Txn}` node
     // op-conversion compiles to the commit engine — unifying the transaction and
@@ -906,30 +906,30 @@ pub fn compile_program(
     // `mut_elim` so the induction phase never sees a transaction loop. See
     // src/ccl/design/mutability.md.
     //
-    // Register-ness is the `Mut(_, Txn)` type; register identity is the α-unique
+    // Being a transactional variable is the `Mut(_, Txn)` type; identity is the α-unique
     // binder `Name`. Both are read off the *inlined, typed* tree — so a
-    // cross-function writer's registers (its `transfer(a, b)` writes already
+    // cross-function writer's mutable variables (its `transfer(a, b)` writes already
     // beta-reduced to name `a`/`b`) are seen, and an unrelated local merely spelled
-    // like a register is not (its binder is a distinct `Name`). This replaces the
+    // like a mutable variable is not (its binder is a distinct `Name`). This replaces the
     // lowering-time base-name registry.
-    let txn_registers = transact_phase::collect_txn_registers(&expr);
+    let txn_mut_vars = transact_phase::collect_txn_mut_vars(&expr);
     // A transactional writer reaching a `with begin():` block via a function call
     // is a nested transaction — the callee's inlined `For` would otherwise be
     // silently absorbed into the outer block's read-your-writes env, dropping its
     // commit. Reject it before the phase strips the sites.
-    transact_phase::check_no_nested_transactions(&expr, &txn_registers)
+    transact_phase::check_no_nested_transactions(&expr, &txn_mut_vars)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    // An induction accumulator written inside a block with no register write is a
+    // An induction accumulator written inside a block with no mutable variable write is a
     // no-atomicity transaction — rejected here (type-aware), not at lowering.
-    transact_phase::check_no_induction_only_transactions(&expr, &txn_registers)
+    transact_phase::check_no_induction_only_transactions(&expr, &txn_mut_vars)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     // A *guarded* induction write inside a committing block (`balance := …; if p:
     // cnt += 1`) is not liftable and would be silently dropped from the decision
     // record — reject it before the phase runs (a debug-only assert would miss it
     // in release).
-    transact_phase::check_no_guarded_induction_write_in_block(&expr, &txn_registers)
+    transact_phase::check_no_guarded_induction_write_in_block(&expr, &txn_mut_vars)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    expr = transact_phase::run(expr, &txn_registers);
+    expr = transact_phase::run(expr, &txn_mut_vars);
     debug!("Transact phase CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).expect("transact phase produced an inconsistent tree");
 
@@ -965,7 +965,7 @@ pub fn compile_program(
     // comment on `post_desugar_ir`.
     let post_desugar_ir = desugared.clone();
 
-    // Fed-out register reads: rewrite a read-only reply that reads a register out of
+    // Fed-out mutable variable reads: rewrite a read-only reply that reads a mutable variable out of
     // its block into an outer-indexed as-of join (an as-of read at the reading
     // transaction's arbitrary commit position), *before* lambda elimination — so a
     // computed reply (`resp << balance + 1`) stays a lambda the elim pass point-frees,

@@ -1,17 +1,17 @@
 //! Lowering of `with begin():` transaction blocks — standalone and as a loop
 //! body — to the direct-mirror `For`/`MutWrite` shape `transact_phase` folds
-//! into one shared commit register.
+//! into one shared commit mutable variable.
 //!
 //! A transaction is lowered exactly like an induction mutation loop
 //! (`ExprStmt(For{target, iter, block}, continuation)`); the *only* structural
 //! difference is that its `MutWrite`s target `Mut(V, Txn)` stores, which
-//! `transact_phase` recognizes (by the register's registered base name) and routes
+//! `transact_phase` recognizes (by the mutable variable's registered base name) and routes
 //! to the commit engine rather than the induction `Recurse`. A standalone
 //! transaction is one commit over a synthesized singleton source. Writes and
-//! reads inside the block run with `in_tx_body = true`, so a bare register read is
-//! a snapshot (a bare register read *outside* a block is the rejected out-of-block
+//! reads inside the block run with `in_tx_body = true`, so a bare mutable variable read is
+//! a snapshot (a bare mutable variable read *outside* a block is the rejected out-of-block
 //! read) and an assignment is a write; a nested `with begin():` is rejected. A
-//! read fed out of a block that does not write that register is a live as-of read;
+//! read fed out of a block that does not write that mutable variable is a live as-of read;
 //! trailing sibling `<<` feeds are request-indexed replies (see
 //! `lower_transaction_loop`).
 
@@ -59,7 +59,7 @@ fn validate_begin_context(context: &Spanned<ChlExpr>) -> Result<(), LoweringErro
 /// Lower a `with begin(): <block>` statement to its per-transaction block chain
 /// — the body of a [`TypedExprNode::Begin`] marker. Validates the `begin()`
 /// context and rejects the handle form (nested `with` is rejected inside
-/// [`lower_tx_block`]). The block is lowered with `in_tx_body = true` (bare register
+/// [`lower_tx_block`]). The block is lowered with `in_tx_body = true` (bare mutable variable
 /// reads are snapshots).
 ///
 /// The caller wraps the returned chain in `Expr::begin(..)` and places it as one
@@ -127,7 +127,7 @@ fn for_over(iter_var: String, source: Expr, block: Expr) -> Expr {
 
 /// Lower a `with begin():` block body to a per-transaction statement chain
 /// ending in `Unit` — the `For` body `transact_phase` reads to build the writer
-/// decision. Runs with `in_tx_body = true` (bare register reads are snapshots).
+/// decision. Runs with `in_tx_body = true` (bare mutable variable reads are snapshots).
 fn lower_tx_block(
     stmts: &[Spanned<ChlStmt>],
     span: Span,
@@ -144,8 +144,8 @@ fn lower_tx_block(
     ctx.in_tx_body = false;
     let block = result?;
     // A transaction must *do* something observable: either write a transactional
-    // register (a committing transaction — a commit-record footprint) or feed a read
-    // (`out << balance`), a read-only transaction whose fed register read is a live
+    // mutable variable (a committing transaction — a commit-record footprint) or feed a read
+    // (`out << balance`), a read-only transaction whose fed mutable variable read is a live
     // as-of read indexed by the enclosing loop. A block that does neither has no
     // footprint at all (its local `let`s are discarded), so reject it — a truly
     // empty transaction is a program error, not a no-op to silently drop.
@@ -160,20 +160,20 @@ fn lower_tx_block(
 }
 
 /// Whether the lowered block chain contains a `MutWrite` (i.e. writes a
-/// transactional register — `write_or_let` emits `MutWrite` only for those).
+/// transactional mutable variable — `write_or_let` emits `MutWrite` only for those).
 fn contains_mut_write(e: &Expr) -> bool {
     matches!(e.node, TypedExprNode::MutWrite { .. }) || e.any_child(contains_mut_write)
 }
 
 /// Whether the lowered block chain contains a `Feed` (`out << e`) — the
-/// footprint of a read-only transaction, whose fed register read is a live as-of
+/// footprint of a read-only transaction, whose fed mutable variable read is a live as-of
 /// read.
 fn contains_feed(e: &Expr) -> bool {
     matches!(e.node, TypedExprNode::Feed { .. }) || e.any_child(contains_feed)
 }
 
 /// Build the block's statement chain right-to-left. Assignments to
-/// transactional registers become `MutWrite` markers (reads stay bare `Var`
+/// transactional mutable variables become `MutWrite` markers (reads stay bare `Var`
 /// snapshots); `if cond:` guards become `Case` (the no-else deny branch); other
 /// assignments are per-iteration `Let`s.
 ///
@@ -199,9 +199,10 @@ fn lower_tx_block_inner(
     let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), block_span, "lower.txn_unit");
     for stmt in stmts.iter().rev() {
         chain = match &stmt.node {
-            // `balance := value` — the transactional register write. `:=` is the
-            // sole register-write operator; `write_or_let` gates it (a register
-            // write commits; a non-register `:=` is a per-transaction local `let`).
+            // `balance := value` — the transactional mutable variable write. `:=` is the
+            // sole variable-write operator; `write_or_let` gates it (a write to a
+            // mutable variable commits; a `:=` to anything else is a
+            // per-transaction local `let`).
             ChlStmt::MutAssign { target, value, .. } => {
                 let name = extract_name_target(target, "mutable assignment")?;
                 let val = lower_expr(value, ctx)?;
@@ -214,16 +215,16 @@ fn lower_tx_block_inner(
                 write_or_let(name, val, chain, stmt.span, ctx)?
             }
             // `x = value` — a plain immutable binding: a per-transaction local
-            // `let`. `=` never writes a register; a plain `=` to a register would be
+            // `let`. `=` never writes a mutable variable; a plain `=` to a mutable variable would be
             // a silent no-op shadow that dies at block end, so reject it and point
-            // at `:=`. (A genuine local shadowing the register's name is fine.)
+            // at `:=`. (A genuine local shadowing the mutable variable's name is fine.)
             ChlStmt::Assign { target, value } => {
                 let name = extract_name_target(target, "assignment")?;
-                if !ctx.is_shadowed(&name) && ctx.is_transactional_register(&name) {
+                if !ctx.is_shadowed(&name) && ctx.is_transactional_mut_var(&name) {
                     return Err(LoweringError::unsupported(
                         stmt.span,
                         format!(
-                            "write register `{name}` inside a `with begin():` block with `:=` \
+                            "write mutable variable `{name}` inside a `with begin():` block with `:=` \
                              (`=` binds immutably — a plain `=` here is a no-op shadow)"
                         ),
                     ));
@@ -241,10 +242,10 @@ fn lower_tx_block_inner(
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
             // `out << e` inside the block — a per-commit feed. Its value reads
-            // the read-your-writes snapshot at this point (a bare register read
+            // the read-your-writes snapshot at this point (a bare mutable variable read
             // resolves to the just-written value); `transact_phase` collects it
             // as a `to_<defer>` tap on the writer decision and hoists a
-            // `Feed(defer, __reg ▷ .to_<defer>)` into the register body, so each
+            // `Feed(defer, __reg ▷ .to_<defer>)` into the mutable variable body, so each
             // emission carries *its own* commit's value. Mirrors the induction
             // phase's in-loop feeds (see `src/ccl/mut_elim.rs`).
             ChlStmt::Expr(value) if matches!(&value.node, ChlExpr::Feed { .. }) => {
@@ -273,9 +274,10 @@ fn lower_tx_block_inner(
 /// name shadowed by an inner binder is a genuine local → a per-transaction
 /// `Let`). Mutability carries no lowering registry, so the target is *not*
 /// classified here: `transact_phase` reads the `Mut(…)` type and routes each
-/// write — a transactional register joins the atomic commit decision; an
+/// write — a transactional mutable variable joins the atomic commit decision; an
 /// induction accumulator is lifted onto the enclosing loop as its own recurrence
-/// (the two run on independent domains). A write to a genuine non-register surfaces
+/// (the two run on independent domains). A write to something that is not a
+/// mutable variable surfaces
 /// post-inference (`check_mut_write_targets`), not here.
 fn write_or_let(
     name: String,

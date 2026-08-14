@@ -28,7 +28,7 @@ elsewhere; both break referential transparency). The two forms differ only in th
 So there is one idea — *surface-impure histories* `𝐷 ⇒ 𝑉`, eliminated into pure dataflow — in
 two merge laws. This distinction is the through-line of the whole document: it is what the
 `HistoryKind` marker (`Overwrite` / `Append`) encodes in the type, why the two disciplines
-differ (a last-write-wins register needs a resolvable writer; an append merge is commutative
+differ (a last-write-wins mutable variable needs a resolvable writer; an append merge is commutative
 and safe to alias), and why the eliminator has two halves.
 
 This rests on the existing extent-vs-tiling correspondence
@@ -89,7 +89,7 @@ lets a feed be a plain output rather than a cyclic binding.)
 ## Surface language
 
 The surface syntax and the behaviour a programmer observes — `:=` mutation, `with begin():`
-transactions, the read rules (read-your-writes, the trailing induction read, the `Txn`-register
+transactions, the read rules (read-your-writes, the trailing induction read, the `Txn`
 block-read rule and as-of reads), feeds as the append-law sibling of mutation, `await_final`, and the
 ordering-and-concurrency contract — are specified in the
 [CHL spec, "Mutability, transactions, and feeds"](../../../docs/chl-spec.md#8-mutability-transactions-and-feeds).
@@ -100,12 +100,12 @@ everything below is how that contract is met.
 Two surface facts are load-bearing for the realization and worth restating here:
 
 - **`:=` introduces and writes; `Txn` is never inferred.** A mutable variable is made by the `:=`
-  operator, not the annotation; a transactional register must be spelled `x: Mut(𝑉, Txn) := …`
+  operator, not the annotation; a transactional mutable variable must be spelled `x: Mut(𝑉, Txn) := …`
   (`Txn` never arises by inference). Type application is parenthesised at both the surface and the
   CCL `Display` level, so `Mut(𝑉, 𝐷)` renders the same way throughout this document and in the
   language.
-- **A `Txn` register is read only inside a `with begin():` block, and a fed-out read is an as-of
-  sample** (compiled to `AsOf`); the sole terminal register read is `await_final`, designed but not
+- **A `Txn` mutable variable is read only inside a `with begin():` block, and a fed-out read is an as-of
+  sample** (compiled to `AsOf`); the sole terminal mutable variable read is `await_final`, designed but not
   built. These two facts drive the
   [live-read rewrite](#replies-live-cross-endpoint-reads-and-commit-ordered-taps) and the
   [`AsOf` engine](#the-runtime-engines) below.
@@ -115,7 +115,7 @@ Two surface facts are load-bearing for the realization and worth restating here:
 > commit order the runtime picks; a program may not assume one transaction serializes before
 > another, and nothing in the compiler or engine should impose such an order. The arbitrary-position
 > fed-out read above is the direct consequence, **not a defect**: a trailing `with begin(): out <<
-> balance` after a loop whose first iteration *denies* may observe the register before the first commit
+> balance` after a loop whose first iteration *denies* may observe the mutable variable before the first commit
 > lands (its singleton read samples an early position). The only ways a `Txn` value interacts with
 > the world are: read/written **inside** a `with begin():` (rejected outside one — as a feed RHS or
 > anywhere else), or observed as a *definite* committed value through the **future `await_final`** —
@@ -147,7 +147,7 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
 - `Begin { body }` — one `with begin():` transaction block, made a *single* `Unit`-valued statement
   (`ExprStmt(Begin{block}, rest)`) so a loop body may freely mix a per-iteration transaction, sibling
   induction writes, and feeds. `body` is the per-transaction statement chain. The transaction phase
-  strips it: a block writing a `Mut(_, Txn)` register becomes a commit site (partitioned by register
+  strips it: a block writing a `Mut(_, Txn)` mutable variable becomes a commit site (partitioned by mutable variable
   domain — induction writes lifted onto the enclosing loop); a read-only block is unwrapped onto the
   loop spine. A standalone block lowers to a singleton `For` wrapping a `Begin`.
 - `Feed { name, value }` / `Defer` — a `<<` feed and its channel. These survive into inference (so
@@ -190,7 +190,7 @@ Everything mutability-dependent is then a post-inference decision on the `Type::
    writes a `Mut` variable bound outside the loop is an accumulator recurrence; any other `For` (only
    feeds/yields, or writes to loop-local mutable variables) is a plain map — rebuilt as the
    `Compose([iter, λ target → body])` generator shape. Transactional-context checks (a `Txn`
-   register written outside `with begin():`, an induction accumulator written inside one) are likewise
+   mutable variable written outside `with begin():`, an induction accumulator written inside one) are likewise
    post-inference, dispatching on `Mut`'s domain.
 
 The payoff: lowering has one loop path and one write path, no `is_mutable`/`with_shadowed`
@@ -228,10 +228,18 @@ Typing:
   parameter) receives the handle. After inlining, no `Mut`-expecting positions remain, so the
   phase's rewrite is purely structural — every surviving `Mut`-typed occurrence is a write target
   or a read, decided by context.
+- **A read derefs the constraint, not the node.** The deref decides what an operand is
+  *constrained against*; the operand's own type slot keeps `Mut(𝑉, 𝐷)`, because that stamp is
+  how the phase finds the read in the first place. So the parameter a mutable variable was passed to
+  holds 𝑉 while the argument node holds the handle, and a later pass comparing the two is
+  comparing types at different levels unless it reads through the handle itself. `inline`'s
+  refinement-entailment check is where that bites: an unwritten mutable variable's value type is still
+  its seed's singleton, so a parameter left to inference acquires a refinement — one the
+  argument does establish, but of the value it denotes rather than of the handle.
 - A parameter `Mut(Int)` means `Mut(Int, _)`; the domain instantiates per call site through the
   let-generalization of UDF bindings. Whether a write site requires `Txn` is the phase's structural
   check, post-inline — so one `bump` can serve an induction accumulator and a transactional
-  register.
+  mutable variable.
 
 #### No aliasing: `Mut` values are second-class (downward-only)
 
@@ -240,7 +248,7 @@ introduction every write targets. The discipline:
 
 1. A `Mut`-typed expression must be a **bare variable reference** — an argument to a `Mut`
    parameter is a variable, never a conditional or computed expression. The two halves catch
-   different things, because a *conditional* over two registers is not itself `Mut`-typed: a
+   different things, because a *conditional* over two mutable variables is not itself `Mut`-typed: a
    mutable read derefs into the arms' join exactly as it derefs into a tuple element (see *Reads
    are implicit derefs* above), so `x if c else y` reads their values and types as a plain `V`.
    What the rule is protecting is the write capability travelling somewhere its target can't be
@@ -254,16 +262,16 @@ introduction every write targets. The discipline:
 
 One structural check after inference enforces all three. The real fault line is the **merge law**,
 not `Feed`-vs-`Mut`. *Append-only* mutability merges commutatively — a feed by `++`, and (at
-runtime) a `Txn` register by the commit operator's timestamped merge — so multiple writers are
+runtime) a `Txn` mutable variable by the commit operator's timestamped merge — so multiple writers are
 already the semantics and aliasing is benign; that is why `Feed` deliberately stays first-class (it
 is returned in `http_serve`'s tuple). *Last-write-wins* mutability instead needs a **resolvable
 writer set** — but that requirement is fundamental only for an **induction** accumulator, which
-compiles to a single-writer `InductionStore` changelog. A `Txn` register already tolerates an open writer set (its
+compiles to a single-writer `InductionStore` changelog. A `Txn` mutable variable already tolerates an open writer set (its
 sites merge their commit streams by time), so applying the uniform second-class discipline to it is
 a conservative stopgap, not a necessity. (Future work splits the same way: the induction aliasing
 rule is a blunt approximation of **affine typing** — a use-at-most-once handle keeps the writer
 unique by construction while lifting downward-only — and first-class `Txn` needs only a runtime
-register key into the already-keyed MVCC store, not the full sigma/index-types generality.)
+mutable variable key into the already-keyed MVCC store, not the full sigma/index-types generality.)
 
 `Mut`-parameter functions must reach their call sites, so they must be inlineable — the stance the
 pipeline already takes for writers and `Feed`-mediating UDFs. (When general recursion lands,
@@ -324,7 +332,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⇒ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⇒ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
-| `final_or_default` | `(𝐷 ⇒ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractFinal`). Applied to a `Txn` register only through the surface [`await_final`](#await_final) primitive (designed, not yet built); a bare fed-out register read never becomes one |
+| `final_or_default` | `(𝐷 ⇒ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractFinal`). Applied to a `Txn` mutable variable only through the surface [`await_final`](#await_final) primitive (designed, not yet built); a bare fed-out mutable variable read never becomes one |
 
 `begin()` never reaches CCL — lowering records the block structure, and the phase mints one
 `begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order (which is what
@@ -343,7 +351,7 @@ searches the `⧺`-union of its writing sites' per-key views
 admits (pointwise maps and unions of causal streams change *what* is read per position, never
 *which* positions the accessor consults).
 
-### Tagged sums in a decision, and in a register
+### Tagged sums in a decision, and in a mutable variable
 
 A decision is a **choice**, and the two things it chooses between carry different data: a grant
 carries a write set, a denial carries nothing. Today that is encoded as a record with a `commit:
@@ -367,9 +375,10 @@ What exists today is the algebra that shape needs, in both directions:
 
 Both are specified in [design-operators.md](../../interpreter/design-operators.md#tile-operators) (the `VariantWrap` and `VariantProject` rows).
 
-**A variant-valued register** follows from the same law, and needs nothing register-specific. A
-register's seed and its writes are *alternatives at one position*, exactly as a conditional's arms
-are, so the register's value space is their **join**: a `` `none `` seed with `` `some `` writes is
+**A variant-valued mutable variable** follows from the same law, and needs nothing specific to
+mutable variables. A
+mutable variable's seed and its writes are *alternatives at one position*, exactly as a conditional's arms
+are, so the mutable variable's value space is their **join**: a `` `none `` seed with `` `some `` writes is
 the two-tag sum `` {`none | `some{Int}} `` with the arm that did not occur left empty, and every
 emission is built at that declared space rather than at the width of whichever alternative occurred.
 ``acc := `some(𝑖)`` under a `` `none `` seed, and a conditional write choosing between tags, are both
@@ -458,7 +467,7 @@ Stateless programs never build a letrec — the phase degenerates to plain feed 
 
 ## Worked example
 
-A transactional register and an induction counter shared across two HTTP endpoints:
+A transactional mutable variable and an induction counter shared across two HTTP endpoints:
 
 ```python
 incr_reqs, incr_resps = http_serve("8080", "POST", "/incr")
@@ -483,8 +492,8 @@ Note the mix: `balance` is transactional; `cnt` is a plain induction accumulator
 loop's induction domain, independent of the commit order, so `cnt` does not join `balance` in the
 atomic commit (it is absent from `incr_commits` below). Writing an induction accumulator inside a
 `with begin():` block **is implemented for a bare, top-level write**: the transaction phase partitions
-the block by register domain, lifting each top-level-spine induction `MutWrite` onto the enclosing loop
-as its own recurrence while the register writes form the commit decision. Because the write is lifted
+the block by mutable variable domain, lifting each top-level-spine induction `MutWrite` onto the enclosing loop
+as its own recurrence while the mutable variable writes form the commit decision. Because the write is lifted
 out entirely, block placement is *inert* for it — a bare in-block induction write is **exactly the
 out-of-block form** (it fires once per iteration unconditionally, independent of whether the co-located
 transaction commits). A **guarded** in-block induction write (`if q: cnt += 1`) is a different matter:
@@ -520,14 +529,14 @@ Reading it off:
   transaction lands in the commit order; `balance(𝑡)` reads the snapshot (resolving, via `balance`'s own
   definition, to the latest commit *strictly before* `𝑡` — no self-reference), and `+ 1` is the
   write.
-- **`balance`** — the register's history: at any `𝑡`, the latest earlier commit's write, else the
+- **`balance`** — the mutable variable's history: at any `𝑡`, the latest earlier commit's write, else the
   initializer. The `balance ↔ incr_commits` cycle is well-founded — the trip around it crosses
   `get_prev_txn` once, so position strictly decreases.
 - **`cnt`** — the induction recurrence, self-referential through `get_prev_seq` (causal); its domain is `IncrIdx`, not
   `Txn`, because its annotation said so.
 - **`incr_resps`** — the reply for `𝑟` depends on `incr_commits(𝑟)` (then discards it): the reply is
   sequenced after the commit.
-- **`get_resps`** — the fed-out register read: `read_at_get` picks the GET's *observation time* (a `Txn`
+- **`get_resps`** — the fed-out mutable variable read: `read_at_get` picks the GET's *observation time* (a `Txn`
   position — wherever the read lands in the commit order) and `balance` is sampled there, replied
   indexed by the GET request loop. This is the **same store-level-timestamp mechanism** the `AsOf`
   sections describe as "a sample at an arbitrary observation-time position": the read takes a timestamp
@@ -561,13 +570,13 @@ this section states how the letrec model *delivers* them.
 - **Induction and transaction domains are independent.** In the worked example's model form `cnt`
   advances per request even though its write sits inside the block (a mix the current lowering
   rejects — see the caveat there); only `Txn`-domain variables participate in the atomic commit. A
-  program that needs the counter transactionally consistent with the register declares it
+  program that needs the counter transactionally consistent with the mutable variable declares it
   `Mut(Int, Txn)`.
 - **Liveness.** Induction domains are finite or stream-complete; `Txn` histories complete when all
-  writer sources do. A fed-out `Txn` register read reads as-of its own position in the commit clock
-  and does not wait for completeness. The one term that *does* wait for a register's completeness is
+  writer sources do. A fed-out `Txn` mutable variable read reads as-of its own position in the commit clock
+  and does not wait for completeness. The one term that *does* wait for a mutable variable's completeness is
   [`await_final`](#await_final) (designed, not yet built); it is well-defined precisely because it
-  closes the writer set (the register is unreferenceable afterward, so no later writer can extend the
+  closes the writer set (the mutable variable is unreferenceable afterward, so no later writer can extend the
   history it just declared complete).
 
 ## Ordering and concurrency
@@ -598,7 +607,7 @@ they are effectively engine tests.
 
 **Open / under-specified.** Two genuine model questions remain: the merge order of a feed `++`-union
 across multiple feeders (or several feeds in one body), and the multi-writer commit-stream merge order
-for one register.
+for one mutable variable.
 
 ## Loop planning (`plan_loops`): letrec patterns → the Transact carrier
 
@@ -639,7 +648,7 @@ causal matcher (`letrec::check_letrec_causal`).
   snapshot. Disjoint footprints commit concurrently; overlapping ones serialize. `release` is the
   commit acknowledgment (the retry signal rides the existing producer/consumer channel). The store
   compacts by the MVCC law and GCs the released prefix.
-- **`AsOf`** — the as-of (temporal) join: **every** fed-out `Txn` register read, regardless of the
+- **`AsOf`** — the as-of (temporal) join: **every** fed-out `Txn` mutable variable read, regardless of the
   reading loop's domain. Given a *trigger* (the reading loop — the positions to sample at) and a
   *source* (the store), it latches, for each trigger position, the store's value as of the moment
   that position is first observed. The output is indexed by the **trigger** (the outer reading loop),
@@ -647,9 +656,9 @@ causal matcher (`letrec::check_letrec_causal`).
   correlation id. It is the dual of the induction accumulator: the induction accumulator latches a private accumulator per
   source step; `AsOf` latches the store's current value per trigger step. It is a *sample at
   observation time* — an arbitrary as-of position, which is exactly the read a transaction gets: the
-  store as of where it lands in the commit order. The only terminal/final register read is
+  store as of where it lands in the commit order. The only terminal/final mutable variable read is
   [`await_final`](#await_final) (designed, not yet built): when implemented it is `ExtractFinal` over the
-  key's `StoreValueStream` (the register-carry stream `StoreValueStream` already projects), folding the
+  key's `StoreValueStream` (the carry stream `StoreValueStream` already projects), folding the
   completed commit-value stream to its final value — no new engine, the same `final_or_default →
   ExtractFinal` path the induction final uses, applied for the first time to a `Txn` history. Absent it,
   a standalone read is just the singleton-trigger case of the same `AsOf`; under the batch scheduler it
@@ -657,7 +666,7 @@ causal matcher (`letrec::check_letrec_causal`).
 - **`StoreValueStream`** — projects one key's `CommitTs ⇀ V` commit-value stream by folding the
   store changelog. It backs the **in-block reply tap** (`out << e` inside a block — a per-commit,
   commit-tick-indexed event stream) and is the fold `AsOf` samples. It is *not* reduced by
-  `ExtractFinal` for a register read — that path (a fold-to-completion "final register value") does
+  `ExtractFinal` for a mutable variable read — that path (a fold-to-completion "final mutable variable value") does
   not exist. `ExtractFinal` itself remains, but for the two genuinely-terminating histories that do
   have a final: a post-loop **induction** accumulator, and the **broadcast source** (a sibling
   induction loop's final, broadcast into a commit decision).
@@ -693,7 +702,7 @@ affordable by that complete compile-time knowledge.
   refinement-types work as dependent sums.
 - **Mutable collections** — sigma types (`List[𝑇] = Σ 𝐼 . 𝐼 ⤇ 𝑇`) as letrec bindings; the
   append-only `Appendable` case first, as a commit stream whose history *is* the collection. This
-  is also what first-class `Mut` (returning or storing references) needs: carrying register identity in
+  is also what first-class `Mut` (returning or storing references) needs: carrying mutable variable identity in
   types is a sigma/index-types question. Until then the second-class discipline is the aliasing
   firewall.
 - **History access / auditing** — `get_prev_*` generalized to user-facing reads at explicit
@@ -704,7 +713,7 @@ affordable by that complete compile-time knowledge.
 ## Reading an induction accumulator in a commit decision
 
 A commit decision may read an induction accumulator at its request position
-(`with begin(): balance += cnt` — the register write folds in `cnt(r)`). The intended letrec is the
+(`with begin(): balance += cnt` — the mutable variable write folds in `cnt(r)`). The intended letrec is the
 [worked example](#worked-example)'s: `𝑐𝑛𝑡` (induction, `IncrIdx`) and `balance`/`incr_commits`
 (transaction, `Txn`) mutually in scope, so `incr_commits(𝑟)` reads `𝑐𝑛𝑡(𝑟)`.
 
@@ -720,7 +729,7 @@ verbatim (a `zip` is opaque to its shape parser), so no recognition change is ne
 
 **Engine — co-iterating the accumulator with the loop source.** Two small changes carry it:
 
-- *`zip` conversion.* A register-read arm of a `zip` (`__cnt.acc`) is a **leaf** source over its own
+- *`zip` conversion.* An arm of a `zip` that reads a mutable variable (`__cnt.acc`) is a **leaf** source over its own
   domain, not an iteration-driven morphism. The generic `zip` path converts such an arm with *no*
   input (rather than fanning the shared iteration input into it, which it would reject); `fan_in`
   then co-aligns the leaf accumulator stream with the input-driven request stream by domain position.
@@ -756,37 +765,37 @@ its decision body is not ready, it re-arms itself on the scheduler's **deferred-
 reuses it (a re-push would duplicate a buffer position against the body's `Memo`). Each demand-driven
 re-pull advances the sibling loop one step until the decision is ready — no blocking loop inside
 `get`, and it composes with an async sibling source (the source's own notification drives the
-re-pulls). A fed-out read *of* the result register is an `AsOf` (an in-block reply tap, or a trailing
+re-pulls). A fed-out read *of* the result mutable variable is an `AsOf` (an in-block reply tap, or a trailing
 standalone read), which demand-drives this convergence: each committed reply pulls the writer, which
 advances the sibling loop, exactly as an in-block reply drives the writer in the co-indexed case. The
 co-indexed and non-cross paths are untouched.
 
 (Note the asymmetry: the broadcast **source** — the sibling induction loop's accumulator — *does*
 have a final, read via `ExtractFinal`, because an induction loop terminates and its final value is
-denotable. The result **register** does not: a `Txn` register has no final-value term, so reads of it
+denotable. The result **mutable variable** does not: a `Txn` mutable variable has no final-value term, so reads of it
 are `AsOf`, never `ExtractFinal`.)
 
 ## Replies: live cross-endpoint reads and commit-ordered taps
 
 A `<<` reply takes one of two forms, by where it sits relative to the `with begin():` block.
 
-**As-of read (reply *of* a register, outside the writing block).** A read-only block
-`with begin(): resp << 𝑒` reading a `Txn` register replies the register as of the reading transaction's
+**As-of read (reply *of* a mutable variable, outside the writing block).** A read-only block
+`with begin(): resp << 𝑒` reading a `Txn` mutable variable replies the mutable variable as of the reading transaction's
 position. The pre-lambda-elim `rewrite_live_reads` turns it into an as-of join indexed by the reading
 loop, not the commit clock — uniformly, whether that loop is a live request stream, a finite loop, or
 a standalone singleton (the live cross-endpoint read is one instance, not a distinct compilation).
 Three shapes:
 
-- **one register** — `as_of((trigger, balance.f)) ≫ (λ 𝑘 → 𝑒)` (`resp << balance`, `resp << balance + 1`);
+- **one mutable variable** — `as_of((trigger, balance.f)) ≫ (λ 𝑘 → 𝑒)` (`resp << balance`, `resp << balance + 1`);
 - **several at one snapshot** — `as_of((trigger, {fᵢ: histᵢ})) ≫ (λ snap → 𝑒[𝑘ᵢ ↦ snap.fᵢ])`
-  (`resp << a + b`), one whole-register snapshot per request (§I-c);
-- **request element combined with a register read** — `zip((trigger, as_of((trigger, source)))) ≫ (λ p
-  → 𝑒[req ↦ p.0, 𝑘ᵢ ↦ p.1(.fᵢ)])` (`resp << balance + req`): the request rides alongside its register
+  (`resp << a + b`), one whole-variable snapshot per request (§I-c);
+- **request element combined with a mutable variable read** — `zip((trigger, as_of((trigger, source)))) ≫ (λ p
+  → 𝑒[req ↦ p.0, 𝑘ᵢ ↦ p.1(.fᵢ)])` (`resp << balance + req`): the request rides alongside its mutable variable
   snapshot. The `as_of` arm is a leaf that op-conversion's `zip` co-iterates with the request stream
   (the same `is_leaf_zip_arm` path as the commit-decision read above) — no new operator.
 
 **commit-ordered / commit-gated reply (reply *inside* the writing block).** A `<<` inside the block
-rides the writer decision as a `to_<defer>` tap, committed atomically with the register write and
+rides the writer decision as a `to_<defer>` tap, committed atomically with the mutable variable write and
 read back as a per-commit value-stream (commit-tick-indexed). So it is **sequenced after the commit**
 and **gated**: a denied transaction (`if 𝑝:` false) proposes no write and emits no tap, replying
 nothing. The tap may read an induction accumulator (`resp << cnt`), which composes with the
@@ -956,7 +965,7 @@ its arm does not fire; a read-modify-write already reads the key, and a purely s
 write needs no carry and stays write-only.
 
 **Sharp edge — a leading deny at position 0.** A block that *denies* (matches no writing/feeding
-guard) at the first transaction is fragile: the register's as-of read has no prior committed value to
+guard) at the first transaction is fragile: the mutable variable's as-of read has no prior committed value to
 latch, so a downstream read at position 0 sees the seed rather than a committed value. An `elif`
 chain whose first request falls through to a non-committing branch hits this. It is not yet handled
 generally; tests that exercise elif routing deliberately lead with a committing position. Treat a
@@ -989,27 +998,27 @@ Designed — it binds `t` to the transaction's commit time (see the CHL spec,
 
 ### `await_final`
 
-The **terminal read of a transactional register** — surface, semantics, and the unreferenceable-after
+The **terminal read of a transactional mutable variable** — surface, semantics, and the unreferenceable-after
 rule are specified in the
 [CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final-decided): `await_final(𝑥)` reads a
-`Mut(𝑉, Txn)` register's final committed value once its whole commit history completes, and `𝑥` is
+`Mut(𝑉, Txn)` mutable variable's final committed value once its whole commit history completes, and `𝑥` is
 unreferenceable afterward so the completion event is well-defined. In the [ordering
-model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the register-domain analog of loop
+model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the commit-domain analog of loop
 completion — a **completeness** edge on the `Txn` domain. Designed, not built. This section is the
 intended realization.
 
 **Intended realization (no new engine).** `await_final(𝑥)` lowers to `final_or_default(𝑥.history, init)`
-— the *single* permitted application of `final_or_default` to a `Txn` history (a bare fed-out register
+— the *single* permitted application of `final_or_default` to a `Txn` history (a bare fed-out mutable variable
 read never becomes one; see the CHL spec, [reads](../../../docs/chl-spec.md#83-reads)). It compiles through the existing `final_or_default →
-ExtractFinal` path, with `ExtractFinal` folding the key's `StoreValueStream` — the register-carry
+ExtractFinal` path, with `ExtractFinal` folding the key's `StoreValueStream` — the carry
 (`carry_forward`) commit-value stream `StoreValueStream` already projects — to its final value. Contrast
 the fed-out as-of read, which hands `AsOf` the raw store fan and samples an *arbitrary* position: same
 `StoreValueStream` source, different reducer (fold-to-final vs. sample-at-trigger). No new operator, no
-new runtime node — `await_final` is the first term to reduce a register stream to completion.
+new runtime node — `await_final` is the first term to reduce a mutable variable stream to completion.
 
 **Build sketch** (for whoever implements it): a `"await_final"` arm in `lower_call`
-(`src/ccl/lower/exprs.rs`) emitting the register-final read; the unreferenceable-after rule enforced by
-the scope machinery that already backs the read/write gates (`LoweringContext`'s transactional-register
+(`src/ccl/lower/exprs.rs`) emitting the variable-final read; the unreferenceable-after rule enforced by
+the scope machinery that already backs the read/write gates (`LoweringContext`'s transactional-variable
 set in `src/ccl/lower/mod.rs`) — drop `𝑥` from scope at the await point so a later reference hits the
 existing gate; and the completeness read allowed to survive the live-read rewrite
 (`rewrite_live_reads` in `src/ccl/transact_phase.rs`) rather than being dropped as an unresolved
@@ -1045,7 +1054,7 @@ legitimately restrict the source; each branch's block is a **distinct transactio
 is intact — still one snapshot, one commit, one write-set per transaction. The whole difference is
 "two transactions" vs. "one transaction, two paths".
 
-**Footgun — a register-reading guard is not an atomic check.** These are *not* equivalent:
+**Footgun — a variable-reading guard is not an atomic check.** These are *not* equivalent:
 
 ```text
 if balance > 0: with begin(): balance -= req      # (A) non-atomic pre-check
@@ -1056,5 +1065,5 @@ In (A) `balance > 0` is a **live/as-of read outside the transaction** — a TOCT
 go stale between the read and the commit. It is faithfully compilable (the guard becomes a gating
 live read deciding whether the transaction fires), but it is not an atomic guard, and a user who
 wrote (A) most likely meant (B), the in-block deny guard. This form should at least be documented,
-ideally linted (a register-reading guard on a conditional transaction) with a pointer at (B).
+ideally linted (a variable-reading guard on a conditional transaction) with a pointer at (B).
 

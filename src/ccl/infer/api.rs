@@ -1097,27 +1097,6 @@ fn has_pre_desugar_artifacts(expr: &Expr) -> bool {
 // Second-class `Mut` discipline
 // ---------------------------------------------------------------------------
 
-/// Strip outer [`Type::Refinement`] layers and, if a mutable variable
-/// (a [`HistoryKind::Overwrite`] history) is underneath, return its `(value,
-/// domain)` children.
-///
-/// Only an `Overwrite` history is a `Mut` for the second-class discipline — a
-/// `Feed` history is a feed channel, not a mutable variable, and is transparent
-/// to these rules. Outer refinements are transparent to mutability: a
-/// mutable variable's reference acquired during solving does not change that it *is* a
-/// mutable variable. Returns `None` for any non-mutable type.
-fn peel_mut(ty: &Type) -> Option<(&Type, &Type)> {
-    match ty {
-        Type::History {
-            value,
-            domain,
-            kind: HistoryKind::Overwrite,
-        } => Some((value, domain)),
-        Type::Refinement(inner, _) => peel_mut(inner),
-        _ => None,
-    }
-}
-
 /// Whether a user annotation is a bare inference hole once outer
 /// [`Type::Refinement`] layers are stripped — i.e. `_` (or a refined `_`).
 ///
@@ -1146,10 +1125,10 @@ fn annotation_peels_to_hole(ty: &Type) -> bool {
 /// 1. A `Mut`-typed *value* must be a bare variable reference — no computed
 ///    expression of `Mut` type, and no non-variable argument to a `Mut`
 ///    parameter ([`InferError::MutNotBareVariable`]). A *conditional* over two
-///    registers is not caught by the first clause: a mutable read derefs into
+///    mutable variables is not caught by the first clause: a mutable read derefs into
 ///    the arms' join exactly as it derefs into a tuple element, so the selection
 ///    types as a plain value and there is no `Mut` left on the node. What the
-///    rule is protecting — a selected register reaching a position that writes
+///    rule is protecting — a selected mutable variable reaching a position that writes
 ///    through it — is the second clause, which reads the argument's *node*.
 /// 2. `Mut` may not appear inside any composite type — only at a top-level
 ///    binding/parameter/expression position or a function *domain*
@@ -1173,9 +1152,9 @@ pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// `Mut` — sets it `false`, so a `Mut` seen there is reported.
 ///
 /// A `Refinement` passes `allow_mut` *through* to its base (mirroring
-/// [`peel_mut`]): a refined mutable variable at a legal position stays legal, while a
-/// refined `Mut` buried in a composite is still caught because the enclosing
-/// composite already set `allow_mut = false`.
+/// [`Type::mut_value_type`]): a refined mutable variable at a legal position stays
+/// legal, while a refined `Mut` buried in a composite is still caught because the
+/// enclosing composite already set `allow_mut = false`.
 fn check_no_nested_mut(
     ty: &Type,
     allow_mut: bool,
@@ -1239,7 +1218,7 @@ fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
         None => true,
         Some(ann) => annotation_peels_to_hole(ann),
     };
-    if annotation_is_unspecified && peel_mut(&binding.ty).is_some() {
+    if annotation_is_unspecified && binding.ty.mut_value_type().is_some() {
         errors.push(InferError::UnannotatedMutBinding {
             name: binding.name.base().to_string(),
         });
@@ -1276,7 +1255,9 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
     // Everything else with a `Mut` type computes or selects it (a conditional
     // `Case`, a `Tuple`/`Apply`/`Cast`, …) and is rejected. A `MutWrite`'s
     // target is a `Name`, not a child node, so it never surfaces here.
-    if peel_mut(&expr.ty).is_some() && !forwards_tail && !matches!(expr.node, TypedExprNode::Var(_))
+    if expr.ty.mut_value_type().is_some()
+        && !forwards_tail
+        && !matches!(expr.node, TypedExprNode::Var(_))
     {
         errors.push(InferError::MutNotBareVariable { at: symbolic(expr) });
     }
@@ -1301,13 +1282,13 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
             fn_ty = inner;
         }
         if let Type::Fun { domain, .. } = fn_ty
-            && peel_mut(domain).is_some()
+            && domain.mut_value_type().is_some()
         {
             if !matches!(argument.node, TypedExprNode::Var(_)) {
                 errors.push(InferError::MutNotBareVariable {
                     at: symbolic(argument),
                 });
-            } else if peel_mut(&argument.ty).is_none() {
+            } else if argument.ty.mut_value_type().is_none() {
                 errors.push(InferError::MutArgNotMutable {
                     at: symbolic(argument),
                 });
@@ -1372,8 +1353,8 @@ pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// promises, rather than a silently-accepted write.
 fn binder_is_mut(b: &TypedBinding) -> bool {
     match &b.user_annotation {
-        Some(a) => peel_mut(a).is_some(),
-        None => peel_mut(&b.ty).is_some(),
+        Some(a) => a.mut_value_type().is_some(),
+        None => b.ty.mut_value_type().is_some(),
     }
 }
 

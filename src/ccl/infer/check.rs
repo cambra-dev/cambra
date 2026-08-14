@@ -7,7 +7,7 @@ use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, f
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
-use crate::ccl::{BaseType, Expr, HistoryKind, Level, Name, Type, TypedExprNode};
+use crate::ccl::{BaseType, Expr, Level, Name, Type, TypedExprNode};
 
 use super::emit::{
     emit_aggregate, emit_apply, emit_begin, emit_binop, emit_case, emit_cast,
@@ -16,7 +16,7 @@ use super::emit::{
     emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
-use super::typing::{Typing, peel_refinements_outer};
+use super::typing::Typing;
 use super::{lit_base, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
 
@@ -260,52 +260,38 @@ impl Typing for CheckCtx {
         t: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError> {
-        // Destructure the resolved type directly (no inference vars). Peel any
-        // outer refinements the function picked up during solving,
-        // and — pre-desugar only — read through a transparent handle to the
-        // value it wraps: a defer's `Feed` to its channel, and a `Mut` history to
-        // its value (a `Mut`-typed collection used as a for-loop source derefs
-        // to the collection). Both mirror the solver's transparent-read rule
-        // that Emit applies when it destructures the same position, so Check and
-        // Emit agree at the consistency wall; post-desugar/-erasure trees carry
-        // neither type.
-        let mut peeled = peel_refinements_outer(t);
-        loop {
-            peeled = match peeled {
-                // A `Overwrite` history derefs to its scalar value (a `Mut`-typed
-                // collection used as a for-loop source reads as the collection).
-                Type::History {
-                    value,
-                    kind: HistoryKind::Overwrite,
-                    ..
-                } => peel_refinements_outer(value),
-                _ => break,
-            };
+        // Destructure the resolved type directly (no inference vars), and —
+        // pre-desugar only — read through a transparent handle to the value it
+        // wraps: a `Mut` history to its value (a `Mut`-typed collection used as a
+        // for-loop source derefs to the collection), a defer's `Feed` to its
+        // channel. Both mirror the solver's transparent-read rule that Emit applies
+        // when it destructures the same position, so Check and Emit agree at the
+        // consistency wall; post-desugar/-erasure trees carry neither type.
+        let mut peeled = t.peel_refinements();
+        while let Some(value) = peeled.mut_value_type() {
+            peeled = value.peel_refinements();
         }
-        match peeled {
-            Type::Fun {
-                domain: d,
-                codomain: c,
-                ..
-            } => Ok(((**d).clone(), (**c).clone())),
-            // A `Feed` history reads as its whole stream `domain ⇒ value` — a
-            // defer's channel — so it destructures directly to (domain, value).
-            Type::History {
-                domain,
-                value,
-                kind: HistoryKind::Append,
-            } => Ok(((**domain).clone(), (**value).clone())),
-            _ => {
-                let located = self.raise(InferError::ExpectedFunction {
-                    found: t.clone(),
-                    at: at(),
-                });
-                self.errors.push(located);
-                // Continue with throwaways so the rest of the rule still runs
-                // (Check accumulates every error rather than failing fast).
-                Ok((self.fresh(), self.fresh()))
-            }
+        if let Type::Fun {
+            domain: d,
+            codomain: c,
+            ..
+        } = peeled
+        {
+            return Ok(((**d).clone(), (**c).clone()));
         }
+        // A feed channel reads as its whole stream `domain ⇒ value`, so it
+        // destructures as that arrow.
+        if let Some((domain, value)) = peeled.as_feed() {
+            return Ok((domain.clone(), value.clone()));
+        }
+        let located = self.raise(InferError::ExpectedFunction {
+            found: t.clone(),
+            at: at(),
+        });
+        self.errors.push(located);
+        // Continue with throwaways so the rest of the rule still runs (Check
+        // accumulates every error rather than failing fast).
+        Ok((self.fresh(), self.fresh()))
     }
 
     fn provide_function(
@@ -343,7 +329,7 @@ impl Typing for CheckCtx {
         // Re-run the discharge on the resolved codomain so the reconstructed
         // type matches the recorded (discharged) one. A named Pi discharges its
         // binder to the argument; an ordinary function's codomain is unchanged.
-        let result = match peel_refinements_outer(fn_ty) {
+        let result = match fn_ty.peel_refinements() {
             // Discharge only when the Pi binder is actually free in the
             // codomain's refinement predicates; otherwise the argument clone
             // would feed a no-op substitution.
@@ -508,7 +494,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // recorded on a `__txp.0 + 1`, say). Comparing modulo refinements here would
         // hide exactly that class of bug, and it is the one this check is best placed
         // to catch: every merge point in the pipeline — a `Case`'s arms, a list's
-        // elements, a register's seed and writes, a channel's contributions — joins,
+        // elements, a mutable variable's seed and writes, a channel's contributions — joins,
         // and the wall is what holds them to it.
         ctx.require_sub(&ty, &expr.ty, &|| format!("type of {label}"))?;
     }

@@ -1,4 +1,4 @@
-//! A scalar transactional register shared *live* across endpoints: `POST /set`
+//! A scalar transactional mutable variable shared *live* across endpoints: `POST /set`
 //! overwrites `latest` (`Mut(String, Txn)`, last-write-wins); `GET /get` reads its
 //! current value cross-endpoint. The GET reads `latest` inside a read-only `with
 //! begin():` block that feeds it out — a live as-of read (`Builtin::AsOf`)
@@ -23,7 +23,7 @@ fn http_counter() {
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
-        // Two overwrites, then read: the live register must reflect the *latest*
+        // Two overwrites, then read: the live mutable variable must reflect the *latest*
         // committed value (`bob`) — not the init `(none)`, nor the first write
         // `alice`. Writes precede the read, so it isn't racing cross-endpoint
         // commit visibility.
@@ -67,14 +67,14 @@ fn http_computed_live_read() {
     assert_eq!(got.trim(), "bob!");
 }
 
-/// A *multi-register* live cross-endpoint read: `GET /get` replies `a + b`,
-/// reading **two** live registers in one block. Snapshot consistency (§I-c)
+/// A *multi-variable* live cross-endpoint read: `GET /get` replies `a + b`,
+/// reading **two** live mutable variables in one block. Snapshot consistency (§I-c)
 /// requires both reads to come from one commit snapshot — served by a single
 /// bundled `as_of((trigger, __reg))` folding the whole store at one frontier,
-/// the reply projecting each register off the latched snapshot record. A `POST
-/// /set` writes both registers, so `a + b` reflects the latest committed values.
+/// the reply projecting each mutable variable off the latched snapshot record. A `POST
+/// /set` writes both mutable variables, so `a + b` reflects the latest committed values.
 #[test]
-fn http_multi_register_live_read() {
+fn http_multi_mut_var_live_read() {
     let port = reserve_test_port();
     let source = format!(
         "set_reqs, set_resps = http_serve(\"{port}\", \"POST\", \"/set\")\n\

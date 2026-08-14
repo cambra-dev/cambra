@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bit_set::BitSet;
+use indoc::indoc;
+
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program, render_errors};
 use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use rstest_log::rstest;
@@ -22,6 +24,100 @@ for i in [1, 2, 3]:
     x += i
 x"#,
     Tile::Scalar(ColumnValue::Ints(vec![6]))
+)]
+// A mutable variable seeded from a **computed** expression rather than a literal.
+//
+// Every other case here seeds from a bare literal, which is a weaker exercise of the
+// mutable variable law than it looks: a projection *selects*, so `r.a` carries the field's
+// refinement into the seed, and the mutable variable's value type is right only because the
+// loop's writes join with it. A seed contributes verbatim and the join is the lattice's
+// — the intersection over every contribution — so the refinement drops out here and the
+// mutable variable types as `Mut(Int)`.
+#[case(
+    r#"
+r = (a=0, b=9)
+x := r.a
+for i in [1, 2, 3]:
+    x += i
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![6]))
+)]
+// The same seed with **no writes at all**. The join has one member, so the mutable variable
+// keeps its seed's refinement — and that is correct, since it really does hold that
+// value at every position. Nothing pre-emptively widens it.
+#[case(
+    r#"
+r = (a=7, b=9)
+x := r.a
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![7]))
+)]
+// A mutable variable whose only write goes **through a `Mut` parameter**. The write is not
+// lexically visible at `x`, so the join needs the call itself to contribute: passing a
+// mutable variable to a `Mut(V)` parameter means the callee may write any `V` there.
+//
+// Without that contribution the mutable variable's value type was left claiming its seed
+// (`{Int | __elem == 0}`) while the parameter demanded `Mut(Int)`, and since `Mut` is
+// invariant the call was rejected outright. The ordinary application edges cannot supply
+// it — `apply` records `arg <: d` against a *fresh variable*, so a `Mut` argument meets
+// an `Infer` and takes the deliberate deref arm, which is right for a bare read
+// (`cnt + 1`) and drops the handle here.
+#[case(
+    r#"
+def fw(c: Mut(Int)):
+  c += 1
+x := 0
+for i in [1, 2, 3]:
+  fw(x)
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![3]))
+)]
+// The same contribution at an argument position that is **not the first**. A call is
+// curried, and `apply` types each application as a fresh variable, so the type of the
+// function being applied says nothing about this parameter — the contribution has to
+// come off the head of the spine (`parameter_type`). Reading it off the applied type
+// instead covers `fw(x, n)` and silently skips this, which then fails the invariance
+// check against `Mut(Int)` because the mutable variable still claims its seed.
+#[case(
+    r#"
+def fw(n: Int, c: Mut(Int)):
+  c += n
+x := 0
+for i in [1, 2, 3]:
+  fw(2, x)
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![6]))
+)]
+// Two mutable variables in one call: every argument position is walked, not just one.
+#[case(
+    r#"
+def fw(a: Mut(Int), b: Mut(Int)):
+  a += 1
+  b += 2
+x := 0
+y := 0
+for i in [1, 2, 3]:
+  fw(x, y)
+(x, y)"#,
+    Tile::Record(HashMap::from([
+        ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
+    ]))
+)]
+// A mutable variable reaching its writer through *two* calls. The inner call's contribution is
+// `Mut(Int)`'s value against the outer parameter's, so the mutable variable's join closes over
+// the whole forwarding chain rather than just the frame it was named in.
+#[case(
+    r#"
+def inner(c: Mut(Int)):
+  c += 1
+def outer(n: Int, c: Mut(Int)):
+  inner(c)
+x := 0
+for i in [1, 2, 3]:
+  outer(7, x)
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![3]))
 )]
 // The `:=` operator marks mutability syntactically — a bare `x := 0` induction
 // accumulator (no `Mut(…)` annotation) written with `x := x + i`.
@@ -460,9 +556,32 @@ fn expect_compile_error(code: &str, needle: &str) {
 
 /// A `+=` (or `:=` write) to a plain `=` binding is rejected: writes require a
 /// mutable variable, they never mean shadowing. Introduce the mutable variable with `:=`.
+///
+/// This is also what pins the *skipped* half of the write rule. A target that is not
+/// a mutable variable
+/// gets **no** type constraint at all — the diagnosis belongs to the mutability
+/// discipline, and a type error raised at the write would pre-empt it with a worse
+/// message. The write's own demand is exercised by
+/// [`write_of_the_wrong_type_is_rejected_against_the_mut_vars_value_type`].
 #[test]
 fn augmented_assignment_to_non_mutable_rejected() {
     expect_mut_discipline_error("x = 0\nx += 1\nx", "not a mutable variable");
+}
+
+/// The other half: when the target *is* a mutable variable, the write is demanded against the
+/// mutable variable's real value type — the demand is not relaxed to buy diagnostic ordering.
+/// `Mut(Int)` genuinely demands `Int` of every write.
+#[test]
+fn write_of_the_wrong_type_is_rejected_against_the_mut_vars_value_type() {
+    expect_compile_error(
+        indoc! {r#"
+            x: Mut(Int) := 0
+            for i in [1]:
+                x := "s"
+            x
+        "#},
+        "write to mutable variable `x`",
+    );
 }
 
 /// `Mut(…)` takes one or two type arguments (`Mut(V)` or `Mut(V, Txn)`); three
@@ -543,7 +662,7 @@ fn rule2_function_returning_mut_is_rejected() {
 /// Rule 1: an argument to a `Mut` parameter must be a bare variable reference,
 /// so a *conditional* selecting between two mutable variables — which one would
 /// the callee's write target? — is rejected. The check reads the argument node,
-/// not its type: a conditional over two registers reads their *values* (a
+/// not its type: a conditional over two mutable variables reads their *values* (a
 /// mutable read derefs into the arms' join, as it does into a tuple element), so
 /// there is no `Mut` on the selection itself to key on.
 #[test]
@@ -635,7 +754,7 @@ fn mut_arg_must_be_a_mutable_not_a_plain_value() {
 }
 // A mutable variable passed to a *non*-`Mut` parameter is read by value (its
 // current value is copied in) — the callee cannot write it back. The parameter
-// annotation is a plain checking-mode declaration here, so the register's value
+// annotation is a plain checking-mode declaration here, so the mutable variable's value
 // type must match it.
 #[test]
 fn nonmut_param_reads_mut_arg_current_value() {
@@ -645,7 +764,7 @@ fn nonmut_param_reads_mut_arg_current_value() {
     );
 }
 // The enforced annotation has force even when the argument is a mutable
-// variable: a `String` parameter rejects an `Int` register's value. Before
+// variable: a `String` parameter rejects an `Int` mutable variable's value. Before
 // parameter annotations were carried through lowering this compiled — the
 // annotation was silently dropped and `a` inferred `Int` from the argument.
 #[test]
@@ -655,7 +774,7 @@ fn nonmut_param_annotation_enforced_against_mut_arg() {
         "mismatch",
     );
 }
-// Pass-by-reference sibling of the above: a `Mut(Int)` register cannot bind a
+// Pass-by-reference sibling of the above: a `Mut(Int)` mutable variable cannot bind a
 // `Mut(String)` parameter — the value types must agree across the `(Mut, Mut)`
 // edge. (This path is unchanged by parameter-annotation enforcement; the `Mut`
 // annotation always seeded the binder type. Pinned here because nothing else
@@ -760,6 +879,63 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
     );
 }
 
+/// A mutable variable passed to a **value** parameter reads, and the read carries the mutable variable's
+/// value type all the way through inlining.
+///
+/// The mutable variable is unwritten, so its value type is still its seed's singleton
+/// (`Mut({Int | __elem == 5}, ?d)`), and the parameter — whose type is inferred, since an
+/// annotation bounds rather than fixes it — takes that refinement, because the call site
+/// is typed against the dereferenced value. Beta-reduction then has to discharge a
+/// refinement demanded of the value against an argument node still stamped with the
+/// handle: the `Mut` survives on the bare `Var` for the phase to find the read. Reading
+/// through the handle is what makes the two comparable; comparing the stamp directly asks
+/// a handle to entail a fact about a value and trips `inline`'s entailment assert.
+///
+/// The last case is the surrounding one that reaches the same parameter *without* a
+/// refinement — the use demands `Int`, which widens it — so a future narrowing of the
+/// read shows up as a difference between the cases rather than as silence.
+#[rstest]
+#[case::unannotated(indoc! {r#"
+    def id(v):
+        v
+    x := 5
+    id(x)
+"#})]
+#[case::annotated(indoc! {r#"
+    def id(v: Int):
+        v
+    x := 5
+    id(x)
+"#})]
+#[case::widened_by_use(indoc! {r#"
+    def inc(v):
+        v + 1
+    x := 4
+    inc(x)
+"#})]
+fn a_mut_var_passed_to_a_value_parameter_reads_its_value(#[case] code: &str) {
+    check_scalar(code, cambra::interpreter::Value::Int(5));
+}
+
+/// The same read from *inside* the loop that writes the mutable variable — the combination the
+/// cases above leave out. The value type is the join over seed and writes, so no
+/// singleton survives and it is not the refinement branch that carries this one; what it
+/// pins is that a mutable variable still reaches a UDF as a per-iteration read.
+#[test]
+fn a_mut_var_read_through_a_udf_inside_its_own_loop() {
+    check_scalar(
+        indoc! {r#"
+            def id(v):
+                v
+            x := 5
+            for i in [1, 2, 3]:
+                x += id(x)
+            x
+        "#},
+        cambra::interpreter::Value::Int(40),
+    );
+}
+
 /// Writing a deref-copy is rejected — `y: Int = x` is immutable, so `y += 1` is
 /// the "not a mutable variable" error, never a silent mutable write. Regression for a
 /// write-site demand coalescing the `Int`-declared `y`'s `.ty` to `Mut` and the
@@ -803,7 +979,7 @@ fn non_mut_redef_shadows_mut_param_fn_lowers_tupled() {
 /// Regression: a `Mut`-param `def` local to a nested scope (here a function
 /// body) must not leak its curried call shape to a same-named top-level `def`.
 /// Statement blocks lower right-to-left, so the top-level `bump(3, 4)` call is
-/// lowered *after* `outer`'s body registers a nested `Mut`-param `bump`; without
+/// lowered *after* `outer`'s body mutable variables a nested `Mut`-param `bump`; without
 /// block-scoping the leak made that call lower curried against the 2-tuple
 /// top-level `bump`. `r = bump(3,4) = 7`; `outer(100)` bumps `y` once then adds
 /// 100 → 101; total 108.
@@ -836,12 +1012,12 @@ fn trailing_hidden_writer_loop_compiles() {
 }
 
 // ---------------------------------------------------------------------------
-// Compound (tuple / record) mutable registers
+// Compound (tuple / record) mutable variables
 //
-// A register holds one `Value`, so a tuple/record accumulator is a boxed
+// A mutable variable holds one `Value`, so a tuple/record accumulator is a boxed
 // `Scalar(Record)` in the changelog, while a tuple/record *literal* compiles to
 // a struct-of-arrays `Record` tiling. The two representations are reconciled at
-// the register boundaries (`read_initial_scalar` seeding, `flat_merge` decision
+// the mutable variable boundaries (`read_initial_scalar` seeding, `flat_merge` decision
 // values, `ExtractFinal` extent-match) via `scalar_tile_to_column_value` /
 // `column_value_to_tile`. These pin that a compound induction accumulator folds,
 // reads-its-own-writes, and carries correctly.
@@ -896,19 +1072,19 @@ acc := (0, 0, 0)
 for i in [1, 2, 3]:
     acc := (i, i * 2, i * 3)
 acc", make_tuple(&[Value::Int(3), Value::Int(6), Value::Int(9)]))]
-// Named record register.
+// Named record mutable variable.
 #[case(r"
 acc := (x=0, y=0)
 for i in [1, 2, 3]:
     acc := (x=i, y=i + i)
 acc", make_record(&[("x", Value::Int(3)), ("y", Value::Int(6))]))]
-fn test_compound_register(#[case] code: &str, #[case] expected: Value) {
+fn test_compound_mut_var(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
 /// Projecting a field off the final tuple accumulator: `acc.0` after the loop.
 #[test]
-fn test_compound_register_field_read() {
+fn test_compound_mut_var_field_read() {
     check_scalar(
         r"
 acc := (0, 0)
@@ -922,7 +1098,7 @@ acc.0",
 /// A nested tuple `((i, i), i)` — `scalar_tile_to_column_value` /
 /// `column_value_to_tile` recurse through the nested record.
 #[test]
-fn test_compound_register_nested() {
+fn test_compound_mut_var_nested() {
     check_scalar(
         r"
 acc := ((0, 0), 0)

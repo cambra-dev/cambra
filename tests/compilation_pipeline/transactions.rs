@@ -1,14 +1,14 @@
 //! Transactional stores (`Mut(V, Txn)` + `with begin():`) — the commit-operator
 //! path. Batch (finite-loop and standalone) single-variable transactions run
 //! end-to-end: `x: Mut(V, Txn)` folds into one shared commit store, each `with
-//! begin():` block is a writer. A transactional register is read only inside a
+//! begin():` block is a writer. A transactional mutable variable is read only inside a
 //! `with begin():` block; the batch tests read a value with a trailing standalone
 //! read-only transaction (`out = defer(); …; with begin(): out << x`) and assert
-//! the fed stream. Every fed-out register read compiles to `AsOf` — an as-of read
+//! the fed stream. Every fed-out mutable variable read compiles to `AsOf` — an as-of read
 //! at the reading transaction's (arbitrary) commit position, indexed by the
 //! reading loop — uniformly, whether the reading loop is a live `DataSource`
 //! stream, a finite loop, or the standalone read's synthesized singleton. There
-//! is no terminal/"final" register read; the trailing standalone read's `out` is
+//! is no terminal/"final" mutable variable read; the trailing standalone read's `out` is
 //! the one-element as-of stream at position 0, which under the batch scheduler
 //! observes the drained store (a scheduling coincidence, not a promise).
 //! Translated from the prototype's transaction suite (its `txn x = e` introducer
@@ -70,15 +70,15 @@ fn check_compile_error(code: &str, needle: &str) {
 // order-independent only because it asserts the final pool, not *which* writer
 // succeeded.
 //
-// TODO(await_final): every trailing `with begin(): out << <register>` in this file
+// TODO(await_final): every trailing `with begin(): out << <mutable variable>` in this file
 // carries an inline `# TODO(await_final)` marking the same thing at the offending
-// line — it reads the register with an arbitrary as-of sample (latched to the
+// line — it reads the mutable variable with an arbitrary as-of sample (latched to the
 // singleton trigger at that read's own commit position, so `out` is the one-element
 // stream at position 0) and observes the drained store only because the
 // single-threaded scheduler happens to run it last. The designed `await_final`
 // primitive is the real terminal read (`src/ccl/design/mutability.md`
 // "await_final"): once it exists, rewrite each of those reads as
-// `await_final(<register>)` and the assertions become semantic rather than
+// `await_final(<mutable variable>)` and the assertions become semantic rather than
 // scheduling artifacts.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -97,7 +97,7 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     40
 )]
-// Two writers over one register: the operator serializes + retries, conserving the
+// Two writers over one mutable variable: the operator serializes + retries, conserving the
 // total: 100 − 30 − 40 = 30.
 #[case::two_writers(
     indoc! {r#"
@@ -155,8 +155,8 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     40
 )]
-// Writer source bound *after* the register declaration (`reqs` between `pool` and
-// the loop). The register letrec is spliced below every source binding, so the
+// Writer source bound *after* the mutable variable declaration (`reqs` between `pool` and
+// the loop). The mutable variable letrec is spliced below every source binding, so the
 // writer's `Var(reqs)` is in scope — previously this crashed with an internal
 // unrecognised-variable error. 100 − 10 − 20 − 30 = 40.
 #[case::source_bound_after_store(
@@ -205,7 +205,7 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     70
 )]
-// A standalone transaction composes with loop-based ones on the shared register:
+// A standalone transaction composes with loop-based ones on the shared mutable variable:
 // 100 − 1 − 10 − 20 = 69.
 #[case::standalone_then_loop(
     indoc! {r#"
@@ -223,7 +223,7 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     69
 )]
-// Two writers, each drawing several amounts, over one register. The operator
+// Two writers, each drawing several amounts, over one mutable variable. The operator
 // serializes + retries across all four commits; subtraction conserves the
 // total regardless of interleaving: 100 − 10 − 20 − 5 − 15 = 50.
 #[case::multi_writer_contention(
@@ -243,7 +243,7 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     50
 )]
-// Three writers on one register compose the same as one: 100 − 10 − 20 − 30 = 40.
+// Three writers on one mutable variable compose the same as one: 100 − 10 − 20 − 30 = 40.
 #[case::three_writers(
     indoc! {r#"
         out = defer()
@@ -312,13 +312,13 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 }
 
 // ---------------------------------------------------------------------------
-// Multiple variables in one transaction + read-your-writes (multi-key register)
+// Multiple variables in one transaction + read-your-writes (multi-key mutable variable)
 // ---------------------------------------------------------------------------
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // A single trailing read-only transaction reads *both* keys under one snapshot
-// (`out << a * 100 + b`) — one consistent view of the finished register.
+// (`out << a * 100 + b`) — one consistent view of the finished mutable variable.
 // `a` and `b` update atomically each iteration: a := sum([1,2,3]) = 6, b := sum of
 // squares = 14 → a*100 + b := 614.
 #[case::multi_var(
@@ -390,7 +390,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
     "#},
     32
 )]
-// Read-only register key: `limit` is read in the guard but written nowhere. x=10
+// Read-only mutable variable key: `limit` is read in the guard but written nowhere. x=10
 // commits (10 ≤ 25); 20/30 denied → total := 10.
 #[case::multi_var_readonly_key(
     indoc! {r#"
@@ -496,7 +496,7 @@ fn commit_stream(ticks: &[usize], values: &[i64]) -> Tile {
 }
 
 /// Drive a program whose result is a single trailing-commit read and return the
-/// committed `Value` at position 0. A compound (tuple/record) register reads back
+/// committed `Value` at position 0. A compound (tuple/record) mutable variable reads back
 /// boxed (`Scalar(Record)`) or struct-of-arrays depending on the read path; both
 /// fold to the same `Value` through `scalar_tile_to_column_value`, so this asserts
 /// on the *value* rather than the (path-dependent) tile shape.
@@ -513,9 +513,9 @@ fn trailing_commit_value(code: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Compound (tuple / record) transactional registers
+// Compound (tuple / record) transactional mutable variables
 //
-// A `Mut({Int, Int}, Txn)` / `Mut({x: Int}, Txn)` register holds one compound
+// A `Mut({Int, Int}, Txn)` / `Mut({x: Int}, Txn)` mutable variable holds one compound
 // `Value`; the commit-store path already threads it (it shares the induction
 // path's `read_initial_scalar` seeding and boxes/unboxes at the value-Case
 // decision merge). Enabling it needed only the tuple/record *type annotation*
@@ -524,7 +524,7 @@ fn trailing_commit_value(code: &str) -> Value {
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-// Unconditional tuple register: (100,0) −10/+10 → (90,10) −20/+20 → (70,30).
+// Unconditional tuple mutable variable: (100,0) −10/+10 → (90,10) −20/+20 → (70,30).
 #[case(indoc! {r#"
     out = defer()
     p: Mut({Int, Int}, Txn) := (100, 0)
@@ -562,7 +562,7 @@ fn trailing_commit_value(code: &str) -> Value {
         out << p
     out
 "#}, make_tuple(&[Value::Int(3), Value::Int(30)]))]
-// Named record register.
+// Named record mutable variable.
 #[case(r"
 out = defer()
 p: Mut({x: Int, y: Int}, Txn) := (x=100, y=0)
@@ -586,13 +586,13 @@ out", make_record(&[("x", Value::Int(70)), ("y", Value::Int(30))]))]
         out << (s, p)
     out
 "#}, make_tuple(&[Value::Int(30), make_tuple(&[Value::Int(70), Value::Int(30)])]))]
-fn test_compound_txn_register(#[case] code: &str, #[case] expected: Value) {
+fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
     assert_eq!(trailing_commit_value(code), expected);
 }
 
-/// A field projected off a tuple transactional register in the trailing read.
+/// A field projected off a tuple transactional mutable variable in the trailing read.
 #[test]
-fn test_compound_txn_register_field() {
+fn test_compound_txn_mut_var_field() {
     assert_eq!(
         trailing_commit_value(indoc! {r#"
                 out = defer()
@@ -611,7 +611,7 @@ fn test_compound_txn_register_field() {
 /// `out << pool` *inside* the block reports each transaction's committed
 /// (read-your-writes) value: `pool - r` after the write — 90, 70, 40 over commit
 /// ticks 1, 2, 3. The feed rides the writer decision as a `to_out` tap,
-/// committed atomically with the register write and read back as a per-commit
+/// committed atomically with the mutable variable write and read back as a per-commit
 /// value-stream (commit-tick-indexed). Contrast a *trailing* standalone read-only
 /// transaction `with begin(): out << pool` (an as-of read latched to the singleton
 /// trigger at that read's own commit position — one value at position 0, the
@@ -654,11 +654,11 @@ fn progress_feed_grant_deny() {
 }
 
 // ---------------------------------------------------------------------------
-// Value types: a transactional register holds any base value, not just int
+// Value types: a transactional mutable variable holds any base value, not just int
 // ---------------------------------------------------------------------------
 
 /// A single-element scalar stream over `domain` — the shape of a trailing
-/// read-only transaction's reply for a non-int register.
+/// read-only transaction's reply for a non-int mutable variable.
 fn scalar_stream(domain: &[usize], codomain: ColumnValue) -> Tile {
     Tile::SealedFunction {
         domain: ColumnValue::UInts(domain.to_vec()),
@@ -668,7 +668,7 @@ fn scalar_stream(domain: &[usize], codomain: ColumnValue) -> Tile {
     }
 }
 
-/// A `bool`-valued transactional register: both writers set `flag = True`; the
+/// A `bool`-valued transactional mutable variable: both writers set `flag = True`; the
 /// trailing read observes the committed `True`.
 #[test]
 fn bool_valued_store() {
@@ -688,7 +688,7 @@ fn bool_valued_store() {
     );
 }
 
-/// A `str`-valued transactional register: the final commit sets `name = "bob"`.
+/// A `str`-valued transactional mutable variable: the final commit sets `name = "bob"`.
 #[test]
 fn string_valued_store() {
     check_tile(
@@ -775,7 +775,7 @@ fn reply_feed_under_one_route_does_not_overfire() {
     );
 }
 
-/// **Both arms feed** in a *committing* block: each arm writes the register `a`
+/// **Both arms feed** in a *committing* block: each arm writes the mutable variable `a`
 /// and replies on `out`. Both taps ride the same commit but must fire only on
 /// their own route — each carries its own `__fire` gate. x=1 → else (a += 100,
 /// out << 0); x=2 → if (a += 2, out << 2); x=3 → if (a += 3, out << 3). Every
@@ -843,8 +843,8 @@ fn ryw_of_conditionally_written_key_after_case() {
 }
 
 /// A **conditional feed in a read-only `with begin():` block** — a conditional
-/// reply that reads a register (`if r > 1: resp << pool`). The block commits no
-/// register, so the reply is a filtered live read: `channelize` fans the guard-
+/// reply that reads a mutable variable (`if r > 1: resp << pool`). The block commits no
+/// mutable variable, so the reply is a filtered live read: `channelize` fans the guard-
 /// `Case` out into a refined-source channel (the same path a non-transactional
 /// `if r > 1: resp << r` takes), rather than the feed-only hoist which handles
 /// only straight-line replies. `pool` is never written, so its as-of value is its
@@ -1070,7 +1070,7 @@ fn sustained_contention_conserves_pool() {
 // Read rules and rejected shapes
 // ---------------------------------------------------------------------------
 
-/// A transactional register may be read only inside a `with begin():` block; a
+/// A transactional mutable variable may be read only inside a `with begin():` block; a
 /// bare read outside one is rejected with a hint to wrap it in a block.
 #[test]
 fn bare_txn_read_outside_tx_rejected() {
@@ -1111,10 +1111,10 @@ fn computed_live_cross_endpoint_read_compiles() {
         .expect("a computed live cross-endpoint read should compile to an as-of join");
 }
 
-/// A live cross-endpoint read that combines the *request element* with a register
+/// A live cross-endpoint read that combines the *request element* with a mutable variable
 /// read (`resp << a + req`) compiles: the live-read rewrite turns it into
 /// `zip((trigger, as_of(store))) ≫ (λ (req, snap) → e)`, pairing each request with
-/// its register snapshot. The end-to-end value is checked in
+/// its mutable variable snapshot. The end-to-end value is checked in
 /// `live_reply_combines_request_and_store`.
 #[test]
 fn live_read_combining_request_and_store_compiles() {
@@ -1134,12 +1134,12 @@ fn live_read_combining_request_and_store_compiles() {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     compile_program(&mut ctx, code, consumer).expect(
-        "a live reply combining the request with a register read should compile to a zip read",
+        "a live reply combining the request with a mutable variable read should compile to a zip read",
     );
 }
 
-/// End-to-end live check of the request-plus-register reply (3b): a batch loop
-/// commits the register to 60, then a **live** source drives replies
+/// End-to-end live check of the request-plus-variable reply (3b): a batch loop
+/// commits the mutable variable to 60, then a **live** source drives replies
 /// `resps << store + req`. Each reply pairs the request with the store's as-of
 /// snapshot (60, after the batch commits), so requests 5 and 15 yield 65 and 75 —
 /// the `zip((trigger, as_of)) ≫ (λ (req, s) → req + s)` shape driven incrementally.
@@ -1224,7 +1224,7 @@ fn nested_transactions_rejected() {
 /// An `if`/`else` inside a `with begin():` block **routes** across keys: each
 /// arm's writes are scoped to its path, and the transaction commits
 /// unconditionally (both arms write). Over `[1, 2, 3]`: x=1 → else → b += 1;
-/// x=2 → a += 2; x=3 → a += 3. Final a = 5, b = 1 — read via the register carry
+/// x=2 → a += 2; x=3 → a += 3. Final a = 5, b = 1 — read via the mutable variable carry
 /// (`get_prev_txn`), each iteration one commit.
 #[test]
 fn tx_if_else_routes_across_keys() {
@@ -1332,10 +1332,10 @@ fn multiple_if_guards_route_independently() {
     );
 }
 
-/// `Txn` is never inferred: a transactional register must be spelled
+/// `Txn` is never inferred: a transactional mutable variable must be spelled
 /// `Mut(V, Txn)`. A fully-inferred bare `:=` mutable variable is an *induction* accumulator, so
 /// writing it inside a `with begin():` block is rejected — the block did not
-/// silently promote it to a `Txn` register.
+/// silently promote it to a `Txn` mutable variable.
 #[test]
 fn txn_domain_never_inferred() {
     check_compile_error(
@@ -1345,7 +1345,7 @@ fn txn_domain_never_inferred() {
                 x := x + 1
             x
         "#},
-        "`x` is written inside a `with begin():` block that commits no transactional register",
+        "`x` is written inside a `with begin():` block that commits no transactional mutable variable",
     );
 }
 
@@ -1362,12 +1362,12 @@ fn induction_write_inside_begin_block_rejected() {
                 cnt := cnt + 1
             cnt
         "#},
-        "`cnt` is written inside a `with begin():` block that commits no transactional register",
+        "`cnt` is written inside a `with begin():` block that commits no transactional mutable variable",
     );
 }
 
 /// A *guarded* induction write in a **mixed** block — one that *does* commit a
-/// transactional register — is rejected. `check_no_induction_only_transactions`
+/// transactional mutable variable — is rejected. `check_no_induction_only_transactions`
 /// passes (the block commits `reg`), but the guarded `cnt += 1` is not liftable
 /// by `partition_spine` and would be silently dropped from the decision record.
 /// A dedicated pre-check (`check_no_guarded_induction_write_in_block`) catches it.
@@ -1388,7 +1388,7 @@ fn guarded_induction_write_in_mixed_block_rejected() {
     );
 }
 
-/// C3: a write to a transactional register *outside* any `with begin():` block
+/// C3: a write to a transactional mutable variable *outside* any `with begin():` block
 /// is rejected (write-side mirror of the read gate). Otherwise it becomes a plain
 /// sequential `let` shadow that silently hides every committed value.
 #[test]
@@ -1403,7 +1403,7 @@ fn out_of_block_txn_write_rejected() {
     );
 }
 
-/// C3, by-reference flavor: a `Mut(_, Txn)` writer body that assigns its register
+/// C3, by-reference flavor: a `Mut(_, Txn)` writer body that assigns its mutable variable
 /// *without* a `with begin():` block is rejected at lowering of the body.
 #[test]
 fn by_ref_txn_write_without_block_rejected() {
@@ -1445,12 +1445,12 @@ fn txn_writer_called_inside_block_rejected() {
 }
 
 /// PR-2 registry leak (same class as PR-1's mutable-registry leak): a
-/// `Mut(_, Txn)` register declared *inside* a `def` body must not leak into the
+/// `Mut(_, Txn)` mutable variable declared *inside* a `def` body must not leak into the
 /// transactional registry and falsely gate a like-spelled top-level local. The
-/// def-body scope snapshots and restores *both* register registries, so `reg`
+/// def-body scope snapshots and restores *both* mutable variable registries, so `reg`
 /// outside `f` is an ordinary local (assignable, readable).
 #[test]
-fn txn_register_in_def_body_does_not_leak_to_outer_local() {
+fn txn_mut_var_in_def_body_does_not_leak_to_outer_local() {
     check_scalar(
         indoc! {r#"
             def f(x):
@@ -1479,12 +1479,12 @@ fn transaction_handle_binding_rejected() {
     );
 }
 
-/// C5: the out-of-block read gate applies to a bare register passed as an
+/// C5: the out-of-block read gate applies to a bare mutable variable passed as an
 /// argument to an *ordinary* function (only a `Mut`-parameter callee accepts a
-/// bare register pass and bypasses the gate). `f(store)` reads the register
+/// bare mutable variable pass and bypasses the gate). `f(store)` reads the mutable variable
 /// outside a block, so it is rejected.
 #[test]
-fn bare_register_arg_to_ordinary_fn_is_gated() {
+fn bare_mut_var_arg_to_ordinary_fn_is_gated() {
     check_compile_error(
         indoc! {r#"
             store: Mut(Int, Txn) := 0
@@ -1497,16 +1497,16 @@ fn bare_register_arg_to_ordinary_fn_is_gated() {
 }
 
 // ---------------------------------------------------------------------------
-// Register identity is the `Mut(_, Txn)` type on the α-unique binding, not the
-// surface base name — so a local variable merely *spelled* like a register is
+// A variable's identity is the `Mut(_, Txn)` type on the α-unique binding, not the
+// surface base name — so a local variable merely *spelled* like a mutable variable is
 // not confused for it (A1: a compiler panic; A2: a spurious rejection).
 // ---------------------------------------------------------------------------
 
 /// A1 regression (no panic): a comprehension whose loop variable is *spelled*
-/// like the register (`[store for store in [1, 2, 3]]`) must not be swept into
+/// like the mutable variable (`[store for store in [1, 2, 3]]`) must not be swept into
 /// the transaction footprint — the comprehension var is a distinct α-unique
 /// binder. Before the fix, base-name footprint collection matched it, then
-/// panicked looking for its (non-existent) register `let`. The register write is
+/// panicked looking for its (non-existent) mutable variable `let`. The mutable variable write is
 /// `store = store - sum([1, 2, 3])` = 100 − 6 = 94, read back by the trailing
 /// read-only transaction (a live as-of read at position 0).
 #[test]
@@ -1527,11 +1527,11 @@ fn like_named_comprehension_var_does_not_panic() {
     );
 }
 
-/// A2 regression (no false rejection): a loop target *spelled* like a register
+/// A2 regression (no false rejection): a loop target *spelled* like a mutable variable
 /// (`for store in [1, 2, 3]`) is a genuine local, not an out-of-block store
 /// read. Before the fix, the base-name read gate rejected `store` inside the
 /// loop even though no transaction is present. The loop feeds `store + 1` per
-/// iteration → `[2, 3, 4]` at loop positions `[0, 1, 2]`; the register itself is
+/// iteration → `[2, 3, 4]` at loop positions `[0, 1, 2]`; the mutable variable itself is
 /// never written, so `transact_phase` is a no-op on it.
 #[test]
 fn like_named_loop_var_is_not_a_store_read() {
@@ -1548,7 +1548,7 @@ fn like_named_loop_var_is_not_a_store_read() {
 }
 
 /// Stage-1 interop: one loop carries BOTH a per-iteration transaction (the
-/// register `store`, written in the block) AND a sibling induction accumulator
+/// mutable variable `store`, written in the block) AND a sibling induction accumulator
 /// (`cnt`, written outside the block), with a reply reading the accumulator. The
 /// two run on independent domains — `cnt` sequences on the request loop, `store`
 /// on the commit order — so the reply `resps << cnt` yields the induction
@@ -1571,7 +1571,7 @@ fn mixed_txn_and_induction_reply_reads_accumulator() {
     );
 }
 
-/// Stage-1 interop, register side: the register accumulates transactionally across
+/// Stage-1 interop, mutable variable side: the mutable variable accumulates transactionally across
 /// the same mixed loop (0 + 10 + 20 + 30 = 60), read back by a trailing
 /// read-only transaction, while the sibling induction `cnt` advances
 /// independently and does not join the atomic commit.
@@ -1597,8 +1597,8 @@ fn mixed_txn_and_induction_store_accumulates() {
 
 /// Stage-2 interop: the induction write sits *physically inside* the `with
 /// begin():` block (`store := store + r; cnt := cnt + 1`), the literal
-/// worked-example form. `transact_phase` partitions the block by register domain —
-/// the register write forms the commit decision; the induction `cnt` write is
+/// worked-example form. `transact_phase` partitions the block by mutable variable domain —
+/// the mutable variable write forms the commit decision; the induction `cnt` write is
 /// lifted onto the enclosing loop as its own recurrence — so the result matches
 /// the sibling form: `resps << cnt` yields the request-indexed running total.
 #[test]
@@ -1619,8 +1619,8 @@ fn mixed_txn_and_induction_write_inside_block() {
     );
 }
 
-/// Stage-2 interop, register side: with the induction write inside the block, the
-/// register still accumulates transactionally (0 + 10 + 20 + 30 = 60) and the
+/// Stage-2 interop, mutable variable side: with the induction write inside the block, the
+/// mutable variable still accumulates transactionally (0 + 10 + 20 + 30 = 60) and the
 /// lifted induction `cnt` stays out of the atomic commit.
 #[test]
 fn mixed_txn_and_induction_write_inside_block_store_accumulates() {
@@ -1646,7 +1646,7 @@ fn mixed_txn_and_induction_write_inside_block_store_accumulates() {
 /// its request position (`store := store + cnt` inside the block). The accumulator
 /// is threaded through the writer source (a `zip` of the loop iter and `cnt`'s
 /// per-position view) and the commit engine co-iterates it — so `cnt` = 1,2,3 and
-/// the register accumulates 0 + 1 + 2 + 3 = 6. `cnt` sequences on the request loop
+/// the mutable variable accumulates 0 + 1 + 2 + 3 = 6. `cnt` sequences on the request loop
 /// (its own domain), independent of the commit clock.
 #[test]
 fn commit_decision_reads_induction_accumulator() {
@@ -1795,7 +1795,7 @@ fn broadcast_off_async_source_sibling_loop() {
 
 /// Stage-3 cross-domain read, reply side: the same loop reads `cnt` in the commit
 /// decision *and* replies with it outside the block. The reply rides the induction
-/// domain (request-indexed → `[1,2,3]`) while the register accumulates to 6.
+/// domain (request-indexed → `[1,2,3]`) while the mutable variable accumulates to 6.
 #[test]
 fn commit_decision_reads_induction_accumulator_with_reply() {
     check_tile(
@@ -1844,7 +1844,7 @@ fn commit_gated_reply_reading_induction_counter() {
 /// Stage-3 commit-ordered reply that commits every iteration: the in-block reply
 /// reads the induction counter `cnt` (cross-domain, via the writer co-iteration)
 /// and — since no transaction denies — every request replies, values `[1, 2, 3]`
-/// at commit ticks 1,2,3. The register accumulates alongside; this is the worked
+/// at commit ticks 1,2,3. The mutable variable accumulates alongside; this is the worked
 /// example's `incr` endpoint in finite-batch form (reply riding the commit,
 /// reading the counter).
 #[test]
@@ -1980,10 +1980,10 @@ fn live_read_progresses_past_deny() {
 }
 
 /// Cross-function transactional writer: `def transfer(src, dst, amt)` writes two
-/// `Mut(_, Txn)` registers inside one `with begin():` block. Inlining
+/// `Mut(_, Txn)` mutable variables inside one `with begin():` block. Inlining
 /// beta-reduces the call so the writes name the caller's `a`/`b` bindings, which
-/// `collect_txn_registers` finds on the inlined, typed tree (the whole point of
-/// keying register identity by the `Mut(_, Txn)` type, not a base name). After
+/// `collect_txn_mut_vars` finds on the inlined, typed tree (the whole point of
+/// keying mutable variable identity by the `Mut(_, Txn)` type, not a base name). After
 /// `transfer(a, b, 30)`: `a` = 100 − 30 = 70, `b` = 0 + 30 = 30 — the trailing
 /// read-only transaction reads `a + b` = 100, the conserved total.
 #[test]
@@ -2007,9 +2007,9 @@ fn cross_function_transfer_conserves_total() {
     );
 }
 
-// A heterogeneous multi-key register: a `Mut(String, Txn)` and a
+// A heterogeneous multi-key mutable variable: a `Mut(String, Txn)` and a
 // `Mut(Int, Txn)` committed together in one block. Regression for the
-// register-wide value extent (`build_commit_store`), which is the union of the
+// variable-wide value extent (`build_commit_store`), which is the union of the
 // distinct per-key extents rather than whichever key was iterated last —
 // reading either key returns its own type. `label` is declared first, so a
 // last-key-wins extent would be `int`, yet the string read must still yield a
@@ -2057,7 +2057,7 @@ fn heterogeneous_multi_key_store_reads_string_key() {
 ///
 /// Off-path safety depends on the guard reading the value it protects. Because
 /// the lazy `filter_values` union never evaluates the off-path arm, a guard that
-/// reads the protected register (`d != 0`) suppresses the fault. An item-only
+/// reads the protected mutable variable (`d != 0`) suppresses the fault. An item-only
 /// guard (`if r != 0`) that does *not* read the divisor offers no protection and
 /// correctly still faults — that is sound semantics (a guard that doesn't guard
 /// the dangerous term), not a limitation; item-only guards otherwise commit and
@@ -2083,7 +2083,7 @@ fn txn_off_path_guarded_division_does_not_fault() {
 }
 
 /// **Interleaved two-writer commit/abort through the store.** Two writer
-/// sites on the *same* register `pool` interleave committing and aborting
+/// sites on the *same* mutable variable `pool` interleave committing and aborting
 /// decisions: `10`/`20` always fit (`` `commit ``), `200`/`300` never do (`` `abort ``).
 /// The variant decision flows through the commit-`Store` codomain — each writer's
 /// `` {`commit{writes} | `abort} `` stream folds into the shared changelog — and the
