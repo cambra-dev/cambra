@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::{
     ccl::{Expr, Name, Type, TypedExprNode},
-    chl_parser::ast::{Param, Span, Spanned},
+    chl_parser::ast::{AnnotationMode, Param, Span, Spanned},
 };
 
 /// If `param` is annotated `Mut(…)` (a pass-by-reference mutable-variable parameter),
@@ -28,11 +28,24 @@ use crate::{
 fn mut_param_history_type(param: &Param) -> Option<Result<(Type, bool), LoweringError>> {
     let annotation = param.annotation.as_ref()?;
     match mut_annotation_parts(&annotation.ty) {
-        // The mode rides the *value* type, as at a `:=` introduction: a bounded
-        // `def f(v <: Mut(V))` infers the parameter's value type under `<: V`.
+        // A `Mut(…)` annotation is exact wherever it is written, for the reason it is
+        // exact at a `:=` introduction: [`Type::History`] is invariant in both
+        // payloads, so `<: Mut(V)` admits exactly `Mut(V, D)` and says nothing `:`
+        // does not (`lower::stmts::check_mut_decl_annotation`).
+        Some(Ok(_)) if annotation.mode == AnnotationMode::Bounded => {
+            Some(Err(LoweringError::unsupported(
+                param.name_span,
+                format!(
+                    "`{} <: Mut(…)` bounds a mutable parameter by its own type: `Mut` is \
+                     invariant in its value type, so `<:` claims nothing `:` does not. \
+                     Write `{}: Mut(…)`",
+                    param.name, param.name
+                ),
+            )))
+        }
         Some(Ok((value, is_txn))) => Some(Ok((
             Type::History {
-                value: Box::new(apply_annotation_mode(annotation.mode, value)),
+                value: Box::new(value),
                 domain: Box::new(Type::Hole),
                 kind: crate::ccl::HistoryKind::Overwrite,
             },

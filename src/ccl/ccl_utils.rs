@@ -693,7 +693,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
     match ty {
         // Annotation-position only, and structural: keep the wrapper and strip
         // inside it, so a bounded annotation's bound is stripped like any other.
-        Type::Below(t) => Type::Below(Box::new(strip_refinements(t))),
+        Type::BoundedHole(t) => Type::BoundedHole(Box::new(strip_refinements(t))),
         Type::Refinement(base, _) => strip_refinements(base),
         Type::Fun {
             domain, codomain, ..

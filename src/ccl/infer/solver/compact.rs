@@ -590,9 +590,11 @@ fn compact_go(
 ) -> CompactType {
     match ty {
         // Not a type — an annotation-position obligation, erased by
-        // `normalize_annotation` before any constraint is emitted (see `Type::Below`).
-        Type::Below(_) => {
-            unreachable!("Type::Below reached the solver; `normalize_annotation` must erase it")
+        // `normalize_annotation` before any constraint is emitted (see `Type::BoundedHole`).
+        Type::BoundedHole(_) => {
+            unreachable!(
+                "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
+            )
         }
         // Atomic types contribute a single atom. A term substitution never
         // touches an atom, so `subst_acc` is irrelevant here.

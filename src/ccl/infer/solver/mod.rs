@@ -72,7 +72,7 @@ pub fn type_level(ty: &Type) -> Level {
         // A bounded annotation's level is its bound's: the variable it becomes is
         // minted at the *use* level by `normalize_annotation`, so the bound is all
         // there is to report here.
-        Type::Below(t) => type_level(t),
+        Type::BoundedHole(t) => type_level(t),
         Type::Fun {
             domain: d,
             codomain: c,

@@ -181,31 +181,24 @@ impl InferCtx {
                 .clone(),
             // A bounded annotation `𝑥 <: 𝑇` means "infer this, subject to `<: 𝑇`"
             // → the same fresh variable, carrying `𝑇` as an upper bound. This is
-            // the *only* place `Below` is consumed; every other pass either
+            // the *only* place `BoundedHole` is consumed; every other pass either
             // rewrites through it structurally or treats it as unreachable.
             //
-            // A bound never wraps a **history**: lowering applies a binder's mode to
-            // the history's *value* type (`lower::stmts::apply_annotation_mode`), so
-            // `x <: Mut(V) := e` arrives as `Mut(Below(V), D)` and the `Below` is
-            // consumed by the value position below.
-            //
-            // That is not merely where it happens to sit — it is the only place it
-            // can. A mutable variable binder's slot must stay structurally a `History`:
-            // `mut_value_type`, the deref coercion, `mut_elim`, and `transact_phase` all
-            // dispatch on the shape, and a variable standing for the whole history
-            // would skip a write's `value <: V` edge, so the mutable variable would never
-            // receive its writes. The value position has no such constraint — a
-            // variable there is the ordinary case, since an unannotated `x := 5` binds
-            // at `Mut(?v, ?d)` too — and it is where a strict subtype can differ at
-            // all. A wrapper here means a lowering path built a history without
-            // routing its annotation through the mode.
-            Type::Below(bound) if bound.is_handle() => {
+            // A bound never wraps a **history**, and there is nothing this arm could
+            // do if one arrived: [`Type::History`] is invariant in both payloads, so
+            // `<: Mut(V, D)` admits exactly `Mut(V, D)` and a variable bounded by it
+            // would only lose the shape that `mut_value_type`, the deref coercion,
+            // `mut_elim`, and `transact_phase` all dispatch on. Lowering rejects the
+            // spelling outright (`lower::stmts::check_mut_decl_annotation`), so a
+            // wrapper here means a `Mut` annotation reached a binder without passing
+            // that check.
+            Type::BoundedHole(bound) if bound.is_handle() => {
                 unreachable!(
-                    "a bounded annotation wraps a history ({bound}); lowering applies \
-                     the binder's mode to the history's value type instead"
+                    "a bounded annotation wraps a history ({bound}); `<:` on a `Mut(…)` \
+                     annotation is rejected at lowering"
                 )
             }
-            Type::Below(bound) => {
+            Type::BoundedHole(bound) => {
                 let v = fresh_var(self.level);
                 let bound = self.normalize_annotation(bound);
                 // A **local** cache, not `self.cache`: this method takes `&self`,

@@ -318,9 +318,9 @@ fn stamp_kind_from(target: &mut Type, reference: &Type) {
 fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
     match ty {
         // Runs *before* `normalize_annotation`, so a bounded annotation is still a
-        // `Below` here: recurse into the bound, or a predicate written inside one
+        // `BoundedHole` here: recurse into the bound, or a predicate written inside one
         // (`x <: {Int | p}`) never gets typed.
-        Type::Below(bound) => emit_annotation_predicates(bound, ctx),
+        Type::BoundedHole(bound) => emit_annotation_predicates(bound, ctx),
         Type::Refinement(inner, r) => {
             // The annotation's refinement is bare over REFINEMENT_BINDER, just
             // like a cast target's — bind the element over the refined base and
@@ -1234,7 +1234,7 @@ pub(super) fn emit_let<C: Typing>(
         // history, which is what makes it mean exactly `y = x`.
         Some(ann) => {
             let declared = match ann {
-                Type::Below(_) => ann.clone(),
+                Type::BoundedHole(_) => ann.clone(),
                 _ => complete_annotation(ann, &bound_ty),
             };
             ctx.bind_annotation(&bound_ty, &declared)?

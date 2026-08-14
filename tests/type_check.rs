@@ -2805,17 +2805,15 @@ mod annotation_kinds {
         );
     }
 
-    /// A binder's mode applies to a mutable variable's **value** type, so `a <: Mut(V)` and
-    /// `a <: V` are the same declaration — and both agree with writing no annotation
-    /// at all, since a bound the inferred type already satisfies admits it rather
-    /// than replacing it.
+    /// The one annotated spelling a `:=` binder accepts is exact and is a `Mut(…)`,
+    /// and it means at a mutable variable what it means at any other binder: the
+    /// annotation *is* the type, so it discards what the value knew beyond it.
     ///
-    /// The `Mut(…)` spelling used to read as *exact*: lowering split the annotation
-    /// into a value type and a domain and dropped the mode on the way, so the bounded
-    /// form discarded the singleton that the unannotated form keeps — a bound that
-    /// lost information.
+    /// `a: Mut(Int) := 5` therefore binds the value at `Int`, while the unannotated
+    /// `a := 5` keeps the seed's singleton. The rejected spellings are covered by
+    /// `mut_decl_annotation_is_exact_and_is_a_mut` (they fail at lowering).
     #[test]
-    fn a_bound_on_a_mut_var_bounds_its_value_type() {
+    fn an_exact_mut_annotation_discards_the_seeds_singleton() {
         // Compared by mutable variable *value* type. Each program ends in a bare read, and a
         // tail denotes the mutable variable's *value*, so the program type is that value type
         // directly — which also keeps the per-run domain variable, whose id differs
@@ -2828,26 +2826,14 @@ mod annotation_kinds {
             );
             ty
         };
-        // No writes, so the value type is the seed's — the bound admits `5`.
-        let bare = mut_value(indoc! {r#"
+        // No writes, so the unannotated value type is the seed's singleton.
+        assert_ne!(
+            mut_value(indoc! {r#"
             a := 5
             a
-        "#});
-        assert_eq!(
-            mut_value(indoc! {r#"
-            a <: Mut(Int) := 5
-            a
         "#}),
-            bare
+            int()
         );
-        assert_eq!(
-            mut_value(indoc! {r#"
-            a <: Int := 5
-            a
-        "#}),
-            bare
-        );
-        // The exact form is what discards the singleton.
         assert_eq!(
             mut_value(indoc! {r#"
             a: Mut(Int) := 5
@@ -2855,27 +2841,20 @@ mod annotation_kinds {
         "#}),
             int()
         );
-        assert_ne!(
-            mut_value(indoc! {r#"
-            a <: Mut(Int) := 5
-            a
-        "#}),
-            int()
-        );
-        // With a write, the value type is the join over seed and writes, so both
-        // modes land on `Int` — the bound is satisfied, not doing the widening.
+        // With a write, the value type is the join over seed and writes, so the
+        // unannotated form lands on `Int` too — the annotation is not what widens it.
         assert_eq!(
             mut_value(indoc! {r#"
-            a <: Mut(Int) := 0
+            a := 0
             a += 1
             a
         "#}),
             int()
         );
-        // And it is still a *declaration*, so the deref-copy below it is a read.
+        // It is still a *declaration*, so the deref-copy below it is a read.
         assert_eq!(
             infer_program(indoc! {r#"
-            a <: Mut(Int) := 0
+            a: Mut(Int) := 0
             b: Int = a
             b
         "#}),
@@ -2883,10 +2862,10 @@ mod annotation_kinds {
         );
     }
 
-    /// The bound is a real obligation on a bounded mutable variable, discharged against both
-    /// contributions to its value type: the seed and every write.
+    /// The exact annotation is a real obligation on the mutable variable, discharged
+    /// against both contributions to its value type: the seed and every write.
     #[test]
-    fn a_bounded_mut_vars_bound_constrains_seed_and_writes() {
+    fn a_mut_vars_annotation_constrains_seed_and_writes() {
         let rejects = |code: &str, needle: &str| {
             let errs = infer_program_err(code);
             let rendered = format!("{errs:?}");
@@ -2897,14 +2876,14 @@ mod annotation_kinds {
         };
         rejects(
             indoc! {r#"
-            a <: Mut(Int) := "s"
+            a: Mut(Int) := "s"
             a
         "#},
             "initializer of mutable `a`",
         );
         rejects(
             indoc! {r#"
-                a <: Mut(Int) := 0
+                a: Mut(Int) := 0
                 for i in [1, 2]:
                     a := "s"
                 a

@@ -235,11 +235,13 @@ pub fn freshen_above(
         return ty.clone();
     }
     match ty {
-        // `Below` is a *pre-inference* annotation marker: `normalize_annotation`
+        // `BoundedHole` is a *pre-inference* annotation marker: `normalize_annotation`
         // erases it into a bounded variable before any constraint is emitted, so
         // the solver never sees one.
-        Type::Below(_) => {
-            unreachable!("Type::Below reached the solver; `normalize_annotation` must erase it")
+        Type::BoundedHole(_) => {
+            unreachable!(
+                "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
+            )
         }
         Type::Base(_)
         | Type::UIntRange(_)

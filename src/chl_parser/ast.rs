@@ -274,7 +274,7 @@ pub struct Param {
 ///
 /// The two spellings differ only in the mode; the type expression is parsed
 /// identically. Lowering turns [`AnnotationMode::Bounded`] into a
-/// [`crate::ccl::Type::Below`] wrapper and leaves `Exact` bare.
+/// [`crate::ccl::Type::BoundedHole`] wrapper and leaves `Exact` bare.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeAnnotation {
     pub mode: AnnotationMode,

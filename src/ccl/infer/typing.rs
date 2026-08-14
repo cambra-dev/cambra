@@ -162,7 +162,7 @@ pub(super) trait Typing {
     /// for the two forms this obligation serves.
     ///
     /// **Returns the normalized annotation**, because normalizing is not
-    /// idempotent: a `Hole` or a [`Type::Below`] mints a fresh variable each time,
+    /// idempotent: a `Hole` or a [`Type::BoundedHole`] mints a fresh variable each time,
     /// so a caller that both reconciles against an annotation and binds at it must
     /// use one normalization for both or it relates two unrelated variables.
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError>;

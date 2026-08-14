@@ -346,12 +346,12 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
-    /// A [`Type::Below`] bounded-annotation marker survived past inference.
+    /// A [`Type::BoundedHole`] bounded-annotation marker survived past inference.
     ///
     /// Like [`InferError::UnresolvedHole`], a compiler bug rather than a
-    /// user-facing error: `normalize_annotation` erases every `Below` it is handed,
+    /// user-facing error: `normalize_annotation` erases every `BoundedHole` it is handed,
     /// so a survivor means a slot inference never normalized.
-    UnresolvedBelow {
+    UnresolvedBoundedHole {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
@@ -675,7 +675,7 @@ impl std::fmt::Debug for InferError {
             InferError::UnresolvedHole { at } => {
                 write!(f, "Unresolved type hole in expression: {at}")
             }
-            InferError::UnresolvedBelow { at } => {
+            InferError::UnresolvedBoundedHole { at } => {
                 write!(f, "Unresolved bounded annotation `<:` in expression: {at}")
             }
             InferError::UnresolvedInfer { id, at } => {
@@ -1046,7 +1046,7 @@ fn collect_type_errors(
         // A bounded annotation inference never normalized. Reported at every
         // strictness, exactly like `Hole`: both are lowering markers whose whole
         // contract is that inference consumes them.
-        Type::Below(_) => errors.push(InferError::UnresolvedBelow {
+        Type::BoundedHole(_) => errors.push(InferError::UnresolvedBoundedHole {
             at: context_sym.to_string(),
         }),
         Type::Infer(var) => {
@@ -2617,7 +2617,7 @@ mod tests {
              use; got {exact:?}"
         );
 
-        let bounded = param_annotation(Type::Below(Box::new(Type::Base(BaseType::Int))));
+        let bounded = param_annotation(Type::BoundedHole(Box::new(Type::Base(BaseType::Int))));
         assert!(
             bounded
                 .iter()
@@ -2949,19 +2949,20 @@ mod tests {
         assert_eq!(check_fully_typed(&expr), Ok(()));
     }
 
-    /// A `Type::Below` surviving inference fails with `UnresolvedBelow`.
+    /// A `Type::BoundedHole` surviving inference fails with `UnresolvedBoundedHole`.
     ///
     /// A backstop, like `UnresolvedHole`: `normalize_annotation` erases every
-    /// `Below` it is handed, and a bounded annotation that somehow reaches the
+    /// `BoundedHole` it is handed, and a bounded annotation that somehow reaches the
     /// solver un-normalized is rejected earlier (nothing can be constrained against
-    /// a `Below`, so it surfaces as an `AnnotationMismatch`). This pins the check
+    /// a `BoundedHole`, so it surfaces as an `AnnotationMismatch`). This pins the check
     /// itself, which the pipeline therefore cannot reach.
     #[test]
-    fn test_check_fully_typed_below_survivor() {
-        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Below(Box::new(Type::Base(BaseType::Int))));
+    fn test_check_fully_typed_bounded_hole_survivor() {
+        let expr =
+            Expr::lit(Lit::Int(1)).with_ty(Type::BoundedHole(Box::new(Type::Base(BaseType::Int))));
         assert_eq!(
             check_fully_typed(&expr),
-            Err(vec![InferError::UnresolvedBelow { at: "1".into() }])
+            Err(vec![InferError::UnresolvedBoundedHole { at: "1".into() }])
         );
     }
 

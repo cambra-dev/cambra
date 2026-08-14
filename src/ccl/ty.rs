@@ -483,7 +483,7 @@ pub fn reset_kind_var_counter() {
 /// | Variant | Owner | Meaning | Must be eliminated by |
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
-/// | `Below(𝑇)` | Lowering | "A bounded annotation `𝑥 <: 𝑇`: infer this, subject to `<: 𝑇`" — an obligation, not a shape | Pass 1's `normalize_annotation` (flagged as `UnresolvedBelow` if it survives) |
+/// | `BoundedHole(𝑇)` | Lowering | "A bounded annotation `𝑥 <: 𝑇`: infer this, subject to `<: 𝑇`" — an obligation, not a shape | Pass 1's `normalize_annotation` (flagged as `UnresolvedBoundedHole` if it survives) |
 /// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); an induction accumulator's *domain* is necessarily `Infer` until the unified phase resolves it (see `Strictness::PreDesugar`) |
 /// | `History` (`kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
 /// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
@@ -582,7 +582,7 @@ pub enum Type {
     /// **This is not a type.** Like [`Hole`](Self::Hole) and [`Infer`](Self::Infer)
     /// it denotes no set of values — it is a *slot* inhabiting the `Type` enum
     /// because annotations are typed positions, and it states an obligation for
-    /// inference rather than a shape. `Below(𝑇)` is not "the type of values below
+    /// inference rather than a shape. `BoundedHole(𝑇)` is not "the type of values below
     /// `𝑇`": there is no such type, which is why nothing may subtype against one,
     /// narrow against one, or compact one. The solver has no rule for it and asserts
     /// so (`constrain::extrude`, `compact`); only the
@@ -594,10 +594,10 @@ pub enum Type {
     /// occupies do not survive inference at all
     /// (`infer::api::debug_assert_annotations_cleared`), so a binder `ty` is the
     /// only place a survivor could hide — flagged there by `collect_type_errors`
-    /// as [`InferError::UnresolvedBelow`](crate::ccl::infer::InferError::UnresolvedBelow).
+    /// as [`InferError::UnresolvedBoundedHole`](crate::ccl::infer::InferError::UnresolvedBoundedHole).
     ///
     /// See `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".
-    Below(Box<Type>),
+    BoundedHole(Box<Type>),
     /// Unresolved type variable, identified by a unique [`crate::ccl::InferVarId`].
     ///
     /// Created during inference by the inference pass
@@ -779,7 +779,7 @@ impl fmt::Display for Type {
             Type::Base(b) => write!(f, "{}", b.keyword()),
             // `n == 0` means an empty range (e.g. the domain of `[]`); render
             // it as `∅` instead of computing `n - 1` and underflowing.
-            Type::Below(t) => write!(f, "<:{t}"),
+            Type::BoundedHole(t) => write!(f, "<:{t}"),
             Type::UIntRange(0) => write!(f, "∅"),
             Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
             // The arrow reflects the resolved `kind`: `⇒` for a compute
@@ -1101,7 +1101,7 @@ impl Type {
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),
             },
-            Type::Below(t) => Type::Below(Box::new(t.without_pi_names())),
+            Type::BoundedHole(t) => Type::BoundedHole(Box::new(t.without_pi_names())),
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| t.without_pi_names()).collect()),
             Type::Record(fs) => Type::Record(
                 fs.iter()
@@ -1171,7 +1171,7 @@ impl Type {
             // A bounded annotation's bound is an ordinary child type — a pass
             // that rewrites types (uniquify's α-renaming, `subst`) must reach
             // inside it exactly as it reaches inside a `Refinement`.
-            Type::Below(t) => f(t),
+            Type::BoundedHole(t) => f(t),
             Type::Fun {
                 domain, codomain, ..
             } => {
@@ -1217,7 +1217,7 @@ impl Type {
             // A bounded annotation's bound is an ordinary child type — a pass
             // that rewrites types (uniquify's α-renaming, `subst`) must reach
             // inside it exactly as it reaches inside a `Refinement`.
-            Type::Below(t) => f(t),
+            Type::BoundedHole(t) => f(t),
             Type::Fun {
                 domain, codomain, ..
             } => {
