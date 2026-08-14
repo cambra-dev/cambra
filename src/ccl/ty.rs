@@ -1192,7 +1192,7 @@ impl Type {
                     domain: Box::new(go(domain, depth, subst)),
                     kind: *kind,
                 },
-                Type::Below(t) => Type::Below(Box::new(go(t, depth, subst))),
+                Type::BoundedHole(t) => Type::BoundedHole(Box::new(go(t, depth, subst))),
                 Type::Base(_)
                 | Type::UIntRange(_)
                 | Type::DataSource(_)
