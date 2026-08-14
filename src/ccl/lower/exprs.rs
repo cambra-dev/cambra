@@ -481,10 +481,8 @@ pub(super) fn lower_compare(
             // mirroring the original operand's (Source) image — exactly the
             // attribution wanted for the duplicated operand.
             use crate::ccl::lineage::copy_frame;
-            let mut copy = operands[i].clone();
             let _frame = copy_frame("lower.compare_operand");
-            copy.freshen_node_ids_deep();
-            copy
+            operands[i].fresh_copy()
         };
         let rhs = operands[i + 1].clone();
         // Each pair comparison images its `<op>` in the chain, spanning its two

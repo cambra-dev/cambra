@@ -2120,7 +2120,10 @@ fn extract_for_defer_impl(
                     let mut fvs = HashSet::new();
                     collect_free_vars(feed, &mut fvs);
                     if fvs.contains(&binding.name) {
-                        let placeholder = Expr::new(TypedExprNode::Lit(Lit::Unit));
+                        // A `mem::take` slot, overwritten below — mint nothing for
+                        // it (`NodeId::PLACEHOLDER`), or the recorder logs a birth
+                        // for a node that never reaches the tree.
+                        let placeholder = Expr::throwaway(TypedExprNode::Lit(Lit::Unit));
                         let original = std::mem::replace(feed, placeholder);
                         // stamp the wrap at construction —
                         // the let's type is its body's, closed over the binder

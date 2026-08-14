@@ -353,12 +353,13 @@ pub(super) fn lower_list_comp(
 /// "The id domain". (The same keep-first shape as the chained-comparison operand
 /// freshen in `lower::exprs`.)
 fn fan_out_copy(origin: &Expr, used: &mut bool, label: &'static str) -> Expr {
-    let mut copy = origin.clone();
-    if *used {
+    let copy = if *used {
         use crate::ccl::lineage::copy_frame;
         let _frame = copy_frame(label);
-        copy.freshen_node_ids_deep();
-    }
+        origin.fresh_copy()
+    } else {
+        origin.clone()
+    };
     *used = true;
     copy
 }

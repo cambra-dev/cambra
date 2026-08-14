@@ -2276,7 +2276,10 @@ fn walk_case(
         let arm_path = and_path(path, &pi);
         // Each arm gets its own copy of the entering values: an arm that leaves a
         // key unchanged carries that value into the rejoin, so a bare clone would
-        // stamp one value's ids into every arm.
+        // stamp one value's ids into every arm. Eager, with the same cost and the
+        // same reason as `mut_elim::rewrite`'s per-branch environment: a key the
+        // arm overwrites has its copy killed by the `env.insert`, so each such
+        // pair is a manufactured death.
         let mut arm_env: HashMap<Name, Expr> = snapshot
             .iter()
             .map(|(k, v)| (k.clone(), v.fresh_copy()))
@@ -2765,7 +2768,7 @@ fn plan_store(
         // here and as the trailing `final_or_default` default in `splice_letrec`
         // — while the `let` that held the original is dropped by
         // `rebind_letrec`, so both placements are copies.
-        let init = key_init[k].fresh_copy();
+        let init = key_init.get(k).expect("key init present").fresh_copy();
         // The `get_prev_txn` history slot — the design's denotation: the
         // `⧺`-merged **per-key commit views** of every site writing this key
         // ("multiple writer sites for one variable merge their commit

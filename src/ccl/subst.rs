@@ -658,12 +658,11 @@ impl Subst {
                 // any open step. Type slots are out of the id domain, so the
                 // predicate `Rc`s the clone shares with its source stay shared.
                 //
-                // Freshening the root as well would work, but it re-mints an id
-                // the carry immediately overwrites, so the step records a `Copy`
-                // whose produced id no node ends up holding. The node survives
-                // either way — only its recorded identity would be one the tree
-                // never keeps — so this is about not logging an operation that is
-                // undone a line later, and about spending one fewer id.
+                // Interior only: the carry above already put the occurrence's id
+                // on the root. Deep-freshening resolves to the same use-site span,
+                // because the carry precedes the freshen and the recorded origin is
+                // the occurrence, but it costs a row, an id, and a hop, and drops
+                // the occurrence out of the live set.
                 e.freshen_interior_node_ids();
             }
             return;

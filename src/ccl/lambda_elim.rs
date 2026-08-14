@@ -362,7 +362,12 @@ fn build_value_case_cform(
     let mut arm_domains: Vec<Type> = Vec::new();
     let mut default_body: Option<Expr> = None;
 
-    for b in branches {
+    // `final_or_default`'s default is the *last* branch's body, which is the one
+    // branch whose body reaches the output twice; the rest move whole into their
+    // arms. Naming the index says that, and keeps the earlier branches from
+    // cloning a body that is dropped on the next iteration.
+    let last = branches.len().saturating_sub(1);
+    for (i, b) in branches.into_iter().enumerate() {
         let guard = elim_lambdas(ctx, b.guard)?;
         let body = elim_lambdas(ctx, b.body)?;
         // First-match gate π̂ᵢ, lifted to a constant-in-element predicate
@@ -380,7 +385,9 @@ fn build_value_case_cform(
         // gate (a leading `if True`) leaves the driver unrefined (always fires).
         let refined_dom = refine_with(driver_dom.clone(), &gate_fn);
         arm_domains.push(refined_dom.clone());
-        default_body = Some(body.clone());
+        if i == last {
+            default_body = Some(body.clone());
+        }
         // const(eᵢ) : {UIntRange(1) | π̂ᵢ} ⤇ V — lift the value over the gated driver.
         let arm = apply_primitive(
             body,
@@ -569,8 +576,10 @@ fn build_scrutinee_case_cform(
         .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
         // eᵢ as a point-free morphism `Pᵢ ⇒ Vᵢ`, reading the projected payload.
         let arm_fn = elim_lambda(ctx, &pat.binding.name, &payload_ty, br.body)?;
+        // `scrut_stream` is built once and composed into every arm, and all arms
+        // stay live in the union below, so each placement needs its own identity.
         arms.push(arm_compose(
-            vec![scrut_stream.clone(), vp, arm_fn],
+            vec![scrut_stream.fresh_copy(), vp, arm_fn],
             driver_dom.clone(),
             &result_ty,
             // A value-position scrutinee case reads a one-element *stream* driver
@@ -1388,7 +1397,13 @@ fn elim_lambda_impl(
                     let arm_fn = elim_lambda(ctx, &payload_name, &payload_ty, br.body)?;
                     let mut chain: Vec<Expr> = Vec::with_capacity(3);
                     if !scrut_is_id {
-                        chain.push(scrut_pf.clone());
+                        // `scrut_pf` is built once before the loop and prepended to
+                        // every arm, and all arms stay live in the fan-out, so each
+                        // placement needs its own identity. No boundary catches a
+                        // bare clone here: the catch-all arm re-mints every
+                        // pass-through node, which launders the duplicate before any
+                        // boundary walk reaches it.
+                        chain.push(scrut_pf.fresh_copy());
                     }
                     chain.push(vp);
                     chain.push(arm_fn);
@@ -1418,7 +1433,8 @@ fn elim_lambda_impl(
                     let payload_pf = if scrut_is_id {
                         vp
                     } else {
-                        typed_compose(vec![scrut_pf.clone(), vp])
+                        // Per-arm placement, as above.
+                        typed_compose(vec![scrut_pf.fresh_copy(), vp])
                     };
                     // Outer morphism `param_ty ⇒ param_ty` — the full element; the
                     // zip's `FanIn` restricts it to the tag-`cᵢ` keys by inner-join.

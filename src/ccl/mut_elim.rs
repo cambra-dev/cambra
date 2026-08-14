@@ -1004,7 +1004,10 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
         let value_ty = value.ty.clone();
         let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), value);
         lambda.ty = Type::fun(target.ty.clone(), value_ty.clone());
-        let mut map = Expr::compose(vec![iter.clone(), lambda]);
+        // One `Feed` per in-block feed, each mapping the one loop source. Two or
+        // more feeds place that source at that many live positions, so a bare
+        // clone would give them one identity.
+        let mut map = Expr::compose(vec![iter.fresh_copy(), lambda]);
         map.ty = Type::fun(domain_ty.clone(), value_ty);
         let mut feed = Expr::feed(defer, map);
         feed.ty = Type::Base(BaseType::Unit);
@@ -1276,6 +1279,17 @@ fn transform_chain(
                 // Likewise the entering values: a branch that leaves an
                 // accumulator alone carries that value into its write set, so a
                 // bare env clone would stamp one value's ids into every branch.
+                //
+                // This is the one place the discipline is *eager* rather than
+                // at-placement, and it costs: an accumulator the branch goes on to
+                // overwrite has its copy killed by the `env.insert`, so the pass
+                // manufactures a death per (branch × overwritten accumulator) that
+                // a placement-time freshen would not. It is load-bearing anyway —
+                // `transform_chain`'s terminal reads the environment with a bare
+                // clone, so the environment itself has to hold distinct identities
+                // by then. Narrowing this to the accumulators a branch actually
+                // carries wants the branch's write set up front, which is what the
+                // walk below is computing.
                 let mut branch_env: HashMap<Name, Expr> = env
                     .iter()
                     .map(|(k, v)| (k.clone(), v.fresh_copy()))

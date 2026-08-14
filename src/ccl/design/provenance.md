@@ -81,10 +81,10 @@ and makes a `NodeId → OperatorId` map non-functional — so uniqueness is what
 an id an *identity* rather than a label.
 
 `assert_unique_node_ids` enforces it at every pass boundary in `compile_program`
-(post-lowering, -inline, -transact, -letrec-run, -desugar, -lambda-elim,
--planning), gated on `cfg!(any(debug_assertions, test))` — the walk is `O(nodes)`
-per boundary and buys nothing in a release compile, where the fold's leak classes
-cover the same ground. A boundary check is a *tree* invariant and encodes no pass
+(post-lowering, -inline, -transact, -letrec-run, -desugar, -as-of-read,
+-lambda-elim, -planning), gated on `cfg!(any(debug_assertions, test))` — the walk
+is `O(nodes)` per boundary and buys nothing in a release compile, where the
+fold's leak classes cover the same ground. A boundary check is a *tree* invariant and encodes no pass
 order, so a reordered pass carries its check with it. It also means a pass is only
 implicated at a boundary that looks at it: a clean run is evidence about the
 gates, not about the passes between them.
@@ -96,11 +96,16 @@ Two primitives, and the choice between them is about what the copy *denotes*:
   the output at more than one position.
 - **Root-carry** (`freshen_interior_node_ids` + `re_root`) — substitution. The
   replacement for a `Var(𝑥)` occurrence denotes what the occurrence denoted — the
-  value of 𝑥 *at that position* — so the occurrence keeps its own id, and with it
-  its source span, while only the interior is freshened. N reads give N distinct
-  roots, so uniqueness holds without deleting the read sites from the output.
-  `Subst`'s compound-replacement arm is the engine; every phase-local
-  substitution takes the same shape.
+  value of 𝑥 *at that position* — so the occurrence keeps its own id while only
+  the interior is freshened. N reads give N distinct roots, so uniqueness holds
+  without deleting the read sites from the output. `Subst`'s compound-replacement
+  arm is the engine; every phase-local substitution takes the same shape.
+
+  Carrying costs nothing: a clone mints no id and re-rooting records no step, so
+  the root needs no row, spends no id, and leaves the occurrence in the live set.
+  Freshening the root instead resolves to the same use-site span, because the
+  carry precedes the freshen and the recorded origin is the occurrence, at the
+  cost of one row, one id, and one hop.
 
 Both fire `on_copy` on every re-minted node, so a freshen is captured as
 `Op::Copy` the moment a session is installed and is a no-op before that. No call
@@ -116,10 +121,22 @@ is the source image by construction.)
 
 **Freshen at placement, not at construction.** Most passes build intermediate
 structures — guard vectors, path conjunctions, per-branch environments — whose
-entries are aliased and then copied into the output. Freshening where a node is
-*placed* in the output tree is what the invariant needs; freshening eagerly into
-an intermediate manufactures nodes that never reach the output and must then be
-declared dead by whoever claims the region.
+entries are aliased and then copied into the output. Placement is where a copy's
+multiplicity is known; freshening earlier assumes an answer, and the three
+outcomes carry different costs.
+
+- **Moved** into the output: no cost. The output node holds the fresh id, and its
+  parent is the original.
+- **Copied again** into the output: a defect the gate catches. The intermediate
+  generation is stranded, so the placed copy's `Copy` names an origin no node
+  holds, a `parents` walk for a span dead-ends, and the fold reports
+  `CopyOfUnknown`. Freshening the substitution engine's `Subst`-resident
+  templates produces this, and the boundary gate fails.
+- **Dropped**: one spent id and one row no query reaches. No check reports it —
+  both leak checks enumerate from the tree, there is no produced-side check
+  (below), and a node absent from the tree is outside `assert_unique_node_ids`.
+  Construction is the only constraint: `new` mints and records, `preserve`
+  carries.
 
 **A term crossing out of the predicate domain must not land aliased ids.**
 Predicate interiors are outside the checked domain (above) and may already alias

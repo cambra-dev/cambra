@@ -987,6 +987,7 @@ pub fn compile_program(
     // `transact_phase::rewrite_as_of_reads`.
     transact_phase::rewrite_as_of_reads(&mut desugared)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    assert_unique_node_ids(&desugared, "post-as-of-read");
     typecheck(&desugared).expect("as-of-read rewrite produced an ill-typed tree");
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;

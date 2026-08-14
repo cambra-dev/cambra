@@ -22,6 +22,18 @@ r#"x = defer()
 for i in [1,2,3]:
   x << i
 x"#, make_int_list(&[1, 2, 3]))]
+// Two feeds inside one read-only `with begin():` block: the letrec phase's
+// feed-only path emits one `Feed` per feed, each mapping the same loop source, so
+// the source lands at two live positions and must be freshened per placement — a
+// bare clone trips the `post-letrec-run` id-uniqueness boundary.
+#[case::two_feeds_in_readonly_txn_loop(
+r#"x = defer()
+y = defer()
+for i in [1,2,3]:
+  with begin():
+    x << i
+    y << i
+x"#, make_int_list(&[1, 2, 3]))]
 // Filter-feed inside a defer: `if cond: d << v` in a loop lowers to a
 // refined-source channel whose domain carries the bare predicate
 // `__elem ▷ source ▷ (λ p → guard)` (the same element form a filtered
