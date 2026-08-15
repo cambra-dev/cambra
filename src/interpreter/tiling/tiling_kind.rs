@@ -170,12 +170,15 @@ impl Tiling {
                 terminal: ColumnValue::Bools(BitVec::new()),
                 accumulator: ColumnValue::from_values(Vec::new(), accumulator),
             },
-            // An empty store: no change events yet, frontier undecided, live.
+            // An empty store: no change events yet, frontier undecided, live, and
+            // no key closed — a writer that has not been pulled yet may still
+            // write any of them.
             Tiling::Store { domain, .. } => Tile::Store {
                 changes: ColumnValue::from_values(Vec::new(), domain),
                 deltas: ColumnValue::Variants(Vec::new()),
                 frontier: Predicate::False,
                 terminal: false,
+                closed_keys: Vec::new(),
             },
         }
     }

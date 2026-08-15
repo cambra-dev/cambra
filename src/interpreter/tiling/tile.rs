@@ -30,7 +30,7 @@ pub enum Tile {
         domain: ColumnValue,
         /// Codomain of the function expressed as an implicitly-vectorized Tile.
         codomain: Box<Tile>,
-        /// Represents a region of the codomain for which no new elements will ever be seen.
+        /// The region of the **domain** for which no new elements will ever be seen.
         /// Calls to `get` can still return tiles with data in this region, but such data is guaranteed to
         /// be the same as data already observed.
         domain_predicate: Predicate,
@@ -58,7 +58,9 @@ pub enum Tile {
         domain2: ColumnValue,
         /// Flattened codomain values; supports vectorized transformations.
         codomain: ColumnValue,
-        /// Whether all domain keys and their value lists have been fully received.
+        /// The region of `domain1` for which no new elements will ever be seen — the same
+        /// statement [`Self::SealedFunction`]'s makes, and covering each key in the region
+        /// together with its whole `domain2`/`codomain` list.
         domain_predicate: Predicate,
         /// Set of flat `domain2`/`codomain` row indices that have been logically removed by
         /// filtering.  1 = deleted; empty means all rows are present.  Preserved for the
@@ -118,6 +120,24 @@ pub enum Tile {
         /// has `terminal == false`; the same store, once its writers finish, flips
         /// `terminal` to `true` while keeping `frontier = LessThanEq(w)`.
         terminal: bool,
+        /// Keys that will receive no further write, deduplicated and in no
+        /// meaningful order — it is read as a set (`Value` is not `Ord`, and
+        /// membership is the only question asked of it). A key closes once every writer
+        /// whose write set contains it has finished, never later than the whole store
+        /// and earlier whenever some other writer is still running: a store whose keys
+        /// are written by different blocks closes each key as that block drains.
+        ///
+        /// **Neither axis derives from the other.** A key that is never written
+        /// appears in no delta, so the tile does not know its own key universe and
+        /// cannot read "every key listed here is closed" as "the store is closed".
+        /// They close different things: `terminal` closes the commit-time
+        /// *domain*, `closed_keys` closes a key's *write set*.
+        ///
+        /// Only a per-key **change** stream may reduce on this. A carry-forward
+        /// projection gains a position at every tick, including ticks that wrote
+        /// some other key, so it is closed by `terminal` alone — see
+        /// [`StoreValueStream`](crate::interpreter::commit_operator::StoreValueStream).
+        closed_keys: Vec<Value>,
     },
 }
 
@@ -318,27 +338,36 @@ impl Tile {
             // on. The frontier advances to the union — for the watermark
             // `LessThanEq(w)` this is `LessThanEq(max(w_self, w_other))`; the
             // `terminal` flag ORs (either side declaring the frontier closed closes
-            // it). Mirrors the `SealedFunction` arm sans `deleted`: a store releases
-            // by physically dropping a decided prefix (see `remove_guarded`), never
-            // by logical tombstoning.
+            // it), and `closed_keys` unions for the same reason — closure is
+            // monotone, so a key either side reports closed stays closed. Mirrors
+            // the `SealedFunction` arm sans `deleted`: a store releases by
+            // physically dropping a decided prefix (see `remove_guarded`), never by
+            // logical tombstoning.
             (
                 Tile::Store {
                     changes: s_changes,
                     deltas: s_deltas,
                     frontier: s_frontier,
                     terminal: s_terminal,
+                    closed_keys: s_closed,
                 },
                 Tile::Store {
                     changes: o_changes,
                     deltas: o_deltas,
                     frontier: o_frontier,
                     terminal: o_terminal,
+                    closed_keys: o_closed,
                 },
             ) => {
                 s_changes.append(o_changes);
                 s_deltas.append(o_deltas);
                 *s_frontier = s_frontier.union(&o_frontier);
                 *s_terminal = *s_terminal || o_terminal;
+                for k in o_closed {
+                    if !s_closed.contains(&k) {
+                        s_closed.push(k);
+                    }
+                }
             }
             (s, o) => panic!("Incompatible tiles {s:?} and {o:?}"),
         };

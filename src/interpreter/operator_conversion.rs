@@ -1542,19 +1542,38 @@ fn build_commit_store(
         1 => value_extents.pop().expect("len == 1"),
         _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
+    // Resolve a footprint key's runtime value from its `field_key`.
+    let runtime_key = |n: &Name| Value::String(n.field_key().into());
+
+    // Each writer's static write footprint, so the store can close a key once the
+    // writers that may touch it have finished rather than only when every writer
+    // has. Tap keys ride here too: a reply tap is written by exactly the writer
+    // whose body fires it, so it closes with that writer.
+    let writer_write_keys: Vec<Vec<Value>> = writers
+        .iter()
+        .map(|w| {
+            w.write_keys
+                .iter()
+                .map(runtime_key)
+                .chain(
+                    body_tap_fields(&w.body.ty)
+                        .into_iter()
+                        .map(|(f, _)| Value::String(f.into())),
+                )
+                .collect()
+        })
+        .collect();
+
     let commit = CommitOperator::with_init_ops(
         init_ops,
         key_extent.clone(),
         value_extent.clone(),
-        writers.len(),
+        writer_write_keys,
     );
     let setters: Vec<_> = (0..writers.len())
         .map(|k| commit.writer_input_setter(k))
         .collect();
     let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
-
-    // Resolve a footprint key's runtime value from its `field_key`.
-    let runtime_key = |n: &Name| Value::String(n.field_key().into());
 
     for (set_writer, w) in setters.into_iter().zip(writers.iter()) {
         let item_ty = w.source.ty.codomain().ok_or_else(|| {
@@ -1939,7 +1958,9 @@ fn convert_store_final_read(
 /// Compile a per-variable read `__reg.field` off a registered transactional
 /// store. `plan_loops` wraps a scalar accumulator read in `final_or_default(stream,
 /// init)`, so the current/final value (via [`ExtractFinal`]) is selected
-/// downstream, not here.
+/// downstream, not here. A surface `await_final` is not this read — it is
+/// [`convert_store_final_read`], which samples a settled key rather than projecting a
+/// stream for something else to reduce.
 fn convert_store_read(
     store_name: &Name,
     field: &str,
@@ -1965,11 +1986,15 @@ fn convert_store_read(
         )
     };
     match (kind, key) {
-        // A `Txn` store key: the raw commit history `Fun(Txn, V)` as a
-        // [`StoreValueStream`] over the commit-log map, keyed by `runtime_key`.
-        // A mutable variable carries forward; a reply tap emits only at its write tick.
-        // `transact_phase` wraps a read in `final_or_default(stream, init)`, which
-        // the `FinalOrDefault` arm compiles to `ExtractFinal` — not special-cased here.
+        // A `Txn` store key as a [`StoreValueStream`] over the commit-log map,
+        // keyed by `runtime_key`. A **history** read carries a mutable variable's
+        // value forward across ticks that wrote other keys (a reply tap already
+        // emits only at its write tick). A **completion** read never carries: it
+        // wants the key's last *write*, and the un-carried stream is the one that
+        // closes when this key's writers drain instead of when the whole store
+        // does — which is what makes `await_final(x)` independent of a store-mate
+        // still committing. `final_or_default(stream, init)` then reduces it with
+        // `ExtractFinal`, supplying the seed when the key was never written.
         (StoreReadKind::Commit, Some((runtime_key, value_extent, _, carry_forward))) => {
             Ok(Box::new(StoreValueStream::new(
                 fan.branch(),

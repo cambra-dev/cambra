@@ -280,9 +280,12 @@ impl CommitEngine {
             changes: ColumnValue::from_uints(ticks),
             deltas: ColumnValue::Variants(deltas),
             frontier,
-            // A rendered store is *live* by default; a producer that knows its
-            // writers are finished flips `terminal` (keeping the numeric frontier).
+            // A rendered store is *live* on both closure axes by default: the
+            // engine tracks commits, not writers, so a producer that knows which
+            // of its writers have finished layers `terminal` and `closed_keys` on
+            // top (keeping the numeric frontier).
             terminal: false,
+            closed_keys: Vec::new(),
         }
     }
 }
@@ -748,23 +751,36 @@ pub struct CommitOperator {
     init_ops: Vec<(Value, Box<dyn TileOperator>)>,
     output_tiling: Tiling,
     writer_inputs: Vec<CycleSlot<dyn TileOperator>>,
+    /// Per writer, the keys it may write — its **static** footprint, so a
+    /// conditionally-written key still counts. This is what lets the store close
+    /// a key when the writers that can touch it finish, rather than only when
+    /// every writer does: a key nobody can still write is final even while the
+    /// store keeps committing other keys.
+    writer_write_keys: Vec<Vec<Value>>,
 }
 
 impl CommitOperator {
     /// Create a commit operator whose store starts at `init` (the tick-0 state),
     /// with keys in `key_extent` and values in `value_extent`.
+    ///
+    /// `writer_write_keys[k]` is writer `k`'s **static** write footprint — every
+    /// key that writer might write, whether or not it does on a given attempt.
+    /// Its length is the writer count. See [`Self::writer_write_keys`].
     pub fn new(
         init: HashMap<Value, Value>,
         key_extent: Extent,
         value_extent: Extent,
-        n_writers: usize,
+        writer_write_keys: Vec<Vec<Value>>,
     ) -> Self {
         let output_tiling = full_store_tiling(&key_extent, &value_extent);
         Self {
             init,
             init_ops: Vec::new(),
             output_tiling,
-            writer_inputs: (0..n_writers).map(|_| CycleSlot::new()).collect(),
+            writer_inputs: (0..writer_write_keys.len())
+                .map(|_| CycleSlot::new())
+                .collect(),
+            writer_write_keys,
         }
     }
 
@@ -779,14 +795,17 @@ impl CommitOperator {
         init_ops: Vec<(Value, Box<dyn TileOperator>)>,
         key_extent: Extent,
         value_extent: Extent,
-        n_writers: usize,
+        writer_write_keys: Vec<Vec<Value>>,
     ) -> Self {
         let output_tiling = full_store_tiling(&key_extent, &value_extent);
         Self {
             init: HashMap::new(),
             init_ops,
             output_tiling,
-            writer_inputs: (0..n_writers).map(|_| CycleSlot::new()).collect(),
+            writer_inputs: (0..writer_write_keys.len())
+                .map(|_| CycleSlot::new())
+                .collect(),
+            writer_write_keys,
         }
     }
 
@@ -860,6 +879,7 @@ impl TileOperator for CommitOperator {
             writer_producers,
             consumed: vec![0; n],
             writer_terminal: vec![false; n],
+            writer_write_keys: self.writer_write_keys.clone(),
             engine: CommitEngine::new(init),
             output_tiling: self.output_tiling.clone(),
             drain_start: 0,
@@ -876,6 +896,10 @@ struct CommitProducer {
     /// finished all its transactions). The store is terminal — fully decided,
     /// no more commits coming — once every writer is.
     writer_terminal: Vec<bool>,
+    /// Per writer, the keys it may write ([`CommitOperator::writer_write_keys`]),
+    /// aligned with [`Self::writer_terminal`]. The two together give per-key
+    /// closure: a key is closed once every writer listing it is terminal.
+    writer_write_keys: Vec<Vec<Value>>,
     engine: CommitEngine,
     /// The full-store output tiling — for a debug-time shape check on the
     /// rendered store tile.
@@ -1036,11 +1060,35 @@ impl TileProducer for CommitProducer {
         // A store with **no** writers is trivially terminal (no commit can ever
         // happen) — `all()` over the empty writer set is `true`, which is what we
         // want, so there is no `is_empty()` guard.
-        if self.writer_terminal.iter().all(|&t| t)
-            && let Tile::Store { terminal, .. } = &mut store
+        if let Tile::Store {
+            terminal,
+            closed_keys,
+            ..
+        } = &mut store
         {
-            // Close the frontier (no more commits), keeping its numeric watermark.
-            *terminal = true;
+            if self.writer_terminal.iter().all(|&t| t) {
+                // Close the frontier (no more commits), keeping its numeric watermark.
+                *terminal = true;
+            }
+            // Per-key closure: a key is closed once every writer whose write set
+            // contains it is terminal, which is no later than the whole store and
+            // earlier whenever some other writer is still running. This is what lets
+            // `await_final(x)` settle while a store-mate
+            // is still committing — nothing can write `x` again, so its final
+            // value is fixed. Reported even when the store is terminal, so a
+            // consumer never has to check both axes.
+            let mut closed: Vec<Value> = Vec::new();
+            for k in self.writer_write_keys.iter().flatten() {
+                let done = self
+                    .writer_write_keys
+                    .iter()
+                    .zip(&self.writer_terminal)
+                    .all(|(keys, &t)| t || !keys.contains(k));
+                if done && !closed.contains(k) {
+                    closed.push(k.clone());
+                }
+            }
+            *closed_keys = closed;
         }
         debug_assert!(
             store.check_from(&self.output_tiling),
@@ -1458,17 +1506,26 @@ impl TileProducer for InductionStoreProducer {
 /// time. Each entry is an immutable committed value at a tick, so the stream is
 /// genuinely monotonic (append-only) and needs **no terminal gate** — every
 /// commit is observable the instant it lands, not held back until all writers
-/// finish. Its `domain_predicate` mirrors the store's (`LessThanEq(watermark)`
-/// while committing, `True` once terminal), so terminality flows through.
+/// finish. Its `domain_predicate` is `LessThanEq(watermark)` while the stream is
+/// still growing and `True` once it is closed — which of the store's two closure
+/// axes closes it is decided by `carry_forward`, below.
 ///
-/// This backs the **in-block reply tap** (`out << e` inside a block —
-/// `carry_forward: false`, one entry per commit tick), the **read-your-writes
-/// mutable variable carry** (`carry_forward: true`, the latest write ≤ each tick), and the
-/// **terminal read**: a surface `await_final(x)` reduces this stream with
-/// [`ExtractFinal`](crate::interpreter::tile_operators::ExtractFinal), which resolves
-/// once the store flips `terminal` below. A read fed *out* of a block does not reduce
-/// it — it folds the store as-of via [`AsOf`] instead, sampling an arbitrary commit
-/// position. One stream, two reducers, selected by the term the program wrote.
+/// Three readers, distinguished by what they project:
+///
+/// - the **in-block reply tap** (`out << e` inside a block — `carry_forward:
+///   false`, one entry per commit tick);
+/// - the **read-your-writes mutable variable carry** (`carry_forward: true`, the
+///   latest write ≤ each tick), which gains a position at every tick and so
+///   closes only with the whole store;
+/// - the **terminal read**, a surface `await_final(x)`: `carry_forward: false`,
+///   so it holds just the ticks that wrote `x` and closes as soon as `x`'s own
+///   writers do ([`Tile::Store`]'s `closed_keys`).
+///   [`ExtractFinal`](crate::interpreter::tile_operators::ExtractFinal) then takes
+///   the last of those writes, or the seed if there were none.
+///
+/// A read fed *out* of a block is none of these — it folds the store as-of via
+/// [`AsOf`], sampling an arbitrary commit position. Which reader a program gets
+/// is selected by the term it wrote, never inferred from the reading loop.
 pub struct StoreValueStream {
     tiling: Tiling,
     store_op: Box<dyn TileOperator>,
@@ -1569,23 +1626,36 @@ impl TileProducer for StoreValueStreamProducer {
         // (consumer-driven; no producer-side drive-to-fixpoint). The store's writer
         // steps one commit per pull and re-arms itself on the wakeup queue, which
         // fans through the cyclic `FanOut` to re-pull this stream as commits land;
-        // terminality flows through the store's `terminal` flag below.
+        // terminality flows through the store's closure flags below.
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
-        // Fold the changelog directly. Terminality flows to this stream: a closed
-        // store (`terminal`) yields a `True` output domain predicate so a
-        // downstream terminal read resolves; a live store carries its `LessThanEq`
-        // watermark through.
+        // Fold the changelog directly. A closed stream yields a `True` output
+        // domain predicate so a downstream terminal read resolves; a live one
+        // carries the store's `LessThanEq` watermark through.
         let Tile::Store {
             changes,
             frontier,
             terminal,
+            closed_keys,
             ..
         } = &store
         else {
             return self.tiling().empty_tile();
         };
-        let domain_predicate = if *terminal {
+        // Which closure axis applies follows from the projection, with no mode flag to
+        // set. A **change** stream (`carry_forward: false`) holds only the ticks that
+        // wrote `key`, so it gains nothing once `key` is closed — it may close on the
+        // per-key axis, which is what lets `await_final(x)` settle while a store-mate
+        // still commits. A **carry** stream gains a position at every tick, including
+        // ticks that wrote some other key, so per-key closure would report terminal
+        // while positions are still arriving; only the whole store closing can close
+        // it.
+        let closed = if self.carry_forward {
+            *terminal
+        } else {
+            *terminal || closed_keys.contains(&self.key)
+        };
+        let domain_predicate = if closed {
             Predicate::True
         } else {
             frontier.clone()
@@ -1743,9 +1813,19 @@ impl TileProducer for StoreFinalReadProducer {
         }
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
-        if !store.is_terminal() {
-            // A writer may still commit, so the key has no settled value to report.
-            // An empty scalar is non-terminal, so the consumer pulls again.
+        let settled = match &store {
+            Tile::Store {
+                terminal,
+                closed_keys,
+                ..
+            } => *terminal || closed_keys.contains(&self.key),
+            _ => false,
+        };
+        if !settled {
+            // A writer that can write `key` may still commit, so there is no settled
+            // value to report. An empty scalar is non-terminal, so the consumer pulls
+            // again. The per-key disjunct is what lets this read settle while a
+            // store-mate's writer is still committing.
             return self.tiling().empty_tile();
         }
         // `store_current` bounds the sample at the decided frontier; a key no commit
@@ -3912,6 +3992,14 @@ mod tests {
         pairs.iter().map(|(k, v)| (acct(k), int(*v))).collect()
     }
 
+    /// Writer write-sets where every writer may write every key the store is
+    /// seeded with — true of each engine-level test here, whose writers all
+    /// contend for the same accounts. Per-key closure then coincides with
+    /// whole-store closure, which is what these tests assert on.
+    fn all_writers_write(init: &HashMap<Value, Value>, n_writers: usize) -> Vec<Vec<Value>> {
+        vec![init.keys().cloned().collect(); n_writers]
+    }
+
     /// Position-driven induction: `x := 0; for i in [1,2,3,4]: if i > 2: x += i`.
     /// The guard (`i > 2`) fires at positions 2 and 3; positions 0 and 1 carry.
     /// Modelled as sparse `step`s over the iteration extent — a change only where
@@ -4937,7 +5025,8 @@ mod tests {
         input: Box<dyn TileOperator>,
         init: HashMap<Value, Value>,
     ) -> Box<dyn TileProducer> {
-        let mut op = CommitOperator::new(init, key_extent(), value_extent(), 1);
+        let writes = all_writers_write(&init, 1);
+        let mut op = CommitOperator::new(init, key_extent(), value_extent(), writes);
         (op.writer_input_setter(0))(input);
         let guard = op.tiling().universal_guard();
         op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new())
@@ -5148,7 +5237,9 @@ mod tests {
     /// bootstraps: the body sees the empty cached store and proposes nothing).
     #[test]
     fn single_writer_cycle() {
-        let commit = CommitOperator::new(balances(&[("n", 0)]), key_extent(), value_extent(), 1);
+        let init = balances(&[("n", 0)]);
+        let writes = all_writers_write(&init, 1);
+        let commit = CommitOperator::new(init, key_extent(), value_extent(), writes);
         let set_writer = commit.writer_input_setter(0);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         // The body reads a branch of the store (the operator's own output).
@@ -5244,11 +5335,14 @@ mod tests {
         draws: &[&[i64]],
     ) -> (Rc<FanOut>, Vec<Rc<RefCell<DriverObservation>>>) {
         let pool = acct("pool");
+        // Every writer's static footprint is the one shared key — which is what
+        // makes them contend, and what keeps the store from closing `pool` until
+        // the last of them finishes.
         let commit = CommitOperator::new(
             balances(&[("pool", init)]),
             key_extent(),
             value_extent(),
-            draws.len(),
+            vec![vec![pool.clone()]; draws.len()],
         );
         let setters: Vec<_> = (0..draws.len())
             .map(|w| commit.writer_input_setter(w))
@@ -5545,8 +5639,13 @@ mod tests {
     /// and denies locally. The pool never goes negative: it ends at 30.
     #[test]
     fn token_pool_two_writers() {
-        let commit =
-            CommitOperator::new(balances(&[("pool", 100)]), key_extent(), value_extent(), 2);
+        let pool_init = balances(&[("pool", 100)]);
+        let commit = CommitOperator::new(
+            pool_init.clone(),
+            key_extent(),
+            value_extent(),
+            all_writers_write(&pool_init, 2),
+        );
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
@@ -5590,8 +5689,13 @@ mod tests {
     /// it fits the pool it read, so the pool never goes negative or exceeds 100.
     #[test]
     fn token_pool_multi_request() {
-        let commit =
-            CommitOperator::new(balances(&[("pool", 100)]), key_extent(), value_extent(), 2);
+        let pool_init = balances(&[("pool", 100)]);
+        let commit = CommitOperator::new(
+            pool_init.clone(),
+            key_extent(),
+            value_extent(),
+            all_writers_write(&pool_init, 2),
+        );
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
@@ -5715,7 +5819,9 @@ mod tests {
     /// without waiting for the writer to finish.
     #[test]
     fn read_as_of_resolves_at_watermark() {
-        let commit = CommitOperator::new(balances(&[("n", 0)]), key_extent(), value_extent(), 1);
+        let init = balances(&[("n", 0)]);
+        let writes = all_writers_write(&init, 1);
+        let commit = CommitOperator::new(init, key_extent(), value_extent(), writes);
         let set_writer = commit.writer_input_setter(0);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         set_writer(Box::new(CounterBody::new(store_fan.branch(), acct("n"), 3)));
@@ -5842,7 +5948,8 @@ mod tests {
         b: Vec<(Value, Value, i64)>,
         pulls: usize,
     ) -> Tile {
-        let commit = CommitOperator::new(init, key_extent(), value_extent(), 2);
+        let writes = all_writers_write(&init, 2);
+        let commit = CommitOperator::new(init, key_extent(), value_extent(), writes);
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
@@ -6067,6 +6174,7 @@ mod tests {
             deltas: ColumnValue::Variants(vec![]),
             frontier: Predicate::LessThanEq(Value::UInt(0)),
             terminal: false,
+            closed_keys: Vec::new(),
         };
         assert_eq!(store_frontier(&undecided), None);
     }
@@ -6138,6 +6246,7 @@ mod tests {
             deltas,
             frontier,
             terminal: false,
+            closed_keys: Vec::new(),
         };
         assert!(validate_tile(&tile), "store_tile built an invalid tile");
         tile
@@ -6292,6 +6401,7 @@ mod tests {
             deltas: ColumnValue::Variants(vec![map_to_value(&balances(&[("a", 1)]))]),
             frontier: Predicate::False,
             terminal: false,
+            closed_keys: Vec::new(),
         }));
         // Non-ascending change ticks.
         assert!(!validate_tile(&Tile::Store {
@@ -6302,6 +6412,7 @@ mod tests {
             ]),
             frontier: Predicate::False,
             terminal: false,
+            closed_keys: Vec::new(),
         }));
     }
     /// A `Memo` over a dense read of a *live* store must never cache a value the
