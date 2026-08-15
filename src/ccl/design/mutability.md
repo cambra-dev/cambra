@@ -826,11 +826,13 @@ causal matcher (`letrec::check_letrec_causal`).
   position is arbitrary whatever the trigger's domain, and a program that means the final value
   spells it [`await_final`](#await_final).
 - **`StoreValueStream`** — projects one key's `CommitTs ⇀ V` commit-value stream by folding the
-  store changelog. It backs the **in-block reply tap** (`out << e` inside a block — a per-commit,
-  commit-tick-indexed event stream), is the fold `AsOf` samples, and is what `ExtractFinal` reduces
-  for an [`await_final`](#await_final) — no new engine, the same `final_or_default → ExtractFinal`
-  path a post-loop **induction** accumulator and a **broadcast source** (a sibling loop's final, fed
-  into a commit decision) already take, applied to a `Txn` history.
+  store changelog, on either of two axes selected by `carry_forward`: the **carry** stream (a
+  position at every commit tick) backs the **in-block reply tap** (`out << e` inside a block) and is
+  the fold `AsOf` samples; the **change** stream (only the ticks that wrote the key) is what
+  `ExtractFinal` reduces for an [`await_final`](#await_final), which is how that read closes when the
+  key's own writers do. No new engine either way — the same `final_or_default → ExtractFinal` path a
+  post-loop **induction** accumulator and a **broadcast source** (a sibling loop's final, fed into a
+  commit decision) already take, applied to a `Txn` history.
 
 The two loop engines are **not interchangeable**: the commit operator is built for an open commit
 clock and mis-drives an incremental/live source, while the induction accumulator is the ordered loop recurrence.
@@ -979,12 +981,20 @@ That operator takes the same sample the fed-out as-of read does, through the sam
 the two differ in what fixes the position — a trigger's arrival there, the store's own closure here.
 Neither term carries a seed operand, because tick 0 of every store is its keys' seeds.
 
-Completion is **coarser than the contract**: `StoreFinalRead` waits for the whole store, so an
-await settles once every writer of the *store* has drained rather than every writer of `𝑥`, and a
-variable whose own writers are finite waits on a store-mate's live writer. Closing the gap takes one
-fact and one disjunct: the store publishes which keys can no longer be written, computed from the
-per-writer write footprints `WriterSite::write_keys` holds at the CCL level, and the operator's gate
-becomes that fact or the store's own closure.
+**Completion is per key, not per store.** A store closes a key once every writer whose *static*
+write footprint contains it has drained — `Tile::Store`'s `closed_keys`, computed over the store's
+own keys from the per-writer write sets `CommitOperator` is built with. That is never later than the
+store's own `terminal`, which waits for every writer, and earlier whenever a writer that cannot
+write the key is still running. `StoreFinalRead`'s gate is that fact or the store's closure, so
+`await_final(𝑥)` settles while a variable `𝑥` shares a block with is still committing, which is
+what the contract asks for. The static footprint is the right input: a conditional write
+(`if 𝑝: 𝑥 := …`) keeps `𝑥` in its block's footprint, so a block that *might* write it keeps it
+open.
+
+No projection reduces on that fact. Every projection of a key's history gains a position at a tick
+the store allocates, so nothing narrower than `terminal` says its positions are done. Per-key
+closure is a statement about the key, which the terminal read consults directly rather than through
+some stream's `domain_predicate`.
 
 A key **no writer site writes** never reaches the operator. `resolve_writer_free_awaits` replaces
 its await with its seed, its write history being statically empty. That covers a variable no block

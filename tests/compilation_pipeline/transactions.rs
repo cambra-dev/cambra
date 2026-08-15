@@ -1706,12 +1706,11 @@ fn a_cross_domain_accumulator_depending_on_an_await_nests_inside_that_store() {
 
 /// A finite mutable variable completes even though an unrelated one never does.
 ///
-/// `b` is driven by a live source that never ends, so its store never reports terminal
-/// and `await_final(b)` cannot resolve — correctly, since there is no final value to
-/// report. `a`'s writers are a finite loop and nothing relates the two, so `a`'s store is
-/// its own and its completion read *does* resolve. A store is terminal only when *every*
-/// one of its writers has drained, so neither read would settle if `a` and `b` were keys
-/// of one store.
+/// `b` is driven by a live source that never ends, so `await_final(b)` cannot resolve —
+/// correctly, since there is no final value to report. `a`'s writers are a finite loop,
+/// so its completion read resolves, unlike `b`'s. The companion
+/// `a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with` is the
+/// same claim where the two are keys of one store, which is the harder half.
 ///
 /// The two halves of the reply are the assertion: one settles, the other stays
 /// unresolved, in the same program and the same pull.
@@ -1763,6 +1762,71 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     assert!(
         fields.get("_1").is_some_and(Tile::is_empty),
         "the live mutable variable has no final value to report; got {result:?}"
+    );
+}
+
+/// The same claim where the two variables are **keys of one store**: a block writes both,
+/// so they share a commit clock, and `b` then gets a second writer off a live source.
+/// Nothing can write `a` after the finite loop drains, so `await_final(a)` settles —
+/// completion is a property of `a`'s own writers, not of every writer that commits
+/// alongside it (the CHL spec, "`await_final`").
+///
+/// This is the case store-level completion got wrong: `Txn[a,b]` is one store, one
+/// `terminal` flag, and that flag stays false forever because `b`'s writer is live. The
+/// store-count assertion is what pins the two variables together — without it the
+/// program could pass by being partitioned rather than by closing per key.
+#[test]
+fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
+    let code = indoc! {r#"
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                a := a + x
+                b := b + x
+        for req in source1():
+            with begin():
+                b := b + req
+        (await_final(a), await_final(b))
+    "#};
+
+    let mut ctx = GlobalContext::default();
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(src.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    assert_eq!(
+        stores_in(&compiled.ast),
+        vec!["Txn[a,b]"],
+        "the shared block must put both keys in one store, or this tests nothing"
+    );
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let ug = producer.tiling().universal_guard();
+
+    src.borrow_mut()
+        .add_data(&[(Value::UInt(0), Value::Int(100))]);
+    ctx.scheduler().check_for_notifications();
+    let mut result = producer.get(ug.clone());
+    for _ in 0..64 {
+        result = producer.get(ug.clone());
+    }
+
+    let Tile::Record(fields) = &result else {
+        panic!("expected a record of both replies, got {result:?}");
+    };
+    assert_eq!(
+        fields.get("_0"),
+        Some(&Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        "`a`'s writers have all drained, so its completion read must settle even though \
+         its store-mate `b` is still committing; got {result:?}"
+    );
+    assert!(
+        fields.get("_1").is_some_and(Tile::is_empty),
+        "`b` still has a live writer, so it has no final value to report; got {result:?}"
     );
 }
 
