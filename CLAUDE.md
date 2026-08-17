@@ -206,7 +206,7 @@ When you are using compact, focus on test output and code changes.
 - When making changes, verify the freshness of the local repo by fetching and comparing the diff. The following commands do this, if there are differences, warn the user and ask the user whether they would like to pull or rebase.
    1. `git fetch origin`
    2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
-- Writing a PR description — or a commit description, which `gh pr create --fill` copies into the body verbatim — is the `pr-description` skill's job (`.claude/skills/pr-description/SKILL.md`): summary first, then a review guide, sub-linear length, the Markdown mechanics, and the `gh api` workaround for editing a posted body. Load it rather than working from memory.
+- Writing a PR title and description — or a commit description, which `gh pr create --fill` copies into the body verbatim — is the `pr-description` skill's job (`.claude/skills/pr-description/SKILL.md`): draft it cold in a subagent, an imperative title, summary first, then a review guide, sub-linear length, the Markdown mechanics, and the `gh api` workaround for editing a posted title and body. Load it rather than working from memory.
 
 ### Stack Management & Rebasing (jj vs git-spice)
 

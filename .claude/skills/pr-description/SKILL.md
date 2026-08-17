@@ -1,13 +1,41 @@
 ---
 name: pr-description
-description: Write or revise a pull-request description, or the commit description that becomes one (`gh pr create --fill` copies it verbatim). Use when creating a PR, writing a commit message that will become a PR body, or editing an existing PR body.
+description: Write or revise a pull-request title and description, or the commit description that becomes one (`gh pr create --fill` copies it verbatim). Use when creating a PR, writing a commit message that will become a PR body, or editing an existing PR title or body.
 ---
 
 # PR descriptions
 
 A PR body is a map for the reviewer.
 
-## The rules
+## Draft it cold
+
+**Delegate the drafting to a fresh reader.** If you authored the change, spawn a subagent to write the title and body: hand it the PR number or the commit range, and pass along *nothing else* about how the work went. Relay its draft rather than rewriting it from your own understanding of the change.
+
+The author is the worst-placed person to describe a change. You know why every hunk exists, so you write from the shape of the investigation and in the vocabulary you invented while working — neither of which the reviewer has. A reader holding only the diff can write only what the diff supports, which is exactly what the reviewer will be holding.
+
+Keep the fresh reader cold in two ways:
+
+- **When rewriting an existing description, tell the subagent not to read the current title or body.** A weak description anchors its own rewrite on the framing you are trying to escape.
+- **Read the diff with `gh pr diff <n>`, not `gh pr diff --patch <n>`.** `--patch` prefixes the commit message, and under `gh pr create --fill` the commit message *is* the existing body — so a draft meant to be blind has already read the text it replaces.
+
+When you cannot delegate, hold to the same discipline directly: work from the diff and the files it touches, and treat any sentence you could not have written from the diff alone as suspect.
+
+## The title
+
+**The title is an imperative that summarizes the change** — it completes "this PR will ___". The reader learns what the change does to the codebase, plus enough mechanism to tell it apart from a neighboring PR.
+
+Do **not** state the new behavior as a fact in the present tense. It reads as a claim about how things already are, so the outcome and the change become indistinguishable, and the mechanism gets forced into a colon-clause tail:
+
+| Instead of | Write |
+|---|---|
+| "Partition collapse composes: replace the bridge arm with normalize-then-recurse" | "Make partition-domain subtyping transitive by normalizing before comparing" |
+| "`constrain_go` asserts the uniquely-keyed invariant it rests on" | "Assert the uniquely-keyed invariant `constrain_go` rests on" |
+
+The title obeys the body's rules too: it stands alone, and it uses the reviewer's terms rather than the ones the work invented. A title that only parses *after* the review orients nobody.
+
+**Revising a description means revising the title.** Leaving the title behind is the more misleading half of a stale PR — it is what shows up in the PR list, in notifications, and in `git log` once the squash-merge takes it.
+
+## The body
 
 **Open with a summary that stands alone** — one paragraph, before the first heading: **why** (the problem in terms the reviewer can understand), **what** (a concise description of the change), **so what** (the impact of the change). A reader who stops there should be able to say what the PR does and why it exists. An opening that starts mid-mechanism fails that test; that sentence is the second paragraph's job.
 
@@ -48,13 +76,16 @@ PRs here are often created with `gh pr create --fill`, so the PR body is the com
 Write three revisions before posting. A description is read by every reviewer and then survives as the commit message, so it earns the extra passes:
 
 1. **Draft** from the diff.
-2. **Check against the rules.** Does the opening stand alone? Is the section order a reading order? Is anything durable stated only here — or restated here from a comment the diff itself adds? Then count the words and compare against the budget; if the draft is over, the cut comes from what the codebase already says, not from the reviewer's map.
+2. **Check against the rules.** Is the title an imperative? Does the opening stand alone? Is the section order a reading order? Is anything durable stated only here — or restated here from a comment the diff itself adds? Then count the words and compare against the budget; if the draft is over, the cut comes from what the codebase already says, not from the reviewer's map.
 3. **Check against the diff.** Re-verify every name, count, and list. A compression pass introduces factual errors more readily than a draft does — an over-cut description that says a pass is affected when the diff exempts it is worse than a long one.
 
 ## Posting and updating
 
-`gh pr edit --body` fails with exit code 1 on a Projects (classic) deprecation warning even when the update succeeds. Use the REST API:
+`gh pr edit` fails with exit code 1 on a Projects (classic) deprecation warning even when the update succeeds. Use the REST API, and PATCH the title alongside the body:
 
 ```bash
-gh api repos/OWNER/REPO/pulls/PR_NUMBER --method PATCH --field body="..." --jq .number
+gh api repos/OWNER/REPO/pulls/PR_NUMBER --method PATCH \
+  --field title="..." --field body="$(cat body.md)" --jq '{number,title}'
 ```
+
+Read the result back (`gh pr view N --json title,body`) — a PATCH that lands still leaves the branch's own commit message untouched, which is harmless here (a squash-merge takes the PR's title and body, not the branch commit's) but worth saying out loud rather than leaving the author to discover the two have diverged.
