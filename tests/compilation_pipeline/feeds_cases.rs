@@ -420,7 +420,14 @@ x"#;
         rendered.contains("Int") && rendered.contains("String"),
         "expected the conflicting element types in the message, got:\n{rendered}"
     );
-    for artifact in ["__floated", "to_x", "__scope_out", "⊎", "CollectionUnion"] {
+    for artifact in [
+        "__floated",
+        "to_x",
+        "__scope_out",
+        "⊎",
+        "Copair",
+        "DisjointJoin",
+    ] {
         assert!(
             !rendered.contains(artifact),
             "desugar artifact `{artifact}` leaked into a user-facing type error:\n{rendered}"

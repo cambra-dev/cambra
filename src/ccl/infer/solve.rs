@@ -1101,7 +1101,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         TypedExprNode::List(elts)
         | TypedExprNode::Tuple(elts)
-        | TypedExprNode::CollectionUnion(elts) => {
+        | TypedExprNode::Copair(elts)
+        | TypedExprNode::DisjointJoin(elts) => {
             for e in elts.iter_mut() {
                 coalesce_node(e, level, ctx);
             }

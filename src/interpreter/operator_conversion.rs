@@ -433,7 +433,7 @@ impl OpConversionContext {
             // discriminates by tag position, so the tags carry no
             // additional dispatch information here; payloads lower to an
             // `Extent::Union`. This covers both the anonymous positional
-            // sums that `++`/CollectionUnion produces (all `Index` tags)
+            // sums that `++`/`Copair` produces (all `Index` tags)
             // and named source-level variants. The tags carry through: they are
             // the arm identities every union column and predicate is keyed by.
             Type::Variant(tags) => {
@@ -705,37 +705,50 @@ fn convert_impl_inner(
         // and preserved through lambda elimination (top-level path).
         // Compiles directly to a `UnionOperator` over the N operand
         // collections.
-        TypedExprNode::CollectionUnion(operands) => {
+        TypedExprNode::Copair(operands) => {
             if operands.len() < 2 {
                 return Err(ConversionError::Unsupported(format!(
-                    "collection_union expects at least 2 inputs, got {}",
+                    "copair expects at least 2 inputs, got {}",
                     operands.len()
                 )));
             }
-            union_operand_ops(operands, input, ctx)
+            union_operand_ops(operands, UnionShape::Copair, input, ctx)
         }
 
-        // `Apply(Tuple(ops), Builtin::CollectionUnion)` — the point-free
+        // A **disjoint join**: the operands are partial collections over one domain,
+        // so the result stays on that domain (`UnionOperator::new_flat`) rather than
+        // on a coproduct of their domains. The node says which operation this is, so
+        // nothing has to be re-derived here — see [`UnionShape`].
+        TypedExprNode::DisjointJoin(operands) => {
+            if operands.is_empty() {
+                return Err(ConversionError::Unsupported(
+                    "disjoint_join expects at least one operand".to_string(),
+                ));
+            }
+            union_operand_ops(operands, UnionShape::DisjointJoin, input, ctx)
+        }
+
+        // `Apply(Tuple(ops), Builtin::Copair)` — the point-free
         // function-form, produced by lambda elimination when a
-        // `CollectionUnion` appears inside a lambda body whose operands
+        // `Copair` appears inside a lambda body whose operands
         // reference the lambda parameter.  Same `UnionOperator` output as
         // the top-level node above.
         TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::CollectionUnion) =>
+            if as_builtin(function) == Some(Builtin::Copair) =>
         {
             let TypedExprNode::Tuple(elts) = &argument.node else {
                 return Err(ConversionError::Unsupported(format!(
-                    "collection_union expects a Tuple argument, got {:?}",
+                    "copair expects a Tuple argument, got {:?}",
                     argument.node
                 )));
             };
             if elts.len() < 2 {
                 return Err(ConversionError::Unsupported(format!(
-                    "collection_union expects at least 2 inputs, got {}",
+                    "copair expects at least 2 inputs, got {}",
                     elts.len()
                 )));
             }
-            union_operand_ops(elts, input, ctx)
+            union_operand_ops(elts, UnionShape::Copair, input, ctx)
         }
 
         // `as_of((trigger, source))` — the live cross-endpoint read. For each
@@ -1236,6 +1249,7 @@ fn expect_no_input(
 }
 
 /// Compile a list literal to a [`Constant`] holding a `Value::Function` binding table.
+///
 fn compile_list_fn(elts: &[Expr]) -> Result<Box<dyn TileOperator>, ConversionError> {
     let mut bindings = Vec::with_capacity(elts.len());
     let mut elt_extent = Extent::Base(BaseType::Unit);
@@ -1891,18 +1905,22 @@ fn apply_binop(
     )))
 }
 
-/// Build the `UnionOperator` for a `CollectionUnion`. With no input (the top-level
-/// / comprehension union, or a Σ / C-form dispatch), each operand is a
-/// self-contained collection and the union is **tagged** (`UnionOperator::new`) —
-/// distinct-extent arms keep their `Extent::Union` domain, which `final_or_default`
-/// dispatches over. With a **fed input** — a value-`Case` fan-out inside a writer
-/// body (`⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)`) — fan the input to every operand (each
-/// filters its own branch of the same element stream) and **flat-merge**
-/// (`UnionOperator::new_flat`): the arms share one domain extent and disjoint
-/// positions, so the union stays on that extent and co-iterates with the sibling
-/// `commit` field of the decision record.
+/// Which of the two collection-combining operations a union node denotes.
+///
+/// Read off the node rather than inferred: `Copair` is a **copairing** (operands
+/// over distinct index sets, result on their coproduct) and `DisjointJoin` is a
+/// **join of partial maps over one domain** (result on that domain, defined only
+/// where the operands are disjoint). Input-presence does not distinguish them — it
+/// decides only *how* the operands are wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnionShape {
+    Copair,
+    DisjointJoin,
+}
+
 fn union_operand_ops(
     operands: &[Expr],
+    shape: UnionShape,
     input: Option<Box<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
@@ -1912,9 +1930,31 @@ fn union_operand_ops(
                 .iter()
                 .map(|e| convert_impl(e, None, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Box::new(UnionOperator::new(ops)))
+            Ok(match shape {
+                UnionShape::Copair => Box::new(UnionOperator::new(ops)) as Box<dyn TileOperator>,
+                UnionShape::DisjointJoin => Box::new(UnionOperator::new_flat(ops)),
+            })
         }
+        // A **fed** union: fan the input to every operand (each restricts its own
+        // branch of the same element stream) and flat-merge, so the result stays on
+        // that one extent and co-iterates with a sibling field — the writer-body
+        // fan-out `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)`, and the `match` fan-out.
+        //
+        // That is a **disjoint join**, and only a disjoint join: a flat merge
+        // reassembles one domain, which is not what a copairing denotes. A fed
+        // `Copair` would have to keep its arms tagged apart, and nothing builds one
+        // today — no program reaches here (`Builtin::Copair` requires a `++` inside a
+        // lambda over the parameter, which fails upstream at the post-elim
+        // typecheck). Rather than compile it as the operation it is not, say so.
         Some(inp) => {
+            if shape == UnionShape::Copair {
+                return Err(ConversionError::Unsupported(
+                    "a fed copairing: its arms are over distinct index sets, so they \
+                     cannot flat-merge back onto one domain, and no tagged fed form \
+                     is built yet"
+                        .to_string(),
+                ));
+            }
             // `Memo` the shared fed input so the fan's branches (one per arm) stay
             // consistent under a re-entrant / per-proposal driver.
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(inp))));
