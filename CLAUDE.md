@@ -64,6 +64,54 @@ Specific decision points where this matters:
 
 - **Defensive checks at internal boundaries.** Add `debug_assert!`, `unreachable!`, and explicit invariant checks at pass boundaries and between modules where load-bearing assumptions live. Don't go overboard — assertions that just restate what the type system already enforces are noise. Add them where the invariant is real but not type-enforced: pass output shapes, module-boundary preconditions, post-conditions on internal helpers. Name what the invariant *is* in the assertion message.
 
+### Prose style: specifications, not blog posts
+
+Design docs, code and doc comments, PR descriptions, commit messages, and answers in chat are
+specification prose. The reader arrives to look one thing up and already knows they need it, so lead
+with the claim and stop. Blog-post habits cost that reader time on every visit: building to a point,
+keeping the reader company, admiring the design.
+
+- **The conclusion is the first sentence.** No scene-setting, no reveal, no "it turns out".
+- **Cut sentences that only announce another sentence.** "There are two problems here." "Let's look
+  at how this works."
+- **State what the code does, in the present tense.** No tour, no `we`, no second person.
+- **No hedges, intensifiers, or significance claims.** A claim needing a hedge needs a bound
+  instead: "at most one", not "usually only one" — a vague quantifier is an unwritten invariant.
+- **No stress italics.** Italicizing `is` or `not` puts a speaking voice in the text; name the
+  contrast in words instead.
+- **A design doc records a decision rather than arguing for it.** Prose answering an objection
+  nobody raised is argument; state the invariant instead.
+- **One claim per sentence, with the claim in the main clause.** Content stacked into em-dash asides
+  makes the reader reassemble it from fragments; asides are for genuine parentheticals.
+- **One name per concept.** Use the name the codebase already gives it rather than coining a second
+  one or reaching for a synonym to avoid repetition; where nothing names it, describe the mechanism.
+  A coined term spreads into other files, and then into identifiers, before anything defines it.
+  Coinage you find already spread is a finding to report, not a decision to make: raise it in the
+  session where you find it, convert what the change touches, and leave the rest to the author.
+- **Every claim is checkable.** Name the code, test, or doc heading that makes it so, or label the
+  conjecture.
+
+Length follows from these rules rather than being a separate target. `docs/operational-semantics/`
+is written this way and is the exemplar to imitate; the dense design docs under `src/ccl/design/`
+are not, so take facts from them and not sentence shape. When editing a passage written in the older
+style, convert it rather than matching it.
+
+None of this is mechanically checkable, and a word-level gate would report dash counts as if they
+were quality. Before writing or revising a doc section or a comment, load the `spec-prose` skill
+(`.claude/skills/spec-prose/SKILL.md`): it carries the before/after pairs, the voice failures, and
+the read-back list. `.claude/hooks/prose-check.py` points at that skill when an Edit or Write adds
+prose, once per file per session, and judges nothing.
+
+### Hard-wrap Markdown at 100 columns
+
+Prose in a `.md` file wraps at 100 columns. A soft-wrapped paragraph is one long line, so editing a
+clause rewrites the whole paragraph in the diff and a review comment can only attach to all of it.
+
+Wrap the prose and leave the structure alone: headings, tables, fenced code, YAML frontmatter, and
+link targets stay on one line, because a wrap changes what several of them mean. Commit messages and
+PR descriptions are the exception — GitHub renders a wrap inside a paragraph as a ragged line break,
+so they stay soft-wrapped (`.claude/skills/pr-description/SKILL.md`).
+
 ### Code Comments
 
 Comment when the *why* is non-obvious — a hidden constraint, a load-bearing invariant, an unusual choice, behavior that would surprise a reader. Skip comments when a good name and a clear signature already convey the intent. Follow rustdoc best practices for public items; don't manufacture docstrings to hit a coverage target.
