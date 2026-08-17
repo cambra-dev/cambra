@@ -59,8 +59,8 @@ use chumsky::prelude::*;
 use smol_str::SmolStr;
 
 use crate::chl_parser::ast::{
-    AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, Comprehension, Expr, IfBranch, Lit,
-    Module, Param, RecordField, Span, Spanned, Stmt, UnaryOp,
+    AnnotationMode, AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, Comprehension, Expr,
+    IfBranch, Lit, Module, Param, RecordField, Span, Spanned, Stmt, TypeAnnotation, UnaryOp,
 };
 use crate::chl_parser::lexer::{self, Token};
 
@@ -918,10 +918,21 @@ where
             });
 
         // ---- def name(params): body ---------------------------------
+        // `x: T` (exact) or `x <: T` (bounded) — the mode is the only difference.
+        let annotation_mode = choice((
+            just(Token::Colon).to(AnnotationMode::Exact),
+            just(Token::LtColon).to(AnnotationMode::Bounded),
+        ));
         let param = select! { Token::Ident(s) => s }
             .map_with(|s, e| (s, e.span()))
             .labelled("parameter name")
-            .then(just(Token::Colon).ignore_then(expr.clone()).or_not())
+            .then(
+                annotation_mode
+                    .clone()
+                    .then(expr.clone())
+                    .map(|(mode, ty)| TypeAnnotation { mode, ty })
+                    .or_not(),
+            )
             .map(|((name, name_span), annotation)| Param {
                 name,
                 name_span,
@@ -984,10 +995,12 @@ where
                 just(Token::Eq)
                     .ignore_then(expr.clone())
                     .map(AssignTail::Plain),
-                // `: ty = value` (immutable) or `: ty := value` (mutable): parse
-                // the annotation, then branch on the assignment operator.
-                just(Token::Colon)
-                    .ignore_then(expr.clone())
+                // An annotated binding: `: ty` (exact) or `<: ty` (bounded),
+                // then `=` (immutable) or `:=` (mutable). The annotation's mode
+                // and the assignment operator are independent choices.
+                annotation_mode
+                    .then(expr.clone())
+                    .map(|(mode, ty)| TypeAnnotation { mode, ty })
                     .then(choice((
                         just(Token::Eq)
                             .ignore_then(expr.clone())
@@ -1124,12 +1137,13 @@ where
 #[derive(Clone)]
 enum AssignTail {
     Plain(Spanned<Expr>),
-    Annotated(Spanned<Expr>, Spanned<Expr>),
+    /// `: ty = value` / `<: ty = value` — an annotated immutable binding.
+    Annotated(TypeAnnotation, Spanned<Expr>),
     /// `:= value` — a bare mutable assignment (`MutAssign` with no annotation).
     MutPlain(Spanned<Expr>),
-    /// `: ty := value` — an annotated mutable assignment (`MutAssign` carrying
-    /// the annotation, e.g. `Mut(V, Txn)`).
-    MutAnnotated(Spanned<Expr>, Spanned<Expr>),
+    /// `: ty := value` / `<: ty := value` — an annotated mutable assignment
+    /// (`MutAssign` carrying the annotation, e.g. `Mut(V, Txn)`).
+    MutAnnotated(TypeAnnotation, Spanned<Expr>),
     Aug(AugOp, Spanned<Expr>),
     Define(Spanned<Expr>),
     None,

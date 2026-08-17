@@ -162,14 +162,14 @@ pub enum Stmt {
         value: Spanned<Expr>,
     },
 
-    /// Annotated assignment: `target: ty = value`.
+    /// Annotated assignment: `target: ty = value` or `target <: ty = value`.
     ///
     /// CHL (unlike Python) requires a value; bare annotations are a parse
-    /// error. `ty` is itself an [`Expr`] (Python's type expressions are
+    /// error. The annotation type is itself an [`Expr`] (type expressions are
     /// arbitrary expressions); interpretation lives in lowering.
     AnnAssign {
         target: Spanned<AssignTarget>,
-        annotation: Spanned<Expr>,
+        annotation: TypeAnnotation,
         value: Spanned<Expr>,
     },
 
@@ -189,7 +189,7 @@ pub enum Stmt {
     /// mutable variable (the annotation carries the `Txn` domain, exactly as before).
     MutAssign {
         target: Spanned<AssignTarget>,
-        annotation: Option<Spanned<Expr>>,
+        annotation: Option<TypeAnnotation>,
         value: Spanned<Expr>,
     },
 
@@ -266,7 +266,33 @@ pub struct IfBranch {
 pub struct Param {
     pub name: SmolStr,
     pub name_span: Span,
-    pub annotation: Option<Spanned<Expr>>,
+    pub annotation: Option<TypeAnnotation>,
+}
+
+/// A user-written type annotation at a binder, and which of the two readings it
+/// asks for.
+///
+/// The two spellings differ only in the mode; the type expression is parsed
+/// identically. Lowering turns [`AnnotationMode::Bounded`] into a
+/// [`crate::ccl::Type::BoundedHole`] wrapper and leaves `Exact` bare.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeAnnotation {
+    pub mode: AnnotationMode,
+    pub ty: Spanned<Expr>,
+}
+
+/// Which reading a binder annotation asks for.
+///
+/// Spec: `docs/chl-spec.md`, "Two annotation forms: exact and bounded".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationMode {
+    /// `x: T` — the binder's type **is** `T`. The initializer (or argument) must
+    /// be a subtype of `T`, and nothing downstream of the binder sees more than
+    /// `T`.
+    Exact,
+    /// `x <: T` — the binder's type is *inferred*, with `T` as an upper bound.
+    /// The value's own type flows through.
+    Bounded,
 }
 
 /// The left-hand side of an assignment, augmented assignment, defer-define,

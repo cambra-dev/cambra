@@ -639,19 +639,13 @@ fn mut_annotation_with_non_txn_domain_rejected() {
 /// annotation says nothing about whether it introduces a mutable variable. Gating on the
 /// annotation instead accepted the bare `y := 0` — which then fell back to a
 /// per-iteration shadowing `let`, silently discarding each update at the iteration
-/// boundary, the very thing `:=` exists to avoid.
+/// boundary, the very thing `:=` exists to avoid. (The spellings are the ones a
+/// `:=` binder accepts at all — see `mut_decl_annotation_is_exact_and_is_a_mut`.)
 #[rstest]
 #[case::annotated_mut(indoc! {r#"
     t := 0
     for i in [1, 2, 3]:
         y: Mut(Int) := i
-        t += y
-    t
-"#})]
-#[case::annotated_value(indoc! {r#"
-    t := 0
-    for i in [1, 2, 3]:
-        y: Int := i
         t += y
     t
 "#})]
@@ -662,8 +656,64 @@ fn mut_annotation_with_non_txn_domain_rejected() {
         t += y
     t
 "#})]
-fn mut_var_declared_inside_loop_rejected(#[case] code: &str) {
+#[case::annotated_txn(indoc! {r#"
+    t := 0
+    for i in [1, 2, 3]:
+        y: Mut(Int, Txn) := i
+        t += y
+    t
+"#})]
+fn register_declared_inside_loop_rejected(#[case] code: &str) {
     expect_compile_error(code, "introduced inside a for-loop body");
+}
+
+/// An annotation on a `:=` binder is **exact** and is a **`Mut(…)`**. Both halves
+/// are rejections rather than reinterpretations, and they share one diagnostic
+/// because they share one remedy.
+///
+/// A plain value type names the wrong thing — `y: Int := 0` binds `y` at
+/// `Mut(Int, D)`, not at `Int`, so reading the annotation as the value type would
+/// make `:` mean something at a `:=` binder that it means at no other. And `<:`
+/// claims nothing `:` does not: `Type::History` is invariant in both payloads, so
+/// the only type below `Mut(V, D)` is `Mut(V, D)` itself.
+#[rstest]
+#[case::bare_value_exact("y: Int := 0\ny")]
+#[case::bare_value_bounded("y <: Int := 0\ny")]
+#[case::mut_bounded("y <: Mut(Int) := 0\ny")]
+#[case::mut_txn_bounded("y <: Mut(Int, Txn) := 0\ny")]
+fn mut_decl_annotation_is_exact_and_is_a_mut(#[case] code: &str) {
+    expect_compile_error(code, "is not a valid mutable-variable annotation");
+}
+
+/// The remedy the diagnostic names is the one that compiles, in both the plain and
+/// the transactional case — the rejection is not hiding a second problem.
+#[test]
+fn the_exact_mut_spelling_the_diagnostic_names_compiles() {
+    check_scalar(
+        indoc! {r#"
+            y: Mut(Int) := 0
+            y += 5
+            y
+        "#},
+        cambra::interpreter::Value::Int(5),
+    );
+}
+
+/// A `Mut(…)` annotation is exact wherever it is written, so the same invariance
+/// argument rejects a bounded pass-by-reference parameter.
+#[test]
+fn a_bounded_mut_param_is_rejected() {
+    expect_compile_error(
+        indoc! {r#"
+            def bump(c <: Mut(Int)):
+                c := c + 1
+            cnt: Mut(Int) := 0
+            for i in [1, 2, 3]:
+                bump(cnt)
+            cnt
+        "#},
+        "invariant in its value type",
+    );
 }
 
 /// `op=` inside a for-loop body is a **mutable write**, so a target that is not a
@@ -1220,17 +1270,21 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
 /// value type all the way through inlining.
 ///
 /// The mutable variable is unwritten, so its value type is still its seed's singleton
-/// (`Mut({Int | __elem == 5}, ?d)`), and the parameter — whose type is inferred, since an
-/// annotation bounds rather than fixes it — takes that refinement, because the call site
-/// is typed against the dereferenced value. Beta-reduction then has to discharge a
-/// refinement demanded of the value against an argument node still stamped with the
-/// handle: the `Mut` survives on the bare `Var` for the phase to find the read. Reading
-/// through the handle is what makes the two comparable; comparing the stamp directly asks
-/// a handle to entail a fact about a value and trips `inline`'s entailment assert.
+/// (`Mut({Int | __elem == 5}, ?d)`), and a parameter whose type is left to inference takes
+/// that refinement, because the call site is typed against the dereferenced value.
+/// Beta-reduction then has to discharge a refinement demanded of the value against an
+/// argument node still stamped with the handle: the `Mut` survives on the bare `Var` for
+/// the phase to find the read. Reading through the handle is what makes the two
+/// comparable; comparing the stamp directly asks a handle to entail a fact about a value
+/// and trips `inline`'s entailment assert.
 ///
-/// The last case is the surrounding one that reaches the same parameter *without* a
-/// refinement — the use demands `Int`, which widens it — so a future narrowing of the
-/// read shows up as a difference between the cases rather than as silence.
+/// The last two cases are the surrounding ones that reach the same parameter *without* a
+/// refinement, so a future narrowing of the read shows up as a difference between the
+/// cases rather than as silence. Each is a distinct reason for the singleton not to
+/// arrive: an exact annotation is a specialization boundary that fixes the domain at
+/// `Int`, and a use demanding `Int` widens an inferred parameter. A **bounded**
+/// annotation is not one of them — it constrains without fixing, so it lands on the
+/// singleton exactly as no annotation does.
 #[rstest]
 #[case::unannotated(indoc! {r#"
     def id(v):
@@ -1238,7 +1292,13 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
     x := 5
     id(x)
 "#})]
-#[case::annotated(indoc! {r#"
+#[case::bounded(indoc! {r#"
+    def id(v <: Int):
+        v
+    x := 5
+    id(x)
+"#})]
+#[case::exact(indoc! {r#"
     def id(v: Int):
         v
     x := 5

@@ -125,6 +125,7 @@ def identity(x):
 **Implemented today:**
 
 * **Let-polymorphism (functions).** A `let` whose RHS is a *function definition* is generalized: the RHS is typed one level deeper, generalized into a `PolyScheme` at the binding site, and instantiated freshly per use. Because Cambra targets fully-monomorphized output, generalization is paired with **monomorphization**, integrated into the coalesce walk (`infer::specialize_use`): a use of a generalized binding is specialized at first visit — clone + `freshen_expr_type_slots`, a two-way pin against the use's *live* instantiation type, and a re-entrant coalesce of the clone — and the binding's `let` rebuilds itself as the chain of demanded specializations. Specialization is keyed on the use's **instantiation identity** (a `SpecKey`, not a resolved type — see [Keying a specialization](#keying-a-specialization)), so uses that instantiate the definition identically **share** one definition. So `def f(x): x == x; f(1); f("foo")` type-checks and runs, a generator used at two element types compiles to two cached specializations (see F2), and a generalized UDF used only inside *another* generalized definition (poly-calls-poly) specializes by plain recursion — its use becomes concrete inside each wrapper clone's re-entrant walk. Levels are live (extrude fires on a genuine level mismatch).
+* **Two binder-annotation forms.** Exact `𝑥 : 𝑇` fixes the binder's type; bounded `𝑥 <: 𝑇` infers it under an upper bound. Both apply at `let` and at a function parameter, carried by `Type::BoundedHole` in annotation position and erased by `normalize_annotation`. See [Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded).
 * **Tagged variants.** The dual of records, natively supporting sum types and pattern-match exhaustiveness inside the structural solver (see §4). Both named (`.Tag(...)`) and positional (`++`-style) sums are handled.
 * **Lattice-carried refinements.** Refinements ride the lattice natively (compared by structural predicate equality) rather than being stitched on by a post-pass; see §4 and [`crate::ccl::infer::solver`]'s `# Refinements`.
 * **Dependent refinements (Pi types).** Refinement predicates may close over an outer binder; `Type::Fun` carries an optional Pi binder, the solver derives binder correspondences when constraining function types, and dependent application discharges the binder to its argument at coalesce. Group-by lookup `groupby(xs, key)(𝑘₀)` types as `{𝑖 | 𝑖 ▷ xs ▷ key == 𝑘₀} ⇒ 𝑉`. See §4.5.
@@ -761,11 +762,107 @@ Both readers compensated by consulting `user_annotation`, which held the user's 
 
 Nothing has to outlive the annotation. The one fact a later pass used to need from it — *is this binder a mutable variable?* — is answered structurally instead: only `MutDecl` (a `:=` introduction) and a pass-by-reference `Lambda` param bind one, and a `Let` cannot, because `emit_let` reads through an initializer that is a mutable variable. That retired the `Mut` discipline's rule 3 along with the bit that stood in for the declaration (see `src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class (downward-only)").
 
+### Annotation kinds: exact and bounded
+
+An annotation at a binder answers one of two different questions, and CHL spells them differently because the answers diverge.
+
+`𝑥 : 𝑇` is **exact**: the binder's type *is* `𝑇`. The initializer (or, at a parameter, the argument) must satisfy `rhs <: 𝑇`, and everything downstream of the binder sees `𝑇` — the value's own type is not observable through it.
+
+`𝑥 <: 𝑇` is **bounded**: the binder's type is *inferred*, with `𝑇` as an upper bound. The value's own type flows through; `𝑇` only constrains what may reach the binder.
+
+The two coincide only where the value's type already *is* the annotation, leaving nothing to discard. They differ wherever the value's type is a **strict** subtype of it — and the annotation's own shape does not decide that, because a Cambra type carries more than a base:
+
+* **Width.** `x : {a: Int} = (a=1, b=2)` binds `x` at `{a: Int}`, so `x.b` is an error. `x <: {a: Int} = (a=1, b=2)` binds `x` at the record's own type, which still has both fields, so `x.b` is `2`.
+* **Refinements.** A literal is typed by its own value ([A literal is refined by its own value](#a-literal-is-refined-by-its-own-value)), so `x : Int = 5` binds `x` at `Int` — the annotation is precisely what discards the singleton — while `x <: Int = 5` leaves it at `5`. Only the second still discharges `arr[x]`'s index-range obligation.
+* **Delivery.** Trait narrowing consumes bases that *arrive* at an operand ([Delivery: the watch follows the edge](#delivery-the-watch-follows-the-edge)), and only the exact form puts one there — it binds at `Int`, while the bounded form binds at a variable that `Int` sits above. So `def f(x: Int): x + "s"` is rejected with no call site and `def f(x <: Int): x + "s"` is not, though both are ill-typed and both fail at the first call.
+
+  This last one is a difference in *reach*, not in meaning, and it is the only bullet here that is: reading the requirements on a value together with its bounds — rather than one delivery at a time — catches the bounded program too, which is the residual gap [Typechecking a never-called definition](#typechecking-a-never-called-definition) already names and locates in the obligation machinery. Do not read it as the split saying that `x <: Int` promises less; what it promises is stated above, and this row is about which mechanism happens to notice.
+
+The refinement case is worth reading twice: the annotation is a bare `Int` and the forms still differ, because `5` is a strict subtype of `Int`. A "simple" annotation is no guarantee that the two agree — only a value that knows nothing beyond the annotation is.
+
+Both kinds apply at both binder positions, `let` and function parameter, with one rule each. The distinction and the two spellings are both settled; the spec states them and gives the reasoning for the tokens ([chl-spec.md](../../../docs/chl-spec.md), "Two annotation forms: exact and bounded"). Nothing below depends on which tokens they are: the mode is a two-valued property of a binder that lowering reads off the surface and turns into `BoundedHole`-or-not, so the surface and the representation are independent.
+
+| | `𝑥 : 𝑇` (exact) | `𝑥 <: 𝑇` (bounded) |
+|---|---|---|
+| `let` | bind at `𝑇`; require `rhs <: 𝑇` | bind at the inferred RHS type; require it `<: 𝑇` |
+| parameter | bind at `𝑇`; every call site requires `arg <: 𝑇` | bind at a fresh variable; require it `<: 𝑇` |
+
+The bounded column is the *only* behaviour that existed before the split, at both positions: a binder annotation contributed one upper bound and nothing else, because `bind_annotation` is one-way (`inferred <: ann` — an annotation has to admit the value, not equal it). A parameter's type was therefore the **meet** of its annotation and whatever its body demanded, which is worth stating plainly because it is neither of the two readings one expects: in `def f(v <: {a: Int}): v.b`, the annotation admits the argument and the projection widens the demand, so `𝑣` ends up at `{a: Int, b: 𝑇}` and callers must supply both fields. That is still what the bounded form means; the split gave it its own spelling and gave `:` the exact reading.
+
+Neither rule needs a mode test at its binder. A parameter binds at `normalize(annotation)`: exact normalizes to `𝑇` itself, bounded to a variable bounded by `𝑇`, and the old two-step (bind at a fresh variable, *then* reconcile against the annotation) is what made an exact annotation behave as neither reading — it contributed one upper bound among several instead of being the type. A `let` binds at the same normalization of its (completed) annotation, and two special cases fall out as consequences rather than tests: a **deref-copy** (`y: Int = x` off a mutable variable) binds at the annotation because that is what exact *means*, and a bare `_` completes to the initializer's type, which for a mutable-variable initializer is the *value* it reads — so `y: _ = x` binds exactly where `y = x` does, and writing through `y` is rejected the same way.
+
+#### BoundedHole is a marker in a type slot, not a type
+
+The bounded form is represented by a `Type::BoundedHole(𝑇)`, which `normalize_annotation` erases into a fresh variable carrying `𝑇` as an upper bound. It is the same kind of object as `Type::Hole` one rung up: `Hole` is the unbounded case, and the two compose in exactly the positions where a compound annotation is partly specified.
+
+Neither is a type, and that is the first thing to know about `BoundedHole`. `Hole`, `Infer`, and `BoundedHole` all inhabit the `Type` enum because *annotation and binder positions are typed positions*, not because they denote anything: `BoundedHole(𝑇)` is not "the type of values below `𝑇`" — no such type exists, since a bound picks out no set of values on its own. It records an obligation for inference to discharge, and inference discharges it by minting a variable and giving it `𝑇` as an upper bound; the bound then lives where bounds belong, on a variable in the constraint graph.
+
+The consequence is that no *typing* rule may take a `BoundedHole`. There is nothing to subtype against, nothing to narrow, nothing to compact — the solver asserts this rather than inventing a rule (`constrain::extrude`, `compact`). Only the structural walks that rewrite every slot uniformly — substitution, free-variable collection, refinement stripping — pass through one, and they do so because they are indifferent to what a slot means.
+
+Putting the bound *in the type* rather than beside it is forced by the **multi-parameter encoding**, not chosen for symmetry. A `def` with more than one parameter uncurries to a single tuple parameter whose annotation is one `Type::Tuple`, with `Hole` at each unannotated position (`lower::functions::uncurry_params`). So `def f(x: 𝐴, y <: 𝐵, z)` has to express three distinct annotation modes *inside one type*, and `Tuple([𝐴, BoundedHole(𝐵), Hole])` does it with no new plumbing. Carrying the mode alongside the type instead would need a mode *tree* mirroring the type's shape, which is this variant in a worse spelling.
+
+#### BoundedHole cannot outlive inference
+
+`BoundedHole` is inference's to erase: Pass 1 replaces it with an `Infer` variable, and nothing downstream can observe one — not by convention but because **the slot it would live in does not survive inference at all**. See [The binder slot, and why annotations do not outlive inference](#the-binder-slot-and-why-annotations-do-not-outlive-inference); the bounded form needs no lifecycle rule of its own.
+
+That the slot does not survive is what makes the guarantee structural, and following `Hole`'s precedent instead would *not* have sufficed. `Hole`'s discipline is erasure plus a check on `ty` slots (`UnresolvedHole`) — which leaves annotation slots covered by neither, so an un-erased marker can sit in one to the end of inference whenever a compound annotation is partly unspecified. That is survivable for `Hole`, which means "unspecified" and is read as such; it is not survivable for `BoundedHole`, which carries a *bound* that something must discharge. A marker whose whole content is a constraint cannot be left somewhere nothing looks.
+
+The remaining backstop is therefore narrow: a binder `ty` is the only slot a `BoundedHole` could reach, and `collect_type_errors` reports `UnresolvedBoundedHole` there. Nothing is expected to trip it — a `BoundedHole` reaching the solver un-normalized fails earlier, since there is no rule for constraining against one.
+
+#### A Hole inside an exact annotation is still inferred
+
+An exact annotation may be partly unspecified — `x: List(_) = [1, 2, 3]`, or the `Feed(_)` bindings the corpus uses. A `Hole` there means "infer this position", so the binder's type is the annotation **with each `Hole` filled from the corresponding position of the inferred RHS type** (`emit::complete_annotation`). That makes `x: _ = e` exactly equivalent to `x = e`, and `x: List(_) = [1, 2, 3]` bind at `List(Int)`. Records complete by *name*, so a field the annotation does not mention is dropped rather than completed — which is exactly the width an exact annotation discards. A **parameter** has no initializer to complete from, so a `Hole` there is simply a fresh variable resolved from the call sites.
+
+The filling is a structural function on the two types, deliberately not a constraint: binding at a normalized annotation and relying on the one-way `rhs <: ann` edge to drive the annotation's fresh variables does *not* work — those variables are minted at the outer level, after the RHS's level has been popped, and escape inference unresolved. Shape disagreements need no handling here, because a `rhs` that cannot flow into `ann` at all is already an `AnnotationMismatch`.
+
+#### A `Mut(…)` annotation is exact
+
+`Type::History` is **invariant in both payloads**: `constrain` relates two histories of
+the same kind in both directions, because a mutable variable is read *and* written
+through the same binder. A `:=` binder's type is a `Mut(𝑉, 𝐷)`, and those two facts
+together rule out both of the spellings a mutable introduction does not accept. Lowering
+rejects them (`lower::stmts::check_mut_decl_annotation`) rather than reinterpreting them:
+
+* `𝑥 <: Mut(𝑉) := 𝑒` — under invariance the only type below `Mut(𝑉, 𝐷)` is `Mut(𝑉, 𝐷)`,
+  so the bound admits exactly the annotation and `<:` claims nothing `:` does not.
+* `𝑥 : 𝑉 := 𝑒` — a plain value type names the wrong thing. The binder is at `Mut(𝑉, 𝐷)`,
+  so reading a bare `𝑉` there would make `:` mean something at a `:=` binder that it
+  means at no other.
+
+The invariance argument does not depend on the binder being a `:=`, so it rejects a
+bounded pass-by-reference parameter too (`lower::functions::mut_param_history_type`):
+a `Mut(…)` annotation is exact wherever it is written.
+
+The consequence for the representation is that a `BoundedHole` never wraps a history,
+which `normalize_annotation` asserts. That is worth stating, because the alternative is
+representable and tempting: **distributing** the bound into the value position, as
+`Mut(BoundedHole(𝑉), 𝐷)`. A mutable variable binder's slot must stay structurally a
+`History` — `mut_value_type`, the deref coercion in `constrain`, `mut_elim`, and
+`transact_phase` all dispatch on that shape, and a variable standing for the whole handle
+would skip a write's `value <: 𝑉` edge — so the value position is the only slot a bound
+*could* occupy. But that is a fact about the pipeline, not about what `<: Mut(𝑉)`
+denotes; distributing silently re-points the bound at a type other than the one written.
+Rejecting leaves "a mutable whose value type is inferred under a ceiling" with no
+spelling, which is the honest position: under invariance it is not a bound on the
+binder's type at all, and no surface syntax puts a bound in a nested position (see
+[chl-spec.md](../../../docs/chl-spec.md), "Two annotation forms: exact and bounded").
+
+#### Exact annotations bound monomorphization
+
+An exact parameter annotation is the program's only lever over specialization count, and this is the sharpest practical consequence of the split.
+
+Specialization is keyed on instantiation identity ([Keying a specialization](#keying-a-specialization)), whose negative read follows a domain's *lower* bounds — the argument that flowed in. With a bounded (or absent) parameter annotation the domain is a variable, so each call site's argument type reaches the key, and the definition splits **per distinct argument type, including per literal value**: `let f = λ 𝑣 → 𝑣 + 1 in let a = f(1) in let b = f(2) in a` yields two clones of one body, distinguished only by the singletons `1` and `2`.
+
+An exact annotation binds the parameter at a concrete, level-0 type. `freshen_above` short-circuits it, every instantiation shares one domain, no argument refinement can reach the domain position, and the uses collapse to a single specialization.
+
+Two caveats keep that from being a blanket guarantee. First, the win is confined to the domain, and the key's *codomain* read follows the consumer's demand — deliberately, since the clone is coalesced under this use's pin and a key blind to the consumer would under-split. So an exact annotation collapses the uses only as far as their consumers agree. Second, the bounded form is genuinely per-call-site checked rather than checked once: `freshen_above` copies a variable's bounds, so the `<: 𝑇` obligation is instantiated with each use and enforced at every argument position.
+
 ### Flowing In: normalizing annotations
 
 There is no conversion *into* a solver type — the solver consumes `ccl::Type` as-is. The only adjustment Pass 1 makes is `normalize_annotation`, which readies a user annotation / expected type for constraint solving:
 
 * **Holes (`Type::Hole`):** become fresh `Type::Infer` variables at the current level.
+* **Bounds (`Type::BoundedHole(𝑇)`):** become fresh `Type::Infer` variables at the current level, carrying `𝑇` as an upper bound — `Hole` with a ceiling (see [Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded)).
 * **Refinements:** are **kept** (recursing to normalize the inner) — they ride the lattice natively (above). A `Refinement(Hole, r)` source annotation thus becomes `Refinement(?fresh, r)`.
 * **Everything else** — including existing `Type::Infer` vars, `Tuple`/`Record` products, and `Type::Variant` sums — is kept verbatim and handled by the solver's structural constraint rules. Tuples and records are width-subtyped positionally/by name; variants are admissible at both polarities (the dual of records), so they need no fresh-var indirection.
 

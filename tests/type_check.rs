@@ -635,6 +635,15 @@ fn dead_code(defs: &str) -> String {
     f = \a -> a.0 + a.foo
     f = 3
 "#})]
+// An *exact* annotation is a delivery, which is what brings this case back within
+// reach: `x: Int` puts a base on the operand rather than a bound above it, so the
+// obligation narrows to `{(Int, Int)}` and `"s"` empties it, with no call site
+// needed. Its bounded twin below is equally ill-typed and is *not* caught here, and
+// the difference is in the mechanism, not in the programs.
+#[case::annotated_param(indoc! {r#"
+    def f(x: Int):
+        x + "s"
+"#})]
 fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
     assert!(
         !infer_program_err(&dead_code(defs)).is_empty(),
@@ -647,18 +656,27 @@ fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
 /// nothing, so a conflict that is only a trait conflict is not reached — see
 /// `src/ccl/design/type-inference.md`, "Typechecking a never-called definition".
 ///
-/// Both bodies are rejected the moment they are called (`f(1)` on either names the
-/// operand, its type, and what the position accepts), so this is about *when* the
-/// conflict is found, not whether. What makes them unreachable here is that neither
-/// asks any one delivery to be impossible: the first places two requirements on `a`
-/// — `a + 1` fixes it at `Int`, `a + "s"` at `String` — each satisfiable alone and
-/// jointly not, and the second sets a requirement against an annotation. Reading a
-/// value's requirements together is what closes both, and that is a property of the
-/// obligation machinery rather than of the discard walk.
+/// The body is rejected the moment it is called (`f(1)` names the operand, its type,
+/// and what the position accepts), so this is about *when* the conflict is found, not
+/// whether. What makes it unreachable here is that no single delivery is impossible:
+/// two requirements land on `a` — `a + 1` fixes it at `Int`, `a + "s"` at `String` —
+/// each satisfiable alone and jointly not. Reading a value's requirements together is
+/// what closes it, and that is a property of the obligation machinery rather than of
+/// the discard walk.
+///
+/// The bounded parameter pairs with the exact one in the previous test and is here
+/// for the same reason as the case above it, not a different one: `x <: Int` bounds
+/// the operand from above without putting a base on it, so nothing is delivered and
+/// the obligation never narrows, while `x: Int` delivers and rejects. Both programs
+/// are ill-typed and both are rejected at a call; what differs is only whether
+/// today's narrowing has anything to consume. Reading `x`'s requirements together
+/// alongside its `Int` bound closes this one too — measured, it is rejected once the
+/// requirement sweep is in the same tree — so this is a gap in reach, not a
+/// consequence of the exact/bounded split.
 #[rstest]
 #[case::conflicting_operand_types("f = \\a -> (a + 1, a + \"s\")")]
-#[case::annotated_param(indoc! {r#"
-    def f(x: Int):
+#[case::bounded_annotated_param(indoc! {r#"
+    def f(x <: Int):
         x + "s"
 "#})]
 fn a_never_called_function_whose_conflict_is_only_a_trait_conflict_is_not_reached(
@@ -970,7 +988,26 @@ sum(f)",
 fn test_def_param_annotation_enforced() {
     // A scalar annotation is enforced at the call site: an identity body infers
     // nothing on its own, so without the annotation any argument was accepted.
-    assert_eq!(infer_program("def g(a: Int):\n    a\ng(1)"), int_lit(1));
+    // The parameter binds *at* `Int` (exact), so the argument's singleton does not
+    // flow through it — that erasure is what makes an annotated parameter a
+    // monomorphization boundary (see `test_exact_param_shares_one_specialization`).
+    assert_eq!(
+        infer_program(indoc! {r#"
+        def g(a: Int):
+            a
+        g(1)
+    "#}),
+        int()
+    );
+    // The bounded form keeps it: `a` is inferred, bounded above by `Int`.
+    assert_eq!(
+        infer_program(indoc! {r#"
+        def g(a <: Int):
+            a
+        g(1)
+    "#}),
+        int_lit(1)
+    );
     assert!(!infer_program_err("def g(a: Int):\n    a\ng(\"x\")").is_empty());
     // A `List(Int)` annotation enforces the element type through the annotation.
     assert_eq!(
@@ -987,6 +1024,15 @@ fn test_multiarg_def_param_annotation_enforced() {
     // Each tupled parameter's annotation is enforced independently.
     assert_eq!(
         infer_program("def g(a: Int, b: String):\n    a\ng(1, \"x\")"),
+        int()
+    );
+    // Per-position modes inside the one tupled annotation: `a` exact, `b` bounded.
+    assert_eq!(
+        infer_program(indoc! {r#"
+            def g(a <: Int, b: String):
+                a
+            g(1, "x")
+        "#}),
         int_lit(1)
     );
     // Wrong type on `a` is rejected.
@@ -1098,13 +1144,24 @@ fn test_tuple_index() {
 // Type annotation tests
 // ---------------------------------------------------------------------------
 
-/// An ascription is one-way: it must *admit* the value, and the value keeps whatever
-/// more precise type it already had. So annotating a literal at its base does not
-/// widen it, while an expression that computes a new value has nothing to keep.
+/// An **exact** annotation (`x: T`) binds the variable *at* `T`: the value must be
+/// admitted by it, and anything more precise the value carried is discarded — so
+/// annotating a literal at its base widens it. The **bounded** form (`x <: T`) is
+/// the one that keeps the value's own type; see `test_bounded_annotation_keeps_the_inferred_type`.
+///
+/// A `_` position declares nothing and is completed from the initializer, which is
+/// what makes `x: _ = e` equivalent to `x = e`.
 #[rstest]
 #[case::literal(
     r"
 x: Int = 2
+x
+",
+    int()
+)]
+#[case::bounded_literal(
+    r"
+x <: Int = 2
 x
 ",
     int_lit(2)
@@ -1984,14 +2041,43 @@ fn positional_and_named_projection_compose() {
 
 /// The brace *type* forms and `.` agree on keying: `{T, U}` is a tuple type, projected
 /// positionally; `{name: T}` is a record type, projected by name.
+///
+/// Both are **exact** annotations (`x: T`), so each binds its variable *at* the declared
+/// type and the literals' singletons are discarded — the projection yields the declared
+/// field type rather than the value that went in (`test_ann_assign_ok` pins that rule
+/// directly). The keying is what is at issue here, not the precision.
 #[test]
 fn brace_type_annotations_project_by_their_keying() {
-    assert_eq!(infer_program("t: {Int, Bool} = (1, True)\nt.0"), int_lit(1));
-    assert_eq!(infer_program("r: {a: Int} = (a=1)\nr.a"), int_lit(1));
+    assert_eq!(
+        infer_program(indoc! {r#"
+        t: {Int, Bool} = (1, True)
+        t.0
+    "#}),
+        int()
+    );
+    assert_eq!(
+        infer_program(indoc! {r#"
+        r: {a: Int} = (a=1)
+        r.a
+    "#}),
+        int()
+    );
     // A *one*-element tuple type carries the trailing comma, like the `(e,)` term.
-    assert_eq!(infer_program("t: {Int,} = (1,)\nt.0"), int_lit(1));
+    assert_eq!(
+        infer_program(indoc! {r#"
+        t: {Int,} = (1,)
+        t.0
+    "#}),
+        int()
+    );
     // A one-*field* record type needs no comma — `a: Int` already marks the form.
-    assert_eq!(infer_program("r: {a: Int,} = (a=1)\nr.a"), int_lit(1));
+    assert_eq!(
+        infer_program(indoc! {r#"
+        r: {a: Int,} = (a=1)
+        r.a
+    "#}),
+        int()
+    );
 }
 
 /// The empty product is `Unit`, and it is the *only* empty product: `{}` in an
@@ -2549,4 +2635,260 @@ fn a_conditional_over_two_mut_vars_denotes_their_values() {
         .to_string(),
         "(Int, 0)"
     );
+}
+
+/// The two binder-annotation forms: exact `x: T` binds *at* `T`; bounded `x <: T`
+/// infers and only bounds.
+///
+/// Design: `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".
+mod annotation_kinds {
+    use super::*;
+    use cambra::ccl::symbolic::symbolic;
+
+    /// Record **width** is the clearest case: an exact annotation is the type, so a
+    /// field it does not mention is not reachable through the binder; a bounded one
+    /// lets the value's own wider type through.
+    #[test]
+    fn exact_narrows_record_width_and_bounded_does_not() {
+        assert!(
+            !infer_program_err(indoc! {r#"
+                x: {a: Int} = (a=1, b=2)
+                x.b
+            "#})
+            .is_empty(),
+            "an exact annotation is the binder's type, so `b` is not reachable"
+        );
+        assert_eq!(
+            infer_program(indoc! {r#"
+            x <: {a: Int} = (a=1, b=2)
+            x.b
+        "#}),
+            int_lit(2)
+        );
+    }
+
+    /// Same at a parameter, which is the asymmetry that motivated the split: the
+    /// two positions now read an annotation the same way.
+    #[test]
+    fn the_two_binder_positions_agree() {
+        assert!(
+            !infer_program_err(indoc! {r#"
+                def f(v: {a: Int}):
+                    v.b
+                f((a=1, b=2))
+            "#})
+            .is_empty(),
+            "an exact parameter is the annotation, so `v.b` is not typeable"
+        );
+        assert_eq!(
+            infer_program(indoc! {r#"
+                def f(v <: {a: Int}):
+                    v.b
+                f((a=1, b=2))
+            "#}),
+            int_lit(2)
+        );
+    }
+
+    /// A literal is typed by its own value, so the two forms differ on whether the
+    /// annotation discards that: only the bounded form keeps the singleton.
+    ///
+    /// This is the difference that matters for proofs — an index-range obligation
+    /// discharges only when the index's type says *which* index it is — though a
+    /// variable subscript is not yet accepted by the surface (`x[i]` is "only
+    /// integer subscripts are supported"), so that consequence is not assertable
+    /// here yet.
+    #[test]
+    fn only_bounded_keeps_a_literals_singleton() {
+        assert_eq!(
+            infer_program(indoc! {r#"
+            i: Int = 0
+            i
+        "#}),
+            int()
+        );
+        assert_eq!(
+            infer_program(indoc! {r#"
+            i <: Int = 0
+            i
+        "#}),
+            int_lit(0)
+        );
+    }
+
+    /// An unspecified position declares nothing and is completed from the
+    /// initializer, so `x: _ = e` is exactly `x = e` — including when the `_` is
+    /// nested inside a compound annotation.
+    #[test]
+    fn an_unspecified_position_is_completed_from_the_initializer() {
+        let unspecified = indoc! {r#"
+            x: _ = 2
+            x
+        "#};
+        let bare = indoc! {r#"
+            x = 2
+            x
+        "#};
+        assert_eq!(infer_program(unspecified), infer_program(bare));
+        assert_eq!(infer_program(unspecified), int_lit(2));
+        // `List(_)` completes its element type rather than leaving a variable that
+        // nothing resolves.
+        assert_eq!(
+            infer_program(indoc! {r#"
+            x: List(_) = [1, 2, 3]
+            sum(x)
+        "#}),
+            int()
+        );
+    }
+
+    /// An exact parameter annotation is a **monomorphization boundary**: it binds
+    /// the parameter at a concrete type, so no argument's type reaches the domain
+    /// and every call site shares one specialization. A bounded (or absent) one
+    /// leaves the domain a variable, and the argument's singleton splits the key —
+    /// one clone per literal.
+    #[test]
+    fn exact_param_collapses_specializations() {
+        fn clones(code: &str) -> usize {
+            let mut lctx = LoweringContext::default();
+            let stmts = parse_module(code);
+            let mut expr = lower_stmts(&stmts, &mut lctx)
+                .into_result()
+                .expect("lowering failed");
+            infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
+            symbolic(&expr).matches("let __mono").count()
+        }
+        let body = indoc! {r#"
+
+                v + 1
+
+            a = f(1)
+            b = f(2)
+            a
+
+        "#};
+        assert_eq!(
+            clones(&format!("def f(v <: Int):{body}")),
+            2,
+            "a bounded param's domain is a variable, so each argument's singleton \
+             splits the specialization key"
+        );
+        assert_eq!(
+            clones(&format!("def f(v: Int):{body}")),
+            1,
+            "an exact param's domain is concrete, so both call sites share one clone"
+        );
+        // …and the collapse survives a consumer that reaches the two uses through
+        // *one* operator, each result flowing into a different operand slot of the
+        // enclosing `+`. Nothing about the uses differs — same function, same
+        // annotation, same literal — so a split here would be two clones of
+        // identical code.
+        assert_eq!(
+            clones(indoc! {r#"
+                def f(v: Int):
+                    v + 1
+                f(1) + f(1)
+            "#}),
+            1,
+            "which operand slot a use lands in is not information about the use"
+        );
+        // The bounded form still splits under the same consumer: there the argument
+        // reaches the *domain*, which is a real difference between the clones.
+        assert_eq!(
+            clones(indoc! {r#"
+                def f(v <: Int):
+                    v + 1
+                f(1) + f(2)
+            "#}),
+            2,
+            "a bounded param still splits per argument, operator consumer or not"
+        );
+    }
+
+    /// The one annotated spelling a `:=` binder accepts is exact and is a `Mut(…)`,
+    /// and it means at a mutable variable what it means at any other binder: the
+    /// annotation *is* the type, so it discards what the value knew beyond it.
+    ///
+    /// `a: Mut(Int) := 5` therefore binds the value at `Int`, while the unannotated
+    /// `a := 5` keeps the seed's singleton. The rejected spellings are covered by
+    /// `mut_decl_annotation_is_exact_and_is_a_mut` (they fail at lowering).
+    #[test]
+    fn an_exact_mut_annotation_discards_the_seeds_singleton() {
+        // Compared by mutable variable *value* type. Each program ends in a bare read, and a
+        // tail denotes the mutable variable's *value*, so the program type is that value type
+        // directly — which also keeps the per-run domain variable, whose id differs
+        // every time, out of the comparison.
+        let mut_value = |code: &str| {
+            let ty = infer_program(code);
+            assert!(
+                ty.mut_value_type().is_none(),
+                "a tail read denotes the mutable variable's value, got the handle {ty}"
+            );
+            ty
+        };
+        // No writes, so the unannotated value type is the seed's singleton.
+        assert_ne!(
+            mut_value(indoc! {r#"
+            a := 5
+            a
+        "#}),
+            int()
+        );
+        assert_eq!(
+            mut_value(indoc! {r#"
+            a: Mut(Int) := 5
+            a
+        "#}),
+            int()
+        );
+        // With a write, the value type is the join over seed and writes, so the
+        // unannotated form lands on `Int` too — the annotation is not what widens it.
+        assert_eq!(
+            mut_value(indoc! {r#"
+            a := 0
+            a += 1
+            a
+        "#}),
+            int()
+        );
+        // It is still a *declaration*, so the deref-copy below it is a read.
+        assert_eq!(
+            infer_program(indoc! {r#"
+            a: Mut(Int) := 0
+            b: Int = a
+            b
+        "#}),
+            int()
+        );
+    }
+
+    /// The exact annotation is a real obligation on the mutable variable, discharged
+    /// against both contributions to its value type: the seed and every write.
+    #[test]
+    fn a_mut_vars_annotation_constrains_seed_and_writes() {
+        let rejects = |code: &str, needle: &str| {
+            let errs = infer_program_err(code);
+            let rendered = format!("{errs:?}");
+            assert!(
+                rendered.contains(needle),
+                "expected an error mentioning {needle:?}, got: {rendered}"
+            );
+        };
+        rejects(
+            indoc! {r#"
+            a: Mut(Int) := "s"
+            a
+        "#},
+            "initializer of mutable `a`",
+        );
+        rejects(
+            indoc! {r#"
+                a: Mut(Int) := 0
+                for i in [1, 2]:
+                    a := "s"
+                a
+            "#},
+            "write to mutable variable `a`",
+        );
+    }
 }

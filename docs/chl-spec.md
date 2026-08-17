@@ -628,10 +628,17 @@ of the partiality disappears entirely.)
 for the unit type `{}` (§6.6).
 
 A literal's **type says which literal it is**, not merely its base: `5` has type
-`{Int where _ == 5}` (§6.4), the refinement pinning that one value. An annotation
-only has to *admit* it — `x: Int = 5` is accepted, widening being the
-annotation's business and not the value's. Unit is the exception with nothing to
-say: it has one inhabitant, so pinning it would add nothing to the base.
+`{Int where _ == 5}` (§6.4), the refinement pinning that one value. So `x = 5`
+gives `x` the type `5`, and it keeps that unless a binder discards it:
+`x: Int = 5` binds `x` at `Int` (an exact annotation *is* the binder's type),
+while `x <: Int = 5` leaves `x` at `5` (a bounded annotation only has to admit
+the value) — see
+[Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded). Any
+operation that computes a *new* value drops it, since it is a fact about one
+value and not about the operation: `x + x` is an `Int`, and a mutable variable
+never takes it (a mutable variable is the sequence its writes produce, so no one write's
+value describes it). Unit is the exception with nothing to say: it has one
+inhabitant, so pinning it would add nothing to the base.
 
 > **Direction [Decided] — `true`/`false`.** The boolean literals are spelled
 > `True`/`False` today, the one exception to the capitalization rule above. They
@@ -1054,8 +1061,11 @@ def f(x: Int, y):
     return x + y
 ```
 
-Annotations are arbitrary expressions evaluated in the surrounding
-scope; they refine the inferred parameter type. Annotations on the
+Annotation types are arbitrary expressions evaluated in the surrounding
+scope. `p: T` fixes the parameter's type at `T`; `p <: T` leaves it
+inferred and bounded above by `T` (see
+[Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
+The two forms may be mixed across a parameter list. Annotations on the
 function's *return type* are not yet supported.
 
 A function whose body contains a `yield` expression anywhere is a
@@ -1406,9 +1416,9 @@ rest of that iteration and gone at the next.
 The converse also holds: a mutable variable must be introduced **before**
 the loop that accumulates it. A `:=` inside a loop body whose target is not
 an already-declared accumulator is a lowering error, at every spelling —
-`y := 0`, `y: Int := 0`, and `y: Mut(Int) := 0` alike, since whether an
-introduction carries a type annotation says nothing about whether it
-introduces a mutable variable. A mutable variable scoped to one iteration would need
+`y := 0`, `y: Mut(Int) := 0`, and `y: Mut(Int, Txn) := 0` alike, since
+whether an introduction carries a type annotation says nothing about
+whether it introduces a mutable variable. A mutable variable scoped to one iteration would need
 the loop's own iteration extent as its sequencing domain, which is the
 nested-recurrence case below:
 
@@ -1522,8 +1532,9 @@ read-only.
 This section is a sketch. The authoritative type system lives in
 [`src/ccl/infer/`](../src/ccl/infer/) — see
 [src/ccl/design/type-inference.md](../src/ccl/design/type-inference.md).
-CHL types are inferred; user-written annotations refine the inferred
-type.
+CHL types are inferred; a user-written annotation either *fixes* the
+binder's type or *bounds* it — see
+[Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded).
 
 Built-in surface types. (The names below are this spec's vocabulary
 for talking about the checker; annotations are writable on `def`
@@ -1640,6 +1651,103 @@ element `{T,}`), record type `{f: T}`, variant type
 > contracts direction in §6), so a contract states its ontology once
 > instead of repeating asserts at every function; the declaration
 > syntax for that invariant is not yet settled.
+
+### Two annotation forms: exact and bounded
+
+An annotation at a binder answers one of two questions, and the two
+have different spellings because the answers differ.
+
+> **Note — why these two spellings.** `<:` relates two *types* everywhere
+> else, and here it sits between a term and a type. The capitalization
+> rule (§6.1) is what makes that unambiguous rather than a pun: a
+> lowercase head means the left side is a term, so `a <: T` reads "`a` has
+> a type that is a subtype of `T`", while `A <: T` reads "`A` is a subtype
+> of `T`". Which reading applies is settled by the case of the name, not
+> by the operator.
+>
+> Exact gets the lighter spelling because it is the safer default, not
+> because it is the more frequent intent. An annotation is written where
+> the type is *not* obvious or where a contract is being fixed, and in
+> both of those cases the more precise reading is the one to have by
+> default. `<:` is then a deliberate opt-in: it loosens the contract and
+> accepts inference whose result is harder to predict from the annotation
+> alone.
+
+`x: T` is **exact**: the binder's type *is* `T`. The initializer (or,
+at a parameter, the argument) must be a subtype of `T`, and nothing
+downstream of the binder sees more than `T`.
+
+`x <: T` is **bounded**: the binder's type is *inferred*, with `T` as
+an upper bound. The value's own type flows through; `T` only
+constrains what may reach the binder.
+
+Both forms are accepted wherever a binder is introduced — an
+assignment (`x: T = e`, `x <: T = e`), a mutable introduction
+(`x: Mut(V) := e`), and a `def` parameter — and mean the same thing in
+each. `<:` does not appear **inside a type literal**: it says how an
+annotation is read, and what it annotates is a term, so `{a <: Int}` is
+not a record type. That is a restriction on type literals, not a claim
+that a binder is the only place an annotation can go — an inline
+annotation on an expression would carry both modes for the same reason a
+binder does.
+
+The two coincide only when the value's type already **is** the
+annotation — when there is nothing for the annotation to discard. They
+differ whenever the value's type is a *strict* subtype of it, which is
+more often than it sounds, because a CHL type carries more than a base:
+
+- **Width.** `x: {a: Int} = (a=1, b=2)` binds `x` at `{a: Int}`, so
+  `x.b` is an error — the annotation is what discards the field.
+  `x <: {a: Int} = (a=1, b=2)` binds `x` at the record's own type, which
+  still has both fields, so `x.b` is `2`.
+- **Literal singletons** (§3.1). `i: Int = 0` binds `i` at `Int`;
+  `i <: Int = 0` leaves it at `0`. Only the second still carries the
+  fact a totality proof needs, so an exact annotation on an index
+  discards the proof that a lookup is in range.
+
+Note that the second example annotates a bare `Int` and the two forms
+still differ. The annotation's own shape is not what decides it: `0` is
+a strict subtype of `Int`, so there is something to discard. What makes
+the forms coincide is the *value* knowing nothing beyond what the
+annotation says.
+
+A mutable introduction takes only the **exact** form, and only a
+`Mut(…)`: `x: Mut(V) := e` and `x: Mut(V, Txn) := e`. A `:=` binder's
+type *is* a `Mut(V, D)`, and both of the other spellings would have to
+be reinterpreted to mean anything:
+
+- `x: V := e` names the value type, not the binder's. The binder is at
+  `Mut(V, D)`, so reading a bare `V` there would make `:` mean
+  something at a `:=` binder that it means at no other.
+- `x <: Mut(V) := e` claims nothing the exact form does not. `Mut` is
+  **invariant** in its value type — a mutable variable is both read and
+  written through the same binder — so the only type below `Mut(V, D)`
+  is `Mut(V, D)`.
+
+Both are rejected rather than reinterpreted. As everywhere else, the
+exact annotation *is* the type: `x: Mut(Int) := 5` binds the value at
+`Int`, discarding the seed's singleton, while the unannotated `x := 5`
+keeps it. The annotation constrains every contribution to the value —
+the seed and each write.
+
+The same invariance makes a `Mut(…)` annotation exact wherever it is
+written, so a `def` parameter takes `c: Mut(V)` and not `c <: Mut(V)`.
+
+> **[Open]** — a mutable whose *value* type is inferred under a ceiling
+> has no spelling. Under invariance that is not a bound on the binder's
+> type at all, so it would need a bound in the value position
+> (`Mut(<: V)`, say) — and `<:` does not appear inside a type literal.
+> Nothing needs it today; the rejection above is what keeps the option
+> open.
+
+> **Note.** An exact parameter annotation also fixes how many times
+> the function is compiled. A bounded or absent one leaves the
+> parameter's type open, so each call site's argument type — down to
+> *which literal* it is — can produce its own specialization; an exact
+> one gives every call site one shared definition. Recommended style
+> therefore annotates a top-level `def`'s parameters exactly and
+> reaches for `<:` where a caller's more precise type has to survive
+> the boundary.
 
 ### 6.2 Non-purity as type wrappers
 
@@ -2015,12 +2123,13 @@ merge law (§8.4): a mutable variable is *last-write-wins*, a feed is
 
 A variable is mutable **by the operator that introduces it**. `:=` both
 introduces and writes a mutable variable; plain `=` is an immutable
-binding and *never* mutates (§4.3). The `Mut(…)` annotation is optional —
-it is `:=`, not the annotation, that makes a variable mutable.
+binding and *never* mutates (§4.3). The annotation is optional — it is
+`:=`, not the annotation, that makes a variable mutable — but a written
+one is a `Mut(…)`, exactly, because that is the binder's type (§6.1).
 
 ```python
 cnt := 0                       # loop accumulator; value type and domain inferred
-cnt: Mut(Int) := 0             # same, value type spelled explicitly
+cnt: Mut(Int) := 0             # value type spelled exactly, so `cnt` is `Int`, not `0`
 balance: Mut(Int, Txn) := 0    # transactional mutable variable over the commit order
 ```
 
@@ -2030,7 +2139,9 @@ balance: Mut(Int, Txn) := 0    # transactional mutable variable over the commit 
   or `+=` applied to a name that is *not* mutable is a **type error**, not
   a silent rebind — this is the rule that makes "declare it with `:=`" a
   real discipline.
-- `Mut(V)` / `Mut(V, D)` — the optional mutability annotation (§6.2). `V`
+- `Mut(V)` / `Mut(V, D)` — the optional mutability annotation (§6.2), and
+  the only shape one can take: a bare `cnt: Int := 0` is rejected, since
+  the binder's type is `Mut(Int, D)` (§6.1). `V`
   is the value type; `D` is the sequencing domain, inferred as the writing
   loop's domain when omitted or written `_`. **`Txn` is never inferred** —
   sharing a variable across concurrent writers or endpoints is a semantic

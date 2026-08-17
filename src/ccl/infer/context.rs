@@ -179,6 +179,40 @@ impl InferCtx {
                 .entry(*id)
                 .or_insert_with(|| fresh_var(self.level))
                 .clone(),
+            // A bounded annotation `𝑥 <: 𝑇` means "infer this, subject to `<: 𝑇`"
+            // → the same fresh variable, carrying `𝑇` as an upper bound. This is
+            // the *only* place `BoundedHole` is consumed; every other pass either
+            // rewrites through it structurally or treats it as unreachable.
+            //
+            // A bound never wraps a **history**, and there is nothing this arm could
+            // do if one arrived: [`Type::History`] is invariant in both payloads, so
+            // `<: Mut(V, D)` admits exactly `Mut(V, D)` and a variable bounded by it
+            // would only lose the shape that `mut_value_type`, the deref coercion,
+            // `mut_elim`, and `transact_phase` all dispatch on. Lowering rejects the
+            // spelling outright (`lower::stmts::check_mut_decl_annotation`), so a
+            // wrapper here means a `Mut` annotation reached a binder without passing
+            // that check.
+            Type::BoundedHole(bound) if bound.is_handle() => {
+                unreachable!(
+                    "a bounded annotation wraps a history ({bound}); `<:` on a `Mut(…)` \
+                     annotation is rejected at lowering"
+                )
+            }
+            Type::BoundedHole(bound) => {
+                let v = fresh_var(self.level);
+                let bound = self.normalize_annotation(bound);
+                // A **local** cache, not `self.cache`: this method takes `&self`,
+                // and the memo exists only to break recursion on cyclic bounds.
+                // `v` is brand new, so the sole action is pushing one upper edge —
+                // there are no lower bounds to close against and nothing to
+                // recurse into, so a fresh memo is equivalent to the shared one.
+                //
+                // The result is discarded because a fresh variable cannot conflict
+                // with its first upper bound; a genuine mismatch surfaces later,
+                // when a value flows in and fails against this bound.
+                let _ = constrain_subtype(&v, &bound, &mut ConstrainCache::new());
+                v
+            }
             // Refinements ride the lattice: keep the wrapper, normalize the
             // inner (so a `Refinement(Hole, r)` source annotation becomes
             // `Refinement(?fresh, r)` rather than losing the refinement).
@@ -395,7 +429,7 @@ impl Typing for InferCtx {
         body_ty
     }
 
-    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), LocatedInferError> {
+    fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
         // Shared by *binder* annotations (trait call sites in the emit rules)
         // and *node* annotations (`emit_node`'s `user_annotation` tail) — the
         // reconciliation is identical: annotation wins on success, conflict
@@ -429,7 +463,7 @@ impl Typing for InferCtx {
                 inferred: inferred_ty,
             })
         })?;
-        Ok(())
+        Ok(ann_simple)
     }
 
     fn binding_slot(&mut self, slot: &mut Type) -> Type {

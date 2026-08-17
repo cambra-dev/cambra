@@ -93,6 +93,12 @@ pub enum Token {
     NotEq,
     #[token("<=")]
     LtE,
+    /// Subtype-bound annotation `<:` — `x <: T` declares an *inferred* type
+    /// bounded above by `T`, where `x: T` declares `T` exactly. Two chars, so
+    /// maximal munch takes it over `Lt` then `Colon`; no expression can put a
+    /// `:` directly after a `<`, so the two never compete.
+    #[token("<:")]
+    LtColon,
     #[token(">=")]
     GtE,
     #[token("++")]
@@ -222,6 +228,7 @@ impl fmt::Display for Token {
             Token::EqEq => "==",
             Token::NotEq => "!=",
             Token::LtE => "<=",
+            Token::LtColon => "<:",
             Token::GtE => ">=",
             Token::PlusPlus => "++",
             Token::PlusEq => "+=",

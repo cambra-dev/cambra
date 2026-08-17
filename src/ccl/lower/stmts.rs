@@ -6,7 +6,9 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
 use super::*;
 use crate::{
     ccl::{BaseType, Branch, Expr, Lit, Type, TypedExprNode},
-    chl_parser::ast::{AssignTarget, IfBranch, Span, Spanned, Stmt as ChlStmt},
+    chl_parser::ast::{
+        AnnotationMode, AssignTarget, IfBranch, Span, Spanned, Stmt as ChlStmt, TypeAnnotation,
+    },
     interpreter::{DataSink, HttpServerDataSource, http_server::SharedHttpServer},
 };
 
@@ -499,7 +501,7 @@ pub(super) fn lower_middle_stmt(
             value,
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
-            if mut_annotation_parts(annotation).is_some() {
+            if mut_annotation_parts(&annotation.ty).is_some() {
                 // `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut`
                 // annotation with the *immutable* `=` operator. This is
                 // contradictory under the cutover: `=` is a plain immutable
@@ -576,16 +578,15 @@ pub(super) fn lower_middle_stmt(
             }
             // Otherwise this is an *introduction*. Resolve the optional
             // annotation to `(value type, transactional?)`:
-            //   (none)             → induction accumulator, value type inferred
-            //   `x: Mut(V) := e`   → induction accumulator at value type `V`
-            //   `x: Mut(V, Txn)`   → transactional mutable variable at value type `V`
-            //   `x: T := e`        → induction accumulator at value type `T`
+            //   (none)                → induction accumulator, value type inferred
+            //   `x: Mut(V) := e`      → induction accumulator at value type `V`
+            //   `x: Mut(V, Txn) := e` → transactional mutable variable at value type `V`
+            //
+            // Those are the only forms: an annotation on a `:=` binder is exact and
+            // is a `Mut(…)` (`check_mut_decl_annotation`).
             let (value_ty, is_txn) = match annotation {
                 None => (Type::Hole, false),
-                Some(ann) => match mut_annotation_parts(ann) {
-                    Some(parts) => parts?,
-                    None => (lower_type_annotation(ann)?, false),
-                },
+                Some(ann) => check_mut_decl_annotation(&name, ann, stmt.span)?,
             };
             // Stamp the binding `Mut(V, D)` (so inference binds `x` at `Mut` and
             // its references deref to `V`). `D = Txn` for a transactional mutable variable
@@ -838,6 +839,77 @@ pub(super) fn check_mut_write_context(
     Ok(())
 }
 
+/// Resolve the annotation on a `:=` **introduction** to `(value type, transactional?)`,
+/// rejecting the two forms that would have to be reinterpreted to be accepted.
+///
+/// A `:=` binder's type *is* a `Mut(V, D)`, so that is what an annotation on one
+/// names. Two consequences, and the rule is their conjunction — **an annotation on
+/// a `:=` binder is exact and is a `Mut(…)`**:
+///
+/// - A plain value type names the wrong thing. `x: Int := e` binds `x` at
+///   `Mut(Int, D)`, not at `Int`, so reading it as the value type would make `:`
+///   mean something here it means nowhere else.
+/// - `<:` claims nothing `:` does not. [`Type::History`] is invariant in both
+///   payloads (`solver::constrain`), so the only type below `Mut(V, D)` is
+///   `Mut(V, D)`.
+///
+/// Both are rejected rather than reinterpreted, and both have the same remedy, so
+/// they share one diagnostic. This leaves "a mutable whose value type is inferred
+/// under a ceiling" unspellable, which is the honest position: under invariance it
+/// is not a bound on the binder's type at all, and no syntax for a bound in the
+/// *value* position exists (`<:` does not appear inside a type literal — see
+/// `docs/chl-spec.md`, "Two annotation forms: exact and bounded").
+pub(super) fn check_mut_decl_annotation(
+    name: &str,
+    ann: &TypeAnnotation,
+    span: Span,
+) -> Result<(Type, bool), LoweringError> {
+    let parts = mut_annotation_parts(&ann.ty).transpose()?;
+    if let (AnnotationMode::Exact, Some(parts)) = (ann.mode, parts.clone()) {
+        return Ok(parts);
+    }
+    // Not accepted. Render what was written — lowering a non-`Mut` annotation
+    // here so an annotation that is not a type at all reports *that* instead.
+    let (value, is_txn, is_mut) = match parts {
+        Some((value, is_txn)) => (value, is_txn, true),
+        None => (lower_type_expr(&ann.ty)?, false, false),
+    };
+    let op = match ann.mode {
+        AnnotationMode::Exact => ":",
+        AnnotationMode::Bounded => "<:",
+    };
+    let written = if is_mut {
+        format!("{}", MutForm(&value, is_txn))
+    } else {
+        value.to_string()
+    };
+    let remedy = MutForm(&value, is_txn);
+    Err(LoweringError::unsupported(
+        span,
+        format!(
+            "`{name} {op} {written} := …` is not a valid mutable-variable annotation: a \
+             `:=` binder's type is `Mut(V, D)`, and `Mut` is invariant in `V`, so the \
+             annotation names the whole variable and is always exact. Write \
+             `{name}: {remedy} := init`, or drop the annotation to infer the value type \
+             (`{name} := init`)"
+        ),
+    ))
+}
+
+/// Renders a value type back as the `Mut(…)` annotation that declares it.
+struct MutForm<'a>(&'a Type, bool);
+
+impl std::fmt::Display for MutForm<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(value, is_txn) = self;
+        if *is_txn {
+            write!(f, "Mut({value}, Txn)")
+        } else {
+            write!(f, "Mut({value})")
+        }
+    }
+}
+
 /// If `annotation` is a `Mut(…)` form, extract its declared *value* type and
 /// whether it is **transactional** (`Mut(V, Txn)`).
 ///
@@ -864,9 +936,9 @@ pub(super) fn mut_annotation_parts(
         return None;
     }
     match args.as_slice() {
-        [value] => Some(lower_type_annotation(value).map(|t| (t, false))),
+        [value] => Some(lower_type_expr(value).map(|t| (t, false))),
         [value, domain] => {
-            let value_ty = match lower_type_annotation(value) {
+            let value_ty = match lower_type_expr(value) {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e)),
             };
@@ -924,7 +996,7 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                 // A malformed `Mut(…)` annotation (`Err`) surfaces its real error
                 // when the `MutAssign` itself is lowered; not registering it here
                 // is harmless.
-                if matches!(mut_annotation_parts(annotation), Some(Ok((_, true)))) {
+                if matches!(mut_annotation_parts(&annotation.ty), Some(Ok((_, true)))) {
                     ctx.register_transactional(id.as_str());
                 }
             }
@@ -950,12 +1022,34 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
     }
 }
 
-/// Whether a type annotation is a pass-by-reference `Mut(…)` form.
-fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
-    mut_annotation_parts(annotation).is_some()
+/// Whether a binder annotation is a pass-by-reference `Mut(…)` form.
+///
+/// Reads the annotation's *type* only. This runs during pre-registration, before
+/// the mode is validated, so a bounded `Mut(…)` still answers `true` here and is
+/// rejected where the parameter is lowered
+/// (`lower::functions::mut_param_history_type`) — registering it either way is
+/// harmless, since the rejection is what the program sees.
+fn is_mut_annotation(annotation: &TypeAnnotation) -> bool {
+    mut_annotation_parts(&annotation.ty).is_some()
 }
 
-/// Lower a CHL type annotation expression to a CCL [`Type`].
+/// Lower a binder's type annotation, applying its [`AnnotationMode`].
+///
+/// `x: T` lowers to `T`; `x <: T` lowers to [`Type::BoundedHole`], the marker
+/// `normalize_annotation` turns into an inference variable bounded above by `T`.
+/// The mode is a property of the *binder*, not of a type: `<:` is grammatical only
+/// where a binder is introduced, so nested positions inside `T` are always exact
+/// and [`lower_type_expr`] needs no mode parameter. (Design:
+/// `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".)
+pub(super) fn lower_type_annotation(annotation: &TypeAnnotation) -> Result<Type, LoweringError> {
+    let ty = lower_type_expr(&annotation.ty)?;
+    Ok(match annotation.mode {
+        AnnotationMode::Exact => ty,
+        AnnotationMode::Bounded => Type::BoundedHole(Box::new(ty)),
+    })
+}
+
+/// Lower a CHL type *expression* to a CCL [`Type`].
 ///
 /// Recognised forms:
 /// - Capitalized primitive names (`Caps` means type — `docs/chl-spec.md`):
@@ -971,7 +1065,7 @@ fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
 ///   comma is what makes it a product, and the parser rejects a comma-free
 ///   `{T}`.
 /// - The empty group `{}` — the unit type, `Unit`.
-pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
+pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
         ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
             LoweringError::unsupported(annotation.span, format!("unknown type annotation: {id}"))
@@ -989,7 +1083,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
             for field in fields {
                 out.push((
                     field.name.as_str().to_string(),
-                    lower_type_annotation(&field.value)?,
+                    lower_type_expr(&field.value)?,
                 ));
             }
             Ok(Type::Record(out))
@@ -1004,7 +1098,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
         ChlExpr::BraceGroup(parts) => Ok(Type::Tuple(
             parts
                 .iter()
-                .map(lower_type_annotation)
+                .map(lower_type_expr)
                 .collect::<Result<_, _>>()?,
         )),
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple
@@ -1077,7 +1171,7 @@ fn lower_type_application(
                 name: None,
                 kind: crate::ccl::ty::FunKind::Data,
                 domain: Box::new(Type::Hole),
-                codomain: Box::new(lower_type_annotation(elem)?),
+                codomain: Box::new(lower_type_expr(elem)?),
             })
         }
         // `Mut(…)` in a nested position is handled by `mut_annotation_parts`
