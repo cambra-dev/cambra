@@ -496,6 +496,25 @@ impl TraitObligation {
         Ok(())
     }
 
+    /// The types the surviving instances still accept at operand position `pos`.
+    ///
+    /// The operand-side reading of [`agreed_assoc`](Self::agreed_assoc), and
+    /// deliberately a *set* rather than an `Option`: an associated position is
+    /// deposited only once the candidates agree, because depositing a guess would
+    /// constrain a live program. Nothing here is deposited — the caller is choosing
+    /// a type for an operand no bound will ever reach, so what it needs is the
+    /// choices, not a verdict that there is exactly one.
+    ///
+    /// Order follows the instance table, so a caller that picks positionally picks
+    /// reproducibly.
+    pub fn accepted_at(&self, pos: u8) -> Vec<BaseType> {
+        self.candidates
+            .borrow()
+            .iter()
+            .filter_map(|i| i.args.get(pos as usize).cloned())
+            .collect()
+    }
+
     /// The type every surviving instance associates with `name`, or `None` if
     /// they disagree — the condition a deposit waits on.
     fn agreed_assoc(&self, name: Assoc) -> Option<BaseType> {

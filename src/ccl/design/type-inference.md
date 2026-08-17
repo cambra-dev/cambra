@@ -226,10 +226,13 @@ The solver's single-sided `Var <: Var` constrain rule leaves a few *structural* 
 What the bottom-up `expr.ty` resolution *doesn't* reach is the **binder slots**: a binder carries a type that is not any node's `expr.ty` — a `Lambda`'s `param.ty`, a `Let`'s `binding.ty`, a `Case` pattern's `binding.ty`, a `For`'s target slot. Each is resolved explicitly in `coalesce_node`, mirroring its definition (inference runs before the mutability/transaction phases, so the recurrence carriers `LetRec`/`Transact` never reach coalesce):
 
 * **`Lambda` `param.ty`** — derived from the lambda's coalesced domain (so body-usage restriction refinements, which are negative-polarity facts visible only in the contravariant domain, survive), and re-derived whenever a parent arm specializes the domain (`refresh_lambda_param_slot`).
-* **`Let` `binding.ty`** — the (already-coalesced) bound expression's type. emit never constrains the binding slot and the generic `expr.ty` resolution skips it, so without this line a `let`-bound `Var`'s **binder slot** (not its uses) stays `Type::Hole`.
-* **`Case` / `For` slots** — run through `resolve_var_type` like any `expr.ty`.
+* **`Let` / `LetRec` / mutable-variable `binding.ty`, `Case` pattern payloads, a `For` target** — resolved *in place* by `resolve_binder_slot`. Resolving the slot is **not** copying the coalesced RHS type onto it: the two agree for an unannotated `let` (the binder is bound at its initializer's type) and disagree for the annotated ones — a deref-copy binds at the value type where the RHS is a handle, a mutable-variable introduction at the handle where the RHS is a value.
 
-Refinement predicates are coalesced by recursing into them (in the `Lambda` arm and `coalesce_type_predicates`); their free variables share the enclosing bindings' vars and coalesce identically, just like ordinary `Var` uses — and their projections recover their domains through the same `Apply`/`Compose` arms (see §2).
+**Resolving a binder slot is two jobs.** `resolve_var_type` settles the type's *structure*; the refinement predicates riding it are expression trees hanging off type slots, carrying inference variables of their own, and they are settled by `coalesce_type_predicates` — which is exactly what `coalesce_node` runs for every `expr.ty`. A slot that did only the first would keep the **pre-coalesce predicate `Rc`**: the predicate memo redirects only the occurrences it visits, so a slot the walk skipped still points at the original, and the stale copy survives with unresolved variables. `resolve_binder_slot` exists so the two halves cannot drift apart per slot.
+
+That residue is invisible in most programs because something else rebuilds the binder — a *generalized* `let`'s definition is re-coalesced by `specialize_use` at each specialization. It is a **value** binding that exposes it: nothing rebuilds it, so the slot is the only chance. Two independent shapes reach it — a `groupby` (a collection, so a value binding, and dependently refined, so its binder type carries a predicate at all) and a `match` over a conditionally-built collection (whose arm domains carry the conditional's gate).
+
+Refinement predicates are otherwise coalesced by recursing into them (in the `Lambda` arm and `coalesce_type_predicates`); their free variables share the enclosing bindings' vars and coalesce identically, just like ordinary `Var` uses — and their projections recover their domains through the same `Apply`/`Compose` arms (see §2).
 
 ### The post-inference check (shared rules)
 
@@ -1412,6 +1415,12 @@ The bottom two rows are ordinary schemes, because their operand types are fixed.
 For each `Branch { guard, body }`: the guard flows one-way into `Type::Base(BaseType::Bool)` (a refined boolean is still a boolean); every body flows one-way into one shared variable. The overall `Case` type is that variable — the arms' **join**. Two arms of incompatible base types therefore collide as `IncompatibleBounds` at coalesce, where a heterogeneous list literal or `CollectionUnion` reports it, rather than as an eager mismatch here. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
 
 The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [Data vs compute functions](#46-data-vs-compute-functions); the strict-equality behavior above is current until that lands.
+
+#### An unobservable arm payload defaults to `Unit`
+
+An arm naming a tag the scrutinee cannot carry receives no lower bound, and if its body ignores its binder it receives no upper bound either — nothing determines that payload's type and nothing can observe it. Such an arm is ordinary code rather than an error (a `match` written for the whole `Option` over a scrutinee inference has pinned to one tag), so inference completes by choosing `Unit`, the type that carries no information.
+
+The choice is recorded on the *variable*, not in the binder slot, so every occurrence of it agrees — the slot, the scrutinee's expected variant, and hence an enclosing lambda's parameter type. Unreachable arms are **kept**, not pruned: an arm for a tag the scrutinee cannot carry projects an empty restriction and contributes nothing, while pruning would narrow the arm set relative to the enclosing lambda's declared domain. `pin_unobservable_arm_payload` in `src/ccl/infer/solve.rs` holds the mechanism, including the two ordering constraints that place it inside the coalesce walk.
 
 ### Record literals and field access
 
