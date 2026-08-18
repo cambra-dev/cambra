@@ -1698,7 +1698,7 @@ pub(super) fn emit_case<C: Typing>(
             variant_type(expected_tags)
         };
         ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
-        // An arm that names no payload claims the tag carries nothing. The claim is
+        // An arm that names no payload refinements the tag carries nothing. The refinement is
         // checked per arm rather than folded into the variant above so that the
         // rejection names the arm, and the message can point at `` case `some(_): ``.
         // Recorded after the scrutinee constraint so the payload has flowed in by

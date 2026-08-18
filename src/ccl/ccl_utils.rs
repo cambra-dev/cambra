@@ -1230,7 +1230,7 @@ where
 /// Keyed on [`PredicateId`] (the origin `Rc`'s address), which is sound only while
 /// that address cannot be reused: overwriting a `refinement.predicate` can drop
 /// the last reference to the origin, freeing an address a later `Rc::new` in the
-/// same pass reclaims, so an unrelated predicate landing there would collide and
+/// same pass rerefinements, so an unrelated predicate landing there would collide and
 /// inherit this entry's rebuild. Every entry therefore retains its origin `Rc` for
 /// the memo's lifetime. This is why passes use `PredMemo` rather than a bare map.
 ///

@@ -628,7 +628,7 @@ fn test_grouping_lookup_edges(#[case] code: &str, #[case] expected: Value) {
 /// Those value assertions hold whether the partition is bucketized once or
 /// rebuilt per use — a rebuild is slower, not wrong — so on their own they
 /// leave the property untested. One `converse` is the bucketize step, so one
-/// per program is the claim.
+/// per program is the refinement.
 ///
 /// Note what this does **not** separate. Two routes deliver the sharing: a
 /// `groupby` is a value binding rather than a generalized function

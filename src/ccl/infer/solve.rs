@@ -430,7 +430,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
 /// everywhere else in this comparison. They cannot be: the two sides here are legally a
 /// handle and its read view, which sit at different depths, so there is no layer count
 /// to compare. Only the handle side is peeled — the read view carries the value's own
-/// claims, and those are compared by the ordinary rule, layers and all.
+/// refinements, and those are compared by the ordinary rule, layers and all.
 #[cfg(debug_assertions)]
 fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
     use crate::ccl::HistoryKind;
@@ -2343,9 +2343,9 @@ mod tests {
             domain: Box::new(Type::Txn),
             kind: HistoryKind::Overwrite,
         };
-        let claim = Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true))));
+        let refinement = Refinement::born(std::rc::Rc::new(TypedExpr::lit(Lit::Bool(true))));
         let on_the_handle =
-            |t: Type| Type::Refinement(Box::new(t), Refinement::sharing(&claim.predicate));
+            |t: Type| Type::Refinement(Box::new(t), Refinement::sharing(&refinement.predicate));
 
         for (read, now) in [
             // handle vs its read view: the refined value sits one layer deeper.
