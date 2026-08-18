@@ -399,6 +399,9 @@ pub(crate) fn observe_bound_scope(holder: &InferVar, side: &'static str, bound: 
                 holder.uid, holder.telescope, bound.ty
             ));
         }
+        if std::env::var_os("CAMBRA_TELESCOPE_BT").is_some() {
+            out.push_str(&format!("{}\n", std::backtrace::Backtrace::force_capture()));
+        }
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

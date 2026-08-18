@@ -112,7 +112,11 @@ impl Typing for CheckCtx {
     }
 
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
-        scheme.instantiate(self.level)
+        // `Typing::instantiate` is the operator-scheme path: the template's
+        // variables stand nowhere, so the instantiation takes this position's
+        // telescope. (A let-generalized binding instantiates directly via
+        // `PolyScheme::instantiate` and keeps its definition-site telescopes.)
+        scheme.instantiate_in(self.level, &self.telescope)
     }
 
     fn normalize(&mut self, ann: &Type) -> Type {
