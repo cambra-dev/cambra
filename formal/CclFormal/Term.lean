@@ -248,24 +248,13 @@ def Pred.elemOnly : Pred → Bool
   | .proj a _ => a.elemOnly
   | .app f a => f.elemOnly && a.elemOnly
 
-/-- The types the term fragment covers, hereditarily. Two conditions, each
-excising a concrete preservation counterexample (spelled out in
-`formal/design.md`):
-
-- **Every refinement predicate is `Pred.elemOnly`** — the non-dependent
-  fragment. Off it, the codomain edge's Pi correspondence (`codRen`) can
-  α-move a *dangling* `Pred.var` reference, producing subtype links whose
-  typing transport is underivable (a modeling artifact: the model does not
-  scope predicate variables).
-- **No `fn` domain is partition-shaped** (`partitionDomain` = `none`).
-  `Sub.fnNorm` collapses a partition domain `⧺ᵢ({𝐷 | π̂ᵢ})` to `𝐷` at *any*
-  kind — deliberate in the Rust, where a partition variant in domain
-  position describes untagged pieces of a collection — but the term model
-  reads `variant` types as *tagged values*, and under that reading the
-  collapse lets a bare `𝐷` value reach a lambda whose body expects the
-  variant: preservation fails at beta. Soundness in the Rust rests on the
-  implicit invariant that index-contiguous same-base variants are fan-out
-  descriptors, never value-variant types.
+/-- The types the term fragment covers, hereditarily: **every refinement
+predicate is `Pred.elemOnly`**, the non-dependent fragment. Off it, the
+codomain edge's Pi correspondence (`codRen`) can α-move a *dangling*
+`Pred.var` reference, producing subtype links whose typing transport is
+underivable — a modeling artifact, since the model does not scope predicate
+variables, and one concrete preservation counterexample (spelled out in
+`formal/design.md`).
 
 The shape follows `Ty.WF`: an inductive with one constructor per head, so
 `cases` is the inversion. -/
@@ -274,7 +263,7 @@ inductive Ty.TermFrag : Ty → Prop
   | uintRange (n) : Ty.TermFrag (.uintRange n)
   | dataSource (s) : Ty.TermFrag (.dataSource s)
   | txn : Ty.TermFrag .txn
-  | fn {n k d c} : partitionDomain d = none → Ty.TermFrag d → Ty.TermFrag c →
+  | fn {n k d c} : Ty.TermFrag d → Ty.TermFrag c →
       Ty.TermFrag (.fn n k d c)
   | tuple {ts} : (∀ t ∈ ts, Ty.TermFrag t) → Ty.TermFrag (.tuple ts)
   | record {fs} : (∀ f ∈ fs, Ty.TermFrag f.2) → Ty.TermFrag (.record fs)
@@ -304,7 +293,7 @@ inductive HasTy : List Ty → Tm → Ty → Prop
   | lit {Γ} (l : Lit) : HasTy Γ (.lit l) l.ty
   | var {Γ n T} : Γ[n]? = some T → HasTy Γ (.var n) T
   | lam {Γ dom body cod} :
-      dom.TermFrag → partitionDomain dom = none →
+      dom.TermFrag →
       HasTy (dom :: Γ) body cod →
       HasTy Γ (.lam dom body) (.fn none .compute dom cod)
   | app {Γ f a name kind dom cod} :

@@ -138,41 +138,26 @@ theorem sub_of_subCheck :
     · exact Sub.txn
     -- Function edge.
     · rename_i n0 k0 d0 c0 n1 k1 d1 c1
-      split at h
-      · -- Normalization branch: recurse on the plain form(s).
-        rename_i hcond
-        have hsz := normPair_sizeOf _ _ hcond
-        exact Sub.fnNorm hcond (sub_of_subCheck _ _ ρl ρr h)
-      · -- General branch.
-        rename_i hcond
-        have hnl : normFun (.fn n0 k0 d0 c0) = none := by
-          cases hn : normFun (.fn n0 k0 d0 c0) with
-          | none => rfl
-          | some _ => exact absurd (Or.inl (by simp [hn])) hcond
-        have hnr : normFun (.fn n1 k1 d1 c1) = none := by
-          cases hn : normFun (.fn n1 k1 d1 c1) with
-          | none => rfl
-          | some _ => exact absurd (Or.inr (by simp [hn])) hcond
-        rw [Bool.and_eq_true, Bool.and_eq_true] at h
-        obtain ⟨⟨hok, hdom⟩, hcod⟩ := h
-        have hcodS := sub_of_subCheck c0 c1 (codRen n0 n1 ρl) ρr hcod
-        split at hdom
-        · -- data-data: invariant domains.
-          rename_i hdd
-          rw [Bool.and_eq_true] at hdd
-          have hk0 : k0 = .data := by simpa using hdd.1
-          have hk1 : k1 = .data := by simpa using hdd.2
-          subst hk0; subst hk1
-          rw [Bool.and_eq_true] at hdom
-          exact Sub.fnData hnl hnr
-            (sub_of_subCheck d1 d0 ρr ρl hdom.1)
-            (sub_of_subCheck d0 d1 ρl ρr hdom.2) hcodS
-        · rename_i hdd
-          have hnd : ¬(k0 = .data ∧ k1 = .data) := by
-            rintro ⟨rfl, rfl⟩
-            exact hdd (by simp)
-          exact Sub.fnCompute hnl hnr (kindOkB_iff.mp hok) hnd
-            (sub_of_subCheck d1 d0 ρr ρl hdom) hcodS
+      rw [Bool.and_eq_true, Bool.and_eq_true] at h
+      obtain ⟨⟨hok, hdom⟩, hcod⟩ := h
+      have hcodS := sub_of_subCheck c0 c1 (codRen n0 n1 ρl) ρr hcod
+      split at hdom
+      · -- data-data: invariant domains.
+        rename_i hdd
+        rw [Bool.and_eq_true] at hdd
+        have hk0 : k0 = .data := by simpa using hdd.1
+        have hk1 : k1 = .data := by simpa using hdd.2
+        subst hk0; subst hk1
+        rw [Bool.and_eq_true] at hdom
+        exact Sub.fnData
+          (sub_of_subCheck d1 d0 ρr ρl hdom.1)
+          (sub_of_subCheck d0 d1 ρl ρr hdom.2) hcodS
+      · rename_i hdd
+        have hnd : ¬(k0 = .data ∧ k1 = .data) := by
+          rintro ⟨rfl, rfl⟩
+          exact hdd (by simp)
+        exact Sub.fnCompute (kindOkB_iff.mp hok) hnd
+          (sub_of_subCheck d1 d0 ρr ρl hdom) hcodS
     -- Tuple.
     · rename_i a b
       obtain ⟨hlen, hpt⟩ := (subSeq_iff ρl ρr a b).mp h
@@ -236,16 +221,7 @@ theorem subCheck_of_sub {ρl ρr : Ren} {lhs rhs : Ty}
   | uintRange n => simp [subCheck]
   | dataSource s => simp [subCheck]
   | txn => simp [subCheck]
-  | @fnNorm ρl ρr n0 k0 d0 c0 n1 k1 d1 c1 hguard hplain ihplain =>
-      simp only [subCheck]
-      rw [dif_pos hguard]
-      exact ihplain
-  | @fnCompute ρl ρr n0 n1 k0 k1 d0 c0 d1 c1 hnl hnr hok hnd hdom hcod ihdom ihcod =>
-      have hcond : ¬((normFun (.fn n0 k0 d0 c0)).isSome ∨
-          (normFun (.fn n1 k1 d1 c1)).isSome) := by
-        rintro (hs | hs)
-        · rw [hnl] at hs; exact absurd hs (by simp)
-        · rw [hnr] at hs; exact absurd hs (by simp)
+  | @fnCompute ρl ρr n0 n1 k0 k1 d0 c0 d1 c1 hok hnd hdom hcod ihdom ihcod =>
       have hdd : (k0 == FunKind.data && k1 == FunKind.data) = false := by
         rw [Bool.and_eq_false_iff]
         by_cases hk : k0 = .data
@@ -256,16 +232,9 @@ theorem subCheck_of_sub {ρl ρr : Ren} {lhs rhs : Ty}
           exact hnd ⟨rfl, by simpa using hp⟩
         · exact .inl (by simpa using hk)
       simp only [subCheck]
-      rw [dif_neg hcond]
       simp [hdd, kindOkB_iff.mpr hok, ihdom, ihcod]
-  | @fnData ρl ρr n0 n1 d0 c0 d1 c1 hnl hnr hdom1 hdom2 hcod ih1 ih2 ihcod =>
-      have hcond : ¬((normFun (.fn n0 .data d0 c0)).isSome ∨
-          (normFun (.fn n1 .data d1 c1)).isSome) := by
-        rintro (hs | hs)
-        · rw [hnl] at hs; exact absurd hs (by simp)
-        · rw [hnr] at hs; exact absurd hs (by simp)
+  | @fnData ρl ρr n0 n1 d0 c0 d1 c1 hdom1 hdom2 hcod ih1 ih2 ihcod =>
       simp only [subCheck]
-      rw [dif_neg hcond]
       simp [kindOkB, ih1, ih2, ihcod]
   | tuple hlen hpt ihpt =>
       simp only [subCheck]

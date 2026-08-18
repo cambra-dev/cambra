@@ -86,46 +86,6 @@ theorem lookupBy_of_mem_nodup [BEq α] [LawfulBEq α] {l : List (α × Ty)}
         rw [hfind]
         exact this
 
-/-- A leg's normal form is well-formed: it is the leg's own base (whose
-well-formedness the leg carries) or that base re-refined by a non-empty
-sublist of the leg's claims, which is exactly `Ty.WF.refined`'s shape. -/
-theorem legNormal_wf {p0 : Ty} (h : p0.WF) (rest : List (FieldKey × Ty)) :
-    (legNormal p0 rest).WF := by
-  cases p0 <;> simp [legNormal] <;> try exact h
-  case refined b ps =>
-    cases h with
-    | refined hne hnr hb =>
-      split
-      · exact hb
-      · split
-        · exact hb
-        · rename_i hEmpty
-          exact .refined (by simpa using hEmpty) hnr hb
-
-/-- Normalization preserves well-formedness: the common domain is the first
-leg's normal form, whose well-formedness the variant carries. -/
-theorem partitionDomain_wf {d u : Ty} (hwf : d.WF)
-    (h : partitionDomain d = some u) : u.WF := by
-  match d, h with
-  | .variant ((k0, p0) :: rest), h =>
-      simp only [partitionDomain] at h
-      split at h
-      · injection h with h
-        subst h
-        cases hwf with
-        | variant hnd hts =>
-            exact legNormal_wf (hts (k0, p0) (List.mem_cons_self ..)) rest
-      · exact absurd h (by simp)
-
-theorem normFun_wf {t t' : Ty} (hwf : t.WF) (h : normFun t = some t') :
-    t'.WF := by
-  match t, h with
-  | .fn n k d c, h =>
-      simp only [normFun, Option.map_eq_some_iff] at h
-      obtain ⟨d', hd, rfl⟩ := h
-      cases hwf with
-      | fn hd0 hc => exact .fn (partitionDomain_wf hd0 hd) hc
-
 /-- The refined case's termination shape: peeling the base stays under the
 refined node's size, whatever the predicate contributes. -/
 theorem Ty.peel_fst_lt_one_add (b : Ty) (n : Nat) :
@@ -151,27 +111,17 @@ theorem Sub.refl : (t : Ty) → t.WF → (ρl ρr : Ren) → ρl.IsId → ρr.Is
   | .dataSource s, _, _, _, _, _ => .dataSource s
   | .txn, _, _, _, _, _ => .txn
   | .fn n k d c, hwf, ρl, ρr, hl, hr => by
-      cases hn : normFun (.fn n k d c) with
-      | some t' =>
-          -- A partition-typed function is reflexively below itself through
-          -- its (shared) normal form.
-          refine Sub.fnNorm (.inl (by simp [hn])) ?_
-          rw [hn]
-          simp only [Option.getD_some]
-          have hsz := normFun_sizeOf hn
-          exact Sub.refl t' (normFun_wf hwf hn) ρl ρr hl hr
-      | none =>
-          cases hwf with
-          | fn hd hc =>
-            have hcod :=
-              Sub.refl c hc (codRen n n ρl) ρr (codRen_diag_isId n hl) hr
-            cases k with
-            | data =>
-                exact .fnData hn hn (Sub.refl d hd ρr ρl hr hl)
-                  (Sub.refl d hd ρl ρr hl hr) hcod
-            | compute =>
-                exact .fnCompute hn hn trivial (fun h => nomatch h.1)
-                  (Sub.refl d hd ρr ρl hr hl) hcod
+      cases hwf with
+      | fn hd hc =>
+        have hcod :=
+          Sub.refl c hc (codRen n n ρl) ρr (codRen_diag_isId n hl) hr
+        cases k with
+        | data =>
+            exact .fnData (Sub.refl d hd ρr ρl hr hl)
+              (Sub.refl d hd ρl ρr hl hr) hcod
+        | compute =>
+            exact .fnCompute trivial (fun h => nomatch h.1)
+              (Sub.refl d hd ρr ρl hr hl) hcod
   | .tuple ts, hwf, ρl, ρr, hl, hr => by
       cases hwf with
       | tuple hts =>

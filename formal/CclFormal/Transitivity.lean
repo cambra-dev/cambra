@@ -1,20 +1,16 @@
 import CclFormal.Equiv
 import CclFormal.Props
-import CclFormal.Trans
 
 /-!
 # Transitivity of the ground subtype relation
 
-Transitivity was **refuted** while the gated-partition bridge arm was a
-target-relative comparison (`CclFormal/Trans.lean` records the history),
-became a live conjecture once the collapse was re-homed as a normalization,
-and was first proved for the binder-free fragment (`NoPi`). The remaining
-obstruction was the **σ-gap**: chaining dependent codomains produces
-premises that view the middle type under different renames, which compose
-only through a reconciliation morphism — the model analogue of
-`constrain.rs :: bridge_holder_gap`.
+`Sub` is transitive on the canonical fragment. The statement first covered
+the binder-free fragment (`NoPi`); the obstruction past it was the **σ-gap**,
+where chaining dependent codomains produces premises that view the middle
+type under different renames, composing only through a reconciliation
+morphism — the model analogue of `constrain.rs :: bridge_holder_gap`.
 
-Canonical Pi binders dissolved the gap. The solver now names every arrow's
+Canonical Pi binders dissolve the gap. The solver now names every arrow's
 binder by its depth (`__pi0`, `__pi1`, … — `ReservedName::Pi`, the
 `REFINEMENT_BINDER` move applied to arrows), so any two types compared at
 the same position carry the *same* binder when both carry one. Every binder
@@ -100,59 +96,6 @@ theorem canon_peel_fst : (d : Nat) → (t : Ty) → Canon d t → Canon d t.peel
 termination_by _ t => sizeOf t
 decreasing_by simp_wf; omega
 
-theorem canon_legNormal (d : Nat) (t : Ty) (rest : List (FieldKey × Ty))
-    (h : Canon d t) : Canon d (legNormal t rest) := by
-  cases t <;> simp [legNormal] <;> try exact h
-  case refined b ps =>
-    rw [Canon] at h
-    split
-    · exact h.2
-    · split
-      · exact h.2
-      · rename_i hEmpty
-        rw [Canon]
-        exact ⟨by simpa using hEmpty, h.2⟩
-
-theorem canon_legUnder : (d : Nat) → (t : Ty) → Canon d t → Canon d (legUnder t)
-  | _, .base _, h => h
-  | _, .uintRange _, h => h
-  | _, .dataSource _, h => h
-  | _, .txn, h => h
-  | _, .fn .., h => h
-  | _, .tuple _, h => h
-  | _, .record _, h => h
-  | _, .variant _, h => h
-  | d, .refined b _, h => by rw [Canon] at h; simpa [legUnder] using h.2
-
-theorem canon_partitionDomain {d : Nat} {t u : Ty} (h : Canon d t)
-    (hd : partitionDomain t = some u) : Canon d u := by
-  match t, hd with
-  | .variant ((k0, p0) :: rest), hd =>
-      simp only [partitionDomain] at hd
-      split at hd
-      · injection hd with hd
-        subst hd
-        have hp0 : Canon d p0 := by
-          rw [Canon] at h
-          exact h (k0, p0) (List.mem_cons_self ..)
-        exact canon_legNormal d p0 rest hp0
-      · exact absurd hd (by simp)
-
-theorem canon_normFun {d : Nat} {t t' : Ty} (h : Canon d t)
-    (hn : normFun t = some t') : Canon d t' := by
-  match t, hn with
-  | .fn n k dom c, hn =>
-      simp only [normFun, Option.map_eq_some_iff] at hn
-      obtain ⟨d', hd, rfl⟩ := hn
-      rw [Canon] at h ⊢
-      exact ⟨h.1, canon_partitionDomain h.2.1 hd, h.2.2⟩
-
-theorem canon_normFun_getD {d : Nat} {t : Ty} (h : Canon d t) :
-    Canon d ((normFun t).getD t) := by
-  cases hn : normFun t with
-  | none => simpa using h
-  | some t' => simpa using canon_normFun h hn
-
 theorem canon_fn_binder {d n k dom c} (h : Canon d (.fn n k dom c)) :
     n = none ∨ n = some (piName d) := by
   rw [Canon] at h; exact h.1
@@ -218,37 +161,14 @@ theorem sub_peel_inv {ρl ρr : Ren} {x y : Ty} (h : Sub ρl ρr x y) :
   | uintRange n => exact ⟨rfl, .uintRange n⟩
   | dataSource s => exact ⟨rfl, .dataSource s⟩
   | txn => exact ⟨rfl, .txn⟩
-  | fnNorm h1 h2 => exact ⟨rfl, .fnNorm h1 h2⟩
-  | fnCompute h1 h2 h3 h4 h5 h6 => exact ⟨rfl, .fnCompute h1 h2 h3 h4 h5 h6⟩
-  | fnData h1 h2 h3 h4 h5 => exact ⟨rfl, .fnData h1 h2 h3 h4 h5⟩
+  | fnCompute h1 h2 h3 h4 => exact ⟨rfl, .fnCompute h1 h2 h3 h4⟩
+  | fnData h1 h2 h3 => exact ⟨rfl, .fnData h1 h2 h3⟩
   | tuple h1 h2 => exact ⟨rfl, .tuple h1 h2⟩
   | record h1 h2 => exact ⟨rfl, .record h1 h2⟩
   | variant h1 h2 => exact ⟨rfl, .variant h1 h2⟩
   | refined hpl hpr _ hdef hbase =>
       rw [hpl, hpr]
       exact ⟨hdef, hbase⟩
-
-/-- Every function-to-function edge relates the two sides' **normal forms**:
-`fnNorm` says so directly, and the general rules only fire when both sides
-are already normal. -/
-theorem sub_normFun {ρl ρr : Ren} {n0 k0 d0 c0 n1 k1 d1 c1}
-    (h : Sub ρl ρr (.fn n0 k0 d0 c0) (.fn n1 k1 d1 c1)) :
-    Sub ρl ρr ((normFun (.fn n0 k0 d0 c0)).getD (.fn n0 k0 d0 c0))
-      ((normFun (.fn n1 k1 d1 c1)).getD (.fn n1 k1 d1 c1)) := by
-  cases h with
-  | fnNorm _ hplain => exact hplain
-  | fnCompute hnl hnr h3 h4 h5 h6 =>
-      rw [hnl, hnr]
-      exact .fnCompute hnl hnr h3 h4 h5 h6
-  | fnData hnl hnr h3 h4 h5 =>
-      rw [hnl, hnr]
-      exact .fnData hnl hnr h3 h4 h5
-  | refined hpl hpr hg _ _ =>
-      simp only [Ty.peel, Prod.mk.injEq] at hpl hpr
-      obtain ⟨-, hl⟩ := hpl
-      obtain ⟨-, hr⟩ := hpr
-      subst hl; subst hr
-      rcases hg with hg | hg <;> exact absurd rfl hg
 
 theorem kindOk_trans {k0 km k1 : FunKind}
     (h1 : kindOk k0 km) (h2 : kindOk km k1) : kindOk k0 k1 := by
@@ -277,9 +197,8 @@ theorem sub_fn_rhs_shape {ρl ρr : Ren} {x : Ty} {nm km dm cm}
     (h : Sub ρl ρr x (.fn nm km dm cm)) (hx : x.peel.2 = []) :
     ∃ n0 k0 d0 c0, x = .fn n0 k0 d0 c0 := by
   cases h with
-  | fnNorm _ _ => exact ⟨_, _, _, _, rfl⟩
-  | fnCompute _ _ _ _ _ _ => exact ⟨_, _, _, _, rfl⟩
-  | fnData _ _ _ _ _ => exact ⟨_, _, _, _, rfl⟩
+  | fnCompute _ _ _ _ => exact ⟨_, _, _, _, rfl⟩
+  | fnData _ _ _ => exact ⟨_, _, _, _, rfl⟩
   | refined hpl hpr hg _ _ =>
       rw [hpl] at hx
       simp only [Ty.peel, Prod.mk.injEq] at hpr hx
@@ -294,9 +213,8 @@ theorem sub_fn_lhs_shape {ρl ρr : Ren} {z : Ty} {nm km dm cm}
     (h : Sub ρl ρr (.fn nm km dm cm) z) (hz : z.peel.2 = []) :
     ∃ n1 k1 d1 c1, z = .fn n1 k1 d1 c1 := by
   cases h with
-  | fnNorm _ _ => exact ⟨_, _, _, _, rfl⟩
-  | fnCompute _ _ _ _ _ _ => exact ⟨_, _, _, _, rfl⟩
-  | fnData _ _ _ _ _ => exact ⟨_, _, _, _, rfl⟩
+  | fnCompute _ _ _ _ => exact ⟨_, _, _, _, rfl⟩
+  | fnData _ _ _ => exact ⟨_, _, _, _, rfl⟩
   | refined hpl hpr hg _ _ =>
       rw [hpr] at hz
       simp only [Ty.peel, Prod.mk.injEq] at hpl hz
@@ -333,163 +251,82 @@ theorem sub_trans_fn {n d : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
     (h2 : Sub ρ2l ρ2r (.fn nm km dm cm) z) :
     Sub ρl ρr (.fn n0 k0 d0 c0) z := by
   obtain ⟨n1, k1, d1, c1, rfl⟩ := sub_fn_lhs_shape h2 hzb
-  have e1 := sub_normFun h1
-  have e2 := sub_normFun h2
-  have hlex : sizeOf ((normFun (Ty.fn n0 k0 d0 c0)).getD (Ty.fn n0 k0 d0 c0))
-      ≤ sizeOf (Ty.fn n0 k0 d0 c0) := by
-    cases hn : normFun (Ty.fn n0 k0 d0 c0) with
-    | none => simp
-    | some t => simpa using Nat.le_of_lt (normFun_sizeOf hn)
-  have hley : sizeOf ((normFun (Ty.fn nm km dm cm)).getD (Ty.fn nm km dm cm))
-      ≤ sizeOf (Ty.fn nm km dm cm) := by
-    cases hn : normFun (Ty.fn nm km dm cm) with
-    | none => simp
-    | some t => simpa using Nat.le_of_lt (normFun_sizeOf hn)
-  have hlez : sizeOf ((normFun (Ty.fn n1 k1 d1 c1)).getD (Ty.fn n1 k1 d1 c1))
-      ≤ sizeOf (Ty.fn n1 k1 d1 c1) := by
-    cases hn : normFun (Ty.fn n1 k1 d1 c1) with
-    | none => simp
-    | some t => simpa using Nat.le_of_lt (normFun_sizeOf hn)
-  by_cases hnorm : (normFun (Ty.fn n0 k0 d0 c0)).isSome ∨
-      (normFun (Ty.fn n1 k1 d1 c1)).isSome
-  · -- At least one outer side normalizes: collapse and recurse.
-    refine Sub.fnNorm hnorm (IH d _ _ _ ?_ (canon_normFun_getD hx)
-      (canon_normFun_getD hy) (canon_normFun_getD hz)
-      h1l h1r h2l h2r hρl hρr e1 e2)
-    have hstrict : sizeOf ((normFun (Ty.fn n0 k0 d0 c0)).getD (Ty.fn n0 k0 d0 c0))
-        + sizeOf ((normFun (Ty.fn n1 k1 d1 c1)).getD (Ty.fn n1 k1 d1 c1))
-        < sizeOf (Ty.fn n0 k0 d0 c0) + sizeOf (Ty.fn n1 k1 d1 c1) := by
-      rcases hnorm with hs | hs
-      · cases hn : normFun (Ty.fn n0 k0 d0 c0) with
-        | none => rw [hn] at hs; exact absurd hs (by simp)
-        | some t =>
-            have := normFun_sizeOf hn
-            simp only [Option.getD_some]
-            omega
-      · cases hn : normFun (Ty.fn n1 k1 d1 c1) with
-        | none => rw [hn] at hs; exact absurd hs (by simp)
-        | some t =>
-            have := normFun_sizeOf hn
-            simp only [Option.getD_some]
-            omega
+  have hdom_sz : sizeOf d1 + sizeOf dm + sizeOf d0 ≤ n := by
+    simp only [Ty.fn.sizeOf_spec] at hbound
     omega
-  · have hnx : normFun (Ty.fn n0 k0 d0 c0) = none := by
-      cases hn : normFun (Ty.fn n0 k0 d0 c0) with
-      | none => rfl
-      | some t => exact absurd (Or.inl (by rw [hn]; simp)) hnorm
-    have hnz : normFun (Ty.fn n1 k1 d1 c1) = none := by
-      cases hn : normFun (Ty.fn n1 k1 d1 c1) with
-      | none => rfl
-      | some t => exact absurd (Or.inr (by rw [hn]; simp)) hnorm
-    rw [hnx] at e1
-    rw [hnz] at e2
-    simp only [Option.getD_none] at e1 e2
-    by_cases hny : (normFun (Ty.fn nm km dm cm)).isSome
-    · -- Only the middle normalizes: recurse through its normal form.
-      refine IH d _ _ _ ?_ hx (canon_normFun_getD hy) hz
-        h1l h1r h2l h2r hρl hρr e1 e2
-      have hstrict : sizeOf ((normFun (Ty.fn nm km dm cm)).getD (Ty.fn nm km dm cm))
-          < sizeOf (Ty.fn nm km dm cm) := by
-        cases hn : normFun (Ty.fn nm km dm cm) with
-        | none => rw [hn] at hny; exact absurd hny (by simp)
-        | some t =>
-            have := normFun_sizeOf hn
-            simp only [Option.getD_some]
-            omega
-      omega
-    · -- Nothing normalizes: the structural rules, edge by edge.
-      have hnyn : normFun (Ty.fn nm km dm cm) = none := by
-        cases hn : normFun (Ty.fn nm km dm cm) with
-        | none => rfl
-        | some t => rw [hn] at hny; simp at hny
-      have hdom_sz : sizeOf d1 + sizeOf dm + sizeOf d0 ≤ n := by
-        simp only [Ty.fn.sizeOf_spec] at hbound
-        omega
-      have hcod_sz : sizeOf c0 + sizeOf cm + sizeOf c1 ≤ n := by
-        simp only [Ty.fn.sizeOf_spec] at hbound
-        omega
-      -- Canonical binder facts feed the diagonal-correspondence lemma:
-      -- every codomain environment in sight is identity-acting.
-      have hb0 := canon_fn_binder hx
-      have hbm := canon_fn_binder hy
-      have hb1 := canon_fn_binder hz
-      have hcod1_id : (codRen n0 nm ρ1l).IsId := codRen_canon_isId hb0 hbm h1l
-      have hcod2_id : (codRen nm n1 ρ2l).IsId := codRen_canon_isId hbm hb1 h2l
-      have hcodC_id : (codRen n0 n1 ρl).IsId := codRen_canon_isId hb0 hb1 hρl
-      cases h1 with
-      | fnNorm hg _ =>
-          rcases hg with hg | hg
-          · rw [hnx] at hg; exact absurd hg (by simp)
-          · rw [hnyn] at hg; exact absurd hg (by simp)
+  have hcod_sz : sizeOf c0 + sizeOf cm + sizeOf c1 ≤ n := by
+    simp only [Ty.fn.sizeOf_spec] at hbound
+    omega
+  -- Canonical binder facts feed the diagonal-correspondence lemma:
+  -- every codomain environment in sight is identity-acting.
+  have hb0 := canon_fn_binder hx
+  have hbm := canon_fn_binder hy
+  have hb1 := canon_fn_binder hz
+  have hcod1_id : (codRen n0 nm ρ1l).IsId := codRen_canon_isId hb0 hbm h1l
+  have hcod2_id : (codRen nm n1 ρ2l).IsId := codRen_canon_isId hbm hb1 h2l
+  have hcodC_id : (codRen n0 n1 ρl).IsId := codRen_canon_isId hb0 hb1 hρl
+  cases h1 with
+  | refined hpl hpr hg _ _ =>
+      simp only [Ty.peel, Prod.mk.injEq] at hpl hpr
+      obtain ⟨-, hl⟩ := hpl
+      obtain ⟨-, hr⟩ := hpr
+      subst hl; subst hr
+      rcases hg with hg | hg <;> exact absurd rfl hg
+  | fnCompute hok1 hnd1 hdom1 hcod1 =>
+      cases h2 with
       | refined hpl hpr hg _ _ =>
           simp only [Ty.peel, Prod.mk.injEq] at hpl hpr
           obtain ⟨-, hl⟩ := hpl
           obtain ⟨-, hr⟩ := hpr
           subst hl; subst hr
           rcases hg with hg | hg <;> exact absurd rfl hg
-      | fnCompute _ _ hok1 hnd1 hdom1 hcod1 =>
-          cases h2 with
-          | fnNorm hg _ =>
-              rcases hg with hg | hg
-              · rw [hnyn] at hg; exact absurd hg (by simp)
-              · rw [hnz] at hg; exact absurd hg (by simp)
-          | refined hpl hpr hg _ _ =>
-              simp only [Ty.peel, Prod.mk.injEq] at hpl hpr
-              obtain ⟨-, hl⟩ := hpl
-              obtain ⟨-, hr⟩ := hpr
-              subst hl; subst hr
-              rcases hg with hg | hg <;> exact absurd rfl hg
-          | fnCompute _ _ hok2 hnd2 hdom2 hcod2 =>
-              have hdom := IH d d1 dm d0 hdom_sz (canon_fn_dom hz)
-                (canon_fn_dom hy) (canon_fn_dom hx)
-                h2r h2l h1r h1l hρr hρl hdom2 hdom1
-              have hcod := IH (d + 1) c0 cm c1 hcod_sz (canon_fn_cod hx)
-                (canon_fn_cod hy) (canon_fn_cod hz)
-                hcod1_id h1r hcod2_id h2r hcodC_id hρr hcod1 hcod2
-              refine Sub.fnCompute hnx hnz (kindOk_trans hok1 hok2) ?_ hdom hcod
-              rintro ⟨rfl, rfl⟩
-              have hkm : km ≠ FunKind.data := fun h => hnd1 ⟨rfl, h⟩
-              cases km with
-              | data => exact hkm rfl
-              | compute => exact hok2
-          | fnData _ _ _ _ _ =>
-              have hk0 : k0 ≠ FunKind.data := fun h => hnd1 ⟨h, rfl⟩
-              cases k0 with
-              | data => exact absurd rfl hk0
-              | compute => exact absurd hok1 (by simp [kindOk])
-      | fnData _ _ hdom1a hdom1b hcod1 =>
-          cases h2 with
-          | fnNorm hg _ =>
-              rcases hg with hg | hg
-              · rw [hnyn] at hg; exact absurd hg (by simp)
-              · rw [hnz] at hg; exact absurd hg (by simp)
-          | refined hpl hpr hg _ _ =>
-              simp only [Ty.peel, Prod.mk.injEq] at hpl hpr
-              obtain ⟨-, hl⟩ := hpl
-              obtain ⟨-, hr⟩ := hpr
-              subst hl; subst hr
-              rcases hg with hg | hg <;> exact absurd rfl hg
-          | fnCompute _ _ hok2 hnd2 hdom2 hcod2 =>
-              have hdom := IH d d1 dm d0 hdom_sz (canon_fn_dom hz)
-                (canon_fn_dom hy) (canon_fn_dom hx)
-                h2r h2l h1r h1l hρr hρl hdom2 hdom1a
-              have hcod := IH (d + 1) c0 cm c1 hcod_sz (canon_fn_cod hx)
-                (canon_fn_cod hy) (canon_fn_cod hz)
-                hcod1_id h1r hcod2_id h2r hcodC_id hρr hcod1 hcod2
-              refine Sub.fnCompute hnx hnz hok2 ?_ hdom hcod
-              rintro ⟨-, rfl⟩
-              exact hnd2 ⟨rfl, rfl⟩
-          | fnData _ _ hdom2a hdom2b hcod2 =>
-              have hdomA := IH d d1 dm d0 hdom_sz (canon_fn_dom hz)
-                (canon_fn_dom hy) (canon_fn_dom hx)
-                h2r h2l h1r h1l hρr hρl hdom2a hdom1a
-              have hdomB := IH d d0 dm d1 (by omega) (canon_fn_dom hx)
-                (canon_fn_dom hy) (canon_fn_dom hz)
-                h1l h1r h2l h2r hρl hρr hdom1b hdom2b
-              have hcod := IH (d + 1) c0 cm c1 hcod_sz (canon_fn_cod hx)
-                (canon_fn_cod hy) (canon_fn_cod hz)
-                hcod1_id h1r hcod2_id h2r hcodC_id hρr hcod1 hcod2
-              exact Sub.fnData hnx hnz hdomA hdomB hcod
+      | fnCompute hok2 hnd2 hdom2 hcod2 =>
+          have hdom := IH d d1 dm d0 hdom_sz (canon_fn_dom hz)
+            (canon_fn_dom hy) (canon_fn_dom hx)
+            h2r h2l h1r h1l hρr hρl hdom2 hdom1
+          have hcod := IH (d + 1) c0 cm c1 hcod_sz (canon_fn_cod hx)
+            (canon_fn_cod hy) (canon_fn_cod hz)
+            hcod1_id h1r hcod2_id h2r hcodC_id hρr hcod1 hcod2
+          refine Sub.fnCompute (kindOk_trans hok1 hok2) ?_ hdom hcod
+          rintro ⟨rfl, rfl⟩
+          have hkm : km ≠ FunKind.data := fun h => hnd1 ⟨rfl, h⟩
+          cases km with
+          | data => exact hkm rfl
+          | compute => exact hok2
+      | fnData _ _ _ =>
+          have hk0 : k0 ≠ FunKind.data := fun h => hnd1 ⟨h, rfl⟩
+          cases k0 with
+          | data => exact absurd rfl hk0
+          | compute => exact absurd hok1 (by simp [kindOk])
+  | fnData hdom1a hdom1b hcod1 =>
+      cases h2 with
+      | refined hpl hpr hg _ _ =>
+          simp only [Ty.peel, Prod.mk.injEq] at hpl hpr
+          obtain ⟨-, hl⟩ := hpl
+          obtain ⟨-, hr⟩ := hpr
+          subst hl; subst hr
+          rcases hg with hg | hg <;> exact absurd rfl hg
+      | fnCompute hok2 hnd2 hdom2 hcod2 =>
+          have hdom := IH d d1 dm d0 hdom_sz (canon_fn_dom hz)
+            (canon_fn_dom hy) (canon_fn_dom hx)
+            h2r h2l h1r h1l hρr hρl hdom2 hdom1a
+          have hcod := IH (d + 1) c0 cm c1 hcod_sz (canon_fn_cod hx)
+            (canon_fn_cod hy) (canon_fn_cod hz)
+            hcod1_id h1r hcod2_id h2r hcodC_id hρr hcod1 hcod2
+          refine Sub.fnCompute hok2 ?_ hdom hcod
+          rintro ⟨-, rfl⟩
+          exact hnd2 ⟨rfl, rfl⟩
+      | fnData hdom2a hdom2b hcod2 =>
+          have hdomA := IH d d1 dm d0 hdom_sz (canon_fn_dom hz)
+            (canon_fn_dom hy) (canon_fn_dom hx)
+            h2r h2l h1r h1l hρr hρl hdom2a hdom1a
+          have hdomB := IH d d0 dm d1 (by omega) (canon_fn_dom hx)
+            (canon_fn_dom hy) (canon_fn_dom hz)
+            h1l h1r h2l h2r hρl hρr hdom1b hdom2b
+          have hcod := IH (d + 1) c0 cm c1 hcod_sz (canon_fn_cod hx)
+            (canon_fn_cod hy) (canon_fn_cod hz)
+            hcod1_id h1r hcod2_id h2r hcodC_id hρr hcod1 hcod2
+          exact Sub.fnData hdomA hdomB hcod
 
 /-- Fuel-bounded transitivity for the canonical fragment. -/
 theorem sub_trans_aux : (n : Nat) → TransIH n
@@ -550,15 +387,12 @@ theorem sub_trans_aux : (n : Nat) → TransIH n
               rcases hg with hg | hg
               · exact absurd rfl hg
               · exact absurd hzb hg
-      | fnNorm hg hp =>
+      | fnCompute a b c d' =>
           exact sub_trans_fn IH (by omega) hx hy hz hzb
-            h1l h1r h2l h2r hρl hρr (.fnNorm hg hp) h2
-      | fnCompute a b c d' e f =>
+            h1l h1r h2l h2r hρl hρr (.fnCompute a b c d') h2
+      | fnData a b c =>
           exact sub_trans_fn IH (by omega) hx hy hz hzb
-            h1l h1r h2l h2r hρl hρr (.fnCompute a b c d' e f) h2
-      | fnData a b c d' e =>
-          exact sub_trans_fn IH (by omega) hx hy hz hzb
-            h1l h1r h2l h2r hρl hρr (.fnData a b c d' e) h2
+            h1l h1r h2l h2r hρl hρr (.fnData a b c) h2
       | tuple hlen1 hpt1 =>
           cases h2 with
           | tuple hlen2 hpt2 =>
@@ -710,16 +544,6 @@ theorem sub_trans_id {d : Nat} {x y z : Ty}
     (h1 : Sub .id .id x y) (h2 : Sub .id .id y z) : Sub .id .id x z :=
   sub_trans hx hy hz Ren.isId_id Ren.isId_id Ren.isId_id Ren.isId_id
     Ren.isId_id Ren.isId_id h1 h2
-
-/-- End-to-end: the triangle that **refuted** transitivity under the bridge
-arm is an instance of the general theorem (its binders are all `none`,
-which is canonical at any depth). -/
-example : Sub .id .id transCex.a transCex.c :=
-  sub_trans_id (d := 0)
-    (by simp [Canon, transCex.a, transCex.gate, transCex.recA])
-    (by simp [Canon, transCex.b, transCex.recA])
-    (by simp [Canon, transCex.c, transCex.recAB])
-    transCex.sub_a_b transCex.sub_b_c
 
 /-! ## Claim order is not observable
 

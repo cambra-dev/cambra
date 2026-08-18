@@ -25,14 +25,12 @@ comparison (the ground residue of `Subst::force_refinement`).
   find-first record/variant arms disagree on duplicate-keyed products. See
   `Ty.WF`.
 
-Partition collapse (`⧺ᵢ({𝐷|π̂ᵢ}) ≡ 𝐷` as a domain) is modeled exactly as
-the Rust now implements it: a **normalization** applied before comparison
-(`Sub.fnNorm` mirroring `constrain_go`'s normalize-then-recurse arm). Its
-predecessor — the target-relative `is_index_partition_of` bridge arm — was
-found by this model to break transitivity of subsumption and to drop the
-Pi-binder correspondence on its codomain edge; both defects are repaired
-by the rewrite (see `formal/design.md` and
-`src/ccl/infer/solver/differential.rs` for the pinned history).
+- **No partition-collapse arm.** A value-`Case` fan-out is a
+  `DisjointJoin` over the arms' one shared domain, so no comparison ever
+  meets a `Variant` of gated legs in domain position against a plain-domain
+  demand (`src/ccl/design/ir.md`, "`Copair` and `DisjointJoin` — two
+  collection-combining operations, not one"). The relation therefore relates
+  a `Variant` domain only to a `Variant` domain.
 -/
 
 namespace CclFormal
@@ -146,151 +144,6 @@ theorem lookupBy_sizeOf [BEq α] [SizeOf α] {l : List (α × Ty)} {k : α} {t :
       simp at hm
       omega
 
-/-- A leg's bare base — what its claims narrow, or the leg itself when it is
-unrefined (the gate lives in the term, a `filter_values` restrict). -/
-def legUnder : Ty → Ty
-  | .refined u _ => u
-  | t => t
-
-/-- The claims a leg carries; none when it is bare. -/
-def Ty.claims : Ty → List Pred
-  | .refined _ ps => ps
-  | _ => []
-
-/-- Same claims, in any order — claim lists are compared as *sets* wherever
-the relation compares them at all. -/
-def sameClaims (a b : List Pred) : Bool :=
-  a.length == b.length && a.all (· ∈ b)
-
-/-- Contiguous `Index` keys from `i`, every leg's `legUnder` equal to
-`common`. -/
-def partitionTagsGo (common : Ty) : Nat → List (FieldKey × Ty) → Bool
-  | _, [] => true
-  | i, (k, p) :: rest =>
-      k == .idx i && legUnder p == common && partitionTagsGo common (i + 1) rest
-
-/-- The domain a gated **partition** normalizes to — mirror of
-`constrain.rs :: partition_domain`: a `Variant` with contiguous `Index(0..n)`
-tags (n ≥ 1) whose legs share one bare base.
-
-A leg's claims are its **gate** plus whatever the shared domain already
-claimed, told apart by *agreement*: gates are per-leg by construction
-(first-match predicates, mutually exclusive), so a claim every leg carries is
-domain and the common claims are the **intersection**, which must survive into
-the normal form. Dropping them would normalize `⧺ᵢ({𝐸 | 𝑝, π̂ᵢ})` to `𝐸`,
-claiming the gates cover all of `𝐸` when they cover only its `𝑝`-satisfying
-part. When the legs all claim the same thing nothing distinguishes gate from
-domain and the claims are peeled — which subsumes the single-leg case under
-one rule. `none` for anything shaped differently.
-
-`legNormal` is that per-leg rule, split out so its size bound
-(`legNormal_sizeOf_le`) is stated once. -/
-def legNormal (p0 : Ty) (rest : List (FieldKey × Ty)) : Ty :=
-  match p0 with
-  | .refined b ps =>
-      if rest.all (fun t => sameClaims t.2.claims ps) then b
-      else
-        let shared := ps.filter (fun r => rest.all (fun t => r ∈ t.2.claims))
-        if shared.isEmpty then b else .refined b shared
-  -- A bare leg claims nothing, so the intersection is empty and the common
-  -- domain is the leg itself.
-  | bare => bare
-
-def partitionDomain : Ty → Option Ty
-  | .variant ((k0, p0) :: rest) =>
-      if k0 == .idx 0 && partitionTagsGo (legUnder p0) 1 rest then
-        some (legNormal p0 rest)
-      else none
-  | _ => none
-
-/-- The plain form of a partition-domained function — mirror of
-`constrain.rs :: normalized_partition_fun`. Kind, binder, and codomain ride
-along untouched. -/
-def normFun : Ty → Option Ty
-  | .fn n k d c => (partitionDomain d).map fun d' => .fn n k d' c
-  | _ => none
-
-theorem legUnder_sizeOf_le (t : Ty) : sizeOf (legUnder t) ≤ sizeOf t := by
-  cases t <;> simp [legUnder] <;> omega
-
-/-- Filtering never grows a list — the size side-condition for keeping a
-partition's shared claims in its normal form. -/
-theorem List.sizeOf_filter_le {α} [SizeOf α] (f : α → Bool) :
-    (l : List α) → sizeOf (l.filter f) ≤ sizeOf l
-  | [] => by simp
-  | a :: t => by
-      have ih := List.sizeOf_filter_le f t
-      by_cases h : f a = true <;> simp [h] <;> omega
-
-/-- A leg's normal form never exceeds the leg: it is the leg's bare base, or
-that base carrying a *sublist* of the leg's own claims. -/
-theorem legNormal_sizeOf_le (p0 : Ty) (rest : List (FieldKey × Ty)) :
-    sizeOf (legNormal p0 rest) ≤ sizeOf p0 := by
-  cases p0 <;> simp [legNormal]
-  case refined b ps =>
-    split
-    · omega
-    · split
-      · omega
-      · have := List.sizeOf_filter_le
-          (fun r => rest.all (fun t => r ∈ t.2.claims)) ps
-        simp
-        omega
-
-/-- Normalizing a domain strictly shrinks it (the common domain sits inside
-the variant's first leg). -/
-theorem partitionDomain_sizeOf {d u : Ty} (h : partitionDomain d = some u) :
-    sizeOf u < sizeOf d := by
-  match d, h with
-  | .variant ((k0, p0) :: rest), h =>
-      simp only [partitionDomain] at h
-      split at h
-      · injection h with h
-        subst h
-        have := legNormal_sizeOf_le p0 rest
-        simp
-        omega
-      · exact absurd h (by simp)
-
-/-- Normalizing a function strictly shrinks it. -/
-theorem normFun_sizeOf {t t' : Ty} (h : normFun t = some t') :
-    sizeOf t' < sizeOf t := by
-  match t, h with
-  | .fn n k d c, h =>
-      simp only [normFun, Option.map_eq_some_iff] at h
-      obtain ⟨d', hd, rfl⟩ := h
-      have := partitionDomain_sizeOf hd
-      simp
-      omega
-
-/-- The combined decrease for the checker's normalization branch: at least
-one side strictly shrinks, the other never grows. -/
-theorem normPair_sizeOf (l r : Ty)
-    (h : (normFun l).isSome ∨ (normFun r).isSome) :
-    sizeOf ((normFun l).getD l) + sizeOf ((normFun r).getD r) <
-      sizeOf l + sizeOf r := by
-  have hl : sizeOf ((normFun l).getD l) ≤ sizeOf l := by
-    cases hn : normFun l with
-    | none => simp
-    | some t => simpa using Nat.le_of_lt (normFun_sizeOf hn)
-  have hr : sizeOf ((normFun r).getD r) ≤ sizeOf r := by
-    cases hn : normFun r with
-    | none => simp
-    | some t => simpa using Nat.le_of_lt (normFun_sizeOf hn)
-  rcases h with h | h
-  · cases hn : normFun l with
-    | none => exact absurd h (by simp [hn])
-    | some t =>
-        have := normFun_sizeOf hn
-        simp only [Option.getD_some]
-        omega
-  · cases hn : normFun r with
-    | none => exact absurd h (by simp [hn])
-    | some t =>
-        have := normFun_sizeOf hn
-        simp only [Option.getD_some]
-        omega
-
 /-- The kind edge over the ground two-point lattice `data ⊑ compute`
 (`constrain.rs :: constrain_kind`): the sole rejection is a capability
 supplied where a collection is demanded. -/
@@ -327,24 +180,10 @@ inductive Sub : Ren → Ren → Ty → Ty → Prop where
   | uintRange {ρl ρr} (n : Nat) : Sub ρl ρr (.uintRange n) (.uintRange n)
   | dataSource {ρl ρr} (s : String) : Sub ρl ρr (.dataSource s) (.dataSource s)
   | txn {ρl ρr} : Sub ρl ρr .txn .txn
-  /-- Partition normalization (`constrain_go`'s normalize-then-recurse arm):
-  a gated partition of `𝐷` *is* the plain function over `𝐷`, so the
-  partitioned side(s) rewrite to their plain forms and the pair re-enters
-  the relation — the general rules then supply the kind edge, domain
-  variance, and Pi correspondence. (The Rust arm also excludes `Infer`
-  domains on either side; the ground fragment has none, so the exclusion is
-  vacuous here.) -/
-  | fnNorm {ρl ρr n0 k0 d0 c0 n1 k1 d1 c1} :
-      ((normFun (.fn n0 k0 d0 c0)).isSome ∨ (normFun (.fn n1 k1 d1 c1)).isSome) →
-      Sub ρl ρr ((normFun (.fn n0 k0 d0 c0)).getD (.fn n0 k0 d0 c0))
-        ((normFun (.fn n1 k1 d1 c1)).getD (.fn n1 k1 d1 c1)) →
-      Sub ρl ρr (.fn n0 k0 d0 c0) (.fn n1 k1 d1 c1)
   /-- Function edge, non-`data`-`data` kinds: the kind lattice admits the
   pair, the domain is contravariant (sides — and their morphisms — swap),
   and the codomain edge carries the Pi correspondence on the lhs morphism. -/
   | fnCompute {ρl ρr n0 n1 k0 k1 d0 c0 d1 c1} :
-      normFun (.fn n0 k0 d0 c0) = none →
-      normFun (.fn n1 k1 d1 c1) = none →
       kindOk k0 k1 →
       ¬(k0 = .data ∧ k1 = .data) →
       Sub ρr ρl d1 d0 →
@@ -354,8 +193,6 @@ inductive Sub : Ren → Ren → Ty → Ty → Prop where
   **invariant** — both directions, spelled the only order-independent way
   (`constrain_go`: "Data domains are invariant"). -/
   | fnData {ρl ρr n0 n1 d0 c0 d1 c1} :
-      normFun (.fn n0 .data d0 c0) = none →
-      normFun (.fn n1 .data d1 c1) = none →
       Sub ρr ρl d1 d0 →
       Sub ρl ρr d0 d1 →
       Sub (codRen n0 n1 ρl) ρr c0 c1 →

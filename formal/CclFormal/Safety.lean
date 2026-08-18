@@ -163,10 +163,9 @@ theorem Sub.to_peel {ρl ρr : Ren} {S W : Ty} (h : Sub ρl ρr S W) :
   | uintRange n => simpa [Ty.peel] using Sub.uintRange n
   | dataSource s => simpa [Ty.peel] using Sub.dataSource s
   | txn => simpa [Ty.peel] using Sub.txn
-  | fnNorm hn hs => simpa [Ty.peel] using Sub.fnNorm hn hs
-  | fnCompute h1 h2 h3 h4 h5 h6 =>
-      simpa [Ty.peel] using Sub.fnCompute h1 h2 h3 h4 h5 h6
-  | fnData h1 h2 h3 h4 h5 => simpa [Ty.peel] using Sub.fnData h1 h2 h3 h4 h5
+  | fnCompute h1 h2 h3 h4 =>
+      simpa [Ty.peel] using Sub.fnCompute h1 h2 h3 h4
+  | fnData h1 h2 h3 => simpa [Ty.peel] using Sub.fnData h1 h2 h3
   | tuple h1 h2 => simpa [Ty.peel] using Sub.tuple h1 h2
   | record h1 h2 => simpa [Ty.peel] using Sub.record h1 h2
   | variant h1 h2 => simpa [Ty.peel] using Sub.variant h1 h2
@@ -183,9 +182,8 @@ theorem Sub.claims_mono {S W : Ty} (h : Sub [] [] S W) :
   | uintRange n => simp [Ty.peel]
   | dataSource s => simp [Ty.peel]
   | txn => simp [Ty.peel]
-  | fnNorm hn hs => simp [Ty.peel]
-  | fnCompute h1 h2 h3 h4 h5 h6 => simp [Ty.peel]
-  | fnData h1 h2 h3 h4 h5 => simp [Ty.peel]
+  | fnCompute h1 h2 h3 h4 => simp [Ty.peel]
+  | fnData h1 h2 h3 => simp [Ty.peel]
   | tuple h1 h2 => simp [Ty.peel]
   | record h1 h2 => simp [Ty.peel]
   | variant h1 h2 => simp [Ty.peel]
@@ -197,9 +195,8 @@ theorem Sub.fn_src {ρl ρr : Ren} {S : Ty} {n k d c}
     (h : Sub ρl ρr S (.fn n k d c)) (hS : S.isRefined = false) :
     ∃ n' k' d' c', S = .fn n' k' d' c' := by
   cases h with
-  | fnNorm _ _ => exact ⟨_, _, _, _, rfl⟩
-  | fnCompute _ _ _ _ _ _ => exact ⟨_, _, _, _, rfl⟩
-  | fnData _ _ _ _ _ => exact ⟨_, _, _, _, rfl⟩
+  | fnCompute _ _ _ _ => exact ⟨_, _, _, _, rfl⟩
+  | fnData _ _ _ => exact ⟨_, _, _, _, rfl⟩
   | refined hl hr hne _ _ =>
       rw [Ty.peel_of_not_refined hS] at hl
       simp [Ty.peel] at hl hr
@@ -207,19 +204,15 @@ theorem Sub.fn_src {ρl ρr : Ren} {S : Ty} {n k d c}
       obtain ⟨-, hr2⟩ := hr
       simp [hl2, hr2] at hne
 
-/-- Function edge inversion, partition-free: exactly the contravariant
-domain and the codomain edge (with its Pi correspondence on the lhs
-morphism). `fnNorm` is starved by the `partitionDomain` hypotheses — the
-term fragment's second condition. -/
+/-- Function edge inversion: exactly the contravariant domain and the
+codomain edge (with its Pi correspondence on the lhs morphism). -/
 theorem Sub.fn_inv {ρl ρr : Ren} {n0 n1 : Option String} {k0 k1 : FunKind}
     {d0 d1 c0 c1 : Ty}
-    (h : Sub ρl ρr (.fn n0 k0 d0 c0) (.fn n1 k1 d1 c1))
-    (h0 : partitionDomain d0 = none) (h1 : partitionDomain d1 = none) :
+    (h : Sub ρl ρr (.fn n0 k0 d0 c0) (.fn n1 k1 d1 c1)) :
     Sub ρr ρl d1 d0 ∧ Sub (codRen n0 n1 ρl) ρr c0 c1 := by
   cases h with
-  | fnNorm hn _ => simp [normFun, h0, h1] at hn
-  | fnCompute _ _ _ _ hdom hcod => exact ⟨hdom, hcod⟩
-  | fnData _ _ hd1 _ hcod => exact ⟨hd1, hcod⟩
+  | fnCompute _ _ hdom hcod => exact ⟨hdom, hcod⟩
+  | fnData hd1 _ hcod => exact ⟨hd1, hcod⟩
   | refined hl hr hne _ _ =>
       simp [Ty.peel] at hl hr
       obtain ⟨-, hl2⟩ := hl
@@ -275,21 +268,16 @@ theorem Sub.rename_invariant {ρl ρr : Ren} {T U : Ty} (h : Sub ρl ρr T U) :
   | uintRange n => exact fun _ _ _ _ => .uintRange n
   | dataSource s => exact fun _ _ _ _ => .dataSource s
   | txn => exact fun _ _ _ _ => .txn
-  | fnNorm hn _ _ =>
-      intro hT hU _ _
-      cases hT with | fn hpd0 _ _ =>
-      cases hU with | fn hpd1 _ _ =>
-      simp [normFun, hpd0, hpd1] at hn
-  | fnCompute hn0 hn1 hk hnd _ _ ihdom ihcod =>
+  | fnCompute hk hnd _ _ ihdom ihcod =>
       intro hT hU ρl' ρr'
-      cases hT with | fn _ hd0 hc0 =>
-      cases hU with | fn _ hd1 hc1 =>
-      exact .fnCompute hn0 hn1 hk hnd (ihdom hd1 hd0 _ _) (ihcod hc0 hc1 _ _)
-  | fnData hn0 hn1 _ _ _ ihd1 ihd2 ihcod =>
+      cases hT with | fn hd0 hc0 =>
+      cases hU with | fn hd1 hc1 =>
+      exact .fnCompute hk hnd (ihdom hd1 hd0 _ _) (ihcod hc0 hc1 _ _)
+  | fnData _ _ _ ihd1 ihd2 ihcod =>
       intro hT hU ρl' ρr'
-      cases hT with | fn _ hd0 hc0 =>
-      cases hU with | fn _ hd1 hc1 =>
-      exact .fnData hn0 hn1 (ihd1 hd1 hd0 _ _) (ihd2 hd0 hd1 _ _)
+      cases hT with | fn hd0 hc0 =>
+      cases hU with | fn hd1 hc1 =>
+      exact .fnData (ihd1 hd1 hd0 _ _) (ihd2 hd0 hd1 _ _)
         (ihcod hc0 hc1 _ _)
   | tuple hlen _ ih =>
       intro hT hU ρl' ρr'
@@ -331,15 +319,15 @@ theorem hasTy_frag {Γ : List Ty} {e : Tm} {T : Ty} (h : HasTy Γ e T) :
   induction h with
   | lit l => exact fun _ => by cases l <;> exact .base _
   | var hn => exact fun hΓ => hΓ _ (List.mem_of_getElem? hn)
-  | lam hfrag hpd _ ih =>
+  | lam hfrag _ ih =>
       intro hΓ
-      refine .fn hpd hfrag (ih fun X hX => ?_)
+      refine .fn hfrag (ih fun X hX => ?_)
       rcases List.mem_cons.mp hX with rfl | hX
       · exact hfrag
       · exact hΓ _ hX
   | app _ _ ihf _ =>
       intro hΓ
-      cases ihf hΓ with | fn _ _ hc => exact hc
+      cases ihf hΓ with | fn _ hc => exact hc
   | letE _ _ ihb ihbody =>
       intro hΓ
       refine ihbody fun X hX => ?_
@@ -591,11 +579,11 @@ theorem HasTy.weaken {Γ : List Ty} {e : Tm} {W : Ty} (h : HasTy Γ e W) :
         have hidx : n + 1 - Γ₁.length = (n - Γ₁.length) + 1 := by omega
         rw [hidx, List.getElem?_cons_succ]
         exact hn
-  | @lam Γ dom body cod hfrag hpd _ ih =>
+  | @lam Γ dom body cod hfrag _ ih =>
       intro Γ₁ Γ₂ U hΓ
       subst hΓ
       rw [Tm.shift_lam]
-      exact .lam hfrag hpd (by simpa using ih (dom :: Γ₁) Γ₂ U rfl)
+      exact .lam hfrag (by simpa using ih (dom :: Γ₁) Γ₂ U rfl)
   | app _ _ ihf iha =>
       intro Γ₁ Γ₂ U hΓ
       rw [Tm.shift_app]
@@ -697,11 +685,11 @@ theorem HasTy.subst_preserves {Γ : List Ty} {e : Tm} {W : Ty}
           have h2 : n - 1 - Γ₁.length = n - Γ₁.length - 1 := by omega
           rw [h2]
           exact hn
-  | @lam Γ dom body cod hfrag hpd _ ih =>
+  | @lam Γ dom body cod hfrag _ ih =>
       intro Γ₁ Γ₂ T v hΓ hv
       subst hΓ
       rw [Tm.subst_lam]
-      refine .lam hfrag hpd ?_
+      refine .lam hfrag ?_
       have hv' : HasTy (dom :: (Γ₁ ++ Γ₂)) (v.shift 0) T := by
         simpa using hv.weaken [] (Γ₁ ++ Γ₂) dom rfl
       exact (by simpa using ih (dom :: Γ₁) Γ₂ T (v.shift 0) rfl hv')
@@ -793,7 +781,7 @@ theorem HasTy.canonical_fn {Γ : List Ty} {v : Tm} {W : Ty}
   | lit l =>
       intro _ n k d c hW
       cases l <;> simp [Lit.ty, Ty.peel] at hW
-  | lam _ _ _ _ => exact fun _ n k d c _ => ⟨_, _, rfl⟩
+  | lam _ _ _ => exact fun _ n k d c _ => ⟨_, _, rfl⟩
   | var _ => intro hv; cases hv
   | app _ _ _ _ => intro hv; cases hv
   | letE _ _ _ _ => intro hv; cases hv
@@ -826,7 +814,7 @@ theorem HasTy.canonical_tuple {Γ : List Ty} {v : Tm} {W : Ty}
   | lit l =>
       intro _ Ts hW
       cases l <;> simp [Lit.ty, Ty.peel] at hW
-  | lam _ _ _ _ =>
+  | lam _ _ _ =>
       intro _ Ts hW
       simp [Ty.peel] at hW
   | var _ => intro hv; cases hv
@@ -875,7 +863,7 @@ theorem HasTy.canonical_variant {Γ : List Ty} {v : Tm} {W : Ty}
   | lit l =>
       intro _ tags hW
       cases l <;> simp [Lit.ty, Ty.peel] at hW
-  | lam _ _ _ _ =>
+  | lam _ _ _ =>
       intro _ tags hW
       simp [Ty.peel] at hW
   | var _ => intro hv; cases hv
@@ -925,7 +913,7 @@ theorem HasTy.lam_inv {Γ : List Ty} {L : Tm} {W : Ty} (h : HasTy Γ L W) :
   induction h with
   | lit l => intro d body hL; simp at hL
   | var _ => intro d body hL; simp at hL
-  | @lam Γ' dom' body' cod' hfrag hpd hbody =>
+  | @lam Γ' dom' body' cod' hfrag hbody =>
       intro d body hL hΓ n k dom cod hW
       injection hL with h1 h2
       subst h1; subst h2
@@ -954,9 +942,9 @@ theorem HasTy.lam_inv {Γ : List Ty} {L : Tm} {W : Ty} (h : HasTy Γ L W) :
       have hSfrag : S.TermFrag := hasTy_frag hty hΓ
       have hSp : (Ty.fn n' k' d' c').TermFrag := hS ▸ hSfrag.peel_fst
       have hWp : (Ty.fn n k dom cod).TermFrag := hW ▸ hfrag.peel_fst
-      cases hSp with | fn hpd' hd' hc' =>
-      cases hWp with | fn hpdW hdW hcW =>
-      obtain ⟨hdom_sub, hcod_sub⟩ := hpeel.fn_inv hpd' hpdW
+      cases hSp with | fn hd' hc' =>
+      cases hWp with | fn hdW hcW =>
+      obtain ⟨hdom_sub, hcod_sub⟩ := hpeel.fn_inv
       have hcod_id : Sub [] [] c' cod :=
         hcod_sub.rename_invariant hc' hcW [] []
       obtain ⟨c₀, hbody, himp_dom, himp_cod⟩ := ih rfl hΓ n' k' d' c' hS
@@ -995,7 +983,7 @@ theorem progress_aux {Γ : List Ty} {e : Tm} {T : Ty} (h : HasTy Γ e T) :
   induction h with
   | lit l => exact fun _ => .inl (.lit l)
   | var hn => intro hΓ; subst hΓ; simp at hn
-  | lam _ _ _ _ => exact fun _ => .inl (.lam _ _)
+  | lam _ _ _ => exact fun _ => .inl (.lam _ _)
   | @app Γ' f a n k dom cod hf ha ihf iha =>
       intro hΓ; subst hΓ
       rcases ihf rfl with hvf | hstf
@@ -1089,7 +1077,7 @@ theorem preservation_aux {Γ : List Ty} {e : Tm} {T : Ty} (h : HasTy Γ e T) :
   induction h with
   | lit l => intro e' hs; cases hs
   | var _ => intro e' hs; cases hs
-  | lam _ _ _ _ => intro e' hs; cases hs
+  | lam _ _ _ => intro e' hs; cases hs
   | @app Γ' f a n k dom cod hf ha ihf iha =>
       intro e' hs hΓ
       cases hs with
@@ -1194,7 +1182,7 @@ theorem HasTy.value_claims {Γ : List Ty} {v : Tm} {W : Ty}
     v.IsVal → ∀ p ∈ W.peel.2, Pred.eval v p = some (.bool true) := by
   induction h with
   | lit l => intro _ p hp; cases l <;> simp [Lit.ty, Ty.peel] at hp
-  | lam _ _ _ _ => intro _ p hp; simp [Ty.peel] at hp
+  | lam _ _ _ => intro _ p hp; simp [Ty.peel] at hp
   | var _ => intro hv; cases hv
   | app _ _ _ _ => intro hv; cases hv
   | letE _ _ _ _ => intro hv; cases hv

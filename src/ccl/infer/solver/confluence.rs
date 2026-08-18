@@ -11,9 +11,8 @@
 //! coalesced type (canonicalized: inference/kind variable ids renamed in
 //! first-occurrence order) or the fact of rejection.
 //!
-//! A violation is typing that depends on constraint arrival order — the
-//! same defect class the retired bridge arm had at the relation level
-//! (`differential.rs :: bridge_normalization_composes`), one level up.
+//! A violation is typing that depends on constraint arrival order: the same
+//! defect class as a non-transitive subtype relation, one level up.
 
 use super::constrain::{ConstrainCache, constrain_subtype};
 use super::differential::{Rng, gen_ty};

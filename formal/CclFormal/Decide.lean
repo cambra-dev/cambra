@@ -21,7 +21,7 @@ def kindOkB : FunKind → FunKind → Bool
 mutual
 
 /-- Decide `Sub ρl ρr lhs rhs`, arm for arm with `constrain_go`'s ground
-fragment (partition collapse as normalization — see `Sub`'s module doc). -/
+fragment. -/
 def subCheck (ρl ρr : Ren) (lhs rhs : Ty) : Bool :=
   match lhs, rhs with
   | .base a, .base b => a == b
@@ -29,18 +29,12 @@ def subCheck (ρl ρr : Ren) (lhs rhs : Ty) : Bool :=
   | .dataSource a, .dataSource b => a == b
   | .txn, .txn => true
   | .fn n0 k0 d0 c0, .fn n1 k1 d1 c1 =>
-      if _h : (normFun (.fn n0 k0 d0 c0)).isSome ∨
-          (normFun (.fn n1 k1 d1 c1)).isSome then
-        -- Partition normalization: rewrite to the plain form(s), re-enter.
-        subCheck ρl ρr ((normFun (.fn n0 k0 d0 c0)).getD (.fn n0 k0 d0 c0))
-          ((normFun (.fn n1 k1 d1 c1)).getD (.fn n1 k1 d1 c1))
+      kindOkB k0 k1 &&
+      (if k0 == .data && k1 == .data then
+        subCheck ρr ρl d1 d0 && subCheck ρl ρr d0 d1
       else
-        kindOkB k0 k1 &&
-        (if k0 == .data && k1 == .data then
-          subCheck ρr ρl d1 d0 && subCheck ρl ρr d0 d1
-        else
-          subCheck ρr ρl d1 d0) &&
-        subCheck (codRen n0 n1 ρl) ρr c0 c1
+        subCheck ρr ρl d1 d0) &&
+      subCheck (codRen n0 n1 ρl) ρr c0 c1
   | .tuple a, .tuple b => subSeq ρl ρr a b
   | .record a, .record b => subFields ρl ρr a b
   | .variant a, .variant b => subTags ρl ρr b a
@@ -58,7 +52,6 @@ decreasing_by
   all_goals first
     | omega
     | exact Ty.peel_sum_lt _ _ _h
-    | (have := normPair_sizeOf _ _ _h; simp at this ⊢; omega)
 
 /-- Tuple positions, in demand (rhs) order. -/
 def subSeq (ρl ρr : Ren) (a b : List Ty) : Bool :=
@@ -176,49 +169,37 @@ demand, a capability never satisfies a collection demand. -/
   (.fn (some "y") .data (.uintRange 3)
     (.refined (.base .int) [(.binop "eq" .elem (.var "z"))])) = false
 
-/- Partition normalization: `⧺ᵢ ({D | πᵢ} ⤇ W) <: D ⤇ W` — a gated
-partition of `D` *is* the plain data function over `D`. -/
+/- No partition collapse: a `Variant` domain is below only a `Variant`
+domain, so a fan-out-shaped supplier does not satisfy a plain-domain demand.
+The fan-out never presents this pair — it is a `DisjointJoin` over the one
+domain its arms share — so the relation needs no arm for it. -/
 #guard subCheck .id .id
   (.fn none .data
     (.variant [(.idx 0, .refined (.uintRange 3) [(.litInt 0)]),
                (.idx 1, .refined (.uintRange 3) [(.litInt 1)])])
     (.base .int))
-  (.fn none .data (.uintRange 3) (.base .int)) = true
-
-/- Normalization boundary: non-contiguous indices are not a partition; the
-general arm's domain edge (`[0,3) ⊀ Variant`) then rejects. -/
-#guard subCheck .id .id
-  (.fn none .data
-    (.variant [(.idx 1, .refined (.uintRange 3) [(.litInt 0)])])
-    (.base .int))
   (.fn none .data (.uintRange 3) (.base .int)) = false
 
-/- A partition of a *different* domain normalizes to that domain and then
-fails data-data invariance against the demand. -/
+/- α-equivalent dependent codomains reconcile through the Pi correspondence
+the function arm mints, at every domain shape. -/
 #guard subCheck .id .id
-  (.fn none .data
-    (.variant [(.idx 0, .refined (.uintRange 4) [(.litInt 0)])])
-    (.base .int))
-  (.fn none .data (.uintRange 3) (.base .int)) = false
-
-/- **Repaired quirk**: normalization re-enters the general arm, so
-α-equivalent dependent codomains reconcile regardless of whether the
-supplier's domain is partition-shaped (the retired bridge arm rejected this
-pair by skipping the Pi correspondence). -/
-#guard subCheck .id .id
-  (.fn (some "x") .data
-    (.variant [(.idx 0, .refined (.uintRange 3) [(.litInt 0)])])
+  (.fn (some "x") .data (.uintRange 3)
     (.refined (.base .int) [(.binop "eq" .elem (.var "x"))]))
   (.fn (some "y") .data (.uintRange 3)
     (.refined (.base .int) [(.binop "eq" .elem (.var "y"))])) = true
 
-/- **Repaired composition**: the counterexample chain that refuted
-transitivity under the bridge arm now composes — see
-`CclFormal/Trans.lean` for the machine-checked derivations. -/
+/- A chain whose two hops use different rules — the kind lattice at the
+first, contravariant record width at the second — composes: the executable
+face of `sub_trans_id`. -/
 #guard subCheck .id .id
-  (.fn none .data
-    (.variant [(.idx 0, .refined (.record [("a", .base .int)]) [(.litBool true)])])
-    (.base .int))
+  (.fn none .data (.record [("a", .base .int)]) (.base .int))
+  (.fn none .compute (.record [("a", .base .int)]) (.base .int)) = true
+#guard subCheck .id .id
+  (.fn none .compute (.record [("a", .base .int)]) (.base .int))
+  (.fn none .compute (.record [("a", .base .int), ("b", .base .bool)])
+    (.base .int)) = true
+#guard subCheck .id .id
+  (.fn none .data (.record [("a", .base .int)]) (.base .int))
   (.fn none .compute (.record [("a", .base .int), ("b", .base .bool)])
     (.base .int)) = true
 

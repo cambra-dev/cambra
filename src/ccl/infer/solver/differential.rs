@@ -14,8 +14,7 @@
 //! `Ty.WF`, where the Rust's trivial-equality short-circuit and its
 //! find-first arms genuinely disagree (pinned below as
 //! `dup_key_record_trips_the_uniquely_keyed_invariant`). Everything else in
-//! the ground fragment is fair game, including the gated-partition bridge
-//! arm — `gen_bridge_pair` aims at it and its guard boundary directly.
+//! the ground fragment is fair game.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -323,146 +322,14 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
     }
 }
 
-/// Aim squarely at the gated-partition bridge arm and its guard boundary:
-/// lhs is a `Data` function over a `Variant` of refined legs of the rhs
-/// domain; perturbations (wrong index, wrong stripped payload, empty tags,
-/// binder-dependent codomains) probe where the guard flips between the
-/// bridge and the general arm — and the arm's no-Pi-correspondence quirk.
-fn gen_bridge_pair(rng: &mut Rng) -> (Type, Type) {
-    let d1 = gen_ty(rng, 1);
-    let legs = rng.below(3); // 0..=2 — 0 exercises the nonempty guard
-    let mut tags = Vec::new();
-    for i in 0..legs {
-        let mut leg = d1.clone();
-        for _ in 0..rng.below(3) {
-            leg = Type::refined_one(leg, Refinement::born(gen_pred(rng)));
-        }
-        // Near-misses: a shifted index or a structurally different payload.
-        // Only the *last* leg's index may shift. Shifting an interior one would
-        // land it on its successor's index, and a duplicate-keyed variant is
-        // outside `Ty.WF` — the one class where the model and `constrain_go`
-        // deliberately disagree (`dup_key_record_trips_the_uniquely_keyed_invariant`),
-        // so generating it would manufacture mismatches rather than find them.
-        // Shifting the last leg still breaks contiguity, which is what this
-        // near-miss is aiming at.
-        let index = if i + 1 == legs && rng.chance(1, 8) {
-            i + 1
-        } else {
-            i
-        } as usize;
-        if rng.chance(1, 8) {
-            leg = gen_ty(rng, 1);
-        }
-        tags.push((FieldKey::Index(index), leg));
-    }
-    let binder = |rng: &mut Rng| match rng.below(3) {
-        0 => None,
-        1 => Some(Name::raw("x")),
-        _ => Some(Name::raw("y")),
-    };
-    let (nl, nr) = (binder(rng), binder(rng));
-    let mut c0 = gen_ty(rng, 1);
-    let mut c1 = if rng.chance(1, 3) {
-        gen_ty(rng, 1)
-    } else {
-        c0.clone()
-    };
-    // Dependent codomains through the bridge: the arm compares them without
-    // the Pi correspondence, so α-equivalent pairs are the sharp case.
-    if rng.chance(1, 2) {
-        if let Some(Name::Raw(b)) = &nl {
-            c0 = Type::refined_one(c0, Refinement::born(dep_pred(b)));
-        }
-        if let Some(Name::Raw(b)) = &nr {
-            c1 = Type::refined_one(c1, Refinement::born(dep_pred(b)));
-        }
-    }
-    let kr = if rng.chance(1, 2) {
-        FunKind::Data
-    } else {
-        FunKind::Compute
-    };
-    let lhs = Type::Fun {
-        name: nl,
-        kind: FunKind::Data,
-        domain: Box::new(Type::Variant(tags)),
-        codomain: Box::new(c0),
-    };
-    let rhs = Type::Fun {
-        name: nr,
-        kind: kr,
-        domain: Box::new(d1),
-        codomain: Box::new(c1),
-    };
-    (lhs, rhs)
-}
-
-/// Peel outer refinement layers (the generator's own small inverse of the
-/// gates it adds — not the deep `strip_refinements`).
-fn peel_outer(mut t: &Type) -> &Type {
-    while let Type::Refinement(base, _) = t {
-        t = base;
-    }
-    t
-}
-
 /// A plausible subtype-partner for `t`, biased toward *accepted* edges so
-/// transitivity chains form at a workable rate: clones, directed edits,
-/// bridge-shaped partners for functions (partition the domain / un-bridge a
-/// partition), and domain/codomain-level edits that exercise contravariance.
+/// transitivity chains form at a workable rate: clones, directed edits, and
+/// domain/codomain-level edits that exercise contravariance.
 fn partner(rng: &mut Rng, t: &Type) -> Type {
     match rng.below(8) {
-        0 => t.clone(),
-        1 | 2 => edit(rng, t),
-        3 => match t {
-            // Partition a function's domain: a bridge-lhs partner.
-            Type::Fun {
-                name,
-                domain,
-                codomain,
-                ..
-            } => {
-                let legs = 1 + rng.below(2);
-                let mut tags = Vec::new();
-                for i in 0..legs {
-                    let mut leg = (**domain).clone();
-                    for _ in 0..rng.below(2) {
-                        leg = Type::refined_one(leg, Refinement::born(gen_pred(rng)));
-                    }
-                    tags.push((FieldKey::Index(i as usize), leg));
-                }
-                Type::Fun {
-                    name: name.clone(),
-                    kind: FunKind::Data,
-                    domain: Box::new(Type::Variant(tags)),
-                    codomain: codomain.clone(),
-                }
-            }
-            _ => gen_ty(rng, 2),
-        },
-        4 => match t {
-            // Un-bridge: a partitioned data function's plain counterpart.
-            Type::Fun {
-                name,
-                kind: FunKind::Data,
-                domain,
-                codomain,
-            } => match &**domain {
-                Type::Variant(tags) if !tags.is_empty() => Type::Fun {
-                    name: name.clone(),
-                    kind: if rng.chance(1, 2) {
-                        FunKind::Data
-                    } else {
-                        FunKind::Compute
-                    },
-                    domain: Box::new(peel_outer(&tags[0].1).clone()),
-                    codomain: codomain.clone(),
-                },
-                _ => gen_ty(rng, 2),
-            },
-            _ => gen_ty(rng, 2),
-        },
-        5 | 6 => match t {
+        0 | 1 => t.clone(),
+        2 | 3 => edit(rng, t),
+        4..=6 => match t {
             // Edit *inside* a function: domain/codomain near-misses probe the
             // contravariant edge and the codomain correspondence.
             Type::Fun {
@@ -595,11 +462,8 @@ fn ty_json(t: &Type) -> Option<String> {
 }
 
 /// Transitivity chain fuzz: build chains `a <: b <: c` that `constrain`
-/// accepts and check the direct edge. Under the retired bridge arm this
-/// found the composition violation now pinned (repaired) as
-/// `bridge_normalization_composes`; with partition collapse as a
-/// normalization, **no violations are tolerated** — any hit is a new
-/// finding and fails the test with the triple printed.
+/// accepts and check the direct edge. No violations are tolerated — a hit is
+/// a finding, and fails the test with the triple printed.
 #[test]
 fn transitivity_chain_fuzz() {
     let seed: u64 = std::env::var("CAMBRA_DIFF_SEED")
@@ -685,7 +549,6 @@ fn differential_ground_subtype_vs_lean_model() {
                 let e = edit(&mut rng, &t);
                 (t, e)
             }
-            3 => gen_bridge_pair(&mut rng),
             _ => gen_pair(&mut rng, 3),
         };
         let (Some(lj), Some(rj)) = (ty_json(&lhs), ty_json(&rhs)) else {
