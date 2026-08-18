@@ -22,9 +22,8 @@ use crate::{
         // (aliased `CommitWriter` to avoid clashing with the CCL `TransactWriter`
         // node-field carrier imported from `ccl` above).
         commit_operator::{
-            AsOf, AsOfField, BodyInputBuffer, BodyInputSource, CommitOperator, InductionStore,
-            StoreDenseRead, StoreFinalRead, StoreValueStream, TransactWriter as CommitWriter,
-            WriterBuffer,
+            AsOf, AsOfField, CommitOperator, InductionDrive, InductionStore, StoreDenseRead,
+            StoreFinalRead, StoreValueStream, TransactDrive, TransactWriter as CommitWriter,
         },
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
@@ -1490,7 +1489,7 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 /// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`]
 /// wired in a cyclic [`FanOut`], one *fused* [`CommitWriter`] per writer (a
 /// branch of the shared store output). Each fused writer reads the cyclic store,
-/// runs its body — the ``let k₀ = p.0 in … let item = p.r in {`commit{writes} | `abort}`` decision, fed via a buffer the writer owns — and either grants (appends
+/// runs its body — the ``let k₀ = p.0 in … let item = p.r in {`commit{writes} | `abort}`` decision, whose input is the drive's tile — and either grants (appends
 /// a proposal) or denies. A single writer is the degenerate case (no conflicts →
 /// no retries); ≥2 writers serialize through the operator with conflict + retry.
 /// A *fused* writer (not fanned) is load-bearing: a stateful sequencing producer
@@ -1566,7 +1565,7 @@ fn build_commit_store(
         })?;
         let item_extent = ctx.extent_of(&item_ty)?;
         let source_op = convert_impl(&w.source, None, ctx)?;
-        // The body is fed `(snap_{k₀}, …, item)` via a buffer the writer owns; the
+        // The body's input is the drive's tile, `(snap_{k₀}, …, item)`; the
         // snapshot columns carry each read key's per-commit value extent.
         let read_extents: Vec<Extent> = w
             .read_keys
@@ -1580,9 +1579,19 @@ fn build_commit_store(
                     })
             })
             .collect::<Result<_, _>>()?;
-        let buffer: BodyInputBuffer = Rc::new(RefCell::new(WriterBuffer::default()));
-        let body_input = BodyInputSource::new(buffer.clone(), read_extents, item_extent);
-        let body_op = convert_impl(&w.body, Some(Box::new(body_input)), ctx)?;
+        let drive = TransactDrive::new(
+            store_fan.branch(),
+            source_op,
+            w.read_keys.iter().map(runtime_key).collect(),
+            read_extents,
+            item_extent,
+        );
+        // Two branches of the drive: the body consumes rows, and the writer acks
+        // finished attempts. The drive advances its item cursor on the release
+        // *intersection*, so a body's consume-release cannot advance it past an
+        // attempt still in flight.
+        let drive_fan = Rc::new(FanOut::new(Box::new(drive)));
+        let body_op = convert_impl(&w.body, Some(drive_fan.branch()), ctx)?;
         // A reply (`out << e`) rides this writer body as `to_<defer>` decision
         // taps. Each commits as a write-only key (appended after the mutable variable write
         // keys), so the reply rides this transaction's commit and is read back as a
@@ -1611,8 +1620,7 @@ fn build_commit_store(
         let writer = CommitWriter::new(
             store_fan.branch(),
             body_op,
-            source_op,
-            buffer,
+            drive_fan.branch(),
             w.read_keys.iter().map(runtime_key).collect(),
             write_keys,
             tap_fields,
@@ -1671,10 +1679,12 @@ fn build_induction_store(
 }
 
 /// Build a single-writer induction store as a position-driven [`InductionStore`]
-/// over a [`Tile::Store`] changelog. Mirrors [`build_commit_store`]'s writer
-/// setup — the body reads `(prev…, item)` through a [`BodyInputSource`] the store
-/// feeds — but the store is driven by iteration position (no cyclic `Recurse`,
-/// no conflict/retry). Reads register as [`StoreReadKind::InductionChangelog`]:
+/// over a [`Tile::Store`] changelog, wired as a cycle through a
+/// `FanOut::new_cyclic`: the store consumes the body's decisions, and an
+/// [`InductionDrive`] reads the changelog back to produce the body's
+/// `(prev…, item)` input. Mirrors [`build_commit_store`]'s writer setup, but
+/// driven by iteration position — one writer, no conflict, no retry. Reads
+/// register as [`StoreReadKind::InductionChangelog`]:
 /// each `__reg.k` folds the changelog densely over the loop extent via
 /// [`StoreDenseRead`], serving both a scalar-final read (`ExtractFinal` over it)
 /// and a co-iterated read (the dense `Fun(D, V)` itself).
@@ -1717,9 +1727,9 @@ fn build_induction_store_single(
         );
     }
 
-    // The body reads each accumulator's snapshot then the loop item, fed through a
-    // buffer the store owns (`BodyInputSource`) — the same body shape a commit
-    // writer expects (`let accᵢ = p.i … let item = p.r`).
+    // The body reads each accumulator's snapshot then the loop item, produced by
+    // the drive — the same body shape a commit writer expects
+    // (`let accᵢ = p.i … let item = p.r`).
     let item_ty = w.source.ty.codomain().ok_or_else(|| {
         ConversionError::TypeError(format!(
             "induction-store writer source must have function type, got {}",
@@ -1749,10 +1759,6 @@ fn build_induction_store_single(
                 })
         })
         .collect::<Result<_, _>>()?;
-    let buffer: BodyInputBuffer = Rc::new(RefCell::new(WriterBuffer::default()));
-    let body_input = BodyInputSource::new(buffer.clone(), read_extents, item_extent);
-    let body_op = convert_impl(&w.body, Some(Box::new(body_input)), ctx)?;
-
     // A reply (`out << e`) rides this loop body as `to_<defer>` decision taps —
     // the same shape a commit writer carries (see `build_commit_store`). Each tap
     // becomes a write-only changelog key (appended after the accumulator keys), so
@@ -1784,21 +1790,20 @@ fn build_induction_store_single(
         _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
 
-    let store = InductionStore::new(
-        init_ops,
-        body_op,
+    let store = InductionStore::new(init_ops, write_keys, tap_fields, key_extent, value_extent);
+    let set_body = store.body_input_setter();
+    // Cyclic: the drive reads this store's changelog back to recover each
+    // position's previous accumulator, so one fan branch feeds the cycle and the
+    // rest serve the downstream `__reg.k` dense reads.
+    let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+    let drive = InductionDrive::new(
+        fan.branch(),
         source_op,
-        buffer,
         w.read_keys.iter().map(runtime_key).collect(),
-        write_keys,
-        tap_fields,
-        key_extent,
-        value_extent,
+        read_extents,
+        item_extent,
     );
-    // A non-cyclic fan: unlike a commit store, no writer reads this store back
-    // (the driver folds the accumulator out of its own engine), so the only
-    // consumers are the downstream `__reg.k` dense reads.
-    let fan = Rc::new(FanOut::new(Box::new(store)));
+    set_body(convert_impl(&w.body, Some(Box::new(drive)), ctx)?);
     Ok(StoreReadInfo {
         fan,
         keys: keys_map,

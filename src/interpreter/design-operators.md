@@ -207,8 +207,20 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
 
 - **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ (Key ⇀ Value)`, held as per-tick write-set deltas with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
 - **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
-- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per `with begin():` site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, feeds `(snap…, item)` to the decision body, and — keyed on `(item, frontier)`, so a retry is idempotent — appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
-- **`BodyInputSource` / `BodyInputSourceProducer`** — serves the writer body its `(snapshot…, item)` input. **Release-aware**: the body fans this source through `FanOut`/`Memo`, which pull it repeatedly per round, so it emits only positions past its released cursor — re-emitting a released position would make the `Memo`'s append-merge duplicate a domain position (an invalid tile). Delta-producing, like the induction body's `fan_in` input.
+- **`TransactDrive` / `TransactDriveProducer`** — one per `with begin():` site: it owns the transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, and **produces** the decision body's `(snap…, item)` input. A row is emitted once per `(item, frontier)`, so a retry at a moved frontier is a fresh position and a re-pull at an unchanged one emits nothing. It closes (terminal) once every transaction has been attempted and acked over a source that can deliver no more — the writer's completeness signal, since the writer owns no source of its own.
+- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull it decides the drive's newest live position and appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
+
+  **The ack is a release intersection.** The drive sits behind a `FanOut` with two branches — the body and the writer — and advances its item cursor on what they *both* release. A body releases a row as soon as it has consumed it, which says nothing about commitment; the writer releases it when the attempt has finished, committed or denied without proposing. Only the intersection means "this item is done", which is why the writer holds a drive branch it barely reads: that branch is the ack channel.
+
+  Both branches of that intersection are load-bearing, including the body's. A compiled body
+  fans its input through a `Memo`, which releases each row as it *consumes* it — and it is
+  that eager half which lets a superseded row be reclaimed before its item finishes. A body
+  chain that released only when its own output was released would leave the intersection
+  standing at the writer's ack, and the window below would grow one row per retry with the
+  supersession release still in place. So this is an obligation on the body chain, alongside
+  forwarding `domain_predicate`.
+
+  **A release is not always an ack, though — supersession reclaims too.** The writer decides only the drive's *newest* live position, so every older one is abandoned and is released immediately rather than at the item's finish. That keeps a contended item's cost flat: the body re-renders the drive's whole live window each pull, so a window that grew one row per retry would make K retries cost K rows retained and K² body rows evaluated. The bound is `MAX_LIVE_ATTEMPTS`, asserted in the drive and measured at six contending writers — a window of 2 with the supersession release, 6 without it, over an item that lost five times. It also means the drive cannot read "a row was released" as "the item finished" — only the release of its **newest live row** is the ack, exactly as a release from the body alone is not one.
 - **`StoreFinalRead` / `StoreFinalReadProducer`** — the **terminal read** of a commit key: `Scalar(V)`, the key's carried value at the position its own writers finish, or the store's tick-0 seed if no commit wrote it. It samples through the same `store_current` as `AsOf` and differs only in what fixes the position — a trigger's arrival there, the store's closure here — so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled. A universal release retires it and releases the store branch; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
 - **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream `CommitTs ⇀ V` out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `SealedFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).
 - **`AsOf` / `AsOfProducer`** — the **as-of (temporal) join**, the cross-endpoint read. Given a `trigger` stream (the positions to sample at, e.g. an HTTP request stream) and the store, it latches the store's current value for each trigger position the first time that position is observed — indexed by the *trigger*, not the commit clock. Reading several mutable variables latches them all from one store render, so a multi-variable read is one snapshot. The dual of the changelog store's own drive: the store latches a private accumulator per *source* step, `AsOf` latches the store per *trigger* step.
@@ -426,28 +438,60 @@ joins, aggregates and the changelog induction store all run over a literal list 
 one thing the distinction would still buy is a memory bound on a never-terminating loop; see
 [*Remaining: the never-terminating bound*](#remaining-the-never-terminating-bound).
 
-**`InductionStore` — the position-driven producer.** It owns a `CommitEngine` seeded at
-tick 0 with the accumulators' inits (so the changelog is self-describing — a read below
-the first *iteration* change folds to the seed), and drives the accumulator recurrence
-**sequentially inside the producer**: it decodes the source into `(absolute position, item)`
-pairs (`decode_source_positioned`) — an async source's domain arrives *unordered* (it
-enumerates a set of arrived keys) and *compacts* as its consumed prefix is released, so the
-drive keys off the actual `UInt` domain position, not the codomain's column order — and
-drives positions **contiguously from `processed`**, stopping at the first gap (a
-not-yet-arrived position; the recurrence is sequential, so a later position cannot be
-decided before its predecessor). For each position it folds the previous accumulator out of
-the engine, feeds the writer body `(prev…, item)` through a [`BodyInputSource`] buffer, reads
-the `` {`commit{writes} | `abort} `` decision (`body_decision_at` decodes the union tag), and
-`step`s the engine — a `` `commit `` position appends a change (tick `pos + 1`), an `` `abort `` (a
-failed guard) is a **carry** (no change; the value inherits). Because the accumulator lives in the engine, not on a cyclic tile, there is
-**no cyclic `FanOut`** — the previous value is always available before the body needs it.
-This dissolves the cyclic-convergence desync that a restricted-source multi-leg realization
-suffered: there is one writer over the *full* source, and a conditional write's carry
-positions simply produce no change rather than a synthesized same-value write on a
-complement leg. As the drive advances it reclaims the consumed source prefix incrementally
-(`release(LessThanEq(processed - 1))`), and releases the whole source (`True`) once terminal
-— the source drops a row only when *every* producer has released it (cross-producer
-intersection), so a co-iterated reader still folding earlier positions keeps them live.
+**`InductionDrive` / `InductionStore` — the position-driven recurrence.** The two halves
+of one loop, wired as a cycle: store → body → drive → `FanOut::new_cyclic(store)`.
+
+The **store** owns a `CommitEngine` seeded at tick 0 with the accumulators' inits (so the
+changelog is self-describing — a read below the first *iteration* change folds to the seed).
+It consumes the body's `` {`commit{writes} | `abort} `` decisions (`body_decision_at` decodes
+the union tag) contiguously from its decided watermark (which counts the positions already
+stepped — the store keeps no separate cursor for them) and `step`s the engine: a `` `commit `` position
+appends a change (tick `pos + 1`), an `` `abort `` (a failed guard) is a **carry** (no change;
+the value inherits). It closes its frontier when the decision stream goes terminal.
+
+That last clause is an **obligation on the body chain**, and worth stating because it is
+easy to violate without noticing. The drive owns the source and closes its body-input tile,
+so the store learns the loop is over only if every operator between the two forwards
+`domain_predicate`. An operator that
+renders a decision column but hardcodes a non-terminal predicate leaves the loop running
+forever with the right values in it — a hang, not a wrong answer. The store asserts the
+matching gaplessness property (a terminal decision stream with a hole in it) but cannot
+assert this one, since "the body never went terminal" is indistinguishable from "the body
+is not done yet".
+
+The **drive** owns the iteration source and produces the body's `(prev…, item)` input. It
+holds no part of the recurrence: the store's decided frontier already names the next position to
+iterate (`step` advances the watermark unconditionally, so a carry decides its position
+without appending a change), and the previous accumulator is that key's value *at* the
+frontier (`store_value_at`, one fold per read key — folding *at* the position being fed,
+which is what the recurrence means, rather than taking the key's latest write). So an
+emitted row is a pure function of the store tile and the source tile, with nothing cached
+that could drift. It decodes the source
+into `(absolute position, item)` pairs (`decode_source_positioned`), since an async source's
+domain arrives *unordered* and *compacts* as its consumed prefix is released; it reclaims
+that prefix incrementally and releases the whole source (`True`) once the loop is done. It
+also releases the changelog through the frontier — the store's keep-latest GC preserves each
+key's latest write inside a released prefix, so the fold is never stranded, and without it
+the store's `FanOut`-intersected watermark could never advance past the cycle branch.
+
+**One position advances per outer pull**, because the cyclic `FanOut` serves a snapshot
+taken before the traversal began: a position decided *during* a pull is not visible until
+the next. This is a property of the cycle, not of the split — the store's producer is on
+the stack for the whole traversal, so no arrangement of drive, body and store can refresh
+the memo mid-pull. It is the rate every cyclic operator here runs at, and the drive re-arms
+on the wakeup queue while a position remains to feed.
+
+A pull-per-position means a long loop re-renders its changelog many times. That is a
+**retention** problem, not a rate problem: the fix is a `Memo` in front of the store's
+readers, caching the rendered tile and letting a reader release its consumed prefix early so
+`gc_released_prefix` bounds what each render covers. Letting the store publish its
+freshly-rendered tile into its own cyclic fan's memo, so the drive sees the position it just
+decided, would buy a multi-position drive by inverting `get`'s direction — a change to the
+model in exchange for a caching improvement, and not one to make.
+
+There is one writer over the *full* source: a conditional write's carry positions produce no
+change rather than a synthesized same-value write on a complement leg, which is what keeps a
+restricted-source multi-leg realization's cyclic-convergence desync from arising.
 
 **`StoreDenseRead` — the dense changelog read.** A `__reg.k` read folds the changelog at
 *every* position of the loop extent → `Fun(D, V)`: an `IterateExtent(D)` trigger supplies

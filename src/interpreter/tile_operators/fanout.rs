@@ -111,12 +111,18 @@ impl<'a> Drop for TakenProducerGuard<'a> {
 /// underlying operator.  Call [`FanOut::branch`] to get additional handles;
 /// subscribing to any handle will reuse the same inner producer.
 pub struct FanOut {
+    // shared-state-ok: the fan-out's own input operator, shared with the branches
+    // that are views of this one operator. It holds an *operator*, not values
+    // passed between operators — the same reason `CycleSlot` is legitimate.
     input: Rc<RefCell<Box<dyn TileOperator>>>,
     tiling: Tiling,
     /// All mutable shared state.  Created eagerly so that branches produced by
     /// [`FanOut::branch`] always share the same object.
     shared: Rc<RefCell<FanOutShared>>,
     /// Whether any branches have been created yet.
+    // shared-state-ok: construction-time bookkeeping of the `FanOut` itself, not a
+    // channel between operators — it records that `branch` has been called, and no
+    // value ever passes through it.
     used: RefCell<bool>,
 }
 
@@ -188,6 +194,8 @@ impl FanOut {
 }
 
 struct FanOutBranch {
+    // shared-state-ok: the same operator handle as [`FanOut::input`] — a branch is
+    // a view of one fan-out, not a second one. An operator, not a value.
     input: Rc<RefCell<Box<dyn TileOperator>>>,
     tiling: Tiling,
     /// All mutable shared state.  Created eagerly so that branches produced by
