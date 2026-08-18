@@ -946,11 +946,17 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ### Scoped inference variables: stored fragments close against a telescope
 
-> **Status: milestones 1–3 implemented** (telescopes threaded; the index
-> coordinate and its four conversion sites live, with the acceptance tests
-> below passing in `compact.rs` and `spec_key.rs`; the record-time check is
-> an internal error on the live solve). The name-path deletions (milestone
-> 4) are pending, as is the formal-model validation. This section is the design of record for retiring open type
+> **Status: implemented and validated.** Telescopes threaded (milestone 1);
+> the index coordinate and its four conversion sites live, with the
+> acceptance tests passing in `compact.rs` and `spec_key.rs` (milestone 2);
+> the record-time check is an internal error on the live solve (milestone
+> 3); the flatten-time canonicalization is retired with its branch, and the
+> remaining name-path deletions are re-scoped to the γ[σ] issue on measured
+> evidence (milestone 4, see the implementation order). The validation — the
+> Lean model rebuilt over the coordinate, rename environments deleted,
+> transitivity stated and proved with no fragment restriction, and the
+> differential oracle green over 150k pairs after catching a real capture in
+> the Fun/Fun opening — lands at the top of this stack with the model. This section is the design of record for retiring open type
 > fragments from the solver. The flatten-time Pi-binder canonicalization on
 > the unmerged branch `dmills/canonical-pi-binders` is the local repair this
 > design replaces; its regression tests — α-variant bounds merge to one
@@ -1084,11 +1090,15 @@ check, β fires at coalesce against the telescope, and the reconciliation of
 two application spines meeting at one variable replaces `bridge_holder_gap`'s
 intensional judgment of substitutions-as-maps. This is the `γ[σ]` form the
 vault issue `type-checker-first-class-dependent-functions` names as what the
-two-sided representation was chosen to graduate into, and it retires
-`Subst::licensed_correspondence_view` per that issue's acceptance criteria:
-with explicit applications there is nothing left to license, and two distinct
+two-sided representation was chosen to graduate into. The *reading* is this
+design's; the *representation* — suspensions on uses, under which two distinct
 discharges meeting at one variable (the O1/O4 corner) become two points of one
-family — representable, where today they are a panic tripwire.
+family and `Subst::licensed_correspondence_view` has nothing left to license —
+is that issue's, and stays there. Measured: with the coordinate fully landed,
+disabling the licensed view still trips the closure bridge's O1/O4 tripwire on
+two shapes (extrusion across levels under a generalized `let`, and
+per-occurrence group-by keys through a polymorphic definition), so the view is
+the fiber-transport carrier until suspensions replace it.
 
 #### Where the conversions run
 
@@ -1216,9 +1226,13 @@ otherwise travels untouched.
   address** — descent and application open the frame at it — so coalesce
   keeps it exactly on the arrows whose codomains reference their frame
   (`references_outermost_frame`, the index-coordinate dependence test) and
-  strips it elsewhere. With identity off the slot, the Fun/Fun codomain edge
-  needs no binder correspondence and `extended_rename`'s production use
-  disappears.
+  strips it elsewhere. Identity needs no correspondence; **transport still
+  does**: mid-solve fragments are name-referenced, and the Fun/Fun codomain
+  edge's `extended_rename` is what carries a fragment's references from one
+  live binder to the other — the application-at-a-variable of
+  [Discharge is application](#discharge-is-application). The correspondence
+  retires with the name coordinate it serves, not with the index
+  coordinate's arrival.
 - **The formal model's rename machinery deletes.** `Ren`/`codRen` exist to
   mirror `extended_rename`; with it gone, transitivity is stated for
   telescope-indexed types directly, without the canonical-fragment
@@ -1267,9 +1281,13 @@ otherwise travels untouched.
 3. **Enforce.** The record-time check becomes an internal error on the live
    solve; the observation log must be empty there first (the wall-mode
    residue above stays observation-only).
-4. **Delete.** The name-keyed paths: the Fun/Fun correspondence,
-   `licensed_correspondence_view`, and the flatten-time canonicalization that
-   never merged.
+4. **Delete.** What actually deletes is the flatten-time canonicalization,
+   with the unmerged branch that carried it. The Fun/Fun correspondence and
+   `licensed_correspondence_view` were slated here and are **measured
+   load-bearing** (see [Discharge is application](#discharge-is-application)
+   and the derivable-consequences bullet on the binder slot): they carry the
+   mid-solve name coordinate's transport, and retire with the γ[σ]
+   suspensions of the vault issue, not with this design.
 
 Validation is the formal model: rebuild `Sub` over telescope-indexed types
 (no rename environments), re-prove the battery, and re-run the differential
