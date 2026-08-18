@@ -2572,10 +2572,12 @@ around `reserve` + `quote` + the feed).
 - **Trailing induction read** — after a `for` loop, a bare reference to an
   induction accumulator is its final value (or the pre-loop value if the
   source was empty). The loop has ended, so "latest" is unambiguous.
-- **A `Txn` mutable variable is read only inside a `with begin():` block.** A bare
-  read outside one is an error. Reading inside a block pins a
-  **snapshot-consistent** view: several mutable variable reads in one block see
-  one commit snapshot — the reason the block is required.
+- **A `Txn` mutable variable is read only inside a `with begin():` block
+  [Decided].** A bare read outside one is an error, and stays one: the block is
+  what pins a **snapshot-consistent** view, so that several mutable variable
+  reads in one block see one commit snapshot. A read that wants no snapshot has
+  the two terms below instead — an as-of read fed out of a block, or
+  `await_final`.
 - **As-of read.** A mutable variable read fed *out* of a block that does not
   itself write that mutable variable is an **as-of read at an arbitrary commit
   position** — the mutable variable's value as of wherever the reading transaction
