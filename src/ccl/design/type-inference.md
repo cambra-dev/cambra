@@ -912,6 +912,40 @@ The expected binder is **always globally fresh** (proposal §5.2 verbatim; the �
 
 The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) and the nested filtered-source group-by both run end-to-end with correct values.
 
+### Canonicalizing a Pi binder needs a position, so it happens at flattening
+
+`compact_go` and `spec_key::key_go` rewrite every arrow's binder to `Name::pi(depth)` as they flatten a type, and no earlier stage does; `Subst::canonical_pi_binder` owns the rule. The depth counts enclosing codomain arrows, so the canonical binder is a *position*, and flattening is the first point in the pipeline where a Pi reference has one.
+
+Before flattening it has none. A dependent refinement is recorded on an inference variable as an ordinary bound, and the variable holding it need not sit under the binder the predicate references. Lowering a group-by produces the shape `lower/exprs.rs`'s tests pin:
+
+```
+λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)
+```
+
+`emit_lambda` types the outer lambda as `(__gb_k: 𝐾) ⇒ …`, and the refinement mentioning `__gb_k` reaches the solver as a bound on the cast's own variable — a position with no enclosing arrow at all. What relates that bound to its binder is the suspended discharge riding the edge, not containment. The two-sided storage above is what makes that work when `fn_ty` is still a variable at the apply site and its concrete Pi arrives later (the opaque/higher-order case, O3).
+
+So the scheme has to satisfy two facts at once. α-variant dependent types must compare equal, or `SpecKey` splits uses that should share a specialization and merged bounds keep a dangling twin — the behaviours `spec_key_shares_alpha_variant_dependent_types` and `alpha_variant_bound_merge_is_canonical` pin. And a reference is unpositioned for as long as it lives on an edge. Flattening is where those meet: it walks the graph and emits a type whose Pi references sit under their binders (`coalesce_compact_go` keeps a binder exactly when the codomain references it), and `check_scope_valid` then holds every coalesced node's type to its lexical scope.
+
+`ReservedName::Pi` holds a `u8`, so what lands in the flattened form is an index; `__pi0` is its `Display`. Naming a reference while it is unpositioned and indexing it once it is not is the locally-nameless discipline, with the abstraction step at the only place that can host it.
+
+#### Alternatives, and what each one breaks on
+
+Each of these removes the rewrite, and each is recorded because it does not work.
+
+- **Mint canonical binders at emission**, so nothing renormalizes. The index counts enclosing *codomain* arrows, making it a property of a binder's position in a finished type rather than of the binder. `emit_lambda` types an inner lambda before knowing what will wrap it, and placing a type in a codomain shifts every Pi binder inside it: `\s -> groupby([1,2,3,4], \x -> x // 2)` infers with the group-by's binder at `__pi1`, where the same term standing alone puts it at `__pi0`.
+
+- **Count from the inside out** — from the reference to its binder rather than from the root — so the encoding survives wrapping and emission can mint it. Wrapping is not the obstruction; the unpositioned edge is. A reference on a bound whose binder is not an ancestor has no number to carry under either direction of counting, and that is the common case rather than a corner: it is what every group-by produces.
+
+- **Give `Type` an α-invariant `PartialEq`/`Hash`** and leave the names alone. The comparison needing α-insensitivity is a `RefinementSet` dedup — `RefinementSet::insert` in `compact_go`'s refinement arm, and `merge_refinements` where two bounds meet — and the binder sits on the enclosing `CompactFun`, one frame above the values being compared. `Eq` and `Hash` take no context parameter, and `ConstrainCache` keys a `HashMap` on `(Type, Type)`, so `Hash` must be a function of the value alone.
+
+- **Rename at merge rather than at flattening**: have `CompactFun::merge` rewrite the incoming side's references onto the incumbent's binder. This one works, and moves the rewrite somewhere worse — once per merge in a fold over a variable's bounds instead of once per flatten — while the surviving binder is the first arrival's again, which is the arrival-order dependence the canonical form exists to remove.
+
+The invariant: a Pi reference is a `Name` while it rides an edge and an index once flattened. What the three walks that flatten owe each other differs, and neither obligation follows from sharing the rule.
+
+`compact_go` and `Type::alpha_normalized` must assign the *same* index, because `lambda_elim` compares a solver-produced type — canonical already, through the first — against an independently rebuilt one by normalizing both through the second (`compacting_is_a_fixpoint_of_alpha_normalization`).
+
+`spec_key::key_go` owes only **injectivity** over enclosing binders. A key is compared with other keys and carries no binder name (`SpecKey::fun`), so a consistent relabelling is invisible there; conflating two binders under one index is not, because it makes two uses share a specialization whose interior was resolved against the other's argument. Injectivity is what each walk is tested for — `canonical_binders_keep_distinct_binders_distinct` and `spec_key_keeps_distinct_binders_distinct` — and it is the property `Subst::canonical_pi_binder` cannot establish by itself: a walk that entered a codomain at the arrow's own depth would name every binder `__pi0`, which is internally consistent and idempotent, so comparing a type against its own canonical form does not detect it.
+
 ## 4.6 Data vs compute functions
 
 > **Status: implemented, minus Σ.** The `FunKind` marker, kind inference,

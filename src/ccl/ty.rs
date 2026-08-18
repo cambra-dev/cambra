@@ -1160,10 +1160,10 @@ impl Type {
                     codomain,
                 } => {
                     let dom = go(domain, depth, subst);
-                    let (name, cod_subst) = subst.canonical_pi_binder(name, depth);
-                    let cod = go(codomain, depth + 1, &cod_subst);
+                    let cod_scope = subst.canonical_pi_binder(name, depth);
+                    let cod = go(codomain, cod_scope.depth, &cod_scope.subst);
                     Type::Fun {
-                        name,
+                        name: cod_scope.binder,
                         kind: kind.clone(),
                         domain: Box::new(dom),
                         codomain: Box::new(cod),

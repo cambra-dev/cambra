@@ -641,11 +641,11 @@ fn compact_go(
             // the rule and why the three walks applying it must agree). The
             // rename also shadows any outer mapping of the source binder, which
             // is what the previous `shadow(b)` was for.
-            let (name, cod_acc) = subst_acc.canonical_pi_binder(name, pi_depth);
-            let cod = compact_go(c, pol, &cod_acc, None, st, pi_depth + 1);
+            let cod_scope = subst_acc.canonical_pi_binder(name, pi_depth);
+            let cod = compact_go(c, pol, &cod_scope.subst, None, st, cod_scope.depth);
             CompactType {
                 fun: Some(CompactFun {
-                    name,
+                    name: cod_scope.binder,
                     kind: KindMerge::of(kind),
                     domains: vec![dom],
                     codomain: Box::new(cod),
@@ -904,6 +904,89 @@ mod tests {
         assert!(
             !matches!(&**base, Type::Refinement(..)),
             "the two α-copies of one constraint must dedup to one layer, got {codomain}"
+        );
+    }
+
+    /// The canonical rename must keep distinct enclosing binders distinct: a
+    /// predicate referencing the *inner* binder denotes a different type from one
+    /// referencing the *outer*, and the two must not flatten alike.
+    ///
+    /// This is the defect a shared rule cannot rule out on its own. A walk that
+    /// entered the codomain at the arrow's own depth would name both binders
+    /// `__pi0`, conflate the two predicates, and still be internally consistent —
+    /// idempotent, even, so comparing a type against its own canonical form would
+    /// not notice. Injectivity is what has to be asserted.
+    #[test]
+    fn canonical_binders_keep_distinct_binders_distinct() {
+        use crate::ccl::infer::solver::compact_type;
+        use crate::ccl::infer::solver::test_helpers::dep_pred;
+        use crate::ccl::{FunKind, Name, Refinement};
+
+        // `(x: [0,3]) ⤇ ((y: [0,4]) ⤇ {Int | __elem == 𝑏})`, for 𝑏 the inner
+        // binder in one case and the outer in the other.
+        let nested = |referenced: &str| Type::Fun {
+            name: Some(Name::raw("x")),
+            kind: FunKind::Data,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Fun {
+                name: Some(Name::raw("y")),
+                kind: FunKind::Data,
+                domain: Box::new(Type::UIntRange(4)),
+                codomain: Box::new(Type::Refinement(
+                    Box::new(Type::Base(BaseType::Int)),
+                    Refinement::born(dep_pred(referenced)),
+                )),
+            }),
+        };
+        assert_ne!(
+            compact_type(&nested("y")).term,
+            compact_type(&nested("x")).term,
+            "canonicalization must not conflate the inner and outer Pi binders"
+        );
+    }
+
+    /// `compact_go` and [`Type::alpha_normalized`] must agree on the assignment,
+    /// because `lambda_elim` compares a solver-produced type (canonical already,
+    /// through this walk) against an independently rebuilt one by normalizing
+    /// both. Flattening the normal form is therefore a fixpoint.
+    #[test]
+    fn compacting_is_a_fixpoint_of_alpha_normalization() {
+        use crate::ccl::infer::solver::compact_type;
+        use crate::ccl::infer::solver::test_helpers::dep_pred;
+        use crate::ccl::{FunKind, Name, Refinement};
+
+        let dep = |binder: &str, base: Type| {
+            Type::Refinement(Box::new(base), Refinement::born(dep_pred(binder)))
+        };
+        let fun = |binder: Option<&str>, domain: Type, codomain: Type| Type::Fun {
+            name: binder.map(Name::raw),
+            kind: FunKind::Data,
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        };
+        // A binder sits in a *domain* (which keeps the arrow's own depth) and an
+        // unnamed arrow nests a scope, so every clause of the rule is exercised.
+        let ty = fun(
+            Some("x"),
+            fun(
+                Some("a"),
+                Type::UIntRange(3),
+                dep("a", Type::Base(BaseType::Int)),
+            ),
+            fun(
+                None,
+                Type::UIntRange(4),
+                fun(
+                    Some("y"),
+                    Type::UIntRange(5),
+                    dep("y", dep("x", Type::Base(BaseType::Int))),
+                ),
+            ),
+        );
+        assert_eq!(
+            compact_type(&ty).term,
+            compact_type(&ty.alpha_normalized()).term,
+            "compact_go must assign the same canonical binders as `alpha_normalized`"
         );
     }
 

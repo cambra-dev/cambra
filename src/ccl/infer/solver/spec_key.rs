@@ -395,8 +395,8 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx, pi_depth: u
             // together. The canonical *name* is discarded — it is not part of
             // the key (see `SpecKey::fun`); what matters is that the
             // *references* were rewritten.
-            let (_, cod_acc) = subst_acc.canonical_pi_binder(name, pi_depth);
-            let cod = key_go(codomain, pol, &cod_acc, ctx, pi_depth + 1);
+            let cod_scope = subst_acc.canonical_pi_binder(name, pi_depth);
+            let cod = key_go(codomain, pol, &cod_scope.subst, ctx, cod_scope.depth);
             // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
             // so keying on it would split every use; its *bounds* are the answer, and
@@ -536,6 +536,41 @@ mod tests {
             spec_key(&fx),
             spec_key(&fy),
             "α-variant dependent instantiation types must share a specialization"
+        );
+    }
+
+    /// The key's canonical rename must stay **injective** over enclosing binders.
+    /// The key does not carry the binder name (see [`SpecKey::fun`]), so what
+    /// records which binder a predicate referenced is the rewritten reference
+    /// itself — and two keys that should differ collapse together if the rename
+    /// gives the inner and outer binders one name. A collapse here is an
+    /// *under*-split: two uses share a specialization whose interior was
+    /// resolved against the other's argument, which is the silent failure
+    /// `Subst::canonical_pi_binder` warns about.
+    #[test]
+    fn spec_key_keeps_distinct_binders_distinct() {
+        use super::spec_key;
+        use crate::ccl::infer::solver::test_helpers::dep_pred;
+        use crate::ccl::{FunKind, Name, Refinement};
+
+        let nested = |referenced: &str| Type::Fun {
+            name: Some(Name::raw("x")),
+            kind: FunKind::Data,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Fun {
+                name: Some(Name::raw("y")),
+                kind: FunKind::Data,
+                domain: Box::new(Type::UIntRange(4)),
+                codomain: Box::new(Type::Refinement(
+                    Box::new(Type::Base(BaseType::Int)),
+                    Refinement::born(dep_pred(referenced)),
+                )),
+            }),
+        };
+        assert_ne!(
+            spec_key(&nested("y")),
+            spec_key(&nested("x")),
+            "keying must not conflate the inner and outer Pi binders"
         );
     }
 

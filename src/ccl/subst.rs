@@ -154,6 +154,32 @@ impl Mapping {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Subst(BTreeMap<Binder, Mapping>);
 
+/// Everything a `Fun`'s codomain must be walked under, produced by one call to
+/// [`Subst::canonical_pi_binder`].
+///
+/// The three fields travel together so that a walk cannot take the canonical
+/// binder and then derive the codomain's depth itself. Getting the name right
+/// and the depth wrong is what this type exists to prevent: entering a codomain
+/// at the arrow's own depth names every enclosing binder `__pi0`, which
+/// conflates the predicates that reference them while staying internally
+/// consistent — and idempotent, so comparing a type against its own canonical
+/// form does not detect it. What each walk owes the others, and the tests that
+/// pin it, are in `src/ccl/design/type-inference.md`, "Canonicalizing a Pi
+/// binder needs a position, so it happens at flattening".
+#[derive(Debug, Clone)]
+pub struct PiCodomain {
+    /// The canonical binder to record on the rebuilt arrow; `None` for a
+    /// non-dependent one.
+    pub binder: Option<Name>,
+    /// The substitution the codomain's predicate references resolve through —
+    /// this morphism with the binder's rename applied on top.
+    pub subst: Subst,
+    /// The codomain's own depth. Every arrow nests a binder's scope whether or
+    /// not it names one, so this is always one deeper than the arrow's; a
+    /// domain keeps the arrow's depth and is therefore walked without it.
+    pub depth: u8,
+}
+
 impl Subst {
     /// The identity substitution — a perfect no-op. `apply_*` on it returns the
     /// input structurally unchanged.
@@ -327,10 +353,18 @@ impl Subst {
     /// walk the codomain under; the caller recurses at `depth + 1` (a domain
     /// keeps `depth`, since only codomain arrows nest a binder's scope).
     ///
-    /// This is `__elem`'s move applied to arrows: one shared name per position
-    /// means α-variant types flatten to *identical* shapes, so they merge, their
-    /// refinement copies dedup rather than accumulating a dangling twin, and
-    /// every identity built on the flattened form is α-insensitive.
+    /// The depth makes the binder a *position*, and flattening is the first
+    /// point in the pipeline where a Pi reference has one: while a dependent
+    /// refinement rides a bound edge, the variable holding it need not sit under
+    /// the binder its predicate references, so there is no index to write. That
+    /// is why the rewrite cannot move earlier, and why the alternatives that
+    /// look like they remove it do not — see `src/ccl/design/type-inference.md`,
+    /// "Canonicalizing a Pi binder needs a position, so it happens at flattening".
+    ///
+    /// One shared name per position is what makes α-variant types flatten to
+    /// identical shapes, so they merge, their refinement copies dedup rather
+    /// than accumulating a dangling twin, and every identity built on the
+    /// flattened form is α-insensitive.
     ///
     /// **Three walks apply it and must agree exactly**, which is why the rule
     /// lives here rather than being spelled out in each: `compact_go` (the
@@ -339,13 +373,21 @@ impl Subst {
     /// function the recorded-vs-recomputed walls compare through). A divergence
     /// between the first two is *silent* and yields a shared clone whose
     /// interior was resolved against a different use's argument.
-    pub fn canonical_pi_binder(&self, name: &Option<Name>, depth: u8) -> (Option<Name>, Subst) {
+    pub fn canonical_pi_binder(&self, name: &Option<Name>, depth: u8) -> PiCodomain {
         match name {
             Some(b) => {
                 let canon = Name::pi(depth);
-                (Some(canon.clone()), self.extended_rename(b.clone(), canon))
+                PiCodomain {
+                    binder: Some(canon.clone()),
+                    subst: self.extended_rename(b.clone(), canon),
+                    depth: depth + 1,
+                }
             }
-            None => (None, self.clone()),
+            None => PiCodomain {
+                binder: None,
+                subst: self.clone(),
+                depth: depth + 1,
+            },
         }
     }
 
