@@ -69,6 +69,15 @@ ci_doc_refs() {
   python3 .github/scripts/doc-refs/check_doc_refs.py || return 1
 }
 
+# Gate the interpreter's no-back-channel invariant: operators exchange tiles
+# through `get`, never through shared mutable state (`src/interpreter/CLAUDE.md`).
+# Same ordering rule as `ci_doc_refs`: checker tests first, and `|| return 1` per
+# command because `ci_all` disables errexit for this function's extent.
+ci_shared_state() {
+  python3 .github/scripts/shared-state/test_check_shared_state.py || return 1
+  python3 .github/scripts/shared-state/check_shared_state.py || return 1
+}
+
 # Fast inner-loop gate for local iteration: format, lint (debug, lib+bins only),
 # and test. Deliberately skips the phases whose cost is compile-bound and rarely
 # relevant mid-iteration — the *release* clippy pass (~2x the debug one; only
@@ -99,6 +108,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_doc_refs || failed=1
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_shared_state || failed=1
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_fmt || failed=1

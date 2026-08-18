@@ -5,7 +5,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Scheduler, UnionArm, Value,
+    BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Scheduler, SharedConsumer,
+    UnionArm, Value, forwarding_consumer,
 };
 
 /// Produces a sealed-function tile whose domain and codomain both equal `extent`.
@@ -30,16 +31,12 @@ impl IterateExtent {
 
     fn add_all_source_handles(
         extent: &Extent,
-        consumer: Rc<RefCell<dyn Consumer>>,
+        consumer: SharedConsumer,
         scheduler: &mut Scheduler,
     ) {
         match extent {
             Extent::DataSourceDomain(extent_impl, ..) => {
-                let c = consumer.clone();
-                scheduler.add_source_handle(
-                    extent_impl.clone(),
-                    Box::new(move || c.borrow_mut().notify()),
-                );
+                scheduler.add_source_handle(extent_impl.clone(), forwarding_consumer(&consumer));
             }
             Extent::Record(fields) => {
                 for field_extent in fields.values() {
