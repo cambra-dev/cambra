@@ -509,7 +509,7 @@ pub struct CompiledProgram {
     /// The post-inference IR snapshot — the program inspector's anchor.
     ///
     /// This is `expr` captured **right after `infer`/`typecheck` and before
-    /// `inline::inline_non_iterable_lambdas` consumes it**: fully typed, but
+    /// `inline::inline_capability_lambdas` consumes it**: fully typed, but
     /// still *source-shaped* (lambdas intact, not yet point-free — `inline`,
     /// `lambda_elim`, and `planning` have not run).
     ///
@@ -885,7 +885,7 @@ pub fn compile_program(
     // See `CompiledProgram::post_inference_ir`.
     let post_inference_ir = expr.clone();
 
-    expr = inline::inline_non_iterable_lambdas(expr);
+    expr = inline::inline_capability_lambdas(expr);
     debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).map_err(|errs| {
         if errs
@@ -1007,8 +1007,8 @@ pub fn compile_program(
     // Planning is the one pass that introduces `iterate` / `restrict` /
     // `Compose` staging, so re-checking its output catches a malformed tile
     // graph an adjacency that doesn't chain would otherwise hide. Planning
-    // surfaces each iterated / join-satisfying extent on its producer's
-    // codomain (`refine_codomain` / `set_codomain`) and the strict checker
+    // surfaces each iterated / join-satisfying extent on its producer
+    // (`refine_extent` / `set_extent`) and the strict checker
     // matches the fresh refinements it mints by structural predicate
     // equality, so the staging shapes now validate without re-blinding the
     // check or peeling cast refinements.

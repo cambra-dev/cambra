@@ -27,20 +27,21 @@ Performing this before `lambda_elim` prevents the let-in-lambda rule from hoisti
 
 ### What is inlined (UDF step)
 
-A `Let { binding, bound_expr, body }` is inlined when `should_inline(bound_expr.ty)` returns `true`:
+A `Let { binding, bound_expr, body }` is inlined when `bound_expr.ty` is a **capability** — a `Fun` whose [`FunKind`](type-inference.md#46-data-vs-compute-functions) is not `Data`. That is the whole rule.
 
-- `bound_expr.ty` is `Fun(domain, codomain)`
-- `domain` is **not** iterable — i.e. `is_iterable_domain(domain)` is `false`
+A capability has no data behind it, so there is nothing to share and inlining is how it reaches its call sites to be specialized there: scalar UDFs, list-producing UDFs, curried functions. A **collection** is the opposite — the binding *is* the data, so op-conversion compiles it once behind a `Memo` and hands each use a `FanOut` branch. Inlining one rebuilds the whole collection per use.
 
-`is_iterable_domain` returns `true` for:
-- `UIntRange(_)`, `DataSource(_)` — finite, enumerable
-- `Tuple(ts)` where **all** components are iterable
-- `Record(fields)` where **all** fields are iterable
-- `Refinement(inner, _)` inheriting the iterability of `inner`
+#### Inlining a collection is loop fusion
 
-And `false` for:
-- `Base(_)` (Int, String, Bool, etc.) — no finite enumeration of all values
-- `Fun(_, _)` as domain — there are infinitely many possible functions of any given function type, so it cannot be enumerated. This case covers list-producing UDFs whose domain is itself a list-shaped function type.
+Substituting a collection at its use sites is **loop fusion**: the use site's pipeline runs
+straight through the source's chain rather than pulling from a materialized `Memo`, exactly as an
+inlined capability's body fuses into its caller's. So "never inline a collection" is a *policy*,
+not a structural bar — it trades one materialization for N recomputations of the source, which pays
+when the source is cheap or singly-used and loses when it is expensive with many uses. Nothing here
+has the cost model to decide per binding (use count is a walk away, source cost is not), so the
+rule takes the bounded-worst-case side and fusion waits behind that model. The same decision waits
+on the type side, where generalizing a collection is
+[filter pushdown](type-inference.md#generalizing-a-collection-is-filter-pushdown).
 
 ### Substitution and beta-reduction
 
@@ -252,7 +253,7 @@ A chain head is left alone when wrapping it with iterate would either be redunda
 - **Restrict-led** — `Apply(_, Apply(_, Restrict))` at head, i.e. the outer `restrict` filter of a refined site.  A `restrict` application always sits on an iteration source by construction (`make_restrict` only ever wraps an iteration-bearing upstream), so a refined site is iteration-bearing just as its unrefined `iterate`-led counterpart is.  Recognising it keeps the pass idempotent on refined sites — without it, a second marker walk would re-enter `wrap_with_iterate` on the still-refined domain and stack a second iteration source.
 - **Provides its own iteration** — `Apply(_, MapDomain | Uncurry | Converse | Copair)` and the nested `PermuteDomain` / `FlattenDomain` applies.  These arms construct iteration internally from their argument, so prepending iterate would feed them an unwanted upstream stream.
 - **Rejects `input=Some`** — value-position `Tuple` / `Record` literals (op-conversion's `Tuple` / `Record` arms assert `input.is_none()`) and the catch-all `Apply` with a non-builtin function (`Proj`, `Var`, curried `Apply`).
-- **Function-typed `Var`** — the bound op was already iterate-wrapped at its let-bind site, so returning the `FanOut` branch directly is correct; an outer iterate would create a redundant `MapResult` lookup.
+- **Collection-typed `Var`** — the bound op was already iterate-wrapped at its let-bind site, so returning the `FanOut` branch directly is correct; an outer iterate would create a redundant `MapResult` lookup.  The test is the arrow's `FunKind::Data`, not mere `Fun`-ness: a capability-typed `Var` has no such wrapping behind it, and the kind is exactly the distinction (see [type-inference.md](type-inference.md#46-data-vs-compute-functions)).
 
 #### Special cases beyond the uniform "wrap argument" pattern
 

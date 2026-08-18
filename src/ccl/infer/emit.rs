@@ -11,6 +11,7 @@ use crate::ccl::ccl_utils::cast_target_refinement;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::symbolic::symbolic;
+use crate::ccl::ty::FunKind;
 use crate::ccl::{
     AggregateKind, BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, Type,
     TypedBinding, TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
@@ -59,6 +60,9 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Loc
 fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
+    // The `Lambda` rule reads the node's own arrow for its kind (see
+    // `emit_lambda`), taken before the walk borrows the node.
+    let recorded_ty = expr.ty.clone();
     let mut ty = match &mut expr.node {
         TypedExprNode::Lit(lit) => ctx.lit_singleton(lit),
 
@@ -89,7 +93,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             }
         }
 
-        TypedExprNode::Lambda { param, body } => emit_lambda(param, body, ctx)?,
+        TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
 
         // Cast: an upcast re-viewing `value` at the supertype `target`. See
         // [`emit_cast`] (shared with `check_node`).
@@ -154,7 +158,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
         },
 
-        TypedExprNode::Compose(elts) => emit_compose(elts, ctx)?,
+        TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, ctx)?,
 
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
@@ -568,6 +572,7 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
 pub(super) fn emit_lambda<C: Typing>(
     param: &mut TypedBinding,
     body: &mut Expr,
+    recorded: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     // The parameter binds at its **declared** type when there is one, and at its
@@ -620,16 +625,29 @@ pub(super) fn emit_lambda<C: Typing>(
     // reference it (see `coalesce_compact_go`) — so monomorphic output is
     // unchanged.
     //
-    // The lambda's **kind is `Compute` by construction**: kind is a provenance
-    // property (see `KindMerge::of`, `src/ccl/infer/solver/compact.rs`), and a
-    // bare `λ` *is* a capability. A data collection is not born here — it is a
-    // comprehension / `groupby` / list literal, each concrete-stamped `Data` via
-    // a `data_fun` annotation that `emit_node` reads as a provenance stamp
-    // (overriding this `Compute`). Because a capability is now concrete `Compute`
-    // rather than a kind var, a capability supplied where a collection is demanded
-    // (`sum(λ x → x + 1)`) is the plain `Compute <: Data` rejection in
-    // `constrain_kind` — no domain-shape guess is needed to catch it.
-    Ok(Type::pi(&param.name, param_simple, body_ty))
+    // The rule derives the domain and the codomain; the **kind rides the node's
+    // own arrow**. Nothing about the parameter type or the body type says whether
+    // a `λ` denotes a collection or a capability — a comprehension's
+    // `λ __iter_record → __iter_record ▷ xs ▷ f` and a plain `λ x → x + 1` are the
+    // same node — so re-deciding it here would be inventing an answer the parts do
+    // not contain. A bare `λ` is born `Compute` (`Expr::lambda`); lowering marks a
+    // collection with a `data_fun` annotation, which `emit_node` resolves onto this
+    // type, and from then on the arrow carries its own kind. Reading it back is
+    // what makes the rule reproduce in Check rather than reconstruct a `Compute`
+    // the annotation had already settled.
+    //
+    // Because a capability stays concrete `Compute`, one supplied where a
+    // collection is demanded (`sum(λ x → x + 1)`) is the plain `Compute <: Data`
+    // rejection in `constrain_kind` — no domain-shape guess is needed to catch it.
+    Ok(Type::Fun {
+        name: Some(param.name.clone()),
+        kind: match recorded {
+            Type::Fun { kind, .. } => kind.clone(),
+            _ => FunKind::Compute,
+        },
+        domain: Box::new(param_simple),
+        codomain: Box::new(body_ty),
+    })
 }
 
 /// Type a [`TypedExprNode::Cast`]: `cast(value, target)` re-views `value` at
@@ -693,7 +711,7 @@ pub(super) fn emit_cast<C: Typing>(
     // to the `Compute` default.
     let kind = match target.peel_refinements() {
         Type::Fun { kind, .. } => kind.clone(),
-        _ => crate::ccl::ty::FunKind::Compute,
+        _ => FunKind::Compute,
     };
     // Preserve the value's Pi binder so the cast result stays a *named* function.
     // A dependent application of the cast then reconciles binders by the identity
@@ -1638,6 +1656,7 @@ pub(super) fn emit_variant_ctor<C: Typing>(
 
 pub(super) fn emit_compose<C: Typing>(
     elts: &mut [Expr],
+    recorded: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     assert!(elts.len() >= 2, "Compose requires at least two elements");
@@ -1660,9 +1679,8 @@ pub(super) fn emit_compose<C: Typing>(
         // Strict refinement-aware adjacency: `prev_cod <: next_dom`, refinement
         // refinements and all — no cast escape. A producer must already supply the
         // refinement its consumer demands. Join planning surfaces the
-        // join-satisfying / iterated domain on each producing morphism's
-        // codomain (`planning`'s `refine_codomain` / iteration-source
-        // `set_codomain`), so a `… ≫ (id ≫ cast({D|r} ⇒ V))` chain composes
+        // join-satisfying / iterated extent on each producing morphism
+        // (`planning`'s `refine_extent` / iteration-source `set_extent`), so a `… ≫ (id ≫ cast({D|r} ⇒ V))` chain composes
         // because the upstream genuinely carries `{D | r}` — matched
         // structurally even across the predicate terms planning re-mints.
         ctx.require_sub(&prev_cod, &d_i, &|| format!("Compose[{i}]"))?;
@@ -1683,18 +1701,19 @@ pub(super) fn emit_compose<C: Typing>(
         Type::Fun { name, .. } => name.clone(),
         _ => None,
     };
-    // The chain's kind is the **first** morphism's: a chain over a data source
-    // (`xs ≫ f`, a comprehension) is a data collection; a chain of compute
-    // morphisms is compute. When the first morphism is still a bare `Infer`
-    // (the common case in Emit — a comprehension composed over a source whose
-    // type has not yet resolved to a `Fun`), the chain's kind is genuinely
-    // use-dependent: mint a fresh kind var so a `Data`-demanding consumer (an
-    // aggregate) forces it `Data` via `constrain_kind`, and it otherwise
-    // resolves from its (now-concrete) domain at coalesce. Hardcoding `Compute`
-    // here would reject every composed comprehension flowing into an aggregate.
-    let kind = match tys[0].peel_refinements() {
+    // The chain's kind **rides its own arrow**, like a lambda's (`emit_lambda`).
+    // It is not the head morphism's: a head can be a re-indexing rather than a
+    // decision — `id ≫ xs` and `.0 ≫ xs` denote the collection `xs` re-addressed,
+    // not the capability `id`/`.0` — so reading the head would flatten every
+    // multi-generator comprehension's columns to capabilities. A rewrite that
+    // rebuilds a chain carries the original node's type across, which is what puts
+    // the right kind here to read. In Emit a chain lowered fresh has no arrow yet,
+    // and its kind is genuinely use-dependent: mint a fresh kind var so a
+    // `Data`-demanding consumer (an aggregate) forces it via `constrain_kind` and
+    // it otherwise resolves at coalesce.
+    let kind = match recorded.peel_refinements() {
         Type::Fun { kind, .. } => kind.clone(),
-        _ => crate::ccl::ty::FunKind::fresh_var(),
+        _ => FunKind::fresh_var(),
     };
     Ok(Type::Fun {
         name: last_name,

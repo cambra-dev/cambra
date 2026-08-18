@@ -801,9 +801,11 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                 typed_compose(vec![build_input, build_key_expr.clone()])
             };
 
-            let converse_ty = Type::fun(
+            // The build side is a hash index — a collection keyed by `K` whose
+            // groups are collections of build rows. Both arrows are data.
+            let converse_ty = Type::data_fun(
                 key_ty.clone(),
-                Type::fun(build_output_ty.clone(), build_output_ty.clone()),
+                Type::data_fun(build_output_ty.clone(), build_output_ty.clone()),
             );
             let build_side = apply_primitive(build_key, Builtin::Converse, converse_ty);
             typecheck(&build_side).expect("Bad build expr");
@@ -844,7 +846,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             let uncurry = apply_primitive(
                 probe_expr,
                 Builtin::Uncurry,
-                Type::fun(
+                Type::data_fun(
                     Type::Tuple(vec![probe_output_ty.clone(), build_output_ty.clone()]),
                     build_output_ty.clone(),
                 ),
@@ -909,7 +911,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             let map_domain = apply_primitive(
                 flattened,
                 Builtin::MapDomain,
-                Type::fun(final_domain_ty.clone(), final_domain_ty.clone()),
+                Type::data_fun(final_domain_ty.clone(), final_domain_ty.clone()),
             );
 
             let result = if let Some(predicate) = predicate {
@@ -955,7 +957,7 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
     // codomain so downstream consumers (e.g. a `cast({base | r} ⇒ …)` reading
     // the produced tuples) see the refinement they expect. A hash join folds
     // its equi-conditions into the key structure with no residual `Restrict`,
-    // so the codomain would otherwise be bare — see [`refine_codomain`]. Apply
+    // so the extent would otherwise be bare — see [`refine_extent`]. Apply
     // it to whichever morphism is returned (the refinement is the extent's,
     // independent of the BFS arm permutation, which only reorders the domain).
 
@@ -963,7 +965,7 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
     // output domain matches the original tuple type expected by the caller.
     let canonical: Vec<usize> = (0..arm_types.len()).collect();
     if arm_order == canonical {
-        return Some(refine_codomain(expr, refinement));
+        return Some(refine_extent(expr, refinement));
     }
 
     // perm[j] = position of canonical arm j in arm_order (i.e. where to find it in actual).
@@ -1011,9 +1013,9 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
     let result = apply_primitive(
         permuted,
         Builtin::MapDomain,
-        Type::fun(canonical_ty.clone(), canonical_ty.clone()),
+        Type::data_fun(canonical_ty.clone(), canonical_ty.clone()),
     );
-    let result = refine_codomain(result, refinement);
+    let result = refine_extent(result, refinement);
     typecheck(&result).expect("Bad permute_domain expr");
     Some(result)
 }
@@ -1061,7 +1063,11 @@ pub(super) fn try_hash_join_rewrite(expr: &mut Expr, domain_ty: &Type) -> bool {
         transformed.ty,
     );
     let codomain = expr.ty.codomain().expect("function-typed iteration site");
-    let result_ty = Type::fun(
+    // The rewritten site denotes the same collection, so the kind rides across —
+    // and its domain is `transformed`'s, which [`refine_extent`] has already made
+    // the join-satisfying extent rather than the full product.
+    let result_ty = Type::fun_like(
+        &expr.ty,
         transformed
             .ty
             .domain()

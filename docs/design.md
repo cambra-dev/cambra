@@ -150,7 +150,7 @@ CHL source
   → uniquify         (ccl/uniquify.rs: α-uniquify binders — Barendregt convention, base+uid Names)
   → infer            (ccl/infer/: type inference; delegates to ccl/infer/solver/, the constraint solver;
                       runs on the user-shaped tree so type errors report against the program as written)
-  → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at
+  → inline           (ccl/inline.rs: inline capability (non-collection) Let bindings; beta-reduce at
                       call sites. Runs *before* channelize so the letrec phase can route an in-loop
                       feed against inlined pass-by-ref writers; it therefore still sees Defer/Feed/Define)
   → transact_phase   (ccl/transact_phase.rs: each `with begin():` block over Mut(V, Txn) variables folds into
