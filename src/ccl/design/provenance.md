@@ -15,12 +15,10 @@ features: the inspector's consumption of the AST snapshots (panes), and adoption
 further phases. A reader can tell the two apart by the marker alone; unmarked prose
 describes code you can go read.
 
-Three sites record without reaching any table in a normal build, because
-`compile_program` opens no `PhaseScope` around them: `simplify`,
-`planning/iterate`, and `transact_phase`'s as-of-read rewrite. `lambda_elim`
-records nothing at all, and operator conversion has no identity to record
-against; see
-[Known prerequisites for panes past `post-channelize`](#known-prerequisites-for-panes-past-post-channelize).
+Two sites record without reaching any table in a normal build, because
+`compile_program` opens no `PhaseScope` around them: `simplify` and
+`planning/iterate`. Operator conversion has no identity to record against; see
+[Known prerequisites for panes past `post-planning`](#known-prerequisites-for-panes-past-post-planning).
 
 ## Mechanism at a glance
 
@@ -109,8 +107,10 @@ the ambient session that logs every mint and copy ([The recorder](#the-recorder)
 `assert_unique_node_ids` backstops that it never persists into a checked tree.
 
 **`Phase`** names the compiler stage that produced or rewrote a node (`Lower`, `Uniquify`, `Infer`,
-`Inline`, `Channelize`, `Transact`, `Letrec`, `LambdaElim`, `Planning`). It lives in the provenance
-data, as each row's `via`, and never in a type.
+`Inline`, `Transact`, `Letrec`, `Channelize`, `AsOfRead`, `LambdaElim`, `Planning`). It lives in the
+provenance data, as each row's `via`, and never in a type. Declaration order is pipeline order, so a
+phase is declared where its rewrite **runs** — `AsOfRead`'s code lives in `transact_phase`, and the
+module a rewrite's code sits in is not its phase.
 
 ### Walking the ids
 
@@ -179,7 +179,7 @@ original survives on a type the walk missed with the rebuild's ids on both.
 `uniquify` is its one caller.
 
 The corpus test `distinct_predicate_terms_never_share_a_node_id` runs the same
-check on the three retained panes, which the boundary walk does not reach: the
+check on every retained pane, which the boundary walk does not reach: the
 `pre-inference` pane is taken after uniquify, between two boundaries.
 
 ### Duplication
@@ -324,7 +324,7 @@ Ids inside refinement predicates are rows like any other. Lowering's projection
 covers every id `collect_tree_ids` enumerates, and `PredMemo::rebuild` records a
 derived predicate against the one it was built from. What is **not** recorded is
 planning raising a predicate back into the main tree; see
-[Known prerequisites for panes past `post-channelize`](#known-prerequisites-for-panes-past-post-channelize).
+[Known prerequisites for panes past `post-planning`](#known-prerequisites-for-panes-past-post-planning).
 
 The backing store is a `HashMap`; the paged, delta-encoded form is a later pure
 re-encoding behind the same accessors.
@@ -463,7 +463,9 @@ which is also what keeps the two constructors apart, since a mint captured in a
 copy-only recording is a site that should have named a node.
 
 **Where recordings are open today.** Lowering's leaf appends and copy sinks, plus
-recordings inside the two pane pairs: `infer/solve` (`mono.specialize`,
+every recording a pane pair's fold reads — each of the phases below runs inside a
+`PhaseScope` that `compile_program` opens, and sits between two retained AST
+snapshots: `infer/solve` (`mono.specialize`,
 `mono.coalesce_let`), `infer/emit` (`infer.lit_singleton`),
 `infer/solver/scheme` (`infer.freshen_predicate`), `inline`
 (`inline.alias`, `inline.udf`, `inline.beta`), `mut_elim` (`letrec.loop`,
@@ -471,22 +473,30 @@ recordings inside the two pane pairs: `infer/solve` (`mono.specialize`,
 `transact_phase` (strip, unwrap block, writer, commit record, history binding,
 key rebind, key-init stash, carrier, the cross-domain and await-final rules), and
 `channelize` (`channelize.cluster`, `channelize.defer_lift`,
-`channelize.defer_collapse`). Two shared helpers record under whichever phase
+`channelize.defer_collapse`), `transact_phase`'s as-of-read rewrite
+(`transact.as_of_read`), and `lambda_elim` (`lambda_elim.abstract`,
+`lambda_elim.point_free`, `lambda_elim.filter`, `lambda_elim.value_case`). Two
+shared helpers record under whichever phase
 scope is open around them: `subst` (`subst.vacuous`, `subst.transport`,
 `subst.force_refinement`) and `ccl_utils`' `PredMemo::rebuild`
 (`predicate.rebuild`).
 
-Three sites record **below** `post_channelize_ir`, so no pane pair's fold reads their
-rows:
-`simplify` (one combinator covering all thirteen `&mut` rule invocations, with no
-rule-body edits), `planning/iterate`, and `transact_phase`'s as-of-read rewrite.
-`compile_program` opens no `PhaseScope` around any of them, so their recordings
-are inert in a normal build and land only under an audit a caller opens.
-`CAMBRA_PROVENANCE_AUDIT=full` (`post-inference..post-as-of-read`) covers the
-as-of-read rewrite; reaching `simplify` and `planning/iterate` needs
-`CAMBRA_PROVENANCE_AUDIT=planning` (`recognized..join-planned`), which is what the
-coverage figures below were measured with. `lambda_elim` records nothing, which
-is what an audit's endpoint stops in front of.
+Two sites record where nothing reads their rows: `simplify` (one combinator
+covering all thirteen `&mut` rule invocations, with no rule-body edits) and
+`planning/iterate`. `compile_program` opens no `PhaseScope` around either, and a
+recording outside a phase scope writes nothing at all — the hooks capture into a
+stack that is never routed to a table — so in a normal build these two cost an
+emptiness check and produce no rows.
+
+They become visible only when a developer sets `CAMBRA_PROVENANCE_AUDIT=planning`
+in the environment before running the compiler or its tests. That opens one scope
+spanning `recognized..join-planned` and prints a coverage and leak line to stderr
+when the span closes: a measurement, run by hand while a phase is being
+instrumented, of how much of that phase's rewriting its recordings explain. It is
+what the coverage figures below were measured with. Naming a span turns pane
+capture off (`provenance_capture_enabled`), so an audit never runs in a build
+that also serves panes. Both sites stop needing one in the commit that runs
+`planning` under a `Phase::Planning` scope.
 
 ### Where to open a recording
 
@@ -587,6 +597,13 @@ The dense self-edge is **ancestry**: a surviving node descends from itself, whic
 is the identity of the weakest-link composition, so density needs no special
 case.
 
+A phase that re-mints its pass-through nodes therefore has almost no self-edges,
+and its pair's relation comes from the parents walk alone: every node is still
+explained, but the pair cannot say that an untouched node was untouched, so each
+pass-through node reads to a consumer as a rewrite of its predecessor.
+`lambda_elim` is that phase today, and its catch-all traversal arm carries why a
+preserve is not taken there.
+
 The leak audit reads the ancestry label alone. `DanglingParent` is a claim about
 `parents` — an ancestry hop stopping at an id that describes nothing — while a
 blamed id the fold never heard of contributes no edge and no class, the same
@@ -671,8 +688,8 @@ id, nothing recorded), so an id cannot be minted **unrecorded**. Minting one and
 then discarding it stays possible, and costs the stranded row named under
 "Freshen at placement, not at construction".
 
-The fold runs over the inspector's two pane pairs today; **planned** is the
-inspector's consumption of what it produces.
+The fold runs over each adjacent pane pair; **planned** is the inspector's
+consumption of what it produces.
 
 ### Gate and audit coverage
 
@@ -683,8 +700,9 @@ An audit's endpoint is **chosen**, because a span running past the last
 instrumented phase counts everything the uninstrumented tail mints as a defect — a
 number that cannot reach zero however correct the recording is, which makes the
 audit read as a broken gate rather than a measurement. The `full` span therefore
-ends at the last instrumented pane, `post-inference..post-as-of-read`, stopping in
-front of `lambda_elim`.
+ends at the last instrumented pane, `post-inference..post-lambda-elim`, stopping
+in front of `planning`, whose group-by and hash-join recognizers mint with
+nothing recording.
 
 **The same discipline governs the gate.** `CAMBRA_PROVENANCE_GATE=1` makes *every*
 compile fold both pane pairs and gate the leak classes, so the gate's corpus
@@ -695,19 +713,43 @@ sample is what let two recording gaps live: `transact_phase` calling
 value-position writer hoist. Both are shapes the eleven listed programs do not
 have. CI runs with it on; it costs about 4% of the test step.
 
-It gates `gated_pane_pairs()`, which is every pair whose phases record. The two
-at the bottom are not there yet: `lambda_elim` and `planning` each mint with
-nothing open, and a gate over such a pair cannot reach zero however correct the
-recording is — it would report a count of how little that phase records, a
-constant rather than a regression. No program count is pinned for them either,
-for the same reason: it churns with every unrelated change. **Flip
-`PaneSpec::gated` in the commit that instruments the last phase in the pair**,
-the same way an endpoint moves.
+It gates `gated_pane_pairs()`, which is every pair whose phases record. The
+bottom one is not there yet: `planning` mints with nothing open, and a gate over
+such a pair cannot reach zero however correct the recording is — it would report
+a count of how little that phase records, a constant rather than a regression. No
+program count is pinned for it either, for the same reason: it churns with every
+unrelated change. **Flip `PaneSpec::gated` in the commit that instruments the
+last phase in the pair**, the same way an endpoint moves.
 
 **Move the endpoint when a phase becomes instrumented, in the commit that
-instruments it:** to `post-lambda-elim` when the elim phase records, and to
-`join-planned` when planning does. Leaving it behind understates coverage; moving
+instruments it:** to `join-planned` when planning records. Leaving it behind
+understates coverage; moving
 it ahead reintroduces the unreachable zero.
+
+#### What retires when the last phase records
+
+The audit is scaffolding for the instrumentation campaign and nothing else: with
+every pane pair gated, a span measuring how much of a phase's rewriting its
+recordings explain has no question left to ask.
+`TODO(provenance-audit-retire)` marks the sites, and it takes with it
+
+- `ProvenanceAudit` and `CAMBRA_PROVENANCE_AUDIT`, along with the audit clause in
+  `provenance_capture_enabled` — capture becomes unconditional once nothing else
+  contends for the phase scopes;
+- `CAMBRA_PROVENANCE_PREDICATES`, whose only reader is the audit's live set;
+- `PaneSpec::gated` and `gated_pane_pairs`, one bit per pair existing only to
+  describe a half-instrumented pipeline — `gate_leaks` then covers every pair;
+- the paragraph in [The recorder](#the-recorder) about the two sites whose rows
+  nothing reads, and the by-hand coverage figures the spans were run to produce.
+
+**What stays is the pane product and the validations over it.** None of it is
+scaffolding for the campaign; all of it is what the campaign was for:
+
+- the recordings at each phase;
+- `PANES`, the fold, and `gate_leaks`;
+- `CAMBRA_PROVENANCE=0`, which measures what capture costs, and
+  `CAMBRA_PROVENANCE_GATE=1`, which trades a second fold per compile for a corpus
+  of every program the caller compiles rather than the handful `corpus()` lists.
 
 ## The seam
 
@@ -786,46 +828,57 @@ it ahead reintroduces the unreachable zero.
   structurally impossible — the projection is *produced by* the fold, never
   mutated incrementally.
 - **Materialization (cold, inspector-only).** `CompiledProgram::materialize_panes`
-  folds `provenance_table` across the two pane pairs, restricting it by phase:
-  `INFER_PHASES` bridges pre → post-inference; `CHANNELIZE_PHASES` (Inline, Transact,
-  Letrec, Channelize) bridges post-inference → post-channelize. It returns the three per-pane
-  `SourceProjection`s, the two pane-pair `ProvenanceMap`s, and each pair's deaths
-  and leak vector. There is no catch-all bridge: a node is explained by a recorded
-  row or it is not explained at all, and the gate is what says which.
-  Materialization returns the leaks rather than asserting on them: a pane pair is
-  clean only once every phase inside it records.
+  folds `provenance_table` across every adjacent pane pair, restricting it by
+  phase. `PANES` is the topology and declares it once: each entry names a pane,
+  the phases that produced it from the pane before it, and whether its pair is
+  gated. It returns a `SourceProjection` per pane and a `PanePair` per pair, each
+  carrying that pair's map, deaths and leak vector. There is no catch-all bridge:
+  a node is explained by a recorded row or it is not explained at all, and the
+  gate is what says which. Materialization returns the leaks rather than
+  asserting on them: a pair is clean only once every phase inside it records.
+
+  The first entry is the anchor — it has no predecessor, and its projection is
+  the lowering projection rather than a fold product. Read `PANES` for the
+  current set rather than a list here; today it runs `pre-inference` through
+  `post-planning`, six panes and five pairs. Projections chain: each pair folds
+  against the projection of the pane above it, so the first pair whose phases do
+  not record leaves every pane below it with nothing to carry forward.
 - **The pane leak gate.** `gate_leaks` asserts the whole `Leak` vector empty at
-  the lowering handoff and at both pane pairs: `Unrecorded` (an output node no
-  capture explains) and `DanglingParent` (an ancestry edge to an id the fold has
-  never heard of) are the only classes, deaths having their own channel.
+  the lowering handoff and at each gated pane pair. `Unrecorded` (an output node
+  no capture explains) and `DanglingParent` (a parent edge to an id the fold has
+  never heard of) are the only two classes. A death is not one of them: it is an
+  ordinary product of any rewrite that replaces a node, carried on its own
+  `PanePair::deaths` channel and never asserted on.
 
-  Where the gate stands: **zero on both classes, at both pane pairs, for every
-  program in `corpus()`** — that being what
-  `pane_pair_folds_have_no_structural_leaks` asserts, as a property rather
-  than a pinned residue count. Capture is total over the adopted span: every
-  output-pane node has an origin. The whole-suite gate
-  (`CAMBRA_PROVENANCE_GATE=1`) is the wider corpus and the narrower span — it
-  holds at zero over every program the caller compiles, at the second pane pair
-  only.
+  **`PaneSpec::gated` says whether a pair is asserted to carry neither class.**
+  Two checks read the same set at different widths:
+  `pane_pair_folds_have_no_structural_leaks` over the programs `corpus()` lists,
+  on every test run, and `CAMBRA_PROVENANCE_GATE=1` over whatever the caller
+  compiles, which is strictly stronger because the wider corpus reaches shapes
+  the eleven listed programs do not.
 
-## Known prerequisites for panes past `post-channelize`
+  **The flag does not license a nonzero residue where it is false.** A leak is a
+  bug wherever it appears; the flag says whether an assertion has been turned on.
+  A pair goes ungated only while some phase inside it does not record, where the
+  residue is a count of how little that phase records — a constant no correct
+  recording elsewhere can drive down, so gating it would pin churn rather than
+  catch a defect.
+
+  Where it stands: every pair from `pre-inference → post-inference` down to
+  `post-as-of-read → post-lambda-elim` is gated, so capture is total over that
+  span on whatever the caller compiles. `post-lambda-elim → post-planning` waits
+  on planning.
+
+## Known prerequisites for panes past `post-planning`
 
 A pane may be issued at **any** point during compilation — the current adoption
 point is an artifact of what has been built, not a statement about the design.
-Three things block extending it, all acknowledged and none blocking the two panes
-that exist:
+The panes stop at `post-planning`, whose pair is not yet gated. Two things stand
+in the way, neither of them touching the pairs that are gated:
 
-- **`lambda_elim` records nothing, and re-mints** nearly every pass-through
-  node, so a pane pair spanning it would have no id correspondence to join on.
-  Its catch-all traversal arm carries a `TODO(preserve)`, and `planning/groupby`
-  relies on that re-minting to launder the ids it lifts out of a refinement
-  predicate — `groupby_recognition_lifts_the_key_without_aliasing` pins the
-  reliance —
-  so a preserve there owes `groupby` an explicit freshen.
-- **Operator conversion has no identity.** `TileOperator` carries none and there
-  is no `OperatorId`, so a pane after it has nothing to resolve against.
-- **Planning does not record what it raises out of the predicate domain.** Three
-  sites cross: `planning/iterate`'s `fn_of_bare_predicate` lift, the group-by key
+- **Planning does not record what it raises out of the predicate domain**, which
+  is what keeps `post-lambda-elim → post-planning` ungated. Three sites
+  cross: `planning/iterate`'s `fn_of_bare_predicate` lift, the group-by key
   extraction, and the hash-join key morphisms. Each would record against its
   term-tree site, that being the node the raised material becomes, but the
   `on_copy` hook reports the *origin it freshened*, and no channel re-roots a
@@ -838,9 +891,12 @@ that exist:
   widening the audit's live set (`CAMBRA_PROVENANCE_PREDICATES=1`) took every gated
   class to zero. (The count is from before the endpoint moved and has not been
   re-taken.) That says the recording is total for the span and the narrow live
-  set is what makes the crossing read as a leak. It says nothing about the two
-  pane pairs, whose phases rebuild predicates through `PredMemo` and are
-  recorded there.
+  set is what makes the crossing read as a leak. It says nothing about the pane
+  pairs that are gated, whose phases rebuild predicates through `PredMemo` and
+  are recorded there.
+- **Operator conversion has no identity**, which is what stops a pane *after*
+  `post-planning`. `TileOperator` carries none and there is no `OperatorId`, so a
+  pane there has nothing to resolve against.
 
 ## Planned — inspector consumers (`src/inspector_model/`)
 

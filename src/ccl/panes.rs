@@ -118,6 +118,12 @@ pub(crate) struct PaneSpec {
     /// pin churn rather than catch a defect. Flip it in the commit that
     /// instruments the last phase in the pair, the same way an audit span's
     /// endpoint moves. Unused on the anchor, which has no pair.
+    ///
+    /// TODO(provenance-audit-retire): this bit and
+    /// [`MaterializedPanes::gated_pane_pairs`] exist only to describe a
+    /// half-instrumented pipeline. Both go when the last phase records, leaving
+    /// [`gate_leaks`] over every pair. See `design/provenance.md`, "What retires
+    /// when the last phase records".
     pub(crate) gated: bool,
 }
 
@@ -129,13 +135,11 @@ pub(crate) struct PaneSpec {
 /// empty and its `gated` is unused — its projection is the lowering projection
 /// rather than a fold product.
 ///
-/// The two pairs at the bottom are ungated because their phases do not record
-/// yet: `lambda_elim` and `planning` each mint with nothing open. Every pair
-/// above them holds at zero on whatever the caller compiles — which the two
-/// commits below this one are what make true of `pre-inference →
-/// post-inference`, by widening the fold's id domain to the slot domain the
-/// passes rewrite and by giving inference's per-instantiation predicate freshen a
-/// copy recording.
+/// The bottom pair is ungated because `planning` mints with nothing open. Every
+/// pair above it holds at zero on whatever the caller compiles — true of
+/// `pre-inference → post-inference` only once the fold's id domain was widened to
+/// the slot domain the passes rewrite and inference's per-instantiation predicate
+/// freshen took a copy recording.
 pub(crate) const PANES: [PaneSpec; 6] = [
     PaneSpec {
         name: "pre-inference",
@@ -165,7 +169,7 @@ pub(crate) const PANES: [PaneSpec; 6] = [
     PaneSpec {
         name: "post-lambda-elim",
         phases: &[Phase::LambdaElim],
-        gated: false,
+        gated: true,
     },
     PaneSpec {
         name: "post-planning",
@@ -466,21 +470,32 @@ mod tests {
     /// reads the pane pair as pure identity. The pin is what makes that
     /// difference visible, so it lists names and not a total.
     const EXERCISED_BOUNDARIES: &[&str] = &[
+        "arithmetic / post-as-of-read → post-lambda-elim",
         "arithmetic / pre-inference → post-inference",
+        "feed_loop / post-as-of-read → post-lambda-elim",
         "feed_loop / post-inference → post-channelize",
         "feed_loop / pre-inference → post-inference",
+        "filter_and_aggregate / post-as-of-read → post-lambda-elim",
         "filter_and_aggregate / pre-inference → post-inference",
+        "for_accumulator / post-as-of-read → post-lambda-elim",
         "for_accumulator / post-inference → post-channelize",
         "for_accumulator / pre-inference → post-inference",
+        "generator_pipeline / post-as-of-read → post-lambda-elim",
         "generator_pipeline / post-inference → post-channelize",
         "generator_pipeline / pre-inference → post-inference",
+        "group_by / post-as-of-read → post-lambda-elim",
         "group_by / pre-inference → post-inference",
+        "inner_join / post-as-of-read → post-lambda-elim",
         "inner_join / pre-inference → post-inference",
+        "prefix_lines / post-as-of-read → post-lambda-elim",
         "prefix_lines / pre-inference → post-inference",
+        "streaming_echo / post-as-of-read → post-lambda-elim",
         "streaming_echo / pre-inference → post-inference",
+        "transaction / post-as-of-read → post-lambda-elim",
         "transaction / post-channelize → post-as-of-read",
         "transaction / post-inference → post-channelize",
         "transaction / pre-inference → post-inference",
+        "udf_chain / post-as-of-read → post-lambda-elim",
         "udf_chain / post-inference → post-channelize",
         "udf_chain / pre-inference → post-inference",
     ];
@@ -762,10 +777,11 @@ mod tests {
                 Phase::AsOfRead,
                 Phase::Channelize,
                 Phase::Infer,
+                Phase::LambdaElim,
                 Phase::Letrec,
                 Phase::Transact
             ],
-            "the transaction fixture is rewritten by exactly these five phases",
+            "the transaction fixture is rewritten by exactly these six phases",
         );
     }
 

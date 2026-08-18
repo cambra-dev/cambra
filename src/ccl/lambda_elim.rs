@@ -48,6 +48,7 @@ use crate::ccl::ccl_utils::{
     typed_compose,
 };
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
+use crate::ccl::provenance;
 use crate::ccl::simplify::simplify;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{BaseType, Branch, Builtin, FieldKey, Lit, Name, Refinement};
@@ -769,6 +770,16 @@ fn elim_lambda_impl(
 ) -> Result<Expr, LambdaElimError> {
     log::trace!("elim_lambda: eliminating λ {param}: {}", symbolic(&body));
     debug_typecheck(&body);
+    // Names the lambda **body**, not the enclosing `Lambda`: one call per body
+    // node, each replacing that node with its own scaffolding — naming the
+    // `Lambda` would collapse a whole body onto one parent. The four desugaring
+    // arms re-enter on an applied form they just minted, so the inner call names
+    // a node this one minted and the fold reaches the original in two hops.
+    let _g = provenance::enter(
+        body.node_id(),
+        "lambda_elim.abstract",
+        provenance::Nature::Machinery,
+    );
     // Capture the body's type before consuming it; the result of eliminating
     // `λ param → body` is a morphism `param_ty → body_ty`. When `param` is
     // still free in `body_ty` (a refinement predicate closes over it — the
@@ -1544,6 +1555,19 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
     }
     log::trace!("elim_lambdas: eliminating {}", symbolic(&expr));
     debug_typecheck(&expr);
+    // Names the node this call was handed. Every arm below rewrites it and every
+    // node the pass touches passes through here exactly once, so each arm's
+    // products — combinator scaffolding, the catch-all's structural rebuild —
+    // take it as their parent with no arm knowing. Two arms open a second
+    // recording on this same node: not a capture gap, but a recording carries one
+    // label and one nature for its whole extent, and those two expand a construct
+    // the user wrote.
+    let node_id = expr.node_id();
+    let _g = provenance::enter(
+        node_id,
+        "lambda_elim.point_free",
+        provenance::Nature::Machinery,
+    );
     let TypedExpr {
         node,
         ty,
@@ -1610,6 +1634,13 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                     }) if is_filter_case_body(body)
                 ) =>
         {
+            // The recording names the whole `Compose`: the source this arm emits
+            // stands in for the composition *and* its trailing filter lambda. The
+            // `Compose` is the outermost of the two. A comprehension's `if` clause
+            // becoming a domain refinement is a `Nature::Expansion` of what the
+            // user wrote.
+            let _fg =
+                provenance::enter(node_id, "lambda_elim.filter", provenance::Nature::Expansion);
             let lambda = terms.pop().unwrap();
             let (param, filter_body) = match lambda.node {
                 TypedExprNode::Lambda { param, body, .. } => (param, *body),
@@ -1707,6 +1738,17 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             scrutinee: None,
             branches,
         } if branches.iter().all(|b| b.pattern.is_none()) => {
+            // Names the `Case`: both builders' scaffolding — the C-form's gated
+            // lifts and `final_or_default`, the fan-out's restricted arms — stands
+            // in for this one node. Guards and bodies are walked by
+            // `elim_lambdas`/`elim_lambda` and named on their own ids, so what
+            // lands here is exactly the union scaffolding. `Nature::Expansion`:
+            // the user's `if`/`elif`/`else` is being expanded, not plumbed.
+            let _cg = provenance::enter(
+                node_id,
+                "lambda_elim.value_case",
+                provenance::Nature::Expansion,
+            );
             // Flatten `elif` chains to one partition first, so a nested
             // conditional collection collapses into a single N-choice fan-out.
             let branches = flatten_trailing_value_case(branches);
@@ -1757,9 +1799,9 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             // property rather than as a mechanism. Settling mint-vs-preserve for
             // the catch-all arm wants its own change.
             //
-            // Neither choice writes a provenance row: this file opens no recording,
-            // and `compile_program` runs `lambda_elim::run` outside every pass
-            // scope it opens.
+            // Either way the mint is recorded: the traversal's recording is open
+            // here, so the rebuilt node claims parentage at the node it replaced.
+            // A preserve would add the id correspondence on top.
             let mut expr = Expr::new(node).with_ty(ty);
             expr.user_annotation = user_annotation;
             expr.try_map_children(|child| elim_lambdas(ctx, child))?;

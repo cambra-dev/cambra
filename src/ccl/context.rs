@@ -571,7 +571,7 @@ pub struct CompiledProgram {
     /// explain them, and `PredMemo::rebuild` records a derived predicate against
     /// the one it was built from. What is not recorded is planning **raising** a
     /// predicate back into the main tree; see `design/provenance.md`, "Known
-    /// prerequisites for panes past `post-channelize`".
+    /// prerequisites for panes past `post-planning`".
     ///
     /// Empty when capture is switched off — no phase scope is opened then, so
     /// every flush is a no-op — see [`provenance_capture_enabled`]. This is the
@@ -1047,6 +1047,12 @@ fn recorded<R>(capture: bool, phase: Phase, f: impl FnOnce() -> R) -> R {
 /// genuinely-dead input id reaches the audit through the fold's death
 /// collection, which it counts apart from the [`Leak`]s that really are
 /// recording bugs.
+///
+/// TODO(provenance-audit-retire): scaffolding for the instrumentation campaign.
+/// This, [`PROVENANCE_PREDICATES_ENV`] and the audit clause in
+/// [`provenance_capture_enabled`] all go once every pane pair is gated, at which
+/// point no span has a question left to ask. See `design/provenance.md`, "What
+/// retires when the last phase records".
 struct ProvenanceAudit {
     span: &'static str,
     state: Option<(PhaseScope, std::collections::HashSet<NodeId>)>,
@@ -1372,24 +1378,25 @@ pub fn compile_program(
     let post_inference_ir = expr.clone_preserving_ids();
 
     // Driver-capture audit span: post-inference pane in, and out at the **last
-    // instrumented pane** — currently `post-as-of-read`, covering inline,
-    // transact, mut_elim, channelize and the as-of-read rewrite.
+    // instrumented pane** — currently `post-lambda-elim`, covering inline,
+    // transact, mut_elim, channelize, the as-of-read rewrite and lambda
+    // elimination.
     //
     // The endpoint is chosen rather than inherited. An audit measures what the
     // recordings explain, so a span running past the last instrumented phase
     // reports every node the uninstrumented tail mints as a defect — a number
     // that cannot reach zero however correct the recording is, which makes the
-    // audit read as a broken gate instead of a measurement. `lambda_elim` is the
-    // next phase here and records nothing (it re-mints nearly every pass-through
-    // node), so the span stops in front of it.
+    // audit read as a broken gate instead of a measurement. `planning` is the
+    // next phase here, and its group-by and hash-join recognizers mint with
+    // nothing recording, so the span stops in front of it.
     //
     // **Move this endpoint when a phase becomes instrumented, in the same commit
-    // that instruments it** — to `post-lambda-elim` when the elim phase records,
-    // and to `join-planned` when planning does. Leaving it behind understates
-    // coverage; moving it ahead reintroduces the unreachable-zero problem.
+    // that instruments it** — to `join-planned` when planning records. Leaving
+    // it behind understates coverage; moving it ahead reintroduces the
+    // unreachable-zero problem.
     let audit = ProvenanceAudit::start(
         "full",
-        "post-inference..post-as-of-read",
+        "post-inference..post-lambda-elim",
         &post_inference_ir,
     );
     // A narrower pane pair over just the mutability phases (inline, transact,
@@ -1516,13 +1523,16 @@ pub fn compile_program(
     .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     assert_unique_node_ids(&channelized, "post-as-of-read");
     typecheck(&channelized).expect("as-of-read rewrite produced an ill-typed tree");
-    // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
-    audit.finish(&channelized);
     // A pane snapshot; see `pre_inference_ir`.
     let post_as_of_read_ir = channelized.clone_preserving_ids();
 
-    let lambda_elim = lambda_elim::run(channelized).errs()?;
+    let lambda_elim = recorded(capture_provenance, Phase::LambdaElim, || {
+        lambda_elim::run(channelized)
+    })
+    .errs()?;
     assert_unique_node_ids(&lambda_elim, "post-lambda-elim");
+    // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
+    audit.finish(&lambda_elim);
     // A pane snapshot; see `pre_inference_ir`.
     let post_lambda_elim_ir = lambda_elim.clone_preserving_ids();
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
