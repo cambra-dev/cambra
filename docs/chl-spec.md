@@ -1596,10 +1596,13 @@ match x:
 
 A pattern spells its tag exactly as a constructor does (§3.15), so an arm
 reads as the inverse of what it matches. `` case `tag(binder): `` binds the
-payload; `` case `tag: `` matches without binding, which is the natural
-spelling for a tag whose payload carries no information. A binder is an
-ordinary local, scoped to its arm. The default arm below takes no backtick:
-`_` is the absence of a tag, not a tag.
+payload; `` case `tag: `` matches without binding it. The non-binding form is
+the natural spelling for a payload-less tag, and is accepted for **any** tag:
+an arm that needs to know only *which* tag fired says exactly that, and there
+is no other way to say it — a binder must be a name, since `_` is the default
+arm rather than a wildcard. A binder is an ordinary local, scoped to its arm.
+The default arm below takes no backtick: `_` is the absence of a tag, not a
+tag.
 
 Like `if`, a `match` is value-yielding by position: where a value is
 required (a function body, the program value), every arm's block must end
@@ -1607,7 +1610,11 @@ in a value-yielding statement.
 
 **Each tag is handled by exactly one arm.** Two arms for one tag is an
 error — the arms *partition* the scrutinee's tags, so first-match never
-arbitrates and arm order is not observable.
+arbitrates and arm order is not observable. A per-arm guard would change
+that: two arms could then name one tag and be told apart by their guards,
+which is order-sensitive. Guards are a **[Tentative]** direction (see the
+note at the end of this section), so the partition rule is stated for the
+guard-free language of today.
 
 **`case _:` is the default arm**, matching whatever the tagged arms did
 not. It binds no payload — the tags it covers have different payload
@@ -1621,26 +1628,6 @@ legal and says nothing about the scrutinee's type — which therefore need
 not be a variant. The scrutinee is still an expression in scope and is
 type-checked as one.
 
-**Exhaustiveness needs no separate check when there is no default arm.**
-The arms describe the consumer, so the scrutinee is constrained to a
-*subtype* of the arms' tag set (width subtyping, §3.15). A `match`
-therefore cannot be non-exhaustive with respect to its own arms; it fails
-only when the scrutinee's type is fixed independently — by an annotation,
-or by a compiler-produced type such as the `Option(V)` of a checked
-lookup — and carries a tag no arm handles. That is reported as an
-unhandled tag.
-
-With a default arm that constraint is *dropped*: the scrutinee may carry
-tags no arm names, which is exactly what the default is for. (Keeping the
-subtype requirement would make the default arm unreachable — every
-scrutinee it could fire on would be rejected first.)
-
-The converse is *not* an error: arms for tags the scrutinee cannot carry
-are simply unreachable, and are *kept* — a projection of a tag the value
-never carries contributes nothing, so a dead arm costs nothing and needs
-no pruning. Writing the full `Option` match over a scrutinee that
-inference has pinned to one tag is ordinary code, not a mistake.
-
 Patterns are **shallow**: an arm matches one tag and binds the whole
 payload, with no nesting, no literal patterns, and no per-arm guard.
 
@@ -1650,16 +1637,22 @@ and bare calls. Dispatching per element is written as a `def` that matches
 on its parameter and is called from the loop or a comprehension, which is
 the same first-match rule reached through a call.
 
-> **Direction [Tentative].** `match` is a statement only. A one-line
-> expression form has no settled syntax: the obvious spellings collide
-> with decided syntax — `{…}` is structural-*type* syntax (§2.4) and
-> `a -> b` is pair sugar (§2.4) — so it is deliberately left out rather
-> than given a form that would have to be retracted. Tuple
-> destructuring on assignment targets (§4.3) is unaffected and remains
-> the only other pattern-like form. A per-arm guard (`` case `some(v) if
-> v > 0: ``) is the natural next addition — the IR already carries a guard
-> alongside each arm's pattern — and needs a *tag-test* predicate term so
-> the arm's gate can combine "is this tag" with the guard.
+> **Direction [Tentative].** A `match` in a value position yields a value
+> exactly as an `if` chain does (§4.5), so what is missing is not
+> expression-ness but a **one-line** spelling. The obvious one is the block
+> with its line breaks removed — `` match scrut: case `foo(x): x case
+> `bar(y): to_x(y) `` — where `case` delimits the arms, so no separator is
+> needed. What it waits on is a one-line block rule, which **no** block
+> statement has today (`if c: x` does not parse either): granting `match`
+> one alone would make it the exception. Tuple destructuring on assignment
+> targets (§4.3) is unaffected and remains the only other pattern-like form.
+>
+> A per-arm guard (`` case `some(v) if v > 0: ``) is the natural next
+> addition — the IR already carries a guard alongside each arm's pattern —
+> and needs a *tag-test* predicate term so the arm's gate can combine "is
+> this tag" with the guard. It also relaxes the one-arm-per-tag rule above:
+> two arms may then name one tag, and arm order becomes observable between
+> them.
 
 ---
 

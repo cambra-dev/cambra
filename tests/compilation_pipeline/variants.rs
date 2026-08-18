@@ -707,6 +707,61 @@ fn test_variant_type_dispatches_like_option(#[case] code: &str, #[case] expected
     check_scalar(code, expected);
 }
 
+/// The **bounded** form (`x <: T`) keeps the value's own type where the exact form
+/// binds *at* the annotation, and for a variant that difference is the **tag set**: a
+/// one-arm value annotated at the two-arm type is still a one-arm value, so a `match`
+/// need only handle the tag it actually carries.
+///
+/// Design: `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".
+/// The type-level halves of this contrast — which tags each form leaves on the binder,
+/// and the singleton payload only the bounded form keeps — are in `type_check.rs`'s
+/// `annotation_kinds`; here it is the end-to-end value.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// The bound is a *bound*: the value still has to be admitted by it, so the same
+// payload and tag checks apply. What it does not do is replace the value's type.
+#[case(
+    r"
+x <: {`some{Int} | `none} = `some(1)
+x",
+    union("some", Value::Int(1))
+)]
+// One arm suffices, because `x` carries one tag. The exact form of the same program
+// is a rejection — see `test_variant_type_rejections`.
+#[case(
+    r"
+x <: {`some{Int} | `none} = `some(1)
+match x:
+    case `some(v):
+        v",
+    Value::Int(1)
+)]
+// Handling more tags than the value carries stays legal under either form: the extra
+// arm is unreachable and kept.
+#[case(
+    r"
+x <: {`some{Int} | `none} = `none
+match x:
+    case `some(v):
+        v
+    case `none:
+        0",
+    Value::Int(0)
+)]
+// At a parameter, where the same asymmetry motivated the split.
+#[case(
+    r"
+def f(v <: {`some{Int} | `none}):
+    match v:
+        case `some(w):
+            w + 1
+f(`some(1))",
+    Value::Int(2)
+)]
+fn test_bounded_variant_annotation(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// The annotation is a real constraint: a value carrying a tag the type does not
 /// name, or the wrong payload for a tag it does, is an annotation mismatch.
 #[rstest]
@@ -740,6 +795,29 @@ x"
     r"
 x: {`some{Int, String} | `none} = `some(1)
 x"
+)]
+// The **bounded** form bounds rather than replaces, and a bound is still checked: a
+// tag the type does not name, or the wrong payload for one it does, fails exactly as
+// under the exact form.
+#[case(
+    r"
+x <: {`some{Int} | `none} = `other(1)
+x"
+)]
+#[case(
+    r#"
+x <: {`some{Int} | `none} = `some("s")
+x"#
+)]
+// The other direction of the contrast in `test_bounded_variant_annotation`: an
+// **exact** annotation makes the binder the two-arm type, so a `match` handling only
+// `` `some `` leaves `` `none `` unhandled — the same program is accepted with `<:`.
+#[case(
+    r"
+x: {`some{Int} | `none} = `some(1)
+match x:
+    case `some(v):
+        v"
 )]
 fn test_variant_type_rejections(#[case] code: &str) {
     let mut ctx = GlobalContext::default();

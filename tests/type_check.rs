@@ -2962,6 +2962,55 @@ mod annotation_kinds {
         );
     }
 
+    /// A variant's **tag set** is the same contrast one level up from record width:
+    /// the exact form binds the binder at the annotation's arms, so a value carrying
+    /// one of them is widened to all of them; the bounded form leaves the value's own
+    /// single arm — and its payload singleton — in place.
+    ///
+    /// The consequence is what a `match` must handle. Under the exact form the binder
+    /// carries `` `none ``, so a `match` on `` `some `` alone is non-exhaustive for it;
+    /// under the bounded form there is no `` `none `` to handle. The end-to-end values
+    /// are in `tests/compilation_pipeline/variants.rs`.
+    #[test]
+    fn exact_widens_a_variants_tags_and_bounded_does_not() {
+        assert_eq!(
+            infer_program(indoc! {r#"
+                x: {`some{Int} | `none} = `some(1)
+                x
+            "#})
+            .to_string(),
+            "{`none | `some{Int}}"
+        );
+        assert_eq!(
+            infer_program(indoc! {r#"
+                x <: {`some{Int} | `none} = `some(1)
+                x
+            "#})
+            .to_string(),
+            "{`some{Int@1}}",
+            "the bounded form keeps the value's own arm, payload singleton included"
+        );
+        assert!(
+            !infer_program_err(indoc! {r#"
+                x: {`some{Int} | `none} = `some(1)
+                match x:
+                    case `some(v):
+                        v
+            "#})
+            .is_empty(),
+            "an exact annotation puts `` `none `` on the binder, which no arm handles"
+        );
+        assert_eq!(
+            infer_program(indoc! {r#"
+                x <: {`some{Int} | `none} = `some(1)
+                match x:
+                    case `some(v):
+                        v
+            "#}),
+            int_lit(1)
+        );
+    }
+
     /// An unspecified position declares nothing and is completed from the
     /// initializer, so `x: _ = e` is exactly `x = e` — including when the `_` is
     /// nested inside a compound annotation.
