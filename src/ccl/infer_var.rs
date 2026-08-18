@@ -288,6 +288,131 @@ impl InferBounds {
     }
 }
 
+/// The binders in lexical scope at an inference variable's creation,
+/// innermost first — the context a bound recorded on the variable must close
+/// against. See `src/ccl/design/type-inference.md`, "Scoped inference
+/// variables: stored fragments close against a telescope".
+///
+/// A persistent cons list: extending shares the tail, so every variable
+/// minted under one scope holds the same nodes and entering a binder costs
+/// one allocation, not a copy per variable. Entries are binder
+/// [`Name`](crate::ccl::Name)s — uniquified, so membership is a name lookup;
+/// a shadowing binder is a separate entry with a distinct uid and shadows
+/// nothing here.
+#[derive(Clone, Default)]
+pub struct Telescope(Option<Rc<TelescopeNode>>);
+
+struct TelescopeNode {
+    binder: crate::ccl::Name,
+    parent: Telescope,
+}
+
+impl Telescope {
+    /// The empty scope — no binders. What test-minted and solver-internal
+    /// placeholder variables carry.
+    pub fn empty() -> Self {
+        Telescope(None)
+    }
+
+    /// This scope with `binder` entered — the innermost entry of the result.
+    pub fn extended(&self, binder: crate::ccl::Name) -> Self {
+        Telescope(Some(Rc::new(TelescopeNode {
+            binder,
+            parent: self.clone(),
+        })))
+    }
+
+    /// Whether `name` is a binder in this scope.
+    pub fn contains(&self, name: &crate::ccl::Name) -> bool {
+        let mut cur = &self.0;
+        while let Some(node) = cur {
+            if node.binder == *name {
+                return true;
+            }
+            cur = &node.parent.0;
+        }
+        false
+    }
+
+    /// The binders, innermost first.
+    pub fn iter(&self) -> impl Iterator<Item = &crate::ccl::Name> {
+        let mut cur = &self.0;
+        std::iter::from_fn(move || {
+            let node = cur.as_ref()?;
+            cur = &node.parent.0;
+            Some(&node.binder)
+        })
+    }
+}
+
+impl fmt::Debug for Telescope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// The free term variables of a bound's type not accounted for where the
+/// bound is being recorded: not in the holder's telescope, and not in either
+/// edge substitution's domain (a discharge's binders are bound by the edge —
+/// the suspension is the application that closes them).
+///
+/// This is the record-time closure check of the scoped-inference-variables
+/// design, in its milestone-1 **observation** form: source references are not
+/// excluded (identifiable in the log by name; enforcement threads the source
+/// set), and the caller logs instead of failing.
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn bound_scope_gaps(
+    telescope: &Telescope,
+    bound: &Bound,
+) -> std::collections::BTreeSet<crate::ccl::Name> {
+    let mut free = subst::type_free_vars(&bound.ty);
+    free.retain(|n| {
+        !telescope.contains(n)
+            && !bound.ty_subst.binders().any(|b| b == n)
+            && !bound.self_subst.binders().any(|b| b == n)
+    });
+    free
+}
+
+/// Log a recorded bound's closure gaps to the file `CAMBRA_TELESCOPE_LOG`
+/// names. Debug builds only, and inert unless the variable is set; one line
+/// per open name, so the file enumerates every fragment the run stored open.
+pub(crate) fn observe_bound_scope(holder: &InferVar, side: &'static str, bound: &Bound) {
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::OnceLock;
+        static LOG: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        let Some(path) =
+            LOG.get_or_init(|| std::env::var_os("CAMBRA_TELESCOPE_LOG").map(Into::into))
+        else {
+            return;
+        };
+        let gaps = bound_scope_gaps(&holder.telescope, bound);
+        if gaps.is_empty() {
+            return;
+        }
+        use std::io::Write;
+        let mut out = String::new();
+        for n in &gaps {
+            out.push_str(&format!(
+                "OPEN ?{} {side} free={n} telescope={:?} ty={}\n",
+                holder.uid, holder.telescope, bound.ty
+            ));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(out.as_bytes());
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (holder, side, bound);
+    }
+}
+
 /// A type inference variable: an unknown type the solver pins down by
 /// accumulating subtyping bounds.
 ///
@@ -302,6 +427,9 @@ pub struct InferVar {
     pub uid: InferVarId,
     /// Scope level at which the variable was minted.
     pub level: Level,
+    /// The binders in lexical scope at creation — immutable like `uid` and
+    /// `level`, and what a recorded bound must close against.
+    pub telescope: Telescope,
     /// Mutable lower/upper bound lists.
     pub bounds: RefCell<InferBounds>,
     /// Trait obligations this variable is an operand of, with the position it
@@ -377,10 +505,21 @@ impl InferVar {
     /// handle and can clear its bounds at teardown, breaking the `Rc` cycles
     /// that mutual subtyping constraints create. With no active arena (e.g.
     /// direct use in unit tests) registration is a no-op.
+    /// Scope-free: the telescope is empty. For test minting and
+    /// solver-internal placeholders with no lexical position; a variable
+    /// proxying or freshening an existing one inherits that one's telescope
+    /// via [`fresh_in`](Self::fresh_in), and emission mints through
+    /// `InferCtx::fresh`, which passes the live scope.
     pub fn fresh(level: Level) -> Rc<InferVar> {
+        Self::fresh_in(level, &Telescope::empty())
+    }
+
+    /// Mint a fresh variable carrying `telescope` as its scope.
+    pub fn fresh_in(level: Level, telescope: &Telescope) -> Rc<InferVar> {
         let var = Rc::new(InferVar {
             uid: fresh_infer_var_id(),
             level,
+            telescope: telescope.clone(),
             bounds: RefCell::new(InferBounds::default()),
             watches: RefCell::new(Vec::new()),
         });
@@ -455,6 +594,61 @@ mod tests {
             Rc::strong_count(&reader),
             1,
             "the holder no longer references the bounds it dropped"
+        );
+    }
+
+    /// A telescope is a scope path: membership sees every enclosing entry, a
+    /// shadowing binder is a separate entry, and extension shares the tail
+    /// rather than copying it.
+    #[test]
+    fn telescope_membership_and_sharing() {
+        use crate::ccl::Name;
+        let outer = Telescope::empty().extended(Name::raw("k"));
+        let inner = outer.extended(Name::raw("n"));
+        assert!(inner.contains(&Name::raw("k")));
+        assert!(inner.contains(&Name::raw("n")));
+        assert!(!outer.contains(&Name::raw("n")));
+        assert!(!inner.contains(&Name::raw("m")));
+        assert_eq!(
+            inner.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            ["n", "k"],
+            "innermost first"
+        );
+    }
+
+    /// The record-time closure check: a bound's free reference is covered by
+    /// the holder's telescope or by an edge substitution's domain, and
+    /// anything else is a gap. The gap set is what milestone 1 logs and
+    /// milestone 3 rejects.
+    #[test]
+    fn bound_scope_gaps_sees_telescope_and_edge_domains() {
+        use crate::ccl::{Lit, Name, Refinement, TypedExpr, subst::Subst};
+        use std::rc::Rc as StdRc;
+        let dep = |referenced: &str| {
+            Type::Refinement(
+                Box::new(Type::Base(BaseType::Int)),
+                Refinement::born(StdRc::new(TypedExpr::binop(
+                    TypedExpr::var(Name::elem()),
+                    crate::ccl::BinOpKind::Compare(crate::ccl::CompareKind::Equals),
+                    TypedExpr::var(Name::raw(referenced)),
+                ))),
+            )
+        };
+        let scope = Telescope::empty().extended(Name::raw("k"));
+
+        // Covered by the telescope.
+        assert!(bound_scope_gaps(&scope, &Bound::conc(dep("k"))).is_empty());
+        // Covered by the edge substitution's domain: the discharge binds it.
+        let discharged = Bound::with_subst(
+            dep("x"),
+            Subst::discharge(Name::raw("x"), TypedExpr::lit(Lit::Int(7))),
+        );
+        assert!(bound_scope_gaps(&scope, &discharged).is_empty());
+        // Covered by neither: the open fragment the design retires.
+        let gaps = bound_scope_gaps(&scope, &Bound::conc(dep("y")));
+        assert_eq!(
+            gaps.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            ["y"]
         );
     }
 

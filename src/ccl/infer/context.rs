@@ -6,9 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::TermMemo;
-use crate::ccl::infer::solver::{
-    ConstrainCache, PolyScheme, constrain_subtype, fresh_var, fun, type_level,
-};
+use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fun, type_level};
 use std::rc::Rc;
 
 use crate::ccl::infer::{InferError, LocatedInferError};
@@ -145,6 +143,11 @@ pub(super) struct InferCtx {
     /// that shared an id across a `let` RHS boundary would silently take the first
     /// level it saw.
     shared_holes: RefCell<HashMap<u32, Type>>,
+    /// The binders in lexical scope at the current emission position — what
+    /// [`Typing::fresh`] stamps on each minted variable as its telescope.
+    /// Extended and restored by `scoped` / `scoped_let` in lockstep with
+    /// [`scopes`](Self::scopes).
+    telescope: crate::ccl::infer_var::Telescope,
 }
 
 impl InferCtx {
@@ -161,6 +164,7 @@ impl InferCtx {
             lit_singletons: HashMap::new(),
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
+            telescope: crate::ccl::infer_var::Telescope::empty(),
         }
     }
 
@@ -183,8 +187,9 @@ impl InferCtx {
     /// kept, recursing to normalize nested holes.
     pub(super) fn normalize_annotation(&self, ty: &Type) -> Type {
         match ty {
-            // A `Hole` annotation means "infer this" → fresh variable.
-            Type::Hole => fresh_var(self.level),
+            // A `Hole` annotation means "infer this" → fresh variable, at
+            // the current lexical position (it carries the live telescope).
+            Type::Hole => Type::Infer(crate::ccl::InferVar::fresh_in(self.level, &self.telescope)),
             // A `SharedHole` means "infer this, and it is the same one as that":
             // the *first* occurrence of an id mints the variable and every later
             // one reuses it. That identity is the entire mechanism — it is how a
@@ -194,7 +199,9 @@ impl InferCtx {
                 .shared_holes
                 .borrow_mut()
                 .entry(*id)
-                .or_insert_with(|| fresh_var(self.level))
+                .or_insert_with(|| {
+                    Type::Infer(crate::ccl::InferVar::fresh_in(self.level, &self.telescope))
+                })
                 .clone(),
             // A bounded annotation `𝑥 <: 𝑇` means "infer this, subject to `<: 𝑇`"
             // → the same fresh variable, carrying `𝑇` as an upper bound. This is
@@ -216,7 +223,7 @@ impl InferCtx {
                 )
             }
             Type::BoundedHole(bound) => {
-                let v = fresh_var(self.level);
+                let v = Type::Infer(crate::ccl::InferVar::fresh_in(self.level, &self.telescope));
                 let bound = self.normalize_annotation(bound);
                 // A **local** cache, not `self.cache`: this method takes `&self`,
                 // and the memo exists only to break recursion on cyclic bounds.
@@ -317,7 +324,7 @@ impl Typing for InferCtx {
     }
 
     fn fresh(&mut self) -> Type {
-        fresh_var(self.level)
+        Type::Infer(crate::ccl::InferVar::fresh_in(self.level, &self.telescope))
     }
 
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
@@ -388,7 +395,10 @@ impl Typing for InferCtx {
                 scheme: PolyScheme::poly(self.level, ty.clone()),
             },
         );
+        let extended = self.telescope.extended(name.clone());
+        let saved = std::mem::replace(&mut self.telescope, extended);
         let r = f(self);
+        self.telescope = saved;
         self.scopes.pop_scope();
         r
     }
@@ -436,7 +446,10 @@ impl Typing for InferCtx {
         };
         self.scopes.push_scope();
         self.scopes.bind(name, Binding { scheme });
+        let extended = self.telescope.extended(name.clone());
+        let saved = std::mem::replace(&mut self.telescope, extended);
         let r = f(self);
+        self.telescope = saved;
         self.scopes.pop_scope();
         r
     }
@@ -576,13 +589,42 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &applied else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        v.bounds
-            .borrow_mut()
-            .lower_mut()
-            .push(crate::ccl::Bound::with_subst(
-                result,
-                crate::ccl::subst::Subst::discharge(&x, argument.clone_preserving_ids()),
-            ));
+        let bound = crate::ccl::Bound::with_subst(
+            result,
+            crate::ccl::subst::Subst::discharge(&x, argument.clone_preserving_ids()),
+        );
+        crate::ccl::infer_var::observe_bound_scope(v, "lower", &bound);
+        v.bounds.borrow_mut().lower_mut().push(bound);
         Ok(applied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::Name;
+    use crate::ccl::infer::typing::Typing;
+    use crate::ccl::provenance::NodeId;
+
+    /// A variable minted inside `scoped` carries the binder in its telescope;
+    /// one minted outside does not — the milestone-1 threading, end to end
+    /// through the emission context.
+    #[test]
+    fn fresh_variables_carry_the_live_telescope() {
+        let mut ctx = InferCtx::new(HashMap::new(), NodeId::fresh());
+        let k = Name::raw("k");
+        let n = Name::raw("n");
+        let inside = ctx.scoped(&k, &Type::Hole, |c| {
+            c.scoped(&n, &Type::Hole, |c| c.fresh())
+        });
+        let outside = ctx.fresh();
+        let (Type::Infer(iv), Type::Infer(ov)) = (&inside, &outside) else {
+            panic!("fresh yields Type::Infer");
+        };
+        assert!(iv.telescope.contains(&k) && iv.telescope.contains(&n));
+        assert!(
+            !ov.telescope.contains(&k),
+            "scoped restores the telescope on exit"
+        );
     }
 }
