@@ -1070,6 +1070,101 @@ with explicit applications there is nothing left to license, and two distinct
 discharges meeting at one variable (the O1/O4 corner) become two points of one
 family — representable, where today they are a panic tripwire.
 
+#### Where the conversions run
+
+A type is **closed** — references to its own arrows stored as indices — from
+construction on; a solver fragment is **open** — free references stored as
+telescope names. An index counts the arrows crossed from their codomain side
+between the reference and its binder, named and unnamed frames alike, so the
+coordinate survives `Type::without_pi_names`. Four sites convert between the
+coordinates; one closing function and one opening function own the
+conversions, and the sites below are their only callers:
+
+- **Construction closes.** `Type::pi` — and every site assembling a
+  `Fun { name: Some(_), .. }` — abstracts its codomain: a free reference to
+  the binder becomes an index. A codomain that is a bare variable has nothing
+  to close; emission's `pi(x, D, ?c)` is that case, and the refinements that later
+  accumulate on `?c` reference `x` by name against their telescopes.
+- **Refinement landing closes.** The compact and key walks close a refinement against
+  the walk's frame stack as it lands in the view — the same two arms that
+  force the edge substitutions into it (`force_refinement`), one conversion
+  after the other. Landing is where it must happen: `CompactType::merge`
+  dedups refinements while bounds fold, before any arrow is assembled, and a
+  closed cast meeting a live emitted arrow at one variable puts an
+  index-spelled claim and a name-spelled claim at one position — one
+  coordinate has to win before the merge compares them. Assembly
+  (`coalesce_compact_go`) then consumes closed refinements and rebuilds the arrow
+  around them; the walk mirrors `Fun` frames one-to-one, so a landed index is
+  already relative to the assembled structure.
+- **Descent opens.** Walking under a binder converts that binder's indices
+  back to a name. The Fun/Fun codomain edge opens each side at its own
+  binder name and carries the correspondence as a discharge at a variable
+  (`[k ↦ x]` read as an application — see
+  [Discharge is application](#discharge-is-application)), so a fragment
+  recorded on an inner variable references the binder by name, closed against
+  that variable's telescope. `normalize_annotation` extends the emission
+  telescope with each Pi binder it descends past, so the variables it mints
+  inside a dependent annotation carry the binder in scope — this is what
+  closes the group-by traveler class, whose fragments today land on variables
+  whose telescopes never saw `__gb_k`.
+- **Application opens at the argument.** Applying a closed family — the
+  dependent-application discharge, β at coalesce — replaces the binder's
+  indices with the argument term. Opening at a name and opening at an
+  argument are one operation with a different replacement.
+
+Mid-solve fragments therefore stay name-referenced — the telescope
+coordinate — and intact closed types (a lowered dependent cast recorded
+whole as a bound) stay index-referenced. Each identity site compares like
+with like because a fragment's coordinate is fixed by which side of a
+construction boundary it sits on, not by when it arrives: two α-variant
+closed casts meeting at one variable are structurally identical, and two
+open fragments meeting at one variable reference the one binder of that
+variable's position, agreed through the edges' discharges.
+
+#### Freshening and `SpecKey`, worked
+
+The keyed-map type a group-by lowers is the exercising case. A generalized
+definition holding one, stored at level `L` with its refinements closed (`#n` is
+an index; the display spelling rides as metadata):
+
+    (k: ?K) |=> ((i: {?D | __elem |> f == #0}) |=> ?V)
+
+`#0` is the refinement's reference to `k`: the predicate sits in the inner arrow's
+domain, where only the outer binder is in scope (a binder scopes over its
+codomain, not its domain), so the innermost in-scope frame is the outer
+arrow's. The same reference from the inner codomain would be `#1`.
+
+**Freshening copies indices verbatim, and that is the whole interaction.**
+`freshen_above` copies a `Fun`'s name slot structurally, and
+`freshen_refinement_predicate` rewrites only a predicate's *type slots*
+(through `freshen_expr_type_slots`); term structure, `#0` included, is
+untouched. An index is anchored to an arrow inside the same type being
+copied, so the copy cannot dangle — the coordinate is fragment-relative and
+the fragment travels whole. Free names in a predicate — the definition's
+captured environment, level ≤ `L` — also copy verbatim and stay correct:
+every use of the definition sits lexically inside those binders' scope, and
+all clones share the one captured binder.
+
+**`SpecKey` compares the closed spelling across uses.** Two uses whose
+lowered annotations are α-variant — two textually identical group-bys, each
+minting its own binder uids — spell identically once closed, so their keys
+agree and the memo shares the specialization. A refinement referencing a *free*
+binder keeps its uniquified name in the key, so two uses under distinct
+enclosing binders key apart. Fiber distinctions — one family discharged at
+two arguments — ride the σ-forced predicates: `key_go` forces each edge's
+substitution into a refinement before it lands in the key, so a use's argument
+term is in the key itself.
+
+**The pin re-bases by opening, not by rewriting indices.** `specialize_use`
+pins a clone to the use's resolved type. The resolved side is closed; the
+clone's emitted arrows are live (`pi(x, D, ?c)` with refinements behind
+variables). The pin's Fun/Fun edges open the closed side at the clone's
+binder names as fragments cross — the ordinary descent conversion above —
+after which every fragment landing on a clone variable is name-referenced
+against that variable's telescope. No index is ever re-based: an index
+converts to a name at a binder crossing or to a term at an application, and
+otherwise travels untouched.
+
 #### What this makes derivable
 
 - **Identity sites are sound by construction.** Refinements on one variable share
@@ -1123,8 +1218,10 @@ family — representable, where today they are a panic tripwire.
    `InferCtx::scopes`; the record-time check logs instead of failing.
    Behaviour-neutral; the log enumerates every fragment the current system
    stores open.
-2. **Convert and mediate.** In-telescope references stored as indices;
-   discharge edges read as applications; the `let`-closing re-address.
+2. **Convert and mediate.** The index coordinate for bound references and
+   its conversions at the four sites of
+   [Where the conversions run](#where-the-conversions-run); discharge edges
+   read as applications; the `let`-closing re-address.
 3. **Enforce.** The record-time check becomes an internal error; the
    observation log must be empty first.
 4. **Delete.** The name-keyed paths: the Fun/Fun correspondence,
@@ -1146,10 +1243,6 @@ new machinery is a finding about the design.
   bound-in-fragment reference one level down — the same α-sensitivity in
   principle, unobserved in practice. Whether abstraction covers term binders
   inside predicates or they stay named is undecided.
-- **Freshening.** A specialization clone's refinements keep definition-site
-  indices; `freshen_expr_type_slots` must copy them verbatim, and the pin to
-  the use's live type re-bases at the boundary. The interaction needs a
-  worked example before milestone 2.
 
 ## 4.6 Data vs compute functions
 
