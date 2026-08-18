@@ -629,9 +629,9 @@ for the unit type `{}` (§6.6).
 
 A literal's **type says which literal it is**, not merely its base: `5` has type
 `{Int where _ == 5}` (§6.4), the refinement pinning that one value. So `x = 5`
-gives `x` the type `5`, and it keeps that unless a binder discards it:
+gives `x` the type `Int@5`, and it keeps that unless a binder discards it:
 `x: Int = 5` binds `x` at `Int` (an exact annotation *is* the binder's type),
-while `x <: Int = 5` leaves `x` at `5` (a bounded annotation only has to admit
+while `x <: Int = 5` leaves `x` at `Int@5` (a bounded annotation only has to admit
 the value) — see
 [Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded). Any
 operation that computes a *new* value drops it, since it is a fact about one
@@ -1699,14 +1699,14 @@ more often than it sounds, because a CHL type carries more than a base:
 - **Width.** `x: {a: Int} = (a=1, b=2)` binds `x` at `{a: Int}`, so
   `x.b` is an error — the annotation is what discards the field.
   `x <: {a: Int} = (a=1, b=2)` binds `x` at the record's own type, which
-  still has both fields, so `x.b` is `2`.
+  still has both fields, so `x.b` is `Int@2`.
 - **Literal singletons** (§3.1). `i: Int = 0` binds `i` at `Int`;
-  `i <: Int = 0` leaves it at `0`. Only the second still carries the
+  `i <: Int = 0` leaves it at `Int@0`. Only the second still carries the
   fact a totality proof needs, so an exact annotation on an index
   discards the proof that a lookup is in range.
 
 Note that the second example annotates a bare `Int` and the two forms
-still differ. The annotation's own shape is not what decides it: `0` is
+still differ. The annotation's own shape is not what decides it: `Int@0` is
 a strict subtype of `Int`, so there is something to discard. What makes
 the forms coincide is the *value* knowing nothing beyond what the
 annotation says.
@@ -2129,7 +2129,7 @@ one is a `Mut(…)`, exactly, because that is the binder's type (§6.1).
 
 ```python
 cnt := 0                       # loop accumulator; value type and domain inferred
-cnt: Mut(Int) := 0             # value type spelled exactly, so `cnt` is `Int`, not `0`
+cnt: Mut(Int) := 0             # value type spelled exactly, so `cnt` is `Int`, not `Int@0`
 balance: Mut(Int, Txn) := 0    # transactional mutable variable over the commit order
 ```
 
