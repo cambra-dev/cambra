@@ -191,10 +191,11 @@ fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] exp
 // type system gave the `Case`; exactly one gated arm is non-empty, so consuming
 // the union (here via `sum`) sees just that arm's elements.
 //
-// The union's tagged-`Variant` domain reconciles against the arms' joined data
-// function by `is_index_partition_of`: every leg is that one domain under its own
-// gate. Arms at *distinct* domains have no join to subtype against and are rejected
-// at inference, so the fan-out is only built at one domain.
+// The legs are partial maps over that one domain, kept disjoint by the gates, so
+// the fan-out assembles them with `DisjointJoin` and lands on the domain directly
+// — no coproduct claim for a consumer to undo. Arms at distinct domains have no
+// join to subtype against and are rejected at inference, so the fan-out is only
+// built at one domain.
 // ---------------------------------------------------------------------------
 
 #[rstest]
@@ -227,10 +228,8 @@ sum([10, 20] if n == 1 else [1, 2])",
 )]
 // `elif` over collections — first matching arm's collection wins. **Three legs over
 // one fiber**: the three arms all have domain `[0, 1)`, so the fan-out is a
-// three-leg `Variant` whose payloads are all that one domain under different gates.
-// This is exactly what `is_index_partition_of` must accept — a positional
-// leg↔domain bijection would reject it — and what an `if`/`elif` accumulator write
-// produces.
+// three-leg `DisjointJoin` over that one domain, each leg restricted by its own
+// gate. This is the shape an `if`/`elif` accumulator write produces.
 #[case(
     r"
 n: Int = 1
