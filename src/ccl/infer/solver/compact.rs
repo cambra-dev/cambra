@@ -311,7 +311,17 @@ impl CompactType {
     ///   *union* keys.
     /// - `fun`: recursively merge each side, flipping polarity on the
     ///   domain.
+    ///
+    /// A side that [`imposes_nothing`](Self::imposes_nothing) is the identity for
+    /// the whole merge, not just component-wise: see that method for why the
+    /// refinement set makes this necessary.
     pub(super) fn merge(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
+        if lhs.imposes_nothing() {
+            return rhs.absorbing_vars_of(lhs);
+        }
+        if rhs.imposes_nothing() {
+            return lhs.absorbing_vars_of(rhs);
+        }
         let mut vars = lhs.vars;
         vars.extend(rhs.vars);
         let mut atoms = lhs.atoms;
@@ -357,6 +367,46 @@ impl CompactType {
             refinements,
             history_slot,
         }
+    }
+
+    /// Whether this contribution says nothing about the position at all — an
+    /// unresolved variable and nothing else.
+    ///
+    /// Each *shape* component already has a `None` that acts as the merge identity
+    /// ("no record component here imposes nothing"). The refinement set has no such
+    /// sentinel: it is a `Vec`, so "no refinement is known of this" and "this is
+    /// known to carry no refinement" are the same empty value. Under the positive
+    /// intersection the second reading wins and erases the other side's refinements
+    /// — so a bare variable bound, which knows nothing, would silently discard the
+    /// singleton a sibling bound established. Recognising the whole contribution as
+    /// the identity is what keeps the two readings apart.
+    ///
+    /// The variables themselves are still carried across by
+    /// [`absorbing_vars_of`](Self::absorbing_vars_of); they are this
+    /// contribution's only content, and they join at every polarity.
+    fn imposes_nothing(&self) -> bool {
+        let CompactType {
+            vars: _,
+            atoms,
+            rec,
+            var,
+            fun,
+            refinements,
+            history_slot,
+        } = self;
+        atoms.is_empty()
+            && rec.is_none()
+            && var.is_none()
+            && fun.is_none()
+            && refinements.is_empty()
+            && history_slot.is_none()
+    }
+
+    /// Take the variable identities of a contribution that
+    /// [`imposes_nothing`](Self::imposes_nothing), leaving everything else as-is.
+    fn absorbing_vars_of(mut self, identity: CompactType) -> CompactType {
+        self.vars.extend(identity.vars);
+        self
     }
 
     /// Merge two refinement sets. The set-op tracks

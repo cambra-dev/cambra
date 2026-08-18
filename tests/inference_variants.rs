@@ -515,16 +515,27 @@ fn ignored_arm_payload_still_takes_its_argument_type() {
     cambra::ccl::infer::check_fully_typed(&full).expect("fully typed");
 }
 
-/// An arm that *reads* its binder needs no pin: the read is an upper bound, so
-/// the variable is constrained and coalesces from its use.
+/// An arm whose body **is** its binder is pinned to the type it flows into, not
+/// to `Unit`.
 ///
-/// Here the use is "be the arm's result", and the result joins with the reachable
-/// arm's — so the unreachable arm's binder comes out as the singleton `1` that
-/// arm produced. The assertion is that specific type rather than merely "not
-/// `Unit`", since what is being pinned down is *where* a read binder gets its
-/// type from.
+/// The binder's only use is "be the arm's result", which records one subtyping
+/// upper bound: the arms' result join. That join is `Int@1` — what the reachable
+/// arm produced — so the unreachable arm's payload is `Int@1` too. The assertion
+/// is that specific type rather than merely "not `Unit`", since what is being
+/// pinned down is *where* a flowing binder gets its type from.
+///
+/// `Unit` here is not a weaker answer, it is an inconsistent one: the payload is
+/// the arm's result, so `Unit` enters the arms' join and collides with `Int`,
+/// rejecting a program that type-checks. That is why this arm of `payload_pin`
+/// exists at all.
+///
+/// The singleton is the second thing under test. The pin's bound arrives beside
+/// the scrutinee's own per-tag variable, whose empty refinement set would absorb
+/// `Int@1`'s down to a bare `Int` under the positive intersection — so this also
+/// covers `CompactType::imposes_nothing`, the only place a refined pin makes that
+/// identity observable.
 #[test]
-fn read_arm_payload_is_not_pinned() {
+fn read_arm_payload_is_pinned_to_where_it_flows() {
     let body = TypedExpr::new(TypedExprNode::Case {
         scrutinee: Some(Box::new(var("x"))),
         branches: vec![arm("a", "v", None, var("v")), arm("b", "w", None, var("w"))],
@@ -537,14 +548,18 @@ fn read_arm_payload_is_not_pinned() {
     cambra::ccl::infer::check_fully_typed(&full).expect("fully typed");
 }
 
-/// What an unreachable arm's payload is pinned to when its body **reads** the
-/// binder.
+/// What an unreachable arm's payload is pinned to when an **operator** reads the
+/// binder — the third of the pin's three cases.
 ///
 /// [`unobservable_arm_payload_resolves_everywhere`] covers the body that ignores
 /// its binder: nothing observes the payload, so `Unit` carries no information and
-/// is the honest choice. A body that reads it observes it, and states what it
-/// needs as a trait obligation — so `Unit` would contradict the read. The pin
-/// takes a type the requirements still accept instead.
+/// is the honest choice. [`read_arm_payload_is_pinned_to_where_it_flows`] covers
+/// the body that *is* the binder, where the payload's requirement is a subtyping
+/// upper bound. Here the read states its requirement as a trait obligation
+/// instead — so `Unit` would contradict it, and the pin takes a type the
+/// requirements still accept. The upper bounds an operand records are the
+/// operator's own requirement variables, which resolve to nothing concrete, which
+/// is why the flow case does not claim these payloads first.
 ///
 /// The cases below are chosen to separate the two halves of that choice:
 ///

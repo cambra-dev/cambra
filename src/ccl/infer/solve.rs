@@ -665,18 +665,41 @@ fn with_shadows<R>(
 /// Width subtyping gives an arm naming a tag the scrutinee cannot carry no lower
 /// bound: nothing determines the payload, and nothing can, so it would reach the
 /// post-inference wall unresolved. The arm is ordinary code rather than an error
-/// (see `src/ccl/design/type-inference.md`, "An unobservable arm payload defaults
-/// to `Unit`"), so a type is chosen here instead.
+/// (see `src/ccl/design/type-inference.md`, "An unobservable arm payload is
+/// pinned to what its uses require"), so a type is chosen here instead.
 ///
-/// **Which** type depends on whether the arm's body reads the binder:
+/// **Which** type depends on what the arm's body does with the binder. In every
+/// case the rule is the same — pin to a type the payload's *requirements* accept —
+/// and the three arms below are the three ways a requirement gets recorded:
 ///
-/// - **It does not.** Nothing observes the payload either, so `Unit` — carrying no
+/// - **Nothing reads it.** No requirement at all, so `Unit` — carrying no
 ///   information — is the choice.
-/// - **It does.** The read states what it needs of the payload, as a trait
+/// - **It flows somewhere.** The binder occurring in a position records a
+///   subtyping upper bound, `payload <: U`. That is a requirement as surely as a
+///   trait obligation is, and when `U` resolves to a concrete type it is the
+///   *strongest* one available: pinning anything else contradicts the flow. The
+///   commonest shape is the body that simply **is** the binder (`` `b(w) → w ``),
+///   where `U` is the arms' result join — `Unit` there does not merely lose
+///   information, it enters that join and collides with the reachable arm's type.
+/// - **It is read by an operator.** The read states what it needs as a trait
 ///   obligation (`v + 1` records `Addable`), and `Unit` would contradict it: the
 ///   pin would reject the very read that makes the payload observable. So the
 ///   obligations choose, from the types their surviving instances still accept
 ///   ([`TraitObligation::accepted_at`]).
+///
+/// The two recorded forms do not compete for the same payload — an operand's
+/// upper bound is the operator's own requirement variable, not a concrete type —
+/// so the concrete flow target is taken first and the obligations decide when
+/// there is none.
+///
+/// **Each upper bound is resolved as its own position**, by a fresh
+/// [`resolve_var_type`] entered at that variable, never as a hop along this
+/// payload's bound chain. The distinction is the whole of `fallback_allowed`
+/// (`src/ccl/infer/solver/compact.rs`): reading `U` *through* the payload would
+/// collapse `U`'s quantifier as a side effect of resolving the payload, and hand
+/// the result to every other variable on the chain. Deciding it here instead is
+/// one deliberate choice, at the one variable whose quantifier is being
+/// eliminated.
 ///
 /// A read need not narrow the choice to one — `v + v` leaves every `Addable` row
 /// standing (`Int`, `UInt`, `String`) — and **any of them is as good as any other
@@ -713,7 +736,7 @@ fn pin_unobservable_arm_payload(p: &Pattern) {
     if !matches!(resolve_var_type(&p.binding.ty), Ok(Type::Infer(_))) {
         return;
     }
-    let chosen = Type::Base(payload_default(&p.binding.ty));
+    let chosen = payload_pin(&p.binding.ty);
     let mut cache = ConstrainCache::new();
     let pinned = constrain_subtype(&chosen, &p.binding.ty, &mut cache)
         .and_then(|()| constrain_subtype(&p.binding.ty, &chosen, &mut cache));
@@ -726,15 +749,51 @@ fn pin_unobservable_arm_payload(p: &Pattern) {
     );
 }
 
-/// The type to pin an unreachable arm's payload to: `Unit` when nothing reads it,
-/// otherwise one the reads' requirements accept. See
+/// The type to pin an unreachable arm's payload to: the concrete type it is
+/// required to flow into, else one its operator reads accept, else `Unit`. See
 /// [`pin_unobservable_arm_payload`], which is the whole rationale.
-fn payload_default(payload: &Type) -> crate::ccl::BaseType {
+fn payload_pin(payload: &Type) -> Type {
+    let Type::Infer(v) = payload else {
+        return Type::Base(crate::ccl::BaseType::Unit);
+    };
+    if let Some(flows_into) = payload_flow_target(v) {
+        return flows_into;
+    }
+    Type::Base(payload_trait_default(v))
+}
+
+/// The concrete type an unreachable payload is required to flow into, if its
+/// upper bounds name one.
+///
+/// Each bound is resolved on its own — [`resolve_var_type`] enters the walk at
+/// that variable, so the collapse that materializes it happens at *its* position
+/// rather than as a hop along the payload's chain (see
+/// [`pin_unobservable_arm_payload`]). A bound that resolves to another variable
+/// says nothing yet and is skipped; an operand's upper bound is exactly that
+/// shape, which is why the operator case falls through to the obligations.
+///
+/// The first concrete answer wins. Several distinct ones would be a meet the type
+/// language cannot spell, and none arises: a payload has at most one upper bound
+/// resolving concretely, since the flows that record more than one are operator
+/// operands, whose bounds are requirement variables.
+fn payload_flow_target(v: &crate::ccl::infer_var::InferVar) -> Option<Type> {
+    // Cloned out of the `RefCell` before resolving: the walk reads bound lists
+    // across the graph, and the pin's `constrain_subtype` will take them mutably.
+    let upper = std::rc::Rc::clone(v.bounds.borrow().upper());
+    upper.iter().find_map(|b| {
+        let ty = b.render_subst().apply_type(&b.ty);
+        match resolve_var_type(&ty) {
+            Ok(t) if !matches!(t, Type::Infer(_)) => Some(t),
+            _ => None,
+        }
+    })
+}
+
+/// The type an unreachable payload's *operator* reads accept — the trait half of
+/// [`payload_pin`].
+fn payload_trait_default(v: &crate::ccl::infer_var::InferVar) -> crate::ccl::BaseType {
     use crate::ccl::BaseType;
 
-    let Type::Infer(v) = payload else {
-        return BaseType::Unit;
-    };
     let watches = v.watches.borrow();
     let Some(((first, pos), rest)) = watches.split_first() else {
         return BaseType::Unit;
@@ -1185,17 +1244,23 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             scrutinee,
             branches,
         } => {
-            if let Some(s) = scrutinee {
-                coalesce_node(s, level, ctx);
-            }
             // Before any occurrence of an arm's payload variable is read: an arm
-            // nothing reaches and whose body ignores its binder has no bound at
-            // all, and needs one recorded on the *variable* to resolve
-            // consistently everywhere it appears.
+            // nothing reaches has no bound that determines its payload, and needs
+            // one recorded on the *variable* to resolve consistently everywhere it
+            // appears. The scrutinee is such an occurrence — its type is the
+            // variant these payload variables sit inside — so the pin precedes its
+            // walk, not just the branches'. Pinning after it would leave the
+            // scrutinee's reading of the payload stale, which is the ordering
+            // invariant `assert_reads_stable` enforces. The pin reads only the
+            // constraint graph, which emission has already finished building, so
+            // nothing here depends on the scrutinee having been coalesced.
             for b in branches.iter() {
                 if let Some(p) = &b.pattern {
                     pin_unobservable_arm_payload(p);
                 }
+            }
+            if let Some(s) = scrutinee {
+                coalesce_node(s, level, ctx);
             }
             for b in branches.iter_mut() {
                 // A pattern's payload binding scopes the branch's guard and

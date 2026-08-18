@@ -1484,11 +1484,22 @@ For each `Branch { guard, body }`: the guard flows one-way into `Type::Base(Base
 
 The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [Data vs compute functions](#46-data-vs-compute-functions); the strict-equality behavior above is current until that lands.
 
-#### An unobservable arm payload defaults to `Unit`
+#### An unobservable arm payload is pinned to what its uses require
 
-An arm naming a tag the scrutinee cannot carry receives no lower bound, and if its body ignores its binder it receives no upper bound either — nothing determines that payload's type and nothing can observe it. Such an arm is ordinary code rather than an error (a `match` written for the whole `Option` over a scrutinee inference has pinned to one tag), so inference completes by choosing `Unit`, the type that carries no information.
+An arm naming a tag the scrutinee cannot carry receives no lower bound — nothing determines that payload's type, and nothing can. Such an arm is ordinary code rather than an error (a `match` written for the whole `Option` over a scrutinee inference has pinned to one tag), so inference chooses a type for it rather than reaching the post-inference wall with an unresolved variable.
 
-The choice is recorded on the *variable*, not in the binder slot, so every occurrence of it agrees — the slot, the scrutinee's expected variant, and hence an enclosing lambda's parameter type. Unreachable arms are **kept**, not pruned: an arm for a tag the scrutinee cannot carry projects an empty restriction and contributes nothing, while pruning would narrow the arm set relative to the enclosing lambda's declared domain. `pin_unobservable_arm_payload` in `src/ccl/infer/solve.rs` holds the mechanism, including the two ordering constraints that place it inside the coalesce walk.
+The rule is **pin to a type the payload's requirements accept**, and a requirement reaches the payload in one of two recorded forms:
+
+- A **subtyping upper bound**, `payload <: 𝑈`, from the binder occurring in a position. When `𝑈` resolves concretely it is the strongest requirement available, and pinning past it contradicts the flow. The commonest shape is the body that *is* the binder (`` `b(w) → w ``), where `𝑈` is the arms' result join: choosing `Unit` there does not merely lose information, it enters that join and collides with the reachable arm's type.
+- A **trait obligation**, from an operator read (`w + 1` records `Addable`). The obligations choose from the types their surviving instances still accept.
+
+With neither, nothing observes the payload at all and `Unit` — the type that carries no information — is the choice. The two forms do not compete for one payload: an operand's upper bound is the operator's own requirement variable rather than a concrete type.
+
+Each upper bound is resolved **as its own position**, by a walk entered at that variable rather than as a hop along the payload's bound chain — the distinction [the collapse happens at the position](#the-collapse-happens-at-the-position) draws. Reading it through the payload would collapse its quantifier as a side effect and hand the result to every other variable on the chain; deciding it in the pin is one deliberate choice, at the one variable whose quantifier is being eliminated.
+
+The choice is recorded on the *variable*, not in the binder slot, so every occurrence of it agrees — the slot, the scrutinee's expected variant, and hence an enclosing lambda's parameter type. That is also why the pin precedes the scrutinee's own walk and not merely the branches': the scrutinee's type is the variant these payload variables sit inside, so a pin placed after it leaves that reading stale. Unreachable arms are **kept**, not pruned: an arm for a tag the scrutinee cannot carry projects an empty restriction and contributes nothing, while pruning would narrow the arm set relative to the enclosing lambda's declared domain. `pin_unobservable_arm_payload` in `src/ccl/infer/solve.rs` holds the mechanism, including the ordering constraints that place it inside the coalesce walk.
+
+A refined pin is what makes the compaction identity below load-bearing: a bare variable bound contributes an empty refinement set, and an empty set is absorbing under the positive intersection, so `Int@1` arriving from the pin would be erased by the scrutinee's own per-tag variable. `CompactType::imposes_nothing` names the contribution that says nothing at all and makes it the merge identity, which is what every *shape* component already gets from its `None`.
 
 ### Record literals and field access
 
