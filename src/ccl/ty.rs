@@ -1038,10 +1038,34 @@ impl Type {
 
     /// Helper for creating a dependent (Pi) **compute** function type
     /// `(name: domain) ⇒ codomain`.
+    ///
+    /// Construction closes: free references to `name` in `codomain` become
+    /// de Bruijn indices ([`crate::ccl::subst::close_pi_binder`]), so the
+    /// constructed arrow never carries a free name for its own binder and two
+    /// α-variant arrows are structurally identical. See
+    /// `src/ccl/design/type-inference.md`, "Where the conversions run".
     pub fn pi(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
+        Type::pi_kinded(name, domain, codomain, FunKind::Compute)
+    }
+
+    /// [`Type::pi`] at an explicit kind, for a rebuild that carries the arrow kind
+    /// it is replacing: a group-by partition function is a dependent *collection*,
+    /// so its Pi stays `⤇` instead of flattening to the capability arrow.
+    ///
+    /// Closes its codomain exactly as [`Type::pi`] does — the kind is the only
+    /// difference, and reaching for a bare [`Type::Fun`] literal to get it is what
+    /// leaves a free binder name in a stored fragment.
+    pub fn pi_kinded(
+        name: impl Into<crate::ccl::Name>,
+        domain: Self,
+        codomain: Self,
+        kind: FunKind,
+    ) -> Self {
+        let name = name.into();
+        let codomain = crate::ccl::subst::close_pi_binder(&name, &codomain);
         Type::Fun {
-            name: Some(name.into()),
-            kind: FunKind::Compute,
+            name: Some(name),
+            kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
@@ -1146,12 +1170,22 @@ impl Type {
     /// the safe default at a site with no function type to copy from.
     pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
-            Type::Fun { name, kind, .. } => Type::Fun {
-                name: name.clone(),
-                kind: kind.clone(),
-                domain: Box::new(domain),
-                codomain: Box::new(codomain),
-            },
+            Type::Fun { name, kind, .. } => {
+                // Construction closes (see [`Type::pi`]): a rebuild computes
+                // its codomain from node types, which reference the binder by
+                // name. Idempotent on a codomain extracted from a closed
+                // arrow — its references are already indices.
+                let codomain = match name {
+                    Some(b) => crate::ccl::subst::close_pi_binder(b, &codomain),
+                    None => codomain,
+                };
+                Type::Fun {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    domain: Box::new(domain),
+                    codomain: Box::new(codomain),
+                }
+            }
             _ => Type::fun(domain, codomain),
         }
     }

@@ -351,16 +351,30 @@ impl Typing for CheckCtx {
         // Re-run the discharge on the resolved codomain so the reconstructed
         // type matches the recorded (discharged) one. A named Pi discharges its
         // binder to the argument; an ordinary function's codomain is unchanged.
+        // The binder's references are indices when the arrow is closed (the
+        // usual case — application opens the frame at the argument, β) and
+        // free names when a name-coordinate form survived; both discharge to
+        // the same argument term.
         let result = match fn_ty.peel_refinements() {
-            // Discharge only when the Pi binder is actually free in the
-            // codomain's refinement predicates; otherwise the argument clone
-            // would feed a no-op substitution.
-            Type::Fun { name: Some(b), .. }
-                if crate::ccl::subst::type_free_vars(&codomain).contains(b) =>
-            {
-                // A discharge template; see the `Let` rule above.
-                crate::ccl::subst::Subst::discharge(b, argument.clone_preserving_ids())
-                    .apply_type(&codomain)
+            Type::Fun { name: Some(b), .. } => {
+                // Both clones are discharge *templates*; see the `Let` rule
+                // above for why they preserve ids.
+                let codomain = if crate::ccl::subst::references_outermost_frame(&codomain) {
+                    crate::ccl::subst::open_pi_binder(
+                        &crate::ccl::subst::Mapping::Discharge(Box::new(
+                            argument.clone_preserving_ids(),
+                        )),
+                        &codomain,
+                    )
+                } else {
+                    codomain
+                };
+                if crate::ccl::subst::type_free_vars(&codomain).contains(b) {
+                    crate::ccl::subst::Subst::discharge(b, argument.clone_preserving_ids())
+                        .apply_type(&codomain)
+                } else {
+                    codomain
+                }
             }
             _ => codomain,
         };

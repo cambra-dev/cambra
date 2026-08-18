@@ -93,8 +93,8 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::subst::Subst;
-use crate::ccl::{FieldKey, HistoryKind, InferVarId, Refinement, Type};
+use crate::ccl::subst::{ClaimCloser, Subst};
+use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
 use super::compact::{AtomKey, KindMerge};
 
@@ -308,20 +308,31 @@ struct KeyCtx {
     /// key `compact_type`'s cycle guard uses, and for the same reason: a variable
     /// legitimately appears at both polarities in one type.
     visiting: HashSet<(InferVarId, bool)>,
-    /// Completed keys per `(variable, polarity)`, for variables reached under the
-    /// identity substitution.
+    /// Completed keys per `(variable, polarity, enclosing frames)`, for
+    /// variables reached under the identity substitution.
     ///
-    /// Sound because a variable's directed key depends only on the variable and
-    /// the direction — not on the position it was reached from. A variable reached
-    /// under a *non-identity* substitution bypasses the memo: the substitution
+    /// Sound because a variable's directed key depends only on the variable, the
+    /// direction, and the frames the refinement-closing runs against — not otherwise
+    /// on the position it was reached from. A variable reached under a
+    /// *non-identity* substitution bypasses the memo: the substitution
     /// rewrites the predicates the walk materializes, so that result *is*
     /// position-dependent.
-    memo: HashMap<(InferVarId, bool), KeyView>,
+    memo: HashMap<(InferVarId, bool, Vec<Option<Name>>), KeyView>,
     /// How many cycle back-edges the walk has dropped. A key computed while a
     /// truncation occurred inside it is *incomplete* — it is missing whatever the
     /// back-edge would have contributed — so it must not be memoized. Comparing
     /// the counter before and after a variable's expansion is what detects that.
     truncations: usize,
+    /// The `Fun` frames the walk is inside of, innermost last (`None` for an
+    /// unnamed arrow — it still counts as a crossing), exactly as
+    /// `compact_go` threads them (the sibling-walk contract).
+    frames: Vec<Option<Name>>,
+    /// Closes each refinement against [`frames`](KeyCtx::frames) as it lands in
+    /// the view (`src/ccl/design/type-inference.md`, "Where the conversions
+    /// run"), so a key's refinement set is index-spelled — two α-variant
+    /// instantiations key together, which is what lets the memo share their
+    /// specialization.
+    closer: ClaimCloser,
 }
 
 /// The specialization key of `ty`: its two directed reads (see the module docs).
@@ -335,6 +346,8 @@ pub fn spec_key(ty: &Type) -> SpecKey {
         visiting: HashSet::new(),
         memo: HashMap::new(),
         truncations: 0,
+        frames: Vec::new(),
+        closer: ClaimCloser::default(),
     };
     // One walk-wide `ctx` for both reads: its memo is keyed by polarity, so the
     // two reads share it without contaminating each other.
@@ -378,6 +391,9 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Refinement(inner, r) => {
             let mut k = key_go(inner, pol, subst_acc, ctx);
             let r = subst_acc.force_refinement(r);
+            // Landing closes, as in `compact_go`: the key stores the
+            // index-spelled claim, so α-variant instantiations key together.
+            let r = ctx.closer.close(&ctx.frames, &r);
             if !k.refinements.contains(&r) {
                 k.refinements.push(r);
             }
@@ -399,7 +415,11 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 Some(b) => subst_acc.shadow(b),
                 None => subst_acc.clone(),
             };
+            // Entering the codomain crosses this arrow's frame, as in
+            // `compact_go`.
+            ctx.frames.push(name.clone());
             let cod = key_go(codomain, pol, &cod_acc, ctx);
+            ctx.frames.pop();
             // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
             // so keying on it would split every use; its pins are the answer, and
@@ -468,12 +488,13 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // directions without ever mixing them at one variable. There is no
         // opposite-polarity fallback either — the dual read subsumes it.
         Type::Infer(state) => {
-            let memo_key = (state.uid, pol);
+            let visit_key = (state.uid, pol);
+            let memo_key = (state.uid, pol, ctx.frames.clone());
             let memoizable = subst_acc.is_id();
             if memoizable && let Some(k) = ctx.memo.get(&memo_key) {
                 return k.clone();
             }
-            if !ctx.visiting.insert(memo_key) {
+            if !ctx.visiting.insert(visit_key) {
                 // A cycle in the bound graph (`?a <: ?b` and `?b <: ?a` is
                 // ordinary). Drop the back-edge: whatever it would contribute is
                 // already on the path that reached it. Recorded so the partial
@@ -494,7 +515,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
                 acc.union(key_go(&b.ty, pol, &inner_acc, ctx));
             }
-            ctx.visiting.remove(&memo_key);
+            ctx.visiting.remove(&visit_key);
             if memoizable && ctx.truncations == truncations_before {
                 ctx.memo.insert(memo_key, acc.clone());
             }
@@ -811,6 +832,91 @@ mod tests {
             visiting: HashSet::new(),
             memo: HashMap::new(),
             truncations: 0,
+            frames: Vec::new(),
+            closer: ClaimCloser::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod claim_closing_tests {
+    use super::*;
+    use crate::ccl::infer::solver::test_helpers::dep_pred;
+    use crate::ccl::infer::solver::{ConstrainCache, constrain_subtype};
+    use crate::ccl::ty::FunKind;
+
+    fn dep_fun(binder: &str) -> Type {
+        Type::Fun {
+            name: Some(Name::raw(binder)),
+            kind: FunKind::Data,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Refinement(
+                Box::new(Type::Base(crate::ccl::BaseType::Int)),
+                Refinement::born(dep_pred(binder)),
+            )),
+        }
+    }
+
+    /// **Acceptance: α-variant dependent instantiation types share a
+    /// specialization.** The key's refinements land closed, so the binder spelling
+    /// never reaches the key and two α-variant uses key together — where a
+    /// name-spelled key split them into per-spelling clones.
+    #[test]
+    fn spec_key_shares_alpha_variant_dependent_types() {
+        let fx = dep_fun("x");
+        let fy = dep_fun("y");
+        // The relation reconciles the α-variants both ways…
+        let mut c = ConstrainCache::new();
+        assert!(constrain_subtype(&fx, &fy, &mut c).is_ok());
+        let mut c = ConstrainCache::new();
+        assert!(constrain_subtype(&fy, &fx, &mut c).is_ok());
+        // …and the specialization key agrees.
+        assert_eq!(
+            spec_key(&fx),
+            spec_key(&fy),
+            "α-variant dependent instantiation types must share a specialization"
+        );
+    }
+
+    /// **Acceptance: the key keeps distinct enclosing binders distinct.** The
+    /// key does not carry the binder name (see [`SpecKey::fun`]); what records
+    /// which binder a refinement referenced is the landed index itself, and a
+    /// collapse here is an *under*-split — two uses sharing a specialization
+    /// whose interior was resolved against the other's argument.
+    #[test]
+    fn spec_key_keeps_distinct_binders_distinct() {
+        let nested = |referenced: &str| Type::Fun {
+            name: Some(Name::raw("x")),
+            kind: FunKind::Data,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Fun {
+                name: Some(Name::raw("y")),
+                kind: FunKind::Data,
+                domain: Box::new(Type::UIntRange(4)),
+                codomain: Box::new(Type::Refinement(
+                    Box::new(Type::Base(crate::ccl::BaseType::Int)),
+                    Refinement::born(dep_pred(referenced)),
+                )),
+            }),
+        };
+        assert_ne!(
+            spec_key(&nested("y")),
+            spec_key(&nested("x")),
+            "the key must not conflate the inner and outer Pi binders"
+        );
+        // A free name that is *no* frame's binder stays a name and stays
+        // distinct from every index: distinct enclosing binders outside the
+        // walked type key apart too.
+        let free = Type::Refinement(
+            Box::new(Type::Base(crate::ccl::BaseType::Int)),
+            Refinement::born(dep_pred("outer")),
+        );
+        let bound = {
+            let Type::Fun { codomain, .. } = dep_fun("x") else {
+                unreachable!()
+            };
+            *codomain
+        };
+        assert_ne!(spec_key(&free), spec_key(&bound));
     }
 }

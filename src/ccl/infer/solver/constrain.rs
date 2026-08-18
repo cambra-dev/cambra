@@ -514,6 +514,26 @@ fn constrain_go_impl(
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
                 _ => sl.clone(),
             };
+            // Descent opens (`src/ccl/design/type-inference.md`, "Where the
+            // conversions run"): a *closed* codomain — one whose claims
+            // reference this arrow's binder as indices — opens at its own
+            // binder name before the edge decomposes it, so fragments
+            // recorded on inner variables are name-referenced against their
+            // telescopes and the correspondence above applies to them. The
+            // pre-scan keeps the common index-free codomain untouched.
+            let open = |n: &Option<crate::ccl::Name>, c: &Type| -> Option<Type> {
+                match n {
+                    Some(b) if crate::ccl::subst::contains_pi_bound(c) => {
+                        Some(crate::ccl::subst::open_pi_binder(
+                            &crate::ccl::subst::Mapping::Rename(b.clone()),
+                            c,
+                        ))
+                    }
+                    _ => None,
+                }
+            };
+            let c0_opened = open(n0, c0);
+            let c1_opened = open(n1, c1);
             // The domain edge. A *compute* domain is contravariant: it is a
             // parameter, nothing can enumerate it, and accepting more inputs than
             // demanded only under-promises. A **data** domain is *invariant* — it is
@@ -546,7 +566,13 @@ fn constrain_go_impl(
             } else {
                 constrain_go(d1, d0, sr, sl, cache)?;
             }
-            constrain_go(c0, c1, &cod_sl, sr, cache)
+            constrain_go(
+                c0_opened.as_ref().map_or(&**c0, |c| c),
+                c1_opened.as_ref().map_or(&**c1, |c| c),
+                &cod_sl,
+                sr,
+                cache,
+            )
         }
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a

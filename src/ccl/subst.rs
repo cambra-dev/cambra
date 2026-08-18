@@ -1370,8 +1370,9 @@ pub fn well_formed(ty: &Type, ctx: &BTreeSet<Binder>) -> bool {
 /// closing does not touch keeps its original `Rc` (pointer-equal), exactly
 /// as [`Subst::force_refinement`] transports a vacuous substitution.
 pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
+    let frames = [Some(binder.clone())];
     let mut out = ty.clone();
-    PiWalk::new(PiMode::Close(binder)).ty(&mut out, 0);
+    PiWalk::new(PiMode::Close(&frames)).ty(&mut out, 0);
     out
 }
 
@@ -1392,10 +1393,32 @@ pub fn open_pi_binder(target: &Mapping, ty: &Type) -> Type {
     out
 }
 
+/// A morphism's `codomain` in the coordinate its *consumer* speaks: descent
+/// under a dependent morphism's binder, where its own reference to that binder
+/// is the free name rather than an index
+/// (`src/ccl/design/type-inference.md`, "Where the conversions run").
+///
+/// The rebuild passes all reach for this at the same shape — a chain adjacency,
+/// an application's transformer arrow, a recognizer matching a family's
+/// predicate — each holding the morphism and the codomain it just read off it.
+/// A non-dependent morphism and an index-free codomain pass through untouched,
+/// so a caller with nothing to open pays a scan.
+pub fn open_codomain(morphism: &Type, codomain: &Type) -> Type {
+    match morphism.peel_refinements() {
+        Type::Fun { name: Some(b), .. } if references_outermost_frame(codomain) => {
+            open_pi_binder(&Mapping::Rename(b.clone()), codomain)
+        }
+        _ => codomain.clone(),
+    }
+}
+
 /// Which conversion a [`PiWalk`] performs.
 enum PiMode<'a> {
-    /// `Var(binder)` at depth `d` becomes `Var(PiBound(d))`.
-    Close(&'a Name),
+    /// `Var(n)` where `n` names a frame becomes `Var(PiBound(k))`, `k` the
+    /// codomain crossings between the reference and that frame: the frame's
+    /// distance in the stack (innermost last, unnamed crossings as `None`)
+    /// plus the crossings walked inside the converted structure itself.
+    Close(&'a [Option<Name>]),
     /// `Var(PiBound(d))` at depth `d` becomes the target (a `Var` for a
     /// rename, the discharged term for an application).
     Open(&'a Mapping),
@@ -1487,9 +1510,11 @@ impl<'a> PiWalk<'a> {
 
     fn expr(&mut self, e: &mut TypedExpr, depth: u32) {
         match &self.mode {
-            PiMode::Close(binder) => {
-                if matches!(&e.node, TypedExprNode::Var(n) if n == *binder) {
-                    e.node = TypedExprNode::Var(Name::PiBound(depth));
+            PiMode::Close(frames) => {
+                if let TypedExprNode::Var(n) = &e.node
+                    && let Some(dist) = frames.iter().rev().position(|f| f.as_ref() == Some(n))
+                {
+                    e.node = TypedExprNode::Var(Name::PiBound(dist as u32 + depth));
                     self.changed += 1;
                     // Fall through: the occurrence's type slot may itself
                     // carry references to convert.
@@ -1510,6 +1535,136 @@ impl<'a> PiWalk<'a> {
         }
         e.walk_type_slots_mut(|t| self.ty(t, depth));
         e.walk_children_mut(|c| self.expr(c, depth));
+    }
+}
+
+/// Does `ty` carry a [`Name::PiBound`] reference anywhere — in a refinement
+/// predicate, a predicate's interior type slots, or their nesting? A cheap
+/// borrowing pre-scan so the opening sites (the Fun/Fun codomain edge) touch
+/// only the types that actually need conversion; the overwhelmingly common
+/// codomain carries none.
+pub fn contains_pi_bound(ty: &Type) -> bool {
+    fn ty_scan(ty: &Type, visited: &mut BTreeSet<PredicateId>) -> bool {
+        match ty {
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::DataSource(_)
+            | Type::ChanDom(..)
+            | Type::Txn
+            | Type::Hole
+            | Type::SharedHole(_)
+            | Type::Infer(_) => false,
+            Type::BoundedHole(t) => ty_scan(t, visited),
+            Type::Fun {
+                domain, codomain, ..
+            } => ty_scan(domain, visited) || ty_scan(codomain, visited),
+            Type::Refinement(base, r) => {
+                (visited.insert(r.predicate_id()) && expr_scan(&r.predicate, visited))
+                    || ty_scan(base, visited)
+            }
+            Type::Tuple(ts) => ts.iter().any(|t| ty_scan(t, visited)),
+            Type::Record(fs) => fs.iter().any(|(_, t)| ty_scan(t, visited)),
+            Type::Variant(tags, _) => tags.iter().any(|(_, t)| ty_scan(t, visited)),
+            Type::History { value, domain, .. } => {
+                ty_scan(value, visited) || ty_scan(domain, visited)
+            }
+        }
+    }
+    fn expr_scan(e: &TypedExpr, visited: &mut BTreeSet<PredicateId>) -> bool {
+        if matches!(&e.node, TypedExprNode::Var(Name::PiBound(_))) {
+            return true;
+        }
+        let mut found = false;
+        e.walk_type_slots(|t| found = found || ty_scan(t, visited));
+        if found {
+            return true;
+        }
+        e.fold_children(false, |acc, c| acc || expr_scan(c, visited))
+    }
+    ty_scan(ty, &mut BTreeSet::new())
+}
+
+/// Does `ty` reference the arrow frame it was just extracted from — a
+/// [`Name::PiBound`] whose index equals the codomain crossings to reach it?
+/// This is the dependence test for a codomain in the index coordinate,
+/// answering what a free-name lookup answers in the name coordinate:
+/// coalesce keeps a Pi binder's name slot, and an application has a
+/// discharge to perform, exactly when this holds.
+pub fn references_outermost_frame(ty: &Type) -> bool {
+    fn ty_scan(ty: &Type, depth: u32, visited: &mut BTreeSet<PredicateId>) -> bool {
+        match ty {
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::DataSource(_)
+            | Type::ChanDom(..)
+            | Type::Txn
+            | Type::Hole
+            | Type::SharedHole(_)
+            | Type::Infer(_) => false,
+            Type::BoundedHole(t) => ty_scan(t, depth, visited),
+            Type::Fun {
+                domain, codomain, ..
+            } => ty_scan(domain, depth, visited) || ty_scan(codomain, depth + 1, visited),
+            Type::Refinement(base, r) => {
+                (visited.insert(r.predicate_id()) && expr_scan(&r.predicate, depth, visited))
+                    || ty_scan(base, depth, visited)
+            }
+            Type::Tuple(ts) => ts.iter().any(|t| ty_scan(t, depth, visited)),
+            Type::Record(fs) => fs.iter().any(|(_, t)| ty_scan(t, depth, visited)),
+            Type::Variant(tags, _) => tags.iter().any(|(_, t)| ty_scan(t, depth, visited)),
+            Type::History { value, domain, .. } => {
+                ty_scan(value, depth, visited) || ty_scan(domain, depth, visited)
+            }
+        }
+    }
+    fn expr_scan(e: &TypedExpr, depth: u32, visited: &mut BTreeSet<PredicateId>) -> bool {
+        if matches!(&e.node, TypedExprNode::Var(Name::PiBound(k)) if *k == depth) {
+            return true;
+        }
+        let mut found = false;
+        e.walk_type_slots(|t| found = found || ty_scan(t, depth, visited));
+        if found {
+            return true;
+        }
+        e.fold_children(false, |acc, c| acc || expr_scan(c, depth, visited))
+    }
+    ty_scan(ty, 0, &mut BTreeSet::new())
+}
+
+/// Closes refinements as they land in a compact/key view (see
+/// `src/ccl/design/type-inference.md`, "Where the conversions run"): a refinement's
+/// free references to the walk's enclosing frames become indices, one
+/// conversion after the substitution forcing at the same two arms. Memoized on
+/// (predicate identity, frame stack) so occurrences that entered a view
+/// sharing one predicate `Rc` leave sharing one `Rc` — the planning-cost
+/// concern of [`crate::ccl::Refinement::predicate`] — and so the common
+/// frame-free claim is returned shared without a walk.
+#[derive(Default)]
+pub(crate) struct ClaimCloser {
+    memo: HashMap<(PredicateId, Vec<Option<Name>>), crate::ccl::Refinement>,
+}
+
+impl ClaimCloser {
+    /// Close `r` against `frames` (innermost frame last, unnamed codomain
+    /// crossings as `None`). A refinement referencing none of the frames keeps its
+    /// predicate `Rc`.
+    pub(crate) fn close(
+        &mut self,
+        frames: &[Option<Name>],
+        r: &crate::ccl::Refinement,
+    ) -> crate::ccl::Refinement {
+        if frames.iter().all(Option::is_none) {
+            return r.clone();
+        }
+        let key = (r.predicate_id(), frames.to_vec());
+        if let Some(done) = self.memo.get(&key) {
+            return done.clone();
+        }
+        let mut walk = PiWalk::new(PiMode::Close(frames));
+        let mut out = r.clone();
+        walk.refinement(&mut out, 0);
+        self.memo.insert(key, out.clone());
+        out
     }
 }
 
@@ -1735,16 +1890,46 @@ mod tests {
         assert_eq!(*r2.predicate, gt(var("i"), int(5)));
     }
 
-    // apply_type shadows a Pi binder: [k↦5] does not touch a codomain that
-    // rebinds k.
+    // A binder's own references are out of a discharge's reach, by one of
+    // two mechanisms depending on the coordinate: a *constructed* arrow
+    // (`Type::pi`) closed them into indices, which no name-keyed
+    // substitution maps; a name-based arrow (the mid-solve form, built
+    // field-wise) shadows the discharge under the binder instead.
     #[test]
     fn apply_type_shadows_pi_binder() {
-        let r = Refinement::born(Rc::new(gt(var("i"), var("k"))));
-        // (k: _) ⇒ {i | i > k} ⇒ _  — the inner k is bound by the Pi.
-        let inner = Type::fun(Type::Refinement(Box::new(Type::infer()), r), Type::infer());
-        let ty = Type::pi("k", Type::infer(), inner);
+        let refined = |pred: TypedExpr| {
+            Type::fun(
+                Type::Refinement(Box::new(Type::infer()), Refinement::born(Rc::new(pred))),
+                Type::infer(),
+            )
+        };
+        // Constructed: (k: _) ⇒ ({i | i > k} ⇒ _) closes k to #0 at
+        // construction, and [k↦5] has nothing to touch.
+        let ty = Type::pi("k", Type::infer(), refined(gt(var("i"), var("k"))));
         let out = Subst::discharge("k", int(5)).apply_type(&ty);
-        // The Pi binder shadows the discharge: predicate is unchanged.
+        let Type::Fun { codomain, .. } = &out else {
+            panic!()
+        };
+        let Type::Fun { domain, .. } = codomain.as_ref() else {
+            panic!()
+        };
+        let Type::Refinement(_, r2) = domain.as_ref() else {
+            panic!()
+        };
+        assert_eq!(
+            *r2.predicate,
+            gt(var("i"), TypedExpr::var(Name::PiBound(0)))
+        );
+
+        // Name-based: the same shape built field-wise keeps `k` a name, and
+        // the shadow is what protects it.
+        let ty = Type::Fun {
+            name: Some(Name::raw("k")),
+            kind: crate::ccl::ty::FunKind::Compute,
+            domain: Box::new(Type::infer()),
+            codomain: Box::new(refined(gt(var("i"), var("k")))),
+        };
+        let out = Subst::discharge("k", int(5)).apply_type(&ty);
         let Type::Fun { codomain, .. } = &out else {
             panic!()
         };
