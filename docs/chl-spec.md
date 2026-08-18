@@ -153,7 +153,9 @@ reserved for future use.
 > `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
 > `summon` (the transactions-as-contextual-parameters layer — §8.7,
 > **[Decided]**), `import` (built-in modules — the `http` module surface,
-> **[Decided]**; general modules remain future work, §9), and `match` /
+> **[Decided]**; general modules remain future work, §9), `assert` and its
+> `static assert` form (function contracts — §6, **[Decided]** as the
+> surface, **[Open]** as to what `static` demands), and `match` /
 > `case` (pattern matching, **[Tentative]** — it appears in the north-star
 > `txn_kv` program and inside refinement predicates (§6.4), but the block
 > syntax has no design writeup). Avoid taking these names for
@@ -671,6 +673,16 @@ point of use. Mutual recursion between top-level functions is
 Operators absent on purpose: `/` (no fractional type), `%`, `**`, `>>`,
 `~`, `@`. Attempting to use these in source is a parse error.
 
+> **Direction [Tentative] — `Real` and `/`.** The target language has a
+> fractional type, `Real`, and a division operator `/` on it. Neither
+> exists today: `Real` is no type the checker knows, `/` is not lexed
+> (§1.8), and there is no fractional literal (§1.7), so a quantity that
+> wants a fraction has nothing to write it with. Everything else is
+> **[Open]** — what `Real` denotes (exact rationals, a decimal, or the
+> `f64` §12 rules out), whether `/` is total or partial at zero
+> (*Partiality*, §3), whether `//` survives beside it, and how an `Int`
+> literal acquires the type in a `Real`-typed position.
+
 ### 3.4 Comparisons
 
 Comparisons chain Python-style: `a < b < c` denotes `a < b and b < c`.
@@ -862,6 +874,8 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 > `` `none ``, §6.5, as in the north-star `txn_kv`), while `Array` lookup stays direct
 > (`arr[i]: T`) because its bounds are statically checked. That would
 > eliminate the not-defined lookup cases above (see *Partiality*, §3).
+> A `FullMap` is the map's version of `Array`'s escape from the option
+> (§6.3): its domain *is* the key type, so `m[k]: V` directly.
 
 ### 3.10 Lambda
 
@@ -1543,6 +1557,9 @@ an **unmarked** entry is accepted in annotation position today; a
 marked one carries its status per "How to read this document".)
 
 - `Int` — signed 64-bit integer.
+- `Real` — a fractional number (**[Tentative]**, §3.3). The checker has no
+  fractional type, there is no fractional literal (§1.7), and `/` is not
+  even lexed (§1.8, §12).
 - `Bool` — `True` or `False`.
 - `String` — UTF-8 string.
 - `{}` — unit type, one inhabitant, and its only CHL spelling (§6.6). There is
@@ -1566,6 +1583,12 @@ marked one carries its status per "How to read this document".)
 - `Map(K, V)` — finite-map type. **[Planned]** — the map literal
   `[k -> v, …]` (§3.11) and `Map(…)` as an annotation are both
   unimplemented.
+- `FullMap(K, V)` — *total*-map type (**[Tentative]**, §6.3): every value
+  of `K` is a key, so lookup yields `V` rather than `Option(V)` and has
+  no missing case. Not implemented.
+- `Time` — a position in the commit order, what a transaction handle's
+  `current_time()` answers (**[Tentative]**, §8.2). §8.2 calls the handle
+  itself a `Txn` value, and the two spellings are not reconciled.
 - `{T₀, T₁, …} ⇒ U` — function type. A function takes exactly one
   argument (§3.8): an n-parameter function's domain is the
   corresponding tuple type, and a keyword-argument function's domain
@@ -1590,9 +1613,14 @@ surface form is `{T where p(_)}` (§6.4), not writable yet.
 > path-sensitive refinement, which is what an annotation cannot express.
 > Whichever surface writes it, what the checker holds is an ordinary refinement
 > type, and call sites must discharge parameter refinements, so preconditions
-> propagate outward to trust boundaries — in the north-star `storefront`,
-> `reserve`'s `assert qty > 0` is what forces the HTTP handler to validate
-> `req.body.qty` before the call typechecks.
+> propagate outward: a refined parameter is an obligation on its caller, and the
+> caller's own precondition an obligation on *its* caller, until the chain
+> reaches whatever first admits the value from outside — a request handler, a
+> file, a source. That **trust boundary** is where the check has to become real,
+> and it is the parameter refinement, not a convention, that puts it there. For
+> the HTTP boundary specifically, the sketch has the library derive the check
+> from the handler's own signature rather than have every handler restate it
+> (§7.4).
 >
 > Discharge is a spectrum, not a promise of static proof: an assert
 > the compiler can prove is discharged at compile time and erased; one
@@ -1600,15 +1628,40 @@ surface form is `{T where p(_)}` (§6.4), not writable yet.
 > form (**[Open]**) demands compile-time discharge — failing the build
 > when the proof doesn't go through — and may generalize to a
 > constexpr-like marker forcing any statement to resolve at compile
-> time. Also **[Open]**: the precise placement and reference rules
-> (what a pre- or postcondition may mention, where the lift draws its
-> cut points) need elaboration; and *nominal* domain types carrying
-> their own invariants (a `Price` whose `assert amount >= 0` rides the
-> type instead of being repeated per function) are the agreed
+> time. One further case: an assert whose subject is the value the body
+> **returns** lifts to a refinement on the **codomain**, not to a
+> parameter binder — it is a postcondition written as an assert, and it
+> lands where a return annotation would.
+>
+> ```python
+> def clamp(n: Int) => Int:
+>     m = if n < 0:
+>             0
+>         else:
+>             n
+>     assert m >= 0        # ... so the signature reads => {Int where _ >= 0}
+>     m
+> ```
+>
+> This is the surface a *conditional* postcondition needs, which a return
+> annotation cannot express: `clamp`'s two branches establish `m >= 0` two
+> different ways (one trivially, one from the `else`'s own condition), and the
+> assert states the bound once, after the branch, over the value both of them
+> produce. Because the refinement lands in the signature, it also binds every
+> later rewrite of the function — a reimplementation that violates it fails to
+> typecheck against its own contract rather than against a test.
+>
+> Also **[Open]**: the precise placement and reference rules (what a
+> pre- or postcondition may mention, which local an assert on the result
+> names as its subject, how the lift renames it to `_`, where the lift
+> draws its cut points) need elaboration; and *nominal* domain types
+> carrying their own invariants (a `Price` whose `assert amount >= 0`
+> rides the type instead of being repeated per function) are the agreed
 > direction for factoring recurring contracts, with no syntax settled
 > yet (§6.1, §6.4). Pinned by `discount_contract` (the mechanism in
 > isolation), `nonneg_inventory` (data refinement plus guarded
-> discharge), and `storefront` (both combined).
+> discharge), and `storefront` (both combined, plus the codomain lift
+> under `static assert`).
 
 The underlying type system additionally tracks unions, source types,
 and inference variables; see
@@ -1644,7 +1697,7 @@ element `{T,}`), record type `{f: T}`, variant type
 > **Direction [Tentative].** Named types come in two strengths. A
 > plain `=` binding to a capitalized name is a structural **alias** —
 > `Item = {price: Int, cost: Int}` — interchangeable with the type it
-> names. A `type` declaration is **nominal** —
+> names, and worked through in §6.7. A `type` declaration is **nominal** —
 > `type Price = {amount: Int}` — distinct from every other type of the
 > same shape. Nominal types are the agreed home for domain invariants
 > (a `Price` carrying `assert amount >= 0` in its declaration, per the
@@ -1796,6 +1849,18 @@ details to change:
   `e in s` (§3.4). `{}` is the unit type (§6.6).
 - `Map(K, V)` — `{is_key: K ⇒ Bool, data: {K where is_key(_)} ⇒ V}`;
   lookup `m[k]: Option(V)`, membership `k in m`.
+- `FullMap(K, V)` — `K ⇒ V`: the **total** map, which is `Map`'s encoding
+  with the `is_key` guard dropped, so the domain is all of `K` and every
+  key is present. Lookup is `m[k]: V` — there is no missing case, so
+  nothing to match (§3.9). A total map is typically *earned* by refining
+  the key type down to keys known to exist, rather than by promising
+  totality over an open type: `FullMap({String where _ in ks}, Int)` is
+  total because its domain says which strings it holds (§6.4). That
+  shifts "the lookup hits" from a runtime invariant to an obligation on
+  whatever constructs the map. **[Open]**: precise semantics and
+  limitations — starting with what that construction-site obligation is
+  (a literal must cover the domain; a domain that grows must extend the
+  map).
 - `Collection(T)` — `{Dom: Type, data: Dom ⇒ T}`: the domain rides
   along in the value.
 
@@ -1875,8 +1940,19 @@ A `match` over `_` is the idiomatic way to refine a variant:
 relies on that value having a name where the refinement sits. In a function
 signature the parameters do, which is what lets a return annotation carry a
 postcondition: `{Int where _ >= item.cost * qty}` refines the result by a
-predicate naming two parameters (§6). Standing alone, a refinement type has no
-such surroundings, and speaks only about its one anonymous subject.
+predicate naming two parameters (§6). Ordinary lexical scope (§5) is what
+supplies those names, and nothing narrows them to parameters: a refinement
+written at the top level may name a top-level binding, which makes that
+binding's *value* part of the type —
+
+```python
+ks = ["a", "b"]
+Key = {String where _ in ks}    # the strings `ks` holds, and no others
+```
+
+A refined key type of that shape is what a total map's domain is (§6.3). A
+refinement with nothing in scope but `_` speaks only about its one anonymous
+subject.
 
 ### 6.5 Variants
 
@@ -1956,6 +2032,61 @@ program to mark the loss. Unit is a **base** type instead, and a base type
 accepts only itself: getting from a product to unit takes an operation that
 says so.
 
+### 6.7 Type-alias statements
+
+**[Tentative]** — not implemented. Nothing special-cases a capitalized
+left-hand side: `src/ccl/lower/mod.rs` lowers the right of an `=` as a *term*,
+so a `{…}` there is rejected as type syntax in value position and a bare type
+name is an unresolved name. The alias-versus-nominal split this rests on is
+the Direction note in §6.1, tentative there too.
+
+A **type alias** binds a capitalized name to a type expression with plain `=`,
+as an ordinary statement of the block it sits in:
+
+```python
+Count = {Int where _ >= 0}       # a name for a refined base type
+Item = {price: Int, cost: Int}   # ... for a record type
+Priced = {Item where _.price >= _.cost}   # ... built from another alias
+```
+
+Afterwards the name is writable wherever a type is: a parameter or return
+annotation (`def f(n: Count) => Item:`), a type argument (`List(Priced)`,
+`Mut(Count)`), a field type inside a record or `Feed(…)`.
+
+The rules, and what each one is doing:
+
+- **`=`, and no keyword.** An alias is a *timeless equation* between a name and
+  a type, which is what `=` already means (§4.3 Direction) — so it is
+  `assign_stmt` (§2.2), not a new statement form. What separates it from a
+  value binding is the **case of the name**: `Caps` means type, without
+  exception (§6.1). A `type` keyword is deliberately not involved; that
+  spelling belongs to the *nominal* declaration §6.1 sketches, which an alias
+  is not.
+- **An alias names an existing type; it does not make a new one.** The alias
+  and its right-hand side are the same type, interchangeable in every position,
+  with no nominal distinction, no conversion, and no invariant of the alias's
+  own. Type equality is structural and so is unaffected by spelling: `Count`
+  and `{Int where _ >= 0}` are one type, and a refined alias is an ordinary
+  type reference wherever it is written — `n: Count` carries the refinement
+  into the signature exactly as the brace form would (§6.4).
+- **The right-hand side is any type expression**, including one that names other
+  aliases (`Priced` above) and one carrying a refinement whose predicate names
+  *values* in scope (§6.4). An alias opens no scope of its own: the predicate
+  sees what the statement sees, and nothing more.
+- **No forward reference** (§3.2). The names on the right must already be in
+  scope, so an alias follows both the aliases and the values it reads. A
+  *self*-referential alias needs no `rec` marker, since §4.3 exempts recursive
+  types, but what one would denote is unworked.
+
+**[Open]** — whether an alias may be **parameterised** (`Pair(T) = {T, T}`),
+which is the difference between naming a type and naming a type constructor;
+whether aliases are block-scoped like every other binding (§5) or top-level
+only; and whether the case rule alone carries the weight, since `Count = Int`
+and `count = n` are one statement form telling a reader which world it is in by
+one letter.
+
+The north-star `storefront` exercises four aliases, two of them refined.
+
 ---
 
 ## 7. Built-in functions and sources
@@ -1978,6 +2109,19 @@ The north-star programs additionally assume non-aggregate built-ins —
 `str`, `open`, `stdout`, and a stream-restriction combinator
 `restrict` — all **[Tentative]**: they exist only as usage sketches in
 [`tests/programs/`](../tests/programs/), with no design writeup.
+
+> **[Open]** — the restriction combinator's **name**, and how any of
+> these combinators are *called*. The corpus spells the same operation
+> two ways: `txn_kv` and `ledger_balance` write `c.restrict(\e -> …)`,
+> the north-star `storefront` writes `orders.filter(\o -> …)`, and
+> nothing decides between them — one of the two names has to go. Both
+> are written in **method** position, which §3.9 does not admit: `.`
+> there is projection of a field out of a product, not lookup of a
+> library function on a collection, and `catalog.keys()` and
+> `txn.current_time()` are the same shape. Whether a collection's
+> combinators are reached through `.` at all — and if so what resolves
+> the name, given that a collection *is* a function (§6.3) and has no
+> fields — is open with them.
 
 ### 7.2 `groupby`
 
@@ -2093,6 +2237,23 @@ unique across the program.
 > tuple-destructuring form above is what's implemented today,
 > special-cased to `http_serve` only as an implementation matter
 > (§4.3 Direction).
+>
+> **Request validation derived from the handler's type**, in the same
+> **[Open]** design. A request is untrusted input, so the endpoint is a
+> trust boundary and every refinement the handler's calls impose on
+> `req.body` has to be discharged there (§6). The sketch has the
+> *library* do it rather than each handler restate it: the request
+> schema is read off the constraints the handler already implies, and a
+> request violating one is refused before the body runs, so a handler
+> body holds domain logic only. A handler that wants a *particular*
+> answer for a rejected field takes the check back by writing it — a
+> pattern match on a lookup is both the check and the branch that
+> answers it, and its success arm is what refines the field for the
+> calls below. Unsettled: what a derived refusal answers with (which
+> status, which body), how a derived check evaluates a refinement whose
+> predicate reads program state (§6.4), and whether writing the check by
+> hand *opts the handler out* of the derived one for that field or
+> merely duplicates it.
 
 ---
 
@@ -2198,8 +2359,21 @@ for req in incr_reqs:
 **Scope transactions minimally.** Only the operations that must be atomic
 go inside `with begin():` — input validation before it, response
 assignment after it. The north-star handlers observe this throughout (e.g.
-`storefront`'s `/order` validates and matches the catalog before opening
-the transaction around `reserve` + `quote` + the feed).
+`storefront`'s `/order` matches the catalog before opening the transaction
+around `reserve` + `quote` + the feed).
+
+> **Direction [Tentative] — a block is also the value it computes.**
+> Scoping minimally puts the reply outside the block, which leaves the
+> block needing to hand its result out: a `with begin():` block in value
+> position denotes the value of its last statement, the same rule a
+> function body follows (§4.1), and the enclosing binding carries it past
+> the block's end. Nothing admits it today — §2.2 has `with_stmt` as a
+> compound statement and an `assign_stmt` right-hand side as an
+> `expression`, and the two never meet. **[Open]** is how §8.4's gating
+> rule reads against it: a reply fed *inside* a block rides the commit and
+> a denied transaction replies nothing, while a reply outside fires
+> regardless — and this shape puts the reply outside with a value that
+> came from inside, so which of the two it inherits has to be said.
 
 ### 8.3 Reads
 
@@ -2434,13 +2608,17 @@ exercises, and its blockers. This spec deliberately does not inline
 them — the gallery is the single source of truth.
 
 The gallery holds two kinds of program. Most compile today and
-illustrate implemented features. The **north-star** programs —
-`reachability`, `fanout`, `txn_kv` — are instead written in the
-*target* syntax of the Direction notes (`rec`, `:=`, `(f=…)` records,
-`\`-lambdas, `Feed`/`Mut` wrappers, transactions) and are
-pinned as expected compile-errors that go red one by one as the
-direction lands; read them as the direction's worked examples, with
-the same status caveats as the Direction notes they exercise.
+illustrate implemented features. The **north-star** programs are
+instead written in the *target* syntax of the Direction notes (`rec`,
+`:=`, `(f=…)` records, `\`-lambdas, `Feed`/`Mut` wrappers, type
+aliases, refinements, transactions) and are pinned as expected
+compile-errors that go red one by one as the direction lands; read
+them as the direction's worked examples, with the same status caveats
+as the Direction notes they exercise. `storefront` is the north-star
+proper — one application over all of it, in the two versions
+`v0.cambra` and `v1.cambra` — and `reachability`, `fanout`, `txn_kv`,
+`discount_contract`, `nonneg_inventory`, and `ledger_balance` isolate
+one capability each so a failure names one gap.
 
 ---
 

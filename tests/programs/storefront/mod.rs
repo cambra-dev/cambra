@@ -2,11 +2,13 @@
 //! launch demo.  One program spanning the layers a conventional stack splits
 //! across systems: transactional order intake (`/order`, `/restock` mutating
 //! a shared refined store), a stream of committed order lines (the `orders`
-//! feed), and time-indexed analytics served over HTTP (`/stats`).  Two
-//! invariants live in the types instead of tests: the store refinement
-//! `{Int where _ >= 0}` makes overselling ill-typed, and `quote`'s
-//! postcondition assert makes selling below cost ill-typed — in every
-//! version.
+//! feed), and time-indexed analytics served over HTTP (`/stats`).  The
+//! domain rules live in the types instead of tests: the `Qty` refinement
+//! (`{Int where _ >= 0}`) makes overselling ill-typed, `ItemPricing`'s record
+//! refinement rejects below-cost catalog entries at the literal, `SKU`
+//! (keys actually in the catalog) makes `inventory`'s `FullMap` lookups
+//! statically hit, and `quote`'s `static assert` makes selling below cost
+//! ill-typed — in every version.
 //!
 //! `v0.cambra` and `v1.cambra` are the two sides of the version-upgrade
 //! dimension: V1
@@ -28,11 +30,12 @@
 //! 1. Compile and boot V0 on a free port.
 //! 2. Drive a mixed workload from client threads: concurrent `/order`
 //!    requests (including oversell attempts on one hot SKU and invalid
-//!    qty <= 0 requests), interleaved `/restock`s, and `/stats` reads.
+//!    qty < 0 requests), interleaved `/restock`s, and `/stats` reads.
 //! 3. Assert the responses: `http.ok` orders priced by V0's `quote`,
 //!    `http.conflict` (409) for oversell attempts — the invariant visibly
-//!    holding under load — `http.bad_request` (400) for invalid qty, and
-//!    `/stats` snapshots
+//!    holding under load — a boundary rejection for invalid qty (the HTTP
+//!    library derives request validation from the handlers' inferred
+//!    constraints), and `/stats` snapshots
 //!    that are consistent with the orders committed before each read.
 //! 4. Upgrade to V1 at a branch point t_new while V0's state persists.
 //! 5. Replay the workload; assert post-t_new orders are priced by V1's
@@ -45,18 +48,26 @@
 //!
 //! ### Current limitations (what this test depends on)
 //!
-//! **Blocked today**: the `\` lambda (the restrict predicates) now lexes; the
-//! next blocker is the `` ` `` prefix on the `` `some ``/`` `none `` variant
-//! tags, which the lexer rejects outright.  Behind it, the `match` expression
-//! on the catalog lookup is still not a keyword and derails the layout pass
-//! (an inconsistent-indentation lex error).  The full dependency list, each
-//! isolated by a smaller gallery program where one exists:
+//! **Blocked today**: the `` ` `` prefix on the `` `some ``/`` `none `` variant
+//! tags is not lexed (the `\` lambda — the filter predicates — already
+//! lexes).  Behind the tag, the `match` expression on the catalog lookup is
+//! still not a keyword and derails the layout pass (an inconsistent-
+//! indentation lex error).  The full dependency list, each isolated by a
+//! smaller gallery program where one exists:
 //!
-//! - Boundary asserts lifted to refinement types — `discount_contract`.
+//! - `static assert` lifted to a codomain refinement — `discount_contract`
+//!   pins the boundary-assert ancestor of this shape.
 //! - Refined transactional store + guarded decrement — `nonneg_inventory`.
 //! - Transaction-time views over feeds — `ledger_balance`.
+//! - Type-alias statements (`Dollars`/`Qty`/`ItemPricing`/`SKU`), record
+//!   refinements (`{… where _.price >= _.cost}`), a value-dependent key type
+//!   (`_ in catalog.keys()`), and `FullMap` total lookups — new with the
+//!   redesigned example; no isolating gallery program yet.
+//! - HTTP-library request validation derived from inferred handler
+//!   constraints — open with the rest of the HTTP library design.
 //! - Transactions, `Mut(..., Txn)`, `match`/`Option`, structured requests,
-//!   `restrict`/`count` — `txn_kv`; v1's `is_promo_spent` additionally uses
+//!   `restrict`/`count` — `txn_kv` (the storefront spells restriction
+//!   `filter`); v1's `is_promo_spent` additionally uses
 //!   `summon(Transaction)` and a time-pinned aggregate inside a
 //!   `requires Transaction` UDF, which no smaller program pins.  Its
 //!   incremental materialization is the efficiency milestone: the naive
