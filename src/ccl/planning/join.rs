@@ -1081,6 +1081,44 @@ pub(super) fn try_hash_join_rewrite(expr: &mut Expr, domain_ty: &Type) -> bool {
         "Attempting hash-join rewrite at iteration site: {}",
         symbolic(expr),
     );
+    // The iteration site is what the recording names. Every product of the plan
+    // — the per-arm `iterate` leaves, the key morphisms, the
+    // `map_domain`/`permute_domain` scaffolding, the residual `restrict`s — is
+    // how *this* site is being materialised, so it is the node they all replace.
+    // Coarse by construction: an n-way plan, and a nested loop-join re-entering
+    // through `join_plan_to_expr`, all descend from this one node. The join
+    // conditions are read out of whichever of the domain's refinements
+    // `convert_refinement_to_join` accepts, and the material lifted from there
+    // keeps that refinement's own parentage — a clone's copy carries the node it
+    // was freshened from, not the node named here.
+    //
+    // Not a fusion: the site's original value-producer is kept rather than
+    // consumed, spliced in as the second element of the compose below with its
+    // id intact. The arms the plan reads come from the domain **type**, and a
+    // type carries no identity to consume.
+    //
+    // The recording spans the *attempts*, as simplify's rule combinator does:
+    // `convert_refinement_to_join` tries each refinement in turn, and both a
+    // rejected refinement and a wholly unmatched domain return through this one
+    // guard's `Drop`. What a half-built plan minted before bailing — the key
+    // copies `plan_loop_join` freshens before `spanning_tree_children` refuses
+    // the condition graph — composes away as a transient: a copy that never
+    // reaches the output tree is not `Unrecorded`, that class being found by
+    // walking that tree, and its parent is this site, so it is no
+    // `DanglingParent` either. Naming the firing instead would mean threading
+    // the site id down through `convert_refinement_to_join` into
+    // `convert_loop_join`.
+    //
+    // How many such transients a compile writes therefore depends on the order
+    // the refinement set is iterated in, which nothing about a set makes
+    // meaningful. That stays unobservable for the same reason they compose away:
+    // the rejected attempts reach no pane, and the accepted plan is the same
+    // whichever refinement supplied it.
+    let _g = provenance::enter(
+        expr.node_id(),
+        "planning.hash_join",
+        provenance::Nature::Machinery,
+    );
     let Some(transformed) = convert_refinement_to_join(domain_ty) else {
         trace!("Hash-join pattern did not match");
         return false;

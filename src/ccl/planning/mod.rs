@@ -30,6 +30,7 @@ use crate::ccl::{
     ccl_utils::apply_primitive,
     infer::typecheck,
     lambda_elim::{self, compose, id},
+    provenance,
     simplify::simplify,
     symbolic::{symbolic, symbolic_typed},
 };

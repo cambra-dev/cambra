@@ -18,10 +18,28 @@ use crate::ccl::ty::FunKind;
 /// `converse(c ≫ key) ≫ map(c)`. Walks the tree, rewriting every such site
 /// (a rewritten site's tail may contain further sites).
 pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
-    if let Some(rewritten) = convert_groupby_pointful(expr) {
+    // The recording names the composition site — the term-tree node the
+    // bucketize chain replaces — and deliberately not the key morphism the
+    // rewrite lifts out of the refined domain's predicate. The composition is
+    // what the user's `groupby(...)` became and what the chain now stands in
+    // for; the lifted key keeps its own parentage, since a clone's copy carries
+    // the predicate node it was freshened from rather than the node named here.
+    // `Nature::Expansion` for the same reason.
+    //
+    // Scoped to the *attempt* and closed before the child walk. Recursing under
+    // it would make a nested site's products descend from this one; a
+    // non-matching node mints nothing, so wrapping the attempt costs a push and
+    // a pop.
+    let rewritten = {
+        let _g = provenance::enter(
+            expr.node_id(),
+            "planning.groupby",
+            provenance::Nature::Expansion,
+        );
+        convert_groupby_pointful(expr)
+    };
+    if let Some(rewritten) = rewritten {
         *expr = rewritten;
-        expr.walk_children_mut(recognize_groupby_sites);
-        return;
     }
     expr.walk_children_mut(recognize_groupby_sites);
 }

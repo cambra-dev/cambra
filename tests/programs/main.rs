@@ -24,6 +24,7 @@ mod http_accumulator;
 mod http_counter;
 mod http_greeter;
 mod inner_join;
+mod join_then_groupby;
 mod ledger_balance;
 mod nonneg_inventory;
 mod prefix_lines;

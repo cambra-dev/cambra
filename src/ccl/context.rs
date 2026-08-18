@@ -1048,11 +1048,10 @@ fn recorded<R>(capture: bool, phase: Phase, f: impl FnOnce() -> R) -> R {
 /// collection, which it counts apart from the [`Leak`]s that really are
 /// recording bugs.
 ///
-/// TODO(provenance-audit-retire): scaffolding for the instrumentation campaign.
-/// This, [`PROVENANCE_PREDICATES_ENV`] and the audit clause in
-/// [`provenance_capture_enabled`] all go once every pane pair is gated, at which
-/// point no span has a question left to ask. See `design/provenance.md`, "What
-/// retires when the last phase records".
+/// A span survives gating when its enclosing pair bundles more phases than the
+/// span does: the `letrec` and `mutelim` spans below isolate phases inside the
+/// four-phase `post-inference → post-channelize` pair. See
+/// `src/ccl/design/provenance.md`, "What gating every pair does not retire".
 struct ProvenanceAudit {
     span: &'static str,
     state: Option<(PhaseScope, std::collections::HashSet<NodeId>)>,
@@ -1378,28 +1377,20 @@ pub fn compile_program(
     let post_inference_ir = expr.clone_preserving_ids();
 
     // Driver-capture audit span: post-inference pane in, and out at the **last
-    // instrumented pane** — currently `post-lambda-elim`, covering inline,
-    // transact, mut_elim, channelize, the as-of-read rewrite and lambda
-    // elimination.
+    // instrumented pane**, which is now the last pane — `join-planned`, covering
+    // inline, transact, mut_elim, channelize, the as-of-read rewrite, lambda
+    // elimination and planning.
     //
     // The endpoint is chosen rather than inherited. An audit measures what the
     // recordings explain, so a span running past the last instrumented phase
     // reports every node the uninstrumented tail mints as a defect — a number
     // that cannot reach zero however correct the recording is, which makes the
-    // audit read as a broken gate instead of a measurement. `planning` is the
-    // next phase here, and its group-by and hash-join recognizers mint with
-    // nothing recording, so the span stops in front of it.
-    //
-    // **Move this endpoint when a phase becomes instrumented, in the same commit
-    // that instruments it** — to `join-planned` when planning records. Leaving
-    // it behind understates coverage; moving it ahead reintroduces the
-    // unreachable-zero problem.
-    let audit = ProvenanceAudit::start(
-        "full",
-        "post-inference..post-lambda-elim",
-        &post_inference_ir,
-    );
-    // A narrower pane pair over just the mutability phases (inline, transact,
+    // audit read as a broken gate instead of a measurement. Every phase that
+    // rewrites expression nodes now records, so the span reaches the end of the
+    // pipeline; operator conversion is past it and has no node identity to
+    // record against.
+    let audit = ProvenanceAudit::start("full", "post-inference..join-planned", &post_inference_ir);
+    // A narrower audit span over just the mutability phases (inline, transact,
     // mut_elim), which is where the fate-prediction question lives.
     let audit_letrec =
         ProvenanceAudit::start("letrec", "post-inference..post-letrec", &post_inference_ir);
@@ -1475,8 +1466,8 @@ pub fn compile_program(
     // hoisted to an ordinary feed of the loop's history for channelize to route.
     // The tree still carries Defer/Feed here, so the check is the relaxed
     // pre-channelize one.
-    // Isolated pane pair over `mut_elim` alone — the phase whose fate prediction
-    // driver capture is meant to delete.
+    // An audit span over `mut_elim` alone — the phase whose fate prediction driver
+    // capture is meant to delete.
     let audit_mutelim = ProvenanceAudit::start("mutelim", "post-transact..post-letrec", &expr);
     let phase_out = recorded(capture_provenance, Phase::Letrec, || mut_elim::run(expr));
     audit_mutelim.finish(&phase_out);
@@ -1531,8 +1522,6 @@ pub fn compile_program(
     })
     .errs()?;
     assert_unique_node_ids(&lambda_elim, "post-lambda-elim");
-    // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
-    audit.finish(&lambda_elim);
     // A pane snapshot; see `pre_inference_ir`.
     let post_lambda_elim_ir = lambda_elim.clone_preserving_ids();
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
@@ -1550,16 +1539,17 @@ pub fn compile_program(
     // Running post-elim is what keeps ONE letrec representation through
     // channelize and lambda_elim; the point-free guard matcher re-checks
     // causality at this wall. See the `mut_elim` recognition docs.
-    let recognized = planning::plan_loops(lambda_elim);
+    let recognized = recorded(capture_provenance, Phase::Planning, || {
+        planning::plan_loops(lambda_elim)
+    });
     debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
     typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
 
-    // Isolated pane pair over `planning::run` — the phases containing
-    // `simplify`'s 13 rules and `wrap_with_iterate`.
-    let audit_planning =
-        ProvenanceAudit::start("planning", "recognized..join-planned", &recognized);
-    let join_planned = planning::run(recognized);
-    audit_planning.finish(&join_planned);
+    let join_planned = recorded(capture_provenance, Phase::Planning, || {
+        planning::run(recognized)
+    });
+    // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
+    audit.finish(&join_planned);
     assert_unique_node_ids(&join_planned, "post-planning");
     debug!(
         "Join-planned CCL:\n{} : {}",

@@ -17,6 +17,7 @@ use crate::ccl::{
     ccl_utils::{commit_payload_ty, count_free, strip_refinements},
     letrec::check_letrec_causal,
     mut_elim::{binding, fun_parts, tvar},
+    provenance,
     symbolic::symbolic,
 };
 
@@ -49,6 +50,14 @@ use crate::ccl::{
 pub(crate) fn plan_loops(expr: Expr) -> Expr {
     let mut expr = expr;
     if let TypedExprNode::LetRec { .. } = &expr.node {
+        // Read before the destructure moves `expr.node` out: a recording needs
+        // the id, never the node, so a site that no longer holds its input can
+        // still open one. The `LetRec` is what every recognition arm below
+        // replaces — the `Transact` carrier, the `let __hist = …` binding it, and
+        // the plain `let` chain a channel group flattens to. The group's
+        // bindings that vanish into the carrier are deaths, which the pane
+        // difference reports without anyone naming them.
+        let letrec_id = expr.node_id();
         let TypedExprNode::LetRec { bindings, body } = expr.node else {
             unreachable!("causal above")
         };
@@ -70,12 +79,30 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
         // with no guards, is exactly an acyclicity check), so flatten it back
         // to plain `let`s in dependency order for planning.
         if !group_has_causal(&bindings) {
+            // Recurse into the definitions before opening the recording: a
+            // nested group inside a definition is its own rewrite and names its
+            // own `LetRec`.
             let bindings = bindings
                 .into_iter()
                 .map(|(b, def)| (b, plan_loops(def)))
                 .collect();
+            let _g = provenance::enter(
+                letrec_id,
+                "planning.channel_group",
+                provenance::Nature::Machinery,
+            );
             return flatten_channel_group(bindings, body);
         }
+        // `Nature::Machinery` for both recognition arms: a `LetRec` becoming a
+        // `Transact` is a change of carrier, not the expansion of a source
+        // construct. The loop or `with begin():` block the user wrote was
+        // expanded into this `LetRec` by `mut_elim` / `transact_phase`, and
+        // those recordings are where the fidelity claim belongs.
+        let _g = provenance::enter(
+            letrec_id,
+            "planning.recognize",
+            provenance::Nature::Machinery,
+        );
         if is_txn_group(&bindings) {
             return recognize_txn_group(bindings, body);
         }
@@ -501,6 +528,15 @@ fn rewrite_txn_reads(
     if let TypedExprNode::Var(n) = &e.node
         && let Some((field, field_ty)) = read_map.get(n)
     {
+        // The projection replaces *this* reference, so the reference is what the
+        // recording names — finer than the enclosing `planning.recognize`, which
+        // would otherwise make every continuation read descend from the `LetRec`
+        // and lose which read went where.
+        let _g = provenance::enter(
+            e.node_id(),
+            "planning.txn_read",
+            provenance::Nature::Machinery,
+        );
         *e = hist_field_read(hist, hist_ty, field.clone(), field_ty.clone());
         return;
     }
@@ -530,6 +566,16 @@ fn collapse_snapshot_sources(e: &mut Expr, hist: &Name, hist_ty: &Type) {
         // Stamp the source with the mutable variable's *own* type (all keys + taps), not
         // just the read subset — the `Var(__hist)` must agree with its binder,
         // and op-conversion's snapshot read projects the fields it needs by name.
+        //
+        // The record literal is what the recording names: the mutable variable
+        // is exactly what it collapses to, and its per-field reads die with it.
+        // Scoped to this arm rather than the function, because the child walk
+        // below runs whether or not this arm fired.
+        let _g = provenance::enter(
+            source.node_id(),
+            "planning.snapshot_source",
+            provenance::Nature::Machinery,
+        );
         *source = tvar(hist, hist_ty.clone());
         // The argument tuple\'s recorded type keeps its shape; re-stamp the
         // source slot.
@@ -635,7 +681,10 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         source,
         body: writer_body,
     };
-    let keys_for_reads = keys.clone();
+    // Only the key *names* are read downstream. Cloning the `TransactKey`s
+    // would deep-clone every seed expression and then discard the copies, which
+    // costs a stranded row per node of every accumulator seed.
+    let key_names_for_reads: Vec<Name> = keys.iter().map(|k| k.name.clone()).collect();
     let mut transact = Expr::new(TypedExprNode::Transact {
         keys,
         writers: vec![writer],
@@ -650,7 +699,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         &h.name,
         &hist,
         &hist_ty,
-        &keys_for_reads,
+        &key_names_for_reads,
         &acc_tys,
         &domain_ty,
     );
@@ -684,7 +733,7 @@ fn rewrite_hist_reads(
     h: &Name,
     hist: &Name,
     hist_ty: &Type,
-    keys: &[TransactKey],
+    keys: &[Name],
     acc_tys: &[Type],
     domain_ty: &Type,
 ) {
@@ -699,6 +748,15 @@ fn rewrite_hist_reads(
             Some(TypedExprNode::Builtin(Builtin::VariantProject(_)))
         )
     {
+        // The whole compose is what the recording names: the history-record read
+        // replaces its matched prefix and, when a tail survives, the rebuilt
+        // compose replaces the compose itself, so both products stand in for
+        // this one node.
+        let _g = provenance::enter(
+            e.node_id(),
+            "planning.hist_read",
+            provenance::Nature::Machinery,
+        );
         // The history-record read replacing the matched prefix, plus how many compose
         // elements the prefix covered (the `variant_project` step included).
         let replacement: Option<(Expr, usize)> =
@@ -707,7 +765,7 @@ fn rewrite_hist_reads(
                     Some(TypedExprNode::Proj(ProjKey::Field(f))),
                     Some(TypedExprNode::Proj(ProjKey::Index(i))),
                 ) if f == F_WRITES => {
-                    let field = keys[*i].name.field_key();
+                    let field = keys[*i].field_key();
                     let field_ty = Type::fun(domain_ty.clone(), acc_tys[*i].clone());
                     Some((hist_field_read(hist, hist_ty, field, field_ty), 4))
                 }
