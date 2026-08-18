@@ -2513,7 +2513,7 @@ fn commit_decision_reads_induction_accumulator() {
 /// trailing read, which is an arbitrary as-of sample — so the committed values
 /// are deterministic: `pool` draws down `100 → 97 → 94` over commit ticks 1, 2.
 /// Exercises the writer's deferred-wakeup convergence: the broadcast `cnt`'s
-/// `ExtractFinal` is empty until its loop's `Recurse` drains, so the writer
+/// `ExtractFinal` is empty until its loop's own cycle drains, so the writer
 /// re-arms itself on the wakeup queue each not-ready pull rather than deadlocking
 /// on the stalled commit frontier; the in-block reply demands each commit and
 /// drives that convergence.
@@ -2568,7 +2568,7 @@ fn broadcast_read_races_a_second_writer() {
 }
 
 /// Broadcast off a finite **async** (data-source) sibling loop. `cnt` counts a
-/// `TestDataSource`'s three elements — a loop whose `Recurse` converges only as
+/// `TestDataSource`'s three elements — a loop that converges only as
 /// the source's data arrives (via scheduler notifications), not synchronously.
 /// The txn decision reads `cnt`'s value (broadcast, 3), observed via an in-block
 /// reply — one commit, `pool = 100 − 3 = 97` at commit tick 1. This is the case

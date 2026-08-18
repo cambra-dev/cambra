@@ -225,7 +225,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
             }
         }
         // Each transaction writer's source is iterated internally by the
-        // mutable variable engine (`Recurse` for an induction accumulator); op-conversion
+        // mutable variable engine (the induction store for an accumulator); op-conversion
         // compiles it with `input=None`, so wrap it like a loop source.
         TypedExprNode::Transact { writers, .. } => {
             for w in writers.iter_mut() {

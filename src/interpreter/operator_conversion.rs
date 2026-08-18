@@ -960,7 +960,7 @@ fn convert_impl_inner(
 
         // `GetPrevSeq` is a letrec guard accessor, never compiled directly:
         // pattern recognition (a `get_prev_seq`-causal self-cycle → the
-        // `Recurse` engine) consumes it before op-conversion. Reaching this
+        // induction-store engine) consumes it before op-conversion. Reaching this
         // arm means a `LetRec` group escaped recognition — a compiler bug,
         // reported explicitly rather than falling through to the generic
         // Apply arm. Recognition lands with the unified phase
@@ -1299,7 +1299,7 @@ fn convert_impl_inner(
 
         // A raw `LetRec` never compiles directly: op-conversion *recognizes
         // patterns* in the group (a `get_prev_seq`-causal self-cycle → the
-        // `Recurse` engine, commit-record shapes → the commit operator) and
+        // induction-store engine, commit-record shapes → the commit operator) and
         // an unrecognized group is a compile error, never a silent fallback.
         // Recognition lands with the unified phase
         // (`src/ccl/design/mutability.md`).

@@ -529,8 +529,9 @@ position it reads the tap **only if that position's delta actually wrote it**
 **conditional feed** (`if p: out << e`) is the same shape — the letrec phase gives it a
 `to_<defer>__fire` gate (its guard path) and folds that path into the `commit` gate so a
 feed-only position still appends a change carrying the tap. Because the drive is
-position-sorted, the tap stream is position-ordered even over an async source (the dense
-`Recurse` path scrambled it by arrival order — the bug this replaces).
+position-sorted, the tap stream is position-ordered even over an async source — which is the
+property that matters, since an async domain arrives in arbitrary order and a tap read off
+arrival order would scramble the feed.
 
 <a id="remaining-the-never-terminating-bound"></a>
 **Bounding a never-terminating loop (keep-latest changelog GC).** The changelog is bounded

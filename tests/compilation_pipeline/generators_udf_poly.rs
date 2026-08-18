@@ -165,7 +165,7 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 // mutates a pre-loop variable (`total += item`) and yields its updated
 // value each iteration, producing a running-total stream.  This routes
 // through the causal `LetRec` the unified phase emits (recognized onto the
-// `Transact` carrier, then `Recurse`), with the yield-defer hoisted out as a
+// `Transact` carrier, then the induction store), with the yield-defer hoisted out as a
 // `to_*` feed field on the history record.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
