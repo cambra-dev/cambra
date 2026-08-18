@@ -1922,8 +1922,9 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
 // Read rules and rejected shapes
 // ---------------------------------------------------------------------------
 
-/// A transactional mutable variable may be read only inside a `with begin():` block; a
-/// bare read outside one is rejected with a hint to wrap it in a block.
+/// A transactional mutable variable may be read only inside a `with begin():` block, and
+/// that is permanent rather than a current limitation (the CHL spec, "8.3 Reads"). The
+/// diagnostic names both legal reads: wrap it in a block, or `await_final` it.
 #[test]
 fn bare_txn_read_outside_tx_rejected() {
     check_compile_error(
@@ -1934,6 +1935,27 @@ fn bare_txn_read_outside_tx_rejected() {
             pool
         "#},
         "read transactional variable `pool` inside a `with begin():` block",
+    );
+}
+
+/// The gate follows a `Mut(_, Txn)` **parameter** into the callee: a by-reference pass is
+/// the one mention lowering lets through, and it hands the callee a mutable variable in
+/// its own right, so a read of it there obeys the same rule. Reading only inside a block
+/// is permanent (the CHL spec, "8.3 Reads"), so it holds through a function boundary as
+/// well as at the top level.
+#[test]
+fn bare_read_of_a_mut_param_outside_a_block_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            def draw(p: Mut(Int, Txn), amt):
+                before = p
+                with begin():
+                    p := p - amt
+            pool: Mut(Int, Txn) := 100
+            draw(pool, 10)
+            await_final(pool)
+        "#},
+        "read transactional variable `p` inside a `with begin():` block",
     );
 }
 

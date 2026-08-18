@@ -1511,7 +1511,7 @@ pub fn check_no_guarded_induction_write_in_block(
 ///
 /// `await_final(x)` declares `x`'s commit history complete, which is what makes "final"
 /// name a fixed value: it closes the writer set (the CHL spec,
-/// [`await_final`](../../../docs/chl-spec.md#86-await_final-decided)). A later mention
+/// [`await_final`](../../../docs/chl-spec.md#86-await_final)). A later mention
 /// uses something already used up — a write would extend a history the program reduced,
 /// a read would sample a store nothing can still drive, and a second `await_final(x)` is
 /// such a mention too.
@@ -1618,7 +1618,7 @@ pub fn check_await_final_linearity(expr: &Expr) -> Result<(), String> {
 /// dependency between two recurrences — a one-way edge between two letrecs, which
 /// [`check_letrec_causal`](crate::ccl::letrec::check_letrec_causal) permits since it
 /// forbids only cycles. That is what makes **phase separation** compile; the CHL spec,
-/// [`await_final`](../../../docs/chl-spec.md#86-await_final-decided), gives the program.
+/// [`await_final`](../../../docs/chl-spec.md#86-await_final), gives the program.
 /// Everything outside a store's own bindings is likewise fine: a block may follow an
 /// await, an await may be bound and used (`f = await_final(pool)`), and an **induction**
 /// accumulator may be seeded from one (`x := await_final(pool)`) — a different

@@ -967,7 +967,7 @@ request-indexed, but not commit-ordered. To gate or commit-order a reply, put it
 
 The **terminal read of a transactional mutable variable**. Surface, semantics, and the
 unreferenceable-after rule are specified in the
-[CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final-decided); in the [ordering
+[CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final); in the [ordering
 model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the commit-domain analog of
 loop completion — a **completeness** edge on the `Txn` domain.
 
@@ -1278,16 +1278,17 @@ legitimately restrict the source; each branch's block is a **distinct transactio
 is intact — still one snapshot, one commit, one write-set per transaction. The whole difference is
 "two transactions" vs. "one transaction, two paths".
 
-**A variable-reading guard is not an atomic check.** These two are not equivalent:
+**A guard reading the variable is rejected, so the non-atomic check is unwritable.** Of these two,
+only (B) is a program:
 
 ```text
-if balance > 0: with begin(): balance -= req      # (A) non-atomic pre-check
+if balance > 0: with begin(): balance -= req      # (A) rejected: `balance` is read outside a block
 with begin(): if balance > 0: balance -= req       # (B) atomic — checked in the snapshot
 ```
 
-In (A) `balance > 0` is a **live/as-of read outside the transaction** — a TOCTOU pre-check that can
-go stale between the read and the commit. It is faithfully compilable (the guard becomes a gating
-as-of read deciding whether the transaction fires), but it is not an atomic guard, and a user who
-wrote (A) most likely meant (B), the in-block deny guard. This form should at least be documented,
-ideally linted (a variable-reading guard on a conditional transaction) with a pointer at (B).
+(A) would be a TOCTOU pre-check, stale between the read and the commit. It does not compile, and not
+because conditional transactions are unbuilt: a `Txn` variable is read only inside a `with begin():`
+block, permanently (the CHL spec, [reads](../../../docs/chl-spec.md#83-reads)), so the guard is
+rejected at lowering whatever becomes of the conditional around it. That leaves (B) as the only way
+to write the check, which is the atomic one, so there is no footgun here to lint.
 
