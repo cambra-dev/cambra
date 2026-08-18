@@ -1170,7 +1170,7 @@ fn test_conditional_record_arms_join_by_field_intersection() {
     // lattice joins)
     assert_eq!(
         infer_program("(a=1, b=2) if True else (a=1, c=3)").to_string(),
-        "{a: 1}"
+        "{a: Int@1}"
     );
     // Arms disagreeing on the shared field keep the field but not the witness.
     assert_eq!(
@@ -2778,7 +2778,7 @@ fn a_single_type_fault_prints_no_demand() {
     "#})
     );
     assert!(
-        missing.contains(".b") && missing.contains("{a: 1}"),
+        missing.contains(".b") && missing.contains("{a: Int@1}"),
         "expected a fault naming the absent field and the record, got: {missing}"
     );
     assert!(
@@ -2860,7 +2860,7 @@ fn a_tail_read_denotes_the_mut_vars_value() {
         a
     "#})
         .to_string(),
-        "7"
+        "Int@7"
     );
 }
 
@@ -2879,7 +2879,7 @@ fn a_conditional_over_two_mut_vars_denotes_their_values() {
             (x if True else y, 0)
         "#})
         .to_string(),
-        "(Int, 0)"
+        "(Int, Int@0)"
     );
 }
 

@@ -833,12 +833,12 @@ impl fmt::Display for Type {
                     )
                 }
             }
-            // A **singleton** prints as the literal it pins: `{Int | __elem == 5}` is
-            // `5`. That is the whole content of the type, and spelling it out puts a
-            // predicate in front of the reader at every literal. Every other
-            // refinement prints in the general form.
+            // A **singleton** prints as its base pinned to the literal: `{Int |
+            // __elem == 5}` is `Int@5`. The predicate is the type's whole content,
+            // and spelling it out puts one in front of the reader at every literal.
+            // Every other refinement prints in the general form.
             Type::Refinement(t, r) => match singleton_value(self) {
-                Some(lit) => write!(f, "{}", symbolic::symbolic(lit)),
+                Some(lit) => write!(f, "{t}@{}", symbolic::symbolic(lit)),
                 None => write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate)),
             },
             Type::Hole => write!(f, "_"),

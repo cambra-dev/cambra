@@ -155,7 +155,7 @@ Types (from `Display for Type` in `src/ccl/mod.rs`):
 
 - **Function**: `(T ⇒ U)` for a compute function; `(T ⤇ U)` (plain-text `|=>`) for a data function (the domain is the data map, joins must be lossless). FunKind is inferred by the solver (`FunKind::Var`, resolved at coalesce — see `src/ccl/design/type-inference.md` §4.6) and `Display` renders it live: a data collection shows `⤇`, a capability (and a genuinely unresolved kind var) `⇒`. A comprehension over a **let-bound** collection source resolves to `⤇` just like one over a literal source (`let x = [1,2,3] in [y + 10 for y in x]` is `⤇`) — its domain is a data collection.
 - **Sigma** (in-flight, same stack): `Σ{D0, D1} ⤇ V` — a data function whose domain is exactly one of the listed choices; with a live witness binder, `(Σ n ∈ {D0, D1}. n ⤇ V)`.
-- **Refinement**: `{T | predicate}` — predicate is rendered via `symbolic`.
+- **Refinement**: `{T | predicate}` — predicate is rendered via `symbolic`. A **singleton** (a base refined by exactly `__elem == <lit>`) renders `T@lit`: `{Int | __elem == 7}` is `Int@7`.
 - **UIntRange**: `[0, N]`, or `∅` when empty.
 - **Hole**: `_`.
 - **Infer**: `?N` (where `N` is the variable id).
