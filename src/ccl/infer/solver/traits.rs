@@ -823,9 +823,9 @@ enum Step {
 /// empty path is the variable itself.
 ///
 /// The unit a requirement actually constrains. A variable is too coarse — `λ 𝑎 𝑏 → …`
-/// passes its parameters through a tuple, so each occurrence of `𝑎` is a distinct
-/// variable and no variable carries both of `𝑎`'s requirements, even though both
-/// constrain one value.
+/// uncurries to a lambda over a tuple and rewrites each occurrence of `𝑎` to a
+/// projection of it, so each occurrence has its own variable and none carries both of
+/// `𝑎`'s requirements, even though both constrain one value.
 type Place = Vec<Step>;
 
 /// What is known about one place: the variables standing at it, and every requirement
