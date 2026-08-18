@@ -693,7 +693,10 @@ fn lower_expr_inner(
             if ctx.is_transactional_mut_var(name) && !ctx.in_tx_body && !ctx.is_shadowed(name) {
                 return Err(LoweringError::unsupported(
                     expr.span,
-                    format!("read transactional variable `{name}` inside a `with begin():` block"),
+                    format!(
+                        "read transactional variable `{name}` inside a `with begin():` block (or \
+                         `await_final({name})` for its final committed value)"
+                    ),
                 ));
             }
             Ok(Expr::var(name.to_string()))

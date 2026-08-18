@@ -507,8 +507,8 @@ fn rewrite_txn_reads(
     e.walk_children_mut(|c| rewrite_txn_reads(c, reg, reg_ty, read_map));
 }
 
-/// Collapse a multi-variable live read\'s snapshot source: the pre-elim
-/// live-read rewrite emits `as_of((trigger, (f_a: ⟨a-hist⟩, f_b: ⟨b-hist⟩)))`
+/// Collapse a multi-variable as-of read\'s snapshot source: the pre-elim
+/// as-of-read rewrite emits `as_of((trigger, (f_a: ⟨a-hist⟩, f_b: ⟨b-hist⟩)))`
 /// with a *record literal* of history reads (the mutable variable record does not exist
 /// yet). After [`rewrite_txn_reads`] every field is `__reg.f`; replace the
 /// literal with the mutable variable itself, so op-conversion latches ONE

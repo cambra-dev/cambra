@@ -102,7 +102,7 @@ A mutable variable mention that denotes its **value** is dereffed by the rule th
 (`infer::emit::emit_value_read`), not by the subtyping relation. `Mut(𝑉) <: 𝑉` is not a
 subtyping fact.
 
-The handle survives in exactly **two** positions, and the second-class discipline is what
+The handle survives in exactly **three** positions, and the second-class discipline is what
 makes them enumerable: rule 1 forces a `Mut`-typed value to be a bare `Var` and rule 2
 keeps `Mut` out of every composite, so a parent always knows whether the operand it is
 about to constrain is a handle position.
@@ -112,6 +112,11 @@ about to constrain is a handle position.
   rule relates the two value types directly.
 - A **write's target**, which is resolved by name rather than as a subexpression. The
   written *value* is an ordinary value position and reads.
+- **[`await_final`](#await_final)'s operand.** The terminal read reduces the mutable variable's
+  history rather than one sampled value, so its scheme `∀ν. Mut(ν, Txn) ⇒ ν` puts a `Mut` in
+  the domain. Inference sees the pass-by-reference case above — `emit_apply` reads that `Mut`
+  off the head of the spine — and lowering resolves the operand by name as it does a write
+  target, so the mention never becomes a value position at all.
 
 A lambda's result is deliberately *not* dereffed: that is where rule 2 catches a function
 returning a `Mut`, and dereffing would silently accept the escape by turning it into a
@@ -164,9 +169,9 @@ Two surface facts are load-bearing for the realization and worth restating here:
   CCL `Display` level, so `Mut(𝑉, 𝐷)` renders the same way throughout this document and in the
   language.
 - **A `Txn` mutable variable is read only inside a `with begin():` block, and a fed-out read is an as-of
-  sample** (compiled to `AsOf`); the sole terminal mutable variable read is `await_final`, designed but not
-  built. These two facts drive the
-  [live-read rewrite](#replies-live-cross-endpoint-reads-and-commit-ordered-taps) and the
+  sample** (compiled to `AsOf`). The one read that waits for the whole history instead of sampling it
+  is [`await_final`](#await_final). These facts drive the
+  [as-of-read rewrite](#replies-live-cross-endpoint-reads-and-commit-ordered-taps) and the
   [`AsOf` engine](#the-runtime-engines) below.
 
 > **Design commitment — transactional mutability is deliberately *unordered*.** There is no
@@ -177,10 +182,10 @@ Two surface facts are load-bearing for the realization and worth restating here:
 > balance` after a loop whose first iteration *denies* may observe the mutable variable before the first commit
 > lands (its singleton read samples an early position). The only ways a `Txn` value interacts with
 > the world are: read/written **inside** a `with begin():` (rejected outside one — as a feed RHS or
-> anywhere else), or observed as a *definite* committed value through the **future `await_final`** —
-> the single sanctioned terminal read. Do **not** add inter-transaction ordering to "fix" the
-> early-read case; the unordering is the intended model, and `await_final` is where determinism comes
-> from when a program needs it.
+> anywhere else), or observed as a definite committed value through
+> [**`await_final`**](#await_final) — the single sanctioned terminal read. Do not add
+> inter-transaction ordering to "fix" the early-read case; the unordering is the intended model, and
+> `await_final` is where determinism comes from when a program needs it.
 
 ## CCL representation
 
@@ -407,7 +412,9 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⇒ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⇒ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
-| `final_or_default` | `(𝐷 ⇒ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractFinal`). Applied to a `Txn` mutable variable only through the surface [`await_final`](#await_final) primitive (designed, not yet built); a bare fed-out mutable variable read never becomes one |
+| `final_or_default` | `(𝐷 ⇒ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractFinal`). Over a `Txn` history it is only ever the surface [`await_final`](#await_final)'s read — a fed-out read is an `as_of_read`, a different term |
+| `as_of_read` | `(Txn ⇒ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
+| `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_or_default` over the mutable variable's history binding. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
 
 `begin()` never reaches CCL — lowering records the block structure, and the phase mints one
 `begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order (which is what
@@ -473,7 +480,7 @@ CHL source
                         writer bodies decision-factored; eliminates For / MutWrite)
   → channelize         (append-mutability elimination: route feeds on the LetRec tree; erase ChanDom
                         by substitution; eliminates Feed / Defer)
-  → live-read rewrite  (bare history reads fed out of read-only blocks → AsOf)
+  → as-of-read rewrite (bare history reads fed out of read-only blocks → AsOf)
   → lambda_elim        (the LetRec travels through — bodies point-freed, group intact)
   → typecheck          (strict wall)
   → plan_loops         (planning/loops.rs: point-free letrec patterns → the Transact carrier;
@@ -522,7 +529,7 @@ about it.
   `{reads ∪ writes}` is therefore one store — which is why the `limit` a guard consults is
   in the same store as the `total` it guards, though nothing writes `limit`.
 - **Snapshot consistency.** A read-only block's reads are latched at one frontier, which
-  `rewrite_live_reads`'s `build_snapshot` realizes by handing `AsOf` a single mutable variable
+  `rewrite_as_of_reads`'s `build_snapshot` realizes by handing `AsOf` a single mutable variable
   record. Keys read together must be in that record. Such a block is *unwrapped* onto the
   spine and leaves no `WriterSite`, so `strip` keeps its footprint explicitly
   (`Stripped::read_only_footprints`).
@@ -560,10 +567,23 @@ key left above the letrec would still find its seed introduction, whereas a defe
 the store exists nowhere else. That is also why an effect statement counts for the transitive
 step — it binds no name, but it contributes to one.
 
-The folded cross-domain induction loops (`CrossDomain`) wrap the **whole** nest: an
-accumulator a commit decision reads must be bound outside any store that reads it, and
-outermost satisfies that for all of them at once (`a_cross_domain_read_coexists_with_a_second_store`
-pins the nesting).
+The folded cross-domain induction loops (`CrossDomain`) get a level of their own, by the
+same rule. Outermost is the usual answer and what the invariant demands — an accumulator a
+commit decision reads must be bound outside any store that reads it, and outermost
+satisfies that for all of them at once (`a_cross_domain_read_coexists_with_a_second_store`).
+But the group can itself depend on a store, through an [`await_final`](#await_final), so
+`cross_level` puts it inside the innermost store it *reads*. The two demands never
+conflict, because an awaited variable's writers all precede the await while a store reading
+the accumulator commits after the accumulator's loop
+(`a_cross_domain_accumulator_depending_on_an_await_nests_inside_that_store` pins the
+induction carrier landing *between* two commit stores).
+
+**One post-condition covers all of it.** The level assignment, the cross-domain level, and
+the store nesting order are three separate arguments that a reference stays in scope, none
+of them enforced by the shapes being built — so `splice_stores` release-asserts the thing
+they are all arguments *for*: the placed tree may not have gained a free name. An escape
+survives the strict typecheck and would surface much later as an unrecognised variable in
+op-conversion.
 
 Both paths close a group through one shared routine, `mut_elim::close_recurrence_group`
 — trailing reads, then feed hoists, then the causality assert, then the `LetRec`. The two
@@ -715,11 +735,11 @@ this section states how the letrec model *delivers* them.
   program that needs the counter transactionally consistent with the mutable variable declares it
   `Mut(Int, Txn)`.
 - **Liveness.** Induction domains are finite or stream-complete; `Txn` histories complete when all
-  writer sources do. A fed-out `Txn` mutable variable read reads as-of its own position in the commit clock
-  and does not wait for completeness. The one term that *does* wait for a mutable variable's completeness is
-  [`await_final`](#await_final) (designed, not yet built); it is well-defined precisely because it
-  closes the writer set (the mutable variable is unreferenceable afterward, so no later writer can extend the
-  history it just declared complete).
+  writer sources do. A fed-out `Txn` mutable variable read reads as-of its own position in the commit
+  clock and does not wait for completeness. The one term that waits for a mutable variable's
+  completeness is [`await_final`](#await_final), and it is well-defined because it closes the writer
+  set: the mutable variable is unreferenceable afterward, so no later writer can extend the history it
+  just declared complete.
 
 ## Ordering and concurrency
 
@@ -798,20 +818,16 @@ causal matcher (`letrec::check_letrec_causal`).
   correlation id. It is the dual of the induction accumulator: the induction accumulator latches a private accumulator per
   source step; `AsOf` latches the store's current value per trigger step. It is a *sample at
   observation time* — an arbitrary as-of position, which is exactly the read a transaction gets: the
-  store as of where it lands in the commit order. The only terminal/final mutable variable read is
-  [`await_final`](#await_final) (designed, not yet built): when implemented it is `ExtractFinal` over the
-  key's `StoreValueStream` (the carry stream `StoreValueStream` already projects), folding the
-  completed commit-value stream to its final value — no new engine, the same `final_or_default →
-  ExtractFinal` path the induction final uses, applied for the first time to a `Txn` history. Absent it,
-  a standalone read is just the singleton-trigger case of the same `AsOf`; under the batch scheduler it
-  observes the drained store, but that coincidence is not part of the semantics.
+  store as of where it lands in the commit order. A *standalone fed-out* read is the
+  singleton-trigger case of the same `AsOf`, latching at its own arrival like any other: the
+  position is arbitrary whatever the trigger's domain, and a program that means the final value
+  spells it [`await_final`](#await_final).
 - **`StoreValueStream`** — projects one key's `CommitTs ⇀ V` commit-value stream by folding the
   store changelog. It backs the **in-block reply tap** (`out << e` inside a block — a per-commit,
-  commit-tick-indexed event stream) and is the fold `AsOf` samples. It is *not* reduced by
-  `ExtractFinal` for a mutable variable read — that path (a fold-to-completion "final mutable variable value") does
-  not exist. `ExtractFinal` itself remains, but for the two genuinely-terminating histories that do
-  have a final: a post-loop **induction** accumulator, and the **broadcast source** (a sibling
-  induction loop's final, broadcast into a commit decision).
+  commit-tick-indexed event stream), is the fold `AsOf` samples, and is what `ExtractFinal` reduces
+  for an [`await_final`](#await_final) — no new engine, the same `final_or_default → ExtractFinal`
+  path a post-loop **induction** accumulator and a **broadcast source** (a sibling loop's final, fed
+  into a commit decision) already take, applied to a `Txn` history.
 
 The two loop engines are **not interchangeable**: the commit operator is built for an open commit
 clock and mis-drives an incremental/live source, while the induction accumulator is the ordered loop recurrence.
@@ -923,7 +939,7 @@ A `<<` reply takes one of two forms, by where it sits relative to the `with begi
 
 **As-of read (reply *of* a mutable variable, outside the writing block).** A read-only block
 `with begin(): resp << 𝑒` reading a `Txn` mutable variable replies the mutable variable as of the reading transaction's
-position. The pre-lambda-elim `rewrite_live_reads` turns it into an as-of join indexed by the reading
+position. The pre-lambda-elim `rewrite_as_of_reads` turns it into an as-of join indexed by the reading
 loop, not the commit clock — uniformly, whether that loop is a live request stream, a finite loop, or
 a standalone singleton (the live cross-endpoint read is one instance, not a distinct compilation).
 Three shapes:
@@ -944,6 +960,69 @@ nothing. The tap may read an induction accumulator (`resp << cnt`), which compos
 commit-decision co-iteration above. Contrast a sibling reply *outside* the block (`resp << cnt`),
 which rides the induction domain and fires every iteration regardless of commit — value-correct,
 request-indexed, but not commit-ordered. To gate or commit-order a reply, put it in the block.
+
+## `await_final`
+
+The **terminal read of a transactional mutable variable**. Surface, semantics, and the
+unreferenceable-after rule are specified in the
+[CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final-decided); in the [ordering
+model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the commit-domain analog of
+loop completion — a **completeness** edge on the `Txn` domain.
+
+The realization is **coarser than that contract**: completion is a property of the whole store, so
+an await settles once every writer of the *store* has drained rather than every writer of `𝑥`, and a
+variable whose own writers are finite hangs on a store-mate's live writer. Two changes close the
+gap, both toward per-key completion. The store would have to know which writers may write each key —
+`WriterSite::write_keys` holds that at the CCL level, and only the per-writer terminal flags reach
+`CommitEngine` — and the completeness read would have to reduce the key's *change* stream, whose
+entries are the ticks that wrote `𝑥`, rather than its carry stream, which gains an entry at every
+tick any store-mate commits.
+
+**No new engine.** `await_final(𝑥)` becomes `final_or_default(𝑥.history, init)` — the only
+application of `final_or_default` to a `Txn` history (a fed-out read is an `as_of_read`; see the
+CHL spec, [reads](../../../docs/chl-spec.md#83-reads)) — compiled through the existing
+`final_or_default → ExtractFinal` path over the key's `StoreValueStream`. The fed-out as-of read
+pulls that same stream and differs only in the reducer: fold-to-final vs. sample-at-trigger.
+
+`resolve_await_finals` mints the read at the await's own site, and placement then needs no
+await-specific logic: the resolved read names the history binding, which is already how a statement
+is carried into its store (["How many commit stores a program
+has"](#how-many-commit-stores-a-program-has)).
+
+The two reads are separated by **term**, not by position: a fed-out read is
+`as_of_read(⟨history⟩)`, and only that term is what `rewrite_as_of_reads` matches. Position alone
+would not hold, because a pass may legitimately move a read — `channelize` copies a channel's
+captured bindings inside the channel it closes, which lands a bound await's read
+(`f = await_final(pool)`, read by a feed loop) directly above the broadcast, where the rewrite
+matches (`await_final_bound_then_read_in_a_feed_loop_stays_final`). Distinct terms also make a
+missed pairing loud: an unpaired `as_of_read` is rejected at the end of the rewrite, where spelling
+it `final_or_default` compiled it to a completeness read that waits for a store nothing will
+drain.
+
+The operand is the mutable variable **handle** — the third position alongside a pass-by-reference
+argument and a write target (["A mutable variable read is an explicit
+operation"](#a-mutable-variable-read-is-an-explicit-operation)). `Builtin::AwaitFinal`'s scheme
+`∀ν. Mut(ν, Txn) ⇒ ν` pins the domain, so awaiting an induction accumulator is a type error; and
+lowering resolves 𝑥 by name, as it does a write target, rather than through the value-reading path
+whose out-of-block gate would reject the very read this is.
+
+**Four rules, in three places.** Two are order-independent and belong at lowering: the operand must
+be a `Mut(_, Txn)` mutable variable named bare, and the await may not sit inside a `with begin():`
+block. The other two need the inlined tree in source order — lowering folds its statement chain
+right-to-left, and a callee's mention becomes a read, a write, or a `Begin` only once inlined:
+
+- `check_await_final_linearity`, post-inline beside the other transaction pre-checks — the mutable
+  variable is **consumed**: no `Var` or `MutWrite` naming it may follow its await.
+- `check_store_acyclicity`, inside the phase because the rule is *store*-relative and the partition
+  is what decides which awaits a given writer or seed may not depend on — **a store may not depend
+  on its own await**. An await of a key in another store is an ordinary one-way edge between
+  two recurrences, which is what makes **phase separation** — drain one transaction, seed the next
+  from its final value — compile.
+
+**A mutable variable no `with begin():` block mentions** is a key of no store, so it has no history
+binding to read and its await resolves to the seed directly (`resolve_writer_free_awaits`) — the
+empty-history case, known empty statically. An all-deny history is the other case: it does build a
+store, and its `final_or_default` reports the seed as that store's default.
 
 ## Not yet implemented
 
@@ -1117,12 +1196,11 @@ finalized into the *read* set by `collect_footprint`, so it has a snapshot to **
 its arm does not fire; a read-modify-write already reads the key, and a purely spine (unconditional)
 write needs no carry and stays write-only.
 
-**Sharp edge — a leading deny at position 0.** A block that *denies* (matches no writing/feeding
-guard) at the first transaction is fragile: the mutable variable's as-of read has no prior committed value to
-latch, so a downstream read at position 0 sees the seed rather than a committed value. An `elif`
-chain whose first request falls through to a non-committing branch hits this. It is not yet handled
-generally; tests that exercise elif routing deliberately lead with a committing position. Treat a
-leading-deny elif chain as unsupported until the position-0 as-of latch is generalized.
+**A leading deny is ordinary.** A block that denies (matches no writing/feeding guard) at the first
+transaction leaves the store's first commit to a later position, which no read has to accommodate: a
+fed-out read samples at its own arrival and may see the seed at any position, and `await_final`
+reduces the whole history whatever order the commits land in
+(`tx_if_elif_leading_deny`).
 
 **Not yet implemented**: `with t = begin():` (the handle) is still rejected.
 
@@ -1148,35 +1226,6 @@ path its guard excludes.
 
 Designed — it binds `t` to the transaction's commit time (see the CHL spec,
 [transactions](../../../docs/chl-spec.md#82-transactions-with-begin)) — but rejected at lowering today.
-
-### `await_final`
-
-The **terminal read of a transactional mutable variable** — surface, semantics, and the unreferenceable-after
-rule are specified in the
-[CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final-decided): `await_final(𝑥)` reads a
-`Mut(𝑉, Txn)` mutable variable's final committed value once its whole commit history completes, and `𝑥` is
-unreferenceable afterward so the completion event is well-defined. In the [ordering
-model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the commit-domain analog of loop
-completion — a **completeness** edge on the `Txn` domain. Designed, not built. This section is the
-intended realization.
-
-**Intended realization (no new engine).** `await_final(𝑥)` lowers to `final_or_default(𝑥.history, init)`
-— the *single* permitted application of `final_or_default` to a `Txn` history (a bare fed-out mutable variable
-read never becomes one; see the CHL spec, [reads](../../../docs/chl-spec.md#83-reads)). It compiles through the existing `final_or_default →
-ExtractFinal` path, with `ExtractFinal` folding the key's `StoreValueStream` — the carry
-(`carry_forward`) commit-value stream `StoreValueStream` already projects — to its final value. Contrast
-the fed-out as-of read, which hands `AsOf` the raw store fan and samples an *arbitrary* position: same
-`StoreValueStream` source, different reducer (fold-to-final vs. sample-at-trigger). No new operator, no
-new runtime node — `await_final` is the first term to reduce a mutable variable stream to completion.
-
-**Build sketch** (for whoever implements it): a `"await_final"` arm in `lower_call`
-(`src/ccl/lower/exprs.rs`) emitting the variable-final read; the unreferenceable-after rule enforced by
-the scope machinery that already backs the read/write gates (`LoweringContext`'s transactional-variable
-set in `src/ccl/lower/mod.rs`) — drop `𝑥` from scope at the await point so a later reference hits the
-existing gate; and the completeness read allowed to survive the live-read rewrite
-(`rewrite_live_reads` in `src/ccl/transact_phase.rs`) rather than being dropped as an unresolved
-`final_or_default` over a live history. **Not built today**: a program that names `await_final` does not
-compile.
 
 ### Conditional transactions (a `with begin():` inside a conditional)
 
@@ -1216,7 +1265,7 @@ with begin(): if balance > 0: balance -= req       # (B) atomic — checked in t
 
 In (A) `balance > 0` is a **live/as-of read outside the transaction** — a TOCTOU pre-check that can
 go stale between the read and the commit. It is faithfully compilable (the guard becomes a gating
-live read deciding whether the transaction fires), but it is not an atomic guard, and a user who
+as-of read deciding whether the transaction fires), but it is not an atomic guard, and a user who
 wrote (A) most likely meant (B), the in-block deny guard. This form should at least be documented,
 ideally linted (a variable-reading guard on a conditional transaction) with a pointer at (B).
 

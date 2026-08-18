@@ -1564,12 +1564,13 @@ impl TileProducer for InductionStoreProducer {
 /// while committing, `True` once terminal), so terminality flows through.
 ///
 /// This backs the **in-block reply tap** (`out << e` inside a block —
-/// `carry_forward: false`, one entry per commit tick) and the **read-your-writes
-/// carry** (`carry_forward: true`, the latest write ≤ each tick). A read
-/// fed *out* of a block does not reduce this stream — it folds the store as-of via
-/// [`AsOf`] instead — so there is no `ExtractFinal`-over-this-stream carry-read
-/// path; a fed-out read always samples an arbitrary commit position, never a
-/// "final".
+/// `carry_forward: false`, one entry per commit tick), the **read-your-writes
+/// mutable variable carry** (`carry_forward: true`, the latest write ≤ each tick), and the
+/// **terminal read**: a surface `await_final(x)` reduces this stream with
+/// [`ExtractFinal`](crate::interpreter::tile_operators::ExtractFinal), which resolves
+/// once the store flips `terminal` below. A read fed *out* of a block does not reduce
+/// it — it folds the store as-of via [`AsOf`] instead, sampling an arbitrary commit
+/// position. One stream, two reducers, selected by the term the program wrote.
 pub struct StoreValueStream {
     tiling: Tiling,
     store_op: Box<dyn TileOperator>,
@@ -2053,7 +2054,11 @@ impl TileProducer for StoreDenseReadProducer {
 /// in the commit order. The HTTP case ("a request arriving now sees the store as
 /// committed by now" — the *live cross-endpoint read*) is the canonical instance,
 /// but a finite loop or a standalone singleton reads the same way — an as-of read
-/// at an arbitrary position, with no terminal/"final" variant. The reply is indexed
+/// at an arbitrary position. (The *completed* value is a different term,
+/// `await_final`, reduced by
+/// [`ExtractFinal`](crate::interpreter::tile_operators::ExtractFinal) over the key's
+/// [`StoreValueStream`];
+/// it never arrives here.) The reply is indexed
 /// by the trigger (the reading loop) — an *outer-indexed* read, not commit-clock
 /// indexed. The pairing is by *processing time* — the only ordering the tile model
 /// exposes between two independent streams — which is exactly "a reader sees what's
@@ -2086,10 +2091,10 @@ pub struct AsOfField {
 #[derive(Clone)]
 enum AsOfOutput {
     /// A single mutable variable → scalar codomain `Fun(B, Scalar(V))` — the bare or
-    /// computed single-variable live read.
+    /// computed single-variable as-of read.
     Scalar { key: Value, value_extent: Extent },
     /// A whole-snapshot record → `Fun(B, Record{field: Scalar(V)})` — the
-    /// multi-variable live read. Every field is folded from **one** source render
+    /// multi-variable as-of read. Every field is folded from a single source render
     /// at one commit frontier (§I-c), so a reply reading several mutable variables sees a
     /// consistent snapshot.
     Record { fields: Vec<AsOfField> },
@@ -2146,7 +2151,7 @@ impl AsOf {
     /// The multi-variable **snapshot** read: sample every `field`'s mutable variable at
     /// one commit snapshot → output `Fun(B, Record{field: Scalar(V)})`, from which
     /// the reply projects each mutable variable. This is the §I-c snapshot-consistent
-    /// live read.
+    /// as-of read.
     pub fn new_snapshot(
         trigger: Box<dyn TileOperator>,
         source: Box<dyn TileOperator>,
@@ -2352,26 +2357,15 @@ impl TileProducer for AsOfProducer {
             _ => Predicate::False,
         };
         let store_terminal = source_tile.is_terminal();
-        // Latch timing distinguishes a **live** trigger from a **batch** one — the
-        // consumer-driven replacement for the retired in-`get` drive-to-fixpoint:
+        // Every trigger position latches as of its own arrival — the watermark the
+        // moment it is first observed — whatever the trigger's domain. Freeze-once:
+        // a position is recorded in `seen` exactly once, so its latched value never
+        // changes; new positions latch newer values as commits land across re-pulls.
+        // The read a program gets is therefore an arbitrary as-of sample, uniformly,
+        // which is what the unordered transactional model specifies (a program that
+        // means the completed value writes `await_final`, whose reducer is
+        // `ExtractFinal` over the key's [`StoreValueStream`], not this operator).
         //
-        //  - A **live** trigger (a non-terminal request stream) cannot wait for a
-        //    store that may never terminate, so each position latches **as of its
-        //    arrival** — the current watermark the moment it is first observed. New
-        //    requests latch newer values as commits land across re-pulls.
-        //  - A **batch** trigger (terminal — a finite loop or the synthesized
-        //    singleton of a standalone read) *can* wait: its store is finite and
-        //    will go terminal, so we **defer** latching until the store is drained.
-        //    The writer's one-step-per-pull self-re-arm drives the store to terminal
-        //    and re-pulls us; latching only then makes the batch observe the
-        //    fully-committed value — the batch scheduler's as-of coincidence, and
-        //    what keeps a standalone read from freezing on the seed. (Deferring is a
-        //    latch-timing gate, not a drive loop: we still sample once per pull.)
-        //
-        // `may_latch` is that gate. Freeze-once is preserved either way — a position
-        // is recorded in `seen` exactly once, so its latched value never changes.
-        let trigger_terminal = trigger_pred.as_bool() == Some(true);
-        let may_latch = store_terminal || !trigger_terminal;
         // If the store has no decided value yet, `snapshot` is `None` and we latch
         // nothing this round — the position is left un-seen and latches on a later
         // pull. Positions at or below the release watermark are skipped: the consumer
@@ -2379,9 +2373,7 @@ impl TileProducer for AsOfProducer {
         // re-presents one (a lazily-compacting trigger's domain still legally carries
         // the position until it compacts). That skip is what makes the `release_impl`
         // compaction safe.
-        if let (true, Tile::SealedFunction { domain, .. }, Some(snap)) =
-            (may_latch, &trigger_tile, &snapshot)
-        {
+        if let (Tile::SealedFunction { domain, .. }, Some(snap)) = (&trigger_tile, &snapshot) {
             for i in 0..domain.len() {
                 let b = domain.index_at(i);
                 if self.is_released(&b) {
@@ -2407,21 +2399,21 @@ impl TileProducer for AsOfProducer {
                 )));
         }
         // Terminality gate. With the producer-side drive-to-fixpoint retired, this
-        // reader samples one watermark per pull and relies on being re-pulled (via
-        // the writer's wakeup fanning through the cyclic `FanOut`) to converge. So
-        // it must stay **non-terminal** until the store itself is terminal *and*
-        // every live trigger position is latched — otherwise it could report "done"
-        // while the store is still committing (freezing a store no other consumer
-        // drives) or while a live trigger position is still awaiting a value (a
-        // finite-batch trigger's terminality would strand that request forever).
-        // Only once the store is fully decided and no unlatched live position
-        // remains does the trigger's own terminality ride through.
-        let has_unlatched_live = matches!(&trigger_tile, Tile::SealedFunction { domain, .. }
+        // reader samples one watermark per pull and relies on being re-pulled (via the
+        // writer's wakeup fanning through the cyclic `FanOut`) to converge. So it must stay
+        // **non-terminal** until the store itself is terminal, or it could report "done"
+        // while the store is still committing and freeze a store no other consumer drives.
+        //
+        // The unlatched-position half covers the one way a terminal store can still owe a
+        // value: the snapshot above is all-or-nothing, so a key with no decided value
+        // withholds it. Every present position latches on the pull that finds a snapshot,
+        // which is why this is otherwise false by the time the gate reads it.
+        let has_unlatched_position = matches!(&trigger_tile, Tile::SealedFunction { domain, .. }
         if (0..domain.len()).any(|i| {
             let b = domain.index_at(i);
             !self.is_released(&b) && !self.seen.contains(&b)
         }));
-        let emit_pred = if store_terminal && !has_unlatched_live {
+        let emit_pred = if store_terminal && !has_unlatched_position {
             trigger_pred
         } else {
             Predicate::False
@@ -5194,9 +5186,10 @@ mod tests {
     /// `StoreValueStream` projects the store's history to `key`'s commit-value
     /// stream (`Txn ⇀ Value`), observable as it commits — no terminal gate — with
     /// terminality flowing through from the store. This checks the projection
-    /// (both values visible while still committing) and that `ExtractFinal` *can*
-    /// compose over it once terminal — a stream-mechanism test, not the mutable variable
-    /// read path (a fed-out mutable variable read is `AsOf`, not `ExtractFinal`).
+    /// (both values visible while still committing) and that `ExtractFinal`
+    /// composes over it once terminal — the mechanism a surface `await_final` read
+    /// compiles to, exercised here at the operator level. (A *fed-out* mutable variable read
+    /// is `AsOf` over the same stream, not `ExtractFinal`.)
     #[test]
     fn store_value_stream_projects_committed_values() {
         let value_ext = Extent::Base(BaseType::Int);

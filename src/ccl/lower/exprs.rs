@@ -5,8 +5,8 @@
 use super::*;
 use crate::{
     ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, LogicKind, Name, Type,
-        TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BinOpKind, Builtin, CompareKind, Expr, LogicKind, Name,
+        Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_data_fun},
     },
     chl_parser::ast::{
@@ -33,6 +33,7 @@ pub(super) fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
 /// | `sum(expr)` | [`TypedExprNode::Aggregate`] (`Sum`) | 1 |
 /// | `max(expr)` | [`TypedExprNode::Aggregate`] (`Max`) | 1 |
 /// | `groupby(collection, key)` | `Lambda`/`Apply` encoding with refinement | 2 |
+/// | `await_final(x)` | [`TypedExprNode::Apply`] of [`Builtin::AwaitFinal`] to a `Var` | 1 |
 ///
 /// Unknown function names return [`LoweringError::Unsupported`]. (CHL has no
 /// keyword-argument syntax, so the parser already rejects those.)
@@ -129,6 +130,67 @@ pub(super) fn lower_call(
             };
             let input = lower_expr(&args[0], ctx)?;
             Ok(Expr::aggregate(input, kind))
+        }
+        // `await_final(x)` — the terminal read of a transactional mutable variable: `x`'s
+        // final committed value once its whole commit history completes (CHL spec,
+        // "`await_final`"). Lowers to `x ▷ await_final` — the handle applied to the
+        // reducing builtin; `transact_phase` replaces it with `final_or_default`
+        // over the mutable variable's history binding.
+        //
+        // The argument is resolved **by name**, like a write's target and unlike an
+        // ordinary call argument: `await_final` reduces the mutable variable's history rather
+        // than consuming a value, so the operand is a handle position and never goes
+        // through the value-reading `lower_expr` (whose out-of-block read gate would
+        // reject the very read this is).
+        "await_final" => {
+            let [arg] = args else {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    "await_final requires exactly one argument",
+                ));
+            };
+            let ChlExpr::Name(id) = &arg.node else {
+                return Err(LoweringError::unsupported(
+                    arg.span,
+                    "await_final takes a transactional mutable variable by name",
+                ));
+            };
+            let reg = id.as_str();
+            if !ctx.is_transactional_mut_var(reg) || ctx.is_shadowed(reg) {
+                return Err(LoweringError::unsupported(
+                    arg.span,
+                    format!(
+                        "`{reg}` is not a transactional mutable variable, so it has no commit history to \
+                         await. `await_final` applies to a `{reg}: Mut(V, Txn) := …` mutable variable; an \
+                         induction accumulator's final value is read by naming it after its loop"
+                    ),
+                ));
+            }
+            // Inside a block the await would be a read of the very history that
+            // block extends — a transaction waiting on its own completion. The
+            // snapshot read (a bare `x`) is the only mutable variable read a block has.
+            if ctx.in_tx_body {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    format!(
+                        "await_final(`{reg}`) inside a `with begin():` block would wait on the \
+                         commit history that block extends; a block reads `{reg}` bare, as a \
+                         snapshot"
+                    ),
+                ));
+            }
+            // The *linearity* rule — the await consumes the mutable variable, so no later read
+            // or write may name it, and no mutable variable may be awaited twice — is not
+            // checkable here: `lower_stmts_inner` builds its statement chain
+            // right-to-left, so lowering visits the tail before the statements it
+            // follows. It is `transact_phase::check_await_final_linearity`, on the
+            // typed tree whose continuation spine runs in source order and where mutable variable
+            // identity is exact. A later `with begin():` block is only rejected by it
+            // if that block names the awaited mutable variable; blocks over other mutable variables
+            // are ordinary.
+            let mut_var = ctx.tag_image(Expr::var(reg.to_string()), arg.span);
+            let await_fn = ctx.tag_image(Expr::builtin(Builtin::AwaitFinal), func.span);
+            Ok(Expr::apply(mut_var, await_fn))
         }
         "defer" => Ok(Expr::new(TypedExprNode::Defer)),
         name if ctx.sources.contains_key(name) => {

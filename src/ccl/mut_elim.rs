@@ -700,7 +700,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
             // straight-line feeds, so re-emit a conditional-feed loop as a generator
             // `iter ≫ (λ target → body)` `Compose` for `channelize` to fan out,
             // rather than flattening it here. (A mutable variable read in the feed value stays
-            // in the arm value; `rewrite_live_reads` handles it post-channelize, as
+            // in the arm value; `rewrite_as_of_reads` handles it post-channelize, as
             // for the straight-line read-only reply.)
             if body_has_statement_case(&loop_body) {
                 // Normalize away the block's trailing `; unit` terminals (a
@@ -982,11 +982,10 @@ pub(crate) fn fold_induction_loop(
 /// no history binding and no letrec.
 ///
 /// When `value` is a read of a transactional mutable variable (a `Var` `transact_phase`
-/// rebound to `final_or_default(__reg.k, init)`, constant in `target`), the map
-/// broadcasts the mutable variable's terminal render to every loop position;
-/// `transact_phase::rewrite_live_reads` (post-`channelize`, pre-lambda-elim)
-/// then turns that broadcast over a live (non-enumerable `Txn`) mutable variable into an
-/// outer-indexed as-of join — the request-loop-indexed live cross-endpoint read.
+/// rebound to `as_of_read(__reg.k)`, constant in `target`), the map broadcasts that
+/// as-of read to every loop position; `transact_phase::rewrite_as_of_reads`
+/// (post-`channelize`, pre-lambda-elim) then pairs it with this loop as its trigger,
+/// which is where the outer-indexed as-of join gets the position it reads at.
 fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
     let (domain_ty, _item_ty) = fun_parts(&iter.ty);
     let mut env: HashMap<Name, Expr> = HashMap::new();

@@ -930,7 +930,15 @@ pub fn compile_program(
     // in release).
     transact_phase::check_no_guarded_induction_write_in_block(&expr, &txn_mut_vars)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    expr = transact_phase::run(expr, &txn_mut_vars);
+    // `await_final` consumes its mutable variable: no mention may follow its await. A
+    // statement-order rule lowering cannot see — it builds its chain right-to-left —
+    // and a callee's mention only becomes a read, a write, or a `Begin` once inlined.
+    // (The companion rule, that a commit store may not depend on the completion of
+    // that same store, is decided per store and so lives inside the phase.)
+    transact_phase::check_await_final_linearity(&expr)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    expr = transact_phase::run(expr, &txn_mut_vars)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     debug!("Transact phase CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).expect("transact phase produced an inconsistent tree");
 
@@ -972,9 +980,10 @@ pub fn compile_program(
     // computed reply (`resp << balance + 1`) stays a lambda the elim pass point-frees,
     // rather than a point-free `const` a planning-time recognizer would have to
     // reject. Uniform across the reading loop's domain. See
-    // `transact_phase::rewrite_live_reads`.
-    transact_phase::rewrite_live_reads(&mut desugared);
-    typecheck(&desugared).expect("live-read rewrite produced an ill-typed tree");
+    // `transact_phase::rewrite_as_of_reads`.
+    transact_phase::rewrite_as_of_reads(&mut desugared)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    typecheck(&desugared).expect("as-of-read rewrite produced an ill-typed tree");
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
