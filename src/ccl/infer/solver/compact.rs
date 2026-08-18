@@ -846,7 +846,22 @@ fn compact_go(
             // an `IncompatibleBounds` error). See the rationale above, and
             // [`fallback_allowed`] for why it happens only at a position.
             let no_concrete = bound.as_ref().is_none_or(|b| {
-                b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none() && b.history_slot.is_none()
+                let CompactType {
+                    atoms,
+                    rec,
+                    fun,
+                    history_slot,
+                    // A variant shape deliberately does *not* count as concrete: an
+                    // arm binder's negative bounds are the arms the body handles, so
+                    // stopping here would make a domain the sum of everything the
+                    // `match` can accept rather than the argument it was given.
+                    var: _,
+                    // Not shape. Both are carried across the fallback explicitly
+                    // below, rather than deciding whether it fires.
+                    vars: _,
+                    refinements: _,
+                } = b;
+                atoms.is_empty() && rec.is_none() && fun.is_none() && history_slot.is_none()
             });
             if no_concrete && allow_fallback {
                 let mut recovered: Option<CompactType> = None;

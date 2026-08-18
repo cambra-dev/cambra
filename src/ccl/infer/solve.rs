@@ -2610,6 +2610,55 @@ mod tests {
         );
     }
 
+    /// The positional restriction itself, with nothing else in the frame.
+    ///
+    /// `let g = λ x → x in let f = λ t → (t.0 ▷ g, t.2 ▷ g) in (0, 1, 2) ▷ f`
+    ///
+    /// `f`'s domain is the tuple its own call site passed, so component 2 is the
+    /// singleton `2`. What makes the program a *detector* is the two `g` uses: their
+    /// results meet in `f`'s result tuple, and that join is `0 ⊔ 2 = Int`. A collapse
+    /// allowed to travel along the bound chain runs out of upper bounds inside `f`,
+    /// continues through `g`'s codomain into the result tuple, and hands that join
+    /// back as the demand on the position it started from — `(0, 1, Int)`.
+    ///
+    /// This is the companion the two `Case` tests above cannot be. Both of those are
+    /// *also* repaired by the fallback's result handling — accumulating separately
+    /// instead of merging into the polarity-correct walk's leftover — so neither
+    /// isolates [`fallback_allowed`](super::solver::compact) and both stay green with
+    /// the guard neutralized to `true`. Here nothing else can move the answer: no
+    /// variant, no refinement set, just a projection whose result reaches a join.
+    #[test]
+    fn a_domain_does_not_read_back_the_join_its_results_meet_in() {
+        let g = TypedExpr::lambda("x", Type::infer(), TypedExpr::var("x"));
+        let through_g = |i: usize| {
+            TypedExpr::apply(
+                TypedExpr::apply(TypedExpr::var("t"), TypedExpr::proj_index(i)),
+                TypedExpr::var("g"),
+            )
+        };
+        let f = TypedExpr::lambda(
+            "t",
+            Type::infer(),
+            TypedExpr::tuple(vec![through_g(0), through_g(2)]),
+        );
+        let arg = TypedExpr::tuple(vec![lit_int(0), lit_int(1), lit_int(2)]);
+        let mut e = TypedExpr::let_bind(
+            "g",
+            g,
+            TypedExpr::let_bind("f", f, TypedExpr::apply(arg, TypedExpr::var("f"))),
+        );
+        run_inference(&mut e).expect("projection-through-identity program type-checks");
+        assert_eq!(
+            collect_mono_param_types(&e),
+            vec![Type::Tuple(vec![
+                int_lit_ty(0),
+                int_lit_ty(1),
+                int_lit_ty(2),
+            ])],
+            "the domain is the argument tuple, not the join its components' results meet in"
+        );
+    }
+
     #[test]
     fn chained_poly_shares_inner_specialization_across_same_typed_clones() {
         // let f = λx. (x, x) in let g = λy. f(y) in (g(1), g(2), g("a"))
