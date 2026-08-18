@@ -1321,7 +1321,9 @@ fn collect_expr_fv(
     collect_type_fv(&e.ty, bound, visited, out);
     for_each_scoped_item(e, &mut |item| match item {
         ScopedItem::VarRef(n) => {
-            if !bound.contains(n) {
+            // A `PiBound` is a bound reference to an arrow of the enclosing
+            // type, not a free name — it is never free and never in a context.
+            if n.pi_bound_index().is_none() && !bound.contains(n) {
                 out.insert(n.clone());
             }
         }
@@ -1343,6 +1345,172 @@ fn collect_expr_fv(
 /// proposal (§6.2) is exactly this check.
 pub fn well_formed(ty: &Type, ctx: &BTreeSet<Binder>) -> bool {
     type_free_vars(ty).is_subset(ctx)
+}
+
+// ---- the locally-nameless coordinate: closing and opening a Pi binder ----
+
+/// Close `binder`'s free references in `ty` into de Bruijn indices
+/// ([`Name::PiBound`]) — the abstraction half of the locally-nameless
+/// coordinate (see `src/ccl/design/type-inference.md`, "The coordinate is
+/// locally nameless"). An index counts the `Fun` codomains crossed between
+/// the reference and the arrow that binds it, named and unnamed frames alike
+/// (so the coordinate survives `Type::without_pi_names`): a reference in the
+/// constructed arrow's immediate codomain closes at `#0`, one per crossed
+/// codomain deeper.
+///
+/// Arrow construction owns closing: it runs over the codomain a dependent
+/// arrow is built around, so a constructed `Type::Fun` never carries a free
+/// name for its own binder. Indices already present are left alone — they
+/// are bound by arrows *inside* `ty`, strictly closer than the frame being
+/// created — so closing composes bottom-up across nested constructions and
+/// is the identity on an already-closed type.
+///
+/// Predicate `Rc` sharing is preserved per call: occurrences sharing one
+/// predicate term leave sharing one rewritten term, and a predicate the
+/// closing does not touch keeps its original `Rc` (pointer-equal), exactly
+/// as [`Subst::force_refinement`] transports a vacuous substitution.
+pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
+    let mut out = ty.clone();
+    PiWalk::new(PiMode::Close(binder)).ty(&mut out, 0);
+    out
+}
+
+/// Open the frame of an arrow whose codomain `ty` was just extracted from
+/// it: every [`Name::PiBound`] reference to that arrow — index equal to the
+/// codomains crossed to reach the reference — becomes `target`. The two
+/// replacement species are the two opening sites (see
+/// `src/ccl/design/type-inference.md`, "Where the conversions run"):
+/// a [`Mapping::Rename`] opens at a name (descent under the binder — the
+/// reference becomes a free `Var` closed against the reader's telescope),
+/// a [`Mapping::Discharge`] opens at the argument (application — β). Indices
+/// bound by arrows inside `ty` are strictly smaller at their references and
+/// stay untouched; no index shifts, because opening only ever removes the
+/// outermost frame.
+pub fn open_pi_binder(target: &Mapping, ty: &Type) -> Type {
+    let mut out = ty.clone();
+    PiWalk::new(PiMode::Open(target)).ty(&mut out, 0);
+    out
+}
+
+/// Which conversion a [`PiWalk`] performs.
+enum PiMode<'a> {
+    /// `Var(binder)` at depth `d` becomes `Var(PiBound(d))`.
+    Close(&'a Name),
+    /// `Var(PiBound(d))` at depth `d` becomes the target (a `Var` for a
+    /// rename, the discharged term for an application).
+    Open(&'a Mapping),
+}
+
+/// The shared engine under [`close_pi_binder`] and [`open_pi_binder`]: one
+/// walk over the mixed type/term structure, threading the crossed-codomain
+/// depth. Only a `Fun` codomain crossing deepens; a domain, a refinement
+/// predicate, and a predicate's interior type slots stay at their enclosing
+/// depth.
+struct PiWalk<'a> {
+    mode: PiMode<'a>,
+    /// Rewrites performed, for change detection (an untouched predicate keeps
+    /// its original `Rc`).
+    changed: usize,
+    /// Predicate terms already rewritten at a given depth, so occurrences
+    /// that entered sharing one `Rc` leave sharing one `Rc`. Keyed by depth
+    /// too: one term reachable at two depths is two different rewrites.
+    memo: HashMap<(PredicateId, u32), Rc<TypedExpr>>,
+}
+
+impl<'a> PiWalk<'a> {
+    fn new(mode: PiMode<'a>) -> Self {
+        PiWalk {
+            mode,
+            changed: 0,
+            memo: HashMap::new(),
+        }
+    }
+
+    fn ty(&mut self, ty: &mut Type, depth: u32) {
+        match ty {
+            // No structural children. An `Infer`'s bounds are the live
+            // graph's, in the solver's name coordinate — a construction-time
+            // conversion must not reach through and rewrite them.
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::DataSource(_)
+            | Type::ChanDom(..)
+            | Type::Txn
+            | Type::Hole
+            | Type::SharedHole(_)
+            | Type::Infer(_) => {}
+            Type::BoundedHole(t) => self.ty(t, depth),
+            Type::Fun {
+                domain, codomain, ..
+            } => {
+                // A binder scopes over its codomain only: the domain stays at
+                // the enclosing depth, the codomain is one crossing deeper.
+                self.ty(domain, depth);
+                self.ty(codomain, depth + 1);
+            }
+            Type::Refinement(base, r) => {
+                self.ty(base, depth);
+                self.refinement(r, depth);
+            }
+            Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
+            Type::Record(fs) => fs.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
+            Type::Variant(tags, _) => tags.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
+            Type::History { value, domain, .. } => {
+                self.ty(value, depth);
+                self.ty(domain, depth);
+            }
+        }
+    }
+
+    fn refinement(&mut self, r: &mut crate::ccl::Refinement, depth: u32) {
+        let key = (r.predicate_id(), depth);
+        if let Some(done) = self.memo.get(&key) {
+            if !Rc::ptr_eq(done, &r.predicate) {
+                *r = crate::ccl::Refinement::sharing(done);
+            }
+            return;
+        }
+        let mut pred = (*r.predicate).clone();
+        let before = self.changed;
+        self.expr(&mut pred, depth);
+        let done = if self.changed > before {
+            // A converted predicate is a genuinely new term; occurrences that
+            // shared the original re-share it through the memo.
+            let done = Rc::new(pred);
+            *r = crate::ccl::Refinement::sharing(&done);
+            done
+        } else {
+            Rc::clone(&r.predicate)
+        };
+        self.memo.insert(key, done);
+    }
+
+    fn expr(&mut self, e: &mut TypedExpr, depth: u32) {
+        match &self.mode {
+            PiMode::Close(binder) => {
+                if matches!(&e.node, TypedExprNode::Var(n) if n == *binder) {
+                    e.node = TypedExprNode::Var(Name::PiBound(depth));
+                    self.changed += 1;
+                    // Fall through: the occurrence's type slot may itself
+                    // carry references to convert.
+                }
+            }
+            PiMode::Open(target) => {
+                if let TypedExprNode::Var(Name::PiBound(k)) = &e.node
+                    && *k == depth
+                {
+                    *e = target.as_expr_preserving(e.node_id, &e.ty);
+                    self.changed += 1;
+                    // The replacement is foreign content: it carries no
+                    // reference to the frame being opened, so there is
+                    // nothing left to convert beneath it.
+                    return;
+                }
+            }
+        }
+        e.walk_type_slots_mut(|t| self.ty(t, depth));
+        e.walk_children_mut(|c| self.expr(c, depth));
+    }
 }
 
 /// Counts [`Subst::assert_no_capture`] calls, so a test can assert *how many
@@ -2003,5 +2171,174 @@ mod rewrite_tests {
             });
             out
         }
+    }
+}
+
+#[cfg(test)]
+mod pi_coordinate_tests {
+    use super::*;
+    use crate::ccl::{BaseType, Lit, Refinement};
+
+    fn int() -> Type {
+        Type::Base(BaseType::Int)
+    }
+    /// `{Int | <pred>}` — the predicate need not be `Bool`-typed for these
+    /// structural tests.
+    fn refined(pred: TypedExpr) -> Type {
+        Type::Refinement(Box::new(int()), Refinement::born(Rc::new(pred)))
+    }
+    fn predicate_of(ty: &Type) -> &TypedExpr {
+        let Type::Refinement(_, r) = ty else {
+            panic!("expected a refinement, got {ty}");
+        };
+        &r.predicate
+    }
+    fn is_pi_bound(e: &TypedExpr, k: u32) -> bool {
+        matches!(&e.node, TypedExprNode::Var(Name::PiBound(i)) if *i == k)
+    }
+
+    /// The worked example from `type-inference.md`, "Freshening and
+    /// `SpecKey`, worked": closing the outer binder of
+    /// `(i: {Int | k}) ⇒ {Int | k}` assigns `#0` in the inner arrow's domain
+    /// (only the outer frame is in scope there) and `#1` in its codomain
+    /// (the inner frame is crossed).
+    #[test]
+    fn closing_counts_codomain_crossings_only() {
+        let k = Name::fresh("k");
+        let inner = Type::pi(
+            Name::fresh("i"),
+            refined(TypedExpr::var(k.clone())),
+            refined(TypedExpr::var(k.clone())),
+        );
+        let closed = close_pi_binder(&k, &inner);
+        let Type::Fun {
+            domain, codomain, ..
+        } = &closed
+        else {
+            panic!("closing preserves the arrow");
+        };
+        assert!(is_pi_bound(predicate_of(domain), 0));
+        assert!(is_pi_bound(predicate_of(codomain), 1));
+    }
+
+    /// Two α-variant codomains close to structurally identical types — the
+    /// property the solver's identity sites key on.
+    #[test]
+    fn closing_is_alpha_canonical() {
+        let shape = |binder: &Name| {
+            Type::pi(
+                Name::fresh("i"),
+                refined(TypedExpr::var(binder.clone())),
+                int(),
+            )
+        };
+        let k = Name::fresh("k");
+        let y = Name::fresh("y");
+        // The `Fun` name slots (the closed binder is gone, but each shape's
+        // *inner* binder is its own fresh mint) are display metadata the
+        // identity sites strip; the refinements themselves are index-canonical.
+        assert_eq!(
+            close_pi_binder(&k, &shape(&k)).without_pi_names(),
+            close_pi_binder(&y, &shape(&y)).without_pi_names()
+        );
+    }
+
+    /// Distinct enclosing binders stay distinct: closing one binder leaves
+    /// the other's references as free names.
+    #[test]
+    fn closing_leaves_other_free_names_alone() {
+        let k = Name::fresh("k");
+        let other = Name::fresh("outer");
+        let ty = refined(TypedExpr::var(other.clone()));
+        assert_eq!(close_pi_binder(&k, &ty), ty);
+        assert!(type_free_vars(&close_pi_binder(&k, &ty)).contains(&other));
+    }
+
+    /// Opening at a name inverts closing (descent under the binder), and
+    /// opening at a term is the application reading (β).
+    #[test]
+    fn opening_inverts_closing() {
+        let k = Name::fresh("k");
+        let inner = Type::pi(
+            Name::fresh("i"),
+            refined(TypedExpr::var(k.clone())),
+            refined(TypedExpr::var(k.clone())),
+        );
+        let closed = close_pi_binder(&k, &inner);
+        assert_eq!(open_pi_binder(&Mapping::Rename(k.clone()), &closed), inner);
+
+        let applied = open_pi_binder(
+            &Mapping::Discharge(Box::new(TypedExpr::lit(Lit::Int(5)))),
+            &closed,
+        );
+        let Type::Fun { domain, .. } = &applied else {
+            panic!("opening preserves the arrow");
+        };
+        assert_eq!(
+            predicate_of(domain).node,
+            TypedExprNode::Lit(Lit::Int(5)),
+            "β replaces the reference with the argument term",
+        );
+    }
+
+    /// Closing composes bottom-up: the inner construction's indices are
+    /// strictly closer than the frame the outer construction creates, so the
+    /// outer close leaves them alone.
+    #[test]
+    fn nested_constructions_compose() {
+        let k = Name::fresh("k");
+        let i = Name::fresh("i");
+        // Construction closes the codomain being wrapped: close `i`'s
+        // references, then build the arrow around the result…
+        let inner_closed = Type::pi(
+            i.clone(),
+            int(),
+            close_pi_binder(&i, &refined(TypedExpr::var(i.clone()))),
+        );
+        // …then put a `k` reference beside the finished inner arrow and run
+        // the outer construction's close over that codomain.
+        let cod = Type::Tuple(vec![inner_closed, refined(TypedExpr::var(k.clone()))]);
+        let closed = close_pi_binder(&k, &cod);
+        let Type::Tuple(ts) = &closed else {
+            panic!("closing preserves the tuple");
+        };
+        let Type::Fun { codomain, .. } = &ts[0] else {
+            panic!("closing preserves the arrow");
+        };
+        assert!(
+            is_pi_bound(predicate_of(codomain), 0),
+            "the inner arrow's own index is untouched by the outer close",
+        );
+        assert!(is_pi_bound(predicate_of(&ts[1]), 0));
+    }
+
+    /// Occurrences sharing one predicate `Rc` leave sharing one `Rc`, and a
+    /// predicate the conversion does not touch keeps its original `Rc`.
+    #[test]
+    fn closing_preserves_predicate_sharing() {
+        let k = Name::fresh("k");
+        let shared = Rc::new(TypedExpr::var(k.clone()));
+        let untouched = Rc::new(TypedExpr::lit(Lit::Int(1)));
+        let slot = |r: &Rc<TypedExpr>| Type::Refinement(Box::new(int()), Refinement::sharing(r));
+        let ty = Type::Tuple(vec![slot(&shared), slot(&shared), slot(&untouched)]);
+        let closed = close_pi_binder(&k, &ty);
+        let Type::Tuple(ts) = &closed else {
+            panic!("closing preserves the tuple");
+        };
+        let pred_rc = |t: &Type| {
+            let Type::Refinement(_, r) = t else {
+                panic!("expected refinement");
+            };
+            Rc::clone(&r.predicate)
+        };
+        assert!(
+            Rc::ptr_eq(&pred_rc(&ts[0]), &pred_rc(&ts[1])),
+            "rewritten occurrences re-share one term",
+        );
+        assert!(!Rc::ptr_eq(&pred_rc(&ts[0]), &shared));
+        assert!(
+            Rc::ptr_eq(&pred_rc(&ts[2]), &untouched),
+            "an untouched predicate keeps its original Rc",
+        );
     }
 }

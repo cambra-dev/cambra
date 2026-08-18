@@ -1,4 +1,4 @@
-//! Structured binder names. The four ways a name can come to exist are four
+//! Structured binder names. The five ways a name can come to exist are five
 //! variants, so the case a site handles is a `match` arm, not a magic-value
 //! check on a shared field.
 //!
@@ -33,10 +33,19 @@
 //!   refinement implicitly binds the *same* one (see [`crate::ccl::Refinement`]),
 //!   which is what makes refinement equality plain structural equality of bare
 //!   predicates. Uniquification never mints it; substitution shadows it.
+//! * [`Name::PiBound`] — a **bound reference to an enclosing arrow's Pi
+//!   binder**, as a de Bruijn index. Not a binder: nothing introduces one; a
+//!   reference becomes one when arrow construction closes its codomain
+//!   ([`crate::ccl::subst::close_pi_binder`]) and becomes a name or a term
+//!   again when descent or application opens the arrow
+//!   ([`crate::ccl::subst::open_pi_binder`]). Identity is the index, so two
+//!   α-variant closed arrows are structurally identical — what the solver's
+//!   identity sites key on.
 //!
-//! Display prints [`Name::base`] — under the convention names are distinct, so
-//! the spelling is unambiguous in almost every rendering. `Debug` surfaces the
-//! `uid` for [`Name::Unique`].
+//! Display prints [`Name::base`] (for a [`Name::PiBound`], the index as
+//! `#0`) — under the convention names are distinct, so the spelling is
+//! unambiguous in almost every rendering. `Debug` surfaces the `uid` for
+//! [`Name::Unique`].
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,6 +149,18 @@ pub enum Name {
     Synthetic { kind: SyntheticKind, uid: Uid },
     /// A name with custom semantics (currently only `__elem`).
     Reserved(ReservedName),
+    /// A bound reference to an enclosing arrow's Pi binder, as a de Bruijn
+    /// index: the number of `Fun` codomains crossed between the reference and
+    /// the arrow that binds it, named and unnamed frames alike (so the
+    /// coordinate survives `Type::without_pi_names`). Assigned at abstraction
+    /// by [`crate::ccl::subst::close_pi_binder`]; converted back to a name or
+    /// a term by [`crate::ccl::subst::open_pi_binder`] when descent or
+    /// application opens the arrow. Never a binder — no binding site
+    /// introduces one, uniquification never mints one, and a substitution
+    /// never maps one (a [`crate::ccl::subst::Subst`] domain is free names).
+    /// See `src/ccl/design/type-inference.md`, "The coordinate is locally
+    /// nameless".
+    PiBound(u32),
 }
 
 impl Name {
@@ -203,13 +224,17 @@ impl Name {
     }
 
     /// The display spelling. Total over every variant; never use it for an
-    /// identity decision — that is what `Name` equality is for.
+    /// identity decision — that is what `Name` equality is for. A
+    /// [`Name::PiBound`] has no spelling of its own — its index needs a
+    /// formatter, so it surfaces through [`Display`](fmt::Display) (`#0`) and
+    /// this returns just the `#` marker.
     pub fn base(&self) -> &str {
         match self {
             Name::Raw(s) => s,
             Name::Unique { base, .. } => base,
             Name::Synthetic { kind, .. } => kind.stem(),
             Name::Reserved(r) => r.spelling(),
+            Name::PiBound(_) => "#",
         }
     }
 
@@ -225,6 +250,11 @@ impl Name {
             Name::Unique { base, uid } => format!("{base}#{}", uid.0),
             Name::Synthetic { kind, uid } => format!("{}#{}", kind.stem(), uid.0),
             Name::Reserved(r) => r.spelling().to_string(),
+            // Not a binder, so no mutable variable is ever declared at one and
+            // no record field is ever labeled by one.
+            Name::PiBound(_) => {
+                unreachable!("a PiBound is a reference, not a binder; it labels no field")
+            }
         }
     }
 
@@ -237,6 +267,14 @@ impl Name {
     /// Is this the reserved refinement element binder?
     pub fn is_elem(&self) -> bool {
         matches!(self, Name::Reserved(ReservedName::Elem))
+    }
+
+    /// The de Bruijn index if this is a [`Name::PiBound`] reference.
+    pub fn pi_bound_index(&self) -> Option<u32> {
+        match self {
+            Name::PiBound(k) => Some(*k),
+            _ => None,
+        }
     }
 
     /// Is this the tupled binder lambda elimination mints ([`SyntheticKind::Pair`])?
@@ -278,10 +316,14 @@ impl From<&Name> for Name {
 }
 
 /// Prints the bare base (see module docs); the `uid` surfaces only through
-/// [`Debug`].
+/// [`Debug`]. A [`Name::PiBound`] prints its index (`#0`) — the one variant
+/// whose display needs a formatter.
 impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.base())
+        match self {
+            Name::PiBound(k) => write!(f, "#{k}"),
+            _ => f.write_str(self.base()),
+        }
     }
 }
 
