@@ -608,3 +608,90 @@ fn read_arm_payload_is_pinned_to_a_type_its_reads_accept(
     cambra::ccl::infer::check_fully_typed(&full)
         .expect("a read payload leaves no unresolved variable");
 }
+
+// ---------------------------------------------------------------------------
+// Group F — what the opposite-polarity collapse must and must not supply
+// ---------------------------------------------------------------------------
+
+/// A **bounded** annotation on a variant bounds the binder; it does not become
+/// its type.
+///
+/// `x <: {`some{Int} | `none} = `some(1)` is the value's own `{`some{Int@1}}`.
+/// Both halves of that are the point: the `none` tag the value cannot carry, and
+/// the singleton the annotation's `Int` would widen away.
+///
+/// What makes it a compaction test rather than an annotation one: `x`'s positive
+/// walk finds the variant off its lower bound — the value — and the annotation
+/// sits on the *upper* side. Counting a variant shape as "not concrete" at every
+/// polarity let the opposite-polarity collapse fire past the value and hand back
+/// the annotation, which is the bound reading as the type. A variant found at a
+/// positive position is what the thing *is*, so the collapse has nothing to add;
+/// only at a negative position is a variant the arms a body can handle rather
+/// than a determination (see `no_concrete` in `src/ccl/infer/solver/compact.rs`).
+#[test]
+fn a_bounded_variant_annotation_does_not_become_the_binders_type() {
+    let ann = Type::BoundedHole(Box::new(variant(&[("some", int()), ("none", unit_ty())])));
+    let mut e = TypedExpr::let_bind_annotated(
+        "x",
+        TypedExpr::variant_ctor("some", lit_int(1)),
+        var("x"),
+        ann,
+    );
+    let mut ctx = TypeInferenceContext::new();
+    let ty = infer(&mut e, &mut ctx).expect("bounded annotation admits the value");
+    assert_eq!(ty, variant(&[("some", int_lit(1))]));
+}
+
+/// The pin fires on what a **value** reached, not on what merely determines the
+/// position.
+///
+/// This is the IR of
+///
+/// ```text
+/// def unwrap(m):
+///     match m:
+///         case `a(v): v
+///         case `b(w): w
+/// p = unwrap(`a(1))
+/// q = unwrap(`a(2))
+/// p + q
+/// ```
+///
+/// The `+` is what makes it a detector. Reading the trait requirements together
+/// writes back an *upper* bound on the dead arm's payload, so an ordinary resolve
+/// reports the position settled while nothing has flowed there. The pin then skips
+/// the arm, the arm's slot records `Int`, and the merge over the arms cannot see
+/// that position contribute — leaving the recorded node type narrower than the
+/// join, which the post-inference wall rejects (`expected Int@1, found Int`) on a
+/// program that type-checks.
+///
+/// So the gate asks the polarity-correct walk alone (`value_reaches` in
+/// `src/ccl/infer/solve.rs`). Asserted through `check_pre_desugar` because that
+/// wall is where the disagreement surfaces — inference itself reports `Int` and
+/// no error.
+#[test]
+fn an_upper_bound_alone_does_not_count_as_a_value_reaching_a_payload() {
+    let body = TypedExpr::new(TypedExprNode::Case {
+        scrutinee: Some(Box::new(var("m"))),
+        branches: vec![arm("a", "v", None, var("v")), arm("b", "w", None, var("w"))],
+    });
+    let unwrap = TypedExpr::lambda("m", Type::Hole, body);
+    let call = |n: i64| TypedExpr::apply(TypedExpr::variant_ctor("a", lit_int(n)), var("f"));
+    let sum = TypedExpr::binop(
+        var("p"),
+        cambra::ccl::BinOpKind::Arithmetic(ArithmeticKind::Add),
+        var("q"),
+    );
+    let mut e = TypedExpr::let_bind(
+        "f",
+        unwrap,
+        TypedExpr::let_bind("p", call(1), TypedExpr::let_bind("q", call(2), sum)),
+    );
+    let mut ctx = TypeInferenceContext::new();
+    assert_eq!(
+        infer(&mut e, &mut ctx).expect("two call sites type-check"),
+        int()
+    );
+    cambra::ccl::infer::check_pre_desugar(&e)
+        .expect("every arm's recorded type is the join the wall recomputes");
+}

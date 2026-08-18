@@ -24,8 +24,8 @@ use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::read_through;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
-    compact_type, constrain_subtype, freshen_expr_type_slots, seed_chan_dom_pairings,
-    simplify_type, spec_key,
+    compact_type, compact_type_polarity_only, constrain_subtype, freshen_expr_type_slots,
+    seed_chan_dom_pairings, simplify_type, spec_key,
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
@@ -730,10 +730,17 @@ fn pin_unobservable_arm_payload(p: &Pattern) {
     // Unobservability is *transitive*: the variable's bound list is rarely empty
     // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
     // a lower bound — and what matters is whether anything concrete reaches it
-    // through the chain. Resolving is the question being asked, so ask it: a
-    // payload that resolves to a bare variable is one no value and no read
-    // determines.
-    if !matches!(resolve_var_type(&p.binding.ty), Ok(Type::Infer(_))) {
+    // through the chain. So the question is asked by resolving.
+    //
+    // But it must be asked of the *value* side alone ([`value_reaches`]). An
+    // ordinary resolve reads the opposite side when the polarity-correct walk
+    // comes up empty, and an upper bound is exactly what an unreachable arm can
+    // acquire without ever being inhabited — the trait-requirement sweep deposits
+    // one on a determined place. Reading it would report the position settled, the
+    // pin would skip the arm, and the arm's slot would record a type the merge
+    // over the arms cannot see it contribute: the node ends up *narrower* than the
+    // join, and the post-inference wall rejects a program that type-checks.
+    if value_reaches(&p.binding.ty) {
         return;
     }
     let chosen = payload_pin(&p.binding.ty);
@@ -934,6 +941,25 @@ pub(super) fn check_scope_valid(
 /// `Type`, via the compact → simplify → coalesce pipeline.
 pub(super) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     coalesce_compact(&simplify_type(compact_type(ty)))
+}
+
+/// Whether a **value** has reached `ty` — as opposed to merely something
+/// determining what it must be.
+///
+/// [`resolve_var_type`] answers the second question: where the polarity-correct
+/// walk finds nothing it takes the opposite side instead, so a position carrying
+/// only a *demand* still resolves to a type. That is the right answer for
+/// materializing a type and the wrong one for deciding whether a position was
+/// ever inhabited — an upper bound deposited by the trait-requirement sweep makes
+/// a value-free position look settled.
+///
+/// So this asks the polarity-correct walk alone
+/// ([`compact_type_polarity_only`]): a bare variable means nothing flowed here.
+fn value_reaches(ty: &Type) -> bool {
+    !matches!(
+        coalesce_compact(&simplify_type(compact_type_polarity_only(ty))),
+        Ok(Type::Infer(_))
+    )
 }
 
 /// Resolve a **binder slot** — a type the bottom-up `expr.ty` walk does not
