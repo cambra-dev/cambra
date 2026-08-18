@@ -769,6 +769,14 @@ pub(super) fn emit_cast<C: Typing>(
         Type::Fun { name: Some(k), .. } => Some(k.clone()),
         _ => None,
     };
+    // Construction closes (see `Type::pi`): re-viewing the value at the
+    // target rebuilds an arrow around the value's codomain, so references to
+    // the preserved binder close here. Idempotent when `v` came out of a
+    // closed arrow (its references are already indices).
+    let v = match &name {
+        Some(k) => crate::ccl::subst::close_pi_binder(k, &v),
+        None => v,
+    };
     Ok(Type::Fun {
         name,
         kind,
@@ -1799,7 +1807,8 @@ pub(super) fn emit_compose<C: Typing>(
     // forward edge); the concrete domain is rebuilt post-coalesce in
     // `coalesce_node`'s `Compose` arm from the preceding morphism's codomain,
     // so there is no reverse-adjacency constraint at emit time.
-    let (first_dom, mut prev_cod) = ctx.as_function(&tys[0], &|| "Compose[0]".to_string())?;
+    let (first_dom, prev_cod) = ctx.as_function(&tys[0], &|| "Compose[0]".to_string())?;
+    let mut prev_cod = crate::ccl::subst::open_codomain(&tys[0], &prev_cod);
     for (i, t) in tys.iter().enumerate().skip(1) {
         let (d_i, c_i) = ctx.as_function(t, &|| "Compose[i]".to_string())?;
         // Strict refinement-aware adjacency: `prev_cod <: next_dom`, refinement
@@ -1810,7 +1819,7 @@ pub(super) fn emit_compose<C: Typing>(
         // because the upstream genuinely carries `{D | r}` — matched
         // structurally even across the predicate terms planning re-mints.
         ctx.require_sub(&prev_cod, &d_i, &|| format!("Compose[{i}]"))?;
-        prev_cod = c_i;
+        prev_cod = crate::ccl::subst::open_codomain(t, &c_i);
     }
     // Keep a dependent *final* morphism's Pi binder on the chain type: the
     // chain's codomain is the final codomain, which may reference that binder
@@ -1843,11 +1852,17 @@ pub(super) fn emit_compose<C: Typing>(
         Type::Fun { kind, .. } => kind.clone(),
         _ => FunKind::Compute,
     };
-    Ok(Type::Fun {
-        name: last_name,
-        kind,
-        domain: Box::new(first_dom),
-        codomain: Box::new(prev_cod),
+    // Construction closes: the chain's codomain was opened at the binder for the
+    // adjacency above, so assembling the Pi puts the reference back in the index
+    // coordinate every stored type is in.
+    Ok(match last_name {
+        Some(b) => Type::pi_kinded(b, first_dom, prev_cod, kind),
+        None => Type::Fun {
+            name: None,
+            kind,
+            domain: Box::new(first_dom),
+            codomain: Box::new(prev_cod),
+        },
     })
 }
 

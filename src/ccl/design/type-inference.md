@@ -947,12 +947,17 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ### Scoped inference variables: stored fragments close against a telescope
 
-> **Status: designed, not implemented.** This section is the design of record
-> for retiring open type fragments from the solver. The flatten-time Pi-binder
-> canonicalization on the unmerged branch `dmills/canonical-pi-binders` is the
-> local repair this design replaces; its regression tests — α-variant bounds
-> merge to one refinement, `spec_key` shares α-variant dependent types, distinct
-> enclosing binders stay distinct — are this design's acceptance tests.
+> **Status: milestones 1 and 2 implemented** (telescopes threaded and
+> observed; the index coordinate and its four conversion sites live, with the
+> acceptance tests below passing in `compact.rs` and `spec_key.rs`).
+> Enforcement (milestone 3) and the name-path deletions (milestone 4) are
+> pending, as is the mediation of the record-time observation log's remaining
+> travelers. This section is the design of record for retiring open type
+> fragments from the solver. The flatten-time Pi-binder canonicalization on
+> the unmerged branch `dmills/canonical-pi-binders` is the local repair this
+> design replaces; its regression tests — α-variant bounds merge to one
+> claim, `spec_key` shares α-variant dependent types, distinct enclosing
+> binders stay distinct — are this design's acceptance tests.
 
 #### The defect this removes
 
@@ -1084,7 +1089,12 @@ conversions, and the sites below are their only callers:
   `Fun { name: Some(_), .. }` — abstracts its codomain: a free reference to
   the binder becomes an index. A codomain that is a bare variable has nothing
   to close; emission's `pi(x, D, ?c)` is that case, and the refinements that later
-  accumulate on `?c` reference `x` by name against their telescopes.
+  accumulate on `?c` reference `x` by name against their telescopes. A rebuild
+  that carries an arrow kind takes `Type::pi_kinded` rather than a `Fun`
+  literal: the group-by partition arrow (`planning::groupby`'s `emit_groupby`)
+  and the eliminated group-by lambda's Pi (`lambda_elim`) are dependent
+  *collections*, and reaching for the literal to set `kind` is what leaves a
+  free binder name in a stored type.
 - **Refinement landing closes.** The compact and key walks close a refinement against
   the walk's frame stack as it lands in the view — the same two arms that
   force the edge substitutions into it (`force_refinement`), one conversion
@@ -1106,11 +1116,23 @@ conversions, and the sites below are their only callers:
   telescope with each Pi binder it descends past, so the variables it mints
   inside a dependent annotation carry the binder in scope — this is what
   closes the group-by traveler class, whose fragments today land on variables
-  whose telescopes never saw `__gb_k`.
+  whose telescopes never saw `__gb_k`. `subst::open_codomain` is this
+  conversion at a rebuild, where a pass holds a morphism and the codomain it
+  just read off it: `emit_compose` opens before the adjacency
+  `prev_cod <: next_dom`, because the next morphism's domain names the binder
+  the chain composes under; `lambda_elim`'s application rule opens for the
+  `apply` transformer's domain, which sits under the pair morphism's binder;
+  and the group-by recognizer opens the family it matches, because it
+  identifies the key binder as the free `Var` on one side of the predicate's
+  equality.
 - **Application opens at the argument.** Applying a closed family — the
   dependent-application discharge, β at coalesce — replaces the binder's
   indices with the argument term. Opening at a name and opening at an
-  argument are one operation with a different replacement.
+  argument are one operation with a different replacement. The
+  post-inference check's `apply` rule is this site's second caller: it
+  re-derives an application's type from the (closed) arrow the tree records,
+  so it opens the codomain at the argument before comparing against the
+  stored, already-discharged type.
 
 Mid-solve fragments therefore stay name-referenced — the telescope
 coordinate — and intact closed types (a lowered dependent cast recorded
@@ -1173,8 +1195,13 @@ otherwise travels untouched.
   keys identify refinements up to binder position; fiber distinctions ride the
   per-use discharges, which the σ-aware constraint cache already keeps
   distinct (see [Keying a specialization](#keying-a-specialization)).
-- **`Type::Fun`'s binder slot degrades to display metadata.** A refinement's
-  binding is its index, not the arrow's name, so the Fun/Fun codomain edge
+- **`Type::Fun`'s binder slot carries no refinement identity.** A refinement's binding
+  is its index, not the arrow's name, so the slot never participates in an
+  identity comparison. It remains load-bearing as the frame's **opening
+  address** — descent and application open the frame at it — so coalesce
+  keeps it exactly on the arrows whose codomains reference their frame
+  (`references_outermost_frame`, the index-coordinate dependence test) and
+  strips it elsewhere. With identity off the slot, the Fun/Fun codomain edge
   needs no binder correspondence and `extended_rename`'s production use
   disappears.
 - **The formal model's rename machinery deletes.** `Ren`/`codRen` exist to

@@ -135,6 +135,17 @@ pub(crate) mod test_helpers {
 
     use crate::ccl::{FieldKey, Refinement, Type};
 
+    /// The dependent refinement `__elem == <name>` — a predicate referencing an
+    /// enclosing Pi binder by (raw) name, the mid-solve coordinate.
+    pub(crate) fn dep_pred(name: &str) -> Rc<crate::ccl::TypedExpr> {
+        use crate::ccl::{BinOpKind, CompareKind, Name, TypedExpr};
+        Rc::new(TypedExpr::binop(
+            TypedExpr::var(Name::elem()),
+            BinOpKind::Compare(CompareKind::Equals),
+            TypedExpr::var(Name::raw(name)),
+        ))
+    }
+
     /// Build a `Type` from `FieldKey`-keyed fields: all-`Name` → `Record`,
     /// otherwise a dense `Tuple` (the only product shapes `ccl::Type` has).
     /// Sparse-`Index` inputs have no `Type` form — tests that need them
