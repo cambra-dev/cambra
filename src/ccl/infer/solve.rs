@@ -24,8 +24,8 @@ use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::read_through;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
-    compact_type, constrain_subtype, freshen_expr_type_slots, seed_chan_dom_pairings,
-    simplify_type, spec_key,
+    compact_type, compact_type_polarity_only, constrain_subtype, freshen_expr_type_slots,
+    seed_chan_dom_pairings, simplify_type, spec_key,
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
@@ -665,18 +665,41 @@ fn with_shadows<R>(
 /// Width subtyping gives an arm naming a tag the scrutinee cannot carry no lower
 /// bound: nothing determines the payload, and nothing can, so it would reach the
 /// post-inference wall unresolved. The arm is ordinary code rather than an error
-/// (see `src/ccl/design/type-inference.md`, "An unobservable arm payload defaults
-/// to `Unit`"), so a type is chosen here instead.
+/// (see `src/ccl/design/type-inference.md`, "An unobservable arm payload is
+/// pinned to what its uses require"), so a type is chosen here instead.
 ///
-/// **Which** type depends on whether the arm's body reads the binder:
+/// **Which** type depends on what the arm's body does with the binder. In every
+/// case the rule is the same — pin to a type the payload's *requirements* accept —
+/// and the three arms below are the three ways a requirement gets recorded:
 ///
-/// - **It does not.** Nothing observes the payload either, so `Unit` — carrying no
+/// - **Nothing reads it.** No requirement at all, so `Unit` — carrying no
 ///   information — is the choice.
-/// - **It does.** The read states what it needs of the payload, as a trait
+/// - **It flows somewhere.** The binder occurring in a position records a
+///   subtyping upper bound, `payload <: U`. That is a requirement as surely as a
+///   trait obligation is, and when `U` resolves to a concrete type it is the
+///   *strongest* one available: pinning anything else contradicts the flow. The
+///   commonest shape is the body that simply **is** the binder (`` `b(w) → w ``),
+///   where `U` is the arms' result join — `Unit` there does not merely lose
+///   information, it enters that join and collides with the reachable arm's type.
+/// - **It is read by an operator.** The read states what it needs as a trait
 ///   obligation (`v + 1` records `Addable`), and `Unit` would contradict it: the
 ///   pin would reject the very read that makes the payload observable. So the
 ///   obligations choose, from the types their surviving instances still accept
 ///   ([`TraitObligation::accepted_at`]).
+///
+/// The two recorded forms do not compete for the same payload — an operand's
+/// upper bound is the operator's own requirement variable, not a concrete type —
+/// so the concrete flow target is taken first and the obligations decide when
+/// there is none.
+///
+/// **Each upper bound is resolved as its own position**, by a fresh
+/// [`resolve_var_type`] entered at that variable, never as a hop along this
+/// payload's bound chain. The distinction is the whole of `fallback_allowed`
+/// (`src/ccl/infer/solver/compact.rs`): reading `U` *through* the payload would
+/// collapse `U`'s quantifier as a side effect of resolving the payload, and hand
+/// the result to every other variable on the chain. Deciding it here instead is
+/// one deliberate choice, at the one variable whose quantifier is being
+/// eliminated.
 ///
 /// A read need not narrow the choice to one — `v + v` leaves every `Addable` row
 /// standing (`Int`, `UInt`, `String`) — and **any of them is as good as any other
@@ -707,13 +730,20 @@ fn pin_unobservable_arm_payload(p: &Pattern) {
     // Unobservability is *transitive*: the variable's bound list is rarely empty
     // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
     // a lower bound — and what matters is whether anything concrete reaches it
-    // through the chain. Resolving is the question being asked, so ask it: a
-    // payload that resolves to a bare variable is one no value and no read
-    // determines.
-    if !matches!(resolve_var_type(&p.binding.ty), Ok(Type::Infer(_))) {
+    // through the chain. So the question is asked by resolving.
+    //
+    // But it must be asked of the *value* side alone ([`value_reaches`]). An
+    // ordinary resolve reads the opposite side when the polarity-correct walk
+    // comes up empty, and an upper bound is exactly what an unreachable arm can
+    // acquire without ever being inhabited — the trait-requirement sweep deposits
+    // one on a determined place. Reading it would report the position settled, the
+    // pin would skip the arm, and the arm's slot would record a type the merge
+    // over the arms cannot see it contribute: the node ends up *narrower* than the
+    // join, and the post-inference wall rejects a program that type-checks.
+    if value_reaches(&p.binding.ty) {
         return;
     }
-    let chosen = Type::Base(payload_default(&p.binding.ty));
+    let chosen = payload_pin(&p.binding.ty);
     let mut cache = ConstrainCache::new();
     let pinned = constrain_subtype(&chosen, &p.binding.ty, &mut cache)
         .and_then(|()| constrain_subtype(&p.binding.ty, &chosen, &mut cache));
@@ -726,15 +756,51 @@ fn pin_unobservable_arm_payload(p: &Pattern) {
     );
 }
 
-/// The type to pin an unreachable arm's payload to: `Unit` when nothing reads it,
-/// otherwise one the reads' requirements accept. See
+/// The type to pin an unreachable arm's payload to: the concrete type it is
+/// required to flow into, else one its operator reads accept, else `Unit`. See
 /// [`pin_unobservable_arm_payload`], which is the whole rationale.
-fn payload_default(payload: &Type) -> crate::ccl::BaseType {
+fn payload_pin(payload: &Type) -> Type {
+    let Type::Infer(v) = payload else {
+        return Type::Base(crate::ccl::BaseType::Unit);
+    };
+    if let Some(flows_into) = payload_flow_target(v) {
+        return flows_into;
+    }
+    Type::Base(payload_trait_default(v))
+}
+
+/// The concrete type an unreachable payload is required to flow into, if its
+/// upper bounds name one.
+///
+/// Each bound is resolved on its own — [`resolve_var_type`] enters the walk at
+/// that variable, so the collapse that materializes it happens at *its* position
+/// rather than as a hop along the payload's chain (see
+/// [`pin_unobservable_arm_payload`]). A bound that resolves to another variable
+/// says nothing yet and is skipped; an operand's upper bound is exactly that
+/// shape, which is why the operator case falls through to the obligations.
+///
+/// The first concrete answer wins. Several distinct ones would be a meet the type
+/// language cannot spell, and none arises: a payload has at most one upper bound
+/// resolving concretely, since the flows that record more than one are operator
+/// operands, whose bounds are requirement variables.
+fn payload_flow_target(v: &crate::ccl::infer_var::InferVar) -> Option<Type> {
+    // Cloned out of the `RefCell` before resolving: the walk reads bound lists
+    // across the graph, and the pin's `constrain_subtype` will take them mutably.
+    let upper = std::rc::Rc::clone(v.bounds.borrow().upper());
+    upper.iter().find_map(|b| {
+        let ty = b.render_subst().apply_type(&b.ty);
+        match resolve_var_type(&ty) {
+            Ok(t) if !matches!(t, Type::Infer(_)) => Some(t),
+            _ => None,
+        }
+    })
+}
+
+/// The type an unreachable payload's *operator* reads accept — the trait half of
+/// [`payload_pin`].
+fn payload_trait_default(v: &crate::ccl::infer_var::InferVar) -> crate::ccl::BaseType {
     use crate::ccl::BaseType;
 
-    let Type::Infer(v) = payload else {
-        return BaseType::Unit;
-    };
     let watches = v.watches.borrow();
     let Some(((first, pos), rest)) = watches.split_first() else {
         return BaseType::Unit;
@@ -875,6 +941,25 @@ pub(super) fn check_scope_valid(
 /// `Type`, via the compact → simplify → coalesce pipeline.
 pub(super) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     coalesce_compact(&simplify_type(compact_type(ty)))
+}
+
+/// Whether a **value** has reached `ty` — as opposed to merely something
+/// determining what it must be.
+///
+/// [`resolve_var_type`] answers the second question: where the polarity-correct
+/// walk finds nothing it takes the opposite side instead, so a position carrying
+/// only a *demand* still resolves to a type. That is the right answer for
+/// materializing a type and the wrong one for deciding whether a position was
+/// ever inhabited — an upper bound deposited by the trait-requirement sweep makes
+/// a value-free position look settled.
+///
+/// So this asks the polarity-correct walk alone
+/// ([`compact_type_polarity_only`]): a bare variable means nothing flowed here.
+fn value_reaches(ty: &Type) -> bool {
+    !matches!(
+        coalesce_compact(&simplify_type(compact_type_polarity_only(ty))),
+        Ok(Type::Infer(_))
+    )
 }
 
 /// Resolve a **binder slot** — a type the bottom-up `expr.ty` walk does not
@@ -1185,17 +1270,23 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             scrutinee,
             branches,
         } => {
-            if let Some(s) = scrutinee {
-                coalesce_node(s, level, ctx);
-            }
             // Before any occurrence of an arm's payload variable is read: an arm
-            // nothing reaches and whose body ignores its binder has no bound at
-            // all, and needs one recorded on the *variable* to resolve
-            // consistently everywhere it appears.
+            // nothing reaches has no bound that determines its payload, and needs
+            // one recorded on the *variable* to resolve consistently everywhere it
+            // appears. The scrutinee is such an occurrence — its type is the
+            // variant these payload variables sit inside — so the pin precedes its
+            // walk, not just the branches'. Pinning after it would leave the
+            // scrutinee's reading of the payload stale, which is the ordering
+            // invariant `assert_reads_stable` enforces. The pin reads only the
+            // constraint graph, which emission has already finished building, so
+            // nothing here depends on the scrutinee having been coalesced.
             for b in branches.iter() {
                 if let Some(p) = &b.pattern {
                     pin_unobservable_arm_payload(p);
                 }
+            }
+            if let Some(s) = scrutinee {
+                coalesce_node(s, level, ctx);
             }
             for b in branches.iter_mut() {
                 // A pattern's payload binding scopes the branch's guard and
@@ -2513,6 +2604,150 @@ mod tests {
         let (specializations, used_names) = specialization_stats(&e);
         assert_eq!(specializations, 4, "per-use g + f specializations");
         assert_eq!(used_names.len(), 4, "every specialization is used");
+    }
+
+    /// `let f = λm. match m { `a(v) → v; `b(w) → w } in
+    ///  let p = f(`a(1)) in let q = f(`a(2)) in <tail>`
+    ///
+    /// built with `tail` reading `p` or reading `q`. Returns the specializations'
+    /// parameter types in source order.
+    #[cfg(test)]
+    fn case_udf_specialization_domains(tail_reads: &str) -> Vec<Type> {
+        use crate::ccl::{Branch, Pattern, TypedBinding};
+        let arm = |tag: &str, b: &str| Branch {
+            pattern: Some(Pattern {
+                tag: tag.to_string(),
+                binding: TypedBinding {
+                    name: b.into(),
+                    ty: Type::Hole,
+                    user_annotation: None,
+                },
+            }),
+            guard: TypedExpr::lit(Lit::Bool(true)),
+            body: TypedExpr::var(b),
+        };
+        let f = TypedExpr::lambda(
+            "m",
+            Type::Hole,
+            TypedExpr::new(TypedExprNode::Case {
+                scrutinee: Some(Box::new(TypedExpr::var("m"))),
+                branches: vec![arm("a", "v"), arm("b", "w")],
+            }),
+        );
+        // The tail is what makes the widening observable, and *any* consumer that
+        // joins the use's result with another value does it — the domain used to
+        // acquire that join. A list literal is the join site with the fewest
+        // moving parts: its elements meet on one element variable, with no
+        // operator signature in between.
+        let tail = TypedExpr::list(vec![TypedExpr::var(tail_reads), lit_int(0)]);
+        let call = |n: i64| {
+            TypedExpr::apply(
+                TypedExpr::variant_ctor("a", lit_int(n)),
+                TypedExpr::var("f"),
+            )
+        };
+        let mut e = TypedExpr::let_bind(
+            "f",
+            f,
+            TypedExpr::let_bind("p", call(1), TypedExpr::let_bind("q", call(2), tail)),
+        );
+        run_inference(&mut e).expect("two-arm case UDF type-checks");
+        collect_mono_param_types(&e)
+    }
+
+    /// A specialization's domain is its *own* use's argument — not the join of
+    /// what the program does with any use's result.
+    ///
+    /// The two-arm `match` is the detector, not the cause. A too-wide domain is
+    /// invisible under contravariance until something *reads* it: the dead arm's
+    /// binder takes its type from the payload, that type enters the arms' join,
+    /// and the post-inference wall compares the join against the per-instance
+    /// codomain. A one-arm `match` is widened identically and simply never
+    /// notices — so this must not be "fixed" by teaching the join to skip dead
+    /// arms.
+    ///
+    /// The widening came from the domain's negative read running out of upper
+    /// bounds inside the definition and continuing along the chain into the *call
+    /// site's* consumers, where the opposite-polarity fallback read a join
+    /// (`1 ⊔ 0` at the list literal) and handed it back as the domain's demand.
+    /// See `fallback_allowed` in `src/ccl/infer/solver/compact.rs`.
+    #[test]
+    fn specialization_domain_is_its_own_argument() {
+        let variant_of = |t: Type| {
+            Type::Variant(vec![(
+                crate::ccl::FieldKey::Name(smol_str::SmolStr::new("a")),
+                t,
+            )])
+        };
+        assert_eq!(
+            case_udf_specialization_domains("p"),
+            vec![variant_of(int_lit_ty(1)), variant_of(int_lit_ty(2))],
+            "each clone's domain is the variant its own call site passed"
+        );
+    }
+
+    /// The companion: *which* use the consumer reads must not move the answer.
+    ///
+    /// This is the same program with the consumer reading `q` instead of `p`.
+    /// Before the fix the widened clone followed the consumer — which is what
+    /// made the defect look positional (in the original report the consumed use
+    /// was also the first one).
+    #[test]
+    fn specialization_domains_do_not_follow_the_consumer() {
+        assert_eq!(
+            case_udf_specialization_domains("p"),
+            case_udf_specialization_domains("q"),
+            "the specializations are the same whichever use the tail reads"
+        );
+    }
+
+    /// The positional restriction itself, with nothing else in the frame.
+    ///
+    /// `let g = λ x → x in let f = λ t → (t.0 ▷ g, t.2 ▷ g) in (0, 1, 2) ▷ f`
+    ///
+    /// `f`'s domain is the tuple its own call site passed, so component 2 is the
+    /// singleton `2`. What makes the program a *detector* is the two `g` uses: their
+    /// results meet in `f`'s result tuple, and that join is `0 ⊔ 2 = Int`. A collapse
+    /// allowed to travel along the bound chain runs out of upper bounds inside `f`,
+    /// continues through `g`'s codomain into the result tuple, and hands that join
+    /// back as the demand on the position it started from — `(0, 1, Int)`.
+    ///
+    /// This is the companion the two `Case` tests above cannot be. Both of those are
+    /// *also* repaired by the fallback's result handling — accumulating separately
+    /// instead of merging into the polarity-correct walk's leftover — so neither
+    /// isolates [`fallback_allowed`](super::solver::compact) and both stay green with
+    /// the guard neutralized to `true`. Here nothing else can move the answer: no
+    /// variant, no refinement set, just a projection whose result reaches a join.
+    #[test]
+    fn a_domain_does_not_read_back_the_join_its_results_meet_in() {
+        let g = TypedExpr::lambda("x", Type::infer(), TypedExpr::var("x"));
+        let through_g = |i: usize| {
+            TypedExpr::apply(
+                TypedExpr::apply(TypedExpr::var("t"), TypedExpr::proj_index(i)),
+                TypedExpr::var("g"),
+            )
+        };
+        let f = TypedExpr::lambda(
+            "t",
+            Type::infer(),
+            TypedExpr::tuple(vec![through_g(0), through_g(2)]),
+        );
+        let arg = TypedExpr::tuple(vec![lit_int(0), lit_int(1), lit_int(2)]);
+        let mut e = TypedExpr::let_bind(
+            "g",
+            g,
+            TypedExpr::let_bind("f", f, TypedExpr::apply(arg, TypedExpr::var("f"))),
+        );
+        run_inference(&mut e).expect("projection-through-identity program type-checks");
+        assert_eq!(
+            collect_mono_param_types(&e),
+            vec![Type::Tuple(vec![
+                int_lit_ty(0),
+                int_lit_ty(1),
+                int_lit_ty(2),
+            ])],
+            "the domain is the argument tuple, not the join its components' results meet in"
+        );
     }
 
     #[test]

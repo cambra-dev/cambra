@@ -52,7 +52,7 @@ pub mod traits;
 // `crate::ccl::infer::solver::…` path (chiefly the inference engine), so the
 // directory split is path-transparent.
 pub use coalesce::{CoalesceError, coalesce_compact};
-pub use compact::{CompactGraph, CompactType, compact_type};
+pub use compact::{CompactGraph, CompactType, compact_type, compact_type_polarity_only};
 pub use constrain::{ConstrainCache, ConstrainError, ExtrudeCache, constrain_subtype, extrude};
 pub use scheme::{
     FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots,

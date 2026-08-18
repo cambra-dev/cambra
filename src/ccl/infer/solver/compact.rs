@@ -311,7 +311,17 @@ impl CompactType {
     ///   *union* keys.
     /// - `fun`: recursively merge each side, flipping polarity on the
     ///   domain.
+    ///
+    /// A side that [`imposes_nothing`](Self::imposes_nothing) is the identity for
+    /// the whole merge, not just component-wise: see that method for why the
+    /// refinement set makes this necessary.
     pub(super) fn merge(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
+        if lhs.imposes_nothing() {
+            return rhs.absorbing_vars_of(lhs);
+        }
+        if rhs.imposes_nothing() {
+            return lhs.absorbing_vars_of(rhs);
+        }
         let mut vars = lhs.vars;
         vars.extend(rhs.vars);
         let mut atoms = lhs.atoms;
@@ -357,6 +367,46 @@ impl CompactType {
             refinements,
             history_slot,
         }
+    }
+
+    /// Whether this contribution says nothing about the position at all — an
+    /// unresolved variable and nothing else.
+    ///
+    /// Each *shape* component already has a `None` that acts as the merge identity
+    /// ("no record component here imposes nothing"). The refinement set has no such
+    /// sentinel: it is a `Vec`, so "no refinement is known of this" and "this is
+    /// known to carry no refinement" are the same empty value. Under the positive
+    /// intersection the second reading wins and erases the other side's refinements
+    /// — so a bare variable bound, which knows nothing, would silently discard the
+    /// singleton a sibling bound established. Recognising the whole contribution as
+    /// the identity is what keeps the two readings apart.
+    ///
+    /// The variables themselves are still carried across by
+    /// [`absorbing_vars_of`](Self::absorbing_vars_of); they are this
+    /// contribution's only content, and they join at every polarity.
+    fn imposes_nothing(&self) -> bool {
+        let CompactType {
+            vars: _,
+            atoms,
+            rec,
+            var,
+            fun,
+            refinements,
+            history_slot,
+        } = self;
+        atoms.is_empty()
+            && rec.is_none()
+            && var.is_none()
+            && fun.is_none()
+            && refinements.is_empty()
+            && history_slot.is_none()
+    }
+
+    /// Take the variable identities of a contribution that
+    /// [`imposes_nothing`](Self::imposes_nothing), leaving everything else as-is.
+    fn absorbing_vars_of(mut self, identity: CompactType) -> CompactType {
+        self.vars.extend(identity.vars);
+        self
     }
 
     /// Merge two refinement sets. The set-op tracks
@@ -503,10 +553,32 @@ pub struct CompactGraph {
 /// walking, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
 pub fn compact_type(ty: &Type) -> CompactGraph {
+    compact_type_with(ty, true)
+}
+
+/// [`compact_type`] with the opposite-polarity collapse suppressed **entirely**,
+/// including at the position the walk enters — the polarity-correct walk alone.
+///
+/// The collapse answers "what type must this position have"; without it the walk
+/// answers the strictly narrower "what reached this position *from the side it is
+/// read from*". Those differ exactly where the collapse is doing its job, and a
+/// caller that must not mistake a demand for a value needs the second question:
+/// an upper bound deposited on an otherwise value-free position makes
+/// [`compact_type`] report a type while nothing has actually flowed there.
+///
+/// Suppressing it walk-wide rather than at the entry is the same thing:
+/// [`fallback_allowed`] already confines the collapse to the entered position, so
+/// disabling it there disables it everywhere.
+pub fn compact_type_polarity_only(ty: &Type) -> CompactGraph {
+    compact_type_with(ty, false)
+}
+
+fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
     let mut st = CompactState {
         in_process: HashSet::new(),
         recursive: HashMap::new(),
         rec_vars: BTreeMap::new(),
+        collapse,
     };
     let term = compact_go(ty, true, &Subst::id(), None, &mut st);
     CompactGraph {
@@ -544,6 +616,32 @@ impl ParentPath<'_> {
     }
 }
 
+/// Whether the opposite-polarity fallback may fire at the variable currently
+/// being walked, given the chain that reached it.
+///
+/// **Only at a position** — the variable the walk entered structurally, never one
+/// reached by following another variable's bounds.
+///
+/// Walking `𝑎 <: 𝑏 <: 𝑐` computes `𝑎`'s transitive upper bound, and finding none
+/// is a *correct* conclusion: `𝑎`'s upper bound is ⊤. What the fallback does next
+/// — take the lower bound instead — is not a subtyping inference but a **choice**,
+/// the collapse of the `∀α ⊒ 𝐿` this system cannot represent (see the rationale in
+/// [`compact_go`]). Choices do not propagate along subtyping edges: `𝐿 <: 𝑐` and
+/// `𝑎 <: 𝑐` together say nothing whatever about `𝐿` versus `𝑎`. So the collapse is
+/// only ever applied to the variable whose quantifier is being eliminated.
+///
+/// Letting it fire further along makes a function's domain the join of everything
+/// the program does with any use's result: an arm binder's upper-bound chain runs
+/// out through the `match` result and the codomain into the call site's operands,
+/// and the join sitting there comes back as the domain's demand. See
+/// `design/type-inference.md`, "The collapse happens at the position".
+///
+/// A structural boundary starts a new position, which is why [`compact_go`] resets
+/// `parents` to `None` at every structural child.
+fn fallback_allowed(parents: Option<&ParentPath<'_>>, st: &CompactState) -> bool {
+    st.collapse && parents.is_none()
+}
+
 /// Walk-wide state threaded through [`compact_go`]: the cycle-tracking tables.
 /// (`parents` stays a per-path argument — it is scoped to one variable's bound
 /// chain and reset across structural boundaries — and the substitution
@@ -556,6 +654,9 @@ struct CompactState {
     /// Bounds of recursive variables (surfaced as `RecursiveType` errors by
     /// `coalesce_compact`).
     rec_vars: BTreeMap<InferVarId, CompactType>,
+    /// Whether the opposite-polarity collapse may fire at all on this walk.
+    /// False for [`compact_type_polarity_only`]; see [`fallback_allowed`].
+    collapse: bool,
 }
 
 /// Compact `ty` at polarity `pol`, composing `subst_acc` — the substitution
@@ -790,6 +891,10 @@ fn compact_go(
             // `rec`/`var`/`fun` get this for free from their `None` merge
             // identity, but refinement sets have no such sentinel, so we keep
             // the var out of the structural fold.
+            // Whether this variable is the *position* being materialized, which is
+            // the only place the opposite-polarity collapse below may happen
+            // ([`fallback_allowed`]).
+            let allow_fallback = fallback_allowed(parents, st);
             let new_parents = ParentPath { uid, prev: parents };
             let mut bound: Option<CompactType> = None;
             for b in primary_bounds.iter() {
@@ -813,18 +918,74 @@ fn compact_go(
             // opposite polarity from where the lambda is coalesced. This is the
             // coalesce-time read of monomorphization; it is sound because every
             // var reaching coalesce is monomorphically determined (one type or
-            // an `IncompatibleBounds` error). See the rationale above.
+            // an `IncompatibleBounds` error). See the rationale above, and
+            // [`fallback_allowed`] for why it happens only at a position.
             let no_concrete = bound.as_ref().is_none_or(|b| {
-                b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none() && b.history_slot.is_none()
+                let CompactType {
+                    atoms,
+                    rec,
+                    fun,
+                    history_slot,
+                    var,
+                    // Not shape. Both are carried across the fallback explicitly
+                    // below, rather than deciding whether it fires.
+                    vars: _,
+                    refinements: _,
+                } = b;
+                // A variant shape counts as concrete only at a **positive**
+                // position, where it is the value's own tags — read off the lower
+                // bounds, it is what the thing *is*, and the fallback firing past
+                // it would overwrite the value with its own upper bound (a bounded
+                // annotation reading back as the binder's type).
+                //
+                // At a negative position it is not a determination at all: an arm
+                // binder's upper bounds are the arms the body can *handle*, so
+                // stopping here would make a domain the sum of everything the
+                // `match` accepts rather than the argument it was given. That
+                // direction still needs the argument the fallback finds.
+                let var_is_shape = pol && var.is_some();
+                atoms.is_empty()
+                    && rec.is_none()
+                    && fun.is_none()
+                    && history_slot.is_none()
+                    && !var_is_shape
             });
-            if no_concrete {
+            if no_concrete && allow_fallback {
+                let mut recovered: Option<CompactType> = None;
                 for b in opposite_bounds.iter() {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
                     let bc = compact_go(&b.ty, !pol, &inner_acc, Some(&new_parents), st);
-                    bound = Some(match bound {
+                    recovered = Some(match recovered {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),
                     });
+                }
+                if let Some(mut recovered) = recovered {
+                    // Carry what the polarity-correct walk *did* find — variable
+                    // identities and refinement demands — across without letting
+                    // it into the structural fold.
+                    //
+                    // Replacing rather than merging is what the *negative* case
+                    // needs: there the primary result may hold a variant shape,
+                    // and it is the arms the body can handle rather than anything
+                    // that flowed in, so merging would union those tags into the
+                    // domain. (At a positive position `no_concrete` now implies
+                    // there is no shape at all to lose.)
+                    //
+                    // Refinements union instead of intersecting, because an empty
+                    // set is absorbing under the positive intersection (the same
+                    // hazard the `from_var` seed avoids above) — and a demanded
+                    // predicate is checked against the value the fallback found,
+                    // so both hold of it.
+                    if let Some(primary) = bound.take() {
+                        recovered.vars.extend(primary.vars);
+                        for r in primary.refinements {
+                            if !recovered.refinements.contains(&r) {
+                                recovered.refinements.push(r);
+                            }
+                        }
+                    }
+                    bound = Some(recovered);
                 }
             }
             // Inject the variable's own identity (refinement-neutral) so it
