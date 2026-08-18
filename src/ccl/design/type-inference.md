@@ -703,7 +703,7 @@ What this changed is instructive, because refinements were rare enough before th
 * **`__elem` is bound by the refinement it rides**, so it is never free *in a type* — the free-variable walk must not report it so.
 * **Beta reduction discharges a refined parameter** when the argument's type entails it: substituting the argument is what establishes the precondition.
 
-Singletons are *not* erased after inference. They are ordinary refinements and ride through to the runtime like any other, which also keeps them available to a future constant fold. They print as the literal they pin (`5`, not `{Int | __elem == 5}`).
+Singletons are *not* erased after inference. They are ordinary refinements and ride through to the runtime like any other, which also keeps them available to a future constant fold. They print as their base pinned to the literal (`Int@5`, not `{Int | __elem == 5}`).
 
 #### Refinements on the lattice
 
