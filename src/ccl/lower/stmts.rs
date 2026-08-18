@@ -7,8 +7,8 @@ use super::*;
 use crate::{
     ccl::{BaseType, Branch, Expr, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExprNode},
     chl_parser::ast::{
-        AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, Span, Spanned,
-        Stmt as ChlStmt, TypeAnnotation,
+        AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, PayloadPattern, Span,
+        Spanned, Stmt as ChlStmt, TypeAnnotation,
     },
     interpreter::{DataSink, HttpServerDataSource, http_server::SharedHttpServer},
 };
@@ -1402,12 +1402,20 @@ pub(super) fn lower_match(
             });
             continue;
         };
-        // A binder-less arm still needs a payload name for `Pattern`. Use a
-        // reserved spelling so the body cannot read what it declined to name.
-        let binder = match &pat.binder {
-            Some(name) => name.as_str().to_string(),
-            None => ctx.fresh_ignored_payload(),
+        // An arm that names no payload still needs a payload name for `Pattern`. Use
+        // a reserved spelling so the body cannot read what it declined to name — for
+        // `_` because that is what `_` means, and for the payload-less form because
+        // there is nothing there to read.
+        let binder = match &pat.payload {
+            PayloadPattern::Named(name) => name.as_str().to_string(),
+            PayloadPattern::Ignored | PayloadPattern::Absent => ctx.fresh_ignored_payload(),
         };
+        // Whether the arm *claims the tag carries nothing*. `` case `tag: `` is a
+        // statement about the type, not an elision of the binder: it matches a
+        // payload-less tag, and `emit_case` turns the claim into a constraint on that
+        // arm's payload. `_` makes no such claim — it has a payload and declines to
+        // read it.
+        let empty_payload = matches!(pat.payload, PayloadPattern::Absent);
         let mut arm_scope = outer_bindings.clone();
         arm_scope.insert(binder.clone());
         let body = ctx.with_shadowed(vec![binder.clone()], |ctx| {
@@ -1421,6 +1429,7 @@ pub(super) fn lower_match(
                     ty: Type::Hole,
                     user_annotation: None,
                 },
+                empty_payload,
             }),
             guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), match_span, "lower.match_guard"),
             body,

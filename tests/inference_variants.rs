@@ -57,6 +57,7 @@ fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> B
                 ty: Type::Hole,
                 user_annotation: None,
             },
+            empty_payload: false,
         }),
         guard: guard.unwrap_or_else(|| TypedExpr::lit(Lit::Bool(true))),
         body,

@@ -2495,6 +2495,7 @@ mod variant_ctor_tests {
             pattern: Some(Pattern {
                 tag: "commit".into(),
                 binding: binding("w", int_ty.clone()),
+                empty_payload: false,
             }),
             guard: bool_true(),
             body: w_plus_1,
@@ -2503,6 +2504,7 @@ mod variant_ctor_tests {
             pattern: Some(Pattern {
                 tag: "abort".into(),
                 binding: binding("a", Type::Base(CclBase::Unit)),
+                empty_payload: false,
             }),
             guard: bool_true(),
             body: typed(TypedExprNode::Lit(Lit::Int(0)), int_ty.clone()),
@@ -2625,6 +2627,7 @@ mod variant_ctor_tests {
                     pattern: Some(Pattern {
                         tag: "commit".into(),
                         binding: binding("w", int_ty.clone()),
+                        empty_payload: false,
                     }),
                     guard: bool_true(),
                     body: w_plus_1,
@@ -2767,6 +2770,7 @@ mod variant_ctor_tests {
                     pattern: Some(Pattern {
                         tag: "commit".into(),
                         binding: binding("w", int_ty.clone()),
+                        empty_payload: false,
                     }),
                     guard: bool_true(),
                     body: arm_body,

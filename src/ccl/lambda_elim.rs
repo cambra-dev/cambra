@@ -2200,6 +2200,7 @@ mod tests {
                     ty: binder_ty,
                     user_annotation: None,
                 },
+                empty_payload: false,
             }),
             guard: Expr::lit(Lit::Bool(true)).with_ty(bool_ty()),
             body,

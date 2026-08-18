@@ -290,15 +290,32 @@ pub struct MatchArm {
     pub body: Vec<Spanned<Stmt>>,
 }
 
-/// The tag a [`MatchArm`] matches, and the name its payload binds to.
+/// The tag a [`MatchArm`] matches, and what it says about that tag's payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchPattern {
     pub tag: SmolStr,
     pub tag_span: Span,
-    /// Name bound to the tag's payload for the arm's body. `None` for the
-    /// binder-less form `case tag:`, which discards a payload it does not read
-    /// (and is the natural spelling for a `Unit` payload such as `none`).
-    pub binder: Option<SmolStr>,
+    pub payload: PayloadPattern,
+}
+
+/// What an arm's pattern says about the tag's payload.
+///
+/// The three spellings make **two** statements, and the split is the point:
+/// declining to *read* a payload is not the same claim as there being none. ``
+/// `some{Int} `` and `` `some `` are different types, so a pattern that names no
+/// payload matches only the second — there is no silent conversion between them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PayloadPattern {
+    /// `` case `tag(v): `` — the tag carries a payload, bound to `v` for the arm's
+    /// body.
+    Named(SmolStr),
+    /// `` case `tag(_): `` — the tag carries a payload the arm does not read. `_` is
+    /// the unused-binder spelling, in the same sense `case _:` uses it for an arm
+    /// whose tag is not named; it is not a name, so the body cannot refer to it.
+    Ignored,
+    /// `` case `tag: `` — the tag carries **no** payload. A type statement, not an
+    /// elision: this arm does not match a `` `tag `` that carries one.
+    Absent,
 }
 
 /// A function parameter: a name with an optional type annotation.

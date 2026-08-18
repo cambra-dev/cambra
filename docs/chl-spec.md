@@ -1595,12 +1595,26 @@ match x:
 ```
 
 A pattern spells its tag exactly as a constructor does (§3.15), so an arm
-reads as the inverse of what it matches. `` case `tag(binder): `` binds the
-payload; `` case `tag: `` matches without binding it. The non-binding form is
-the natural spelling for a payload-less tag, and is accepted for **any** tag:
-an arm that needs to know only *which* tag fired says exactly that, and there
-is no other way to say it — a binder must be a name, since `_` is the default
-arm rather than a wildcard. A binder is an ordinary local, scoped to its arm.
+reads as the inverse of what it matches. There are three payload spellings,
+making **two** statements:
+
+| Pattern | Means |
+|---|---|
+| `` case `tag(v): `` | the tag carries a payload; bind it to `v` |
+| `` case `tag(_): `` | the tag carries a payload this arm does not read |
+| `` case `tag: `` | the tag carries **nothing** |
+
+A binder is an ordinary local, scoped to its arm. `_` is not a name — the body
+cannot refer to it — it is the unused-binder spelling, the same sense in which
+`case _:` names no tag.
+
+**The third form is a claim about the type, not an elision of the binder.**
+`` `some{Int} `` and `` `some `` are different types (§6.5), so `` case `some: ``
+matches only a payload-less `` `some ``; against one carrying an `Int` it is an
+error, and the fix is `` case `some(_): ``. There is no silent conversion
+between a tag with a payload and a tag without one, in a pattern any more than
+anywhere else.
+
 The default arm below takes no backtick: `_` is the absence of a tag, not a
 tag.
 
@@ -1646,6 +1660,13 @@ the same first-match rule reached through a call.
 > statement has today (`if c: x` does not parse either): granting `match`
 > one alone would make it the exception. Tuple destructuring on assignment
 > targets (§4.3) is unaffected and remains the only other pattern-like form.
+>
+> `_` is accepted as an unused binder in a **pattern payload** only. Generalizing
+> it to every binder position — a lambda parameter, a `for` target, a tuple
+> destructuring slot — is the obvious extension and is **[Tentative]**: it needs
+> a rule for how `_` in a *type* position (§2.4, where it already means "infer
+> this") and `_` in a *binder* position stay distinguishable, which is by
+> position but has not been written down.
 >
 > A per-arm guard (`` case `some(v) if v > 0: ``) is the natural next
 > addition — the IR already carries a guard alongside each arm's pattern —

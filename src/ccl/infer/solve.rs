@@ -2671,6 +2671,7 @@ mod tests {
                     ty: Type::Hole,
                     user_annotation: None,
                 },
+                empty_payload: false,
             }),
             guard: TypedExpr::lit(Lit::Bool(true)),
             body: TypedExpr::var(b),

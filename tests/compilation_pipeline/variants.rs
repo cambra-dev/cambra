@@ -228,12 +228,14 @@ match `some(5):
         0",
     Value::Int(4)
 )]
-// A binder-less arm over a payload-carrying tag: the payload is simply dropped.
+// `_` over a payload-carrying tag: there *is* a payload and the arm declines to read
+// it. The payload-less spelling `` case `some: `` is a different claim and is rejected
+// here — see `test_a_named_payload_is_not_optional`.
 #[case(
     r"
 x = `some(9)
 match x:
-    case `some:
+    case `some(_):
         1
     case `none:
         0",
@@ -470,13 +472,13 @@ match x:
         "no""#,
     Value::String("hi".into())
 )]
-// A binder-less tagged arm beside a default: the ignored binder is still typed from
-// the scrutinee, and must not be resolved from the default arm either.
+// An `_` payload beside a default arm: the ignored binder is still typed from the
+// scrutinee, and must not be resolved from the default arm either.
 #[case(
     r"
 x = `a(1)
 match x:
-    case `a:
+    case `a(_):
         7
     case _:
         0",
@@ -826,6 +828,84 @@ fn test_variant_type_rejections(#[case] code: &str) {
         compile_program(&mut ctx, code, consumer).is_err(),
         "expected a diagnostic for `{code}`"
     );
+}
+
+/// A tag's payload is not optional to *mention*: `` case `tag: `` says the tag carries
+/// nothing, and `` `some{Int} `` and `` `some `` are different types, so it does not
+/// match a tag that carries one. `` case `tag(_): `` is the spelling for "there is a
+/// payload and this arm does not read it".
+///
+/// The distinction is the absence of a silent conversion, so the check is a real
+/// constraint on the arm rather than a lint: an arm naming no payload constrains that
+/// payload to `Unit`, and the diagnostic names the arm.
+///
+/// Surface: `docs/chl-spec.md`, "4.10 `match` — tag dispatch".
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::informative_payload(
+    r"
+x = `some(9)
+match x:
+    case `some:
+        1
+    case `none:
+        0"
+)]
+// Also when the tag comes from an annotation rather than from a constructed value.
+#[case::annotated_informative_payload(
+    r"
+x: {`some{Int} | `none} = `none
+match x:
+    case `some:
+        1
+    case `none:
+        0"
+)]
+// `_` is not a name: an arm that declines to read its payload cannot then read it.
+#[case::underscore_is_not_readable(
+    r"
+x = `some(9)
+match x:
+    case `some(_):
+        _ + 1
+    case `none:
+        0"
+)]
+fn test_a_named_payload_is_not_optional(#[case] code: &str) {
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    assert!(
+        compile_program(&mut ctx, code, consumer).is_err(),
+        "expected a diagnostic for `{code}`"
+    );
+}
+
+/// The payload-less form over a tag that really carries nothing, which is what it is
+/// for — and `_` over the same tag, which claims nothing and is equally fine.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    r"
+x = `none
+match x:
+    case `some(v):
+        v
+    case `none:
+        0",
+    Value::Int(0)
+)]
+#[case(
+    r"
+x = `none
+match x:
+    case `some(v):
+        v
+    case `none(_):
+        0",
+    Value::Int(0)
+)]
+fn test_empty_payload_arm_matches_a_payload_less_tag(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
 
 /// A `match` arm body that uses its payload at the **wrong type** is rejected, and

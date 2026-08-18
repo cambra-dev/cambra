@@ -605,6 +605,7 @@ mod tests {
                     pattern: Some(Pattern {
                         tag: "T".into(),
                         binding: bind("payload"),
+                        empty_payload: false,
                     }),
                     guard: var("g0"),
                     body: var("payload"),

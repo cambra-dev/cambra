@@ -1674,6 +1674,7 @@ mod rewrite_tests {
             pattern: Some(crate::ccl::Pattern {
                 tag: tag.into(),
                 binding: TypedBinding::new_unannotated(payload),
+                empty_payload: false,
             }),
             guard: int(1),
             body: int(2),

@@ -60,8 +60,8 @@ use smol_str::SmolStr;
 
 use crate::chl_parser::ast::{
     AnnotationMode, AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, Comprehension, Expr,
-    IfBranch, Lit, MatchArm, MatchPattern, Module, Param, RecordField, Span, Spanned, Stmt,
-    TypeAnnotation, UnaryOp, VariantPayload,
+    IfBranch, Lit, MatchArm, MatchPattern, Module, Param, PayloadPattern, RecordField, Span,
+    Spanned, Stmt, TypeAnnotation, UnaryOp, VariantPayload,
 };
 use crate::chl_parser::lexer::{self, Token};
 
@@ -1037,10 +1037,17 @@ where
             just(Token::Backtick).ignore_then(match_ident),
             select! { Token::Ident(s) if s.as_str() == "_" => s }.map_with(|s, e| (s, e.span())),
         ));
+        // The payload position takes a name or `_`. `_` is the **unused-binder**
+        // spelling — the arm has a payload and declines to read it — so it is mapped
+        // to `Ignored` rather than to a variable called `_`: nothing may refer to it.
+        let case_binder = choice((
+            select! { Token::Ident(s) if s.as_str() == "_" => s }.map(|_| None),
+            match_ident.map(|(name, _)| Some(name)),
+        ));
         let case_arm = just(Token::Case)
             .ignore_then(case_pattern)
             .then(
-                match_ident
+                case_binder
                     .delimited_by(just(Token::LParen), just(Token::RParen))
                     .or_not(),
             )
@@ -1061,11 +1068,16 @@ where
                         body,
                     };
                 }
+                let payload = match binder {
+                    Some(Some(name)) => PayloadPattern::Named(name),
+                    Some(None) => PayloadPattern::Ignored,
+                    None => PayloadPattern::Absent,
+                };
                 MatchArm {
                     pattern: Some(MatchPattern {
                         tag,
                         tag_span,
-                        binder: binder.map(|(name, _)| name),
+                        payload,
                     }),
                     body,
                 }
@@ -1873,10 +1885,10 @@ mod tests {
                 assert_eq!(arms.len(), 2);
                 let p0 = arms[0].pattern.as_ref().expect("tagged arm");
                 assert_eq!(p0.tag.as_str(), "some");
-                assert_eq!(p0.binder.as_deref(), Some("v"));
+                assert_eq!(p0.payload, PayloadPattern::Named("v".into()));
                 let p1 = arms[1].pattern.as_ref().expect("tagged arm");
                 assert_eq!(p1.tag.as_str(), "none");
-                assert_eq!(p1.binder, None);
+                assert_eq!(p1.payload, PayloadPattern::Absent);
             }
             other => panic!("expected Match, got {other:?}"),
         }

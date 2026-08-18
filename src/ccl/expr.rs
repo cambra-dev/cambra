@@ -1981,7 +1981,20 @@ pub struct Pattern {
     /// variant's keys.
     pub tag: String,
     /// Payload binding, in scope for the branch's `guard` and `body`.
+    ///
+    /// Always present, even for an arm whose source named no payload: the name is
+    /// then a reserved spelling nothing can refer to. What the *source* said about
+    /// the payload's type is [`Self::empty_payload`], not the presence of this.
     pub binding: TypedBinding,
+    /// Whether the arm claims the tag carries **nothing** — the surface `` case
+    /// `tag: ``, as against `` case `tag(_): `` which has a payload it declines to
+    /// read.
+    ///
+    /// A claim about the type, so it is a constraint and not a formality:
+    /// `` `some{Int} `` and `` `some `` are different types, and an arm that names no
+    /// payload does not match the first. `emit_case` records it as `payload <: Unit`
+    /// on that arm alone, which is what lets the rejection name the arm.
+    pub empty_payload: bool,
 }
 
 #[cfg(test)]
