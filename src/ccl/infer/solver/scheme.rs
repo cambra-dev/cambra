@@ -70,6 +70,32 @@ impl PolyScheme {
             &mut FreshenCache::new(),
         )
     }
+
+    /// [`instantiate`](Self::instantiate), stamping the *use site's* telescope
+    /// on every variable the instantiation mints. For an operator scheme the
+    /// template's variables stand nowhere — they were built outside any
+    /// program scope, so inheriting their (empty) telescopes would leave the
+    /// instantiation's variables scope-free at a position that has scope, and
+    /// a dependent refinement flowing into an operand variable would be an open
+    /// record. A *let*-generalized scheme keeps plain
+    /// [`instantiate`](Self::instantiate): its clone stands where the
+    /// definition stood, and the definition-site telescopes are the contract
+    /// (see `src/ccl/design/type-inference.md`, "Freshening and `SpecKey`,
+    /// worked").
+    pub fn instantiate_in(
+        &self,
+        current_level: Level,
+        telescope: &crate::ccl::infer_var::Telescope,
+    ) -> Type {
+        let mut cache = FreshenCache::new();
+        cache.site_telescope = Some(telescope.clone());
+        freshen_above(
+            self.level,
+            &self.body,
+            FreshenLevel::At(current_level),
+            &mut cache,
+        )
+    }
 }
 
 /// Cache for [`freshen_above`]: each original quantified variable maps to its
@@ -78,6 +104,11 @@ impl PolyScheme {
 /// single fresh (or pre-seeded — see [`seed_chan_dom_pairings`]) rename.
 #[derive(Default)]
 pub struct FreshenCache {
+    /// When set, every variable this freshening mints takes *this* telescope
+    /// instead of inheriting its original's — the operator-scheme
+    /// instantiation mode ([`PolyScheme::instantiate_in`]). Unset for
+    /// specialization clones, which stand where their definition stood.
+    pub site_telescope: Option<crate::ccl::infer_var::Telescope>,
     /// Original quantified var → its fresh replacement.
     pub vars: HashMap<InferVarId, Rc<InferVar>>,
     /// Original quantified channel-domain name → its rename. Seeded by
@@ -323,8 +354,13 @@ pub fn freshen_above(
             };
             // A freshened clone stands where the original stood, so it
             // inherits the original's telescope: the bounds copied below were
-            // recorded against that scope.
-            let v = InferVar::fresh_in(new_level, &tv.telescope);
+            // recorded against that scope. The exception is an operator-scheme
+            // instantiation, whose template stands nowhere — it takes the use
+            // site's telescope instead (see [`FreshenCache::site_telescope`]).
+            let v = InferVar::fresh_in(
+                new_level,
+                cache.site_telescope.as_ref().unwrap_or(&tv.telescope),
+            );
             cache.vars.insert(tv.uid, Rc::clone(&v));
 
             // Snapshot bounds before recursing — the recursion may touch

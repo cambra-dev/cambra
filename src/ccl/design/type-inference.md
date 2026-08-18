@@ -951,8 +951,10 @@ The pipeline passes downstream of inference treat function types structurally an
 > observed; the index coordinate and its four conversion sites live, with the
 > acceptance tests below passing in `compact.rs` and `spec_key.rs`).
 > Enforcement (milestone 3) and the name-path deletions (milestone 4) are
-> pending, as is the mediation of the record-time observation log's remaining
-> travelers. This section is the design of record for retiring open type
+> pending. The record-time observation log is mediated down to one residual
+> class: a post-elimination re-check whose claim references a comprehension
+> binder after `lambda_elim` erased its lambda — enforcement has to decide
+> that class. This section is the design of record for retiring open type
 > fragments from the solver. The flatten-time Pi-binder canonicalization on
 > the unmerged branch `dmills/canonical-pi-binders` is the local repair this
 > design replaces; its regression tests — α-variant bounds merge to one
