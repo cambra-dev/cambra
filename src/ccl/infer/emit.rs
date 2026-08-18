@@ -60,12 +60,33 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Loc
 fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
+    // The literal's own id, taken before the walk borrows the node — the slot the
+    // `Lit` rule brackets its singleton predicate on. See there.
+    let node_id = expr.node_id();
     // The `Lambda` rule reads the node's own type for its kind (see
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
     let has_ann = expr.user_annotation.is_some();
     let mut ty = match &mut expr.node {
-        TypedExprNode::Lit(lit) => ctx.lit_singleton(lit),
+        TypedExprNode::Lit(lit) => {
+            // A literal's type is its singleton, `{Int | __elem == n}`, and the
+            // three nodes of that `__elem == n` term are minted *here* — the
+            // predicate is a pure function of the literal value, memoized per
+            // pass, so it is born the first time each distinct value is seen.
+            //
+            // Bracket on the literal's own node. Two things follow. The mints
+            // land inside a frame, so the widened `collect_tree_ids` (which now
+            // reaches refinement predicates) can explain them instead of
+            // reporting `Unexplained`. And the resulting edge is the one
+            // `predicate-lineage-report` records as missing: nothing used to
+            // link a singleton refinement back to the literal the user wrote.
+            let _g = crate::ccl::lineage::enter(
+                node_id,
+                "infer.lit_singleton",
+                crate::ccl::lineage::Nature::Machinery,
+            );
+            ctx.lit_singleton(lit)
+        }
 
         // Resolve a variable through its bound scheme. A monomorphic binder
         // freshens nothing and returns its type verbatim. A *polymorphic* `let`

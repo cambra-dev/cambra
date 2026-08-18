@@ -1,44 +1,67 @@
-//! Lineage data model: the per-pass rewrite log and the fold that collapses it
-//! into a node↔node relation plus a source-span projection.
+//! Lineage data model: the per-compile node table and the folds that collapse
+//! it into a node↔node relation plus a source-span projection.
 //!
 //! # The model
 //!
-//! Every IR node has a stable [`NodeId`]. As a pass rewrites the tree it appends
-//! [`RewriteStep`]s to a [`LineageLog`]: a [`Op::Transform`] records "these input
-//! ids vanished, these output ids appeared"; a [`Op::Copy`] records "these output
-//! ids are freshened duplicates of that origin." Each step *separately* carries a
-//! `blame` set (the upstream ids the outputs attribute to — **not** the same as
-//! what they consumed), a `nature` bit (faithful expansion vs. pure machinery),
-//! and a stable `label`. An untouched id is one no step mentions.
+//! Every IR node has a stable [`NodeId`], and every node a pass *produces* gets
+//! a row in the [`LineageTable`]: the ids the rewrite consumed to produce it
+//! (`parents`), the ids it attributes to (`blame` — **not** the same as what it
+//! consumed), and an interned [`RewriteTag`] carrying the pass, the fidelity
+//! `nature`, and a stable `label`. An id with no row was never rewritten.
 //!
-//! At an inspector pane boundary the intervening logs are folded once, in pass
-//! order, by [`collapse`] into a [`LineageMap`] — a bidirectional node↔node
+//! Rows are a **byproduct of performing the rewrite**, never a post-pass diff: a
+//! pass brackets the node it is about to rewrite ([`enter`]) and the
+//! construction hooks capture what that bracket's extent mints.
+//!
+//! At an inspector pane boundary the rows the boundary's passes wrote are folded
+//! once by [`collapse`] into a [`LineageMap`] — a bidirectional node↔node
 //! relation with an explicit self-edge for every id that survived — and, in
 //! parallel, into a [`SourceProjection`] that resolves each surviving node's
-//! blame back to source spans. The fold composes away ids born and consumed
-//! within the phase, and its two-sided leak check ([`Leak`]) guarantees no node
-//! silently loses its history.
+//! attribution back to source spans. The fold composes away ids born and
+//! consumed within the phase, and its two-sided leak check ([`Leak`]) is what
+//! says whether a node silently lost its history.
 //!
-//! # Two independent channels (load-bearing)
+//! The fold is **order-free**: it reads the rows as an edge set and sweeps them
+//! in ascending [`NodeId`], which is a topological order of the definition graph
+//! (see [`collapse`], "The algebra"). Nothing depends on the order rows were
+//! written in — which matters, because a frame's rows are written when the frame
+//! *closes*, so an enclosing rewrite's rows land after the rows of the rewrites
+//! it contains.
 //!
-//! `consumed` and `blame` are distinct and never mixed:
+//! # Two columns, because they are two kinds of relation (load-bearing)
 //!
-//! * **`consumed`** drives *fate* accounting — an id is consumed, carried, or
-//!   dropped — and the leak audit. Lineage edges resolve through the `roots`
-//!   state, which only `consumed`/`produced` move.
-//! * **`blame`** drives *span* resolution and may name ids that survive the step.
-//!   It resolves through the `attr` projection, never through `roots`.
+//! Both columns relate a node to other nodes; they differ in **what the
+//! relation asserts**, which is a label on the edge rather than the presence of
+//! one. Both reach [`LineageMap`], each labelling the edges it contributes:
 //!
-//! Welding the two would (for example) resolve a channelized feed union — whose
-//! step consumes the enclosing `Defer`/`Let` but blames the surviving fed-value
-//! operands — to the `defer` keyword's span rather than the operands'.
+//! * **`parents`** — *descends from*. The ids the rewrite consumed to produce
+//!   this node, and the column the leak audit reads: a parent the boundary
+//!   never heard of is a lineage that stops at an id describing nothing
+//!   ([`Leak::ParentUnknown`]).
+//! * **`blame`** — *related to, but not consumed*. It may name ids that
+//!   **survive** the rewrite, so it is not an ancestry claim: the edges it
+//!   contributes carry the relatedness label, and a consumer asking "what was
+//!   this made from" reads the label rather than the edge's presence.
+//!
+//! The labels compose **weakest-link** along a path ([`EdgeLabels`]): a closed
+//! edge asserts descent only when every hop on the way consumed the one before
+//! it, and one relatedness hop anywhere makes the whole path relatedness. That
+//! is what keeps the two readings apart once transitivity has run, and what lets
+//! a consumer render the relatedness or prune it — instead of receiving one
+//! unlabelled edge set it cannot take apart again.
+//!
+//! Attribution reads **both, unioned**: a node's spans are its parents' spans
+//! plus whatever distinct spans its blame adds. Blame is the rare case (four
+//! sites in the whole compiler), so for almost every node this is simply the
+//! spans of whatever it was made from. Attribution reads no label — a span is
+//! a span whichever channel named the node it came from.
 //!
 //! # Domains, not passes
 //!
 //! [`LineageMap`] is generic over its two id domains so the same relation serves
 //! lowering's `SourceKey → NodeId` projection, a pane pair's `NodeId → NodeId`, and a
-//! future `NodeId → OperatorId` edge. Passes live in the *data* (each step's
-//! `via`/`label`), never in the type.
+//! future `NodeId → OperatorId` edge. Passes live in the *data* (each row's
+//! [`RewriteTag`]), never in the type.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -48,60 +71,9 @@ use crate::ccl::provenance::{NodeId, Pass};
 use crate::chl_parser::ast::Span;
 
 /// A stable, human-readable name for a rewrite, e.g. `"channelize.feed_union"`
-/// or `"inline.fanout"`. Carried on every [`RewriteStep`] and surfaced through
-/// [`RewriteTag`] for inspector tooltips.
+/// or `"inline.fanout"`. Fixed at the bracket site, interned into every row's
+/// [`RewriteTag`], and surfaced from there for inspector tooltips.
 pub type RewriteLabel = &'static str;
-
-/// One rewrite's identity relation, in a single hop.
-///
-/// Appended to a [`LineageLog`] while a pass runs. The two channels it carries —
-/// the `op`'s consumed/produced/origin ids and the separate `blame` ids — are
-/// resolved independently at [`collapse`] time (see the module docs).
-#[derive(Clone, Debug, PartialEq, Eq)]
-// Consumed when the passes adopt the recorder (next commit in the stack).
-pub(crate) struct RewriteStep {
-    /// The identity relation this step performs.
-    pub op: Op,
-    /// Upstream ids the outputs *attribute* to — separate from `op`'s consumed
-    /// set (blame ⊥ consumption). May name ids that survive the step. Resolved
-    /// to spans at collapse through the projection being built, never through
-    /// the lineage `roots`.
-    pub blame: Vec<NodeId>,
-    /// Faithful expansion of a user construct vs. pure machinery. The one bit
-    /// the collapsed graph cannot recover; display policy derives from it later.
-    pub nature: Nature,
-    /// Stable rewrite label for tooling.
-    pub label: RewriteLabel,
-}
-
-/// The identity relation a [`RewriteStep`] performs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Op {
-    /// `consumed` ids vanish; `produced` ids appear. Empty `produced` = discard.
-    ///
-    /// An id in `consumed ∩ produced` **survives while absorbing**: the fold
-    /// removes every consumed root, unions them (including the surviving id's
-    /// own), and assigns that union to each produced id — so a carried id keeps
-    /// its own lineage plus the lineage of what it absorbed.
-    Transform {
-        /// Ids that vanish. Each must be live at the step, else
-        /// [`Leak::ConsumedUnknown`].
-        consumed: Vec<NodeId>,
-        /// Ids that appear. A live id here that was not also consumed is a lying
-        /// step, [`Leak::ProducedLive`].
-        produced: Vec<NodeId>,
-    },
-    /// `produced` ids mirror `origin`'s lineage (freshened copies). Silent on
-    /// the origin's own fate — the origin stays live, so a later step may still
-    /// consume it while the copies retain the lineage snapshotted here.
-    Copy {
-        /// The id whose lineage is mirrored. Must be live, else
-        /// [`Leak::CopyOfUnknown`].
-        origin: NodeId,
-        /// The freshened copies.
-        produced: Vec<NodeId>,
-    },
-}
 
 /// The fidelity of a node to its blamed source — the one fact the collapsed
 /// graph cannot recover. A trinary axis.
@@ -117,22 +89,22 @@ pub(crate) enum Op {
 /// without touching how any pass records.
 ///
 /// Public because it rides in the public [`RewriteTag`] (and thus
-/// [`SourceAttribution`]); the recorder-facing [`RewriteStep`] carries it too.
+/// [`SourceAttribution`]); a [`LoweringStep::Leaf`] carries one too.
 ///
 /// [`Source`](Nature::Source) is listed first because it is the base case: the
 /// root of a lowered source expression. The rule for who gets it is *structural*
 /// and stated in one place — see `LoweringContext::tag_source` in
 /// `src/ccl/lower/mod.rs`, and `design/provenance.md`, "The seam
-/// (`src/ccl/context.rs`)". It is emitted **only by lowering** — the fold's
-/// attributing arms and both wire validators carry debug guards that no *pass*
-/// step ever carries it. On the wire a `Source`-nature tag null-compresses
+/// (`src/ccl/context.rs`)". It is emitted **only by lowering** — [`attribute`]
+/// and both wire validators carry debug guards that no *pass* rewrite ever
+/// carries it. On the wire a `Source`-nature tag null-compresses
 /// (serializes as
 /// `rewritten: null` via [`is_source`](Nature::is_source)) so the wire stays
 /// byte-identical to the retired `rewritten: None` encoding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Nature {
     /// The node is the root of a lowered source expression. Lowering-only;
-    /// guarded off the pass logs and off the wire. Note this is a *positional*
+    /// guarded off the pass rows and off the wire. Note this is a *positional*
     /// fact, not "images something the user wrote" — an interior image (a call's
     /// callee, a chained comparison's operands) carries `Machinery` with the
     /// `"lower.image"` label instead.
@@ -172,42 +144,51 @@ impl Nature {
     }
 }
 
-/// A pass's ordered rewrite record. Passes append; the fold reads.
-pub(crate) type LineageLog = Vec<RewriteStep>;
-
-/// Lowering's log entry: the same [`Op`]s a
-/// [`RewriteStep`] carries, but anchored by literal source **spans** rather than
-/// NodeId blame.
+/// Lowering's log entry, in the two shapes lowering actually has.
 ///
-/// The distinction from [`RewriteStep::blame`] is load-bearing and is exactly
-/// why this is a *sibling* struct rather than one type generic over its
-/// attribution domain: an **`anchor`** is a literal span *attached* at
-/// construction (lowering knows the source token it is imaging right there),
-/// whereas `blame` is a NodeId *reference resolved* later through the
-/// accumulating projection (a pass names an upstream id whose spans it does not
-/// itself hold). Attached-literal vs resolved-through-state are different
-/// semantics, not two instances of one thing — and thread-local statics cannot
-/// be generic, so a blame-domain generic would erase to the same at the
-/// recorder boundary anyway. There is no NodeId-blame field: the one site that
-/// would name an upstream id — a substitution, whose replacement takes the
-/// replaced occurrence's attribution — carries the occurrence's identity instead
-/// (`crate::ccl::subst`'s `as_expr_preserving`), so there is no id left to
-/// resolve. Add one when a site demands it.
+/// Its attribution channel is a literal source **span**, attached here at
+/// construction because lowering knows the source token it is imaging right
+/// there. A [`LineageTable`] row's `blame`, by contrast, is a NodeId
+/// *reference* resolved later through the accumulating projection: a pass names
+/// an upstream id whose spans it does not itself hold. Attached-literal and
+/// resolved-through-state are different semantics, not two instances of one
+/// thing, which is why lowering records into its own log rather than into the
+/// table — and thread-local statics cannot be generic, so an
+/// attribution-domain generic would erase to the same thing at the recorder
+/// boundary anyway. There is deliberately no NodeId-blame channel here:
+/// root-carry eliminated its only prospective user; add one when a site demands
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LoweringStep {
-    /// The identity relation this step performs. For lowering: a leaf mint is a
-    /// `Transform { consumed: [], produced: [id] }` (pure insertion); a copy
-    /// site is a `Copy { origin, produced }`.
-    pub op: Op,
-    /// The literal source spans the produced nodes image, attached here at
-    /// construction. Empty for a `Copy` (it mirrors its origin's folded entry).
-    pub anchor: Vec<Span>,
-    /// `Source` for a direct image, `Machinery` for manufactured plumbing
-    /// (`Expansion` is unused at lowering sites — the split folds into
-    /// `Machinery`, the per-rule label being the primary datum).
-    pub nature: Nature,
-    /// Stable rewrite label for tooling (`"lower.image"`, `"lower.<rule>"`).
-    pub label: RewriteLabel,
+pub(crate) enum LoweringStep {
+    /// A **leaf mint**: one node, imaged at one span. Lowering's ordinary
+    /// record — it mints from scratch, so a leaf has no lineage ancestor and is
+    /// a node plus the span it images, and nothing else.
+    Leaf {
+        /// The node this record is about.
+        id: NodeId,
+        /// The literal source span it images.
+        anchor: Span,
+        /// `Source` for a lowered expression's root, `Machinery` for an interior
+        /// image or manufactured plumbing (`Expansion` is unused at lowering
+        /// sites — the split folds into `Machinery`, the per-rule label being
+        /// the primary datum).
+        nature: Nature,
+        /// Stable rewrite label for tooling (`"lower.image"`, `"lower.<rule>"`).
+        label: RewriteLabel,
+    },
+    /// A **copy**: `produced` are freshened duplicates of `origin` and mirror
+    /// its folded entry verbatim. It carries no anchor, nature or label because
+    /// the fold reads none of them — uncurry's template interiors and the
+    /// compare-chain's second-use operands are exactly their origins' images, so
+    /// a tag here would be an unobservable value, and a wrong one would look
+    /// meaningful while being inert.
+    Copy {
+        /// The node whose folded entry the copies mirror. Must be recorded by an
+        /// earlier step, else [`Leak::ParentUnknown`].
+        origin: NodeId,
+        /// The freshened duplicates.
+        produced: Vec<NodeId>,
+    },
 }
 
 /// Lowering's ordered record. Appended at leaf grain by
@@ -215,19 +196,133 @@ pub(crate) struct LoweringStep {
 /// [`collapse_lowering`] into the always-on lowering projection.
 pub(crate) type LoweringLog = Vec<LoweringStep>;
 
-/// A collapsed bidirectional relation between two id domains.
+/// The lowering log, plus the set of [`NodeId`]s it has already explained.
 ///
-/// **Dense**: an id that survived a phase appears as its own self-edge, so there
-/// is one uniform edge kind and no identity special case. Self-edges are
-/// derivable (an id present in both snapshots is its own edge), so a later
-/// sparse re-encoding behind the accessors is a pure re-encoding — consumers
-/// must go through [`upstream`](Self::upstream) / [`downstream`](Self::downstream)
-/// / [`edges`](Self::edges) and never touch the raw maps.
+/// The set exists for one caller: [`lowering_predicate_leaf`], which sweeps a
+/// finished refinement predicate and must **not** re-record a node that already
+/// carries precise attribution from its own lowering. The fold is
+/// last-write-wins, so a blanket sweep would silently replace a node's real span
+/// and label with the coarse predicate ones — a loss no leak class can see,
+/// because the node stays explained either way.
+#[derive(Default)]
+struct LoweringRecord {
+    log: LoweringLog,
+    recorded: HashSet<NodeId>,
+}
+
+/// What an edge asserts about its two endpoints — a **set**, because one pair of
+/// ids can be related both ways at once.
+///
+/// The two labels are the two relations a row records, closed transitively:
+///
+/// * **descent** — the downstream node *descends from* the upstream one, i.e.
+///   every hop between them consumed the node before it to produce the next.
+///   A row's `parents` are its descent hops.
+/// * **relatedness** — the downstream node is *related to, but not consumed
+///   from*, the upstream one. A row's `blame` are its relatedness hops, and
+///   they may name a node that is still alive elsewhere in the output tree,
+///   which is exactly why relatedness is not an ancestry claim.
+///
+/// The closure is **weakest-link** ([`then`](Self::then)): a path is descent
+/// only while every hop on it is a descent hop, and one relatedness hop anywhere
+/// makes the endpoint related. Without that rule the label would decay into
+/// "reachable somehow" over two hops — you do not descend from something you are
+/// merely related to. Paths meeting at one endpoint pair [`union`](Self::union)
+/// their labels, which is how a pair comes to carry both.
+///
+/// The set is never empty: a label set exists only where an edge does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EdgeLabels {
+    descent: bool,
+    related: bool,
+}
+
+impl EdgeLabels {
+    /// *Descends from*, alone — a `parents` hop, and the identity of
+    /// [`then`](Self::then): the zero-length path from a surviving node to
+    /// itself is descent, which is what makes a dense self-edge read as
+    /// ancestry.
+    pub const DESCENT: Self = EdgeLabels {
+        descent: true,
+        related: false,
+    };
+
+    /// *Related to, but not consumed*, alone — a `blame` hop.
+    pub const RELATED: Self = EdgeLabels {
+        descent: false,
+        related: true,
+    };
+
+    /// Whether the pair is in the descent relation.
+    pub fn descends(self) -> bool {
+        self.descent
+    }
+
+    /// Whether the pair is in the relatedness relation.
+    pub fn relates(self) -> bool {
+        self.related
+    }
+
+    /// Extend a path by one hop: the weakest-link composition.
+    ///
+    /// Descent survives only if both the path so far and the hop are descent;
+    /// relatedness appears as soon as either is related, because a path may take
+    /// the relatedness reading of any hop that offers one. Associative, with
+    /// [`DESCENT`](Self::DESCENT) as its identity, so the sweep can carry one
+    /// label per root and fold hops in any order.
+    #[must_use]
+    pub fn then(self, hop: Self) -> Self {
+        EdgeLabels {
+            descent: self.descent && hop.descent,
+            related: self.related || hop.related,
+        }
+    }
+
+    /// Both readings of two paths that reach the same endpoint pair.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        EdgeLabels {
+            descent: self.descent || other.descent,
+            related: self.related || other.related,
+        }
+    }
+}
+
+/// One end of a labelled edge: the id at the far end, and what the edge to it
+/// asserts.
+///
+/// The accessors hand back these rather than bare ids because the label is the
+/// content of the edge, not a detail to project away — a consumer that cannot
+/// tell relatedness from descent cannot choose to render or prune it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Link<T> {
+    /// The id at the far end of the edge.
+    pub id: T,
+    /// What the edge to it asserts.
+    pub labels: EdgeLabels,
+}
+
+/// A collapsed bidirectional relation between two id domains, its edges labelled
+/// by what they assert ([`EdgeLabels`]).
+///
+/// **One entry per `(upstream, downstream)` pair**, holding the label set: a
+/// pair reached both by descent and by relatedness is one edge carrying both,
+/// never two edges disagreeing about one pair.
+///
+/// **Dense**: an id that survived a phase appears as its own descent self-edge,
+/// so there is one uniform edge kind and no identity special case. Self-edges
+/// are derivable (an id present in both snapshots is its own edge) and so are
+/// the two directions from each other, so a later sparse re-encoding behind the
+/// accessors is a pure re-encoding — consumers must go through
+/// [`upstream`](Self::upstream) / [`downstream`](Self::downstream) /
+/// [`edges`](Self::edges) and never touch the raw maps. The accessors expose the
+/// labels, so that promise covers what an edge *asserts* as well as which pairs
+/// exist.
 pub struct LineageMap<U, D> {
-    /// upstream → downstream (fan-out).
-    down: HashMap<U, Vec<D>>,
-    /// downstream → upstream (origins).
-    up: HashMap<D, Vec<U>>,
+    /// upstream → labelled downstream (fan-out).
+    down: HashMap<U, Vec<Link<D>>>,
+    /// downstream → labelled upstream (origins).
+    up: HashMap<D, Vec<Link<U>>>,
 }
 
 impl<U, D> LineageMap<U, D>
@@ -235,25 +330,37 @@ where
     U: Eq + Hash + Copy + Ord,
     D: Eq + Hash + Copy + Ord,
 {
-    /// The upstream origins of a downstream id (empty if the id is unknown to
-    /// the map). Sorted, deduplicated.
-    pub fn upstream(&self, d: &D) -> &[U] {
+    /// The upstream origins of a downstream id, each with what its edge asserts
+    /// (empty if the id is unknown to the map). Sorted by id, one entry per
+    /// origin.
+    pub fn upstream(&self, d: &D) -> &[Link<U>] {
         self.up.get(d).map_or(&[], Vec::as_slice)
     }
 
-    /// The downstream fan-out of an upstream id (empty if the id is unknown to
-    /// the map). Sorted, deduplicated.
-    pub fn downstream(&self, u: &U) -> &[D] {
+    /// The downstream fan-out of an upstream id, each with what its edge asserts
+    /// (empty if the id is unknown to the map). Sorted by id, one entry per
+    /// target.
+    pub fn downstream(&self, u: &U) -> &[Link<D>] {
         self.down.get(u).map_or(&[], Vec::as_slice)
     }
 
-    /// Every `(upstream, downstream)` edge, in deterministic order. Includes the
-    /// dense self-edges.
-    pub fn edges(&self) -> Vec<(U, D)> {
-        let mut out: Vec<(U, D)> = self
+    /// Every edge as `(upstream, labelled downstream)`, in deterministic order.
+    /// Includes the dense self-edges.
+    pub fn edges(&self) -> Vec<(U, Link<D>)> {
+        let mut out: Vec<(U, Link<D>)> = self
             .up
             .iter()
-            .flat_map(|(d, us)| us.iter().map(move |u| (*u, *d)))
+            .flat_map(|(d, us)| {
+                us.iter().map(move |u| {
+                    (
+                        u.id,
+                        Link {
+                            id: *d,
+                            labels: u.labels,
+                        },
+                    )
+                })
+            })
             .collect();
         out.sort_unstable();
         out
@@ -317,7 +424,11 @@ impl serde::Serialize for SourceAttribution {
 }
 
 /// How a rewritten node came to exist, for tooltips and display policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Hash`/`Eq` are what let a [`LineageTable`] intern the whole triple as one
+/// [`RuleId`]: the three fields are fixed together at a bracket site, so they
+/// are one value, not three columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RewriteTag {
     /// The pass that performed the rewrite.
     pub via: Pass,
@@ -349,210 +460,313 @@ impl RewriteTag {
 /// pane's instance is materialized by [`collapse`] at snapshot-serve time.
 pub type SourceProjection = HashMap<NodeId, SourceAttribution>;
 
-/// A history-integrity violation surfaced by [`collapse`]. The fold's error
-/// channel.
+/// A history-integrity violation surfaced by a fold. The folds' error channel.
 ///
 /// `Leak::Duplicate` (one id at two tree positions) is deliberately *not* here:
 /// it is a tree invariant, checked pipeline-wide by `assert_unique_node_ids`,
-/// not a collapse concern.
+/// not a fold concern. Nor is any class shaped like a claim about a *rewrite*:
+/// a row describes a node, so "two rewrites did X" has nowhere to live. The two
+/// invariants that are properties of a record — one row per id, and every row
+/// anchored through some channel — are asserted at
+/// [`LineageTable::record`], at the site that would violate them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Leak {
-    /// An output id with no lineage — a `fresh()` where a preserve was intended
-    /// (nothing produced or preserved this id).
+    /// An output id with no lineage — a `fresh()` where a preserve was intended:
+    /// no row in the window produced it and the input pane does not hold it, so
+    /// nothing explains why it is in the output tree.
     Unexplained { output: NodeId },
-    /// An input id that was neither consumed nor carried into the output — its
-    /// history vanished silently.
-    Dropped { input: NodeId },
-    /// A [`Op::Transform`] consumed an id that was not live (an ordering or
-    /// attribution bug).
-    ConsumedUnknown { consumed: NodeId },
-    /// A [`Op::Copy`] named an origin that was not live.
-    CopyOfUnknown { origin: NodeId },
-    /// A [`Op::Transform`] produced an already-live id it did not also consume
-    /// (a lying step: it claims to mint what already exists).
-    ProducedLive { produced: NodeId },
-    /// A [`Op::Transform`] with **both** empty `consumed` and empty `blame`
-    /// (index into the concatenated log) — a truly unanchored mint. Every step
-    /// must anchor its outputs through *some* channel: consumption or blame. A
-    /// consume-nothing transform that still names `blame` is the legal
-    /// *pure-insertion* shape (a node inserted over surviving material,
-    /// attributed via blame, with genuinely no lineage ancestor); only the
-    /// both-empty case cannot explain where its outputs came from.
-    EmptyConsumed { step: usize },
+    /// An input id that is absent from the output pane — **the death report**,
+    /// not a defect.
+    ///
+    /// Deaths are the set difference `input_ids ∖ output_ids`, which is the
+    /// whole of it: nothing declares a fate, so nothing can over-claim one, and
+    /// this class fires for *every* node that dies in the window. It is data the
+    /// inspector reads, never something a gate asserts against. The class that
+    /// *is* a defect on this side is [`Unexplained`](Leak::Unexplained) — an
+    /// output node no capture explains.
+    Died { input: NodeId },
+    /// A row named a parent the window has never heard of: no row inside the
+    /// window produced it and the input pane does not hold it. The node's
+    /// lineage stops at an id that describes nothing.
+    ///
+    /// **One class for both edge shapes**, deliberately. The sole parent of a
+    /// freshened copy and one consumed id of a fusion are the identical
+    /// condition — an edge to an id outside the window — and telling them apart
+    /// would mean recording the *shape* of the rewrite, which the `parents`
+    /// column does not and should not carry: its cardinality already expresses
+    /// 1:1, 1:many and many:1, and nothing else about the shape was ever read.
+    ParentUnknown { parent: NodeId },
 }
 
-/// Resolve a `blame` set to a [`SourceAttribution`] through the `attr`
-/// projection: the order-preserving, deduplicated union of each blamed id's
-/// spans, tagged with `{via, nature, label}`.
+impl Leak {
+    /// Whether this is a **defect** — something the capture got wrong — rather
+    /// than the death report.
+    ///
+    /// The split is the gate: every class but [`Died`](Leak::Died) means the
+    /// record is inconsistent or incomplete, while `Died` is the boundary's set
+    /// difference and fires on every ordinary death. Living on the enum rather
+    /// than at the one gate keeps the two readings from drifting apart — adding
+    /// a class forces the question here.
+    pub(crate) fn is_defect(&self) -> bool {
+        match self {
+            Leak::Died { .. } => false,
+            Leak::Unexplained { .. } | Leak::ParentUnknown { .. } => true,
+        }
+    }
+}
+
+/// The [`SourceAttribution`] a recorded node carries: the ordered, deduplicated
+/// union of its attribution sources' spans, tagged with the row's rule.
 ///
-/// Blame resolves through `attr` (the span channel), never through the lineage
-/// `roots`. A blamed id absent from `attr` contributes no spans (it has no
-/// known source), which is legal — empty blame or all-unknown blame yields
-/// `spans: []`, the "known node, no source anchor" case.
+/// **The sources are `parents` ∪ `blame`** — both channels, `parents` first and
+/// then blame's distinct additions. Parentage takes precedence in the *order*,
+/// which is what keeps the projection deterministic, but blame is never dropped:
+/// a rewrite that names blame is saying "these outputs are also about that
+/// node", not "attribute them there instead". A row with no parents (the pure
+/// insertion) has blame as all there is; a row with no blame — the common case,
+/// blame being named at four sites in the whole compiler — resolves through what
+/// it was made from, which is why walking the lineage recovers a source location
+/// for almost every node.
 ///
-/// A private helper of [`collapse`], so it is dead exactly while `collapse` is.
-#[allow(dead_code)]
+/// The union is **unlabelled**: a span is a span whichever channel named the
+/// node it came from, so this function reads the two columns as one sequence.
+/// The distinction they carry is spent in the [`LineageMap`] instead, where each
+/// column labels the edges it contributes ([`EdgeLabels`]) — `mut_elim`'s
+/// `enter(stmt_id)` + `blame(for_id)` is the shape: the products descend from
+/// the statement and are merely *related to* the loop keyword, and both spans
+/// are theirs.
+///
+/// A source id absent from `attr` contributes no spans (it has no known source),
+/// which is legal: a node whose every source is unknown gets `spans: []`, the
+/// "known node, no source anchor" case, deliberately distinct from a node absent
+/// from the projection entirely.
 fn attribute(
-    blame: &[NodeId],
-    nature: Nature,
-    via: Pass,
-    label: RewriteLabel,
+    table: &LineageTable,
+    id: NodeId,
+    tag: RewriteTag,
     attr: &SourceProjection,
 ) -> SourceAttribution {
-    // No *pass* step may carry `Nature::Source`: `Source` means "this node is a
+    // No *pass* row may carry `Nature::Source`: `Source` means "this node is a
     // source construct's direct one-to-one translation", which only lowering can
     // produce — a later pass rewriting a node changes what it is. The guard sits
-    // on the attributing ARM, not on projection entries: an *inherited* Source
-    // tag on a preserved id in a later pane is legal and reaches the projection
-    // by clone, never through this fn. See `design/provenance.md`, "The lineage
-    // model (`src/ccl/lineage.rs`)".
+    // here, on the node being attributed by a rewrite, not on projection entries:
+    // an *inherited* Source tag on a preserved id in a later pane is legal and
+    // reaches the projection by clone, never through this fn. See
+    // `design/provenance.md`, "The lineage model (`src/ccl/lineage.rs`)".
     debug_assert!(
-        !nature.is_source(),
-        "a pass step carries Nature::Source (label {label:?}, via {via:?}) — \
-         Source is emitted only by lowering"
+        !tag.nature.is_source(),
+        "a pass rewrite carries Nature::Source (label {:?}, via {:?}) — \
+         Source is emitted only by lowering",
+        tag.label,
+        tag.via,
     );
     let mut spans: Vec<Span> = Vec::new();
-    for b in blame {
-        if let Some(a) = attr.get(b) {
-            for s in &a.spans {
-                if !spans.contains(s) {
-                    spans.push(*s);
+    for src in table.parents(id).iter().chain(table.blame(id)) {
+        if let Some(a) = attr.get(src) {
+            for sp in &a.spans {
+                if !spans.contains(sp) {
+                    spans.push(*sp);
                 }
             }
         }
     }
     SourceAttribution {
         spans,
-        rewritten: RewriteTag { via, nature, label },
+        rewritten: tag,
     }
 }
 
-/// Fold the concatenated per-pass logs between two pane snapshots into the
-/// pane-pair [`LineageMap`], the output pane's [`SourceProjection`], and any
-/// integrity [`Leak`]s.
+/// A row's one-hop upstream edges, each with what that hop asserts: `parents` as
+/// descent hops, `blame` as relatedness hops.
 ///
-/// `logs` is the intervening passes' logs in pass order; each step's `via` comes
-/// from its owning log's [`Pass`] (passes live in the data, not the types).
+/// **One entry per id.** A row naming an id in both columns is one hop carrying
+/// both labels, not two hops — the pair `(p, x)` is a single edge, and emitting
+/// it twice would leave the endpoint pair with two disagreeing labels for the
+/// fold to pick between. Parents come first so the order is deterministic; the
+/// linear scan is over a row's own columns, which hold a handful of ids.
+fn row_hops(table: &LineageTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
+    let mut hops: Vec<(NodeId, EdgeLabels)> = Vec::new();
+    let named = (table.parents(x).iter().map(|p| (*p, EdgeLabels::DESCENT)))
+        .chain(table.blame(x).iter().map(|b| (*b, EdgeLabels::RELATED)));
+    for (id, label) in named {
+        match hops.iter_mut().find(|(h, _)| *h == id) {
+            Some((_, labels)) => *labels = labels.union(label),
+            None => hops.push((id, label)),
+        }
+    }
+    hops
+}
+
+/// Fold the rows a pane boundary's passes wrote into the pane-pair
+/// [`LineageMap`], the output pane's [`SourceProjection`], and any integrity
+/// [`Leak`]s.
+///
+/// `window` is the passes the boundary spans, and it is what turns a
+/// whole-compile table back into a per-boundary window: one table covers every
+/// session a compile opens, so a row's `via` is the only thing that says which
+/// boundary produced it. **An id whose row lies outside `window` is, to this
+/// boundary, an ordinary un-produced id** — an input-pane node if the input pane
+/// holds it, and unknown otherwise. Without that restriction a `Mono`-produced
+/// input-pane id at the post-desugar boundary would resolve straight past the
+/// pane it is supposed to bottom out in.
+///
 /// `input_ids` / `output_ids` are the two pane snapshots; `upstream_attr` is the
 /// input pane's already-resolved projection, which untouched ids inherit
 /// unchanged.
 ///
-/// # The fold
+/// # The algebra
 ///
-/// State is `roots: id → {input ids it descends from}`, seeded to the identity
-/// (`roots[u] = {u}`) for every input id, and `attr`, seeded from
-/// `upstream_attr`. Per step, in log order:
+/// A node's lineage annotation is a **map from input-pane ids to the label of
+/// the path that reached them** ([`EdgeLabels`]):
 ///
-/// * **[`Op::Transform`]**: every consumed id must be live; their root sets
-///   union into `new_roots`; the consumed ids are removed; each produced id gets
-///   `new_roots` and a fresh attribution. Survivor-carry works because a carried
-///   id's own roots were in the union before removal.
-/// * **[`Op::Copy`]**: the origin must be live and *stays* live; each produced
-///   id snapshots a clone of the origin's roots and mirrors the origin's
-///   attribution (re-tagged when `blame` is empty, else freshly attributed).
+/// ```text
+/// roots(x) = ⋃ { roots(p) ∘ hop(p → x) : p ∈ parents(x) ∪ blame(x) }
+/// roots(x) = { x ↦ descent }                   if x is an input-pane id
+/// ```
 ///
-/// At emit, each output id's roots become its `up` edges and the reverse `down`
-/// edges — the bipartite product for N:M steps and self-edges for untouched ids
-/// both fall out. Ids born and consumed within the phase never reach an output
-/// and compose away.
+/// where `hop(p → x)` is descent for a `parents` edge, relatedness for a `blame`
+/// edge and both for an id the row names in both columns; `∘` extends every path
+/// in `roots(p)` by that hop, weakest-link ([`EdgeLabels::then`]); and `⋃` unions
+/// the labels of paths that arrive at one root. The empty union `∅` is a row
+/// whose parents are all unknown.
 ///
-/// Exercised only by this module's tests until a pane boundary calls it, which
-/// needs the per-pass logs the passes do not yet record. `collapse_lowering` is
-/// the always-on sibling and shares the [`RootTracker`] core, so the fold logic
-/// here is not untested — only this entry point is uncalled.
-#[allow(dead_code)]
+/// Labelled root maps under that union form a commutative monoid — `union` on
+/// [`EdgeLabels`] is a join, and `then` distributes over it — and commutativity
+/// plus associativity, plus one row per id so no node has two definitions to
+/// order, are exactly what make the fold insensitive to the order the rows were
+/// written in. (Idempotence buys cheapness, not order-freeness.)
+///
+/// Order-freeness is not a nicety: write order is *not* chronology. A frame's
+/// rows are written when the frame closes, so an enclosing rewrite's rows land
+/// after the rows of the rewrites it contains.
+///
+/// Ids born and consumed inside the window are interior vertices on a path and
+/// compose away; the self-edge for an untouched id falls out; the N:M bipartite
+/// product of a fusion falls out of its product rows each holding the whole
+/// consumed set as parents.
+///
+/// # The fold is one ascending sweep
+///
+/// Every edge runs from a smaller [`NodeId`] to a larger one: a row's parents and
+/// its blame are alike ids the rewrite *read*, and the node itself was minted
+/// afterwards from one process-global monotone counter (a produced id is
+/// *captured* via [`on_mint`], never declared). A node is therefore never its own ancestor, so **ascending
+/// `NodeId` order is a topological order** and one sweep suffices — no fixed
+/// point, no memo, no cycle guard. [`sweep_metrics`] measures the falsifier (a
+/// backward edge).
+///
+/// A node reachable from nothing still keeps an entry holding `∅`, which is what
+/// distinguishes "known, with empty lineage" from "the window has never heard of
+/// this id" ([`Leak::Unexplained`]).
+///
+/// # The attribution channel rides along, and is not a monoid
+///
+/// `attr` is resolved in the same sweep, and needs the same topological order for
+/// a different reason: a row's attribution sources are ids that existed when the
+/// rewrite ran. But attribution has no join — one node cannot carry two
+/// `via`/`label` pairs — so it depends on there being exactly **one row per id**,
+/// not on any algebra. That is the invariant [`LineageTable::record`] asserts at
+/// write time, where the second writer is standing.
 pub(crate) fn collapse(
-    logs: &[(Pass, LineageLog)],
+    table: &LineageTable,
+    window: &[Pass],
     input_ids: &HashSet<NodeId>,
     output_ids: &HashSet<NodeId>,
     upstream_attr: &SourceProjection,
 ) -> (LineageMap<NodeId, NodeId>, SourceProjection, Vec<Leak>) {
-    // Seeded from the input pane's identity roots; attr inherits `upstream_attr`.
-    let mut tracker = RootTracker::seeded(input_ids);
+    let mut leaks: Vec<Leak> = Vec::new();
+
+    // The vertex set: every id the window knows, in mint order — which is a
+    // topological order of the edges (see the doc comment).
+    let mut vertices: Vec<NodeId> = table
+        .rows_in(window)
+        .chain(input_ids.iter().copied())
+        .collect();
+    vertices.sort_unstable();
+    vertices.dedup();
+
+    let mut roots: HashMap<NodeId, HashMap<NodeId, EdgeLabels>> = HashMap::new();
     let mut attr: SourceProjection = upstream_attr.clone();
 
-    for (pass, log) in logs {
-        let via = *pass;
-        for step in log {
-            match &step.op {
-                Op::Transform { consumed, produced } => {
-                    // A step must anchor its outputs through *some* channel:
-                    // consumption or blame. Empty-consumed-with-blame is
-                    // the legal pure-insertion shape; only both-empty is a leak.
-                    let anchored = !step.blame.is_empty();
-                    tracker.transform(consumed, produced, anchored, false);
-                    let out_attr = attribute(&step.blame, step.nature, via, step.label, &attr);
-                    for p in produced {
-                        attr.insert(*p, out_attr.clone());
+    for &x in &vertices {
+        let Some(tag) = table.rule_in(x, window) else {
+            // No row in this window: an input-pane id, reachable from itself and
+            // nothing else. A node descends from itself, so the self-edge is a
+            // descent edge. Its upstream attribution passes through unchanged.
+            roots.insert(x, HashMap::from([(x, EdgeLabels::DESCENT)]));
+            continue;
+        };
+
+        let mut r: HashMap<NodeId, EdgeLabels> = HashMap::new();
+        for (p, hop) in row_hops(table, x) {
+            debug_assert!(
+                p < x,
+                "row {x:?} names the younger id {p:?} as an upstream — both columns hold \
+                 ids the rewrite read before it minted, so ascending NodeId order must be \
+                 a topological order of the definition graph",
+            );
+            // An upstream older than `x` is already resolved if the window knows
+            // it at all. No entry means it is neither an input-pane id nor
+            // produced here: a *descent* hop there is a lineage stopping at an id
+            // that describes nothing, while a relatedness-only hop is the same
+            // silence `attribute` keeps for a blamed id with no known spans —
+            // blame is a pointer at material the boundary need not hold, so it
+            // contributes no edge and no class.
+            match roots.get(&p) {
+                Some(pr) => {
+                    for (root, path) in pr {
+                        let composed = path.then(hop);
+                        r.entry(*root)
+                            .and_modify(|l| *l = l.union(composed))
+                            .or_insert(composed);
                     }
                 }
-                Op::Copy { origin, produced } => {
-                    // A copy mirrors its origin's lineage, never its fate: the
-                    // origin stays live and its roots are snapshotted here, so a
-                    // later consume of the origin leaves these copies correct.
-                    if !tracker.copy(*origin, produced) {
-                        tracker.advance();
-                        continue;
-                    }
-                    let out_attr = if step.blame.is_empty() {
-                        // Copy-mirror re-tag: as in `attribute`, no pass step may
-                        // carry Source — only lowering emits it.
-                        debug_assert!(
-                            !step.nature.is_source(),
-                            "a pass Copy step carries Nature::Source (label {:?}, via {via:?}) — \
-                             Source is emitted only by lowering",
-                            step.label,
-                        );
-                        SourceAttribution {
-                            spans: attr
-                                .get(origin)
-                                .map(|a| a.spans.clone())
-                                .unwrap_or_default(),
-                            rewritten: RewriteTag {
-                                via,
-                                nature: step.nature,
-                                label: step.label,
-                            },
-                        }
-                    } else {
-                        attribute(&step.blame, step.nature, via, step.label, &attr)
-                    };
-                    for p in produced {
-                        attr.insert(*p, out_attr.clone());
-                    }
-                }
+                None if hop.descends() => leaks.push(Leak::ParentUnknown { parent: p }),
+                None => {}
             }
-            tracker.advance();
         }
+        roots.insert(x, r);
+
+        let a = attribute(table, x, tag, &attr);
+        attr.insert(x, a);
     }
 
-    // Emit. Each output id's surviving roots become its up-edges (and the
+    // Emit. Each output id's labelled roots become its up-edges (and the
     // mirrored down-edges); sorted for determinism.
-    let mut down: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    let mut up: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    let mut down: HashMap<NodeId, Vec<Link<NodeId>>> = HashMap::new();
+    let mut up: HashMap<NodeId, Vec<Link<NodeId>>> = HashMap::new();
     for o in output_ids {
-        match tracker.roots_of(o) {
+        match roots.get(o) {
             Some(origins) => {
-                let mut origins: Vec<NodeId> = origins.iter().copied().collect();
+                let mut origins: Vec<Link<NodeId>> = origins
+                    .iter()
+                    .map(|(u, labels)| Link {
+                        id: *u,
+                        labels: *labels,
+                    })
+                    .collect();
                 origins.sort_unstable();
-                for &u in &origins {
-                    down.entry(u).or_default().push(*o);
+                for link in &origins {
+                    down.entry(link.id).or_default().push(Link {
+                        id: *o,
+                        labels: link.labels,
+                    });
                 }
                 up.insert(*o, origins);
             }
-            None => tracker.push_leak(Leak::Unexplained { output: *o }),
+            // Neither an input-pane id nor produced by any row in the window.
+            None => leaks.push(Leak::Unexplained { output: *o }),
         }
     }
     for ds in down.values_mut() {
         ds.sort_unstable();
     }
 
-    // A live input id that never reached the output was dropped without
-    // explanation (a consumed id was removed from `roots`; a carried id is in
-    // the output as a self-edge).
+    // An input id absent from the output pane **died**. Nothing declares a fate,
+    // so this difference is the whole death report rather than a residue of one.
     for u in input_ids {
-        if tracker.is_live(u) && !output_ids.contains(u) {
-            tracker.push_leak(Leak::Dropped { input: *u });
+        if !output_ids.contains(u) {
+            leaks.push(Leak::Died { input: *u });
         }
     }
 
@@ -565,180 +779,123 @@ pub(crate) fn collapse(
         .filter_map(|o| attr.get(o).map(|a| (*o, a.clone())))
         .collect();
 
-    (LineageMap { down, up }, projection, tracker.into_leaks())
+    (LineageMap { down, up }, projection, leaks)
 }
 
-/// The shared roots/leak core of the two folds. Owns the
-/// `roots` state (`id → {input ids it descends from}`) and the accumulating
-/// [`Leak`]s, exposing the per-step fate operations both [`collapse`] and
-/// [`collapse_lowering`] drive. The attribution (`attr`) side lives in each fold
-/// — blame-resolved-through-state for a pane pair, literal-anchor for lowering —
-/// so it deliberately stays out of the tracker.
-struct RootTracker {
-    roots: HashMap<NodeId, HashSet<NodeId>>,
-    leaks: Vec<Leak>,
-    step_index: usize,
+/// What one ascending sweep of [`collapse`] costs on a given window, and whether
+/// the sweep's premise holds. Measurement-only.
+///
+/// [`backward_edges`](Self::backward_edges) is the falsifier: ascending `NodeId`
+/// order is only a topological order if every edge runs from a smaller id to a
+/// larger one, so a non-zero count is exactly the number of vertices the sweep
+/// would have to revisit — the fixed point it claims not to need.
+#[cfg(test)]
+pub(crate) struct SweepMetrics {
+    /// Vertices the sweep visits — and, since `roots` only ever grows, its peak
+    /// entry count.
+    pub vertices: usize,
+    /// Lineage edges (`upstream → node`, either label) in the window.
+    pub edges: usize,
+    /// Edges running from a larger `NodeId` to a smaller one — the revisit
+    /// count. Must be zero.
+    pub backward_edges: usize,
 }
 
-impl RootTracker {
-    /// A tracker seeded with the input pane's identity roots (`roots[u] = {u}`).
-    fn seeded(input_ids: &HashSet<NodeId>) -> Self {
-        RootTracker {
-            roots: input_ids.iter().map(|&u| (u, HashSet::from([u]))).collect(),
-            leaks: Vec::new(),
-            step_index: 0,
-        }
-    }
-
-    /// An empty tracker — lowering's degeneration: no input pane, so `roots`
-    /// starts empty and nearly every `Transform` is a pure insertion.
-    fn empty() -> Self {
-        RootTracker {
-            roots: HashMap::new(),
-            leaks: Vec::new(),
-            step_index: 0,
-        }
-    }
-
-    /// The fate side of a [`Op::Transform`]: check the unanchored-mint leak
-    /// (both consumed and the caller-supplied anchor empty), union-and-remove the
-    /// consumed roots, then assign that union to every produced id (survivor-carry
-    /// works because a carried id's own roots were in the union before removal).
-    /// `anchored` is `true` when the step carries *some* attribution anchor —
-    /// blame for a pass step, a literal span for a lowering leaf.
-    ///
-    /// `reimage_ok` suppresses the [`Leak::ProducedLive`] check: a *pass* step
-    /// producing a live id it did not consume is a lying step, but a lowering
-    /// leaf may legitimately **re-image** a node (last tag wins — `lower_expr`
-    /// re-tags an arm's already-tagged root as the construct's direct image), so
-    /// the lowering fold passes `true` here. Lowering leaves always have empty
-    /// `consumed`, so the re-image just overwrites empty roots with empty roots.
-    fn transform(
-        &mut self,
-        consumed: &[NodeId],
-        produced: &[NodeId],
-        anchored: bool,
-        reimage_ok: bool,
-    ) {
-        if consumed.is_empty() && !anchored {
-            self.leaks.push(Leak::EmptyConsumed {
-                step: self.step_index,
-            });
-        }
-        let mut new_roots: HashSet<NodeId> = HashSet::new();
-        for c in consumed {
-            match self.roots.remove(c) {
-                Some(r) => new_roots.extend(r),
-                None => self.leaks.push(Leak::ConsumedUnknown { consumed: *c }),
+/// Measure a window without folding it: enumerate the same vertices and edges
+/// [`collapse`] sweeps and count any edge that runs backwards.
+#[cfg(test)]
+pub(crate) fn sweep_metrics(
+    table: &LineageTable,
+    window: &[Pass],
+    input_ids: &HashSet<NodeId>,
+) -> SweepMetrics {
+    let mut vertices: HashSet<NodeId> = table.rows_in(window).collect();
+    vertices.extend(input_ids.iter().copied());
+    let (mut edges, mut backward_edges) = (0usize, 0usize);
+    for x in table.rows_in(window) {
+        for (p, _) in row_hops(table, x) {
+            edges += 1;
+            if p >= x {
+                backward_edges += 1;
             }
         }
-        for p in produced {
-            // A produced id still live here was not consumed (consumed ids were
-            // just removed): a pass step lies about minting it. A lowering
-            // re-image (`reimage_ok`) is legitimate last-tag-wins, not a lie.
-            if self.roots.contains_key(p) && !reimage_ok {
-                self.leaks.push(Leak::ProducedLive { produced: *p });
-            }
-            self.roots.insert(*p, new_roots.clone());
-        }
     }
-
-    /// The fate side of a [`Op::Copy`]: the origin must be live and *stays* live;
-    /// each produced id snapshots a clone of the origin's roots. Returns `false`
-    /// (recording [`Leak::CopyOfUnknown`]) when the origin is not live, so the
-    /// caller skips the attribution mirror.
-    fn copy(&mut self, origin: NodeId, produced: &[NodeId]) -> bool {
-        let Some(origin_roots) = self.roots.get(&origin).cloned() else {
-            self.leaks.push(Leak::CopyOfUnknown { origin });
-            return false;
-        };
-        for p in produced {
-            self.roots.insert(*p, origin_roots.clone());
-        }
-        true
-    }
-
-    /// Advance the step counter (drives [`Leak::EmptyConsumed`]'s index).
-    fn advance(&mut self) {
-        self.step_index += 1;
-    }
-
-    /// The roots of an id, if live.
-    fn roots_of(&self, id: &NodeId) -> Option<&HashSet<NodeId>> {
-        self.roots.get(id)
-    }
-
-    /// Whether `id` is live.
-    fn is_live(&self, id: &NodeId) -> bool {
-        self.roots.contains_key(id)
-    }
-
-    fn push_leak(&mut self, leak: Leak) {
-        self.leaks.push(leak);
-    }
-
-    fn into_leaks(self) -> Vec<Leak> {
-        self.leaks
+    SweepMetrics {
+        vertices: vertices.len(),
+        edges,
+        backward_edges,
     }
 }
 
 /// Fold a [`LoweringLog`] into the always-on **lowering projection** and any
-/// integrity [`Leak`]s. The lowering degeneration of
-/// [`collapse`], sharing its [`RootTracker`] core with three simplifications:
+/// integrity [`Leak`]s. The lowering counterpart to [`collapse`], and the one
+/// fold that is **sequential**: its log genuinely is chronology (leaf entries
+/// are appended at construction, not at frame close), and its last-tag-wins
+/// re-imaging is real semantics rather than an artifact of reading a log as a
+/// sequence. Four simplifications follow from lowering minting from scratch:
 ///
-/// * **no input pane** — lowering mints from scratch, so `roots` starts empty
-///   and a leaf `Transform { consumed: [], produced: [id] }` is a pure insertion
-///   with empty roots (its attribution comes from the literal `anchor`, not from
-///   blame resolved through state);
+/// * **no input pane** — so there is no lineage to compose. Where [`collapse`]
+///   carries a set of input-pane roots per id, here every such set would be
+///   empty, and what is left of it is a plain **live set**: the ids some record
+///   has covered;
 /// * **no [`LineageMap`] output** — the lowering projection ships as pane-0
-///   spans, not edges, so there is no `up`/`down` to build and no `Dropped` class
+///   spans, not edges, so there is no `up`/`down` to build and no `Died` class
 ///   (there are no input ids to drop);
-/// * **no upstream attr** — a leaf's attribution is `{spans: anchor, RewriteTag}`
-///   built directly here; a `Copy` mirrors its origin's already-folded entry.
+/// * **no attribution state to resolve through** — a leaf's attribution is
+///   `{spans: [anchor], RewriteTag}` built directly here from its literal span; a
+///   copy mirrors its origin's already-folded entry;
+/// * **no one-row-per-id requirement** — a re-image is a second record for one
+///   id (`lower_expr` re-tags an arm's already-tagged root as the construct's
+///   direct image) and the later tag deliberately wins.
 ///
 /// Runs always-on at the lowering→pipeline handoff (the leak *checks* stay
-/// debug/test-gated at the boundary). `Leak::Unexplained` is an unrecorded mint
-/// (an output-tree node that no leaf produced and no copy placed); a template
-/// id born, copied, and never placed composes away (born-copied-discarded — live
-/// but neither input nor output, so no leak); orphaned keys are structurally
-/// impossible (the projection is produced by the fold, never mutated).
+/// debug/test-gated at the boundary). [`Leak::Unexplained`] is an unrecorded mint
+/// (an output-tree node that no leaf produced and no copy placed);
+/// [`Leak::ParentUnknown`] is a copy of an origin no earlier record covered; a
+/// template id born, copied, and never placed composes away (live but not an
+/// output, so no leak); orphaned keys are structurally impossible (the projection
+/// is produced by the fold, never mutated).
 pub(crate) fn collapse_lowering(
     log: &LoweringLog,
     output_ids: &HashSet<NodeId>,
 ) -> (SourceProjection, Vec<Leak>) {
-    let mut tracker = RootTracker::empty();
+    let mut live: HashSet<NodeId> = HashSet::new();
+    let mut leaks: Vec<Leak> = Vec::new();
     let mut attr: SourceProjection = SourceProjection::new();
 
     for step in log {
-        match &step.op {
-            Op::Transform { consumed, produced } => {
-                // The anchor is the literal attribution channel: a leaf with a
-                // non-empty anchor is a legal pure insertion even with empty
-                // `consumed`. Both-empty is the unanchored-mint leak.
-                let anchored = !step.anchor.is_empty();
-                tracker.transform(consumed, produced, anchored, true);
-                // Attribution comes straight from the literal anchor spans — no
-                // blame resolution (lowering knows the source token here).
-                let out_attr = SourceAttribution {
-                    spans: dedup_spans(&step.anchor),
-                    rewritten: RewriteTag {
-                        via: Pass::Lower,
-                        nature: step.nature,
-                        label: step.label,
+        match step {
+            LoweringStep::Leaf {
+                id,
+                anchor,
+                nature,
+                label,
+            } => {
+                live.insert(*id);
+                // Attribution comes straight from the literal anchor — no
+                // resolution through state, because lowering knows the source
+                // token right here.
+                attr.insert(
+                    *id,
+                    SourceAttribution {
+                        spans: vec![*anchor],
+                        rewritten: RewriteTag {
+                            via: Pass::Lower,
+                            nature: *nature,
+                            label,
+                        },
                     },
-                };
-                for p in produced {
-                    attr.insert(*p, out_attr.clone());
-                }
+                );
             }
-            Op::Copy { origin, produced } => {
+            LoweringStep::Copy { origin, produced } => {
                 // A copy mirrors its origin's already-folded entry verbatim (the
                 // compare-chain second-use operand and the uncurry template
                 // interiors are exactly their origins' images/plumbing).
-                if !tracker.copy(*origin, produced) {
-                    tracker.advance();
+                if !live.contains(origin) {
+                    leaks.push(Leak::ParentUnknown { parent: *origin });
                     continue;
                 }
+                live.extend(produced.iter().copied());
                 if let Some(origin_attr) = attr.get(origin).cloned() {
                     for p in produced {
                         attr.insert(*p, origin_attr.clone());
@@ -746,16 +903,15 @@ pub(crate) fn collapse_lowering(
                 }
             }
         }
-        tracker.advance();
     }
 
     // Every output-tree node must be explained (produced by a leaf or a copy).
     // An unexplained output is an unrecorded lowering mint; this leak IS the
-    // coverage check (there is no separate gate). There is no `Dropped` class
+    // coverage check (there is no separate gate). There is no `Died` class
     // (no input pane).
     for o in output_ids {
-        if !tracker.is_live(o) {
-            tracker.push_leak(Leak::Unexplained { output: *o });
+        if !live.contains(o) {
+            leaks.push(Leak::Unexplained { output: *o });
         }
     }
 
@@ -764,83 +920,368 @@ pub(crate) fn collapse_lowering(
         .filter_map(|o| attr.get(o).map(|a| (*o, a.clone())))
         .collect();
 
-    (projection, tracker.into_leaks())
+    (projection, leaks)
 }
 
-/// Order-preserving deduplicated span union (a leaf anchor is normally one span,
-/// but the sink-record's whole-program anchor and future multi-span leaves stay
-/// well-behaved).
-fn dedup_spans(spans: &[Span]) -> Vec<Span> {
-    let mut out: Vec<Span> = Vec::with_capacity(spans.len());
-    for s in spans {
-        if !out.contains(s) {
-            out.push(*s);
+// ===========================================================================
+// The node table: the recording, keyed by the node it describes.
+//
+// One row per recorded *node*, which is how every consumer asks its question
+// ("where did this node come from?"), so a lookup is a hash probe and the pane
+// fold is one ascending sweep over the rows a boundary's passes wrote.
+// ===========================================================================
+
+/// An interned [`RewriteTag`] — a [`LineageTable`] row's `rule` column.
+///
+/// The whole `{via, nature, label}` triple is interned as **one** id because a
+/// bracket site fixes all three together: `via` is the session's pass, and
+/// `nature`/`label` are the two literals at the [`enter`] call. There are on the
+/// order of thirty distinct triples in the compiler, so one index buys all
+/// three columns and a row carries a single handle instead of three fields.
+///
+/// Only meaningful against the table that minted it: the ids are dense indices
+/// into that table's tag vector, not global constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct RuleId(u32);
+
+/// One recorded node's row. Both edge kinds plus the interned rule; see
+/// [`LineageTable`] for why there is no span column, and
+/// [`record`](LineageTable::record) for the two invariants a row must satisfy.
+struct Row {
+    parents: Vec<NodeId>,
+    blame: Vec<NodeId>,
+    rule: RuleId,
+}
+
+/// Per-compile lineage keyed by the node each record describes: `NodeId → {
+/// parents, blame, rule }`.
+///
+/// # The two edge kinds stay separate
+///
+/// `parents` are the ids a rewrite **consumed** to produce the node (a
+/// bracket's slot, or a fusion's whole consumed set); `blame` are the ids the
+/// rewrite is *related to* but did not consume, which may still be alive
+/// elsewhere in the tree and say nothing about any node's fate. Both are
+/// relations over the same pair of ids and both reach the fold, so what the
+/// columns buy is the **label** the fold puts on the edge ([`EdgeLabels`]) —
+/// welding them would answer "what was this made from" with a node that merely
+/// survives beside the answer (see the module docs, "Two columns, because they
+/// are two kinds of relation (load-bearing)").
+///
+/// # There is no span column, deliberately
+///
+/// A node's spans are *derived*: walk `parents` back until the walk reaches a
+/// node the lowering projection covers, which is where real spans live. That
+/// walk is a handful of hops and does not lengthen as programs grow, so a span
+/// column would be a denormalization paid on every row ever minted, for a
+/// lookup the parent edges already answer.
+///
+/// # "No row" is an expected state, not an error
+///
+/// The key space is `NodeId`, and a `NodeId` can be *addressed* without ever
+/// having been *recorded*. So every read tolerates an unknown id —
+/// [`parents`](Self::parents) and [`blame`](Self::blame) come back empty,
+/// [`rule`](Self::rule) `None` — and, the sharper half of the same rule,
+/// [`deaths`](Self::deaths) considers **only ids a [`record`](Self::record)
+/// actually wrote**. A death is the set difference `recorded ∖ live`, so a
+/// difference taken over addressed-but-unwritten ids would report nodes that
+/// never existed as deaths. Row enumeration is private for exactly that reason —
+/// [`deaths`](Self::deaths) and the pane fold's `rows_in` are the operations
+/// that legitimately need it, and each takes the difference against something
+/// (a live set, a pass window) rather than against the key space.
+///
+/// Refinement-predicate interiors **are** recorded here. They are `TypedExpr`s
+/// inside a `Type::Refinement`'s predicate, carrying real `NodeId`s from the same
+/// global counter and interleaved with main-tree ids, and `collect_tree_ids`
+/// enumerates them — so the fold must explain them and this table must hold their
+/// rows (`design/provenance.md`, "Walking the ids").
+///
+/// This was a `TODO(predicate-rows)` and is now done for two of the three
+/// crossings: a term entering a predicate is recorded (lowering sweeps the
+/// finished term; inference brackets `singleton_predicate` on its literal), and a
+/// predicate being rewritten is recorded. The third — planning **raising** a
+/// predicate back into the main tree — is not, and lands with the planning
+/// commit; those nodes are minted below the last pane, so no boundary gates them
+/// yet.
+///
+/// It was a **population** change, not a schema change: these ids already had
+/// addresses here, so no column moved. The prior measurement that justified it
+/// stands as the attribution evidence — over the eleven-program corpus at the
+/// `post-inference..join-planned` audit window the residue was 1184
+/// [`Leak::ParentUnknown`] edges and nothing else, every one a predicate-interior
+/// id of the input tree, and admitting them took every gated class to zero.
+///
+/// The backing store is a plain map on purpose: the row *semantics* above are
+/// what a reader has to check, and a paged/interned column encoding would be a
+/// pure re-encoding behind these accessors — the same promise
+/// [`LineageMap`] makes.
+#[derive(Default)]
+pub(crate) struct LineageTable {
+    rows: HashMap<NodeId, Row>,
+    /// Tag by [`RuleId`] index — the interning table's forward direction.
+    rules: Vec<RewriteTag>,
+    /// Tag → its already-assigned id, so equal tags share one row column.
+    interned: HashMap<RewriteTag, RuleId>,
+}
+
+// The accessors are the table's whole contract and are exercised as such by this
+// module's tests; the compiler itself only ever writes rows.
+#[allow(dead_code)]
+impl LineageTable {
+    /// The [`RuleId`] for `tag` in this table, assigning one on first sight.
+    ///
+    /// Interning is separate from [`record`](Self::record) because a flush
+    /// writes many rows under one tag: the caller interns once per frame and
+    /// hands the handle to each row.
+    pub(crate) fn intern_rule(&mut self, tag: RewriteTag) -> RuleId {
+        if let Some(id) = self.interned.get(&tag) {
+            return *id;
         }
+        // u32 is not a real limit — the distinct-tag count is the number of
+        // bracket sites in the compiler, which is a source-code property.
+        let id = RuleId(
+            u32::try_from(self.rules.len()).expect("more distinct rewrite tags than a u32 indexes"),
+        );
+        self.rules.push(tag);
+        self.interned.insert(tag, id);
+        id
     }
-    out
+
+    /// Record one produced node's row.
+    ///
+    /// Three invariants, all of them properties of the write and all of them
+    /// checked here, at the site that would violate one, rather than at a fold
+    /// that only runs when someone materializes a pane:
+    ///
+    /// * **one row per id.** Attribution has no join — a node cannot carry two
+    ///   `via`/`label` pairs — so a second writer for an id has no answer, and
+    ///   silently overwriting would make the surviving row a lie about which
+    ///   rewrite made the node. Ids come from one monotone counter and
+    ///   `produced` is captured from the construction hook, so a second write
+    ///   means a rewrite claimed to mint what already existed.
+    /// * **every row is anchored through some channel** — consumption or blame.
+    ///   A row with neither cannot explain where the node came from, which is
+    ///   the whole content of a lineage record. (A row with blame but no parents
+    ///   is the legal *pure insertion*: a node placed over surviving material,
+    ///   attributed through blame, with genuinely no lineage ancestor.)
+    /// * **a node is not its own parent.** A node's lineage is the product of
+    ///   its parents', so an id on both sides would define itself in terms of
+    ///   itself — the one construct that makes an edge run backwards and forces
+    ///   [`collapse`] to a fixed point rather than a single ascending sweep. An
+    ///   in-place rewrite that keeps its id is a **preserve**: it records
+    ///   nothing, and that is correct, because identity here is *referent*
+    ///   identity and the pane resolves it by shared id.
+    ///
+    /// The checks are `debug_assert!`s because this is the construction hot path
+    /// — every mint under an open frame lands here — and each one costs a hash
+    /// probe or a scan. What is gated is the *checking*: the row written is the
+    /// same row in every build.
+    pub(crate) fn record(
+        &mut self,
+        id: NodeId,
+        parents: &[NodeId],
+        blame: &[NodeId],
+        rule: RuleId,
+    ) {
+        debug_assert!(
+            !self.rows.contains_key(&id),
+            "node {id:?} already has a lineage row — a rewrite claims to have minted an id \
+             that already exists, and attribution has no join to resolve the two claims with"
+        );
+        debug_assert!(
+            !parents.is_empty() || !blame.is_empty(),
+            "node {id:?} has neither a parent nor a blamed id — every record must anchor its \
+             node through some channel: consumption or blame"
+        );
+        debug_assert!(
+            !parents.contains(&id),
+            "node {id:?} is its own parent — a rewrite cannot consume what it produces"
+        );
+        self.rows.insert(
+            id,
+            Row {
+                parents: parents.to_vec(),
+                blame: blame.to_vec(),
+                rule,
+            },
+        );
+    }
+
+    /// The ids consumed to produce `id`; empty for an unrecorded id. Predicate
+    /// interiors used to be the standing example of one and no longer are — they
+    /// are recorded (see the type's docs).
+    pub(crate) fn parents(&self, id: NodeId) -> &[NodeId] {
+        self.rows.get(&id).map_or(&[], |r| r.parents.as_slice())
+    }
+
+    /// The ids `id`'s rewrite is related to but did not consume; empty for an
+    /// unrecorded id, and empty for the common case of a row that mirrors its
+    /// parents' attribution.
+    pub(crate) fn blame(&self, id: NodeId) -> &[NodeId] {
+        self.rows.get(&id).map_or(&[], |r| r.blame.as_slice())
+    }
+
+    /// The rewrite that produced `id`, or `None` for an unrecorded id.
+    pub(crate) fn rule(&self, id: NodeId) -> Option<RewriteTag> {
+        let row = self.rows.get(&id)?;
+        Some(self.rules[row.rule.0 as usize])
+    }
+
+    /// The interned handle a recorded id's row holds, or `None` for an
+    /// unrecorded id. The identity two rows share when they name one rewrite.
+    pub(crate) fn rule_id(&self, id: NodeId) -> Option<RuleId> {
+        Some(self.rows.get(&id)?.rule)
+    }
+
+    /// Whether `id` has a row.
+    pub(crate) fn contains(&self, id: NodeId) -> bool {
+        self.rows.contains_key(&id)
+    }
+
+    /// The rewrite that produced `id` **if that rewrite is one of `window`'s
+    /// passes**, else `None`.
+    ///
+    /// This is what restricts a whole-compile table to one pane boundary: to a
+    /// boundary, an id produced by a pass outside its window is an ordinary
+    /// un-produced id, which is exactly how the input pane's own nodes have to
+    /// read for the fold to bottom out there.
+    pub(crate) fn rule_in(&self, id: NodeId, window: &[Pass]) -> Option<RewriteTag> {
+        self.rule(id).filter(|tag| window.contains(&tag.via))
+    }
+
+    /// The ids `window`'s passes produced, in arbitrary order.
+    ///
+    /// Private, and the same rule [`deaths`](Self::deaths) rests on: enumerating
+    /// rows is only ever correct against a *window* or against a live set, never
+    /// against the key space, since a `NodeId` can be addressed without ever
+    /// having been recorded. This module's folds are the only callers.
+    fn rows_in<'a>(&'a self, window: &'a [Pass]) -> impl Iterator<Item = NodeId> + 'a {
+        self.rows
+            .iter()
+            .filter(|(_, row)| window.contains(&self.rules[row.rule.0 as usize].via))
+            .map(|(id, _)| *id)
+    }
+
+    /// Ids the table recorded that are absent from `live` — **the death
+    /// report**. Deaths are a set difference and nothing declares one, so this
+    /// is the whole of it.
+    ///
+    /// The difference is taken over recorded rows only, never over the key
+    /// *space*: the key space is a global counter, so it addresses ids this
+    /// compile never built, and an id that was addressed but never recorded
+    /// describes no node that could have died. Predicate interiors were the
+    /// standing example — counting over the key space would have invented a death
+    /// per predicate node in the program — and are now recorded and live, so they
+    /// cancel from both sides. Sorted, so a caller's report is deterministic.
+    pub(crate) fn deaths(&self, live: &HashSet<NodeId>) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self
+            .rows
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// The number of recorded nodes.
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The number of distinct rewrite tags interned — the rule column's
+    /// cardinality.
+    pub(crate) fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// The distinct passes this table holds rows for, deduplicated.
+    ///
+    /// A tag is interned only when a row is written under it, so the interning
+    /// table's passes are exactly the passes that recorded something. Test-only:
+    /// it answers "which passes rewrote this program", which is a question about
+    /// a compile rather than about a node, and nothing in the pipeline asks it.
+    #[cfg(test)]
+    pub(crate) fn recorded_passes(&self) -> Vec<Pass> {
+        let mut out: Vec<Pass> = Vec::new();
+        for tag in &self.rules {
+            if !out.contains(&tag.via) {
+                out.push(tag.via);
+            }
+        }
+        out
+    }
 }
 
 // ===========================================================================
 // The recorder: an ambient thread-local step stack that turns node construction
-// into RewriteSteps as a byproduct of the rewrite (never a post-pass diff).
+// into lineage rows as a byproduct of the rewrite (never a post-pass diff).
 //
-// Discipline mirrors `infer_var::ACTIVE_ARENA`: install a capture buffer at a
-// pass boundary, let construction hooks feed it, drain at the boundary. The
-// compile path is single-threaded (the only `thread::spawn`s are runtime I/O),
-// so a per-thread stack is safe. An empty stack means recording is off — the
+// Discipline mirrors `infer_var::ACTIVE_ARENA`: install a capture target at a
+// boundary, let construction hooks feed it, drain at the boundary. The compile
+// path is single-threaded (the only `thread::spawn`s are runtime I/O), so a
+// per-thread stack is safe. An empty stack means recording is off — the
 // overwhelmingly common case (tests, non-recorded compiles), reduced to a cheap
 // emptiness check on the construction hot path.
 // ===========================================================================
 
 thread_local! {
-    /// The open steps, innermost last. Empty ⇒ recording off. A construction
+    /// The open frames, innermost last. Empty ⇒ recording off. A construction
     /// hook ([`on_mint`]/[`on_copy`]) pushes into the innermost frame only;
     /// nesting is by frame depth.
     static STEP_STACK: RefCell<Vec<OpenStep>> = const { RefCell::new(Vec::new()) };
 
-    /// The log the finalized steps flush into, installed per boundary by a
-    /// [`RecorderSession`]. `None` ⇒ no session: a step still captures into its
-    /// frame, but its flush is a silent no-op (uniform single code path). The
-    /// [`ActiveLog`] kind routes each flush to a [`RewriteStep`] (pass) or a
-    /// [`LoweringStep`] (lowering).
-    static ACTIVE_LOG: RefCell<Option<ActiveLog>> = const { RefCell::new(None) };
+    /// The [`LineageTable`] a pass frame's flush writes its rows into, installed
+    /// by a [`TableSession`]. `None` ⇒ no table: a flush is a silent no-op
+    /// (uniform single code path).
+    ///
+    /// Installed for a **whole compile** rather than per pass, unlike
+    /// [`ACTIVE_PASS`]: a row is keyed by a node id, which is unique for the
+    /// life of the process, so one table spans every pass a compile runs and no
+    /// id can collide between them.
+    static ACTIVE_TABLE: RefCell<Option<LineageTable>> = const { RefCell::new(None) };
+
+    /// The pass a flush tags its rows with, installed per pass by a
+    /// [`PassScope`]. `None` ⇒ no pass is being recorded: a frame still captures
+    /// into itself, but its flush writes nothing.
+    ///
+    /// The pass is **ambient for the scope's extent** because a [`RewriteTag`]
+    /// needs it and a frame cannot supply it: an [`OpenStep`] carries the two
+    /// literals at its bracket site (`label`, `nature`) and knows nothing about
+    /// which pass is running, while the boundary that opens the scope knows
+    /// exactly that.
+    static ACTIVE_PASS: RefCell<Option<Pass>> = const { RefCell::new(None) };
+
+    /// Lowering's log, installed by the always-on [`LoweringSession`]. `None` ⇒
+    /// not lowering. Lowering records into its own sink because its attribution
+    /// is a literal span rather than a resolved reference (see [`LoweringStep`]).
+    static ACTIVE_LOWERING_LOG: RefCell<Option<LoweringRecord>> = const { RefCell::new(None) };
 }
 
-/// The kind of log a [`RecorderSession`] installs — the session-kind routing.
-/// `on_mint`/`on_copy` push NodeIds regardless (they are
-/// blame-domain-agnostic); a frame's flush matches this to emit the right step
-/// type, and the always-on lowering leaves ([`lowering_leaf`]) append here too.
-/// The lowering log, plus the set of [`NodeId`]s it has already explained.
-///
-/// The set exists for one caller: [`lowering_predicate_leaf`], which sweeps a
-/// finished refinement predicate and must **not** re-record a node that already
-/// carries precise attribution from its own lowering. The fold is
-/// last-write-wins (`attr.insert(p, out_attr)`), so a blanket sweep would
-/// silently replace a node's real span and label with the coarse predicate one —
-/// a loss no leak class can see, because the node stays explained either way.
-#[derive(Default)]
-struct LoweringRecord {
-    log: LoweringLog,
-    recorded: HashSet<NodeId>,
-}
-
-enum ActiveLog {
-    /// A pass boundary's log (inspector-only sessions).
-    Pass(LineageLog),
-    /// Lowering's log (the always-on session, all builds).
-    Lowering(LoweringRecord),
-}
-
-/// An in-flight step accumulating the ids born and copied within its dynamic
-/// extent. Finalized (flushed to a [`RewriteStep`]) by its [`StepGuard`]'s
-/// `Drop`. The `produced`/copy sides are *captured*, not declared: this is what
-/// makes recording a byproduct of construction rather than a parallel
-/// annotation.
+/// An in-flight frame accumulating the ids born and copied within its dynamic
+/// extent. Finalized by its [`FrameGuard`]'s `Drop`. The `births`/copy sides are
+/// *captured*, not declared: this is what makes recording a byproduct of
+/// construction rather than a parallel annotation.
 struct OpenStep {
     label: RewriteLabel,
-    /// The ids this step declared it would consume. The `produced` side is
+    /// The ids this frame declared it would consume. The produced side is
     /// discovered from the construction hooks, never declared.
+    ///
+    /// An [`enter`] frame opens with this **empty** and only ever gains entries
+    /// through [`FrameGuard::also_consumes`] — the fusion escape hatch. See
+    /// [`origin`](Self::origin).
     consumed: Vec<NodeId>,
+    /// The id occupying the rewritten slot when an [`enter`] frame opened.
+    /// `None` for a [`copy_frame`], the one frame kind with no slot.
+    ///
+    /// This is the *driver* channel: the frame names the node it is rewriting,
+    /// not the nodes it destroys. Every id minted in its extent takes it as a
+    /// **parent** — "this output was made from that node" — which is
+    /// deliberately **silent on the origin's fate**. Fate is decided by the
+    /// live-set difference at the pane boundary, never at record time, so a
+    /// bracket over a node that *survives* (the adopt-a-live-subtree shape: keep
+    /// the id, mint a wrapper over a child) is not a false death claim.
+    origin: Option<NodeId>,
     blame: Vec<NodeId>,
     nature: Nature,
     /// Ids minted via `Expr::new` while this was the innermost open frame.
@@ -851,89 +1292,114 @@ struct OpenStep {
 }
 
 impl OpenStep {
-    /// Finalize this frame into the active log's [`RewriteStep`]s.
+    /// Finalize this frame into the installed [`LineageTable`], one row per node
+    /// it produced.
     ///
-    /// The frame emits one `Transform { consumed, produced: births }`, and its
-    /// captured freshen pairs flush as per-origin `Copy` steps (empty blame — a
-    /// copy mirrors its origin, it does not re-attribute), so a deep freshen's
-    /// one-pair-per-node duplication lands as one `Copy` step per freshened
-    /// origin. A copy's origin is always *discovered* through the `on_copy` hook,
-    /// never declared up front: every duplication path funnels through
-    /// [`TypedExpr::freshen_node_id`](crate::ccl::expr::TypedExpr::freshen_node_id),
-    /// so capture is total and a declared-origin frame kind would be redundant.
+    /// Two products, and the split is the whole of the design:
     ///
-    /// A `Transform` frame whose `consumed` *and* captured `births` are both
-    /// empty emits no `Transform` record: it was opened purely to capture the
-    /// freshen pairs of a deep clone (its only output is those per-origin `Copy`
-    /// steps), and a `Transform { consumed: [], produced: [] }` would be an
-    /// unanchored no-op ([`Leak::EmptyConsumed`] were blame also empty).
-    fn flush_into(self, log: &mut LineageLog) {
+    /// * **the bracket's own births** — every id minted in the frame's extent
+    ///   takes the frame's parentage. With no fusion that is the single slot id:
+    ///   "this node was made from the node I was rewriting", asserting *nothing*
+    ///   about whether that node died. With fusion ([`FrameGuard::also_consumes`])
+    ///   it is the slot plus every extra id, which is the many:1 shape — a
+    ///   product of several origins' lineages, and the only place any id is
+    ///   named at record time. That set is a *lineage-edge* declaration, not a
+    ///   fate assertion: the boundary's live-set difference decides death, so
+    ///   naming a survivor costs an over-broad edge, never a phantom death.
+    /// * **the captured freshens** — each `(origin, fresh)` pair the `on_copy`
+    ///   hook reported rows the fresh id on the node it was duplicated from, not
+    ///   on the frame's slot. A copy's origin is always *discovered* through the
+    ///   hook, never declared up front: every duplication path funnels through
+    ///   [`TypedExpr::freshen_node_id`](crate::ccl::expr::TypedExpr::freshen_node_id),
+    ///   so capture is total and a declared-origin frame kind would be redundant.
+    ///
+    /// A frame that minted nothing, freshened nothing and fused nothing is a
+    /// **preserve** and writes no row — the in-place mutation case
+    /// (`*op = BinOpKind::Concat`), and what lets a pass bracket every rewrite
+    /// *attempt* rather than every firing.
+    fn flush_into_table(self, via: Pass) {
         let OpenStep {
             label,
             consumed,
+            origin,
             blame,
             nature,
             births,
             copies,
         } = self;
-        if !(consumed.is_empty() && births.is_empty()) {
-            log.push(RewriteStep {
-                op: Op::Transform {
-                    consumed,
-                    produced: births,
-                },
-                blame,
-                nature,
-                label,
+        let Some(origin) = origin else {
+            Self::assert_copy_only(label, &consumed, &births);
+            Self::row_per_copy(via, label, nature, &copies);
+            return;
+        };
+        debug_assert!(
+            !births.contains(&origin),
+            "bracket {label:?} minted its own slot id {origin:?} — the slot id is read \
+             before the rewrite runs, so it cannot also be a birth",
+        );
+        if !births.is_empty() {
+            let mut parents = vec![origin];
+            parents.extend(consumed.into_iter().filter(|c| *c != origin));
+            with_table(|table| {
+                let rule = table.intern_rule(RewriteTag { via, nature, label });
+                for &id in &births {
+                    table.record(id, &parents, &blame, rule);
+                }
             });
         }
-        for (origin, produced) in group_copies(&copies) {
-            log.push(RewriteStep {
-                op: Op::Copy { origin, produced },
-                blame: Vec::new(),
-                nature,
-                label,
-            });
+        Self::row_per_copy(via, label, nature, &copies);
+    }
+
+    /// Row each captured freshen on the node it duplicated. A copy mirrors its
+    /// origin rather than re-attributing, so it carries no blame of its own.
+    fn row_per_copy(via: Pass, label: RewriteLabel, nature: Nature, copies: &[(NodeId, NodeId)]) {
+        if copies.is_empty() {
+            return;
         }
+        with_table(|table| {
+            let rule = table.intern_rule(RewriteTag { via, nature, label });
+            for &(origin, fresh) in copies {
+                table.record(fresh, &[origin], &[], rule);
+            }
+        });
+    }
+
+    /// An originless frame ([`copy_frame`]) has nowhere to attach a consume or a
+    /// mint: a row needs a parent and the frame has none, so anything captured
+    /// into one would vanish from the record rather than land somewhere wrong. A
+    /// pass site that trips this wants [`enter`] on the node it is rewriting; a
+    /// lowering site wants [`lowering_leaf`] for its mints.
+    fn assert_copy_only(label: RewriteLabel, consumed: &[NodeId], births: &[NodeId]) {
+        debug_assert!(
+            consumed.is_empty() && births.is_empty(),
+            "copy frame {label:?} captured consumes {consumed:?} and mints {births:?} — a frame \
+             with no origin has nothing to attach them to. A pass site wants `enter` on the \
+             node being rewritten; a lowering leaf mint belongs in `lowering_leaf`",
+        );
     }
 
     /// Finalize this frame into a [`LoweringLog`]. Lowering frames are opened
-    /// **only** to capture ambient `Copy`s (uncurry's template-interior freshens,
+    /// **only** to capture ambient copies (uncurry's template-interior freshens,
     /// the compare-chain operand freshens); the leaf mints append directly via
     /// [`lowering_leaf`], so a lowering frame carries no consumed ids and no
-    /// births — only the captured per-origin copies flush here, as `Copy`
-    /// [`LoweringStep`]s mirroring their origins' folded entries (empty anchor).
+    /// births — only the captured per-origin copies flush here, as
+    /// [`LoweringStep::Copy`]s mirroring their origins' folded entries.
     fn flush_into_lowering(self, rec: &mut LoweringRecord) {
         let OpenStep {
             label,
-            nature,
+            consumed,
             births,
             copies,
             ..
         } = self;
-        debug_assert!(
-            births.is_empty(),
-            "a lowering copy-frame captured a mint ({births:?}) — leaf mints must \
-             append via lowering_leaf, frames capture only copies",
-        );
+        Self::assert_copy_only(label, &consumed, &births);
         for (origin, produced) in group_copies(&copies) {
             rec.recorded.extend(produced.iter().copied());
-            rec.log.push(LoweringStep {
-                op: Op::Copy { origin, produced },
-                anchor: Vec::new(),
-                nature,
-                label,
-            });
+            rec.log.push(LoweringStep::Copy { origin, produced });
         }
     }
 }
 
-/// Append a single-node leaf [`LoweringStep`] (`Transform { consumed: [],
-/// produced: [id] }`, `anchor: [span]`) to the active lowering log — the
-/// leaf-grain recording that `tag_source`/`tag_machinery`
-/// route through. A no-op when no lowering session is installed (the lower
-/// submodules' unit tests, which only inspect the tree shape) or when a pass
-/// session is active (defensive: lowering leaves belong only to a lowering log).
 /// Record one node of a **refinement predicate**, unless it is already
 /// explained.
 ///
@@ -952,17 +1418,14 @@ pub(crate) fn lowering_predicate_leaf(id: NodeId, span: Span, nature: Nature, la
     if id == NodeId::PLACEHOLDER {
         return;
     }
-    ACTIVE_LOG.with(|slot| {
-        if let Some(ActiveLog::Lowering(rec)) = slot.borrow_mut().as_mut() {
+    ACTIVE_LOWERING_LOG.with(|slot| {
+        if let Some(rec) = slot.borrow_mut().as_mut() {
             if !rec.recorded.insert(id) {
                 return;
             }
-            rec.log.push(LoweringStep {
-                op: Op::Transform {
-                    consumed: Vec::new(),
-                    produced: vec![id],
-                },
-                anchor: vec![span],
+            rec.log.push(LoweringStep::Leaf {
+                id,
+                anchor: span,
                 nature,
                 label,
             });
@@ -970,21 +1433,72 @@ pub(crate) fn lowering_predicate_leaf(id: NodeId, span: Span, nature: Nature, la
     });
 }
 
+/// Append a [`LoweringStep::Leaf`] to the active lowering log — the leaf-grain
+/// recording that `tag_source`/`tag_machinery` route through. A no-op when no
+/// [`LoweringSession`] is installed (the lower submodules' unit tests, which
+/// only inspect the tree shape).
 pub(crate) fn lowering_leaf(id: NodeId, span: Span, nature: Nature, label: RewriteLabel) {
-    ACTIVE_LOG.with(|slot| {
-        if let Some(ActiveLog::Lowering(rec)) = slot.borrow_mut().as_mut() {
+    ACTIVE_LOWERING_LOG.with(|slot| {
+        if let Some(rec) = slot.borrow_mut().as_mut() {
             rec.recorded.insert(id);
-            rec.log.push(LoweringStep {
-                op: Op::Transform {
-                    consumed: Vec::new(),
-                    produced: vec![id],
-                },
-                anchor: vec![span],
+            rec.log.push(LoweringStep::Leaf {
+                id,
+                anchor: span,
                 nature,
                 label,
             });
         }
     });
+}
+
+/// Run `f` against the installed [`LineageTable`], or do nothing when no
+/// [`TableSession`] is installed — the one place a flush touches the sink, so
+/// "recording is off" is a single silent no-op rather than a branch per row.
+fn with_table(f: impl FnOnce(&mut LineageTable)) {
+    ACTIVE_TABLE.with(|slot| {
+        if let Some(table) = slot.borrow_mut().as_mut() {
+            f(table);
+        }
+    });
+}
+
+/// RAII installer for the per-compile [`LineageTable`] — the sink every pass
+/// frame's flush writes into.
+///
+/// It brackets a **whole compile** rather than a pass, so it outlives — and
+/// nests around — every [`PassScope`] that compile opens; `Drop` clears the slot
+/// so a panicking compile never leaves a stale table for the next one.
+pub(crate) struct TableSession {
+    // Not `Copy`/`Clone`; holds the installed-table invariant for its lifetime.
+    _private: (),
+}
+
+impl TableSession {
+    /// Install a fresh, empty table as this thread's mirror target. Non-reentrant
+    /// (debug-asserted): a nested install would silently split one compile's rows
+    /// across two tables.
+    pub(crate) fn install() -> Self {
+        ACTIVE_TABLE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            debug_assert!(
+                slot.is_none(),
+                "a TableSession is already installed on this thread",
+            );
+            *slot = Some(LineageTable::default());
+        });
+        TableSession { _private: () }
+    }
+
+    /// Drain and return the table, ending the session.
+    pub(crate) fn into_table(self) -> LineageTable {
+        ACTIVE_TABLE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+impl Drop for TableSession {
+    fn drop(&mut self) {
+        ACTIVE_TABLE.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 /// Group captured `(origin, fresh)` pairs into per-origin produced-lists,
@@ -1000,66 +1514,193 @@ fn group_copies(copies: &[(NodeId, NodeId)]) -> Vec<(NodeId, Vec<NodeId>)> {
     out
 }
 
-/// Open a lineage step, returning an RAII guard that finalizes it on drop.
+/// Open a **lowering** copy-only frame: it consumes nothing, mints nothing, and
+/// exists solely to capture the `(origin, fresh)` pairs a clone's freshen reports,
+/// which flush as per-origin [`LoweringStep::Copy`]s (or, under a pass scope, as
+/// one row per copy).
 ///
-/// While the guard is alive the step is the innermost open frame: every id
-/// minted (via `Expr::new`) or freshened (via the freshen helpers) on this
-/// thread is captured into it. `blame` is the separate attribution channel
-/// (blame ⊥ consumption) — the upstream ids the outputs trace to, which may
-/// differ from what the step consumes.
+/// This is the one frame kind with **no origin**, and lowering is the one place
+/// that shape is right: uncurry's template-interior freshens and the
+/// compare-chain operand freshens duplicate nodes with no slot being rewritten,
+/// so there is no id for a bracket to name. Every copy the frame captures
+/// carries its own origin from the hook, so the frame itself needs none — which
+/// is exactly why it can afford to declare nothing at all. A *pass* that
+/// duplicates uses [`enter`], whose origin is the node the duplication is being
+/// performed for.
 ///
-/// `consumed` is the only thing a frame declares up front; the produced side is
-/// discovered from the construction hooks. A frame that consumes nothing and
-/// mints nothing — opened purely to capture a clone's freshen pairs — is a
-/// [`copy_frame`], which spells that out and has no inert arguments.
-pub(crate) fn step(
-    label: RewriteLabel,
-    consumed: Vec<NodeId>,
-    blame: Vec<NodeId>,
-    nature: Nature,
-) -> StepGuard {
+/// `nature` is fixed at [`Machinery`](Nature::Machinery) rather than taken as an
+/// argument because a lowering copy's nature is never read: a
+/// [`LoweringStep::Copy`] mirrors the origin's already-folded attribution
+/// *verbatim*, so passing a nature here would be passing an unobservable value —
+/// and a wrong one (a `Nature::Source` on a copy frame) would look meaningful
+/// while being inert. A pass copy's row *does* carry a nature that reaches the
+/// attribution; that is one more reason a pass duplication belongs in [`enter`],
+/// which names it.
+pub(crate) fn copy_frame(label: RewriteLabel) -> FrameGuard {
     STEP_STACK.with(|s| {
         let mut stack = s.borrow_mut();
         let depth = stack.len();
         stack.push(OpenStep {
             label,
-            consumed,
-            blame,
+            consumed: Vec::new(),
+            origin: None,
+            blame: Vec::new(),
+            nature: Nature::Machinery,
+            births: Vec::new(),
+            copies: Vec::new(),
+        });
+        FrameGuard { depth }
+    })
+}
+
+// ===========================================================================
+// Driver capture: brackets keyed on node identity.
+//
+// A pass opens a bracket naming the node it is *about to rewrite* and declares
+// nothing else. Everything minted while the bracket is innermost attaches to
+// that node as a `Copy` — "mirrors its lineage" — which is silent on whether the
+// node survived. Deaths are the pane boundary's live-set difference, so no site
+// predicts a fate.
+//
+// A frame therefore carries an `origin: NodeId` — an observed parentage — and
+// not a predicted death set. The produced side is never declared at all: it is a
+// byproduct of construction, discovered through the mint hooks.
+//
+// There is no constructor for a frame that declares anything: every rewriting
+// site opens an `enter` bracket, and the one frame with no origin (`copy_frame`)
+// is lowering's copy sink, which declares nothing either.
+// ===========================================================================
+
+/// Open a **driver bracket** over the node currently in the slot being
+/// rewritten, returning an RAII guard that finalizes it on drop.
+///
+/// `slot_id` is read off the node *before* the rewrite runs; every id minted
+/// while this is the innermost frame records `slot_id` as its parent. Nothing is
+/// declared and no fate is predicted — see [`OpenStep::flush_bracket`].
+///
+/// The guard form rather than a closure is an **ergonomics judgment**, not a
+/// type-system limitation: every current site's bracketed region is
+/// `return <one expression>`, which a `FnOnce` would wrap fine. Two things make
+/// the scope the better unit anyway:
+///
+/// * **The bracketed region is a scope, not an expression.** A site may want to
+///   talk to the open frame after opening it — `mut_elim` calls [`FrameGuard::blame`] on the
+///   next line, naming the `For` so the products resolve to the loop keyword's
+///   span rather than the enclosing statement's. A closure taking only the
+///   rewrite has no channel for that; the frame's extra channels would have to
+///   become parameters, one per channel.
+/// * **A channel may fire from a runtime-decided point inside the region.**
+///   Whether a rewrite takes the arm that widens its attribution is decided by
+///   a `match` on the node, potentially far below the `enter`. Expressing that
+///   as a closure means making a function's whole tail a closure body so that
+///   one arm can reach the frame.
+///
+/// Nothing is lost by the guard: the bracket needs the id only at *entry* (the
+/// `Copy` encoding never inspects the exit state), so a scope guard carries
+/// exactly the information a closure would.
+pub(crate) fn enter(slot_id: NodeId, label: RewriteLabel, nature: Nature) -> FrameGuard {
+    STEP_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let depth = stack.len();
+        stack.push(OpenStep {
+            label,
+            consumed: Vec::new(),
+            origin: Some(slot_id),
+            blame: Vec::new(),
             nature,
             births: Vec::new(),
             copies: Vec::new(),
         });
-        StepGuard { depth }
+        FrameGuard { depth }
     })
 }
 
-/// Open a **lowering** copy-only frame: it consumes nothing, mints nothing, and
-/// exists solely to capture the `(origin, fresh)` pairs a clone's freshen reports,
-/// which flush as per-origin [`Op::Copy`] steps.
-///
-/// The distinct constructor is what keeps the frame honest, and the reason it is
-/// lowering-specific is the two folds' `Op::Copy` arms:
-/// [`collapse_lowering`] mirrors the origin's already-folded attribution
-/// *verbatim*, so a lowering copy's `nature` and `blame` are genuinely never read
-/// — passing them would be passing unobservable values, and a wrong one (a
-/// `Nature::Source` on a copy frame) would look meaningful while being inert.
-/// [`collapse`] does **not** mirror: a pass `Op::Copy` with empty blame builds
-/// `RewriteTag { nature: step.nature, .. }`, so a pass copy-frame's nature reaches
-/// the attribution and must be chosen deliberately. Such a frame opens with
-/// [`step`] and names its nature.
-pub(crate) fn copy_frame(label: RewriteLabel) -> StepGuard {
-    step(label, Vec::new(), Vec::new(), Nature::Machinery)
-}
-
-/// RAII finalizer for an open [`step`]. Popping and flushing on `Drop` is
-/// panic-safe: an unwind through an open step still pops its frame (so the stack
+/// RAII finalizer for an open frame. Popping and flushing on `Drop` is
+/// panic-safe: an unwind through an open frame still pops it (so the stack
 /// is never left corrupt) and flushes what was captured before the panic.
-pub(crate) struct StepGuard {
+///
+/// The guard is also the *only* handle on the frame it opened: the extra
+/// channels ([`FrameGuard::also_consumes`], [`FrameGuard::blame`]) are inherent
+/// methods on it, so a site cannot address a frame it does not hold — the
+/// innermost frame may belong to a callee or to an enclosing recursion.
+#[must_use = "a dropped FrameGuard records nothing — bind it (`let _g = …`), \
+              and note `let _ = …` drops it immediately"]
+pub(crate) struct FrameGuard {
     /// The stack index this frame occupied when opened, for the LIFO tripwire.
     depth: usize,
 }
 
-impl Drop for StepGuard {
+impl FrameGuard {
+    /// Fusion (many:1): this frame **also** destroys `id`, a node the driver
+    /// cannot see because it is not the bracketed one.
+    ///
+    /// The intended sole escape hatch, and **the only place any id is named at
+    /// record time** — everything else about a frame is observed. The named id
+    /// joins the bracketed origin in the products' `parents`, so it asserts
+    /// descent, not a fate.
+    ///
+    /// A [`copy_frame`] has no origin for it to sit beside, so this is
+    /// meaningless there and [`assert_copy_only`] catches it.
+    ///
+    /// [`assert_copy_only`]: OpenStep::assert_copy_only
+    // No production caller: the compiler's rewrites are all 1:many, so every
+    // bracket flushes a `Copy`. The hatch is retained because it is the only way
+    // to express the many:1 shape at all — a fusion onto an older survivor has
+    // to remint (`consumed: [S, D…] → produced: [S′]`) to keep parents ahead of
+    // children, and there is no other channel that can say so. Exercised by
+    // `a_fusion_gives_every_product_the_bipartite_product`.
+    #[allow(dead_code)]
+    pub(crate) fn also_consumes(&self, id: NodeId) {
+        if id == NodeId::PLACEHOLDER {
+            return;
+        }
+        self.with_own_frame(|top| top.consumed.push(id));
+    }
+
+    /// Additional source attribution for this frame: nodes its products are
+    /// *about* beyond the one being rewritten.
+    ///
+    /// With empty blame the products take the bracketed node's spans (the
+    /// default, and right for most rewrites). Naming blame **adds** to that —
+    /// attribution is the union of the parents' spans and these — so a site
+    /// widens the attribution rather than redirecting it.
+    ///
+    /// It relates without claiming descent: these ids may name nodes that
+    /// survive the rewrite, so they ride the `blame` column rather than
+    /// `parents` and reach the pane-to-pane relation as *relatedness* edges
+    /// ([`EdgeLabels`]) — a consumer receives both labels and can render or
+    /// prune the relatedness itself. Weakest-link closure keeps the distinction
+    /// alive downstream: anything reached through one of these hops is related,
+    /// never descended.
+    pub(crate) fn blame(&self, ids: &[NodeId]) {
+        self.with_own_frame(|top| top.blame.extend(ids.iter().copied()));
+    }
+
+    /// Address *this* guard's frame, asserting it is the innermost open one.
+    ///
+    /// The channels above are only meaningful about the frame the caller holds;
+    /// reaching whatever happens to be on top would silently retarget a callee's
+    /// or an enclosing recursion's frame. Same `debug_assert_eq!` convention as
+    /// the LIFO tripwire in [`Drop`](FrameGuard::drop).
+    fn with_own_frame(&self, f: impl FnOnce(&mut OpenStep)) {
+        STEP_STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            debug_assert_eq!(
+                stack.len(),
+                self.depth + 1,
+                "FrameGuard channel used while it is not the innermost open frame \
+                 (expected depth {}, stack has {})",
+                self.depth,
+                stack.len(),
+            );
+            if let Some(top) = stack.last_mut() {
+                f(top);
+            }
+        });
+    }
+}
+
+impl Drop for FrameGuard {
     fn drop(&mut self) {
         // Pop our frame. Guards drop in LIFO order in normal control flow and on
         // unwind alike; the tripwire catches a manually-mis-ordered drop.
@@ -1068,27 +1709,34 @@ impl Drop for StepGuard {
             debug_assert_eq!(
                 stack.len(),
                 self.depth + 1,
-                "StepGuard dropped out of LIFO order (expected depth {}, stack has {})",
+                "FrameGuard dropped out of LIFO order (expected depth {}, stack has {})",
                 self.depth,
                 stack.len(),
             );
             stack.pop()
         });
         let Some(frame) = frame else { return };
-        // Flush to the active log if a session is installed; a no-op otherwise.
-        // The log kind routes the flush to the matching step type.
-        ACTIVE_LOG.with(|slot| match slot.borrow_mut().as_mut() {
-            Some(ActiveLog::Pass(log)) => frame.flush_into(log),
-            Some(ActiveLog::Lowering(rec)) => frame.flush_into_lowering(rec),
-            None => {}
-        });
+        // Lowering records into its own log; a pass frame writes table rows
+        // tagged with the ambient pass. Under neither, the flush is a silent
+        // no-op — the frame still captured, it simply has nowhere to land.
+        if ACTIVE_LOWERING_LOG.with(|slot| slot.borrow().is_some()) {
+            ACTIVE_LOWERING_LOG.with(|slot| {
+                if let Some(rec) = slot.borrow_mut().as_mut() {
+                    frame.flush_into_lowering(rec);
+                }
+            });
+            return;
+        }
+        if let Some(via) = ACTIVE_PASS.with(|p| *p.borrow()) {
+            frame.flush_into_table(via);
+        }
     }
 }
 
 /// A hook called from `Expr::new` for every minted [`NodeId`]. Pushes the id
-/// into the innermost open step's births, or does nothing when no step is open
+/// into the innermost open frame's births, or does nothing when no frame is open
 /// (the common case — a borrow and an emptiness check). The [`PLACEHOLDER`]
-/// sentinel is ignored so `Default`/`mem::take` throwaways never pollute a step.
+/// sentinel is ignored so `Default`/`mem::take` throwaways never pollute a frame.
 ///
 /// [`PLACEHOLDER`]: NodeId::PLACEHOLDER
 pub(crate) fn on_mint(id: NodeId) {
@@ -1148,13 +1796,17 @@ pub(crate) fn preserve_ids() -> PreservingIds {
 /// genuine duplications a callee performs, so it can manufacture duplicate ids
 /// in a way the per-copy method cannot.
 ///
-/// It exists because what must not mint inside a predicate rebuild is not a copy
-/// but an arbitrary caller-supplied rewrite: `f` does not clone the predicate, it
-/// mints *into* it (a substitution materializing a template, a rule building a
-/// conjunction). Nothing records a predicate rewrite, so a node minted there is
-/// one no record explains, and a `Copy` rowed against it folds as
-/// [`Leak::CopyOfUnknown`]. `clone_preserving_ids` covers one copy;
-/// only a scope covers a region.
+/// It exists because what must not re-identify a predicate is not a copy but an
+/// arbitrary caller-supplied *rewrite*: `f` does not clone the predicate, it
+/// mints and copies *into* it (a substitution materializing a template, a rule
+/// building a conjunction). The rewritten term **replaces** the original in its
+/// `Refinement`, so it is the same logical node and keeps its ids;
+/// `clone_preserving_ids` can say that about one copy but not about a whole
+/// region, and only a scope can.
+///
+/// Note this is no longer justified by predicates being *outside* the id domain —
+/// they are in it, and the fold explains them (`design/provenance.md`, "Walking
+/// the ids"). It is justified by the rewrite being a replacement.
 ///
 /// Preserving is honest here because the rebuilt term *replaces* the original
 /// everywhere the walk reaches — which holds only because `uniquify` walks the
@@ -1184,10 +1836,10 @@ pub(crate) fn copy_id(origin: NodeId) -> NodeId {
 }
 
 /// A hook called from the freshen helpers for every `(origin, fresh)`
-/// duplication. Pushes the pair into the innermost open step's copies, or does
-/// nothing when no step is open. Guards the [`PLACEHOLDER`] sentinel on both
+/// duplication. Pushes the pair into the innermost open frame's copies, or does
+/// nothing when no frame is open. Guards the [`PLACEHOLDER`] sentinel on both
 /// sides, as [`on_mint`] does: a placeholder origin would fold as
-/// [`Leak::CopyOfUnknown`] against an id that is never live by construction.
+/// [`Leak::ParentUnknown`] against an id nothing ever records.
 ///
 /// [`PLACEHOLDER`]: NodeId::PLACEHOLDER
 pub(crate) fn on_copy(origin: NodeId, fresh: NodeId) {
@@ -1201,87 +1853,103 @@ pub(crate) fn on_copy(origin: NodeId, fresh: NodeId) {
     });
 }
 
-/// RAII installer for the active recording log. [`new`](Self::new) installs a
-/// **pass** log ([`ActiveLog::Pass`]); [`lowering`](Self::lowering) installs a
-/// **lowering** log ([`ActiveLog::Lowering`]). The matching drain
-/// ([`into_log`](Self::into_log) / [`into_lowering_log`](Self::into_lowering_log))
+/// RAII installer for **lowering's** log.
+///
+/// Installed unconditionally for the whole of lowering in every build, because
+/// the projection it folds into is release-critical: an `InferError` resolves
+/// its blame node to a span through it. [`into_log`](Self::into_log) drains and
 /// ends the session; `Drop` clears the slot so a panic never leaves a stale log
-/// installed for the next boundary. At most one session per thread, and — since
-/// the lowering session installs unconditionally in every build — it must fully
-/// drain before the first pass session opens.
-pub(crate) struct RecorderSession {
+/// installed. At most one per thread, and it must fully drain before the first
+/// [`PassScope`] opens — a frame flushing while both were installed would record
+/// lowering-shaped copies for a pass rewrite.
+pub(crate) struct LoweringSession {
     // Not `Copy`/`Clone`; holds the installed-log invariant for its lifetime.
     _private: (),
 }
 
-impl RecorderSession {
-    /// Install a fresh, empty **pass** log as the active recording target for
-    /// this thread. Non-reentrant: at most one session per thread
-    /// (debug-asserted).
-    ///
-    /// The pass-log counterpart to [`lowering`](Self::lowering), which is
-    /// always-on. Uncalled outside this module's tests until a pass boundary
-    /// installs a session of its own.
-    #[allow(dead_code)]
-    pub(crate) fn new() -> Self {
-        Self::install(ActiveLog::Pass(Vec::new()))
-    }
-
-    /// Install a fresh, empty **lowering** log. The always-on session:
-    /// installed for the whole of lowering in every build. Its leaf entries
-    /// ([`lowering_leaf`]) and copy-frame flushes route to a [`LoweringLog`].
-    pub(crate) fn lowering() -> Self {
-        Self::install(ActiveLog::Lowering(LoweringRecord::default()))
-    }
-
-    fn install(log: ActiveLog) -> Self {
-        ACTIVE_LOG.with(|slot| {
+impl LoweringSession {
+    /// Install a fresh, empty lowering log as this thread's recording target.
+    /// Non-reentrant (debug-asserted).
+    pub(crate) fn install() -> Self {
+        ACTIVE_LOWERING_LOG.with(|slot| {
             let mut slot = slot.borrow_mut();
             debug_assert!(
                 slot.is_none(),
-                "a RecorderSession is already installed on this thread",
+                "a LoweringSession is already installed on this thread",
             );
-            *slot = Some(log);
+            *slot = Some(LoweringRecord::default());
         });
-        RecorderSession { _private: () }
+        LoweringSession { _private: () }
     }
 
-    /// Drain and return the recorded **pass** log, ending the session. The
-    /// subsequent `Drop` is then a no-op (the slot is already empty).
-    ///
-    /// Paired with [`new`](Self::new), so it is dead exactly while that is.
-    #[allow(dead_code)]
-    pub(crate) fn into_log(self) -> LineageLog {
-        ACTIVE_LOG.with(|slot| match slot.borrow_mut().take() {
-            Some(ActiveLog::Pass(log)) => log,
-            other => {
-                debug_assert!(other.is_none(), "into_log on a non-pass session");
-                Vec::new()
-            }
-        })
-    }
-
-    /// Drain and return the recorded **lowering** log, ending the session.
-    pub(crate) fn into_lowering_log(self) -> LoweringLog {
-        ACTIVE_LOG.with(|slot| match slot.borrow_mut().take() {
-            Some(ActiveLog::Lowering(rec)) => rec.log,
-            other => {
-                debug_assert!(
-                    other.is_none(),
-                    "into_lowering_log on a non-lowering session"
-                );
-                Vec::new()
-            }
-        })
+    /// Drain and return the recorded log, ending the session. The subsequent
+    /// `Drop` is then a no-op (the slot is already empty).
+    pub(crate) fn into_log(self) -> LoweringLog {
+        ACTIVE_LOWERING_LOG.with(|slot| slot.borrow_mut().take().unwrap_or_default().log)
     }
 }
 
-impl Drop for RecorderSession {
+impl Drop for LoweringSession {
     fn drop(&mut self) {
-        // Clear on unwind (and after a plain `into_log`, harmlessly): the next
-        // pass must never see a stale log.
-        ACTIVE_LOG.with(|slot| *slot.borrow_mut() = None);
+        ACTIVE_LOWERING_LOG.with(|slot| *slot.borrow_mut() = None);
     }
+}
+
+/// RAII installer for the ambient [`Pass`] a frame's flush tags its rows with.
+///
+/// One scope per pass, opened at the boundary that runs it. The pass is carried
+/// here rather than passed per frame because a bracket site knows its `label`
+/// and `nature` but not which pass is running, and because the boundary that
+/// opens the scope is precisely the thing that does: one pass runs inside one
+/// scope, so the pass is ambient over the scope's whole extent. (A scope over a
+/// *window* of several passes, as the audits open, tags every row with the one
+/// pass it names — no single pass being the truthful answer there.)
+///
+/// Opening a scope is what turns pass recording **on**: outside one a frame
+/// still captures, but its flush has no tag to complete a row with and writes
+/// nothing.
+pub(crate) struct PassScope {
+    // Not `Copy`/`Clone`; holds the installed-pass invariant for its lifetime.
+    _private: (),
+}
+
+impl PassScope {
+    /// Install `pass` as this thread's ambient recording pass. Non-reentrant
+    /// (debug-asserted): a nested scope would silently retag the inner pass's
+    /// rows on exit.
+    pub(crate) fn enter(pass: Pass) -> Self {
+        debug_assert!(
+            ACTIVE_LOWERING_LOG.with(|slot| slot.borrow().is_none()),
+            "opening a PassScope ({pass:?}) while lowering's log is still installed — a \
+             frame would flush lowering-shaped copies for a pass rewrite. Drain the \
+             LoweringSession first",
+        );
+        ACTIVE_PASS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            debug_assert!(
+                slot.is_none(),
+                "a PassScope is already open on this thread (opening {pass:?})",
+            );
+            *slot = Some(pass);
+        });
+        PassScope { _private: () }
+    }
+}
+
+impl Drop for PassScope {
+    fn drop(&mut self) {
+        ACTIVE_PASS.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Read the installed [`LineageTable`] mid-compile, or `None` when no
+/// [`TableSession`] is installed.
+///
+/// The compile's table is drained at the end of the compile, so a measurement
+/// that folds a window *inside* one — the lineage audit — has no other way to
+/// reach the rows it just caused to be written.
+pub(crate) fn with_active_table<R>(f: impl FnOnce(&LineageTable) -> R) -> Option<R> {
+    ACTIVE_TABLE.with(|slot| slot.borrow().as_ref().map(f))
 }
 
 /// The current open-step depth on this thread — a probe for the panic-safety
@@ -1299,6 +1967,14 @@ mod tests {
         Span::new(start, end)
     }
 
+    /// The pass the tests record under. The recorder is pass-agnostic — the tag
+    /// only rides through to a row — so naming one constant keeps the choice
+    /// from looking meaningful at each call site.
+    const TEST_PASS: Pass = Pass::Inline;
+
+    /// The boundary window every fold test uses: the one pass its rows carry.
+    const WINDOW: &[Pass] = &[TEST_PASS];
+
     fn ids<const N: usize>() -> [NodeId; N] {
         std::array::from_fn(|_| NodeId::fresh())
     }
@@ -1307,103 +1983,76 @@ mod tests {
         items.into_iter().collect()
     }
 
-    /// The predicate sweep must not overwrite attribution a node already has.
-    ///
-    /// This is the one property of `lowering_predicate_leaf` that **no leak class
-    /// can see**: the fold is last-write-wins, so a node re-recorded by the sweep
-    /// is still perfectly *explained* — it has just silently swapped its real
-    /// span and label for the sweep's coarse ones. Measured on the pipeline
-    /// corpus, a blanket sweep clobbers 318 nodes and every gate stays green.
-    #[test]
-    fn the_predicate_sweep_skips_already_recorded_nodes() {
-        let [recorded, fresh] = ids::<2>();
-        let session = RecorderSession::lowering();
-        // A node lowered in the main tree: precise span, precise label.
-        lowering_leaf(recorded, span(10, 20), Nature::Source, "lower.precise");
-        // The sweep runs over a predicate containing both that node and one
-        // minted while assembling the predicate.
-        lowering_predicate_leaf(recorded, span(0, 99), Nature::Machinery, "lower.sweep");
-        lowering_predicate_leaf(fresh, span(0, 99), Nature::Machinery, "lower.sweep");
-        let log = session.into_lowering_log();
-
-        assert_eq!(log.len(), 2, "the already-recorded node is not re-recorded");
-        let for_recorded: Vec<_> = log
-            .iter()
-            .filter(
-                |s| matches!(&s.op, Op::Transform { produced, .. } if produced == &vec![recorded]),
-            )
-            .collect();
-        assert_eq!(
-            for_recorded.len(),
-            1,
-            "exactly one entry for the lowered node"
-        );
-        assert_eq!(
-            for_recorded[0].label, "lower.precise",
-            "its own label survives"
-        );
-        assert_eq!(
-            for_recorded[0].anchor,
-            vec![span(10, 20)],
-            "its own span survives"
-        );
-
-        let for_fresh: Vec<_> = log
-            .iter()
-            .filter(|s| matches!(&s.op, Op::Transform { produced, .. } if produced == &vec![fresh]))
-            .collect();
-        assert_eq!(
-            for_fresh.len(),
-            1,
-            "the assembly node is explained by the sweep"
-        );
-        assert_eq!(for_fresh[0].label, "lower.sweep");
-    }
-
-    /// A second sweep over the same predicate adds nothing — the skip is keyed on
-    /// the id, not on which sweep recorded it, so overlapping predicates (one
-    /// term riding several type slots) cannot double-record.
-    #[test]
-    fn the_predicate_sweep_is_idempotent() {
-        let [n] = ids::<1>();
-        let session = RecorderSession::lowering();
-        lowering_predicate_leaf(n, span(1, 2), Nature::Machinery, "lower.sweep");
-        lowering_predicate_leaf(n, span(3, 4), Nature::Machinery, "lower.sweep");
-        let log = session.into_lowering_log();
-        assert_eq!(
-            log.len(),
-            1,
-            "one entry per node however many sweeps reach it"
-        );
-        assert_eq!(log[0].anchor, vec![span(1, 2)], "the first sweep wins");
-    }
-
-    fn transform(consumed: Vec<NodeId>, produced: Vec<NodeId>, blame: Vec<NodeId>) -> RewriteStep {
-        RewriteStep {
-            op: Op::Transform { consumed, produced },
-            blame,
-            nature: Nature::Expansion,
-            label: "test.transform",
-        }
-    }
-
-    fn copy(origin: NodeId, produced: Vec<NodeId>, blame: Vec<NodeId>) -> RewriteStep {
-        RewriteStep {
-            op: Op::Copy { origin, produced },
-            blame,
-            nature: Nature::Expansion,
-            label: "test.copy",
-        }
-    }
-
-    /// One pass' worth of log at `Pass::Inline` (an arbitrary non-lowering pass).
-    fn phase(steps: Vec<RewriteStep>) -> Vec<(Pass, LineageLog)> {
-        vec![(Pass::Inline, steps)]
+    /// The gated subset of a leak vector — everything but the death report. The
+    /// hand-built tables below mostly report no deaths at all and assert on the
+    /// whole vector; a test that records a *real* rewrite gets `Died` for the
+    /// node it replaced and wants this instead.
+    fn defects(leaks: &[Leak]) -> Vec<&Leak> {
+        leaks.iter().filter(|l| l.is_defect()).collect()
     }
 
     fn sorted(mut v: Vec<NodeId>) -> Vec<NodeId> {
         v.sort_unstable();
         v
+    }
+
+    /// The ids one side of a node's edges names, labels dropped — for the tests
+    /// whose subject is *which pairs* the fold derives rather than what they
+    /// assert. The label tests below read [`Link::labels`] instead.
+    fn ids_of(links: &[Link<NodeId>]) -> Vec<NodeId> {
+        links.iter().map(|l| l.id).collect()
+    }
+
+    /// What the edge to `id` asserts, or `None` when the pair is not an edge at
+    /// all — the two answers a labelled relation can give, kept apart.
+    fn labels_of(links: &[Link<NodeId>], id: NodeId) -> Option<EdgeLabels> {
+        links.iter().find(|l| l.id == id).map(|l| l.labels)
+    }
+
+    /// Write one row by hand, at `TEST_PASS` with an `Expansion` nature.
+    fn row(table: &mut LineageTable, id: NodeId, parents: &[NodeId], blame: &[NodeId]) {
+        row_tagged(
+            table,
+            id,
+            parents,
+            blame,
+            RewriteTag {
+                via: TEST_PASS,
+                nature: Nature::Expansion,
+                label: "test.rewrite",
+            },
+        );
+    }
+
+    /// Write one row by hand under a named tag — for the tests where the pass,
+    /// the nature or the label is the thing under test.
+    fn row_tagged(
+        table: &mut LineageTable,
+        id: NodeId,
+        parents: &[NodeId],
+        blame: &[NodeId],
+        tag: RewriteTag,
+    ) {
+        let rule = table.intern_rule(tag);
+        table.record(id, parents, blame, rule);
+    }
+
+    /// A table holding exactly `rows`, each `(node, parents)` with no blame.
+    fn table_of(rows: &[(NodeId, &[NodeId])]) -> LineageTable {
+        let mut table = LineageTable::default();
+        for (id, parents) in rows {
+            row(&mut table, *id, parents, &[]);
+        }
+        table
+    }
+
+    /// An attribution holding `spans`, tagged as a lowered direct image — what
+    /// an upstream pane's entries look like.
+    fn imaged(spans: &[Span]) -> SourceAttribution {
+        SourceAttribution {
+            spans: spans.to_vec(),
+            rewritten: RewriteTag::direct_image(),
+        }
     }
 
     // ---- lineage composition ----------------------------------------------
@@ -1412,110 +2061,218 @@ mod tests {
     fn transient_born_and_consumed_composes_away() {
         // A → B (born) → C. B exists in neither snapshot; lineage flows A → C.
         let [a, b, c] = ids();
-        let logs = phase(vec![
-            transform(vec![a], vec![b], vec![]),
-            transform(vec![b], vec![c], vec![]),
-        ]);
-        let (map, _proj, leaks) = collapse(&logs, &set([a]), &set([c]), &SourceProjection::new());
-        assert!(leaks.is_empty(), "{leaks:?}");
-        assert_eq!(map.upstream(&c), &[a]);
-        assert_eq!(map.downstream(&a), &[c]);
+        let table = table_of(&[(b, &[a]), (c, &[b])]);
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([a]),
+            &set([c]),
+            &SourceProjection::new(),
+        );
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        assert_eq!(ids_of(map.upstream(&c)), vec![a]);
+        assert_eq!(ids_of(map.downstream(&a)), vec![c]);
         // B is a transient: unknown to the map in both directions.
         assert!(map.upstream(&b).is_empty());
         assert!(map.downstream(&b).is_empty());
     }
 
     #[test]
-    fn copy_of_copy_chain_composes() {
-        // A copied to B, B copied to C; C's roots compose back to A.
+    fn one_parent_reaching_two_products_fans_out() {
+        // A is rewritten twice — a duplication and a replacement, say. Both
+        // products trace to A, and A's own fate is decided by the panes alone:
+        // here it survives, so it keeps its self-edge alongside the fan-out.
         let [a, b, c] = ids();
-        let logs = phase(vec![copy(a, vec![b], vec![]), copy(b, vec![c], vec![])]);
-        let (map, _proj, leaks) =
-            collapse(&logs, &set([a]), &set([a, c]), &SourceProjection::new());
+        let table = table_of(&[(b, &[a]), (c, &[a])]);
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([a]),
+            &set([a, b, c]),
+            &SourceProjection::new(),
+        );
         assert!(leaks.is_empty(), "{leaks:?}");
-        assert_eq!(map.upstream(&c), &[a]);
-        assert_eq!(map.upstream(&a), &[a], "origin keeps its self-edge");
+        assert_eq!(ids_of(map.upstream(&b)), vec![a]);
+        assert_eq!(ids_of(map.upstream(&c)), vec![a]);
+        assert_eq!(
+            ids_of(map.upstream(&a)),
+            vec![a],
+            "the parent keeps its self-edge"
+        );
+        assert_eq!(sorted(ids_of(map.downstream(&a))), sorted(vec![a, b, c]));
     }
 
     #[test]
-    fn copy_whose_origin_is_consumed_later_keeps_edges() {
-        // Copy A→B, then a Transform consumes A→C. B snapshotted A's lineage
-        // before A was consumed, so both B and C trace to A.
-        let [a, b, c] = ids();
-        let logs = phase(vec![
-            copy(a, vec![b], vec![]),
-            transform(vec![a], vec![c], vec![]),
-        ]);
-        let (map, _proj, leaks) =
-            collapse(&logs, &set([a]), &set([b, c]), &SourceProjection::new());
-        assert!(leaks.is_empty(), "{leaks:?}");
-        assert_eq!(map.upstream(&b), &[a]);
-        assert_eq!(map.upstream(&c), &[a]);
-        assert_eq!(sorted(map.downstream(&a).to_vec()), sorted(vec![b, c]));
-    }
-
-    #[test]
-    fn n_to_m_transform_is_the_bipartite_product() {
-        // {A,B} → {C,D}: every input reaches every output (2×2 = 4 edges).
+    fn a_fusion_gives_every_product_the_bipartite_product() {
+        // {A,B} fused into {C,D}: every input reaches every output (2×2 = 4
+        // edges), which falls out of each product row holding the whole
+        // consumed set as its parents.
         let [a, b, c, d] = ids();
-        let logs = phase(vec![transform(vec![a, b], vec![c, d], vec![])]);
-        let (map, _proj, leaks) =
-            collapse(&logs, &set([a, b]), &set([c, d]), &SourceProjection::new());
-        assert!(leaks.is_empty(), "{leaks:?}");
-        assert_eq!(map.upstream(&c), sorted(vec![a, b]).as_slice());
-        assert_eq!(map.upstream(&d), sorted(vec![a, b]).as_slice());
-        assert_eq!(map.downstream(&a), sorted(vec![c, d]).as_slice());
-        assert_eq!(map.downstream(&b), sorted(vec![c, d]).as_slice());
+        let table = table_of(&[(c, &[a, b]), (d, &[a, b])]);
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([a, b]),
+            &set([c, d]),
+            &SourceProjection::new(),
+        );
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        assert_eq!(ids_of(map.upstream(&c)), sorted(vec![a, b]));
+        assert_eq!(ids_of(map.upstream(&d)), sorted(vec![a, b]));
+        assert_eq!(ids_of(map.downstream(&a)), sorted(vec![c, d]));
+        assert_eq!(ids_of(map.downstream(&b)), sorted(vec![c, d]));
         assert_eq!(map.edges().len(), 4);
     }
 
     #[test]
     fn untouched_id_gets_self_edge_and_inherits_attribution() {
-        // No steps mention A: it survives with a self-edge and its upstream
+        // No row mentions A: it survives with a self-edge and its upstream
         // attribution passes through unchanged.
         let [a] = ids();
         let mut upstream = SourceProjection::new();
-        upstream.insert(
-            a,
-            SourceAttribution {
-                spans: vec![span(3, 9)],
-                rewritten: RewriteTag::direct_image(),
-            },
+        upstream.insert(a, imaged(&[span(3, 9)]));
+        let (map, proj, leaks) = collapse(
+            &LineageTable::default(),
+            WINDOW,
+            &set([a]),
+            &set([a]),
+            &upstream,
         );
-        let (map, proj, leaks) = collapse(&phase(vec![]), &set([a]), &set([a]), &upstream);
         assert!(leaks.is_empty(), "{leaks:?}");
-        assert_eq!(map.upstream(&a), &[a]);
-        assert_eq!(map.downstream(&a), &[a]);
+        assert_eq!(ids_of(map.upstream(&a)), vec![a]);
+        assert_eq!(ids_of(map.downstream(&a)), vec![a]);
         assert_eq!(proj.get(&a), upstream.get(&a), "attribution unchanged");
     }
 
+    /// A window exercising a chain, a fan-out and an N:1 merge, with every
+    /// parent known and every input dying — so it folds leak-free whichever
+    /// order its rows were written in. Returns `(rows, inputs, outputs,
+    /// upstream_attr)` with the rows in dependency order.
+    #[allow(clippy::type_complexity)]
+    fn mixed_window() -> (
+        Vec<(NodeId, Vec<NodeId>, Vec<NodeId>)>,
+        HashSet<NodeId>,
+        HashSet<NodeId>,
+        SourceProjection,
+    ) {
+        let [a, b, x, y, z] = ids();
+        let mut upstream = SourceProjection::new();
+        upstream.insert(a, imaged(&[span(0, 2)]));
+        upstream.insert(b, imaged(&[span(4, 6)]));
+        let rows = vec![
+            (x, vec![a], vec![a]),
+            (y, vec![x], vec![]),
+            (z, vec![x, b], vec![b]),
+        ];
+        (rows, set([a, b]), set([y, z]), upstream)
+    }
+
+    fn table_from(rows: &[(NodeId, Vec<NodeId>, Vec<NodeId>)]) -> LineageTable {
+        let mut table = LineageTable::default();
+        for (id, parents, blame) in rows {
+            row(&mut table, *id, parents, blame);
+        }
+        table
+    }
+
     #[test]
-    fn survivor_carry_keeps_own_root_and_absorbs_others() {
-        // consumed = {A, B}, produced = {A}: A survives while absorbing B.
-        let [a, b] = ids();
-        let logs = phase(vec![transform(vec![a, b], vec![a], vec![])]);
-        let (map, _proj, leaks) =
-            collapse(&logs, &set([a, b]), &set([a]), &SourceProjection::new());
-        assert!(leaks.is_empty(), "{leaks:?}");
-        assert_eq!(map.upstream(&a), sorted(vec![a, b]).as_slice());
+    fn the_write_order_of_the_rows_does_not_change_the_fold() {
+        // The property the ascending sweep buys: the rows are an edge set, so
+        // writing them in dependency order or in reverse gives byte-identical
+        // results. It is not a nicety — a frame's rows are written when the
+        // frame closes, so an enclosing rewrite's rows land after the rows of
+        // the rewrites it contains.
+        let (rows, inputs, outputs, upstream) = mixed_window();
+        let mut reversed = rows.clone();
+        reversed.reverse();
+
+        let (map, proj, leaks) = collapse(&table_from(&rows), WINDOW, &inputs, &outputs, &upstream);
+        let (rev_map, rev_proj, rev_leaks) =
+            collapse(&table_from(&reversed), WINDOW, &inputs, &outputs, &upstream);
+
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        assert_eq!(leaks, rev_leaks, "same leaks in either order");
+        assert_eq!(
+            map.edges(),
+            rev_map.edges(),
+            "same relation in either order"
+        );
+        assert_eq!(proj, rev_proj, "same projection in either order");
+    }
+
+    #[test]
+    fn the_sweep_visits_every_vertex_once_and_never_backwards() {
+        // The sweep's premise, measured: ascending NodeId is a topological order
+        // of the definition graph, so the revisit count is zero.
+        let (rows, inputs, _outputs, _upstream) = mixed_window();
+        let m = sweep_metrics(&table_from(&rows), WINDOW, &inputs);
+        assert_eq!(m.vertices, 5, "two input ids + three produced");
+        assert_eq!(m.edges, 4, "a→x, x→y, x→z, b→z");
+        assert_eq!(
+            m.backward_edges, 0,
+            "a backward edge is a vertex the single sweep would have to revisit",
+        );
+    }
+
+    #[test]
+    fn a_row_produced_outside_the_window_reads_as_un_produced() {
+        // The window restriction, which is what turns a whole-compile table back
+        // into a per-boundary one. B was produced by a pass this boundary does
+        // not span, so to this boundary it is an ordinary input-pane node: the
+        // fold stops there rather than resolving through to A.
+        let [a, b, c] = ids();
+        let mut table = LineageTable::default();
+        row_tagged(
+            &mut table,
+            b,
+            &[a],
+            &[],
+            RewriteTag {
+                via: Pass::Mono,
+                nature: Nature::Machinery,
+                label: "other.pass",
+            },
+        );
+        row(&mut table, c, &[b], &[]);
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([b]),
+            &set([c]),
+            &SourceProjection::new(),
+        );
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        assert_eq!(
+            ids_of(map.upstream(&c)),
+            vec![b],
+            "the out-of-window row is the boundary's input, not a step through it",
+        );
     }
 
     // ---- leak taxonomy -----------------------------------------------------
 
     #[test]
-    fn clean_log_produces_no_leaks() {
+    fn clean_rows_produce_no_leaks() {
         let [a, b] = ids();
-        let logs = phase(vec![transform(vec![a], vec![b], vec![a])]);
-        let (_map, _proj, leaks) = collapse(&logs, &set([a]), &set([b]), &SourceProjection::new());
+        let table = table_of(&[(b, &[a])]);
+        let (_map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([a]),
+            &set([a, b]),
+            &SourceProjection::new(),
+        );
         assert!(leaks.is_empty(), "{leaks:?}");
     }
 
     #[test]
     fn leak_unexplained_fires_on_output_with_no_lineage() {
-        // Z appears in the output snapshot but nothing produced or preserved it.
+        // Z appears in the output snapshot but no row produced it and the input
+        // pane does not hold it.
         let [a, z] = ids();
         let (_map, _proj, leaks) = collapse(
-            &phase(vec![]),
+            &LineageTable::default(),
+            WINDOW,
             &set([a]),
             &set([a, z]),
             &SourceProjection::new(),
@@ -1527,159 +2284,389 @@ mod tests {
     }
 
     #[test]
-    fn leak_dropped_fires_on_live_input_missing_from_output() {
-        // B is live at the end (never consumed) but absent from the output.
+    fn leak_died_fires_on_an_input_missing_from_the_output() {
+        // B is an input-pane id absent from the output pane, and nothing said so.
         let [a, b] = ids();
         let (_map, _proj, leaks) = collapse(
-            &phase(vec![]),
+            &LineageTable::default(),
+            WINDOW,
             &set([a, b]),
             &set([a]),
             &SourceProjection::new(),
         );
-        assert!(leaks.contains(&Leak::Dropped { input: b }), "{leaks:?}");
+        assert!(leaks.contains(&Leak::Died { input: b }), "{leaks:?}");
     }
 
     #[test]
-    fn leak_consumed_unknown_fires_on_non_live_consume() {
+    fn leak_parent_unknown_fires_on_a_parent_the_window_never_heard_of() {
+        // X is neither an input-pane id nor produced in the window, so B's
+        // lineage stops at an id that describes nothing. One class, whether the
+        // unknown id is a lone parent (as here) or one of a fusion's several —
+        // the parents column does not record which.
         let [a, x, b] = ids();
-        let logs = phase(vec![transform(vec![x], vec![b], vec![])]);
-        let (_map, _proj, leaks) =
-            collapse(&logs, &set([a]), &set([a, b]), &SourceProjection::new());
+        let table = table_of(&[(b, &[x])]);
+        let (_map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([a]),
+            &set([a, b]),
+            &SourceProjection::new(),
+        );
         assert!(
-            leaks.contains(&Leak::ConsumedUnknown { consumed: x }),
+            leaks.contains(&Leak::ParentUnknown { parent: x }),
             "{leaks:?}"
+        );
+
+        let [a2, x2, b2] = ids();
+        let table = table_of(&[(b2, &[a2, x2])]);
+        let (_map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([a2]),
+            &set([b2]),
+            &SourceProjection::new(),
+        );
+        assert!(
+            leaks.contains(&Leak::ParentUnknown { parent: x2 }),
+            "one of a fusion's parents is the same class: {leaks:?}",
         );
     }
 
+    // ---- the write-time invariants -----------------------------------------
+    //
+    // Each is a property of the *record*, asserted where the second writer is
+    // standing rather than in a fold that only runs when a pane is materialized.
+    // Debug-gated because they are `debug_assert!`s: there is no release
+    // behaviour to assert, the row being written the same way in every build.
+
     #[test]
-    fn leak_copy_of_unknown_fires_on_non_live_origin() {
-        let [a, x, b] = ids();
-        let logs = phase(vec![copy(x, vec![b], vec![])]);
-        let (_map, _proj, leaks) = collapse(&logs, &set([a]), &set([a]), &SourceProjection::new());
-        assert!(
-            leaks.contains(&Leak::CopyOfUnknown { origin: x }),
-            "{leaks:?}"
-        );
+    #[cfg(debug_assertions)]
+    fn a_second_row_for_one_id_is_rejected() {
+        // Attribution has no join — a node cannot carry two `via`/`label` pairs
+        // — so a second claimant has no answer and overwriting would make the
+        // survivor a lie about which rewrite made the node.
+        let [a, b, p] = ids();
+        let caught = std::panic::catch_unwind(|| {
+            let mut table = LineageTable::default();
+            row(&mut table, p, &[a], &[]);
+            row(&mut table, p, &[b], &[]);
+        });
+        assert!(caught.is_err(), "a duplicate produce must be rejected");
     }
 
     #[test]
-    fn leak_produced_live_fires_when_producing_an_unconsumed_live_id() {
-        // Transform consumes A but produces B, which was already live.
+    #[cfg(debug_assertions)]
+    fn a_row_with_neither_parent_nor_blame_is_rejected() {
+        // A truly unanchored mint: nothing explains where the node came from.
+        let [b] = ids();
+        let caught = std::panic::catch_unwind(|| {
+            let mut table = LineageTable::default();
+            row(&mut table, b, &[], &[]);
+        });
+        assert!(caught.is_err(), "an unanchored record must be rejected");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_node_may_not_be_its_own_parent() {
+        // The self-referential definition — the one construct that makes an edge
+        // run backwards and forces the fold to a fixed point. An in-place
+        // rewrite that keeps its id is a preserve: it records nothing.
         let [a, b] = ids();
-        let logs = phase(vec![transform(vec![a], vec![b], vec![])]);
-        let (_map, _proj, leaks) =
-            collapse(&logs, &set([a, b]), &set([b]), &SourceProjection::new());
-        assert!(
-            leaks.contains(&Leak::ProducedLive { produced: b }),
-            "{leaks:?}"
-        );
-    }
-
-    #[test]
-    fn empty_consumed_with_blame_is_the_legal_pure_insertion_shape() {
-        // A consume-nothing Transform that names blame is a pure insertion: the
-        // output gets empty lineage roots (present in the map with empty `up`)
-        // and a blame-attributed projection entry. No EmptyConsumed leak.
-        let [a, b] = ids();
-        let mut upstream = SourceProjection::new();
-        upstream.insert(
-            a,
-            SourceAttribution {
-                spans: vec![span(1, 4)],
-                rewritten: RewriteTag::direct_image(),
-            },
-        );
-        let logs = phase(vec![transform(vec![], vec![b], vec![a])]);
-        let (map, proj, leaks) = collapse(&logs, &set([a]), &set([a, b]), &upstream);
-        assert!(leaks.is_empty(), "pure insertion is leak-free: {leaks:?}");
-        // b is present in the map with genuinely empty lineage roots.
-        assert!(
-            map.upstream(&b).is_empty(),
-            "pure insertion has no lineage ancestor"
-        );
-        // b is attributed via its blame, not via consumption.
-        let attr = proj.get(&b).expect("b attributed via blame");
-        assert_eq!(attr.spans, vec![span(1, 4)]);
-    }
-
-    #[test]
-    fn leak_empty_consumed_fires_when_consumed_and_blame_both_empty() {
-        // A truly unanchored mint: neither consumption nor blame explains it.
-        let [a, b] = ids();
-        let logs = phase(vec![transform(vec![], vec![b], vec![])]);
-        let (_map, _proj, leaks) =
-            collapse(&logs, &set([a]), &set([a, b]), &SourceProjection::new());
-        assert!(
-            leaks
-                .iter()
-                .any(|l| matches!(l, Leak::EmptyConsumed { .. })),
-            "{leaks:?}"
-        );
+        let caught = std::panic::catch_unwind(|| {
+            let mut table = LineageTable::default();
+            row(&mut table, a, &[a, b], &[]);
+        });
+        assert!(caught.is_err(), "consumed ∩ produced ≠ ∅ must be rejected");
     }
 
     // ---- blame / attribution ----------------------------------------------
 
     #[test]
-    fn expansion_blame_yields_deduped_ordered_span_union() {
-        // blame = [A, B]; A: [s1, s2], B: [s2, s3] → [s1, s2, s3].
+    fn a_pure_insertion_is_related_to_its_blame_and_descends_from_nothing() {
+        // A node placed over surviving material: no parents at all, attributed
+        // through blame. Its one edge is the relatedness edge blame contributes;
+        // nothing claims it descends from anything.
+        let [a, b] = ids();
+        let mut upstream = SourceProjection::new();
+        upstream.insert(a, imaged(&[span(1, 4)]));
+        let mut table = LineageTable::default();
+        row(&mut table, b, &[], &[a]);
+        let (map, proj, leaks) = collapse(&table, WINDOW, &set([a]), &set([a, b]), &upstream);
+        assert!(leaks.is_empty(), "pure insertion is leak-free: {leaks:?}");
+        assert_eq!(
+            labels_of(map.upstream(&b), a),
+            Some(EdgeLabels::RELATED),
+            "the insertion is related to what it was blamed on, and descends from nothing",
+        );
+        assert_eq!(ids_of(map.upstream(&b)), vec![a], "and from nothing else");
+        let attr = proj.get(&b).expect("b attributed via blame");
+        assert_eq!(attr.spans, vec![span(1, 4)]);
+    }
+
+    #[test]
+    fn the_span_union_is_deduplicated_across_both_channels() {
+        // parents = [A], blame = [A, B] — A is named twice and A's own spans
+        // overlap B's. A: [s1, s2], B: [s2, s3] → [s1, s2, s3], each span once.
         let [a, b, out] = ids();
         let (s1, s2, s3) = (span(0, 1), span(2, 3), span(4, 5));
         let mut upstream = SourceProjection::new();
-        upstream.insert(
-            a,
-            SourceAttribution {
-                spans: vec![s1, s2],
-                rewritten: RewriteTag::direct_image(),
-            },
-        );
-        upstream.insert(
-            b,
-            SourceAttribution {
-                spans: vec![s2, s3],
-                rewritten: RewriteTag::direct_image(),
-            },
-        );
-        // A and B survive (blame ⊥ consumption); the step consumes neither but
-        // carries them, so use a survivor-carry-free shape: consume a separate
-        // transient. Here we consume A and produce `out`, blaming both A and B.
-        let logs = phase(vec![transform(vec![a], vec![out], vec![a, b])]);
-        let (_map, proj, leaks) = collapse(&logs, &set([a, b]), &set([out, b]), &upstream);
-        // B is carried to the output to avoid a Dropped leak; A is consumed.
+        upstream.insert(a, imaged(&[s1, s2]));
+        upstream.insert(b, imaged(&[s2, s3]));
+        let mut table = LineageTable::default();
+        row(&mut table, out, &[a], &[a, b]);
+        // B is carried to the output pane so the fold reports no death for it.
+        let (_map, proj, leaks) = collapse(&table, WINDOW, &set([a, b]), &set([out, b]), &upstream);
         assert_eq!(
-            leaks,
-            vec![],
+            defects(&leaks),
+            Vec::<&Leak>::new(),
             "blame does not affect fate accounting: {leaks:?}"
         );
         let attr = proj.get(&out).expect("out attributed");
         assert_eq!(attr.spans, vec![s1, s2, s3]);
-        let tag = &attr.rewritten;
-        assert_eq!(tag.via, Pass::Inline);
-        assert_eq!(tag.nature, Nature::Expansion);
+        assert_eq!(attr.rewritten.via, Pass::Inline);
+        assert_eq!(attr.rewritten.nature, Nature::Expansion);
+    }
+
+    #[test]
+    fn empty_blame_attributes_through_the_parents() {
+        // The common case: no blame, so the node's spans are its parent's,
+        // re-tagged with the rewrite that produced it.
+        let [a, b] = ids();
+        let mut upstream = SourceProjection::new();
+        upstream.insert(a, imaged(&[span(1, 2)]));
+        let mut table = LineageTable::default();
+        row_tagged(
+            &mut table,
+            b,
+            &[a],
+            &[],
+            RewriteTag {
+                via: TEST_PASS,
+                nature: Nature::Expansion,
+                label: "copy.mirror",
+            },
+        );
+        let (_map, proj, leaks) = collapse(&table, WINDOW, &set([a]), &set([a, b]), &upstream);
+        assert!(leaks.is_empty(), "{leaks:?}");
+        let attr = proj.get(&b).expect("product attributed");
+        assert_eq!(attr.spans, vec![span(1, 2)], "mirrors the parent's spans");
+        assert_eq!(attr.rewritten.via, Pass::Inline);
+        assert_eq!(attr.rewritten.nature, Nature::Expansion);
+        assert_eq!(attr.rewritten.label, "copy.mirror");
+    }
+
+    #[test]
+    fn empty_blame_on_a_fusion_unions_every_parents_spans() {
+        // The many:1 case of the same rule, and the reason it is one rule: a
+        // fusion names no blame, and its product is an image of everything it
+        // was made from — so it resolves to the union, not to nothing.
+        let [a, b, out] = ids();
+        let mut upstream = SourceProjection::new();
+        upstream.insert(a, imaged(&[span(0, 3)]));
+        upstream.insert(b, imaged(&[span(7, 9)]));
+        let table = table_of(&[(out, &[a, b])]);
+        let (_map, proj, leaks) = collapse(&table, WINDOW, &set([a, b]), &set([out]), &upstream);
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        assert_eq!(
+            proj.get(&out).expect("fusion attributed").spans,
+            vec![span(0, 3), span(7, 9)],
+        );
+    }
+
+    #[test]
+    fn parents_and_blame_reach_the_relation_under_different_labels() {
+        // The two channels populated with *distinct* nodes: the product was made
+        // from P and is additionally *about* B. Its spans are both, parentage
+        // first. Both nodes reach the relation, and the labels are what keep the
+        // claims apart — B survives the rewrite, so "the product is related to
+        // B" must not read as "the product descends from B".
+        let [p, b, out] = ids();
+        let (sp, sb) = (span(0, 4), span(9, 12));
+        let mut upstream = SourceProjection::new();
+        upstream.insert(p, imaged(&[sp]));
+        upstream.insert(b, imaged(&[sb]));
+        let mut table = LineageTable::default();
+        row(&mut table, out, &[p], &[b]);
+        let (map, proj, leaks) = collapse(&table, WINDOW, &set([p, b]), &set([b, out]), &upstream);
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        assert_eq!(
+            proj.get(&out).expect("out attributed").spans,
+            vec![sp, sb],
+            "both channels resolve, parentage first",
+        );
+        assert_eq!(
+            labels_of(map.upstream(&out), p),
+            Some(EdgeLabels::DESCENT),
+            "descent-only: the consumed node is an ancestor and nothing else",
+        );
+        assert_eq!(
+            labels_of(map.upstream(&out), b),
+            Some(EdgeLabels::RELATED),
+            "relatedness-only: the blamed node is named, not descended from",
+        );
+        assert_eq!(
+            labels_of(map.downstream(&b), b),
+            Some(EdgeLabels::DESCENT),
+            "and B, surviving, still descends from itself",
+        );
+    }
+
+    #[test]
+    fn one_id_in_both_columns_is_one_edge_carrying_both_labels() {
+        // A rewrite that consumes P *and* names it as blame — the case the
+        // per-pair storage exists for. It is one pair, so it is one edge, and
+        // the edge asserts both relations rather than the fold picking a winner
+        // or the map holding the pair twice.
+        let [p, out] = ids();
+        let mut table = LineageTable::default();
+        row(&mut table, out, &[p], &[p]);
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([p]),
+            &set([out]),
+            &SourceProjection::new(),
+        );
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        assert_eq!(
+            ids_of(map.upstream(&out)),
+            vec![p],
+            "one entry for one pair"
+        );
+        let labels = labels_of(map.upstream(&out), p).expect("the pair is an edge");
+        assert!(labels.descends() && labels.relates(), "{labels:?}");
+    }
+
+    #[test]
+    fn two_paths_to_one_root_union_their_labels() {
+        // The same pair reached twice, once each way: OUT descends from X, which
+        // descends from R, and OUT is separately blamed on R. Both readings are
+        // true of the pair `(R, OUT)`, and the entry carries both — a consumer
+        // pruning relatedness still sees the descent, and one pruning descent
+        // still sees the relatedness.
+        let [r, x, out] = ids();
+        let mut table = LineageTable::default();
+        row(&mut table, x, &[r], &[]);
+        row(&mut table, out, &[x], &[r]);
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([r]),
+            &set([out]),
+            &SourceProjection::new(),
+        );
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        let labels = labels_of(map.upstream(&out), r).expect("the pair is an edge");
+        assert!(labels.descends() && labels.relates(), "{labels:?}");
+    }
+
+    #[test]
+    fn a_mixed_path_is_relatedness_not_descent() {
+        // Weakest link, which is the whole content of the label. OUT descends
+        // from M, and M is *related to* R — so OUT is related to R and does not
+        // descend from it. Reading the closure as unlabelled reachability would
+        // make R an ancestor of OUT while R is still standing in the tree.
+        let [r, m, out] = ids();
+        let mut table = LineageTable::default();
+        row(&mut table, m, &[], &[r]);
+        row(&mut table, out, &[m], &[]);
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([r]),
+            &set([r, out]),
+            &SourceProjection::new(),
+        );
+        assert!(leaks.is_empty(), "{leaks:?}");
+        assert_eq!(
+            labels_of(map.upstream(&out), r),
+            Some(EdgeLabels::RELATED),
+            "one relatedness hop on the path makes the endpoint related",
+        );
+        assert_eq!(
+            labels_of(map.downstream(&r), out),
+            Some(EdgeLabels::RELATED),
+            "and the mirrored direction agrees",
+        );
+    }
+
+    #[test]
+    fn an_all_descent_path_stays_descent_through_a_transient() {
+        // The other half of weakest-link: composing descent with descent is
+        // descent however many transients the path runs through, so the label
+        // is not merely "one hop, unrewritten".
+        let [a, b, c] = ids();
+        let table = table_of(&[(b, &[a]), (c, &[b])]);
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([a]),
+            &set([c]),
+            &SourceProjection::new(),
+        );
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        assert_eq!(labels_of(map.upstream(&c), a), Some(EdgeLabels::DESCENT));
+    }
+
+    #[test]
+    fn a_blamed_id_the_window_never_heard_of_is_not_a_parent_unknown() {
+        // `ParentUnknown` is a claim about the `parents` column: a *descent* hop
+        // that stops at an id describing nothing. Blame points at material the
+        // boundary need not hold, so an unknown blamed id contributes no edge and
+        // no leak — the same silence `attribute` keeps for a blamed id with no
+        // known spans.
+        let [a, unknown, b] = ids();
+        let mut table = LineageTable::default();
+        row(&mut table, b, &[a], &[unknown]);
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([a]),
+            &set([b]),
+            &SourceProjection::new(),
+        );
+        assert_eq!(
+            defects(&leaks),
+            Vec::<&Leak>::new(),
+            "an unknown blamed id is not a defect: {leaks:?}"
+        );
+        assert_eq!(
+            ids_of(map.upstream(&b)),
+            vec![a],
+            "and it contributes no edge"
+        );
     }
 
     #[test]
     fn machinery_empty_blame_is_present_with_empty_spans() {
         // The "known node, no source anchor" case: present in the projection
-        // with spans: [], distinct from a node absent from the projection.
+        // with spans: [], distinct from a node absent from the projection. Its
+        // ancestor has no spans either, so there is nothing to inherit.
         let [a, b] = ids();
-        let logs = vec![(
-            Pass::Inline,
-            vec![RewriteStep {
-                op: Op::Transform {
-                    consumed: vec![a],
-                    produced: vec![b],
-                },
-                blame: vec![],
+        let mut table = LineageTable::default();
+        row_tagged(
+            &mut table,
+            b,
+            &[a],
+            &[],
+            RewriteTag {
+                via: TEST_PASS,
                 nature: Nature::Machinery,
                 label: "machinery.plumbing",
-            }],
-        )];
-        let (_map, proj, leaks) = collapse(&logs, &set([a]), &set([b]), &SourceProjection::new());
-        assert!(leaks.is_empty(), "{leaks:?}");
+            },
+        );
+        let (_map, proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([a]),
+            &set([b]),
+            &SourceProjection::new(),
+        );
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
         let attr = proj.get(&b).expect("b present in projection");
         assert!(attr.spans.is_empty(), "known node, no source anchor");
-        let tag = &attr.rewritten;
-        assert_eq!(tag.nature, Nature::Machinery);
+        assert_eq!(attr.rewritten.nature, Nature::Machinery);
     }
 
     #[test]
@@ -1688,7 +2675,8 @@ mod tests {
         // no projection entry at all — distinct from present-but-empty spans.
         let [a] = ids();
         let (_map, proj, leaks) = collapse(
-            &phase(vec![]),
+            &LineageTable::default(),
+            WINDOW,
             &set([a]),
             &set([a]),
             &SourceProjection::new(),
@@ -1700,68 +2688,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn copy_empty_blame_mirrors_origin_retagged() {
-        // Copy with empty blame mirrors the origin's spans, re-tagged with the
-        // copy's {via, nature, label}.
-        let [a, b] = ids();
-        let mut upstream = SourceProjection::new();
-        upstream.insert(
-            a,
-            SourceAttribution {
-                spans: vec![span(1, 2)],
-                rewritten: RewriteTag::direct_image(),
-            },
-        );
-        let logs = vec![(
-            Pass::Inline,
-            vec![RewriteStep {
-                op: Op::Copy {
-                    origin: a,
-                    produced: vec![b],
-                },
-                blame: vec![],
-                nature: Nature::Expansion,
-                label: "copy.mirror",
-            }],
-        )];
-        let (_map, proj, leaks) = collapse(&logs, &set([a]), &set([a, b]), &upstream);
-        assert!(leaks.is_empty(), "{leaks:?}");
-        let attr = proj.get(&b).expect("copy attributed");
-        assert_eq!(attr.spans, vec![span(1, 2)], "mirrors origin spans");
-        let tag = &attr.rewritten;
-        assert_eq!(tag.via, Pass::Inline);
-        assert_eq!(tag.nature, Nature::Expansion);
-        assert_eq!(tag.label, "copy.mirror");
-    }
-
     // ---- the lowering fold (collapse_lowering) -----------------------------
 
     fn leaf(id: NodeId, sp: Span, nature: Nature, label: RewriteLabel) -> LoweringStep {
-        LoweringStep {
-            op: Op::Transform {
-                consumed: Vec::new(),
-                produced: vec![id],
-            },
-            anchor: vec![sp],
+        LoweringStep::Leaf {
+            id,
+            anchor: sp,
             nature,
             label,
         }
     }
 
     fn lowering_copy(origin: NodeId, produced: Vec<NodeId>) -> LoweringStep {
-        LoweringStep {
-            op: Op::Copy { origin, produced },
-            anchor: Vec::new(),
-            nature: Nature::Source,
-            label: "lower.copy",
-        }
+        LoweringStep::Copy { origin, produced }
     }
 
     #[test]
-    fn lowering_pure_insertion_leaf_is_attributed_from_its_anchor() {
-        // A leaf mint: no input pane, empty roots, attribution straight from the
-        // literal anchor span with the direct-image tag.
+    fn lowering_leaf_is_attributed_from_its_anchor() {
+        // A leaf mint: no input pane, no lineage ancestor, attribution straight
+        // from the literal anchor span with the direct-image tag.
         let [a] = ids();
         let log = vec![leaf(a, span(2, 7), Nature::Source, "lower.image")];
         let (proj, leaks) = collapse_lowering(&log, &set([a]));
@@ -1800,9 +2745,9 @@ mod tests {
     fn lowering_born_copied_discarded_template_composes_away() {
         // The uncurry shape: a template proj node is minted (leaf, Machinery),
         // copied into an occurrence's interior, and never itself placed in the
-        // output tree. It is live at the end but neither placed nor an output id,
-        // so it composes away with NO leak (there is no Dropped class in
-        // lowering, and Unexplained checks outputs only).
+        // output tree. It is live at the end but not an output id, so it
+        // composes away with NO leak (there is no Died class in lowering, and
+        // Unexplained checks outputs only).
         let [template, occ_interior] = ids();
         let log = vec![
             leaf(
@@ -1844,11 +2789,23 @@ mod tests {
     }
 
     #[test]
-    fn lowering_substituted_root_inherits_its_occurrences_leaf_attribution() {
-        // A substituted root carries the occurrence's own id, so the log holds no
-        // step for it — just the occurrence's leaf entry — while its interior
-        // children are copies of the replacement template. The root keeps its own
-        // (Source) attribution; the interior mirrors the template (Machinery).
+    fn lowering_parent_unknown_fires_on_a_copy_of_an_unrecorded_origin() {
+        let [never, copy] = ids();
+        let log = vec![lowering_copy(never, vec![copy])];
+        let (_proj, leaks) = collapse_lowering(&log, &set([copy]));
+        assert!(
+            leaks.contains(&Leak::ParentUnknown { parent: never }),
+            "{leaks:?}"
+        );
+    }
+
+    #[test]
+    fn lowering_root_carry_preserve_inherits_its_leaf_attribution() {
+        // Root-carry: the substituted compound root carries the
+        // occurrence's own id (a preserve). In the log that is just the
+        // occurrence's leaf entry — no copy for the root — and its interior
+        // children are copies of the template. The root keeps its own (Source)
+        // attribution; the interior mirrors the template (Machinery).
         let [occurrence, tmpl_child, occ_child] = ids();
         let log = vec![
             // The param-use occurrence, imaged Source at its mint.
@@ -1881,11 +2838,12 @@ mod tests {
     }
 
     #[test]
-    fn lowering_reimage_last_tag_wins_without_produced_live_leak() {
+    fn lowering_reimage_last_tag_wins() {
         // `lower_expr` re-tags an arm's already-tagged root as the construct's
-        // direct image: two leaf steps for one id. The lowering fold treats the
-        // re-image as last-tag-wins (no ProducedLive leak); the later Source tag
-        // wins over the earlier machinery one.
+        // direct image: two leaf records for one id. Lowering has no
+        // one-record-per-id rule (the fold is sequential and its log genuinely
+        // is chronology), so the later Source tag wins over the earlier
+        // machinery one, with no leak.
         let [id] = ids();
         let log = vec![
             leaf(id, span(0, 5), Nature::Machinery, "lower.compare_chain"),
@@ -1902,176 +2860,286 @@ mod tests {
 
     // ---- the recorder ------------------------------------------------------
     //
-    // These exercise the hooks through *real* `Expr` construction (`Expr::lit`,
-    // `Expr::tuple`) and the freshening `Clone`, not hand-built steps, so the hook
-    // wiring in `expr.rs` is under test too.
+    // These exercise the construction hooks through *real* `Expr` construction
+    // (`Expr::new`/`Expr::lit`/`Expr::tuple` + a freshening `Clone`), not
+    // hand-written rows, so the hook wiring in `expr.rs` is under test too.
 
-    use crate::ccl::Lit;
     use crate::ccl::expr::Expr;
+    use crate::ccl::{Lit, TypedExprNode};
+
+    /// Run `f` with a table installed and `TEST_PASS` ambient, and return the
+    /// rows it recorded — the two things a pass boundary sets up.
+    fn recorded(f: impl FnOnce()) -> LineageTable {
+        let table = TableSession::install();
+        {
+            let _scope = PassScope::enter(TEST_PASS);
+            f();
+        }
+        table.into_table()
+    }
+
+    /// The predicate sweep must not overwrite attribution a node already has.
+    ///
+    /// This is the one property of `lowering_predicate_leaf` that **no leak class
+    /// can see**: the fold is last-write-wins, so a node re-recorded by the sweep
+    /// is still perfectly *explained* — it has just silently swapped its real
+    /// span and label for the sweep's coarse ones. Measured on the pipeline
+    /// corpus, a blanket sweep clobbers 318 nodes and every gate stays green.
+    #[test]
+    fn the_predicate_sweep_skips_already_recorded_nodes() {
+        let [recorded_id, fresh] = ids::<2>();
+        let session = LoweringSession::install();
+        lowering_leaf(recorded_id, span(10, 20), Nature::Source, "lower.precise");
+        lowering_predicate_leaf(recorded_id, span(0, 99), Nature::Machinery, "lower.sweep");
+        lowering_predicate_leaf(fresh, span(0, 99), Nature::Machinery, "lower.sweep");
+        let log = session.into_log();
+
+        assert_eq!(log.len(), 2, "the already-recorded node is not re-recorded");
+        let leaf = |want: NodeId| {
+            log.iter()
+                .find_map(|s| match s {
+                    LoweringStep::Leaf {
+                        id, anchor, label, ..
+                    } if *id == want => Some((*anchor, *label)),
+                    _ => None,
+                })
+                .expect("a leaf for this id")
+        };
+        assert_eq!(
+            leaf(recorded_id),
+            (span(10, 20), "lower.precise"),
+            "the lowered node keeps its own span and label",
+        );
+        assert_eq!(
+            leaf(fresh),
+            (span(0, 99), "lower.sweep"),
+            "the assembly node is explained by the sweep",
+        );
+    }
+
+    /// A second sweep over the same predicate adds nothing — the skip is keyed on
+    /// the id, so overlapping predicates (one term riding several type slots)
+    /// cannot double-record.
+    #[test]
+    fn the_predicate_sweep_is_idempotent() {
+        let [n] = ids::<1>();
+        let session = LoweringSession::install();
+        lowering_predicate_leaf(n, span(1, 2), Nature::Machinery, "lower.sweep");
+        lowering_predicate_leaf(n, span(3, 4), Nature::Machinery, "lower.sweep");
+        let log = session.into_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "one entry per node however many sweeps reach it"
+        );
+        assert!(matches!(&log[0], LoweringStep::Leaf { anchor, .. } if *anchor == span(1, 2)));
+    }
 
     #[test]
-    fn transform_step_captures_births_as_produced() {
-        let session = RecorderSession::new();
-        let consumed = NodeId::fresh();
-        let (a, b);
-        {
-            let _g = step("rw.build", vec![consumed], vec![], Nature::Expansion);
+    fn a_bracket_rows_every_birth_on_its_slot() {
+        let slot = NodeId::fresh();
+        let (mut a, mut b) = (NodeId::PLACEHOLDER, NodeId::PLACEHOLDER);
+        let table = recorded(|| {
+            let _g = enter(slot, "rw.build", Nature::Expansion);
             a = Expr::lit(Lit::Int(1)).node_id();
             b = Expr::lit(Lit::Int(2)).node_id();
-        }
-        let log = session.into_log();
-        assert_eq!(log.len(), 1);
+        });
         assert_eq!(
-            log[0].op,
-            Op::Transform {
-                consumed: vec![consumed],
-                produced: vec![a, b],
-            },
-            "produced = exactly the ids built in the step's extent, in order",
+            table.parents(a),
+            &[slot],
+            "a birth is parented on the node the bracket named",
         );
+        assert_eq!(table.parents(b), &[slot]);
+        assert_eq!(
+            table.rule(a),
+            Some(RewriteTag {
+                via: TEST_PASS,
+                nature: Nature::Expansion,
+                label: "rw.build",
+            }),
+            "the row's `via` is the ambient pass — the one part of the tag no \
+             bracket site knows",
+        );
+        assert_eq!(table.rule(a), table.rule(b));
+        assert!(
+            !table.contains(slot),
+            "the bracketed slot is read, not produced: it gets no row of its own",
+        );
+        assert_eq!(table.len(), 2, "one row per produced id");
         assert_eq!(step_stack_depth(), 0, "guard popped its frame");
     }
 
     #[test]
-    fn nested_steps_capture_births_in_the_innermost_frame_only() {
-        let session = RecorderSession::new();
-        let (outer_c, inner_c) = (NodeId::fresh(), NodeId::fresh());
-        let (outer_pre, inner_id, outer_post);
-        {
-            let _outer = step("rw.outer", vec![outer_c], vec![], Nature::Expansion);
+    fn nested_brackets_attribute_each_mint_to_its_innermost_slot() {
+        // Bracket granularity is precision: a mint attributes to the innermost
+        // open bracket. Coarser bracketing is not *wrong*, it is less precise —
+        // the mint attaches to whatever enclosing node was named.
+        let (outer_slot, inner_slot) = (NodeId::fresh(), NodeId::fresh());
+        let (mut outer_pre, mut inner_id, mut outer_post) = (
+            NodeId::PLACEHOLDER,
+            NodeId::PLACEHOLDER,
+            NodeId::PLACEHOLDER,
+        );
+        let table = recorded(|| {
+            let _outer = enter(outer_slot, "rw.outer", Nature::Expansion);
             outer_pre = Expr::lit(Lit::Int(0)).node_id();
             {
-                let _inner = step("rw.inner", vec![inner_c], vec![], Nature::Expansion);
+                let _inner = enter(inner_slot, "rw.inner", Nature::Expansion);
                 inner_id = Expr::lit(Lit::Int(1)).node_id();
             }
             outer_post = Expr::lit(Lit::Int(2)).node_id();
-        }
-        let log = session.into_log();
-        // Inner flushes on its (earlier) drop, then outer.
-        assert_eq!(log.len(), 2);
+        });
+        assert_eq!(table.parents(inner_id), &[inner_slot]);
+        assert_eq!(table.parents(outer_pre), &[outer_slot]);
         assert_eq!(
-            log[0].op,
-            Op::Transform {
-                consumed: vec![inner_c],
-                produced: vec![inner_id],
-            },
-            "inner step owns only the birth in its extent",
+            table.parents(outer_post),
+            &[outer_slot],
+            "the outer bracket owns the births outside the inner extent, and only those",
         );
-        assert_eq!(
-            log[1].op,
-            Op::Transform {
-                consumed: vec![outer_c],
-                produced: vec![outer_pre, outer_post],
-            },
-            "outer step owns the births outside the inner extent, not the inner birth",
-        );
+        assert_eq!(table.rule(inner_id).map(|t| t.label), Some("rw.inner"));
+        assert_eq!(table.rule(outer_pre).map(|t| t.label), Some("rw.outer"));
     }
 
     #[test]
-    fn deep_freshen_in_a_step_yields_per_origin_copies() {
-        // Build a 3-node tree (tuple + two lits) OUTSIDE any step, then clone it
+    fn a_deep_freshen_rows_each_node_on_its_own_origin() {
+        // Build a 3-node tree (tuple + two lits) OUTSIDE any frame, then clone it
         // inside a copy-only frame — one that consumes nothing and mints nothing
         // of its own, so its whole output is the freshen pairs `Clone` reports
         // through the `on_copy` hook.
         let source = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
-        // The source's node ids are the origins each per-node `Copy` should record.
+        // The source's node ids are the origins each per-node row should name.
         let old_ids: HashSet<NodeId> = std::iter::once(source.node_id())
             .chain(source.child_exprs().iter().map(|c| c.node_id()))
             .collect();
 
-        let session = RecorderSession::new();
-        let clone = {
+        let mut clone = Expr::lit(Lit::Int(0));
+        let table = recorded(|| {
             let _g = copy_frame("dup");
-            source.clone()
-        };
-        let log = session.into_log();
+            clone = source.clone();
+        });
 
-        // The clone is a distinct 3-node tree sharing no id with its source.
         let fresh_ids: HashSet<NodeId> = std::iter::once(clone.node_id())
             .chain(clone.child_exprs().iter().map(|c| c.node_id()))
             .collect();
-        assert_eq!(fresh_ids.len(), 3);
+        assert_eq!(fresh_ids.len(), 3, "the clone is a distinct 3-node tree");
         assert!(
             fresh_ids.is_disjoint(&old_ids),
-            "a clone shares no id with its source"
+            "a clone shares no id with its source",
         );
-
-        // Three nodes freshened: three per-origin Copy steps, one produced each,
-        // one Copy per pre-freshen origin id.
-        assert_eq!(log.len(), 3, "one Copy step per freshened origin");
-        let mut copied_origins = HashSet::new();
-        for s in &log {
-            match &s.op {
-                Op::Copy { origin, produced } => {
-                    assert_eq!(produced.len(), 1, "one produced entry per freshened node");
-                    copied_origins.insert(*origin);
-                }
-                other => panic!("expected only Copy steps, got {other:?}"),
-            }
+        assert_eq!(table.len(), 3, "one row per cloned node");
+        let mut origins: HashSet<NodeId> = HashSet::new();
+        for id in fresh_ids {
+            let parents = table.parents(id);
+            assert_eq!(parents.len(), 1, "a copy has exactly its origin as parent");
+            origins.insert(parents[0]);
         }
         assert_eq!(
-            copied_origins, old_ids,
-            "every freshened node recorded a per-origin copy",
+            origins, old_ids,
+            "every cloned node rows on the node it was duplicated from",
         );
     }
 
     #[test]
-    fn transform_frame_capturing_only_freshens_emits_no_empty_transform() {
-        // A Transform frame opened purely to capture a deep freshen (no consumed
-        // ids, no births) emits only its per-origin Copy steps — never an empty
-        // `Transform { consumed: [], produced: [] }`.
+    fn a_bracket_that_only_clones_records_nothing_of_its_own() {
+        // A bracket whose rewrite turns out to be a pure duplication (nothing
+        // minted by hand, nothing fused) writes only the rows the clone reported,
+        // none of them naming its slot.
         let source = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
-
-        let session = RecorderSession::new();
+        // The bracketed slot is the node being rewritten, not the tree being
+        // duplicated — the two are distinct at every real site.
+        let slot = NodeId::fresh();
+        let mut clone = Expr::lit(Lit::Int(0));
+        let table = recorded(|| {
+            let _g = enter(slot, "wrap.freshen", Nature::Machinery);
+            clone = source.clone();
+        });
+        assert_eq!(table.len(), 3, "only the three cloned nodes");
+        for id in
+            std::iter::once(clone.node_id()).chain(clone.child_exprs().iter().map(|c| c.node_id()))
         {
-            let _g = step("wrap.freshen", vec![], vec![], Nature::Machinery);
-            let _clone = source.clone();
+            assert_ne!(
+                table.parents(id),
+                &[slot],
+                "each row names the cloned node's own origin, not the frame's slot",
+            );
         }
-        let log = session.into_log();
-        assert_eq!(log.len(), 3, "only the three per-origin Copy steps");
+    }
+
+    #[test]
+    fn a_captured_freshen_rows_on_its_own_origin() {
+        // Most production in `channelize`/`transact_phase` is a `clone`, not
+        // an `Expr::new`. Those fire `on_copy`, whose origin is the *copied* node,
+        // not the bracketed slot — so the copy channel stays independent of the
+        // bracket's own parentage rather than being folded into it.
+        let tree = Expr::tuple(vec![Expr::lit(Lit::Int(1))]);
+        let slot = NodeId::fresh();
+        let mut copy_root = NodeId::PLACEHOLDER;
+        let table = recorded(|| {
+            let _g = enter(slot, "rw.duplicate", Nature::Machinery);
+            copy_root = tree.clone().node_id();
+        });
+        assert_eq!(table.parents(copy_root), &[tree.node_id()]);
         assert!(
-            log.iter().all(|s| matches!(s.op, Op::Copy { .. })),
-            "no empty Transform emitted: {log:?}",
+            table.blame(copy_root).is_empty(),
+            "a copy mirrors its origin rather than re-attributing",
         );
     }
 
     #[test]
-    fn no_step_open_records_nothing() {
-        let session = RecorderSession::new();
-        // Construction and cloning with an empty stack capture nowhere.
-        let _e = Expr::lit(Lit::Int(1));
-        let x = Expr::lit(Lit::Int(2));
-        let _copy = x.clone();
-        let log = session.into_log();
-        assert!(log.is_empty(), "empty stack ⇒ nothing recorded: {log:?}");
+    fn no_frame_open_records_nothing() {
+        let table = recorded(|| {
+            // Construction and cloning with an empty stack capture nowhere.
+            let _e = Expr::lit(Lit::Int(1));
+            let x = Expr::lit(Lit::Int(2));
+            let _copy = x.clone();
+        });
+        assert_eq!(table.len(), 0, "empty stack ⇒ nothing recorded");
     }
 
     #[test]
-    fn no_session_installed_makes_the_flush_a_silent_no_op() {
-        // A step open with no ACTIVE_LOG: births still capture into the frame,
-        // but the guard's flush finds no log and does nothing (no panic).
+    fn no_pass_scope_open_makes_the_flush_a_silent_no_op() {
+        // A bracket open with no ambient pass: births still capture into the
+        // frame, but the guard's flush has no tag to complete a row with and
+        // does nothing (no panic).
         assert!(
-            ACTIVE_LOG.with(|s| s.borrow().is_none()),
-            "precondition: no session installed",
+            ACTIVE_PASS.with(|s| s.borrow().is_none()),
+            "precondition: no pass scope open",
         );
+        let table_session = TableSession::install();
         {
-            let _g = step("rw", vec![NodeId::fresh()], vec![], Nature::Expansion);
+            let _g = enter(NodeId::fresh(), "rw", Nature::Expansion);
             let _a = Expr::lit(Lit::Int(1));
         }
         assert_eq!(
             step_stack_depth(),
             0,
-            "guard still pops cleanly with no log"
+            "guard still pops cleanly with no pass scope"
         );
+        assert_eq!(table_session.into_table().len(), 0);
     }
 
     #[test]
-    fn panic_inside_a_step_unwinds_without_poisoning_the_stack() {
+    fn no_table_installed_makes_the_flush_a_silent_no_op() {
+        assert!(
+            ACTIVE_TABLE.with(|s| s.borrow().is_none()),
+            "precondition: no table installed",
+        );
+        let _scope = PassScope::enter(TEST_PASS);
+        let slot = NodeId::fresh();
+        {
+            let _g = enter(slot, "rw.build", Nature::Machinery);
+            let _ = Expr::lit(Lit::Int(1));
+        }
+        assert_eq!(step_stack_depth(), 0, "guard still pops cleanly");
+    }
+
+    #[test]
+    fn panic_inside_a_bracket_unwinds_without_poisoning_the_stack() {
         assert_eq!(step_stack_depth(), 0, "clean precondition");
         let result = std::panic::catch_unwind(|| {
-            let _g = step("boom", vec![NodeId::fresh()], vec![], Nature::Expansion);
+            let _g = enter(NodeId::fresh(), "boom", Nature::Expansion);
             let _a = Expr::lit(Lit::Int(1));
-            panic!("deliberate panic inside an open step");
+            panic!("deliberate panic inside an open bracket");
         });
         assert!(result.is_err(), "the panic propagated");
         assert_eq!(
@@ -2081,115 +3149,154 @@ mod tests {
         );
 
         // Recording still works afterward.
-        let session = RecorderSession::new();
-        let consumed = NodeId::fresh();
-        let a;
-        {
-            let _g = step("rw", vec![consumed], vec![], Nature::Expansion);
+        let slot = NodeId::fresh();
+        let mut a = NodeId::PLACEHOLDER;
+        let table = recorded(|| {
+            let _g = enter(slot, "rw", Nature::Expansion);
             a = Expr::lit(Lit::Int(7)).node_id();
-        }
-        let log = session.into_log();
-        assert_eq!(log.len(), 1);
-        assert_eq!(
-            log[0].op,
-            Op::Transform {
-                consumed: vec![consumed],
-                produced: vec![a],
-            },
-        );
+        });
+        assert_eq!(table.parents(a), &[slot]);
     }
 
     #[test]
     fn default_uses_placeholder_records_nothing_and_two_defaults_share_id() {
-        let session = RecorderSession::new();
-        let d1 = Expr::default();
-        let d2 = Expr::default();
-        // Even inside an open step, a Default throwaway must not be captured.
-        let consumed = NodeId::fresh();
-        {
-            let _g = step("rw", vec![consumed], vec![], Nature::Expansion);
+        let slot = NodeId::fresh();
+        let (mut d1, mut d2) = (NodeId::PLACEHOLDER, NodeId::PLACEHOLDER);
+        let mut kept = NodeId::PLACEHOLDER;
+        let table = recorded(|| {
+            d1 = Expr::default().node_id();
+            d2 = Expr::default().node_id();
+            // Even inside an open bracket, a Default throwaway must not be
+            // captured.
+            let _g = enter(slot, "rw", Nature::Expansion);
             let _d3 = Expr::default();
-        }
-        let log = session.into_log();
+            // A real mint alongside it, so the frame records at all: a bracket
+            // that captures nothing is a preserve and stays silent, which would
+            // make "the Default was not captured" vacuously true.
+            kept = Expr::lit(Lit::Int(3)).node_id();
+        });
 
+        assert_eq!(d1, NodeId::PLACEHOLDER, "Default mints the sentinel");
         assert_eq!(
-            d1.node_id(),
-            NodeId::PLACEHOLDER,
-            "Default mints the sentinel"
-        );
-        assert_eq!(
-            d1.node_id(),
-            d2.node_id(),
+            d1, d2,
             "two Defaults share the placeholder id (they compare equal regardless — \
              node_id is excluded from PartialEq)",
         );
-        assert_eq!(log.len(), 1);
-        match &log[0].op {
-            Op::Transform { produced, .. } => {
-                assert!(
-                    produced.is_empty(),
-                    "the Default was not captured: {produced:?}"
-                )
-            }
-            other => panic!("expected a Transform, got {other:?}"),
-        }
+        assert_eq!(table.len(), 1, "the Default throwaway got no row");
+        assert_eq!(table.parents(kept), &[slot], "the real mint was captured");
     }
 
     #[test]
-    fn end_to_end_session_step_feeds_collapse() {
-        // Ties (a) and (b): record a real rewrite through a session, then fold
-        // the drained log with `collapse` and check the resulting relation.
+    fn a_fused_flush_gives_its_product_every_consumed_id_as_a_parent() {
+        // Fusion (many:1), the sole escape hatch and the only place any id is
+        // named at record time. The product's lineage is the product of every
+        // origin's, which is what the parents column carries.
+        let (slot, fused) = (NodeId::fresh(), NodeId::fresh());
+        let mut product = NodeId::PLACEHOLDER;
+        let table = recorded(|| {
+            let g = enter(slot, "rw.fuse", Nature::Machinery);
+            g.also_consumes(fused);
+            product = Expr::lit(Lit::Int(1)).node_id();
+        });
+        assert_eq!(
+            table.parents(product),
+            &[slot, fused],
+            "a fusion's whole consumed set is the product's parent set",
+        );
+    }
+
+    #[test]
+    fn a_flush_carries_the_blame_channel_into_the_row_unmerged() {
+        let (slot, blamed) = (NodeId::fresh(), NodeId::fresh());
+        let mut product = NodeId::PLACEHOLDER;
+        let table = recorded(|| {
+            let g = enter(slot, "rw.blamed", Nature::Machinery);
+            g.blame(&[blamed]);
+            product = Expr::lit(Lit::Int(1)).node_id();
+        });
+        assert_eq!(table.parents(product), &[slot], "blame is not a parent");
+        assert_eq!(table.blame(product), &[blamed], "and a parent is not blame");
+    }
+
+    #[test]
+    fn bracket_over_an_untouched_node_records_nothing() {
+        // A rule that inspects and declines. No mint, no copy, id unchanged:
+        // the *preserve*, and it must not cost a row — this is what lets a pass
+        // bracket every rewrite *attempt* rather than every firing.
+        let e = Expr::lit(Lit::Int(1));
+        let table = recorded(|| {
+            let _g = enter(e.node_id(), "rw.noop", Nature::Machinery);
+        });
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn bracket_over_an_in_place_mutation_records_nothing() {
+        // `simplify`'s `*op = BinOpKind::Concat` shape: the node's *value*
+        // changes, its identity does not. A preserve, and correctly silent —
+        // the node's lineage is the self-edge it already had.
+        let mut e = Expr::lit(Lit::Int(1));
+        let id = e.node_id();
+        let table = recorded(|| {
+            let _g = enter(id, "rw.in_place", Nature::Machinery);
+            e.node = TypedExprNode::Lit(Lit::Int(2));
+        });
+        assert_eq!(e.node_id(), id);
+        assert_eq!(table.len(), 0);
+    }
+
+    // ---- driver capture: a bracket declares nothing ------------------------
+    //
+    // The property under test throughout: a bracket names the node being
+    // rewritten; births are captured; fate is the boundary's live-set
+    // difference. These are the pass/fail statements behind the design.
+
+    #[test]
+    fn end_to_end_bracket_feeds_the_fold() {
+        // Record a real rewrite through a bracket, then fold the rows and check
+        // the resulting relation and attribution.
         let a = Expr::lit(Lit::Int(1));
         let a_id = a.node_id();
-
-        let session = RecorderSession::new();
-        let out_id;
-        {
-            let _g = step("rw.replace", vec![a_id], vec![a_id], Nature::Expansion);
+        let mut out_id = NodeId::PLACEHOLDER;
+        let table = recorded(|| {
+            let _g = enter(a_id, "rw.replace", Nature::Expansion);
             out_id = Expr::lit(Lit::Int(2)).node_id();
-        }
-        let log = session.into_log();
+        });
 
-        let logs = vec![(Pass::Inline, log)];
         let (map, proj, leaks) = collapse(
-            &logs,
+            &table,
+            WINDOW,
             &set([a_id]),
             &set([out_id]),
             &SourceProjection::new(),
         );
-        assert!(leaks.is_empty(), "{leaks:?}");
-        assert_eq!(map.upstream(&out_id), &[a_id]);
-        assert_eq!(map.downstream(&a_id), &[out_id]);
-        // The output attributes to the (blamed) input via this pass.
+        // `a` is replaced, so it dies — reported, not a defect.
+        assert!(defects(&leaks).is_empty(), "{leaks:?}");
+        assert_eq!(ids_of(map.upstream(&out_id)), vec![a_id]);
+        assert_eq!(ids_of(map.downstream(&a_id)), vec![out_id]);
         let attr = proj.get(&out_id).expect("output attributed");
-        let tag = &attr.rewritten;
-        assert_eq!(tag.via, Pass::Inline);
-        assert_eq!(tag.label, "rw.replace");
+        assert_eq!(attr.rewritten.via, Pass::Inline);
+        assert_eq!(attr.rewritten.label, "rw.replace");
     }
 
     #[test]
     fn born_copied_discarded_template_composes_without_leaks() {
         // The `fold_induction_loop`/`build_writer` template shape (transact/letrec
         // instrumentation hazard): a single frame births a template `T`, copies
-        // it per read site (via `Subst::discharge_env_in_place`), and discards
-        // `T` (it never reaches the output tree). Per `OpenStep::flush_into`'s
-        // refinement the frame's `Transform` (which produces `T`) flushes BEFORE
-        // the captured `Copy` steps, so `T` is live when the copies are processed —
-        // the whole shape composes in ONE frame, no split needed. `T` remains live
-        // at collapse (never consumed) but is neither an input-pane nor an
-        // output-pane id, so it triggers no leak (`Dropped` checks inputs only,
-        // `Unexplained` checks outputs only).
-        let origin = NodeId::fresh(); // an input-pane id the template descends from
-        let (t, c1, c2);
-        let session = RecorderSession::new();
-        {
-            let _g = step(
-                "test.template",
-                vec![origin],
-                vec![origin],
-                Nature::Machinery,
-            );
-            // Birth the template inside the frame (a mint captured as `produced`).
+        // it per read site (the read-your-writes environment discharge freshens
+        // a clone's interior at each), and discards `T` (it never reaches the
+        // output tree). `T` is neither an input-pane nor an output-pane id, so
+        // it triggers no leak (`Died` checks inputs only, `Unexplained` checks
+        // outputs only) — the whole shape composes in ONE frame, no split needed.
+        let origin = NodeId::fresh(); // the bracketed slot, an input-pane id
+        let (mut t, mut c1, mut c2) = (
+            NodeId::PLACEHOLDER,
+            NodeId::PLACEHOLDER,
+            NodeId::PLACEHOLDER,
+        );
+        let table = recorded(|| {
+            let _g = enter(origin, "test.template", Nature::Machinery);
+            // Birth the template inside the frame (a mint captured as a birth).
             let template = Expr::lit(Lit::Int(0));
             t = template.node_id();
             // Copy it twice — one freshened clone per read site.
@@ -2197,41 +3304,252 @@ mod tests {
             c1 = r1.node_id();
             let r2 = template.clone();
             c2 = r2.node_id();
-        }
-        let log = session.into_log();
-        // Flush order: the Transform producing T first, then a Copy per origin.
-        assert_eq!(
-            log[0].op,
-            Op::Transform {
-                consumed: vec![origin],
-                produced: vec![t],
-            },
-            "the Transform (producing T) flushes before the captured copies: {log:?}",
-        );
-        assert!(
-            log[1..]
-                .iter()
-                .all(|s| matches!(&s.op, Op::Copy { origin: o, .. } if *o == t)),
-            "the per-origin copies of T flush after it is live: {log:?}",
-        );
+        });
+        assert_eq!(table.parents(t), &[origin]);
+        assert_eq!(table.parents(c1), &[t], "the copies row on the template");
+        assert_eq!(table.parents(c2), &[t]);
 
-        let logs = vec![(Pass::Inline, log)];
+        // The sweep's premise on rows written by the *recorder* rather than by
+        // hand: capture-only births plus one monotone counter means no edge runs
+        // backwards, so no vertex is ever revisited.
+        assert_eq!(
+            sweep_metrics(&table, WINDOW, &set([origin])).backward_edges,
+            0,
+            "a captured record's edges all run from smaller NodeId to larger",
+        );
         let (map, _proj, leaks) = collapse(
-            &logs,
+            &table,
+            WINDOW,
             &set([origin]),
             &set([c1, c2]),
             &SourceProjection::new(),
         );
         assert!(
-            leaks.is_empty(),
-            "born-copied-discarded template composes leak-free in one frame: {leaks:?}",
+            defects(&leaks).is_empty(),
+            "born-copied-discarded template composes defect-free in one frame: {leaks:?}",
         );
-        // c1/c2 carry T's roots — the frame's consumed lineage (`origin`).
-        assert_eq!(map.upstream(&c1), &[origin]);
-        assert_eq!(map.upstream(&c2), &[origin]);
+        // c1/c2 carry T's roots — the frame's parentage (`origin`).
+        assert_eq!(ids_of(map.upstream(&c1)), vec![origin]);
+        assert_eq!(ids_of(map.upstream(&c2)), vec![origin]);
         assert_eq!(
-            sorted(map.downstream(&origin).to_vec()),
+            sorted(ids_of(map.downstream(&origin))),
             sorted(vec![c1, c2])
         );
+    }
+
+    #[test]
+    fn bracketed_wrap_does_not_claim_the_wrapped_node_died() {
+        // The adopt-a-live-subtree shape: mint a wrapper *over* the bracketed
+        // node, which stays in the tree as a child. Both ids are live at the
+        // boundary; the fold must report no death and no leak. A record that
+        // declared the slot consumed would report it dead.
+        let slot = NodeId::fresh();
+        let mut wrapper = NodeId::PLACEHOLDER;
+        let table = recorded(|| {
+            let _g = enter(slot, "rw.wrap", Nature::Machinery);
+            wrapper = Expr::lit(Lit::Int(0)).node_id();
+        });
+        let (map, _proj, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([slot]),
+            &set([slot, wrapper]),
+            &SourceProjection::new(),
+        );
+        assert!(leaks.is_empty(), "{leaks:?}");
+        assert_eq!(ids_of(map.upstream(&wrapper)), vec![slot]);
+        assert_eq!(
+            ids_of(map.upstream(&slot)),
+            vec![slot],
+            "the wrapped node survives"
+        );
+    }
+
+    #[test]
+    fn deaths_are_the_boundary_difference_not_a_declaration() {
+        // The fate-prediction replacement, end to end. One rewrite; whether the
+        // bracketed node survives is decided *only* by which snapshot it is in.
+        // The identical record yields "survived" against one output pane and
+        // "died" against another, and no site said either.
+        let make = || {
+            let slot = NodeId::fresh();
+            let mut born = NodeId::PLACEHOLDER;
+            let table = recorded(|| {
+                let _g = enter(slot, "rw.maybe_drop", Nature::Expansion);
+                born = Expr::lit(Lit::Int(1)).node_id();
+            });
+            (slot, born, table)
+        };
+
+        let (slot, born, table) = make();
+        let (_m, _p, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([slot]),
+            &set([slot, born]),
+            &SourceProjection::new(),
+        );
+        assert!(leaks.is_empty(), "survivor pane: {leaks:?}");
+
+        let (slot, born, table) = make();
+        let (map, _p, leaks) = collapse(
+            &table,
+            WINDOW,
+            &set([slot]),
+            &set([born]),
+            &SourceProjection::new(),
+        );
+        assert_eq!(
+            leaks,
+            vec![Leak::Died { input: slot }],
+            "nothing declares a fate, so `Died` IS the death report",
+        );
+        assert_eq!(
+            ids_of(map.upstream(&born)),
+            vec![slot],
+            "lineage survives the death"
+        );
+    }
+
+    // ---- the node table's columns ------------------------------------------
+
+    fn tag(label: RewriteLabel) -> RewriteTag {
+        RewriteTag {
+            via: TEST_PASS,
+            nature: Nature::Machinery,
+            label,
+        }
+    }
+
+    #[test]
+    fn a_row_round_trips_every_column() {
+        let mut table = LineageTable::default();
+        let [node, parent, blamed] = ids();
+        let rule = table.intern_rule(tag("rw.one"));
+        table.record(node, &[parent], &[blamed], rule);
+
+        assert_eq!(table.parents(node), &[parent]);
+        assert_eq!(table.blame(node), &[blamed]);
+        assert_eq!(table.rule(node), Some(tag("rw.one")));
+        assert!(table.contains(node));
+    }
+
+    #[test]
+    fn a_fusion_row_round_trips_all_its_parents() {
+        // The many:1 shape: one product, every consumed id a parent. Parents are
+        // a set of edges, not a single channel, so none of them may be dropped
+        // or reordered into a "primary".
+        let mut table = LineageTable::default();
+        let [node, p0, p1, p2] = ids();
+        let rule = table.intern_rule(tag("rw.fuse"));
+        table.record(node, &[p0, p1, p2], &[], rule);
+
+        assert_eq!(table.parents(node), &[p0, p1, p2]);
+        assert!(
+            table.blame(node).is_empty(),
+            "no blame is not empty parents"
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_id_reads_empty_rather_than_panicking() {
+        // The predicate-interior case: a real id from the same counter that no
+        // bracket ever produced. Every read must have an answer for it.
+        let mut table = LineageTable::default();
+        let [parent, recorded, never] = ids();
+        let rule = table.intern_rule(tag("rw.one"));
+        table.record(recorded, &[parent], &[], rule);
+
+        assert!(table.parents(never).is_empty());
+        assert!(table.blame(never).is_empty());
+        assert_eq!(table.rule(never), None);
+        assert_eq!(table.rule_in(never, WINDOW), None);
+        assert!(!table.contains(never));
+    }
+
+    #[test]
+    fn a_row_outside_the_window_reads_as_unrecorded_to_that_boundary() {
+        let mut table = LineageTable::default();
+        let [parent, node] = ids();
+        let rule = table.intern_rule(RewriteTag {
+            via: Pass::Mono,
+            ..tag("rw.one")
+        });
+        table.record(node, &[parent], &[], rule);
+
+        assert!(table.rule(node).is_some(), "the row exists");
+        assert_eq!(
+            table.rule_in(node, WINDOW),
+            None,
+            "but not to a boundary whose window excludes its pass",
+        );
+    }
+
+    #[test]
+    fn deaths_never_name_an_id_no_row_recorded() {
+        // The single most important invariant: the death set is
+        // `recorded ∖ live`, taken over rows and never over the key space. The
+        // key space is the global counter, so it addresses ids this compile never
+        // built at all; a difference taken over it would report every one of them
+        // as a death. Predicate interiors used to be the standing example — they
+        // were addressed but unrecorded, and absent from the live set too — and
+        // are no longer, since `collect_tree_ids` enumerates them and the fold
+        // records them. They now cancel from both sides, which is why admitting
+        // them did not move the death counts.
+        let mut table = LineageTable::default();
+        let [parent, survivor, dead, never] = ids();
+        let rule = table.intern_rule(tag("rw.one"));
+        table.record(survivor, &[parent], &[], rule);
+        table.record(dead, &[parent], &[], rule);
+
+        let live: HashSet<NodeId> = set([survivor]);
+        let deaths = table.deaths(&live);
+        assert_eq!(
+            deaths,
+            vec![dead],
+            "only a recorded id absent from the live set is a death",
+        );
+        assert!(
+            !deaths.contains(&never),
+            "an id with no row describes no node that could have died",
+        );
+    }
+
+    #[test]
+    fn equal_tags_share_one_rule_id_and_distinct_tags_do_not() {
+        let mut table = LineageTable::default();
+        let [parent, a, b, c] = ids();
+        let one = table.intern_rule(tag("rw.one"));
+        let one_again = table.intern_rule(tag("rw.one"));
+        let other = table.intern_rule(tag("rw.other"));
+        assert_eq!(one, one_again, "the tag is the interning key, by value");
+        assert_ne!(one, other);
+
+        table.record(a, &[parent], &[], one);
+        table.record(b, &[parent], &[], one_again);
+        table.record(c, &[parent], &[], other);
+        assert_eq!(
+            table.rule_id(a),
+            table.rule_id(b),
+            "two rows naming one rewrite hold one handle",
+        );
+        assert_ne!(table.rule_id(a), table.rule_id(c));
+        assert_eq!(table.rule_count(), 2, "two distinct tags, two entries");
+        assert_eq!(table.rule(c), Some(tag("rw.other")));
+    }
+
+    #[test]
+    fn a_differing_nature_is_a_distinct_rule_despite_a_shared_label() {
+        // The triple is interned whole: one arm of a rewrite relabelled to a
+        // different nature is a different rule, which is exactly why a site that
+        // needs two natures opens a second frame rather than mutating one.
+        let mut table = LineageTable::default();
+        let machinery = table.intern_rule(tag("rw.one"));
+        let expansion = table.intern_rule(RewriteTag {
+            nature: Nature::Expansion,
+            ..tag("rw.one")
+        });
+        assert_ne!(machinery, expansion);
+        assert_eq!(table.rule_count(), 2);
     }
 }

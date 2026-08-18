@@ -116,6 +116,7 @@ use crate::ccl::{
     TypedExpr, TypedExprNode,
     ccl_utils::{count_free, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
+    lineage,
 };
 
 /// `true` when `ty` carries channelization-erasable residue — a `Hole` stamped
@@ -1215,6 +1216,19 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // non-clustered defers (inner `let d = Defer in ...`
             // separated from this cluster by other lets).
             let body_rewritten = desugar(current_body, ctx)?;
+            // The cluster's whole product — each assembled channel, the
+            // `Feed`-kind `LetRec` binding them, and the union machinery
+            // `combine_feed_values` mints — is bracketed on the **outermost**
+            // `let d = Defer` node it replaces. The inner defers of a cluster are
+            // consumed by the same rewrite but are not named: they are absent
+            // from the output tree, so the boundary difference reports them, and
+            // naming them here would be a fate assertion this pass is in no
+            // position to make (a defer whose handle survives in a type is not
+            // dead).
+            //
+            // Opened *after* the body recursion so a nested cluster's products
+            // attach to their own `let`, not to this one.
+            let _g = lineage::enter(node_id, "channelize.cluster", lineage::Nature::Expansion);
             channelize_cluster(&defer_names, &chan_names, body_rewritten, ctx)
         }
         TypedExprNode::Let {
@@ -1237,7 +1251,23 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 // Read before the lift consumes the binding.
                 let (outer, lvl) = handle_chan_dom(&binding.ty)
                     .unwrap_or_else(|| (binding.name.clone(), crate::ccl::ChanLevel(0)));
-                let lift = lift_defer(&binding.name, *bound_expr, &body);
+                // The lift *mints*: `desugar_substitute` replaces the inner
+                // scope's trailing `Var` with the outer body, and any `ExprStmt`
+                // prefix is rebuilt onto the lifted spine. Those products stand in
+                // for this `let`, which the lift consumes, so it is the slot.
+                // `Machinery` — merging two defer scopes is plumbing that undoes an
+                // inlining artifact, not anything the user wrote.
+                //
+                // The recursion below runs outside the frame, so a nested lift
+                // attributes to its own `let`.
+                let lift = {
+                    let _g = lineage::enter(
+                        node_id,
+                        "channelize.defer_lift",
+                        lineage::Nature::Machinery,
+                    );
+                    lift_defer(&binding.name, *bound_expr, &body)
+                };
                 // The lift renames the inner defer binder to the outer name,
                 // but *consumer types outside the lifted subtree* may carry
                 // the inner handle's rigid `ChanDom`. Record the alias so the
@@ -1273,6 +1303,15 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 && is_defer_returning(inner_body, &inner_binding.name)
                 && contains_defer(inner_be)
             {
+                // This arm rebuilds: it copies the inner scope out of the
+                // borrowed tree and splices the outer body into its tail, so the
+                // collapsed `let` and both copies are new nodes standing in for
+                // this `let`. Same slot and same reason as the lift above.
+                let _g = lineage::enter(
+                    node_id,
+                    "channelize.defer_collapse",
+                    lineage::Nature::Machinery,
+                );
                 let inner_name = inner_binding.name.clone();
                 let inner_be = (**inner_be).clone();
                 let inner_body = (**inner_body).clone();
@@ -1296,6 +1335,7 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                         .push((inner_key, Type::ChanDom(outer, lvl)));
                 }
                 let collapsed = Expr::let_bind(binding.name.clone(), inner_be, renamed);
+                drop(_g);
                 return desugar(collapsed, ctx);
             }
             // Recurse first so any inner aliases / UDF-inlines get
@@ -2148,12 +2188,19 @@ fn extract_for_defer_impl(
                         // stamp the wrap at construction —
                         // the let's type is its body's, closed over the binder
                         // (the design §6.2 discharge) — there is no
-                        // re-derivation pass to fill a `Hole` in. (The discharge
-                        // clone here only feeds `apply_type`; its nodes land in
-                        // the type/predicate domain, so it is left un-freshened.)
-                        let let_ty =
-                            crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone())
-                                .apply_type(&original.ty);
+                        // re-derivation pass to fill a `Hole` in. The discharge
+                        // payload only feeds `apply_type`, so it is a *template*
+                        // rather than a tree node — it keeps its ids, and the
+                        // sibling is minted at the read inside `apply_type`.
+                        let let_ty = crate::ccl::subst::Subst::discharge(
+                            &binding.name,
+                            bound_expr.clone_preserving_ids(),
+                        )
+                        .apply_type(&original.ty);
+                        // The `Let` this walk is rebuilding keeps the original
+                        // `bound_expr` in the body, and each extracted feed that
+                        // captures the binder gets its own re-binding of the same
+                        // definition, so every wrap is a copy.
                         *feed = Expr::let_bind(binding.name.clone(), bound_expr.clone(), original)
                             .with_ty(let_ty);
                     }

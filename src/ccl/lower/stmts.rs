@@ -1924,7 +1924,7 @@ x";
     #[test]
     fn lowering_tags_nodes_with_source_spans() {
         use crate::ccl::TypedExprNode;
-        use crate::ccl::lineage::{Nature, RecorderSession, collapse_lowering};
+        use crate::ccl::lineage::{LoweringSession, Nature, collapse_lowering};
         use crate::ccl::provenance::NodeId;
         use crate::chl_parser::ast::Span;
         use std::collections::HashSet;
@@ -1941,11 +1941,11 @@ x";
         // Install the always-on lowering session, lower, then fold the log into
         // the lowering projection — the same handoff `compile_program` runs.
         let mut ctx = LoweringContext::default();
-        let session = RecorderSession::lowering();
+        let session = LoweringSession::install();
         let lowered = lower_stmts(&stmts, &mut ctx)
             .into_result()
             .expect("lowering succeeds");
-        let log = session.into_lowering_log();
+        let log = session.into_log();
         let mut output_ids: HashSet<NodeId> = HashSet::new();
         fn ids(e: &Expr, acc: &mut HashSet<NodeId>) {
             acc.insert(e.node_id());

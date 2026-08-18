@@ -940,7 +940,17 @@ impl TypedExpr {
     ///
     /// In no shape are the source and the copy both reachable from one tree, so
     /// nothing ever observes two live nodes at one identity. A template is not a
-    /// tree node; a throwaway sits outside the tree the pipeline goes on rewriting.
+    /// tree node; a snapshot sits outside the tree the pipeline goes on rewriting;
+    /// a rollback copy replaces what it copied.
+    ///
+    /// # What this is not for
+    ///
+    /// Not for silencing a `Leak::Unexplained` or `Leak::ParentUnknown`. Those
+    /// mean a copy was made with no step open, or against an origin the log never
+    /// recorded — a recording gap. Freshening everywhere and recording it costs no
+    /// compile time and no meaningful memory (the naive arm ran faster than
+    /// baseline at 2-3x the ids), so the fix is to record at the copy site. See
+    /// the vault's `freshening-clone-report`.
     pub(crate) fn clone_preserving_ids(&self) -> Self {
         let _preserving = crate::ccl::lineage::preserve_ids();
         self.clone()

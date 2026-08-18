@@ -467,10 +467,10 @@ fn fan_out_element_case(
                 ),
                 Expr::lambda(iter_var, Type::Hole, gate),
             );
-            // `gate_on_source` rides the cast target's refinement predicate, so
-            // its interior is in the domain the fold must explain and nothing in
-            // the main-tree walk reaches it. Sweep it
-            // (`src/ccl/design/provenance.md`, "Walking the ids").
+            // `gate_on_source` rides the cast target's refinement predicate — a
+            // type slot outside the `walk_children` walk — so nothing else will
+            // record its interior, and `collect_tree_ids` now enumerates it.
+            // Sweep it (`design/provenance.md`, "Walking the ids", crossing 1).
             ctx.tag_predicate(&gate_on_source, span, "lower.comp_arm_gate_pred");
             let target = refined_data_fun(Type::Hole, gate_on_source, Type::Hole);
             ctx.tag_machinery(make_cast(elem_map, target), span, ec)

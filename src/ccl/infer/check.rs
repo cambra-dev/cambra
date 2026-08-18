@@ -238,8 +238,10 @@ impl Typing for CheckCtx {
         // predicates — then return the (owned) body type unchanged rather than
         // cloning `bound_expr` for a no-op discharge.
         if crate::ccl::subst::type_free_vars(&body_ty).contains(name) {
-            // A discharge template is not a tree node: it is cloned again at
-            // every read, and that read is where the sibling is minted.
+            // A type-level discharge. The template keeps its ids because a
+            // template is not a tree node — it is cloned again at every read, and
+            // that read is where the sibling is minted. (Not because predicates
+            // are out of the id domain; they are in it.)
             crate::ccl::subst::Subst::discharge(name, bound_expr.clone_preserving_ids())
                 .apply_type(&body_ty)
         } else {

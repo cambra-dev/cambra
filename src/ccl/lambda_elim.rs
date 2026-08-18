@@ -1122,8 +1122,8 @@ fn elim_lambda_impl(
             // to the bound expression (design §6.2 move-site rule) — the same
             // substitution inference's let-closing and `emit_let` apply, so
             // the post-elim check's reconstruction reconciles structurally.
-            let let_ty =
-                crate::ccl::subst::Subst::discharge(&v, new_def.clone()).apply_type(&result_ty);
+            let let_ty = crate::ccl::subst::Subst::discharge(&v, new_def.clone_preserving_ids())
+                .apply_type(&result_ty);
             Ok(Expr::let_bind(v, new_def, new_body).with_ty(let_ty))
         }
 

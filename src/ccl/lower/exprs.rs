@@ -623,13 +623,13 @@ mod tests {
     #[test]
     fn chained_compare_freshens_shared_operands() {
         use crate::ccl::context::{assert_unique_node_ids, collect_tree_ids};
-        use crate::ccl::lineage::{RecorderSession, collapse_lowering};
+        use crate::ccl::lineage::{LoweringSession, collapse_lowering};
 
         let expr = parse_expr("1 < x < 3");
         let mut ctx = LoweringContext::default();
-        let session = RecorderSession::lowering();
+        let session = LoweringSession::install();
         let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
-        let log = session.into_lowering_log();
+        let log = session.into_log();
 
         // The same tripwire the pipeline runs at every pass boundary — this test
         // is the crafted program for the class it guards.
