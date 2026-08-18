@@ -170,7 +170,7 @@ pub enum ScopedItem<'a> {
     VarRef(&'a Name),
     /// A variable-key *label* occurrence — a [`Transact`](TypedExprNode::Transact)
     /// key or writer footprint entry. Not a variable use: it names a field of
-    /// the mutable variable record the node denotes, so free-variable analyses skip it
+    /// the history record the node denotes, so free-variable analyses skip it
     /// while a consumer that cares about every name a node mentions folds it in.
     KeyRef(&'a Name),
 }

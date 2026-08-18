@@ -1024,7 +1024,7 @@ fn await_final_bound_then_read_in_a_feed_loop_stays_final() {
 
 /// Bound to a name and used downstream: the await need not be the program's tail.
 /// The letrec splice moves above the `let` that reads the history binding, which is
-/// what keeps `reg_pool` in scope there.
+/// what keeps `hist_pool` in scope there.
 #[test]
 fn await_final_bound_then_computed_with() {
     check_tile(
@@ -1274,8 +1274,8 @@ fn await_final_of_an_induction_accumulator_rejected() {
 /// The shape a single program-wide store made impossible: `b`'s seed names `a`'s
 /// completion, so with one store `b`'s tick-0 value would await the store `b` itself
 /// writes. No block mentions `a` and `b` together, so they partition into two stores
-/// and the dependency is an ordinary one-way edge between two letrecs — `reg_a` bound
-/// outside, `reg_b`'s seed reading it. `a` reaches 1 + 1 = 2, seeding `b`, which
+/// and the dependency is an ordinary one-way edge between two letrecs — `hist_a` bound
+/// outside, `hist_b`'s seed reading it. `a` reaches 1 + 1 = 2, seeding `b`, which
 /// reaches 3.
 #[test]
 fn a_mut_var_seeded_from_another_store_s_final_value() {
@@ -1538,7 +1538,7 @@ fn registers_written_in_one_block_share_a_store() {
 
 /// **Snapshot consistency** holds a store together too, and writes alone do not show it:
 /// nothing writes both mutable variables, but one block reads both, latching them at a
-/// single frontier, so they must come from one mutable variable record. The writers are
+/// single frontier, so they must come from one history record. The writers are
 /// exactly those of `unrelated_mut_vars_get_separate_stores` — only this read is added.
 ///
 /// The read stays a `with begin():` block because it *is* the subject; what is dropped is

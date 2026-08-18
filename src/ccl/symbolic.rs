@@ -451,7 +451,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // `transact (k = init, …) { [reads]⇒[writes] over <source> do <body>;
         // … }` — the shared keys with their seeds, then one writer clause per
         // concurrent writer. Reads of a key are the record projection
-        // `__reg.k` elsewhere in the tree, not shown here.
+        // `__hist.k` elsewhere in the tree, not shown here.
         TypedExprNode::Transact { keys, writers, .. } => {
             let key_strs: Vec<_> = keys
                 .iter()

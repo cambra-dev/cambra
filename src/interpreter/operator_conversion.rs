@@ -106,8 +106,8 @@ pub fn convert_record_fields_to_operators(
             bound_expr,
             body,
         } => {
-            // `let __reg = Transact{…}`: build the shared store and register it
-            // (the reads `__reg.k` in the fields project off it), the same as
+            // `let __hist = Transact{…}`: build the shared store and register it
+            // (the reads `__hist.k` in the fields project off it), the same as
             // the `convert_impl` `Let` arm. Multi-sink programs (a trailing
             // `Record`) reach the store binding through here.
             if let TypedExprNode::Transact {
@@ -246,7 +246,7 @@ struct KeyReadInfo {
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
     value_extent: Extent,
-    /// The key's position in the writer's `writes` tuple: `__reg.k` projects
+    /// The key's position in the writer's `writes` tuple: `__hist.k` projects
     /// `.writes.(index)` off the store body stream (`Induction` stores).
     index: usize,
     /// Whether the key's value carries forward across commit ticks that don't
@@ -256,8 +256,8 @@ struct KeyReadInfo {
     carry_forward: bool,
 }
 
-/// A built transactional store, registered under its `__reg` binder so each
-/// per-variable read (`__reg.k`) can branch the shared fan and project key
+/// A built transactional store, registered under its `__hist` binder so each
+/// per-variable read (`__hist.k`) can branch the shared fan and project key
 /// `k`. The scalar-read reduction (`final_or_default` → `ExtractFinal`) is
 /// expressed in the CCL, not here.
 struct StoreReadInfo {
@@ -287,9 +287,9 @@ pub struct OpConversionContext {
     scopes: ScopeStack<Name, (Rc<FanOut>, BindingKind)>,
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
-    /// Transactional stores in scope, keyed by their `__reg` binder. A
-    /// `let __reg = Transact{…}` builds the shared store once and mutable variables
-    /// it here; each variable read `__reg.k` projects key `k` off the shared
+    /// Transactional stores in scope, keyed by their `__hist` binder. A
+    /// `let __hist = Transact{…}` builds the shared store once and mutable variables
+    /// it here; each variable read `__hist.k` projects key `k` off the shared
     /// store fan (see [`StoreReadInfo`]). Names are α-unique, so a flat
     /// (unscoped) map suffices.
     transactional_stores: HashMap<Name, StoreReadInfo>,
@@ -377,12 +377,12 @@ impl OpConversionContext {
         self.scopes.lookup(name)
     }
 
-    /// Register a built transactional store under its `__reg` binder.
+    /// Register a built transactional store under its `__hist` binder.
     fn register_store(&mut self, name: Name, info: StoreReadInfo) {
         self.transactional_stores.insert(name, info);
     }
 
-    /// Look up a transactional store by its `__reg` binder.
+    /// Look up a transactional store by its `__hist` binder.
     fn lookup_store(&self, name: &Name) -> Option<&StoreReadInfo> {
         self.transactional_stores.get(name)
     }
@@ -501,8 +501,8 @@ fn convert_impl_inner(
             panic!("Expected no lambdas, got {}", symbolic(expr));
         }
 
-        // `__reg.k` — a read of variable `k` off a transactional store. The
-        // shared store fan was built at `let __reg = Transact{…}`; this
+        // `__hist.k` — a read of variable `k` off a transactional store. The
+        // shared store fan was built at `let __hist = Transact{…}`; this
         // branches it and projects key `k`'s carry-forward stream. A store read
         // is a leaf source (no upstream input).
         TypedExprNode::Apply { argument, function }
@@ -520,10 +520,10 @@ fn convert_impl_inner(
         }
 
         // A bare `Transact` never reaches here: `plan_loops` always binds it as
-        // `let __reg = Transact{…}`, which the `Let` arm intercepts (building
+        // `let __hist = Transact{…}`, which the `Let` arm intercepts (building
         // the shared store and registering it) before compiling `bound_expr`.
         TypedExprNode::Transact { .. } => Err(ConversionError::Unsupported(
-            "Transact must be bound by a `let __reg = …` (recognition invariant), \
+            "Transact must be bound by a `let __hist = …` (recognition invariant), \
              never compiled as a bare value"
                 .into(),
         )),
@@ -546,9 +546,9 @@ fn convert_impl_inner(
             bound_expr,
             body,
         } => {
-            // `let __reg = Transact{…} in body`: build the shared store once
-            // and register it under `__reg`; the variable reads (`__reg.k`)
-            // in `body` project keys off it. `__reg` is never a plain `Var`
+            // `let __hist = Transact{…} in body`: build the shared store once
+            // and register it under `__hist`; the variable reads (`__hist.k`)
+            // in `body` project keys off it. `__hist` is never a plain `Var`
             // use, so it needs no scope binding.
             if let TypedExprNode::Transact {
                 keys,
@@ -639,7 +639,7 @@ fn convert_impl_inner(
                     // arms, function upstream produces function arms.  `fan_in`
                     // picks the matching combinator.
                     //
-                    // A **store-read arm** (`__reg.k`) is a *leaf* source over
+                    // A **store-read arm** (`__hist.k`) is a *leaf* source over
                     // its own domain (empty input), not an iteration-driven
                     // morphism — it must not take the fanned input (it would
                     // reject it). This is the cross-domain co-iteration shape: a
@@ -775,8 +775,8 @@ fn convert_impl_inner(
         // `transact_phase::rewrite_as_of_reads`. `AsOf` folds the raw `Tile::Store`
         // fan directly (via `store_current`), so no `StoreValueStream`
         // intermediary. Two source shapes:
-        //   - `__reg.k` (a bare mutable variable read) → a scalar `AsOf` sampling key `k`;
-        //   - `__reg` (the whole store) → a snapshot `AsOf` sampling every field
+        //   - `__hist.k` (a bare mutable variable read) → a scalar `AsOf` sampling key `k`;
+        //   - `__hist` (the whole store) → a snapshot `AsOf` sampling every field
         //     of the reply's record type at one commit frontier (§I-c), which the
         //     reply then projects.
         TypedExprNode::Apply { argument, function }
@@ -796,7 +796,7 @@ fn convert_impl_inner(
                 )));
             };
             let trigger_op = convert_impl(trigger, None, ctx)?;
-            // A whole-store source (`Var(__reg)`) → snapshot read: the as_of's
+            // A whole-store source (`Var(__hist)`) → snapshot read: the as_of's
             // output codomain is the record of sampled fields.
             if let TypedExprNode::Var(store_name) = &source.node
                 && ctx.lookup_store(store_name).is_some()
@@ -1435,9 +1435,9 @@ fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, ConversionError> {
     Ok(Box::new(Constant::new(value, extent)))
 }
 
-/// Build the operator graph for a `let __reg = Transact{…}` and return the
-/// [`StoreReadInfo`] registered under the `__reg` binder so each per-variable
-/// read `__reg.k` ([`convert_store_read`]) branches the fan and projects it.
+/// Build the operator graph for a `let __hist = Transact{…}` and return the
+/// [`StoreReadInfo`] registered under the `__hist` binder so each per-variable
+/// read `__hist.k` ([`convert_store_read`]) branches the fan and projects it.
 ///
 /// Op-conversion dispatches on the store's sequencing `domain`: a concrete
 /// iteration extent → the position-driven [`InductionStore`] changelog (an
@@ -1704,7 +1704,7 @@ fn build_induction_store(
 /// `(prev…, item)` input. Mirrors [`build_commit_store`]'s writer setup, but
 /// driven by iteration position — one writer, no conflict, no retry. Reads
 /// register as [`StoreReadKind::InductionChangelog`]:
-/// each `__reg.k` folds the changelog densely over the loop extent via
+/// each `__hist.k` folds the changelog densely over the loop extent via
 /// [`StoreDenseRead`], serving both a scalar-final read (`ExtractFinal` over it)
 /// and a co-iterated read (the dense `Fun(D, V)` itself).
 fn build_induction_store_single(
@@ -1813,7 +1813,7 @@ fn build_induction_store_single(
     let set_body = store.body_input_setter();
     // Cyclic: the driver reads this store's changelog back to recover each
     // position's previous accumulator, so one fan branch feeds the cycle and the
-    // rest serve the downstream `__reg.k` dense reads.
+    // rest serve the downstream `__hist.k` dense reads.
     let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
     let driver = InductionDriver::new(
         fan.branch(),
@@ -1831,7 +1831,7 @@ fn build_induction_store_single(
     })
 }
 
-/// Resolve an `as_of` read's `source` — a bare mutable variable read `__reg.k`
+/// Resolve an `as_of` read's `source` — a bare mutable variable read `__hist.k`
 /// off a registered commit store — to the raw store fan branch, its runtime key,
 /// and the key's value extent. `AsOf` folds the [`Tile::Store`] fan directly (via
 /// `store_current`), so the as-of path takes the fan + key rather than
@@ -1842,7 +1842,7 @@ fn as_of_store_source(
 ) -> Result<(Box<dyn TileOperator>, Value, Extent), ConversionError> {
     let bad = || {
         ConversionError::Unsupported(format!(
-            "as_of source must be a bare store mutable variable read `__reg.k`, got {:?}",
+            "as_of source must be a bare store mutable variable read `__hist.k`, got {:?}",
             source.node
         ))
     };
@@ -1907,7 +1907,7 @@ fn as_of_snapshot_fields(
         .collect()
 }
 
-/// The `(store, field)` of a `__reg.field` read on a registered store, if `e` is one.
+/// The `(store, field)` of a `__hist.field` read on a registered store, if `e` is one.
 /// The same shape the generic `Apply`/`Proj` arm matches, factored out so the
 /// `FinalRead` arm can recognise its own operand.
 fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, String)> {
@@ -1955,7 +1955,7 @@ fn convert_store_final_read(
     )))
 }
 
-/// Compile a per-variable read `__reg.field` off a registered transactional
+/// Compile a per-variable read `__hist.field` off a registered transactional
 /// store. `plan_loops` wraps a scalar accumulator read in `final_or_default(stream,
 /// init)`, so the current/final value (via [`ExtractFinal`]) is selected
 /// downstream, not here. A surface `await_final` is not this read — it is
@@ -2345,7 +2345,7 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
 // `scalar_tile_to_column_value` later in the pipeline.  Filtering here
 // keeps that caller from ever seeing a function-typed argument.
 /// Whether a `zip` arm is a **leaf source** over its own domain — a store read
-/// `__reg.k` or an `as_of((trigger, store))` read — rather than an
+/// `__hist.k` or an `as_of((trigger, store))` read — rather than an
 /// iteration-driven morphism. Such an arm is converted with *no* input (it would
 /// reject the fanned iteration input); `fan_in` co-aligns it with the
 /// input-driven arms by domain position. This is the cross-domain co-iteration
@@ -2353,7 +2353,7 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
 /// combining the request with a store read (`zip((trigger, as_of(store)))`).
 fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
     match &expr.node {
-        // `__reg.k` — a store read.
+        // `__hist.k` — a store read.
         TypedExprNode::Apply { argument, function }
             if matches!(&function.node, TypedExprNode::Proj(ProjKey::Field(_))) =>
         {

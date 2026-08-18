@@ -160,7 +160,7 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         }
         // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
         // iteration site (op-conversion compiles it with `input=None`), so wrap
-        // it; the `source` is a mutable variable read (`__reg.k`), not an iteration source,
+        // it; the `source` is a mutable variable read (`__hist.k`), not an iteration source,
         // and is left alone. A `Var` trigger is already iterate-wrapped at its
         // let-site, so `wrap_with_iterate`'s `is_iteration_bearing` check makes
         // this a no-op there; a raw `[unit]` singleton (the standalone terminal
