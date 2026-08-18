@@ -117,6 +117,11 @@ pub enum Token {
     /// Two chars, so maximal munch takes it over `-` then `>`.
     #[token("->")]
     Arrow,
+    /// Function-type arrow `=>`, the return-type annotation separator on a `def`
+    /// (`docs/chl-spec.md`, "4.1 `def` — function definition"). Two chars, so
+    /// maximal munch takes it over `=` then `>`.
+    #[token("=>")]
+    DoubleArrow,
     #[token("*=")]
     StarEq,
     #[token("//=")]
@@ -245,6 +250,7 @@ impl fmt::Display for Token {
             Token::PlusEq => "+=",
             Token::MinusEq => "-=",
             Token::Arrow => "->",
+            Token::DoubleArrow => "=>",
             Token::StarEq => "*=",
             Token::DoubleSlashEq => "//=",
             Token::DoubleSlash => "//",

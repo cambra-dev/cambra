@@ -507,7 +507,7 @@ pub(super) fn lower_middle_stmt(
             value,
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
-            if mut_annotation_parts(&annotation.ty).is_some() {
+            if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                 // `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut`
                 // annotation with the *immutable* `=` operator. This is
                 // contradictory under the cutover: `=` is a plain immutable
@@ -525,7 +525,7 @@ pub(super) fn lower_middle_stmt(
                     ),
                 ));
             }
-            let annotation_ty = lower_type_annotation(annotation)?;
+            let annotation_ty = lower_type_annotation(annotation, ctx)?;
             let val = lower_expr(value, ctx)?;
             Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),
@@ -592,7 +592,7 @@ pub(super) fn lower_middle_stmt(
             // is a `Mut(…)` (`check_mut_decl_annotation`).
             let (value_ty, is_txn) = match annotation {
                 None => (Type::Hole, false),
-                Some(ann) => check_mut_decl_annotation(&name, ann, stmt.span)?,
+                Some(ann) => check_mut_decl_annotation(&name, ann, stmt.span, ctx)?,
             };
             // Stamp the binding `Mut(V, D)` (so inference binds `x` at `Mut` and
             // its references deref to `V`). `D = Txn` for a transactional mutable variable
@@ -641,9 +641,10 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::FunctionDef {
             name,
             params,
+            output,
             body: fn_body,
         } => {
-            let func_expr = lower_function_body(stmt.span, params, fn_body, ctx)?;
+            let func_expr = lower_function_body(stmt.span, params, output.as_ref(), fn_body, ctx)?;
             Ok(ctx.tag_image(
                 Expr::let_bind(name.as_str().to_string(), func_expr, body),
                 stmt.span,
@@ -869,8 +870,9 @@ pub(super) fn check_mut_decl_annotation(
     name: &str,
     ann: &TypeAnnotation,
     span: Span,
+    ctx: &mut LoweringContext,
 ) -> Result<(Type, bool), LoweringError> {
-    let parts = mut_annotation_parts(&ann.ty).transpose()?;
+    let parts = mut_annotation_parts(&ann.ty, ctx).transpose()?;
     if let (AnnotationMode::Exact, Some(parts)) = (ann.mode, parts.clone()) {
         return Ok(parts);
     }
@@ -878,7 +880,7 @@ pub(super) fn check_mut_decl_annotation(
     // here so an annotation that is not a type at all reports *that* instead.
     let (value, is_txn, is_mut) = match parts {
         Some((value, is_txn)) => (value, is_txn, true),
-        None => (lower_type_expr(&ann.ty)?, false, false),
+        None => (lower_type_expr(&ann.ty, ctx)?, false, false),
     };
     let op = match ann.mode {
         AnnotationMode::Exact => ":",
@@ -929,6 +931,7 @@ impl std::fmt::Display for MutForm<'_> {
 /// slot is a lowering error. Returns `None` for a non-`Mut` annotation.
 pub(super) fn mut_annotation_parts(
     annotation: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
 ) -> Option<Result<(Type, bool), LoweringError>> {
     // `Mut(…)` is type application — a call with a bare-name head (application
     // is parenthesised at both levels; see `lower_type_annotation`).
@@ -942,9 +945,9 @@ pub(super) fn mut_annotation_parts(
         return None;
     }
     match args.as_slice() {
-        [value] => Some(lower_type_expr(value).map(|t| (t, false))),
+        [value] => Some(lower_type_expr(value, ctx).map(|t| (t, false))),
         [value, domain] => {
-            let value_ty = match lower_type_expr(value) {
+            let value_ty = match lower_type_expr(value, ctx) {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e)),
             };
@@ -1002,7 +1005,10 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                 // A malformed `Mut(…)` annotation (`Err`) surfaces its real error
                 // when the `MutAssign` itself is lowered; not registering it here
                 // is harmless.
-                if matches!(mut_annotation_parts(&annotation.ty), Some(Ok((_, true)))) {
+                if matches!(
+                    mut_annotation_parts(&annotation.ty, ctx),
+                    Some(Ok((_, true)))
+                ) {
                     ctx.register_transactional(id.as_str());
                 }
             }
@@ -1014,9 +1020,11 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
             // name in the block wins (a non-`Mut` redefinition clears an earlier
             // `Mut` one, so its calls lower tupled).
             ChlStmt::FunctionDef { name, params, .. } => {
-                let has_mut_param = params
-                    .iter()
-                    .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation));
+                let has_mut_param = params.iter().any(|p| {
+                    p.annotation
+                        .as_ref()
+                        .is_some_and(|a| is_mut_annotation(a, ctx))
+                });
                 if has_mut_param {
                     ctx.register_mut_param_fn(name.as_str());
                 } else {
@@ -1035,8 +1043,8 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
 /// rejected where the parameter is lowered
 /// (`lower::functions::mut_param_history_type`) — registering it either way is
 /// harmless, since the rejection is what the program sees.
-fn is_mut_annotation(annotation: &TypeAnnotation) -> bool {
-    mut_annotation_parts(&annotation.ty).is_some()
+fn is_mut_annotation(annotation: &TypeAnnotation, ctx: &mut LoweringContext) -> bool {
+    mut_annotation_parts(&annotation.ty, ctx).is_some()
 }
 
 /// Lower a binder's type annotation, applying its [`AnnotationMode`].
@@ -1047,8 +1055,11 @@ fn is_mut_annotation(annotation: &TypeAnnotation) -> bool {
 /// where a binder is introduced, so nested positions inside `T` are always exact
 /// and [`lower_type_expr`] needs no mode parameter. (Design:
 /// `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".)
-pub(super) fn lower_type_annotation(annotation: &TypeAnnotation) -> Result<Type, LoweringError> {
-    let ty = lower_type_expr(&annotation.ty)?;
+pub(super) fn lower_type_annotation(
+    annotation: &TypeAnnotation,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    let ty = lower_type_expr(&annotation.ty, ctx)?;
     Ok(match annotation.mode {
         AnnotationMode::Exact => ty,
         AnnotationMode::Bounded => Type::BoundedHole(Box::new(ty)),
@@ -1073,7 +1084,10 @@ pub(super) fn lower_type_annotation(annotation: &TypeAnnotation) -> Result<Type,
 /// - A variant type `` {`a | `b{Int}} `` — the same brace group, told apart from
 ///   a tuple type by its arms' backticks.
 /// - The empty group `{}` — the unit type, `Unit`.
-pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
+pub(super) fn lower_type_expr(
+    annotation: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
     match &annotation.node {
         // A primitive (`Int`) or the wildcard `_`. A lone name is never a variant:
         // a tag is written with its backtick wherever it appears.
@@ -1084,7 +1098,7 @@ pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, Low
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
         ChlExpr::Call { func, args } => {
-            lower_type_application(annotation.span, type_ctor_head(func)?, args)
+            lower_type_application(annotation.span, type_ctor_head(func)?, args, ctx)
         }
         // Record type `{name: T, …}`.
         ChlExpr::BraceRecord(fields) => {
@@ -1092,7 +1106,7 @@ pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, Low
             for field in fields {
                 out.push((
                     field.name.as_str().to_string(),
-                    lower_type_expr(&field.value)?,
+                    lower_type_expr(&field.value, ctx)?,
                 ));
             }
             Ok(Type::Record(out))
@@ -1112,20 +1126,36 @@ pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, Low
         // `BinOp` nodes. The readings never collide: in *type* position there is
         // no boolean to disjoin, and the arms are backticked.
         ChlExpr::BraceGroup(parts) => match parts.as_slice() {
-            [only] if only.node.is_variant_arms() => lower_variant_type(only),
+            [only] if only.node.is_variant_arms() => lower_variant_type(only, ctx),
             // Arms are `|`-separated; a comma would make this a tuple *of*
             // variant types, which is a different type and almost never meant.
             _ if parts.iter().any(|p| p.node.is_variant_arms()) => Err(LoweringError::unsupported(
                 annotation.span,
                 "a variant type separates its arms with `|`: `` {`a | `b{Int}} ``",
             )),
-            _ => Ok(Type::Tuple(
-                parts
-                    .iter()
-                    .map(lower_type_expr)
-                    .collect::<Result<_, _>>()?,
-            )),
+            _ => {
+                let mut out = Vec::with_capacity(parts.len());
+                for part in parts {
+                    out.push(lower_type_expr(part, ctx)?);
+                }
+                Ok(Type::Tuple(out))
+            }
         },
+        // Refinement type `{T where p}` (`docs/chl-spec.md`, "6.4 Refinement
+        // syntax"): the base type refined by a `Bool` predicate over the
+        // anonymous subject `_`. The subject lowers to the reserved binder
+        // `__elem` (`REFINEMENT_BINDER`), so the stored predicate is a bare
+        // `Bool` term with `__elem` free — the same shape a singleton or a
+        // `groupby` refinement carries. Discharge of the predicate is the
+        // solver's structural refinement subsumption; this only builds the type.
+        ChlExpr::BraceRefinement { base, predicate } => {
+            let base_ty = lower_type_expr(base, ctx)?;
+            let pred = lower_refinement_predicate(predicate, ctx)?;
+            Ok(Type::Refinement(
+                Box::new(base_ty),
+                crate::ccl::Refinement::born(Rc::new(pred)),
+            ))
+        }
         // A variant type is delimited, so its arms are never bare: without the
         // braces there is nothing to say where the `|`-chain ends. A `|` in type
         // position has no other reading — CHL has no union *of types* — so the
@@ -1160,9 +1190,12 @@ pub(super) fn lower_type_expr(annotation: &Spanned<ChlExpr>) -> Result<Type, Low
 /// hand-written `` `some{T} | `none `` would be a distinct type from `Option(T)`
 /// that merely happens to carry the same arms, and an annotation written in the
 /// other order would not compare equal to what inference produced.
-fn lower_variant_type(ann: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
+fn lower_variant_type(
+    ann: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
     let mut arms: Vec<(FieldKey, Type)> = Vec::new();
-    collect_variant_arms(ann, &mut arms)?;
+    collect_variant_arms(ann, &mut arms, ctx)?;
     arms.sort_by(|(a, _), (b, _)| a.cmp(b));
     if let Some(dup) = arms.windows(2).find(|w| w[0].0 == w[1].0) {
         return Err(LoweringError::unsupported(
@@ -1180,6 +1213,7 @@ fn lower_variant_type(ann: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
 fn collect_variant_arms(
     ann: &Spanned<ChlExpr>,
     arms: &mut Vec<(FieldKey, Type)>,
+    ctx: &mut LoweringContext,
 ) -> Result<(), LoweringError> {
     match &ann.node {
         ChlExpr::BinOp {
@@ -1187,8 +1221,8 @@ fn collect_variant_arms(
             op: ChlBinOp::LogicalOr,
             right,
         } => {
-            collect_variant_arms(left, arms)?;
-            collect_variant_arms(right, arms)
+            collect_variant_arms(left, arms, ctx)?;
+            collect_variant_arms(right, arms, ctx)
         }
         ChlExpr::VariantCtor { tag, payload, .. } => {
             let payload = match payload {
@@ -1199,7 +1233,7 @@ fn collect_variant_arms(
                 // already resolved the elision and this is an ordinary type
                 // expression — `Int` from `` `a{Int} ``, the one-tuple `{Int,}`
                 // from `` `a{Int,} ``.
-                Some(ChlVariantPayload::Fields(ty)) => lower_type_expr(ty)?,
+                Some(ChlVariantPayload::Fields(ty)) => lower_type_expr(ty, ctx)?,
                 // Parens carry a *value*; an arm in a type names the type its
                 // tag stores.
                 Some(ChlVariantPayload::Term(_)) => {
@@ -1256,11 +1290,32 @@ fn type_ctor_head(head: &Spanned<ChlExpr>) -> Result<&str, LoweringError> {
     }
 }
 
+/// Lower the predicate of a refinement type `{T where p}`.
+///
+/// The predicate is an ordinary CHL `Bool` expression whose anonymous subject
+/// `_` denotes the value being refined. Lowering runs with
+/// [`LoweringContext::in_refinement_predicate`] set (save/restore, so a nested
+/// annotation cannot inherit it) so that a bare `_` resolves to the reserved
+/// refinement binder `__elem` rather than a variable named `_`. The result is a
+/// bare boolean [`Expr`] in which `__elem` is free — exactly the shape
+/// [`crate::ccl::Refinement`] stores.
+fn lower_refinement_predicate(
+    predicate: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let saved = ctx.in_refinement_predicate;
+    ctx.in_refinement_predicate = true;
+    let result = lower_expr(predicate, ctx);
+    ctx.in_refinement_predicate = saved;
+    result
+}
+
 /// Lower a type constructor `head` applied to `args`.
 fn lower_type_application(
     span: Span,
     head: &str,
     args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
     match head {
         // A list type is a mapping `index-range ⤇ element`; the length
@@ -1279,7 +1334,7 @@ fn lower_type_application(
                 name: None,
                 kind: crate::ccl::ty::FunKind::Data,
                 domain: Box::new(Type::Hole),
-                codomain: Box::new(lower_type_expr(elem)?),
+                codomain: Box::new(lower_type_expr(elem, ctx)?),
             })
         }
         // `Option(T)` abbreviates the two-tag variant `{some: T, none: Unit}` —
@@ -1292,7 +1347,7 @@ fn lower_type_application(
                     "`Option` takes one type argument: `Option(T)`",
                 ));
             };
-            Ok(Type::option_of(lower_type_expr(payload)?))
+            Ok(Type::option_of(lower_type_expr(payload, ctx)?))
         }
         // `Mut(…)` in a nested position is handled by `mut_annotation_parts`
         // before this function is reached; seeing it here means a `Mut` inside
@@ -1814,6 +1869,50 @@ x";
             message.contains("(name=value)"),
             "expected a paren-record hint, got: {message}"
         );
+    }
+
+    /// A refinement type annotation `{T where p}` lowers to a
+    /// [`Type::Refinement`], and — the rule that distinguishes it from an
+    /// ordinary predicate — the anonymous subject `_` in `p` lowers to the
+    /// reserved refinement binder `__elem` (`REFINEMENT_BINDER`), *not* a
+    /// variable named `_`. That resolution is what the
+    /// `in_refinement_predicate` flag buys: `_` denotes "the value being
+    /// refined" only inside a predicate.
+    ///
+    /// `symbolic` renders only a binding's inferred `ty`, and the annotation
+    /// rides `user_annotation` (still `Hole`-typed pre-inference), so the test
+    /// reads the annotation back off the `Let` and renders *its* type — one
+    /// string that surfaces the base, the predicate, and the resolved subject.
+    #[rstest]
+    // Flat refinement: the predicate's `_` becomes `__elem`.
+    #[case("x: {Int where _ != 0} = 5\nx", "{Int | __elem != 0}")]
+    // Nested refinement: both levels' `_` resolve to `__elem`, and the
+    // save/restore of `in_refinement_predicate` around the inner annotation
+    // keeps the flag from leaking — the outer `_` still lowers to `__elem`
+    // after the inner predicate closes.
+    #[case(
+        "x: { {Int where _ != 1} where _ != 0} = 5\nx",
+        "{{Int | __elem != 1} | __elem != 0}"
+    )]
+    fn test_lower_refinement_annotation(#[case] code: &str, #[case] expected_ty: &str) {
+        use crate::ccl::{Type, TypedExprNode};
+
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
+        let TypedExprNode::Let { binding, .. } = &ccl.node else {
+            panic!("expected a top-level Let, got {:?}", ccl.node);
+        };
+        let ann = binding
+            .user_annotation
+            .as_ref()
+            .expect("an annotated assignment must carry a user annotation");
+        assert!(
+            matches!(ann, Type::Refinement(..)),
+            "expected a Type::Refinement, got {ann:?}"
+        );
+        assert_eq!(format!("{ann}"), expected_ty);
     }
 
     // -----------------------------------------------------------------------

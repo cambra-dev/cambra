@@ -12,6 +12,10 @@ use crate::{
     chl_parser::ast::{AnnotationMode, Param, Span, Spanned},
 };
 
+/// The binder a `=> T` output annotation introduces to check the body's result.
+/// Reserved (double-underscore) so it cannot collide with a user name.
+const OUTPUT_BINDER: &str = "__output";
+
 /// If `param` is annotated `Mut(…)` (a pass-by-reference mutable-variable parameter),
 /// return its mutable type `Mut(V, D)` and whether it is **transactional**
 /// (`Mut(V, Txn)`). Returns `None` for any non-`Mut` annotation (or an
@@ -25,9 +29,12 @@ use crate::{
 /// induction accumulator and a mutable variable. The transactional flag *is* returned
 /// so the body's `with begin():` writes register as transactional at lowering
 /// time (the block-classification decision runs before inference).
-fn mut_param_history_type(param: &Param) -> Option<Result<(Type, bool), LoweringError>> {
+fn mut_param_history_type(
+    param: &Param,
+    ctx: &mut LoweringContext,
+) -> Option<Result<(Type, bool), LoweringError>> {
     let annotation = param.annotation.as_ref()?;
-    match mut_annotation_parts(&annotation.ty) {
+    match mut_annotation_parts(&annotation.ty, ctx) {
         // A `Mut(…)` annotation is exact wherever it is written, for the reason it is
         // exact at a `:=` introduction: [`Type::History`] is invariant in both
         // payloads, so `<: Mut(V)` admits exactly `Mut(V, D)` and says nothing `:`
@@ -124,7 +131,7 @@ pub(super) fn uncurry_params(
         // one of the two binders that may hold a mutable variable, and nothing asks an
         // annotation about it. Non-`Mut` params stay `Hole` (inferred), as before.
         // Multi-arg pass-by-ref lands with transactions.
-        let param_ty = match mut_param_history_type(&params[0]) {
+        let param_ty = match mut_param_history_type(&params[0], ctx) {
             Some(Ok((mut_ty, _is_txn))) => mut_ty,
             _ => Type::Hole,
         };
@@ -134,7 +141,7 @@ pub(super) fn uncurry_params(
             // `emit_lambda` binds at `user_annotation.or(param.ty)`, so restating it
             // as an annotation would be the same type twice.
             if let Some(ann) = &params[0].annotation
-                && mut_param_history_type(&params[0]).is_none()
+                && mut_param_history_type(&params[0], ctx).is_none()
             {
                 // Any *other* annotation (`int`, `List[T]`, …) is a
                 // **checking-mode** declaration: attach it so `emit_lambda` binds
@@ -142,7 +149,7 @@ pub(super) fn uncurry_params(
                 // rejected at the call site. Without this the annotation was
                 // silently dropped and the param inferred purely from its body (so
                 // `def g(a: int)` with an identity body accepted any argument).
-                param.declare(lower_type_annotation(ann)?);
+                param.declare(lower_type_annotation(ann, ctx)?);
             }
         }
         return Ok(lam);
@@ -155,9 +162,12 @@ pub(super) fn uncurry_params(
     // functions are always inlined (a `Mut`-param function must reach its call
     // sites), so the curried chain never survives to `lambda_elim`. Call sites
     // apply curried to match (see `lower_call`, keyed on `mut_param_fns`).
-    if params.iter().any(|p| mut_param_history_type(p).is_some()) {
+    if params
+        .iter()
+        .any(|p| mut_param_history_type(p, ctx).is_some())
+    {
         return Ok(params.iter().rev().fold(body_expr, |acc, param| {
-            let param_ty = match mut_param_history_type(param) {
+            let param_ty = match mut_param_history_type(param, ctx) {
                 Some(Ok((mut_ty, _is_txn))) => mut_ty,
                 _ => Type::Hole,
             };
@@ -205,13 +215,13 @@ pub(super) fn uncurry_params(
     // single-parameter case: each annotated position is enforced at the call site,
     // unannotated positions ride `Hole` (inferred). Skip if no parameter is
     // annotated. (This arm has no `Mut` params — those are curried above.)
-    let elem_anns: Vec<Type> = params
-        .iter()
-        .map(|p| match &p.annotation {
-            Some(ann) => lower_type_annotation(ann),
-            None => Ok(Type::Hole),
-        })
-        .collect::<Result<_, _>>()?;
+    let mut elem_anns: Vec<Type> = Vec::with_capacity(params.len());
+    for p in params {
+        elem_anns.push(match &p.annotation {
+            Some(ann) => lower_type_annotation(ann, ctx)?,
+            None => Type::Hole,
+        });
+    }
     let mut lam = Expr::lambda(&tuple_name, Type::Hole, body_with_subs);
     if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
         && let TypedExprNode::Lambda { param, .. } = &mut lam.node
@@ -300,6 +310,7 @@ fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr
 pub(super) fn lower_function_body(
     fn_span: Span,
     params: &[Param],
+    output: Option<&Spanned<ChlExpr>>,
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
@@ -323,7 +334,7 @@ pub(super) fn lower_function_body(
     let snapshot = ctx.snapshot_transactional();
     let mut mut_param_names: HashSet<String> = HashSet::new();
     for param in params {
-        if let Some(res) = mut_param_history_type(param) {
+        if let Some(res) = mut_param_history_type(param, ctx) {
             let (_, is_txn) = match res {
                 Ok(v) => v,
                 Err(e) => {
@@ -360,10 +371,26 @@ pub(super) fn lower_function_body(
     // pre-uniquify name a sibling function could reuse.
     ctx.restore_transactional(snapshot);
 
+    // A `=> T` output annotation checks the body's result against `T`. Wrap the
+    // body in an annotated let *inside* the lambda, so the annotation's predicate
+    // sees the parameters in scope — a refinement `{Int where _ >= a}` refers to
+    // parameter `a`. In the multi-arg case `uncurry_params` rewrites those
+    // parameter references (in the term *and* in this annotation's type slot) to
+    // tuple projections along with the rest of the body.
+    let mut body_expr = body_result?;
+    if let Some(output) = output {
+        let output_ty = lower_type_expr(output, ctx)?;
+        let ret = ctx.tag_image(Expr::var(OUTPUT_BINDER), output.span);
+        body_expr = ctx.tag_image(
+            Expr::let_bind_annotated(OUTPUT_BINDER, body_expr, ret, output_ty),
+            output.span,
+        );
+    }
+
     // Tag the function's lambda wrapper with the `def` span. (The synthetic
     // tuple-arg lambda for the multi-param case is the user's function node,
     // so the def span is the right blame here.)
-    let func = uncurry_params(params, body_result?, fn_span, ctx)?;
+    let func = uncurry_params(params, body_expr, fn_span, ctx)?;
     Ok(ctx.tag_image(func, fn_span))
 }
 

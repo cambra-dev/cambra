@@ -87,27 +87,29 @@
 //! - Version dispatch across a branch point — no isolating program yet
 //!   (deferred with the still-open versioning surface).
 //!
-//! The variant tags lex and parse now (`docs/chl-spec.md`, "3.15 Variant
-//! constructors"), so what each file pins is the blocker that was behind them,
-//! and neither is about variants:
+//! The variant tags and the refinement braces parse now (`docs/chl-spec.md`,
+//! "3.15 Variant constructors" and "6.4 Refinement syntax"), so what each file
+//! pins is the blocker behind them:
 //!
-//! - **v0 — refinement syntax is unparsed.**  `Qty = {Int where _ >= 0}` uses the
-//!   refinement separator, which is lexed as a reserved word but has no parse rule
-//!   yet (`docs/chl-spec.md`, "6.4 Refinement syntax").  The parser recovers past
-//!   each `where`, so the same run also reports the other unshipped surfaces
-//!   listed above (`->` map-literal entries, `static assert`, `requires`, `<<`).
+//! - **v0 — map-literal entries are unparsed.**  The first blocker is the `->`
+//!   entry pair in the `catalog` literal.  The parser recovers past each
+//!   statement, so the same run also reports the other unshipped surfaces listed
+//!   above (`static assert`, `requires`, `<<`) and one the refinements exposed:
+//!   `SKU`'s predicate `_ in catalog.keys()` parses only as far as `in`, which is
+//!   no expression operator.
 //! - **v1 — a layout failure, which lexing hits first.**  `quote` writes a
 //!   multi-line `if`/`else` **expression** whose `else:` sits at a shallower
 //!   indent than the then-branch body it follows.  The off-side rule dedents to a
 //!   level that was never opened and the lexer reports inconsistent indentation.
 //!   What is missing is a continuation rule for a bracket-less multi-line
 //!   expression: `docs/chl-spec.md`, "1.4 Implicit line continuation" covers only
-//!   bracketed forms.  Behind it, v0's `where` and everything else listed above.
+//!   bracketed forms.  Behind it, v0's map-literal entries and everything else
+//!   listed above.
 
 use super::common::expect_compile_error;
 
 #[test]
 fn storefront_currently_blocked_in_the_front_end() {
-    expect_compile_error(include_str!("v0.cambra"), "found 'where'");
+    expect_compile_error(include_str!("v0.cambra"), "found '->'");
     expect_compile_error(include_str!("v1.cambra"), "inconsistent indentation");
 }

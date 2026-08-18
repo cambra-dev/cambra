@@ -28,6 +28,7 @@ mod ledger_balance;
 mod nonneg_inventory;
 mod prefix_lines;
 mod reachability;
+mod refinement;
 mod storefront;
 mod streaming_echo;
 mod txn_kv;

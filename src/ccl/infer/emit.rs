@@ -334,9 +334,18 @@ fn stamp_kind_from(target: &mut Type, reference: &Type) {
 /// annotation `Type`, so their expression sub-trees get inferred types.
 /// Refinement predicates are `Expr`s that mention free variables of the
 /// enclosing scope; this must run while those bindings are live (i.e.
-/// during `emit_node` of the annotated node). Each predicate is rebuilt in
-/// place ([`emit_bare_predicate`]) so the typed term lands on the annotation.
-fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
+/// during `emit_node` of the annotated node, or of the `let` whose binder the
+/// annotation types). Each predicate is rebuilt in place
+/// ([`emit_bare_predicate`]) so the typed term lands on the annotation.
+///
+/// Every annotation that becomes a *type* owes this: an annotation reaching a
+/// node's `ty` or a binder's `ty` carries its predicate terms to the
+/// post-inference wall, where an untyped one surfaces as `UnresolvedInfer` on
+/// the predicate's own nodes.
+pub(super) fn emit_annotation_predicates<C: Typing>(
+    ty: &mut Type,
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
     match ty {
         // Runs *before* `normalize_annotation`, so a bounded annotation is still a
         // `BoundedHole` here: recurse into the bound, or a predicate written inside one
@@ -1297,6 +1306,13 @@ pub(super) fn emit_let<C: Typing>(
     // special case: `b: _ = a` completes its unspecified position from an already
     // deref'd `bound_ty`, so it means what `b = a` means.
     let bound_ty = read_through(&bound_ty);
+    // An exact annotation *is* what the binder binds at (below), so its refinement
+    // predicates ride `binding.ty` to the post-inference wall. Type them here —
+    // the predicates mention the enclosing scope's bindings, not the binder's own
+    // name, so this is the scope they belong in.
+    if let Some(ann) = &mut binding.user_annotation {
+        emit_annotation_predicates(ann, ctx)?;
+    }
     // The type the variable is bound at over the body.
     let scheme_ty = match &binding.user_annotation {
         // Every other annotation: the variable binds at what the annotation

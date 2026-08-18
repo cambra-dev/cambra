@@ -353,10 +353,10 @@ fn lower_for_body_stmts(
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));
                 }
-                if mut_annotation_parts(&annotation.ty).is_some() {
+                if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                     return Err(in_loop_mut_var_error(stmt.span, &name));
                 }
-                let ann = lower_type_annotation(annotation)?;
+                let ann = lower_type_annotation(annotation, ctx)?;
                 let val = lower_expr(value, ctx)?;
                 frame_introduced.insert(name.clone());
                 bindings.push((name, val, Some(ann), stmt.span));
@@ -386,13 +386,15 @@ fn lower_for_body_stmts(
             ChlStmt::FunctionDef {
                 name,
                 params,
+                output,
                 body: fn_body,
             } => {
                 let name_str = name.as_str().to_string();
                 if mutation_scope.contains(&name_str) {
                     return Err(outer_binding_write_error(stmt.span, &name_str));
                 }
-                let func_expr = lower_function_body(stmt.span, params, fn_body, ctx)?;
+                let func_expr =
+                    lower_function_body(stmt.span, params, output.as_ref(), fn_body, ctx)?;
                 frame_introduced.insert(name_str.clone());
                 bindings.push((name_str, func_expr, None, stmt.span));
             }
@@ -874,10 +876,10 @@ fn lower_loop_body_chain(
                 value,
             } => {
                 let name = extract_name_target(target, "annotated assignment")?;
-                if mut_annotation_parts(&annotation.ty).is_some() {
+                if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                     return Err(in_loop_mut_var_error(stmt.span, &name));
                 }
-                let ann = lower_type_annotation(annotation)?;
+                let ann = lower_type_annotation(annotation, ctx)?;
                 let val = lower_expr(value, ctx)?;
                 ctx.tag_image(Expr::let_bind_annotated(name, val, chain, ann), stmt.span)
             }
