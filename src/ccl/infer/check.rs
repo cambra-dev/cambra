@@ -204,7 +204,11 @@ impl Typing for CheckCtx {
         // truth for width/variance and (since refinements ride the lattice as
         // restriction refinements) refinement subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
-        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new()) {
+        //
+        // A post-pass re-derivation: this runs over a tree a later pass has
+        // already rewritten, so a refinement referencing an erased binder is expected
+        // here rather than an internal error.
+        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::post_pass()) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }

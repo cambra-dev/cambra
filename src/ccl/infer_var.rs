@@ -377,20 +377,39 @@ pub(crate) fn bound_scope_gaps(
 /// Log a recorded bound's closure gaps to the file `CAMBRA_TELESCOPE_LOG`
 /// names. Debug builds only, and inert unless the variable is set; one line
 /// per open name, so the file enumerates every fragment the run stored open.
-pub(crate) fn observe_bound_scope(holder: &InferVar, side: &'static str, bound: &Bound) {
+pub(crate) fn observe_bound_scope(
+    holder: &InferVar,
+    side: &'static str,
+    bound: &Bound,
+    enforce: bool,
+) {
     #[cfg(debug_assertions)]
     {
         use std::sync::OnceLock;
         static LOG: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-        let Some(path) =
-            LOG.get_or_init(|| std::env::var_os("CAMBRA_TELESCOPE_LOG").map(Into::into))
-        else {
+        let log_path = LOG.get_or_init(|| std::env::var_os("CAMBRA_TELESCOPE_LOG").map(Into::into));
+        if log_path.is_none() && !enforce {
             return;
-        };
+        }
         let gaps = bound_scope_gaps(&holder.telescope, bound);
         if gaps.is_empty() {
             return;
         }
+        // The record-time closure invariant, as an internal error on the live
+        // solve (see `src/ccl/design/type-inference.md`, "The invariant"). A
+        // `Name::Raw` gap is a *source* reference and legal: a source has no
+        // binding site, so it is never uniquified — while after uniquification
+        // every binder reference is `Unique`/`Synthetic` — and its standing is
+        // the same one `check_scope_valid` gives it.
+        if enforce && let Some(open) = gaps.iter().find(|n| !n.is_raw()) {
+            panic!(
+                "open fragment recorded on ?{}: `{open:?}` is free in the {side} bound                  `{}` but is neither in the holder's telescope {:?} nor discharged by                  the edge's substitutions — the fragment left its binder's scope                  without a mediating discharge (see type-inference.md, \"The invariant\")",
+                holder.uid, bound.ty, holder.telescope,
+            );
+        }
+        let Some(path) = log_path else {
+            return;
+        };
         use std::io::Write;
         let mut out = String::new();
         for n in &gaps {
@@ -412,7 +431,7 @@ pub(crate) fn observe_bound_scope(holder: &InferVar, side: &'static str, bound: 
     }
     #[cfg(not(debug_assertions))]
     {
-        let _ = (holder, side, bound);
+        let _ = (holder, side, bound, enforce);
     }
 }
 
@@ -653,6 +672,40 @@ mod tests {
             gaps.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
             ["y"]
         );
+    }
+
+    /// The record-time closure invariant is an internal error on the live
+    /// solve: recording a bound whose free reference is a *uniquified* name
+    /// covered by neither the holder's telescope nor the edge's substitutions
+    /// panics. Debug builds only — the check rides `debug_assertions`, like
+    /// `check_scope_valid`.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "open fragment recorded")]
+    fn recording_an_open_fragment_is_an_internal_error() {
+        use crate::ccl::{Name, Refinement, TypedExpr};
+        use std::rc::Rc as StdRc;
+        let dep = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(StdRc::new(TypedExpr::var(Name::fresh("escaped")))),
+        );
+        let holder = InferVar::fresh(0);
+        observe_bound_scope(&holder, "lower", &Bound::conc(dep), true);
+    }
+
+    /// A `Name::Raw` gap is a source reference, which has no binding site and
+    /// is legal free — enforcement lets it through.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_raw_name_gap_is_a_source_reference_and_allowed() {
+        use crate::ccl::{Name, Refinement, TypedExpr};
+        use std::rc::Rc as StdRc;
+        let dep = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(StdRc::new(TypedExpr::var(Name::raw("users")))),
+        );
+        let holder = InferVar::fresh(0);
+        observe_bound_scope(&holder, "lower", &Bound::conc(dep), true);
     }
 
     /// A fresh variable's lists are the shared empty one, so minting costs no

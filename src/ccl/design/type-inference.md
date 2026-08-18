@@ -946,14 +946,11 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ### Scoped inference variables: stored fragments close against a telescope
 
-> **Status: milestones 1 and 2 implemented** (telescopes threaded and
-> observed; the index coordinate and its four conversion sites live, with the
-> acceptance tests below passing in `compact.rs` and `spec_key.rs`).
-> Enforcement (milestone 3) and the name-path deletions (milestone 4) are
-> pending. The record-time observation log is mediated down to one residual
-> class: a post-elimination re-check whose claim references a comprehension
-> binder after `lambda_elim` erased its lambda — enforcement has to decide
-> that class. This section is the design of record for retiring open type
+> **Status: milestones 1–3 implemented** (telescopes threaded; the index
+> coordinate and its four conversion sites live, with the acceptance tests
+> below passing in `compact.rs` and `spec_key.rs`; the record-time check is
+> an internal error on the live solve). The name-path deletions (milestone
+> 4) are pending, as is the formal-model validation. This section is the design of record for retiring open type
 > fragments from the solver. The flatten-time Pi-binder canonicalization on
 > the unmerged branch `dmills/canonical-pi-binders` is the local repair this
 > design replaces; its regression tests — α-variant bounds merge to one
@@ -997,9 +994,20 @@ recorded — a lookup, since uniquify gives every binding site one uid — and a
 violation is a record-time internal error naming the variable and the
 reference, not a fragment waiting for a coincidence to keep it unobserved.
 
+Enforcement is scoped to the **live solve** — emission and its
+specialization pins, the derivations a `ConstrainCache::new` cache serves.
+A post-pass re-derivation (`ConstrainCache::post_pass`) observes without
+enforcing: it walks trees where a later pass has erased binders (a
+post-elimination claim legitimately references a compiled-away comprehension
+binder), and its variables are throwaway comparison state that never
+reaches an output type.
+
 Sources stay name-referenced and outside the telescope: a source name is a
 unique global identifier with no binding structure, the same standing
-`check_scope_valid` gives it.
+`check_scope_valid` gives it. The record-time check recognizes one by its
+name form — a source is never uniquified (it has no binding site), while
+after uniquification every binder reference is `Unique` or `Synthetic`, so a
+`Name::Raw` gap is a source reference and passes.
 
 #### The coordinate is locally nameless
 
@@ -1055,9 +1063,11 @@ A `let` telescope entry carries its definiens. A refinement may reference it whi
 in scope — this is what user-written refinement types need
 (`{Int | __elem > n}` with `n` let-bound) — and lifting a type past the
 binding discharges the reference to the definiens: the existing `let`-closing
-discharge in `coalesce_node`, re-addressed from name to telescope entry.
-Pi entries have no definiens; lifting past one abstracts instead of
-discharging, which is the family formation below.
+discharge in `coalesce_node`. No re-addressing was needed: a uniquified name
+*is* its telescope entry's address in the locally-nameless coordinate, so the
+name-keyed discharge already speaks in entries. Pi entries have no definiens;
+lifting past one abstracts instead of discharging, which is the family
+formation below.
 
 #### Discharge is application
 
@@ -1250,8 +1260,9 @@ otherwise travels untouched.
    its conversions at the four sites of
    [Where the conversions run](#where-the-conversions-run); discharge edges
    read as applications; the `let`-closing re-address.
-3. **Enforce.** The record-time check becomes an internal error; the
-   observation log must be empty first.
+3. **Enforce.** The record-time check becomes an internal error on the live
+   solve; the observation log must be empty there first (the wall-mode
+   residue above stays observation-only).
 4. **Delete.** The name-keyed paths: the Fun/Fun correspondence,
    `licensed_correspondence_view`, and the flatten-time canonicalization that
    never merged.

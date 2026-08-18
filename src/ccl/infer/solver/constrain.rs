@@ -143,6 +143,18 @@ pub enum ConstrainError {
 /// composites grow along lexical nesting depth, not around cycles).
 pub struct ConstrainCache {
     edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
+    /// Whether this derivation is the **live solve** — emission and its
+    /// specialization pins, where a recorded fragment becomes solved output —
+    /// rather than a post-pass re-derivation over a tree a later pass has
+    /// already rewritten.
+    ///
+    /// Bounds recorded on the live solve enforce the telescope closure
+    /// invariant as a record-time internal error
+    /// (`src/ccl/design/type-inference.md`, "The invariant"). A post-pass
+    /// re-derivation does not: its refinements legitimately reference binders the
+    /// pass it runs after erased, and its variables are throwaway comparison
+    /// state that reaches no output type.
+    live_solve: bool,
 }
 
 impl ConstrainCache {
@@ -150,6 +162,17 @@ impl ConstrainCache {
     pub fn new() -> Self {
         Self {
             edges: HashMap::new(),
+            live_solve: true,
+        }
+    }
+
+    /// The cache for a post-pass re-derivation — `check`'s structural
+    /// re-derivation of types a later pass rewrote (see
+    /// [`live_solve`](Self::live_solve) for what that changes).
+    pub fn post_pass() -> Self {
+        Self {
+            edges: HashMap::new(),
+            live_solve: false,
         }
     }
 
@@ -705,7 +728,7 @@ fn constrain_go_impl(
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
                 let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone());
-                crate::ccl::infer_var::observe_bound_scope(lv, "upper", &bound);
+                crate::ccl::infer_var::observe_bound_scope(lv, "upper", &bound, cache.live_solve);
                 let mut s = lv.bounds.borrow_mut();
                 s.upper_mut().push(bound);
                 Rc::clone(s.lower())
@@ -740,7 +763,7 @@ fn constrain_go_impl(
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
                 let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone());
-                crate::ccl::infer_var::observe_bound_scope(rv, "lower", &bound);
+                crate::ccl::infer_var::observe_bound_scope(rv, "lower", &bound, cache.live_solve);
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);
                 Rc::clone(s.upper())

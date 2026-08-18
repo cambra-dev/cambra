@@ -652,7 +652,8 @@ impl Typing for InferCtx {
             result,
             crate::ccl::subst::Subst::discharge(&x, argument.clone()),
         );
-        crate::ccl::infer_var::observe_bound_scope(v, "lower", &bound);
+        // The dependent-apply push is live-solve only, so it always enforces.
+        crate::ccl::infer_var::observe_bound_scope(v, "lower", &bound, true);
         v.bounds.borrow_mut().lower_mut().push(bound);
         Ok(applied)
     }
