@@ -48,10 +48,10 @@
 //! **upper** bound on the operand — the polarity is what keeps that a restatement of
 //! the requirement rather than an invented value.
 //!
-//! Its unit is a [`Place`] — a variable plus a field path — rather than a variable,
-//! because a multi-parameter lambda passes its parameters through a tuple and so splits
-//! one value's occurrences across several variables. Currying a program must not change
-//! what it means.
+//! Its unit is a [`Place`] — one value, however many variables stand at it — rather
+//! than a variable, because a multi-parameter lambda passes its parameters through a
+//! tuple and so splits one value's occurrences across several variables. Currying a
+//! program must not change what it means.
 //!
 //! A refinement narrows exactly as its base does: `{𝑇 | 𝑝}` satisfies a trait when `𝑇`
 //! does, because satisfaction is judged on each bound contribution as it arrives and
@@ -819,19 +819,27 @@ enum Step {
     HistoryValue,
 }
 
-/// A **place**: a value, identified as a variable plus the path that reaches it. The
-/// empty path is the variable itself.
+/// The descent that reaches one place from the root of a sweep: the path of [`Step`]s
+/// taken, empty at the root itself.
 ///
-/// The unit a requirement actually constrains. A variable is too coarse — `λ 𝑎 𝑏 → …`
-/// uncurries to a lambda over a tuple and rewrites each occurrence of `𝑎` to a
-/// projection of it, so each occurrence has its own variable and none carries both of
-/// `𝑎`'s requirements, even though both constrain one value.
-type Place = Vec<Step>;
+/// Only ever a **key**, and only within one [`places_under`] call — two roots' paths
+/// name unrelated values and are never compared. Nothing reads it back; it exists so
+/// that variables reached by different routes land in the same bucket iff they stand
+/// for the same value.
+type StepPath = Vec<Step>;
 
-/// What is known about one place: the variables standing at it, and every requirement
-/// landing on it.
+/// A **place**: one value, as the set of variables standing at it and every requirement
+/// landing on them.
+///
+/// The unit a requirement actually constrains, and the reason it is not the variable:
+/// `λ 𝑎 𝑏 → …` uncurries to a lambda over a tuple and rewrites each occurrence of
+/// `𝑎` to a projection of it, so each occurrence has its own variable and none carries
+/// both of `𝑎`'s requirements, even though both constrain one value. Curried, `𝑎` is a
+/// binder its occurrences share and one variable carries both — so a place holds
+/// however many variables the spelling happens to split the value across, and the
+/// intersection is taken over the whole set.
 #[derive(Default)]
-struct PlaceInfo {
+struct Place {
     vars: Vec<Rc<InferVar>>,
     reqs: Vec<(Rc<TraitObligation>, u8)>,
 }
@@ -846,7 +854,8 @@ fn peel_refinements(ty: &Type) -> &Type {
     cur
 }
 
-/// Group everything reachable from `root` by the place it constrains.
+/// Group everything reachable from `root` into the [`Place`] it constrains, keyed by
+/// the [`StepPath`] that reaches it.
 ///
 /// Follows **upper** bounds, because `𝑣 <: 𝑈` means `𝑣`'s value reaches `𝑈` and so a
 /// requirement on `𝑈` is a requirement on `𝑣`. A variable upper bound stays at the
@@ -875,10 +884,10 @@ fn peel_refinements(ty: &Type) -> &Type {
 /// inference (a self-call is an unbound variable) and `LetRec` is born after it — so
 /// this is a precondition to re-check when recursive definitions arrive, not a live
 /// hazard.
-fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<Place, PlaceInfo> {
-    let mut out: std::collections::BTreeMap<Place, PlaceInfo> = Default::default();
-    let mut seen: std::collections::HashSet<(InferVarId, Place)> = Default::default();
-    let mut frontier = vec![(Rc::clone(root), Place::new())];
+fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Place> {
+    let mut out: std::collections::BTreeMap<StepPath, Place> = Default::default();
+    let mut seen: std::collections::HashSet<(InferVarId, StepPath)> = Default::default();
+    let mut frontier = vec![(Rc::clone(root), StepPath::new())];
     while let Some((var, path)) = frontier.pop() {
         if !seen.insert((var.uid, path.clone())) {
             continue;
@@ -984,7 +993,7 @@ fn conflicting_base(var: &Rc<InferVar>, required: &BaseType) -> Option<BaseType>
 }
 
 /// Queue `ty` one `step` below `path`, if it is a variable once refinements are peeled.
-fn descend(ty: &Type, path: &Place, step: Step, frontier: &mut Vec<(Rc<InferVar>, Place)>) {
+fn descend(ty: &Type, path: &StepPath, step: Step, frontier: &mut Vec<(Rc<InferVar>, StepPath)>) {
     if let Type::Infer(up) = peel_refinements(ty) {
         let mut deeper = path.clone();
         deeper.push(step);
@@ -998,7 +1007,7 @@ fn resolve_pass(
     deposited: &mut std::collections::HashSet<(InferVarId, BaseType)>,
 ) -> Result<(), OperandFailure> {
     for root in vars {
-        for (_, place) in places_under(root) {
+        for place in places_under(root).into_values() {
             if place.reqs.is_empty() {
                 continue;
             }
