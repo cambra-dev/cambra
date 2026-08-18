@@ -26,8 +26,10 @@
 //! thread-CPU time too — ratio ≈ 1.00 — so a CPU-time bound buys nothing over wall.)
 //! Most tests get 10s; the three heaviest compiles get 30s.
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 
 use bit_set::BitSet;
@@ -111,6 +113,38 @@ pub(crate) fn check_scalar(code: &str, expected: Value) {
     let result = run_pipeline(code);
     let scalar = scalar_tile_to_column_value(result);
     assert_eq!(scalar.as_single().unwrap(), expected);
+}
+
+/// Extract a readable string from a `catch_unwind` payload.  Most compiler
+/// panics carry `String` or `&'static str`; anything else falls back to a
+/// placeholder so the test doesn't lose its diagnostic.
+fn panic_payload_to_string(payload: &Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s.to_string()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Check that the compiler produces an expected error on a program.
+/// Use this for negative tests and for program features that have
+/// only been partially implemented.
+pub fn check_compile_error(code: &str, needle: &str) {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| run_pipeline(code)));
+    let payload = match result {
+        Ok(_) => panic!(
+            "expected compile_program to panic with substring {needle:?}; \
+             program ran to completion"
+        ),
+        Err(payload) => payload,
+    };
+    let msg = panic_payload_to_string(&payload);
+    assert!(
+        msg.contains(needle),
+        "expected panic to contain {needle:?}; got: {msg}",
+    );
 }
 
 // ---------------------------------------------------------------------------

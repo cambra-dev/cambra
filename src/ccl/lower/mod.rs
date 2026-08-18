@@ -331,6 +331,16 @@ pub struct LoweringContext {
     /// wins (see [`pre_register_mut_param_fns`]).
     pub(super) mut_param_fns: HashSet<String>,
 
+    /// Whether lowering is currently inside a refinement predicate `{T where p}`
+    /// (§6.4). The predicate's anonymous subject is written `_`, and while this
+    /// flag is set a bare `_` in *term* position lowers to the reserved
+    /// refinement binder [`crate::ccl::REFINEMENT_BINDER`] (`Name::elem()`)
+    /// rather than an ordinary variable named `_`. Set only around the predicate
+    /// (save/restore, so a nested annotation cannot leak it), it is what makes
+    /// "`_` is the value being refined" a local rule of the predicate rather than
+    /// a global meaning of `_`.
+    pub(super) in_refinement_predicate: bool,
+
     /// Counter behind [`fresh_shared_hole`](Self::fresh_shared_hole).
     next_shared_hole: u32,
 }
@@ -354,6 +364,20 @@ impl LoweringContext {
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
     ) {
         self.sources.insert(name.into(), source);
+    }
+
+    /// Perfom some action on the context with
+    /// `in_refinement_predicate` set to true, then return that field
+    /// to its previous value.
+    pub fn with_in_refinement_predicate<F, T>(&mut self, f: F) -> T
+    where
+        F: FnOnce(&mut Self) -> T,
+    {
+        let old = self.in_refinement_predicate;
+        self.in_refinement_predicate = true;
+        let out = f(self);
+        self.in_refinement_predicate = old;
+        out
     }
 
     /// Drain all sources accumulated for this compilation.
@@ -680,6 +704,12 @@ fn lower_expr_inner(
         ChlExpr::Lit(lit) => lower_constant(lit),
         ChlExpr::Name(id) => {
             let name = id.as_str();
+            // Inside a refinement predicate (`{T where p}`), `_` is the anonymous
+            // subject — the value being refined — which is the reserved binder
+            // `__elem` (`docs/chl-spec.md`, "6.4 Refinement syntax").
+            if ctx.in_refinement_predicate && name == "_" {
+                return Ok(Expr::var(crate::ccl::Name::elem()));
+            }
             // A transactional mutable variable may be read only inside a `with begin():`
             // block, which pins a snapshot-consistent view (all txn reads in one
             // block observe one commit snapshot). Inside a transaction
@@ -764,6 +794,14 @@ fn lower_expr_inner(
             expr.span,
             "`{…}` is type syntax (a record type `{name: T}`); \
              a record value is written `(name=value)`",
+        )),
+        // A refinement `{T where p}` is structural *type* syntax; it names a
+        // type, not a value. (Accepted in annotation position — see
+        // `lower_type_annotation`.)
+        ChlExpr::BraceRefinement { .. } => Err(LoweringError::unsupported(
+            expr.span,
+            "`{T where p}` is a refinement *type*; it is written in annotation \
+             position, not as a value",
         )),
         // Attribute access `target.attr` → `Apply(target, Proj(k))`. The `Proj` images
         // the `.attr` access the user wrote.

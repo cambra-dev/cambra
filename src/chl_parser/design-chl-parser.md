@@ -124,7 +124,12 @@ Key shape choices:
   allowing it: `{T,}` is the one-element product and a comma-free `{T}` is a
   parse error, while the empty `{}` is the **unit type**, which lowering reads as
   `Unit` (see [docs/chl-spec.md](../../docs/chl-spec.md),
-  "6.6 The empty product is unit").
+  "6.6 The empty product is unit"). A `where` clause after a single colon-free
+  base turns the brace into a refinement type `{T where p}` (`Expr::BraceRefinement`,
+  [docs/chl-spec.md](../../docs/chl-spec.md), "6.4 Refinement syntax"); the
+  clause gates off the one-element `{T}` diagnostic, and its predicate `p` — an
+  ordinary expression whose subject `_` lowering maps to the refinement binder —
+  is parsed with the same `expr` as everything else.
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.

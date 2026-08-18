@@ -231,10 +231,11 @@ pub enum Stmt {
         body: Vec<Spanned<Stmt>>,
     },
 
-    /// `def name(params): body`.
+    /// `def name(params) => output: body`.
     FunctionDef {
         name: SmolStr,
         params: Vec<Param>,
+        output: Option<Spanned<Expr>>,
         body: Vec<Spanned<Stmt>>,
     },
 
@@ -485,6 +486,25 @@ pub enum Expr {
     ///   maps the empty group there; it does *not* build an empty
     ///   [`crate::ccl::Type::Tuple`], which is not a valid type.
     BraceGroup(Vec<Spanned<Expr>>),
+
+    /// A refinement type `{ T where p }`: the base type `T`, the keyword
+    /// `where`, and a predicate `p` over the anonymous subject `_`
+    /// (`docs/chl-spec.md`, "6.4 Refinement syntax").
+    ///
+    /// Term-level braces are reserved for structural **type** syntax like
+    /// [`Expr::BraceRecord`] / [`Expr::BraceGroup`], so this too is only
+    /// meaningful in annotation position: lowering reads it as a
+    /// [`crate::ccl::Type::Refinement`] and rejects it in value position.
+    ///
+    /// `base` is a single colon-free type expression (the parser rejects a
+    /// multi-item or `field: T` base before this variant is built). `predicate`
+    /// is an ordinary CHL `Bool` expression in which `_` denotes the value being
+    /// refined; lowering maps that `_` to the reserved refinement binder
+    /// (`crate::ccl::REFINEMENT_BINDER`).
+    BraceRefinement {
+        base: Box<Spanned<Expr>>,
+        predicate: Box<Spanned<Expr>>,
+    },
 
     /// Subscript: `target[index]` — **collection lookup only**. Projecting a product
     /// is a different operation and has its own spelling, [`Expr::Attribute`].
