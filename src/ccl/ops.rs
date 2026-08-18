@@ -393,7 +393,7 @@ pub enum Builtin {
     /// "Builtins", and [`crate::ccl::letrec::check_letrec_causal`]).
     ///
     /// Op-conversion never compiles this builtin directly: letrec pattern
-    /// recognition consumes it (the causal self-cycle becomes the `Recurse`
+    /// recognition consumes it (the causal self-cycle becomes the induction-store
     /// engine), so its op-conversion arm is a deliberate error, like
     /// `LetRec`'s.
     GetPrevSeq,

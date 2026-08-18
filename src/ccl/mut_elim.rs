@@ -21,8 +21,8 @@
 //! [`crate::ccl::planning::plan_loops`] runs **after `lambda_elim`**, on the group's point-free
 //! normal form, and lowers each group onto the domain-parameterized
 //! [`TypedExprNode::Transact`] carrier (`let __hist = Transact{…} in …`),
-//! whose induction domain op-conversion compiles to the `Recurse` recurrence
-//! (the `Txn` domain, to the commit operator).
+//! whose induction domain op-conversion compiles to the changelog induction
+//! store (the `Txn` domain, to the commit operator).
 //!
 //! **Why one `LetRec` travels post-elim, and why `Transact` still exists.**
 //! Recognition anchors on the guard builtins (`get_prev_seq` / `get_prev_txn`
@@ -1293,8 +1293,8 @@ fn transform_chain(
         // unchanged value is a no-op — the conditional change rides the *values*
         // (each value-`Case` compiles via the C-form at `lambda_elim`), not a
         // per-position commit gate. One writer over the full source, so no
-        // restricted per-leg sources and no cyclic desync — the changelog
-        // (`InductionStore`) realization the dense multi-leg `Recurse` replaced.
+        // restricted per-leg sources and no cyclic desync, which a multi-leg
+        // realization over per-leg restricted sources could not avoid.
         TypedExprNode::ExprStmt { expr: effect, body }
             if matches!(
                 &effect.node,
@@ -1526,10 +1526,10 @@ fn decision_writes(dec: &Expr) -> Vec<Expr> {
 ///   (`⧺ⱼ wⱼᵢ ↾ π̂ⱼ`), so a **partial op** (`//`, `%`) in a write value is only
 ///   evaluated at the positions its guard admits — never at a carried position.
 ///
-/// Carry-completeness is also what makes the dense `Recurse` path correct for an
-/// **async source**: that path cycles on `.writes` (not `` `commit ``), and `writes`
-/// now carries `snapshotᵢ` (the previous accumulator) wherever no guard fires, so
-/// the guard is honored by the value rather than silently dropped.
+/// Carry-completeness is also what makes a **`.writes`-cycling** realization correct
+/// for an **async source**: `writes` carries `snapshotᵢ` (the previous accumulator)
+/// wherever no guard fires, so the guard is honored by the value rather than
+/// silently dropped.
 fn conditional_decision(
     writing: Vec<(Expr, Vec<Expr>)>,
     carry: Vec<Expr>,

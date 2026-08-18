@@ -6,7 +6,7 @@
 //! (`ExprStmt(For{target, iter, block}, continuation)`); the *only* structural
 //! difference is that its `MutWrite`s target `Mut(V, Txn)` stores, which
 //! `transact_phase` recognizes (by the mutable variable's registered base name) and routes
-//! to the commit engine rather than the induction `Recurse`. A standalone
+//! to the commit engine rather than the induction store. A standalone
 //! transaction is one commit over a synthesized singleton source. Writes and
 //! reads inside the block run with `in_tx_body = true`, so a bare mutable variable read is
 //! a snapshot (a bare mutable variable read *outside* a block is the rejected out-of-block

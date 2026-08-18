@@ -503,11 +503,9 @@ fn test_incremental_global_aggregate() {
     );
 }
 
-/// Mutation loop summing values from an incremental source, semantically
-/// equivalent to `sum(source1())` but exercising `Recurse` instead of
 /// A *conditional* induction write over an async source: `if i > 15: x := x + i`.
-/// An async (`DataSourceDomain`) extent routes to the dense `Recurse` path, which
-/// cycles on `.writes` (not `.commit`). The writer decision is *carry-complete*
+/// An async (`DataSourceDomain`) extent routes to the changelog induction store.
+/// The writer decision is *carry-complete*
 /// (`writes.x = Case[i > 15 → x + i; true → x]`), so a rejected position carries the
 /// previous accumulator rather than accumulating unconditionally — the guard is
 /// honored by the value, not silently dropped. Source `[10, 20, 30]`, guard `> 15`:
@@ -562,7 +560,7 @@ x";
 /// `InductionStore` drives the source by *absolute position* (an async domain
 /// arrives unordered), so the feed's per-position stream is position-ordered —
 /// loop position `p` sees `cnt = p + 1`, not a value scrambled by arrival order
-/// (the dense `Recurse` path's bug this replaces). Source `[10, 20, 30]` → the
+/// rather than by arrival. Source `[10, 20, 30]` → the
 /// feed maps `{0 ↦ 1, 1 ↦ 2, 2 ↦ 3}`.
 #[test_log::test]
 fn test_incremental_tap_loop() {
@@ -613,7 +611,7 @@ o";
     );
 }
 
-/// `MapAggregate`.  Verifies that `Recurse` correctly:
+/// `MapAggregate`.  Verifies that the induction cycle correctly:
 /// - Re-reads its `domain` input as the source grows in batches.
 /// - Holds back the final emission until the source signals it's done.
 /// - Fires notifications when each batch arrives and again on terminal.
