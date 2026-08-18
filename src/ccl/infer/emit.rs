@@ -1828,7 +1828,7 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 
 /// The per-position `to_<defer>` output fields a writer's decision carries beyond
 /// `writes`, read off the writer body's codomain — `(field, value_ty)`. Each
-/// becomes a virtual variable-record key `to_<defer>: Fun(domain, value_ty)` (the
+/// becomes a virtual history-record key `to_<defer>: Fun(domain, value_ty)` (the
 /// per-position feed output stream). The decision codomain is the variant
 /// `` {`commit{𝑃} | `abort} ``; the taps live inside the (dense) `commit` payload
 /// record `𝑃`, so peel `commit` and drop the `writes` field.
@@ -1929,7 +1929,7 @@ fn emit_transact_writer<C: Typing>(
 ///
 /// The node denotes the mutable variable **record** `{key: ⟦key⟧}` — each key's read type
 /// `Fun(domain, α)` (the value's history over the mutable variable's sequencing domain),
-/// what a variable projection `__reg.key` yields; a read reduces it to the
+/// what a variable projection `__hist.key` yields; a read reduces it to the
 /// latest `α` via `final_or_default(history, init)`. The init is the position-0
 /// value, so it bounds the codomain `α` (`init <: α`), not the whole stream.
 /// There is no recurrence *fixpoint* over a step type — the mutable variable↔writer cycle
@@ -1951,7 +1951,7 @@ pub(super) fn emit_transact<C: Typing>(
     // bound) — the codomain of the key's history.
     let mut key_types: HashMap<Name, Type> = HashMap::with_capacity(keys.len());
     for k in keys.iter_mut() {
-        // The variable-record field is the value's history `Fun(domain, α)` over
+        // The history-record field is the value's history `Fun(domain, α)` over
         // the mutable variable's sequencing domain; `final_or_default` reads it back to the
         // latest `α`.
         let value_ty = ctx.fresh();
@@ -1969,7 +1969,7 @@ pub(super) fn emit_transact<C: Typing>(
     for w in writers.iter_mut() {
         emit_transact_writer(w, &key_types, ctx)?;
         // A `to_<defer>` field on the writer's decision record becomes a
-        // virtual mutable variable key the consumer reads as `__reg.to_…`. Its stream
+        // virtual mutable variable key the consumer reads as `__hist.to_…`. Its stream
         // is **site-domained** — one tap value per iteration of *this
         // writer's* source (the channel unions channelize assembled reference
         // it at that type) — unlike the key histories, which live over the

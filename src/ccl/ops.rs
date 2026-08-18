@@ -455,7 +455,7 @@ pub enum Builtin {
     /// *completeness*; every other fed-out mutable variable read is an arbitrary as-of
     /// sample ([`Self::AsOf`]). It is a surface marker in the sense the `For` /
     /// `Begin` / `MutWrite` nodes are: [`crate::ccl::transact_phase`] consumes it,
-    /// replacing each occurrence with `final_or_default(reg_x, init)` over the
+    /// replacing each occurrence with `final_or_default(hist_x, init)` over the
     /// mutable variable's history binding — the single sanctioned application of
     /// [`Self::FinalOrDefault`] to a commit history. So it never reaches
     /// op-conversion, and its arm there is a deliberate error like

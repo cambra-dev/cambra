@@ -2107,7 +2107,7 @@ fn extract_for_defer_impl(
                 // is bound (a generator body inlined out) needs it carried
                 // along; a channel that doesn't mention it must *not* be
                 // wrapped, or every channel drags in an unused binding — a whole
-                // mutable variable record, in the worst case (each `http_serve` reply re-emitting
+                // history record, in the worst case (each `http_serve` reply re-emitting
                 // a mutable variable it never reads). The reference test is
                 // `collect_free_vars` rather than `count_free` because the
                 // binding may be referenced only through a `user_annotation` /

@@ -29,15 +29,15 @@
 //!    building the direct fold used; only the assembly below differs.
 //! 2. **partitions** the keys into commit stores ([`partition_keys`]) and
 //!    **assembles** one `LetRec` per store (see [`plan_store`]): one **history** binding
-//!    `reg_k : Txn ⇒ V = λ t → get_prev_txn(view, t, init)` per key — reading
+//!    `hist_k : Txn ⇒ V = λ t → get_prev_txn(view, t, init)` per key — reading
 //!    its writing site's commit stream (or self-guarded for a read-only key) —
 //!    and one **commit-record** binding `commits_j : 𝐼 ⇒ {time, write_targets,
 //!    decision}` per site, whose `decision` is the writer body applied to the
-//!    snapshot `(reg_rk(begin(r)) …, source(r))` of the variables it reads, at commit
-//!    time `begin(r)` (the [`Builtin::BeginTxn`] oracle). The `reg_k ↔
+//!    snapshot `(hist_rk(begin(r)) …, source(r))` of the variables it reads, at commit
+//!    time `begin(r)` (the [`Builtin::BeginTxn`] oracle). The `hist_k ↔
 //!    commits_j` cycle crosses `get_prev_txn` once, so it is guarded.
 //! 3. **places** the stores ([`splice_stores`]), rebinding each key variable still
-//!    named in the continuation from `let x = init` to `let x = as_of_read(reg_x)` over
+//!    named in the continuation from `let x = init` to `let x = as_of_read(hist_x)` over
 //!    its history binding — an as-of read of it, at a position nothing has supplied yet.
 //!    A read fed out of a block that does not write `x` is broadcast over the reading
 //!    loop and, after `channelize`, joined with that loop into an `AsOf` by
@@ -199,12 +199,12 @@ fn first_unpaired_as_of_read(e: &Expr) -> Option<Name> {
 
 /// One as-of read in a reply chain: its `let` binder, the history-binding
 /// reference (the as-of source for a single-variable read — recognition later
-/// rewrites it to a variable-record projection), the variable-record field its
+/// rewrites it to a history-record projection), the history-record field its
 /// history will occupy (`hist.field_key()`, matching recognition's read map),
 /// and the mutable variable's value type.
 struct BoundRead {
     name: Name,
-    reg_read: Expr,
+    hist_read: Expr,
     field: String,
     value_ty: Type,
 }
@@ -215,7 +215,7 @@ struct BoundRead {
 fn as_of_join(expr: &Expr) -> Option<Expr> {
     // Walk consecutive `let kᵢ = final_or_default((⟨histᵢ⟩, _))` bindings —
     // each a bare reference to a live history binding — down to the broadcast
-    // body. Pre-recognition there is no shared mutable variable record: several
+    // body. Pre-recognition there is no shared history record: several
     // mutable variables are several history bindings; the snapshot case rebuilds
     // their record below and recognition collapses it onto the mutable variable.
     let mut reads: Vec<BoundRead> = Vec::new();
@@ -226,14 +226,14 @@ fn as_of_join(expr: &Expr) -> Option<Expr> {
         body,
     } = &cur.node
     {
-        let Some((reg_read, field)) = as_of_read_source(bound_expr) else {
+        let Some((hist_read, field)) = as_of_read_source(bound_expr) else {
             break;
         };
         reads.push(BoundRead {
             name: binding.name.clone(),
-            reg_read: reg_read.clone(),
+            hist_read: hist_read.clone(),
             field,
-            value_ty: reg_read.ty.codomain()?,
+            value_ty: hist_read.ty.codomain()?,
         });
         cur = body;
     }
@@ -301,7 +301,7 @@ fn build_zip_read(
     // The as-of source and the variable-snapshot value type: one mutable variable reads bare,
     // several fold into a record (as in `build_snapshot`).
     let (source, snap_ty) = if used.len() == 1 {
-        (used[0].reg_read.clone(), used[0].value_ty.clone())
+        (used[0].hist_read.clone(), used[0].value_ty.clone())
     } else {
         let record_ty = Type::Record(
             used.iter()
@@ -310,12 +310,12 @@ fn build_zip_read(
         );
         let source_ty = Type::Record(
             used.iter()
-                .map(|r| (r.field.clone(), r.reg_read.ty.clone()))
+                .map(|r| (r.field.clone(), r.hist_read.ty.clone()))
                 .collect(),
         );
         let source = Expr::new(TypedExprNode::Record(
             used.iter()
-                .map(|r| (r.field.clone(), r.reg_read.clone()))
+                .map(|r| (r.field.clone(), r.hist_read.clone()))
                 .collect(),
         ))
         .with_ty(source_ty);
@@ -372,7 +372,7 @@ fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
 }
 
 /// Match `as_of_read(⟨hist⟩)` over a **commit-log** history — a bare reference to a
-/// `Txn`-domained letrec history binding — returning the read and the variable-record
+/// `Txn`-domained letrec history binding — returning the read and the history-record
 /// field its history will occupy. `None` for any other bound expression.
 ///
 /// The domain test is the exact `Type::Txn` commit-sequencing domain, not a derived
@@ -383,7 +383,7 @@ fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
 fn as_of_read_source(bound_expr: &Expr) -> Option<(&Expr, String)> {
     let TypedExprNode::Apply {
         function: sample_fn,
-        argument: reg_read,
+        argument: hist_read,
     } = &bound_expr.node
     else {
         return None;
@@ -391,13 +391,13 @@ fn as_of_read_source(bound_expr: &Expr) -> Option<(&Expr, String)> {
     if !matches!(&sample_fn.node, TypedExprNode::Builtin(Builtin::AsOfRead)) {
         return None;
     }
-    if !matches!(reg_read.ty.domain(), Some(Type::Txn)) {
+    if !matches!(hist_read.ty.domain(), Some(Type::Txn)) {
         return None;
     }
-    let TypedExprNode::Var(hist) = &reg_read.node else {
+    let TypedExprNode::Var(hist) = &hist_read.node else {
         return None;
     };
-    Some((reg_read, hist.field_key()))
+    Some((hist_read, hist.field_key()))
 }
 
 /// `as_of((trigger, source)) : Fun(B, codomain)`.
@@ -414,7 +414,7 @@ fn build_as_of(trigger: &Expr, source: &Expr, codomain: Type) -> Option<Expr> {
 /// A single-variable as-of read: `as_of((trigger, balance.f))`, bare when the reply
 /// is the identity `read`, else `≫ (λ read → e)`.
 fn build_single(trigger: &Expr, read: &BoundRead, lam_body: &Expr, out_ty: Type) -> Option<Expr> {
-    let as_of = build_as_of(trigger, &read.reg_read, read.value_ty.clone())?;
+    let as_of = build_as_of(trigger, &read.hist_read, read.value_ty.clone())?;
     if matches!(&lam_body.node, TypedExprNode::Var(n) if *n == read.name) {
         return Some(as_of);
     }
@@ -425,9 +425,9 @@ fn build_single(trigger: &Expr, read: &BoundRead, lam_body: &Expr, out_ty: Type)
 /// A multi-variable as-of read: `as_of((trigger, (f_a: ⟨a-hist⟩, f_b:
 /// ⟨b-hist⟩))) ≫ (λ snap → e[kᵢ ↦ snap.fᵢ])` — one snapshot record per
 /// request (§I-c), the reply projecting each mutable variable off it. The source is a
-/// record *literal* of the history-binding reads (the shared mutable variable record
+/// record *literal* of the history-binding reads (the shared history record
 /// does not exist pre-recognition); recognition rewrites each field to
-/// `__reg.f` and then collapses the literal onto the mutable variable itself,
+/// `__hist.f` and then collapses the literal onto the mutable variable itself,
 /// so the engine latches one whole-variable snapshot per request.
 fn build_snapshot(
     trigger: &Expr,
@@ -442,12 +442,12 @@ fn build_snapshot(
     );
     let source_ty = Type::Record(
         used.iter()
-            .map(|r| (r.field.clone(), r.reg_read.ty.clone()))
+            .map(|r| (r.field.clone(), r.hist_read.ty.clone()))
             .collect(),
     );
     let source = Expr::new(TypedExprNode::Record(
         used.iter()
-            .map(|r| (r.field.clone(), r.reg_read.clone()))
+            .map(|r| (r.field.clone(), r.hist_read.clone()))
             .collect(),
     ))
     .with_ty(source_ty);
@@ -578,7 +578,7 @@ struct RawSite {
 /// the target defer, the fresh `to_<defer>` tap field the writer decision's
 /// `` `commit `` payload carries beside `writes`, and the tap value's type. The writer
 /// decision computes the tap value alongside the write set (read-your-writes at
-/// the feed's position); the phase hoists `Feed(defer, __reg ▷ .to_<defer>)`
+/// the feed's position); the phase hoists `Feed(defer, __hist ▷ .to_<defer>)`
 /// into the mutable variable body so `channelize` routes it as an ordinary channel
 /// contribution — mirroring `mut_elim`'s in-loop induction feeds. The tap
 /// commits with the transaction (a denied `` `abort `` contributes no reply, since
@@ -932,8 +932,8 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         // The loop body and the continuation between them carry every reference to
         // this loop's accumulators, so their `Mut(V, D)`s give each one the value
         // type inference joined for it.
-        let reg_vtys = mut_var_value_tys([&*body, &*cont]);
-        let fold = fold_induction_loop(&target, &iter, *body, &reg_vtys);
+        let value_tys = mut_var_value_tys([&*body, &*cont]);
+        let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
         for (i, (acc, vty)) in fold.accs.iter().enumerate() {
             if cross_reads.contains(acc) {
                 let final_var = fold
@@ -2116,7 +2116,7 @@ fn walk_block(
         }
         // Unreachable, as in `splice_block` / `partition_spine`. The rule it would
         // implement is known — the seed enters the read-your-writes environment
-        // exactly as a `Let`'s bound value does — but a block-local register also
+        // exactly as a `Let`'s bound value does — but a block-local mutable variable also
         // needs a decision this pass cannot make alone: whether its writes join the
         // enclosing commit or are private to the block.
         TypedExprNode::MutDecl { .. } => todo!(
@@ -2441,7 +2441,7 @@ fn fun_parts(ty: &Type) -> (Type, Type) {
 ///
 /// Built point-free (a `zip` of two `commits_j` views) rather than as a one-arm
 /// `match` lambda: a `match` covering only `commit` over a two-tag scrutinee is a
-/// width-subtyping error at the strict wall (`` {`commit | `abort} ≮: {`commit} ``),
+/// width-subtyping error at the strict `typecheck` (`` {`commit | `abort} ≮: {`commit} ``),
 /// whereas `variant_project` carries its own stamped type and reads the payload
 /// off the stream directly. The views are pointwise reads of the (guarded) commit
 /// stream, so the references to `commits_j` stay guarded
@@ -2521,7 +2521,7 @@ fn record_field_ty(ty: &Type, field: &str) -> Type {
 
 /// A hoisted in-block feed: the target defer and the tap binding (`Fun(𝐼, V)`
 /// over its site's commit-record stream) whose per-commit values feed it.
-/// `recognize` maps a read of `tap` to the mutable variable record's tap field.
+/// `recognize` maps a read of `tap` to the history record's tap field.
 struct HoistedFeed {
     defer: Name,
     tap: Name,
@@ -2531,19 +2531,19 @@ struct HoistedFeed {
 /// Assemble the transaction `letrec` from the built writers/keys/feeds and
 /// splice it in at the outermost key `let`. Emits, in mutual scope:
 ///
-/// - one **history** binding per key — `reg_k : Txn ⇒ V = λ t →
+/// - one **history** binding per key — `hist_k : Txn ⇒ V = λ t →
 ///   get_prev_txn((view, t, init))`, `view` its writing site's commit stream
-///   (guarded — the `reg_k ↔ commits_j` cycle crosses `get_prev_txn`) or
-///   `reg_k` itself for a read-only key (a self-guarded constant);
+///   (guarded — the `hist_k ↔ commits_j` cycle crosses `get_prev_txn`) or
+///   `hist_k` itself for a read-only key (a self-guarded constant);
 /// - one **commit-record** binding per `with begin():` site — `commits_j : 𝐼 ⇒
 ///   {time, write_targets, decision}`, whose `decision` is the writer body
-///   (verbatim) applied to the mutable variable snapshot `(reg_rk(begin(r)) …,
+///   (verbatim) applied to the mutable variable snapshot `(hist_rk(begin(r)) …,
 ///   source(r))` at the site's commit time, and whose `write_targets` names the
 ///   write-set keys' histories so recognition recovers the writer's write-set;
 /// - one **tap** binding per in-block feed — `commits_j ≫ .decision ≫ .field`.
 ///
 /// The continuation rebinds each key variable's `let x = init` to a
-/// `final_or_default(reg_x, init)` read over its history and hoists each
+/// `final_or_default(hist_x, init)` read over its history and hoists each
 /// in-block feed to `Feed(defer, tap)`. `recognize` inverts this straight into
 /// the `Transact{keys, writers, domain: Txn}` carrier.
 ///
@@ -2676,7 +2676,7 @@ fn plan_store(
         // `commits_j ≫ .decision ≫ variant_project(`commit) ≫ .field`, the
         // per-commit tap stream — the tap rides the (dense) `commit` payload, so
         // eliminate the `` {`commit{𝑃} | `abort} `` decision before the field read.
-        // recognition maps its ref to the mutable variable record's `field` tap. Emitted in
+        // recognition maps its ref to the history record's `field` tap. Emitted in
         // feed (source) order across sites.
         let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(&decision_ty);
         for f in feeds {
@@ -2716,7 +2716,7 @@ fn plan_store(
     let mut hist_bindings: Vec<(TypedBinding, Expr)> = Vec::with_capacity(key_names.len());
     for k in &key_names {
         let v = value_ty(k);
-        let reg_k = hist[k].clone();
+        let hist_k = hist[k].clone();
         let t = Name::fresh("__t");
         let init = key_init.get(k).cloned().expect("key init present");
         // The `get_prev_txn` history slot — the design's denotation: the
@@ -2732,7 +2732,7 @@ fn plan_store(
         // history. The pointwise maps and the union are guarded shapes
         // (`letrec::is_guarded_history_slot` — they change what is read at each
         // position, never which positions the accessor consults), so the
-        // `reg_k ↔ commits_j` cycles still cross the guard.
+        // `hist_k ↔ commits_j` cycles still cross the guard.
         let view_rec_ty = Type::Record(vec![
             (F_TIME.to_string(), Type::Txn),
             (F_WRITE.to_string(), v.clone()),
@@ -2777,7 +2777,7 @@ fn plan_store(
             }
             None => {
                 let ty = history_ty(&v);
-                (tvar(&reg_k, ty.clone()), ty)
+                (tvar(&hist_k, ty.clone()), ty)
             }
         };
         let arg_ty = Type::Tuple(vec![view_ty, Type::Txn, v.clone()]);
@@ -2790,7 +2790,7 @@ fn plan_store(
         );
         let mut lam = Expr::lambda(t, Type::Txn, gpt);
         lam.ty = history_ty(&v);
-        hist_bindings.push((binding(reg_k, history_ty(&v)), lam));
+        hist_bindings.push((binding(hist_k, history_ty(&v)), lam));
     }
 
     // History bindings first, then commit records, then tap views — order is
@@ -3154,7 +3154,7 @@ fn resolve_await_finals(e: &mut Expr, hist: &HashMap<Name, Name>, key_init: &Has
     e.walk_children_mut(|c| resolve_await_finals(c, hist, key_init));
 }
 
-/// `final_read(reg_k)` — key `k`'s **terminal read**: its value at the position its own
+/// `final_read(hist_k)` — key `k`'s **terminal read**: its value at the position its own
 /// writers finish. Minted only for a [`Builtin::AwaitFinal`] marker.
 ///
 /// No seed operand, for the same reason [`as_of_read`] has none: this samples the carried

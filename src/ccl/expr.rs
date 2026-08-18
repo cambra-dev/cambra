@@ -356,8 +356,8 @@ pub enum TypedExprNode {
     /// [`crate::ccl::planning::plan_loops`] and consumed at operator
     /// conversion. It denotes a pure value — the mutable variable **record** `{key:
     /// ⟦key⟧}`, each field a key's history `Fun(domain, V)` — so a variable
-    /// read is the record projection `__reg.key` (an `Apply` of `Proj(field)`
-    /// to the `__reg` binder). Serialization and the mutable variable↔writer cycle are
+    /// read is the record projection `__hist.key` (an `Apply` of `Proj(field)`
+    /// to the `__hist` binder). Serialization and the mutable variable↔writer cycle are
     /// the *operator's* runtime behaviour (a cyclic `FanOut`), not the node's
     /// denotation — exactly as the induction/commit store realizes the recurrence.
     ///
@@ -371,7 +371,7 @@ pub enum TypedExprNode {
         /// sequencing domain. Each carries its position-0 `init` (the seed,
         /// evaluated once outside every writer's parameter scope). The node
         /// denotes the mutable variable **record** `{key.field_key(): Fun(domain, V)}`; a
-        /// variable read is a projection `__reg.key`. A single-key carrier is
+        /// variable read is a projection `__hist.key`. A single-key carrier is
         /// the one-accumulator case.
         keys: Vec<TransactKey>,
         /// The writers, in declaration order. Each reads/writes a footprint of
@@ -1907,7 +1907,7 @@ impl Default for TypedExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransactKey {
     /// The key — the (α-uniquified) `Name` of the mutable variable. A read of the
-    /// variable projects [`Name::field_key`] of the mutable variable record (`__reg.k`).
+    /// variable projects [`Name::field_key`] of the history record (`__hist.k`).
     pub name: Name,
     /// The position-0 initial value (the scalar seed), evaluated once outside
     /// every writer's scope. The key's history is `Fun(domain, V)`; a read is

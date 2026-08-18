@@ -366,7 +366,7 @@ Three arms share an input across multiple downstream consumers:
   each tuple / record element; the elements get `Some(fan_out_branch)` and
   combine via [`fan_in`] (function-tiled arms) or [`ScalarFanIn`] (scalar arms).
   The 2-arm Zip-with-const fast path skips the fan-out and emits a single
-  `MapResultToConst` instead. A **store-read arm** (`__reg.k`) is a *leaf*
+  `MapResultToConst` instead. A **store-read arm** (`__hist.k`) is a *leaf*
   source over its own domain, so it is converted with **no** input (rather than
   the fanned branch, which it would reject); `fan_in` co-aligns it with the
   input-driven arms by domain position. This is the cross-domain co-iteration a
@@ -493,7 +493,7 @@ There is one writer over the *full* source: a conditional write's carry position
 change rather than a synthesized same-value write on a complement leg, which is what keeps a
 restricted-source multi-leg realization's cyclic-convergence desync from arising.
 
-**`StoreDenseRead` — the dense changelog read.** A `__reg.k` read folds the changelog at
+**`StoreDenseRead` — the dense changelog read.** A `__hist.k` read folds the changelog at
 *every* position of the loop extent → `Fun(D, V)`: an `IterateExtent(D)` trigger supplies
 the domain positions (a live enumeration — over a `DataSource` it re-reads the arrived keys
 each pull, so it spans live arrivals — and it aligns via `fan_in` with any co-iterated
