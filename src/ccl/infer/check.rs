@@ -65,6 +65,12 @@ pub(super) struct CheckCtx {
     /// `emit_node` maintains Emit's. Seeded with the tree's root at
     /// construction, so a rule always has a node to blame.
     current_node: NodeId,
+    /// The binders in lexical scope at the current position. Check resolves
+    /// no names through it — recorded types are trusted — but the variables
+    /// it mints sit at lexical positions like Emit's, so they carry the live
+    /// telescope and the record-time closure observation stays meaningful in
+    /// both modes.
+    telescope: crate::ccl::infer_var::Telescope,
 }
 
 impl CheckCtx {
@@ -78,6 +84,7 @@ impl CheckCtx {
             errors: Vec::new(),
             pred_memo: Default::default(),
             current_node: root,
+            telescope: crate::ccl::infer_var::Telescope::empty(),
         }
     }
 }
@@ -101,7 +108,7 @@ impl Typing for CheckCtx {
     }
 
     fn fresh(&mut self) -> Type {
-        fresh_var(self.level)
+        Type::Infer(crate::ccl::InferVar::fresh_in(self.level, &self.telescope))
     }
 
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
@@ -200,10 +207,15 @@ impl Typing for CheckCtx {
         Ok(())
     }
 
-    fn scoped<R>(&mut self, _name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn scoped<R>(&mut self, name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
         // Check trusts each `Var`/binder node's recorded `Type` rather than
-        // resolving names, so there is no scope to maintain.
-        f(self)
+        // resolving names, so there is no name scope to maintain — only the
+        // telescope, for the variables minted under this binder.
+        let extended = self.telescope.extended(name.clone());
+        let saved = std::mem::replace(&mut self.telescope, extended);
+        let r = f(self);
+        self.telescope = saved;
+        r
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -220,13 +232,17 @@ impl Typing for CheckCtx {
 
     fn scoped_let<R>(
         &mut self,
-        _name: &Name,
+        name: &Name,
         _bound_ty: &Type,
         _generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        // See `scoped`: Check maintains no scope and does not generalize.
-        f(self)
+        // See `scoped`: no name scope, no generalization — telescope only.
+        let extended = self.telescope.extended(name.clone());
+        let saved = std::mem::replace(&mut self.telescope, extended);
+        let r = f(self);
+        self.telescope = saved;
+        r
     }
 
     fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {

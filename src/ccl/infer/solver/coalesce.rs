@@ -253,7 +253,8 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         0 => {
             // No concrete contribution; emit a fresh Infer slot.
             // check_fully_typed reports it as UnresolvedInfer if it
-            // survives.
+            // survives. Scope-free: the slot is an error placeholder that
+            // never takes a bound, so it has no telescope to close against.
             Type::Infer(InferVar::fresh(0))
         }
         1 => all.remove(0),

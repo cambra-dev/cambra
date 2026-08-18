@@ -678,9 +678,10 @@ fn constrain_go_impl(
         // onto the two content sides.
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
+                let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone());
+                crate::ccl::infer_var::observe_bound_scope(lv, "upper", &bound);
                 let mut s = lv.bounds.borrow_mut();
-                s.upper_mut()
-                    .push(Bound::edge(sl.clone(), rhs.clone(), sr.clone()));
+                s.upper_mut().push(bound);
                 Rc::clone(s.lower())
             };
             // A var-var edge carries the watch downward (see `link_watches`); the
@@ -712,9 +713,10 @@ fn constrain_go_impl(
         // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
+                let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone());
+                crate::ccl::infer_var::observe_bound_scope(rv, "lower", &bound);
                 let mut s = rv.bounds.borrow_mut();
-                s.lower_mut()
-                    .push(Bound::edge(sr.clone(), lhs.clone(), sl.clone()));
+                s.lower_mut().push(bound);
                 Rc::clone(s.upper())
             };
             // Deliver the contribution to any trait obligation this variable is an
@@ -1065,8 +1067,10 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 return Type::Infer(Rc::clone(existing));
             }
             // Conservative approximation: a fresh variable at the target
-            // level, linked to the original by the appropriate bound.
-            let nvs = InferVar::fresh(target_level);
+            // level, linked to the original by the appropriate bound. It
+            // proxies the original, so it inherits the original's telescope —
+            // the bounds copied below close against the same scope.
+            let nvs = InferVar::fresh_in(target_level, &tv.telescope);
             cache.insert((tv.uid, pol), Rc::clone(&nvs));
             copy_watches(tv, &nvs);
 
@@ -1162,7 +1166,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             let nvs = cached_pos
                 .clone()
                 .or_else(|| cached_neg.clone())
-                .unwrap_or_else(|| InferVar::fresh(target_level));
+                .unwrap_or_else(|| InferVar::fresh_in(target_level, &tv.telescope));
             // Which bound links does the reused proxy already carry? A polar
             // proxy under the `true` key has the positive link (`tv <: proxy`);
             // under the `false` key, the negative link (`proxy <: tv`). A fresh

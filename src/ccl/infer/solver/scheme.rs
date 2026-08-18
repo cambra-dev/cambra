@@ -321,7 +321,10 @@ pub fn freshen_above(
                 FreshenLevel::At(level) => level,
                 FreshenLevel::Preserve => tv.level,
             };
-            let v = InferVar::fresh(new_level);
+            // A freshened clone stands where the original stood, so it
+            // inherits the original's telescope: the bounds copied below were
+            // recorded against that scope.
+            let v = InferVar::fresh_in(new_level, &tv.telescope);
             cache.vars.insert(tv.uid, Rc::clone(&v));
 
             // Snapshot bounds before recursing — the recursion may touch
