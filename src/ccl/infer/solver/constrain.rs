@@ -153,7 +153,9 @@ pub struct ConstrainCache {
     /// (`src/ccl/design/type-inference.md`, "The invariant"). A post-pass
     /// re-derivation does not: its refinements legitimately reference binders the
     /// pass it runs after erased, and its variables are throwaway comparison
-    /// state that reaches no output type.
+    /// state that reaches no output type. The `Fun`/`Fun` codomain opening
+    /// asks the same question: the live solve opens only toward a side carrying
+    /// inference variables, a re-derivation unconditionally.
     live_solve: bool,
 }
 
@@ -542,11 +544,31 @@ fn constrain_go_impl(
             // reference this arrow's binder as indices — opens at its own
             // binder name before the edge decomposes it, so fragments
             // recorded on inner variables are name-referenced against their
-            // telescopes and the correspondence above applies to them. The
-            // pre-scan keeps the common index-free codomain untouched.
-            let open = |n: &Option<crate::ccl::Name>, c: &Type| -> Option<Type> {
+            // telescopes and the correspondence above applies to them.
+            //
+            // On the live solve, opening is gated on the **opposite** side
+            // carrying inference variables: only a live side records
+            // fragments, so only there would a dangling index land. A ground
+            // closed-closed pair compares index-to-index instead — opening it
+            // at display names would let an unrelated *free* reference that
+            // happens to share the binder's spelling capture the reopened
+            // index (found by the differential oracle; with uniquified
+            // binders the collision needs the same uid, which *is* the same
+            // binder, but the ground relation must not depend on that
+            // convention). A post-pass re-derivation opens unconditionally: it
+            // reconciles types that different passes spelled in different
+            // coordinates (a closed arrow's codomain against a rebuilt,
+            // discharged one). That is the same question
+            // [`ConstrainCache::live_solve`] already answers for the record
+            // sites, so this reads the flag rather than adding a second one.
+            // The pre-scan keeps the common index-free codomain untouched.
+            let open = |n: &Option<crate::ccl::Name>, c: &Type, other: &Type| -> Option<Type> {
                 match n {
-                    Some(b) if crate::ccl::subst::contains_pi_bound(c) => {
+                    Some(b)
+                        if crate::ccl::subst::contains_pi_bound(c)
+                            && (!cache.live_solve
+                                || crate::ccl::subst::type_contains_infer(other)) =>
+                    {
                         Some(crate::ccl::subst::open_pi_binder(
                             &crate::ccl::subst::Mapping::Rename(b.clone()),
                             c,
@@ -555,8 +577,8 @@ fn constrain_go_impl(
                     _ => None,
                 }
             };
-            let c0_opened = open(n0, c0);
-            let c1_opened = open(n1, c1);
+            let c0_opened = open(n0, c0, c1);
+            let c1_opened = open(n1, c1, c0);
             // The domain edge. A *compute* domain is contravariant: it is a
             // parameter, nothing can enumerate it, and accepting more inputs than
             // demanded only under-promises. A **data** domain is *invariant* — it is

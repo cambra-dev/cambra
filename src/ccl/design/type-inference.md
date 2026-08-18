@@ -1000,7 +1000,11 @@ A post-pass re-derivation (`ConstrainCache::post_pass`) observes without
 enforcing: it walks trees where a later pass has erased binders (a
 post-elimination claim legitimately references a compiled-away comprehension
 binder), and its variables are throwaway comparison state that never
-reaches an output type.
+reaches an output type. The `Fun`/`Fun` codomain opening reads the same flag,
+so one distinction serves both sites: the live solve opens only toward a side
+carrying inference variables, where a dangling index could land on a recorded
+fragment, and a re-derivation opens unconditionally because it is reconciling
+two passes' spellings of one type.
 
 Sources stay name-referenced and outside the telescope: a source name is a
 unique global identifier with no binding structure, the same standing
