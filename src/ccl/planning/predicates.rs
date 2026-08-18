@@ -223,3 +223,111 @@ fn compile_refinements(refinements: &mut RefinementSet, base: &Type, memo: &Pred
         });
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::ccl_utils::trivially_true_predicate;
+    use crate::ccl::context::Phase;
+    use crate::ccl::provenance::{NodeId, PhaseScope, ProvenanceTable, TableSession};
+    use crate::ccl::{BaseType, Lit, Name};
+    use std::collections::HashSet;
+
+    /// Every id reachable from `e`, main tree only.
+    fn ids_of(e: &Expr) -> HashSet<NodeId> {
+        let mut out = HashSet::new();
+        fn go(e: &Expr, out: &mut HashSet<NodeId>) {
+            out.insert(e.node_id());
+            e.walk_children(&mut |c| go(c, out));
+        }
+        go(e, &mut out);
+        out
+    }
+
+    /// Walk `parents` back from `id` until it reaches an id in `roots`, or runs
+    /// out of rows. `None` when the ancestry never reaches one.
+    fn resolves_into(table: &ProvenanceTable, id: NodeId, roots: &HashSet<NodeId>) -> bool {
+        let mut frontier = vec![id];
+        let mut seen = HashSet::new();
+        while let Some(n) = frontier.pop() {
+            if roots.contains(&n) {
+                return true;
+            }
+            if !seen.insert(n) {
+                continue;
+            }
+            frontier.extend_from_slice(table.parents(n));
+        }
+        false
+    }
+
+    /// Raise `bare` out of a predicate under a recording naming `site`, and
+    /// report which of the result's nodes reach the predicate and which reach
+    /// the site.
+    fn raise(bare: &Expr, site: NodeId) -> (ProvenanceTable, Expr, HashSet<NodeId>) {
+        let pred_ids = ids_of(bare);
+        let session = TableSession::install();
+        let raised = {
+            let _scope = PhaseScope::enter(Phase::Planning);
+            let _g = provenance::enter(site, "test.raise", provenance::Nature::Machinery);
+            fn_of_bare_predicate(&Type::Base(BaseType::Int), bare)
+        };
+        (session.into_table(), raised, pred_ids)
+    }
+
+    /// **Both paths of `fn_of_bare_predicate` attribute the raised predicate to
+    /// the predicate**, never to the term-tree site the recording names.
+    ///
+    /// The fast path clones, and a clone's copy names the node it was freshened
+    /// from, so the predicate's parentage rides along by construction. The slow
+    /// path η-expands and lambda-eliminates, minting a `Lambda` that descends
+    /// from the site — but that wrapper is consumed by the elimination rather
+    /// than placed, so it composes away as a transient and every node that
+    /// reaches the output still resolves into the predicate.
+    ///
+    /// This is what makes the two agree. Before `lambda_elim` recorded, the
+    /// slow path's whole product landed on the site, because the sub-run's
+    /// mints fell through to the enclosing recording.
+    #[test]
+    fn both_raising_paths_attribute_the_predicate_to_the_predicate() {
+        let int_ty = Type::Base(BaseType::Int);
+        let bool_ty = Type::Base(BaseType::Bool);
+        let elem = || Expr::var(Name::elem()).with_ty(int_ty.clone());
+        // A real `𝐷 ⇒ Bool`, so the deep typechecker accepts the η-expansion the
+        // slow path builds.
+        let pred_fn = |domain: Type| trivially_true_predicate(domain);
+
+        // Fast path: already `__elem ▷ p`, so the raise is a single clone of `p`.
+        let fast = Expr::apply(elem(), pred_fn(int_ty.clone())).with_ty(bool_ty.clone());
+        // Slow path, constant: `__elem` is not free, so elimination emits
+        // `const(e)` and the η-wrapper never reaches the output.
+        let slow_const = Expr::lit(Lit::Bool(false)).with_ty(bool_ty.clone());
+        // Slow path, `__elem` free: `__elem ▷ p ▷ q`, whose outer argument is an
+        // application rather than the bare `__elem`, so the fast path declines.
+        let slow_free = Expr::apply(
+            Expr::apply(elem(), pred_fn(int_ty.clone())).with_ty(bool_ty.clone()),
+            pred_fn(bool_ty.clone()),
+        )
+        .with_ty(bool_ty.clone());
+
+        for (name, bare) in [
+            ("fast", fast),
+            ("slow/constant", slow_const),
+            ("slow/free", slow_free),
+        ] {
+            let site = NodeId::fresh();
+            let (table, raised, pred_ids) = raise(&bare, site);
+            let site_only = HashSet::from([site]);
+            for id in ids_of(&raised) {
+                assert!(
+                    resolves_into(&table, id, &pred_ids),
+                    "{name}: {id:?} does not resolve into the predicate",
+                );
+                assert!(
+                    !resolves_into(&table, id, &site_only),
+                    "{name}: {id:?} resolves to the term-tree site instead",
+                );
+            }
+        }
+    }
+}

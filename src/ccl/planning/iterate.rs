@@ -394,11 +394,10 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     let Some(domain_ty) = expr.ty.domain() else {
         return;
     };
-    // The recording names the site being wrapped.
-    //
-    // These rows reach no table in a normal compile: `compile_program` calls
-    // `planning::run` outside every pass scope it opens, so they land only under
-    // `CAMBRA_PROVENANCE_AUDIT=planning` (`recognized..join-planned`).
+    // The recording names the site being wrapped. The predicate lifted out of
+    // the type lands as a `Copy` of the term it was freshened from, so it keeps
+    // the predicate's parentage rather than taking this site's — see
+    // `both_raising_paths_attribute_the_predicate_to_the_predicate`.
     let _g = provenance::enter(
         expr.node_id(),
         "planning.iterate",

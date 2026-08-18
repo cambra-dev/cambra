@@ -117,13 +117,10 @@ pub(crate) struct PaneSpec {
     /// constant no correct recording elsewhere can drive down, so gating it would
     /// pin churn rather than catch a defect. Flip it in the commit that
     /// instruments the last phase in the pair, the same way an audit span's
-    /// endpoint moves. Unused on the anchor, which has no pair.
-    ///
-    /// TODO(provenance-audit-retire): this bit and
-    /// [`MaterializedPanes::gated_pane_pairs`] exist only to describe a
-    /// half-instrumented pipeline. Both go when the last phase records, leaving
-    /// [`gate_leaks`] over every pair. See `design/provenance.md`, "What retires
-    /// when the last phase records".
+    /// endpoint moves. Unused on the anchor, which has no pair. A pane may be
+    /// issued at any point in the pipeline, so the bit outlives any one pair
+    /// becoming gated; see `src/ccl/design/provenance.md`, "What gating every
+    /// pair does not retire".
     pub(crate) gated: bool,
 }
 
@@ -135,11 +132,10 @@ pub(crate) struct PaneSpec {
 /// empty and its `gated` is unused — its projection is the lowering projection
 /// rather than a fold product.
 ///
-/// The bottom pair is ungated because `planning` mints with nothing open. Every
-/// pair above it holds at zero on whatever the caller compiles — true of
-/// `pre-inference → post-inference` only once the fold's id domain was widened to
-/// the slot domain the passes rewrite and inference's per-instantiation predicate
-/// freshen took a copy recording.
+/// Every pair is gated, so the leak classes hold at zero over whatever the caller
+/// compiles. `pre-inference → post-inference` reaches that only because the fold's
+/// id domain was widened to the slot domain the passes rewrite and inference's
+/// per-instantiation predicate freshen took a copy recording.
 pub(crate) const PANES: [PaneSpec; 6] = [
     PaneSpec {
         name: "pre-inference",
@@ -174,7 +170,7 @@ pub(crate) const PANES: [PaneSpec; 6] = [
     PaneSpec {
         name: "post-planning",
         phases: &[Phase::Planning],
-        gated: false,
+        gated: true,
     },
 ];
 
@@ -311,6 +307,10 @@ mod tests {
             (
                 "inner_join",
                 include_str!("../../tests/programs/inner_join/program.cambra").to_string(),
+            ),
+            (
+                "join_then_groupby",
+                include_str!("../../tests/programs/join_then_groupby/program.cambra").to_string(),
             ),
             (
                 "prefix_lines",
@@ -471,32 +471,46 @@ mod tests {
     /// difference visible, so it lists names and not a total.
     const EXERCISED_BOUNDARIES: &[&str] = &[
         "arithmetic / post-as-of-read → post-lambda-elim",
+        "arithmetic / post-lambda-elim → post-planning",
         "arithmetic / pre-inference → post-inference",
         "feed_loop / post-as-of-read → post-lambda-elim",
         "feed_loop / post-inference → post-channelize",
+        "feed_loop / post-lambda-elim → post-planning",
         "feed_loop / pre-inference → post-inference",
         "filter_and_aggregate / post-as-of-read → post-lambda-elim",
+        "filter_and_aggregate / post-lambda-elim → post-planning",
         "filter_and_aggregate / pre-inference → post-inference",
         "for_accumulator / post-as-of-read → post-lambda-elim",
         "for_accumulator / post-inference → post-channelize",
+        "for_accumulator / post-lambda-elim → post-planning",
         "for_accumulator / pre-inference → post-inference",
         "generator_pipeline / post-as-of-read → post-lambda-elim",
         "generator_pipeline / post-inference → post-channelize",
+        "generator_pipeline / post-lambda-elim → post-planning",
         "generator_pipeline / pre-inference → post-inference",
         "group_by / post-as-of-read → post-lambda-elim",
+        "group_by / post-lambda-elim → post-planning",
         "group_by / pre-inference → post-inference",
         "inner_join / post-as-of-read → post-lambda-elim",
+        "inner_join / post-lambda-elim → post-planning",
         "inner_join / pre-inference → post-inference",
+        "join_then_groupby / post-as-of-read → post-lambda-elim",
+        "join_then_groupby / post-lambda-elim → post-planning",
+        "join_then_groupby / pre-inference → post-inference",
         "prefix_lines / post-as-of-read → post-lambda-elim",
+        "prefix_lines / post-lambda-elim → post-planning",
         "prefix_lines / pre-inference → post-inference",
         "streaming_echo / post-as-of-read → post-lambda-elim",
+        "streaming_echo / post-lambda-elim → post-planning",
         "streaming_echo / pre-inference → post-inference",
         "transaction / post-as-of-read → post-lambda-elim",
         "transaction / post-channelize → post-as-of-read",
         "transaction / post-inference → post-channelize",
+        "transaction / post-lambda-elim → post-planning",
         "transaction / pre-inference → post-inference",
         "udf_chain / post-as-of-read → post-lambda-elim",
         "udf_chain / post-inference → post-channelize",
+        "udf_chain / post-lambda-elim → post-planning",
         "udf_chain / pre-inference → post-inference",
     ];
 
@@ -779,9 +793,10 @@ mod tests {
                 Phase::Infer,
                 Phase::LambdaElim,
                 Phase::Letrec,
+                Phase::Planning,
                 Phase::Transact
             ],
-            "the transaction fixture is rewritten by exactly these six phases",
+            "the transaction fixture is rewritten by exactly these seven phases",
         );
     }
 

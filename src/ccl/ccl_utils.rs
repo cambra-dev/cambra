@@ -1472,6 +1472,13 @@ impl<C: PartialEq + Clone> PredMemo<C> {
     /// merely walks past is never reallocated and stays pointer-shared with
     /// occurrences the pass never visits.
     ///
+    /// TODO(discarded-copy): a `false` report still pays for a full copy. `f`
+    /// takes `&mut Expr`, so the predicate is cloned before there is any way to
+    /// know whether `f` will change it, and a `false` answer discards the clone.
+    /// The copy is captured and recorded like any other, so the table gains
+    /// entries for nodes no tree ends up holding. Neither a correctness nor a
+    /// soundness gap — it bloats the table.
+    ///
     /// Returns whether the slot ended up pointing somewhere new — which is *not*
     /// just `f`'s answer. A nested reuse inside `f` can re-point a slot in the copy
     /// with `f` having nothing of its own to report; discarding the copy would then
