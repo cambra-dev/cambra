@@ -38,10 +38,20 @@
 //! [`FunKindVar`](crate::ccl::ty::FunKindVar) already uses for kinds; no phase runs
 //! "once everything is known". Each operand position carries a **candidate set** of
 //! instances that only ever shrinks ([`TraitObligation::narrow`]), and each
-//! associated type is deposited on its position as an ordinary lower bound once every
-//! surviving candidate *agrees* on it ([`TraitObligation::try_deposit`]) — agreement,
-//! not a lone survivor. A deposit reaches **associated positions only**; nothing is
-//! ever written back onto an operand.
+//! associated type is deposited on its position once every surviving candidate *agrees*
+//! on it ([`TraitObligation::try_deposit`]) — agreement, not a lone survivor.
+//!
+//! Delivery only ever offers one contribution at a time, so it cannot see two
+//! requirements that are individually satisfiable and jointly are not.
+//! [`resolve_operand_requirements`] is the pass that reads a value's requirements
+//! together: an empty intersection is rejected, and a singleton is deposited as an
+//! **upper** bound on the operand — the polarity is what keeps that a restatement of
+//! the requirement rather than an invented value.
+//!
+//! Its unit is a [`Place`] — one value, however many variables stand at it — rather
+//! than a variable, because a multi-parameter lambda passes its parameters through a
+//! tuple and so splits one value's occurrences across several variables. Currying a
+//! program must not change what it means.
 //!
 //! A refinement narrows exactly as its base does: `{𝑇 | 𝑝}` satisfies a trait when `𝑇`
 //! does, because satisfaction is judged on each bound contribution as it arrives and
@@ -51,19 +61,20 @@
 //!
 //! `src/ccl/design/type-inference.md`, "Traits" is the design of record, and carries
 //! the arguments this module only acts on: why the constraint lattice cannot state an
-//! operator's requirement on its own, why a deposit is one-way and waits for agreement,
-//! why refinement transparency is permanent rather than a convenience, what the tables
-//! hold and what that does *not* say about resolution, and what a trait would relate
-//! beyond types — associated *functions*, which the shape here allows and does not yet
-//! have. Which operators state which requirement, and which take a fixed result rather
-//! than an associated one, is `schemes.rs`'s business, not this module's.
+//! operator's requirement on its own, why the two deposit polarities are not the same
+//! move, why the requirement sweep sits between emission and coalesce and runs to a
+//! fixpoint, why refinement transparency is permanent rather than a convenience, what
+//! the tables hold and what that does *not* say about resolution, and what a trait
+//! would relate beyond types — associated *functions*, which the shape here allows and
+//! does not yet have. Which operators state which requirement, and which take a fixed
+//! result rather than an associated one, is `schemes.rs`'s business, not this module's.
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::ccl::{BaseType, InferVar, Type};
+use crate::ccl::{BaseType, FieldKey, InferVar, InferVarId, Type};
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
 
@@ -73,7 +84,9 @@ use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
 /// Closed and built-in. The set is the operators the language has, not a user
 /// vocabulary — but the instances are already *data* ([`Trait::instances`]), so a
 /// user-declared trait is a table extension rather than a new mechanism.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `Ord` so a diagnostic can order the requirements it lists. Resolution does not
+/// depend on it: a candidate set is a set, and the verdict is an intersection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Trait {
     /// `+` over `(𝐴, 𝐵)`, associating `Output`. The `(String, String) ⇝ String` row is
     /// why surface `+` on strings types through arithmetic; `simplify` rewrites it to
@@ -432,13 +445,21 @@ impl TraitObligation {
             trait_: self.trait_,
             position: pos,
             found: found.clone(),
-            accepted: self
-                .candidates
-                .borrow()
-                .iter()
-                .filter_map(|i| i.args.get(pos as usize).cloned())
-                .collect(),
+            accepted: self.accepted_at(pos),
         })
+    }
+
+    /// The trait's operand positions *other* than `pos`, with what each still accepts.
+    ///
+    /// Arity is read off a surviving row rather than stored: every row of a trait has
+    /// a type at every position that trait declares, which is the same invariant
+    /// [`accepted_at`](Self::accepted_at) rests on.
+    fn siblings_of(&self, pos: u8) -> Vec<(u8, Vec<BaseType>)> {
+        let arity = self.candidates.borrow().first().map_or(0, |i| i.args.len());
+        (0..arity as u8)
+            .filter(|i| *i != pos)
+            .map(|i| (i, self.accepted_at(i)))
+            .collect()
     }
 
     /// Restrict position `pos` to instances accepting `base`, then deposit the
@@ -453,15 +474,23 @@ impl TraitObligation {
         base: &BaseType,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
+        // Read before the mutable borrow: "what this position could have accepted" is
+        // only meaningful before the contribution rules rows out.
+        let accepted = self.accepted_at(pos);
         {
             let mut candidates = self.candidates.borrow_mut();
-            let accepted: Vec<BaseType> = candidates
-                .iter()
-                .filter_map(|i| i.args.get(pos as usize).cloned())
-                .collect();
+            #[cfg(debug_assertions)]
+            let before = candidates.len();
             // A candidate with no such position is one this trait's arity does not
             // reach; it cannot accept the contribution, so it drops out too.
             candidates.retain(|i| i.args.get(pos as usize) == Some(base));
+            // Re-delivery of a fact already recorded is the common case and changes
+            // nothing; only an actual shrink can move the verdict this obligation
+            // contributes, so only a shrink is worth policing.
+            #[cfg(debug_assertions)]
+            if candidates.len() < before {
+                assert_narrowing_is_still_open(self);
+            }
             if candidates.is_empty() {
                 return Err(ConstrainError::NoTraitInstance {
                     trait_: self.trait_,
@@ -507,6 +536,10 @@ impl TraitObligation {
     ///
     /// Order follows the instance table, so a caller that picks positionally picks
     /// reproducibly.
+    ///
+    /// Never empty for a position the trait's arity reaches: a candidate set is
+    /// non-empty by invariant (emptying it is the error), and every instance of a
+    /// trait carries a type at every position that trait declares.
     pub fn accepted_at(&self, pos: u8) -> Vec<BaseType> {
         self.candidates
             .borrow()
@@ -625,6 +658,528 @@ pub fn verify_narrowing_is_complete(resolve: impl Fn(&Type) -> Option<Type>) {
             );
         }
     });
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// The obligation-counter high-water mark at the moment the requirement sweep
+    /// finished, or `None` before it runs.
+    ///
+    /// [`resolve_operand_requirements`] reads candidate sets as final. They are, *for
+    /// the obligations that matter*: a generalized definition's subtree is never
+    /// coalesced in place, so its variables take no new bounds afterwards, and the
+    /// narrowing that does continue during coalesce acts on the per-instantiation
+    /// clones `freshen_watches` mints — obligations that did not exist when the sweep
+    /// ran. The mark is what makes that checkable rather than merely argued: see
+    /// [`assert_narrowing_is_still_open`].
+    static EMISSION_MARK: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// Open the narrowing window, discarding any previous run's mark.
+///
+/// Called from [`InferArena::new`](crate::ccl::infer::InferArena::new), which is the
+/// construct whose lifetime this state shares: the mark is per-run for the same reason
+/// the variable capture is. Resetting it is not optional bookkeeping. The mark is a
+/// high-water mark of a *process-global* counter, so a stale one left by an earlier run
+/// on this thread sits below every obligation the current run mints, and
+/// [`assert_narrowing_is_still_open`] would pass vacuously instead of being inert —
+/// checking nothing, and silently, which is the failure mode it exists to prevent.
+#[cfg(debug_assertions)]
+pub fn unseal_emission() {
+    EMISSION_MARK.with(|m| m.set(None));
+}
+
+/// Close it, recording which obligations existed at that point.
+///
+/// Asserts the window was open, so the pairing with [`unseal_emission`] is checked
+/// rather than remembered: a run that reached here without opening one is a run whose
+/// mark belongs to a different run.
+#[cfg(debug_assertions)]
+pub fn seal_emission() {
+    EMISSION_MARK.with(|m| {
+        debug_assert!(
+            m.get().is_none(),
+            "sealing a window that was never opened — this run inherited mark {:?} from \
+             an earlier run on this thread, so `unseal_emission` did not run at arena \
+             entry",
+            m.get(),
+        );
+        m.set(Some(OBLIGATION_COUNTER.load(Ordering::Relaxed)));
+    });
+}
+
+/// After emission, only an obligation minted *since* emission — a freshened clone —
+/// may still narrow.
+///
+/// This is the timing assumption [`resolve_operand_requirements`] rests on, and it is
+/// exactly the kind that fails silently: a pass that narrowed a *definition's*
+/// obligation during coalesce would leave the check reading a stale candidate set and
+/// quietly stop rejecting programs it used to reject. Measured across the suite the
+/// violation count is zero; this keeps it that way by name rather than by
+/// re-measurement.
+#[cfg(debug_assertions)]
+fn assert_narrowing_is_still_open(obligation: &Rc<TraitObligation>) {
+    EMISSION_MARK.with(|m| {
+        let Some(mark) = m.get() else {
+            return;
+        };
+        debug_assert!(
+            obligation.uid.0 >= mark,
+            "{obligation:?} was minted during emission but narrowed after it — \
+             `resolve_operand_requirements` read this obligation's candidate set as \
+             final at end of emission, so whatever narrowed it here is invisible to the \
+             check. Either the check has to move later, or this write belongs in \
+             emission.",
+        );
+    });
+}
+
+/// One requirement a single operand carries: which trait asked, at which of its
+/// positions, and what that position can still accept.
+///
+/// Several on one variable is the ordinary case — `𝑥 + 1 > 2` requires `Addable` and
+/// `Orderable` of `𝑥` — and they compose exactly when some type satisfies them all.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OperandRequirement {
+    /// The trait that placed the requirement.
+    pub trait_: Trait,
+    /// Which of its operand positions this variable stands at.
+    pub position: u8,
+    /// The bases still accepted there.
+    pub accepted: Vec<BaseType>,
+    /// The trait's *other* operand positions and what each still accepts.
+    ///
+    /// A requirement on its own reads as an unexplained demand — "only `Int` here" is
+    /// a consequence, not a premise. What narrowed the position is the type that
+    /// reached the operand beside it, so carrying the siblings lets a diagnostic say
+    /// where the demand came from without any provenance being recorded: they are read
+    /// off the same candidate set. Empty for a unary trait, which has no beside.
+    pub siblings: Vec<(u8, Vec<BaseType>)>,
+}
+
+/// Find an operand no type can satisfy: two or more requirements on one variable
+/// whose accepted sets have nothing in common.
+///
+/// **The one check narrowing cannot make.** Narrowing is push-based, so an obligation
+/// learns only what is *delivered*, and in `λ 𝑎 → (𝑎 + 1, 𝑎 + "s")` each of the two
+/// obligations was narrowed through its **other** operand — one to `{Int}`, the other
+/// to `{String}`. Neither set is empty, so neither failed; nothing compared them, and
+/// the definition type-checked despite being ill-typed for every possible argument.
+/// Delivery cannot close this, because the hole *is* the case where no type arrives.
+///
+/// So the requirements are read together — the move coalesce makes on a variable's
+/// bounds, applied to its obligations. `vars` is every variable minted during the run,
+/// which is the only enumeration that reaches a definition: a generalized definition's
+/// subtree is deliberately never coalesced in place, so walking the tree would see
+/// only use-site clones, and a clone that goes unsatisfiable already fails by delivery.
+///
+/// Returns the offending variable alongside its requirements; the caller supplies
+/// blame, because node identity belongs to the tree and not to the solver.
+pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Result<(), OperandFailure> {
+    // A deposit is an ordinary `constrain_subtype`, so it can deliver a base to another
+    // variable's watches and shrink *their* candidate sets — which can determine a
+    // value that was open when this pass looked at it. So the sweep runs to a fixpoint
+    // rather than once. It terminates because candidate sets only shrink and the base
+    // vocabulary is finite; `deposited` is what makes "nothing new happened" cheap to
+    // decide, since re-depositing a bound the graph already carries is not progress.
+    let mut deposited: std::collections::HashSet<(InferVarId, BaseType)> =
+        std::collections::HashSet::new();
+    loop {
+        let before = deposited.len();
+        // Re-read the arena every pass rather than snapshotting once. Every variable
+        // being a root is what makes the sweep complete — it is why a function's domain
+        // needs no traversal of its own — and a deposit is an ordinary
+        // `constrain_subtype`, which is entitled to mint variables (an extrusion proxy,
+        // which `copy_watches` gives the original's requirements). Measured, the arena
+        // does not currently grow here; re-reading makes that irrelevant instead of
+        // load-bearing.
+        resolve_pass(&crate::ccl::infer_var::arena_vars(), cache, &mut deposited)?;
+        if deposited.len() == before {
+            return Ok(());
+        }
+    }
+}
+
+/// One step into a value: how a sub-place is reached from the place above it.
+///
+/// Distinguished rather than collapsed onto [`FieldKey`] because a record field and a
+/// variant arm of the same name are different positions, and a function's result is
+/// neither. Merging any two of them would intersect requirements that constrain
+/// different values, which is how a sweep like this produces a *false* rejection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Step {
+    /// A tuple position or a record field.
+    Field(FieldKey),
+    /// A variant arm's payload.
+    Arm(FieldKey),
+    /// A function's result. Its *domain* is deliberately not a step — see
+    /// [`places_under`].
+    Result,
+    /// A history's value (the cell or element a `Mut`/`Feed` handle carries).
+    HistoryValue,
+}
+
+/// The descent that reaches one place from the root of a sweep: the path of [`Step`]s
+/// taken, empty at the root itself.
+///
+/// Only ever a **key**, and only within one [`places_under`] call — two roots' paths
+/// name unrelated values and are never compared. Nothing reads it back; it exists so
+/// that variables reached by different routes land in the same bucket iff they stand
+/// for the same value.
+type StepPath = Vec<Step>;
+
+/// A **place**: one value, as the set of variables standing at it and every requirement
+/// landing on them.
+///
+/// The unit a requirement actually constrains, and the reason it is not the variable:
+/// `λ 𝑎 𝑏 → …` uncurries to a lambda over a tuple and rewrites each occurrence of
+/// `𝑎` to a projection of it, so each occurrence has its own variable and none carries
+/// both of `𝑎`'s requirements, even though both constrain one value. Curried, `𝑎` is a
+/// binder its occurrences share and one variable carries both — so a place holds
+/// however many variables the spelling happens to split the value across, and the
+/// intersection is taken over the whole set.
+#[derive(Default)]
+struct Place {
+    vars: Vec<Rc<InferVar>>,
+    reqs: Vec<(Rc<TraitObligation>, u8)>,
+}
+
+/// Strip every refinement layer, as [`offered`] does: `{𝑇 | 𝑝}` constrains a place
+/// exactly as `𝑇` does, so structure underneath a refinement is still structure.
+fn peel_refinements(ty: &Type) -> &Type {
+    let mut cur = ty;
+    while let Type::Refinement(inner, _) = cur {
+        cur = inner;
+    }
+    cur
+}
+
+/// Group everything reachable from `root` into the [`Place`] it constrains, keyed by
+/// the [`StepPath`] that reaches it.
+///
+/// Follows **upper** bounds, because `𝑣 <: 𝑈` means `𝑣`'s value reaches `𝑈` and so a
+/// requirement on `𝑈` is a requirement on `𝑣`. A variable upper bound stays at the
+/// same place; a *structural* one descends — `𝑣 <: (𝑈₀, 𝑈₁)` says `𝑣`'s component 0
+/// reaches `𝑈₀`, so `𝑈₀`'s requirements belong to the place one field deeper, never to
+/// `𝑣` itself.
+///
+/// Why this reads the graph once at the end rather than reusing `link_watches`, and
+/// why the grouping is what licenses each step, are in
+/// `src/ccl/design/type-inference.md`, "The unit is a place, not a variable". The arms
+/// below carry the per-former reason; the design doc does not repeat them.
+///
+/// The match on a bound's type is **exhaustive on purpose**. What the sweep reaches is
+/// what "every requirement is read" means, so a new [`Type`] variant that can hold a
+/// type has to fail this build and be classified deliberately — a wildcard arm would
+/// let the grammar grow while the sweep quietly stopped covering it, and nothing would
+/// fail. Peeling refinements at every step is the same concern one level down: matching
+/// a bound's type directly would let a refined structural bound fall through to the
+/// leaf arm, and the walk would stop at a place it should have descended past.
+///
+/// `seen` is keyed on the *pair*, so a variable revisited at a different place is
+/// revisited — which is correct, and which means a cycle through a **structural** upper
+/// bound (`𝑣 <: (𝑢)`, `𝑢 <: (𝑣)`) would lengthen the path forever rather than being
+/// absorbed. A variable cycle is fine: the path does not grow, so `seen` closes it.
+/// Nothing builds the structural kind today — source-level recursion does not reach
+/// inference (a self-call is an unbound variable) and `LetRec` is born after it — so
+/// this is a precondition to re-check when recursive definitions arrive, not a live
+/// hazard.
+fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Place> {
+    let mut out: std::collections::BTreeMap<StepPath, Place> = Default::default();
+    let mut seen: std::collections::HashSet<(InferVarId, StepPath)> = Default::default();
+    let mut frontier = vec![(Rc::clone(root), StepPath::new())];
+    while let Some((var, path)) = frontier.pop() {
+        if !seen.insert((var.uid, path.clone())) {
+            continue;
+        }
+        let entry = out.entry(path.clone()).or_default();
+        entry.vars.push(Rc::clone(&var));
+        for (obligation, pos) in var.watches.borrow().iter() {
+            if !entry
+                .reqs
+                .iter()
+                .any(|(o, p)| o.uid == obligation.uid && p == pos)
+            {
+                entry.reqs.push((Rc::clone(obligation), *pos));
+            }
+        }
+        for bound in var.bounds.borrow().upper().iter() {
+            // Refinements are peeled at every step, for the same reason `offered` peels
+            // them: `{𝑇 | 𝑝}` constrains a place exactly as `𝑇` does, so a refined
+            // bound must not hide the structure underneath it.
+            match peel_refinements(&bound.ty) {
+                Type::Infer(up) => frontier.push((Rc::clone(up), path.clone())),
+                Type::Tuple(elems) => {
+                    for (i, elem) in elems.iter().enumerate() {
+                        descend(elem, &path, Step::Field(FieldKey::Index(i)), &mut frontier);
+                    }
+                }
+                Type::Record(fields) => {
+                    for (name, ty) in fields {
+                        let key = FieldKey::Name(name.as_str().into());
+                        descend(ty, &path, Step::Field(key), &mut frontier);
+                    }
+                }
+                Type::Variant(arms) => {
+                    for (tag, payload) in arms {
+                        descend(payload, &path, Step::Arm(tag.clone()), &mut frontier);
+                    }
+                }
+                // The result only. Two codomains consume one value and group; two
+                // domains are two arguments and must not — the argument is in
+                // `src/ccl/design/type-inference.md`, "The unit is a place, not a
+                // variable".
+                //
+                // Measured, so the exclusion is not read as a known counterexample:
+                // descending into the domain as well changes no test outcome. Two
+                // incompatible sources for one monomorphic domain are already an
+                // `IncompatibleBounds`, and a polymorphic one freshens per use. It stays
+                // out because grouping distinct values is unlicensed, not because a
+                // program distinguishes the two traversals.
+                Type::Fun {
+                    domain: _,
+                    codomain,
+                    ..
+                } => descend(codomain, &path, Step::Result, &mut frontier),
+                // The value a register or channel carries is a component of it in the
+                // same sense a field is; the domain beside it is an index, not a value
+                // this place holds.
+                Type::History { value, .. } => {
+                    descend(value, &path, Step::HistoryValue, &mut frontier)
+                }
+                // Leaves: nothing inside to constrain. `Base`/`UIntRange` are concrete,
+                // and the rest are placeholders or nullary carriers.
+                Type::Base(_)
+                | Type::UIntRange(_)
+                | Type::Hole
+                | Type::SharedHole(_)
+                | Type::DataSource(_)
+                | Type::ChanDom(_, _)
+                | Type::Txn => {}
+                // `peel_refinements` returns a non-refinement by construction.
+                Type::Refinement(_, _) => unreachable!("refinements are peeled above"),
+                // `BoundedHole` is a *pre-inference* annotation marker:
+                // `normalize_annotation` erases it into a bounded variable before any
+                // constraint is emitted, so it is never a recorded bound.
+                Type::BoundedHole(_) => unreachable!(
+                    "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
+                ),
+            }
+        }
+    }
+    out
+}
+
+/// A concrete base already on `var` that `required` contradicts, if there is one.
+///
+/// Both directions are read, and neither is redundant. A **lower** bound is a value
+/// that already reaches the variable — an exact annotation, a literal — and it must be
+/// *below* `required`, which for two distinct bases it is not. An **upper** bound is
+/// another ceiling — a monomorphic operator's operand, a bounded annotation — and two
+/// distinct base ceilings have no common value under them. Either way the requirement
+/// cannot be satisfied, and one of the two is what the lattice would have reported.
+///
+/// Bases only. A structural bound is a different mistake (a tuple where a trait wants a
+/// base) and belongs to `Offered::NotABase`, which narrowing already rejects on arrival.
+fn conflicting_base(var: &Rc<InferVar>, required: &BaseType) -> Option<BaseType> {
+    let bounds = var.bounds.borrow();
+    bounds
+        .lower()
+        .iter()
+        .chain(bounds.upper().iter())
+        .filter_map(|b| offered_base(&b.ty))
+        .find(|base| *base != required)
+        .cloned()
+}
+
+/// Queue `ty` one `step` below `path`, if it is a variable once refinements are peeled.
+fn descend(ty: &Type, path: &StepPath, step: Step, frontier: &mut Vec<(Rc<InferVar>, StepPath)>) {
+    if let Type::Infer(up) = peel_refinements(ty) {
+        let mut deeper = path.clone();
+        deeper.push(step);
+        frontier.push((Rc::clone(up), deeper));
+    }
+}
+
+fn resolve_pass(
+    vars: &[Rc<InferVar>],
+    cache: &mut ConstrainCache,
+    deposited: &mut std::collections::HashSet<(InferVarId, BaseType)>,
+) -> Result<(), OperandFailure> {
+    for root in vars {
+        for place in places_under(root).into_values() {
+            if place.reqs.is_empty() {
+                continue;
+            }
+            let mut requirements: Vec<OperandRequirement> = place
+                .reqs
+                .iter()
+                .map(|(obligation, pos)| OperandRequirement {
+                    trait_: obligation.trait_,
+                    position: *pos,
+                    accepted: obligation.accepted_at(*pos),
+                    siblings: obligation.siblings_of(*pos),
+                })
+                .collect();
+            // Sorted so a diagnostic lists them the same way for programs that differ
+            // only in spelling. `place.reqs` is in traversal order, which currying
+            // changes; the verdict does not depend on it, and the message should not
+            // either.
+            requirements.sort();
+            debug_assert!(
+                requirements.iter().all(|r| !r.accepted.is_empty()),
+                "a live obligation accepts something at every position its trait \
+                 declares, but {requirements:?} has an empty set — either a candidate \
+                 set was emptied without raising, or a watch was placed past its \
+                 trait's arity",
+            );
+            // The intersection: bases every requirement at this place accepts.
+            // Commutative, so the verdict does not depend on traversal order.
+            // Owned rather than borrowed from `requirements`, which the failure arms
+            // below move into the diagnostic.
+            let common: Vec<BaseType> = requirements[0]
+                .accepted
+                .iter()
+                .filter(|base| requirements[1..].iter().all(|r| r.accepted.contains(base)))
+                .cloned()
+                .collect();
+            match common.as_slice() {
+                // Nothing satisfies every requirement, so no argument ever could.
+                [] => {
+                    // Narrowest first, then the variable the walk reached them from.
+                    // An *interior* place is reached only through a bound, and blame
+                    // deliberately does not follow bounds, so no node's type can ever
+                    // name a variable standing there — without the root as a candidate
+                    // the walk finds nothing and lands on the tree root, which is a
+                    // different statement entirely rather than a wider one.
+                    let blame = place
+                        .vars
+                        .iter()
+                        .map(|v| v.uid)
+                        .chain(std::iter::once(root.uid))
+                        .collect();
+                    return Err(OperandFailure::Unsatisfiable {
+                        vars: blame,
+                        requirements,
+                    });
+                }
+                // Exactly one base left: the requirements *determine* this value, so say
+                // so on the lattice rather than keeping it to ourselves. This is the
+                // write-back that makes `λ 𝑥 → 𝑥 + 1` infer `Int ⇒ Int` instead of
+                // leaving the parameter open, and it is what lets a requirement collide
+                // with an ordinary bound — an annotation, or a monomorphic operator's
+                // operand — which comparing requirements against each other cannot do.
+                //
+                // An **upper** bound, and the polarity is the whole argument for why
+                // this is not "recovering information the program should have supplied":
+                // it states what may flow in, which is exactly what the requirement
+                // says. It adds no lower bound, so a genuinely under-connected value is
+                // still under-determined afterwards.
+                [only] => {
+                    for var in &place.vars {
+                        // Read the lattice before writing to it. `constrain_subtype`
+                        // *records* a bound rather than checking it against the ones
+                        // already there, so a requirement contradicting an annotation or
+                        // a monomorphic operator's operand would otherwise surface at
+                        // coalesce as a bare `IncompatibleBounds` — twice, once per
+                        // direction, and with no mention of the trait that demanded it.
+                        // The facts are all here, so the diagnostic is made here.
+                        if let Some(found) = conflicting_base(var, only) {
+                            return Err(OperandFailure::ContradictsBound {
+                                vars: place
+                                    .vars
+                                    .iter()
+                                    .map(|v| v.uid)
+                                    .chain(std::iter::once(root.uid))
+                                    .collect(),
+                                requirements,
+                                required: (*only).clone(),
+                                found,
+                            });
+                        }
+                        if !deposited.insert((var.uid, (*only).clone())) {
+                            continue;
+                        }
+                        let deposit = Type::Base((*only).clone());
+                        constrain_subtype(&Type::Infer(Rc::clone(var)), &deposit, cache)
+                            .map_err(|error| OperandFailure::Conflict { error })?;
+                    }
+                    // The bound alone does not reach the obligations at this place: it
+                    // is an *upper* bound and narrowing consumes lower ones. So tell
+                    // them directly. This is not new information — the intersection just
+                    // proved the place accepts nothing else — but recording it is what
+                    // lets the fact travel: pinning `𝑎` to `Int` leaves `Addable(𝑎, 𝑏)`
+                    // with one row, which determines `𝑏` next round.
+                    for (obligation, pos) in &place.reqs {
+                        obligation.narrow(*pos, only, cache).map_err(|error| {
+                            debug_assert!(
+                                false,
+                                "narrowing by a base the intersection just proved \
+                                 acceptable emptied {obligation:?} at operand {pos}",
+                            );
+                            OperandFailure::Conflict { error }
+                        })?;
+                    }
+                }
+                // Several bases still satisfy everything: the requirements genuinely do
+                // not pin the value, and leaving it open is the honest answer.
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Why [`resolve_operand_requirements`] rejected a value.
+pub enum OperandFailure {
+    /// No type satisfies every requirement on it — ill-typed for every argument.
+    ///
+    /// Raised for the first such place found, matching emission next door (also
+    /// fail-fast, also at most one error). *Whether* a program is rejected does not
+    /// depend on order — the intersection is commutative — but *which* place is named,
+    /// when a program has several, follows the order variables were minted in.
+    Unsatisfiable {
+        /// Blame candidates, narrowest first: the variables standing at the offending
+        /// place, then the variable the walk reached them from. The caller takes the
+        /// first one the expression tree actually mentions.
+        ///
+        /// The root is on the list because it is the only candidate an *interior* place
+        /// has. Such a place is reached through a bound, and blame is structural —
+        /// deliberately not following bounds — so no node's type ever names a variable
+        /// standing there, and a list of those alone would always come up empty.
+        vars: Vec<InferVarId>,
+        /// Every requirement landing on that place.
+        requirements: Vec<OperandRequirement>,
+    },
+    /// The requirements determine one base, and the value already carries a different
+    /// one — from an annotation, a literal, or a monomorphic operator's operand.
+    ///
+    /// Distinct from [`Unsatisfiable`](Self::Unsatisfiable): there the requirements
+    /// contradict *each other*, and no bound need exist at all. Here each requirement
+    /// is satisfiable and they agree with one another; what they agree on is what the
+    /// program has already ruled out. Both are "no argument could work", found by
+    /// different comparisons, and only this one has a type to point at.
+    ContradictsBound {
+        /// Blame candidates, as [`Unsatisfiable::vars`](Self::Unsatisfiable).
+        vars: Vec<InferVarId>,
+        /// The requirements, which together determined `required`.
+        requirements: Vec<OperandRequirement>,
+        /// The base they determine.
+        required: BaseType,
+        /// The base already on the value.
+        found: BaseType,
+    },
+    /// The lattice refused the deposit.
+    ///
+    /// **Not known to be reachable.** `constrain_subtype` *records* a bound rather than
+    /// checking it against those already present, so the contradiction this would name
+    /// is caught one step earlier, by reading the bounds directly
+    /// ([`ContradictsBound`](Self::ContradictsBound)). Kept because the call is
+    /// fallible and swallowing its error would be worse than carrying an arm for it.
+    Conflict {
+        /// Whatever the lattice objected to.
+        error: ConstrainError,
+    },
 }
 
 /// What a bound contribution tells a trait about the position it landed on.

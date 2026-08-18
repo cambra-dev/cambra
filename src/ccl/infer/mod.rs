@@ -142,6 +142,97 @@ pub(super) fn variant_type(tags: BTreeMap<FieldKey, Type>) -> Type {
     Type::Variant(tags.into_iter().collect())
 }
 
+/// The node to blame for a fact about a *place* — given the variables standing at it,
+/// the first node, in pre-order, whose own type mentions any of them.
+///
+/// Several variables because a place is not a variable: the requirements that
+/// contradict each other can sit on operator-minted variables no node's type ever
+/// names, while the value they constrain is a component of one that is. Each is tried
+/// in turn, against the whole tree, and the first that appears anywhere wins — so the
+/// result is the earliest *variable* that is named, not the outermost *node* naming
+/// any of them. Sharpening that would mean walking the tree once and asking each node
+/// about every variable, which buys a better span for a case that already falls back
+/// to a coarse one.
+///
+/// Blame is read *out of the tree* rather than stamped onto the solver structure that
+/// raised it. A `NodeId` is provenance, and a copy of one squirrelled away in the
+/// solver would be copied onward by every clone that structure makes — outliving the
+/// construct it identifies. The tree cannot go stale that way, because it *is* the
+/// thing being described.
+///
+/// Falls back to the root, so a span can be coarse but never wrong — an interior place
+/// is exactly the case where that can happen. Only reached on a failure path, so the
+/// walk costs nothing in the passing case.
+fn blame_node_for_place(
+    expr: &Expr,
+    uids: &[crate::ccl::InferVarId],
+) -> crate::ccl::provenance::NodeId {
+    /// Structural only — deliberately does **not** follow a variable's bounds. The
+    /// question is which node's type *is written in terms of* this variable, and
+    /// chasing bounds would answer a different one (nearly every node, transitively).
+    ///
+    /// Exhaustive on purpose: a new [`Type`] variant that can hold a type must break
+    /// this build rather than silently degrade a span to the program root.
+    fn mentions(ty: &Type, uid: crate::ccl::InferVarId) -> bool {
+        match ty {
+            Type::Infer(v) => v.uid == uid,
+            Type::Refinement(inner, _) => mentions(inner, uid),
+            // Unlike the solver walks, this one reads *node type slots* and runs
+            // before coalesce clears annotations, so a bounded annotation is still
+            // in place. Its bound is an ordinary type and can name the variable.
+            Type::BoundedHole(bound) => mentions(bound, uid),
+            Type::Fun {
+                domain, codomain, ..
+            } => mentions(domain, uid) || mentions(codomain, uid),
+            Type::History { value, domain, .. } => mentions(value, uid) || mentions(domain, uid),
+            Type::Tuple(elems) => elems.iter().any(|t| mentions(t, uid)),
+            Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
+            Type::Variant(arms) => arms.iter().any(|(_, t)| mentions(t, uid)),
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::Hole
+            | Type::SharedHole(_)
+            | Type::DataSource(_)
+            | Type::ChanDom(_, _)
+            | Type::Txn => false,
+        }
+    }
+    /// The slots that make this node *itself* the place: its own type, an
+    /// annotation written on it, a cast's target. Deliberately **not** the
+    /// binder slots [`Expr::walk_type_slots`] also visits — a binder's type is
+    /// always mirrored either in the node's own type (a lambda's domain is its
+    /// type's domain) or in a child's (a `let` binder's type is the
+    /// definition's), so a binder slot never reaches a variable the walk would
+    /// otherwise miss. It only lets an enclosing node answer for a type its
+    /// child owns, which costs the span its precision: with the binder slot
+    /// counted, `f = \a -> …` shadows the `\a -> …` that actually carries the
+    /// conflicting requirements.
+    fn owns(e: &Expr, uid: crate::ccl::InferVarId) -> bool {
+        let own = mentions(&e.ty, uid);
+        let annotated = e.user_annotation.as_ref().is_some_and(|a| mentions(a, uid));
+        let cast = matches!(
+            &e.node,
+            crate::ccl::TypedExprNode::Cast { target, .. } if mentions(target, uid)
+        );
+        own || annotated || cast
+    }
+    fn go(e: &Expr, uid: crate::ccl::InferVarId) -> Option<crate::ccl::provenance::NodeId> {
+        if owns(e, uid) {
+            return Some(e.node_id());
+        }
+        let mut found = None;
+        e.walk_children(|child| {
+            if found.is_none() {
+                found = go(child, uid);
+            }
+        });
+        found
+    }
+    uids.iter()
+        .find_map(|uid| go(expr, *uid))
+        .unwrap_or_else(|| expr.node_id())
+}
+
 /// Resolve a (possibly variable-laden) [`Type`] to a concrete type for use
 /// in error messages. Falls back to [`Type::Hole`] if coalesce fails (which
 /// can happen for types with incompatible bounds that triggered the error).
@@ -373,6 +464,67 @@ pub(crate) fn run(
     // it was approximating incrementally. Debug-only, and a pure read of the graph.
     #[cfg(debug_assertions)]
     solver::traits::verify_narrowing_is_complete(|ty| resolve_var_type(ty).ok());
+
+    // Every requirement a definition places on one of its own values is recorded by
+    // now, so this is where they can be read *together* — the step narrowing cannot
+    // take, since it only ever sees one contribution at a time. Runs before coalesce
+    // for two reasons: the tree is still whole, so a conflict can be blamed on a real
+    // node, and a generalized definition's variables are still reachable, which after
+    // coalesce they are not.
+    {
+        use solver::traits::{OperandFailure, OperandRequirement};
+        /// Render a solver-side requirement for display: bases become types, and the
+        /// trait becomes its name, so no message borrows the solver's vocabulary.
+        fn stated(r: OperandRequirement) -> StatedRequirement {
+            StatedRequirement {
+                trait_: r.trait_.to_string(),
+                position: r.position,
+                accepted: r.accepted.into_iter().map(Type::Base).collect(),
+                siblings: r
+                    .siblings
+                    .into_iter()
+                    .map(|(pos, accepted)| (pos, accepted.into_iter().map(Type::Base).collect()))
+                    .collect(),
+            }
+        }
+        let mut cache = solver::ConstrainCache::new();
+        if let Err(failure) = solver::traits::resolve_operand_requirements(&mut cache) {
+            let (blame_vars, error) = match failure {
+                OperandFailure::Unsatisfiable { vars, requirements } => (
+                    vars,
+                    InferError::UnsatisfiableOperand {
+                        requirements: requirements.into_iter().map(stated).collect(),
+                    },
+                ),
+                OperandFailure::ContradictsBound {
+                    vars,
+                    requirements,
+                    required,
+                    found,
+                } => (
+                    vars,
+                    InferError::RequirementContradictsBound {
+                        requirements: requirements.into_iter().map(stated).collect(),
+                        required: Box::new(Type::Base(required)),
+                        found: Box::new(Type::Base(found)),
+                    },
+                ),
+                // See `OperandFailure::Conflict`: no program is known to reach this,
+                // so it takes the generic vocabulary rather than one of its own.
+                OperandFailure::Conflict { error } => (
+                    Vec::new(),
+                    map_constrain_err(error, "a value an operator constrains"),
+                ),
+            };
+            let node_id = blame_node_for_place(expr, &blame_vars);
+            return Err(vec![LocatedInferError { error, node_id }]);
+        }
+    }
+    // Sealed *after* the requirement sweep, not before: the sweep itself narrows, and
+    // legitimately so. What must not happen is a later pass narrowing a definition's
+    // obligation, which would leave the sweep's verdict stale.
+    #[cfg(debug_assertions)]
+    solver::traits::seal_emission();
 
     // Pass 2: resolve each node's inference variables in place into expr.ty,
     // fill the binder slots that aren't any node's expr.ty (the `Let` binding

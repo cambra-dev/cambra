@@ -508,6 +508,243 @@ fn a_mut_var_that_reads_itself_still_gets_a_type(#[case] code: &str, #[case] bas
     assert_eq!(mut_var_value_type(code).to_string(), base);
 }
 
+/// A definition whose requirements no single type satisfies is rejected **with no call
+/// site** — it is ill-typed for every possible argument, so there is nothing to wait for.
+///
+/// Two mechanisms cover this between them, and the split follows how the program's
+/// occurrences share variables. Where one variable carries several requirements (a
+/// single-parameter lambda), intersecting the accepted sets rejects directly. Where the
+/// occurrences sit on *different* variables (a multi-parameter lambda destructures its
+/// tuple parameter, so each use is its own projection), no intersection sees the
+/// conflict — the requirement is instead written back as a bound, and the collision is
+/// an ordinary one. Neither mechanism subsumes the other; `neither_degenerates` needs
+/// the first and `multi_arg` needs the second.
+#[rstest]
+#[case::two_traits_disjoint("f = \\a -> (a + 1, a + \"s\")")]
+#[case::neither_degenerates("f = \\a -> (a // a, a + \"s\")")]
+#[case::orderable_vs_addable("f = \\a -> (a < 1, a + \"s\")")]
+#[case::negatable_vs_addable("f = \\a -> (-a, a + \"s\")")]
+#[case::three_way("f = \\a -> (a + 1, a + \"s\", a and True)")]
+#[case::multi_arg("f = \\a, b -> (a + 1, a + \"s\")")]
+#[case::multi_arg_def(indoc! {r#"
+    def f(a, b):
+        (a + 1, a + "s")
+"#})]
+// A requirement against an ordinary bound, which comparing requirements cannot see:
+// `and` is a monomorphic scheme, and an annotation is a plain bound.
+#[case::monomorphic_operator("f = \\a -> (a and True, a + 1)")]
+#[case::annotation(indoc! {r#"
+    def f(x: Int):
+        x + "s"
+"#})]
+// The requirement travels through a call: `f`'s instantiated obligation is watched by
+// `x`, where it meets the one `x + "a"` placed.
+#[case::across_a_call(indoc! {r#"
+    f = \x -> x + 1
+    def g(x):
+        a = x + "a"
+        f(x)
+"#})]
+// Only unsatisfiable transitively: `a + 1` pins `a`, which leaves `a + b` one row and
+// so pins `b`, which `b + "s"` then contradicts. Nothing is wrong with any single
+// requirement, and no *variable* carries two — the conflict exists only at the place.
+#[case::transitively("f = \\a, b -> (a + b, a + 1, b + \"s\")")]
+#[case::transitively_def(indoc! {r#"
+    def f(a, b):
+        (a + b, a + 1, b + "s")
+"#})]
+// Two transitive hops: `a + 1` pins `a`, so `a + b` pins `b`, so `b + c` pins `c`,
+// which `c + "s"` contradicts.
+#[case::two_hops("f = \\a, b, c -> (a + b, b + c, a + 1, c + \"s\")")]
+// The place reached by a field selection rather than a tuple position.
+#[case::record_field(indoc! {r#"
+    def f(r):
+        (r.x + 1, r.x + "s")
+"#})]
+#[case::tuple_field(indoc! {r#"
+    def f(p):
+        (p.0 + 1, p.0 + "s")
+"#})]
+// A requirement on a function's *result*, reached through the call rather than a field.
+#[case::higher_order("f = \\g -> (g(1) + 1, g(1) + \"s\")")]
+// The two requirements meet only through an intervening binding.
+#[case::through_a_let(indoc! {r#"
+    def f(a):
+        c = a
+        (c + 1, a + "s")
+"#})]
+fn a_definition_no_argument_satisfies_is_rejected(#[case] defs: &str) {
+    assert!(
+        !infer_program_err(&dead_code(defs)).is_empty(),
+        "no type satisfies every requirement here, so no call site could ever make it \
+         well-typed",
+    );
+}
+
+/// The rejection above is reported as its **own** error, naming every requirement and
+/// what each still accepts.
+///
+/// This is what distinguishes it from `NoTraitInstance`, and the distinction is the reason
+/// the variant exists: nothing *arrived*, so there is no offending type to show and a
+/// message shaped around one would have to invent it. The conflicting demands are the
+/// only facts there are, so they are what the message carries — and each requirement
+/// names its trait, so a conflict spanning two of them reads as such.
+///
+/// (The span this resolves to is `unsatisfiable_operand_carries_resolved_span`, in
+/// `src/ccl/context.rs`, where the lowering projection is in scope.)
+#[rstest]
+#[case::one_trait("f = \\a -> (a + 1, a + \"s\")", &["Addable", "Int", "String"])]
+#[case::two_traits("f = \\a -> (a < 1, a + \"s\")", &["Orderable", "Addable", "Int", "String"])]
+fn an_unsatisfiable_operand_names_the_requirements(#[case] defs: &str, #[case] expected: &[&str]) {
+    let errs = infer_program_err(&dead_code(defs));
+    let err = errs
+        .iter()
+        .find(|e| matches!(e, InferError::UnsatisfiableOperand { .. }))
+        .unwrap_or_else(|| panic!("expected an UnsatisfiableOperand, got {errs:?}"));
+    let rendered = format!("{err:?}");
+    for want in expected {
+        assert!(
+            rendered.contains(want),
+            "the message must name {want}, since the requirements are the only facts \
+             the error has; got:\n{rendered}",
+        );
+    }
+}
+
+/// Each requirement states *why* its position is narrowed, by naming what the trait's
+/// other operand accepts — the fact that did the narrowing.
+///
+/// Without it a line is a conclusion with its premise removed: "only `String` here" is
+/// true because a `String` reached the operand beside it, and a reader who is not told
+/// that has to reconstruct it. A **unary** trait has no beside, so it says nothing
+/// rather than something vacuous.
+#[test]
+fn a_requirement_says_what_narrowed_it() {
+    let errs = infer_program_err(&dead_code("f = \\a -> (-a, a + \"s\")"));
+    let rendered = format!("{errs:?}");
+    assert!(
+        rendered.contains("Addable accepts only String as its operand 1 (its operand 2 is String)"),
+        "a binary trait names the operand beside it; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("Negatable accepts only Int as its operand 1\n"),
+        "a unary trait has no other operand, so the clause is omitted rather than \
+         empty; got:\n{rendered}",
+    );
+}
+
+/// Currying moves the requirements onto different variables and so changes the order
+/// they are found in. The message must not notice.
+///
+/// The verdict never depended on traversal order — an intersection is commutative —
+/// but the *rendering* did, so two spellings of one program produced two orderings of
+/// one explanation.
+#[test]
+fn the_requirement_list_reads_the_same_in_both_spellings() {
+    let curried = infer_program_err(&dead_code("f = \\a -> (a + 1, a + \"s\")"));
+    let uncurried = infer_program_err(&dead_code("f = \\a, b -> (a + 1, a + \"s\")"));
+    assert_eq!(
+        format!("{curried:?}"),
+        format!("{uncurried:?}"),
+        "the same conflict, spelled two ways, must read identically",
+    );
+}
+
+/// A requirement contradicting an *ordinary* bound is its own diagnostic, naming the
+/// type the value already has beside the one the requirements agree it must be.
+///
+/// This is the deposit's half of the mechanism, and the half no intersection can
+/// reach: a *bounded* annotation and a monomorphic operator's operand are plain
+/// bounds, not requirements, so comparing requirements with each other sees nothing
+/// wrong. (An *exact* annotation is a delivery instead — it puts a base on the
+/// operand, so `x: Int` never reaches here and fails by narrowing.) The
+/// lattice is therefore read before it is written to — otherwise the contradiction
+/// only surfaces at coalesce, as two `IncompatibleBounds` (one per direction) naming
+/// neither the trait nor the operator that demanded it.
+#[rstest]
+#[case::bounded_annotation(indoc! {r#"
+    def f(x <: Int):
+        x + "s"
+"#}, "Int", "String")]
+#[case::monomorphic_operator("f = \\a -> (a and True, a + 1)", "Bool", "Int")]
+fn a_requirement_contradicting_a_bound_names_both(
+    #[case] defs: &str,
+    #[case] found: &str,
+    #[case] required: &str,
+) {
+    let errs = infer_program_err(&dead_code(defs));
+    assert_eq!(
+        errs.len(),
+        1,
+        "one mistake is one diagnostic; got {} — {errs:?}",
+        errs.len(),
+    );
+    assert!(
+        matches!(errs[0], InferError::RequirementContradictsBound { .. }),
+        "expected the bound-conflict variant, got {:?}",
+        errs[0],
+    );
+    let rendered = format!("{:?}", errs[0]);
+    assert!(
+        rendered.contains(found) && rendered.contains(required),
+        "the message must name both the type the value has ({found}) and the one it is \
+         required to be ({required}); got:\n{rendered}",
+    );
+}
+
+/// The controls for [`a_definition_no_argument_satisfies_is_rejected`]: requirements
+/// that *do* have a common type must stay accepted.
+#[rstest]
+#[case::same_trait_twice("f = \\a -> (a + 1, a + 2)")]
+#[case::two_traits_overlap("f = \\a -> (a + 1, a < 2)")]
+#[case::annotation_agrees(indoc! {r#"
+    def f(x: Int):
+        x + 1
+"#})]
+#[case::nothing_determined("f = \\a, b -> a + b")]
+#[case::a_chain_that_agrees("f = \\a, b, c -> (a + b, b + c, a + 1)")]
+#[case::a_chain_determining_nothing("f = \\a, b, c -> (a + b, b + c)")]
+#[case::determined_to_string("f = \\a, b -> (a + b, a + \"s\")")]
+#[case::record_field_agrees(indoc! {r#"
+    def f(r):
+        (r.x + 1, r.x + 2)
+"#})]
+#[case::higher_order_agrees("f = \\g -> (g(1) + 1, g(1) + 2)")]
+// A generalized binding used at two different types: each use resolves its own copy,
+// so the `Int` use must not empty the `String` use's candidate set.
+#[case::polymorphic_reuse(indoc! {r#"
+    id = \x -> x
+    f = \a, b -> (id(a) + 1, id(b) + "s")
+"#})]
+fn satisfiable_requirements_are_accepted(#[case] defs: &str) {
+    infer_program(&dead_code(defs));
+}
+
+/// A determined operand travels: pinning one value can leave a neighbouring
+/// obligation with a single row, which determines *its* other operand in turn.
+///
+/// Both orders are checked because the sweep visits variables in mint order. With the
+/// binders one way round the cascade completes in a single pass; reversed, `b` is
+/// visited before `a` is pinned and only the second round can close it. Ordering the
+/// binders must not change the type, which is what makes the fixpoint load-bearing
+/// rather than defensive.
+#[rstest]
+#[case::in_order("f = \\a -> \\b -> (a + 1, a < b)")]
+#[case::reversed("f = \\b -> \\a -> (a + 1, a < b)")]
+// The same program uncurried. A multi-parameter lambda passes its parameters through a
+// tuple, so `a`'s occurrences are separate variables; the answer must not depend on
+// that, which is what makes the unit a place rather than a variable.
+#[case::uncurried("f = \\a, b -> (a + 1, a < b)")]
+#[case::uncurried_through_an_operand("f = \\a, b -> (a + b, a + 1)")]
+fn a_determined_operand_cascades(#[case] defs: &str) {
+    let ty = infer_program(&yielding_f(defs)).to_string();
+    assert!(
+        !ty.contains('?'),
+        "both parameters are determined — `a` by `+ 1`, then `b` because that leaves \
+         `Orderable` one row — so no position should still be open; got {ty}",
+    );
+}
+
 /// A cycle must not hide a conflict: the seed and the write have to agree, and the
 /// obligation sees both as ordinary bounds.
 #[test]
@@ -560,14 +797,23 @@ fn test_let(#[case] code: &str, #[case] expected: Type) {
 /// Close a program over definitions nothing calls: `defs` followed by the program
 /// value they are dead with respect to.
 ///
-/// Cases below carry the definitions alone, so a one-line definition stays a plain
-/// string and only a genuinely multi-line one reaches for `indoc!`. A case that
-/// needs a *live* use of one of its definitions binds it (`live = f(1)`) rather
-/// than ending the program with it — a monomorphic binding's RHS is walked whether
-/// or not the binding is read, so the use specializes exactly as a trailing call
-/// would.
+/// Every case that uses this carries the definitions alone, so a one-line definition
+/// stays a plain string and only a genuinely multi-line one reaches for `indoc!`. A
+/// case that needs a *live* use of one of its definitions binds it (`live = f(1)`)
+/// rather than ending the program with it — a monomorphic binding's RHS is walked
+/// whether or not the binding is read, so the use specializes exactly as a trailing
+/// call would.
 fn dead_code(defs: &str) -> String {
     format!("{}\n1", defs.trim_end())
+}
+
+/// Close a program over definitions and yield `f`, so the program's type *is* `f`'s
+/// and a test can assert on what was inferred for the definition itself.
+///
+/// The counterpart to [`dead_code`] for tests that read a type rather than a verdict,
+/// and it keeps the same discipline: the trailing line lives here, not in every case.
+fn yielding_f(defs: &str) -> String {
+    format!("{}\nf", defs.trim_end())
 }
 
 /// A function nobody calls is still typechecked. Monomorphization drops such a
@@ -635,13 +881,27 @@ fn dead_code(defs: &str) -> String {
     f = \a -> a.0 + a.foo
     f = 3
 "#})]
-// An *exact* annotation is a delivery, which is what brings this case back within
-// reach: `x: Int` puts a base on the operand rather than a bound above it, so the
-// obligation narrows to `{(Int, Int)}` and `"s"` empties it, with no call site
-// needed. Its bounded twin below is equally ill-typed and is *not* caught here, and
-// the difference is in the mechanism, not in the programs.
+// The last three are each ill-typed and each caught by a different mechanism, which
+// is why they are listed together.
+//
+// An *exact* annotation is a **delivery**: `x: Int` puts a base on the operand rather
+// than a bound above it, so the obligation narrows to `{(Int, Int)}` and `"s"` empties
+// it — no call site and no sweep needed.
+//
+// The other two deliver nothing and are reached by the requirement sweep instead.
+// `conflicting_operand_types` puts two requirements on `a` — `a + 1` fixes it at
+// `Int`, `a + "s"` at `String` — satisfiable alone and not together, so neither
+// narrows and the sweep's intersection is empty. `bounded_annotated_param` is the
+// exact case's twin: `x <: Int` bounds the operand from above *without* putting a
+// base on it, so narrowing has nothing to consume, and the sweep is what reads the
+// requirement against the bound already recorded there.
 #[case::annotated_param(indoc! {r#"
     def f(x: Int):
+        x + "s"
+"#})]
+#[case::conflicting_operand_types("f = \\a -> (a + 1, a + \"s\")")]
+#[case::bounded_annotated_param(indoc! {r#"
+    def f(x <: Int):
         x + "s"
 "#})]
 fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
@@ -649,40 +909,6 @@ fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
         !infer_program_err(&dead_code(defs)).is_empty(),
         "an ill-typed definition must be rejected whether or not it is called"
     );
-}
-
-/// The gap the previous test stops at, and the reason it is a gap: an obligation
-/// narrows as bases are *delivered* to it, and a never-called definition delivers
-/// nothing, so a conflict that is only a trait conflict is not reached — see
-/// `src/ccl/design/type-inference.md`, "Typechecking a never-called definition".
-///
-/// The body is rejected the moment it is called (`f(1)` names the operand, its type,
-/// and what the position accepts), so this is about *when* the conflict is found, not
-/// whether. What makes it unreachable here is that no single delivery is impossible:
-/// two requirements land on `a` — `a + 1` fixes it at `Int`, `a + "s"` at `String` —
-/// each satisfiable alone and jointly not. Reading a value's requirements together is
-/// what closes it, and that is a property of the obligation machinery rather than of
-/// the discard walk.
-///
-/// The bounded parameter pairs with the exact one in the previous test and is here
-/// for the same reason as the case above it, not a different one: `x <: Int` bounds
-/// the operand from above without putting a base on it, so nothing is delivered and
-/// the obligation never narrows, while `x: Int` delivers and rejects. Both programs
-/// are ill-typed and both are rejected at a call; what differs is only whether
-/// today's narrowing has anything to consume. Reading `x`'s requirements together
-/// alongside its `Int` bound closes this one too — measured, it is rejected once the
-/// requirement sweep is in the same tree — so this is a gap in reach, not a
-/// consequence of the exact/bounded split.
-#[rstest]
-#[case::conflicting_operand_types("f = \\a -> (a + 1, a + \"s\")")]
-#[case::bounded_annotated_param(indoc! {r#"
-    def f(x <: Int):
-        x + "s"
-"#})]
-fn a_never_called_function_whose_conflict_is_only_a_trait_conflict_is_not_reached(
-    #[case] defs: &str,
-) {
-    assert_eq!(infer_program(&dead_code(defs)), int_lit(1));
 }
 
 /// The complement, and the guard against the walk over-rejecting: typechecking a
@@ -1585,37 +1811,33 @@ fn test_self_application_types() {
     );
 }
 
-/// An unapplied lambda whose parameter is used only as an operator's operand keeps an
-/// **open parameter** and, today, a determined result.
+/// An unapplied lambda is typed as precisely as its operators' requirements allow —
+/// **both** ends — and no more.
 ///
-/// `\x -> x + 1` carries the obligation `Addable(A, Int) ⇝ O`. Nothing is ever
-/// deposited onto an operand position, so `A` stays an inference variable exactly as
-/// it does for `\x -> x` — the program states "`x` is addable to `Int`", and `A`'s
-/// information is the program's to supply.
+/// `\x -> x + 1` carries `Addable(𝐴, Int ⇝ 𝑂)`. `Int` in the second position leaves
+/// only the `Addable(Int, Int ⇝ Int)` row, and a single surviving row determines the
+/// first position as much as the associated one: the parameter is `Int` because
+/// nothing else could ever be passed. So it is deposited as an *upper* bound and the
+/// domain closes.
 ///
-/// `O` is a different matter: the obligation is its only source, and every
-/// instance whose second operand is `Int` returns `Int`, so it resolves. That
-/// is a fact about today's table rather than a stable property — adding
-/// `Addable(Float, Int) ⇝ Float` would leave two candidates whose outputs disagree
-/// and open the result too, which is why this asserts the codomain per case rather
-/// than as a rule.
+/// The polarity is the point. An upper bound states what may flow *in*, which is
+/// exactly what the requirement says; it invents no value, so a parameter the program
+/// genuinely leaves unconstrained stays open — `open_both_ends` is that case, where
+/// three rows survive and neither operand is pinned.
+///
+/// How much closes is a fact about today's table, not a stable property: adding
+/// `Addable(Float, Int ⇝ Float)` would leave two rows disagreeing on both the operand
+/// and the output, reopening both. Hence per-case expectations rather than a rule.
 #[rstest]
-#[case::comparison(
-    r"
-f = \x -> x > 1
-f
-",
-    bool_ty()
-)]
-#[case::arithmetic(
-    r"
-f = \x -> x + 1
-f
-",
-    int()
-)]
-fn test_lambda_unapplied(#[case] code: &str, #[case] expected_codomain: Type) {
-    let ty = infer_program(code);
+#[case::comparison("f = \\x -> x > 1", Some(int()), bool_ty())]
+#[case::arithmetic("f = \\x -> x + 1", Some(int()), int())]
+#[case::arithmetic_string("f = \\x -> x + \"s\"", Some(string()), string())]
+fn test_lambda_unapplied(
+    #[case] defs: &str,
+    #[case] expected_domain: Option<Type>,
+    #[case] expected_codomain: Type,
+) {
+    let ty = infer_program(&yielding_f(defs));
     let Type::Fun {
         domain, codomain, ..
     } = &ty
@@ -1624,11 +1846,35 @@ fn test_lambda_unapplied(#[case] code: &str, #[case] expected_codomain: Type) {
     };
     assert_eq!(
         **codomain, expected_codomain,
-        "the operator's trait determines the result even with an open operand",
+        "the operator's trait determines the result",
     );
+    match expected_domain {
+        Some(expected) => assert_eq!(
+            **domain, expected,
+            "a single surviving instance determines the operand too",
+        ),
+        None => assert!(
+            matches!(**domain, Type::Infer(_)),
+            "an operand no single row determines stays open, got {domain}",
+        ),
+    }
+}
+
+/// The other half of [`test_lambda_unapplied`]: with every row still standing, a
+/// requirement determines nothing and both operands stay open.
+#[test]
+fn an_undetermined_operand_stays_open() {
+    let ty = infer_program(&yielding_f("f = \\a, b -> a + b"));
+    let Type::Fun { domain, .. } = &ty else {
+        panic!("expected a function type, got {ty}");
+    };
+    let Type::Tuple(params) = &**domain else {
+        panic!("expected a tuple domain, got {domain}");
+    };
     assert!(
-        matches!(**domain, Type::Infer(_)),
-        "an operand a trait does not determine stays open, got {domain}",
+        params.iter().all(|p| matches!(p, Type::Infer(_))),
+        "`a + b` leaves every Addable row standing, so neither operand is pinned; \
+         got {domain}",
     );
 }
 

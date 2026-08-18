@@ -320,13 +320,14 @@ repeats is dropped, so one defect stays one diagnostic however many specializati
 enclose it.
 
 **What this does not reach.** Resolution reads the bounds a body *recorded*, so a
-requirement that only takes effect when a concrete type is **delivered** is not
-evaluated here and cannot fail here. Trait obligations are the case: an obligation
-narrows its candidate set as bases arrive, and one whose operand never receives a base
-narrows nothing and so rejects nothing, however few implementations could ever satisfy
-it. Closing that is a property of the obligation machinery — an unsatisfiable
-*intersection* of the requirements on one variable is visible without any delivery — not
-of this walk, which only decides whether the definition's copies are resolved at all.
+requirement that takes effect only when a concrete type is **delivered** is not
+evaluated here. Trait obligations are the case: an obligation narrows as bases arrive,
+and one whose operand never receives a base rejects nothing, however few
+instances could satisfy it. Reading a value's requirements *together* covers it,
+which needs no delivery and is a separate pass
+([Requirements are read together, once](#requirements-are-read-together-once)). The two
+are complementary: that pass runs on every program, and this walk is what makes a dead
+definition's bounds resolved in the first place.
 
 **A shape that looks like an escape and is not.** `if 𝑝: [x for x in xs if 𝑞] else: xs`
 is accepted with no call site, and rejected at one. That is not laxity: both arms'
@@ -777,9 +778,9 @@ The two coincide only where the value's type already *is* the annotation, leavin
 
 * **Width.** `x : {a: Int} = (a=1, b=2)` binds `x` at `{a: Int}`, so `x.b` is an error. `x <: {a: Int} = (a=1, b=2)` binds `x` at the record's own type, which still has both fields, so `x.b` is `2`.
 * **Refinements.** A literal is typed by its own value ([A literal is refined by its own value](#a-literal-is-refined-by-its-own-value)), so `x : Int = 5` binds `x` at `Int` — the annotation is precisely what discards the singleton — while `x <: Int = 5` leaves it at `5`. Only the second still discharges `arr[x]`'s index-range obligation.
-* **Delivery.** Trait narrowing consumes bases that *arrive* at an operand ([Delivery: the watch follows the edge](#delivery-the-watch-follows-the-edge)), and only the exact form puts one there — it binds at `Int`, while the bounded form binds at a variable that `Int` sits above. So `def f(x: Int): x + "s"` is rejected with no call site and `def f(x <: Int): x + "s"` is not, though both are ill-typed and both fail at the first call.
+* **Delivery.** Trait narrowing consumes bases that *arrive* at an operand ([Delivery: the watch follows the edge](#delivery-the-watch-follows-the-edge)), and only the exact form puts one there — it binds at `Int`, while the bounded form binds at a variable that `Int` sits above. Both `def f(x: Int): x + "s"` and `def f(x <: Int): x + "s"` are ill-typed and both are rejected with no call site, but not by the same machinery: the exact form delivers `Int`, which narrows the obligation until `"s"` empties it, while the bounded form delivers nothing and is caught instead by [Requirements are read together, once](#requirements-are-read-together-once), reading the requirement against the bound already recorded on the value.
 
-  This last one is a difference in *reach*, not in meaning, and it is the only bullet here that is: reading the requirements on a value together with its bounds — rather than one delivery at a time — catches the bounded program too, which is the residual gap [Typechecking a never-called definition](#typechecking-a-never-called-definition) already names and locates in the obligation machinery. Do not read it as the split saying that `x <: Int` promises less; what it promises is stated above, and this row is about which mechanism happens to notice.
+  This last one is a difference in *reach*, not in meaning, and it is the only bullet here that is. Do not read it as the split saying that `x <: Int` promises less; what it promises is stated above, and this row is about which mechanism happens to notice.
 
 The refinement case is worth reading twice: the annotation is a bare `Int` and the forms still differ, because `5` is a strict subtype of `Int`. A "simple" annotation is no guarantee that the two agree — only a value that knows nothing beyond the annotation is.
 
@@ -1338,11 +1339,48 @@ A position that stays in the second row for the whole program — nothing ever d
 
 ### What an obligation determines
 
-A deposit records what every surviving instance agrees on, and reaches the **associated positions only**. Nothing is written back onto an operand.
+A deposit records what every surviving instance agrees on. It reaches both kinds of position, at opposite polarities:
 
-The asymmetry is about where information comes from, not about soundness — with one candidate left, its operand types are implied exactly as its associated types are. An associated position is a fresh variable nothing else constrains from below, so the obligation is its only source. An operand always has the program's own `operandᵢ <: 𝐴ᵢ` edge. Determining an operand from the table would supply information the program was meant to supply, which hides an under-connected lowering rather than exposing it.
+| position | bound | because |
+|---|---|---|
+| associated | **lower** | the obligation is its only source — nothing else constrains it from below |
+| operand | **upper** | the table states what *may* reach the operand, not what does |
 
-How much is determined follows from the table, associated positions included. `λ 𝑥 → 𝑥 + 1` is `∀𝐴 𝑂. (𝐴 : Addable(𝐴, Int ⇝ 𝑂)) ⇒ 𝐴 → 𝑂` with `𝑂` resolving to `Int`, because `Int` at the second position leaves only `Addable(Int, Int ⇝ Int)`. Adding `Addable(Float, Int ⇝ Float)` would leave two rows whose outputs disagree, and `𝑂` would be as open as `𝐴` already is — which is why a deposit waits for agreement rather than firing on a unique candidate.
+A lower bound on an operand would invent a value the program never supplied, and would let an under-connected lowering pass by supplying the type its missing edge should have carried. An upper bound cannot: it gives coalesce nothing to resolve *to*.
+
+How much is determined follows from the table. `λ 𝑥 → 𝑥 + 1` is `Int ⇒ Int`, because `Int` at the second position leaves only `Addable(Int, Int ⇝ Int)` and one surviving row fixes every position of it. `λ 𝑎 𝑏 → 𝑎 + 𝑏` determines nothing, and both parameters stay open. Adding `Addable(Float, Int ⇝ Float)` would reopen the first case, two rows disagreeing — which is why a deposit waits for agreement rather than firing on a unique candidate.
+
+### Requirements are read together, once
+
+Narrowing consumes one contribution at a time, so an obligation learns only what is *delivered* to it. Requirements that are individually satisfiable and jointly not therefore pass: in `λ 𝑎 → (𝑎 + 1, 𝑎 + "s")` each obligation narrows through its **other** operand, to `{Int}` and `{String}`; neither set is empty, and nothing compares them.
+
+A pass between emission and coalesce closes this. For each value it intersects what every requirement on that value accepts, with three outcomes:
+
+* **Empty** — nothing satisfies them all, so no argument could. `UnsatisfiableOperand`, listing each requirement together with what the trait's other operand accepts, that being what narrowed it.
+* **One base** — the requirements determine the value. It is deposited as an upper bound, and the obligations there are narrowed by it directly, since an upper bound does not reach them on its own.
+* **Several** — the value stays open.
+
+Before depositing, the pass reads the bounds the value already carries. A base that disagrees is `RequirementContradictsBound`, naming both it and the required type. Left to the write, the same contradiction reaches coalesce as two `IncompatibleBounds` naming no trait: a *bounded* annotation and a monomorphic operator's operand are ordinary bounds, so no intersection of requirements sees them. An *exact* annotation does not reach here at all — it delivers a base, so the obligation narrows and fails on its own ([Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded)).
+
+Both rejections say no argument could work, and they differ in what collides. An empty intersection is the requirements contradicting each other. A bound conflict is the requirements agreeing, on something the program has already ruled out.
+
+Placement is forced at both ends. **After emission**, because that is when a definition's requirements are all recorded. **Before coalesce**, because a generalized definition's subtree is never coalesced in place, so a walk of the tree would see only use-site clones — and a clone that goes unsatisfiable already fails by delivery. The pass repeats **to a fixpoint**: determining one value can leave a neighbouring obligation with a single row, determining another.
+
+This is the gap [Typechecking a never-called definition](#typechecking-a-never-called-definition) names. The two are complementary. That walk resolves a dead definition's recorded bounds, which catches `λ 𝑎 → (𝑎.0, 𝑎.foo)`; this pass needs no delivery, and does not depend on whether anything calls the definition.
+
+#### The unit is a place, not a variable
+
+Every position of a requirement is an ordinary inference variable, but a requirement is *about* a value, and one value is generally several variables. A **place** is that value. It is named by a root variable plus the path of field selections reaching it — each element of the path a **step** — and the empty path names the root's own value. `places_under` returns, per place, the variables standing at it together with the requirements they carry; it is one *place*'s requirements that are read together.
+
+Places are found by following **upper** bounds: `𝑣 <: 𝑈` means `𝑣`'s value reaches `𝑈`, so a requirement on `𝑈` is one on `𝑣`. A variable bound stays at the same place, `𝑣` and `𝑈` being two variables for one value; a structural one descends, so in `𝑣 <: (𝑈₀, 𝑈₁)` the requirements on `𝑈₀` belong one field deeper and not to `𝑣`. Each `𝑈ᵢ` is itself a variable, which is why the path is load-bearing rather than decorative: it is what separates the value `𝑈₀` stands for from `𝑣`'s, and what lets variables reached by different routes be recognized as one value.
+
+A variable alone is the wrong unit because the parameter a programmer writes is not one variable. `λ 𝑎 𝑏 → …` uncurries to a lambda over a tuple and rewrites each occurrence of `𝑎` to a projection of that tuple, so each occurrence has its own inference variable and none of them carries both of `𝑎`'s requirements. Written curried, `𝑎` is a binder its occurrences share, and one variable carries both. Only the spelling differs.
+
+Which positions are steps is decided per type former, by an exhaustive match. The rules are one comment per former at `places_under`, in `src/ccl/infer/solver/traits.rs`.
+
+A function's **codomain** is a step; its **domain** is not. Descent groups requirements that constrain the same value, and is not how they are reached — every variable is a root, so all requirements are reached regardless. Across `𝑣 <: (𝐷 ⇒ 𝐶)` and `𝑣 <: (𝐷′ ⇒ 𝐶′)`, the codomains `𝐶` and `𝐶′` consume one value, `𝑣`'s result, and so group. `𝐷` and `𝐷′` are two arguments feeding one parameter — two values — and intersecting their requirements would ask a question the program does not pose. `dom(𝑣)` is a root in its own right, so nothing is missed.
+
+Reading the graph once, at the end, is what [`link_watches`](#delivery-the-watch-follows-the-edge) cannot do: it runs when an edge is **recorded**, so an edge predating an obligation never carries it, and it follows **variable** edges only, stopping at the structural hop a multi-parameter lambda introduces. Two consequences: currying is unobservable, `λ 𝑎 𝑏 → (𝑎 + 1, 𝑎 < 𝑏)` and its curried form taking one type; and `λ 𝑎 𝑏 → (𝑎 + 𝑏, 𝑎 + 1, 𝑏 + "s")` is rejected, where no single requirement is wrong and no variable carries two.
 
 Two problems look like they want an obligation of their own, and are not:
 
@@ -1374,12 +1412,6 @@ That the list is closed is an argument about today's code, not something the com
 ### Requirements are generalized
 
 Obligations ride variables through `freshen_above`, so a generalized function carries its operators' requirements into its scheme. Each use instantiates and resolves its **own** copy — sharing one would let a `String` use empty an `Int` use's candidate set.
-
-### A definition nobody calls delivers nothing
-
-Narrowing is driven by delivery, so an obligation whose operands never receive a base narrows nothing and rejects nothing. That is exactly the residual gap named in [Typechecking a never-called definition](#typechecking-a-never-called-definition), and stating operator requirements rather than operand equality is what makes it observable: `f = λ𝑎 → (𝑎 + 1, 𝑎 + "s")` places two requirements on `𝑎`, each satisfiable alone and jointly not, and no delivery reaches either while `f` is uncalled. Under an equality rule the two `+`s collided structurally instead, so the conflict was a bound conflict and resolution found it.
-
-The requirements are still *recorded*, and jointly reading them is what would reject it — an unsatisfiable **intersection** of the requirements on one variable is visible with no delivery at all. That belongs to the obligation machinery rather than to the discard walk, and is not part of this change; `a_never_called_function_whose_conflict_is_only_a_trait_conflict_is_not_reached` holds the two cases so the gap has a name and a test rather than being an absence. Called, both are rejected, and with a better message than the equality rule gave: the trait, the operand position, and what that position accepts.
 
 ---
 

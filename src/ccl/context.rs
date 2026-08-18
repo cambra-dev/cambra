@@ -1112,6 +1112,7 @@ pub fn compile_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     /// Driver that runs `compile_program` for an error-only test, returning
     /// the collected error list. Discards the program — these tests only
@@ -1249,6 +1250,52 @@ Error: lowering error
             span,
             Some(chl_parser::ast::Span::new(0, 1)),
             "the use of `y` spans byte offsets 0..1"
+        );
+    }
+
+    /// The requirement sweep is a *third* blame path, beside emission's and
+    /// coalesce's, and it resolves to a span like both of them.
+    ///
+    /// It needs its own because it raises before coalesce and about a **place**, which
+    /// is not always some node's type: where a value's occurrences are split across
+    /// variables, the conflict sits at an interior place that only a *bound* reaches.
+    /// Blame is structural and does not follow bounds, so no node's type names a
+    /// variable standing there — which is why the failure offers the variable the walk
+    /// started from as well, and why both spellings below can name the lambda.
+    ///
+    /// Both are pinned because they are the same program: whether the parameters are
+    /// curried decides whether the place is interior, and the diagnostic must not
+    /// notice. Each case also puts a binding *before* the offending one, so the tree
+    /// root's own span is not the expected answer — without that, a blame path that had
+    /// silently collapsed to the root would still look correct here.
+    #[rstest]
+    #[case::curried(
+        "g = 2\nf = \\a -> (a + 1, a + \"s\")\ng\n",
+        "\\a -> (a + 1, a + \"s\")"
+    )]
+    #[case::uncurried(
+        "g = 2\nf = \\a, b -> (a + 1, a + \"s\")\ng\n",
+        "\\a, b -> (a + 1, a + \"s\")"
+    )]
+    fn unsatisfiable_operand_carries_resolved_span(#[case] code: &str, #[case] expected: &str) {
+        let errs = compile_err(code);
+        let (error, span) = errs
+            .iter()
+            .find_map(|e| match e {
+                CompileError::Infer { error, span } => Some((error, *span)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
+        assert!(
+            matches!(error, InferError::UnsatisfiableOperand { .. }),
+            "expected the sweep's own error, got {error:?}"
+        );
+        let span = span.expect("an unsatisfiable operand resolves to a source span");
+        assert_eq!(
+            &code[span.start..span.end],
+            expected,
+            "blame must land on a node enclosing the conflict, never the whole program \
+             and never nothing",
         );
     }
 
