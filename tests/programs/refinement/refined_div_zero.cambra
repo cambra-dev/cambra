@@ -1,0 +1,9 @@
+# The refined divisor rejects the literal `0` at the call site: `0` cannot
+# satisfy `{Int where _ != 0}`, so the program is a type error.
+
+def refined_div(left: Int, right: {Int where _ != 0}):
+    left // right
+
+y = refined_div(2, 0)
+
+y

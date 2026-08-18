@@ -344,10 +344,10 @@ fn lower_for_body_stmts(
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));
                 }
-                if mut_annotation_parts(annotation).is_some() {
+                if mut_annotation_parts(annotation, ctx).is_some() {
                     return Err(in_loop_mut_var_error(stmt.span, &name));
                 }
-                let ann = lower_type_annotation(annotation)?;
+                let ann = lower_type_annotation(annotation, ctx)?;
                 let val = lower_expr(value, ctx)?;
                 frame_introduced.insert(name.clone());
                 bindings.push((name, val, Some(ann), stmt.span));
@@ -865,10 +865,10 @@ fn lower_loop_body_chain(
                 value,
             } => {
                 let name = extract_name_target(target, "annotated assignment")?;
-                if mut_annotation_parts(annotation).is_some() {
+                if mut_annotation_parts(annotation, ctx).is_some() {
                     return Err(in_loop_mut_var_error(stmt.span, &name));
                 }
-                let ann = lower_type_annotation(annotation)?;
+                let ann = lower_type_annotation(annotation, ctx)?;
                 let val = lower_expr(value, ctx)?;
                 ctx.tag_image(Expr::let_bind_annotated(name, val, chain, ann), stmt.span)
             }

@@ -1548,8 +1548,7 @@ marked one carries its status per "How to read this document".)
   have the same field names with the same field types.
 - ``{ `tag₀{…} | `tag₁{…} | … }`` — variant type (**[Decided]**, §6.5).
   Not writable yet.
-- `{T where p(_)}` — refinement type (**[Decided]**, §6.4). Not writable
-  yet.
+- `{T where p(_)}` — refinement type (§6.4), where `_` refers to the value being refined.
 - `Mut(V)` / `Mut(V, Txn)` — mutable-variable / transactional-variable
   type (§6.2, §8).
 - `Map(K, V)` — finite-map type. **[Planned]** — the map literal
@@ -1563,8 +1562,8 @@ marked one carries its status per "How to read this document".)
 
 CHL also supports **refinement types**: a value of the refined type is
 a value of the base type for which a predicate holds. Refinements are
-inferred internally by built-ins like `groupby` (§7.2); the decided
-surface form is `{T where p(_)}` (§6.4), not writable yet.
+inferred internally by built-ins like `groupby` (§7.2); the surface
+form `{T where p(_)}` (§6.4) is writable in annotation position.
 
 > **Direction [Decided] — function contracts.** A contract can be written two
 > ways, and which one to reach for is a matter of the case at hand. As a
@@ -1710,9 +1709,6 @@ Sketched at the same **[Tentative]** level:
 
 ### 6.4 Refinement syntax
 
-**[Decided]** — not implemented. `where` is lexed and reserved (§1.6); the brace
-form is not parsed.
-
 A refinement is written `{ 𝑇 where 𝑝 }` — the base type, the keyword
 `where`, and a predicate over the value being refined:
 
@@ -1722,8 +1718,7 @@ A refinement is written `{ 𝑇 where 𝑝 }` — the base type, the keyword
 {{a: Int} where _.a > 0}                # ... a single-field record; no comma
 ```
 
-Three pieces. The form is not parsed today, though `where` is already lexed and
-reserved (§1.6):
+Refinement syntax has three pieces:
 
 - **`{ … }`** because a refinement *is* a structural type (§2.4). The base
   type sits inside the braces in its own spelling, so refining a structural

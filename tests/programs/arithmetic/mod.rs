@@ -7,5 +7,4 @@ use super::common::{expect_compile_error, expect_scalar};
 fn arithmetic() {
     expect_scalar(include_str!("program.cambra"), "20");
     expect_compile_error(include_str!("div_zero.cambra"), "attempt to divide by zero");
-    expect_compile_error(include_str!("refined_div_zero.cambra"), "type error");
 }

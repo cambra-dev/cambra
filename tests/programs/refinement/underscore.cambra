@@ -1,0 +1,7 @@
+# Outside a refinement, "_" is just a normal variable name
+
+_ = 1
+
+y = 2 + _
+
+y

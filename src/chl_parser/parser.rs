@@ -332,15 +332,44 @@ where
                 brace_item
                     .separated_by(just(Token::Comma))
                     .collect::<Vec<_>>()
-                    .then(just(Token::Comma).or_not()),
+                    .then(just(Token::Comma).or_not())
+                    // A `where p` clause turns the brace into a refinement type
+                    // `{ T where p }` (§6.4). It binds looser than everything in
+                    // `p`, which extends to the closing `}` (newlines are already
+                    // suppressed inside brackets, §1.4), so `expr` greedily
+                    // consumes the predicate up to `}`.
+                    .then(just(Token::Where).ignore_then(expr.clone()).or_not()),
             )
             .then_ignore(just(Token::RBrace))
-            .validate(|(items, trailing_comma), e, emitter| {
+            .validate(|((items, trailing_comma), refinement), e, emitter| {
                 let span = e.span();
                 let with_value = items.iter().filter(|(_, v)| v.is_some()).count();
                 let all_idents =
                     !items.is_empty() && items.iter().all(|(k, _)| matches!(k.node, Expr::Name(_)));
-                if !items.is_empty() && with_value == items.len() && all_idents {
+                if let Some(predicate) = refinement {
+                    // Refinement `{ T where p }`. The base is exactly one
+                    // colon-free type; a `field: T` item or more than one item is
+                    // not a base type. Checked here, before the single-element
+                    // `{T}` diagnostic below, so `{Int where …}` (one colon-free
+                    // item, no trailing comma) reads as a refinement rather than a
+                    // missing-comma tuple.
+                    if items.len() == 1 && with_value == 0 {
+                        let base = items.into_iter().next().expect("len == 1").0;
+                        Spanned::new(
+                            span,
+                            Expr::BraceRefinement {
+                                base: Box::new(base),
+                                predicate: Box::new(predicate),
+                            },
+                        )
+                    } else {
+                        emitter.emit(Rich::custom(
+                            span,
+                            "a refinement refines a single base type: `{T where p}`",
+                        ));
+                        Spanned::new(span, Expr::Error)
+                    }
+                } else if !items.is_empty() && with_value == items.len() && all_idents {
                     // Record type `{field: T, …}`. A one-field record needs no
                     // trailing comma — `field: T` already marks the form.
                     let fields = items
@@ -1272,6 +1301,42 @@ mod tests {
         assert!(matches!(parse_e("{Int,}").node, Expr::BraceGroup(v) if v.len() == 1));
         // The empty group is the unit type — `Unit` after lowering.
         assert!(matches!(parse_e("{}").node, Expr::BraceGroup(v) if v.is_empty()));
+    }
+
+    #[test]
+    fn refinement_type_parses() {
+        // `{ T where p }` (§6.4): a base type, `where`, and a predicate over the
+        // anonymous subject `_`. The single colon-free base does *not* hit the
+        // `{T}`-needs-a-comma diagnostic once a `where` clause is present.
+        let Expr::BraceRefinement { base, predicate } = parse_e("{Int where _ != 0}").node else {
+            panic!(
+                "expected a BraceRefinement, got {:?}",
+                parse_e("{Int where _ != 0}").node
+            );
+        };
+        assert!(matches!(base.node, Expr::Name(ref n) if n == "Int"));
+        // The predicate is an ordinary comparison over `_`.
+        assert!(matches!(predicate.node, Expr::Compare { .. }));
+
+        // The base may itself be a structural type — refining a record nests two
+        // brace pairs, the inner one being the record type.
+        let Expr::BraceRefinement { base, .. } = parse_e("{{a: Int} where _.a > 0}").node else {
+            panic!("expected a BraceRefinement over a record base");
+        };
+        assert!(matches!(base.node, Expr::BraceRecord(_)));
+    }
+
+    #[test]
+    fn refinement_base_must_be_a_single_type() {
+        // `where` refines one base type; a comma-separated list or a `field: T`
+        // item in front of `where` has no base-type reading.
+        for src in ["{Int, Bool where _ != 0}", "{a: Int where _ != 0}"] {
+            let result = parse_expression(src);
+            assert!(
+                !result.errors.is_empty(),
+                "expected `{src}` to be rejected (refinement base is a single type)"
+            );
+        }
     }
 
     #[test]

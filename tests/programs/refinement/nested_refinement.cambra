@@ -1,0 +1,6 @@
+def no_zero_no_one_div(left: Int, right: { {Int where _ != 1} where _ != 0}):
+    left // right
+
+y = no_zero_no_one_div(2, 0)
+
+y

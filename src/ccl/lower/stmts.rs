@@ -499,7 +499,7 @@ pub(super) fn lower_middle_stmt(
             value,
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
-            if mut_annotation_parts(annotation).is_some() {
+            if mut_annotation_parts(annotation, ctx).is_some() {
                 // `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut`
                 // annotation with the *immutable* `=` operator. This is
                 // contradictory under the cutover: `=` is a plain immutable
@@ -517,7 +517,7 @@ pub(super) fn lower_middle_stmt(
                     ),
                 ));
             }
-            let annotation_ty = lower_type_annotation(annotation)?;
+            let annotation_ty = lower_type_annotation(annotation, ctx)?;
             let val = lower_expr(value, ctx)?;
             Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),
@@ -582,9 +582,9 @@ pub(super) fn lower_middle_stmt(
             //   `x: T := e`        → induction accumulator at value type `T`
             let (value_ty, is_txn) = match annotation {
                 None => (Type::Hole, false),
-                Some(ann) => match mut_annotation_parts(ann) {
+                Some(ann) => match mut_annotation_parts(ann, ctx) {
                     Some(parts) => parts?,
-                    None => (lower_type_annotation(ann)?, false),
+                    None => (lower_type_annotation(ann, ctx)?, false),
                 },
             };
             // Stamp the binding `Mut(V, D)` (so inference binds `x` at `Mut` and
@@ -851,6 +851,7 @@ pub(super) fn check_mut_write_context(
 /// slot is a lowering error. Returns `None` for a non-`Mut` annotation.
 pub(super) fn mut_annotation_parts(
     annotation: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
 ) -> Option<Result<(Type, bool), LoweringError>> {
     // `Mut(…)` is type application — a call with a bare-name head (application
     // is parenthesised at both levels; see `lower_type_annotation`).
@@ -864,9 +865,9 @@ pub(super) fn mut_annotation_parts(
         return None;
     }
     match args.as_slice() {
-        [value] => Some(lower_type_annotation(value).map(|t| (t, false))),
+        [value] => Some(lower_type_annotation(value, ctx).map(|t| (t, false))),
         [value, domain] => {
-            let value_ty = match lower_type_annotation(value) {
+            let value_ty = match lower_type_annotation(value, ctx) {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e)),
             };
@@ -924,7 +925,7 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                 // A malformed `Mut(…)` annotation (`Err`) surfaces its real error
                 // when the `MutAssign` itself is lowered; not registering it here
                 // is harmless.
-                if matches!(mut_annotation_parts(annotation), Some(Ok((_, true)))) {
+                if matches!(mut_annotation_parts(annotation, ctx), Some(Ok((_, true)))) {
                     ctx.register_transactional(id.as_str());
                 }
             }
@@ -936,9 +937,11 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
             // name in the block wins (a non-`Mut` redefinition clears an earlier
             // `Mut` one, so its calls lower tupled).
             ChlStmt::FunctionDef { name, params, .. } => {
-                let has_mut_param = params
-                    .iter()
-                    .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation));
+                let has_mut_param = params.iter().any(|p| {
+                    p.annotation
+                        .as_ref()
+                        .is_some_and(|a| is_mut_annotation(a, ctx))
+                });
                 if has_mut_param {
                     ctx.register_mut_param_fn(name.as_str());
                 } else {
@@ -951,8 +954,8 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
 }
 
 /// Whether a type annotation is a pass-by-reference `Mut(…)` form.
-fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
-    mut_annotation_parts(annotation).is_some()
+fn is_mut_annotation(annotation: &Spanned<ChlExpr>, ctx: &mut LoweringContext) -> bool {
+    mut_annotation_parts(annotation, ctx).is_some()
 }
 
 /// Lower a CHL type annotation expression to a CCL [`Type`].
@@ -971,7 +974,10 @@ fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
 ///   comma is what makes it a product, and the parser rejects a comma-free
 ///   `{T}`.
 /// - The empty group `{}` — the unit type, `Unit`.
-pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
+pub(super) fn lower_type_annotation(
+    annotation: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
     match &annotation.node {
         ChlExpr::Name(id) => name_type(id.as_str()).ok_or_else(|| {
             LoweringError::unsupported(annotation.span, format!("unknown type annotation: {id}"))
@@ -981,7 +987,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
         // (`docs/chl-spec.md`).
         ChlExpr::Call { func, args } => {
             let head = type_ctor_head(func)?;
-            lower_type_application(annotation.span, head, args)
+            lower_type_application(annotation.span, head, args, ctx)
         }
         // Record type `{name: T, …}`.
         ChlExpr::BraceRecord(fields) => {
@@ -989,7 +995,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
             for field in fields {
                 out.push((
                     field.name.as_str().to_string(),
-                    lower_type_annotation(&field.value)?,
+                    lower_type_annotation(&field.value, ctx)?,
                 ));
             }
             Ok(Type::Record(out))
@@ -1001,12 +1007,28 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
         // is unit, and `Tuple([])` is not a valid type (see
         // `docs/chl-spec.md`, "6.6 The empty product is unit").
         ChlExpr::BraceGroup(parts) if parts.is_empty() => Ok(Type::Base(BaseType::Unit)),
-        ChlExpr::BraceGroup(parts) => Ok(Type::Tuple(
-            parts
-                .iter()
-                .map(lower_type_annotation)
-                .collect::<Result<_, _>>()?,
-        )),
+        ChlExpr::BraceGroup(parts) => {
+            let mut out = Vec::with_capacity(parts.len());
+            for part in parts {
+                out.push(lower_type_annotation(part, ctx)?);
+            }
+            Ok(Type::Tuple(out))
+        }
+        // Refinement type `{T where p}` (`docs/chl-spec.md`, "6.4 Refinement
+        // syntax"): the base type refined by a `Bool` predicate over the
+        // anonymous subject `_`. The subject lowers to the reserved binder
+        // `__elem` (`REFINEMENT_BINDER`), so the stored predicate is a bare
+        // `Bool` term with `__elem` free — the same shape a singleton or a
+        // `groupby` refinement carries. Discharge of the predicate is the
+        // solver's structural refinement subsumption; this only builds the type.
+        ChlExpr::BraceRefinement { base, predicate } => {
+            let base_ty = lower_type_annotation(base, ctx)?;
+            let pred = lower_refinement_predicate(predicate, ctx)?;
+            Ok(Type::Refinement(
+                Box::new(base_ty),
+                crate::ccl::Refinement::born(Rc::new(pred)),
+            ))
+        }
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple
         // *type* is written with braces `{T, U}` (`docs/chl-spec.md`).
         ChlExpr::Tuple(_) => Err(LoweringError::unsupported(
@@ -1054,11 +1076,32 @@ fn type_ctor_head(head: &Spanned<ChlExpr>) -> Result<&str, LoweringError> {
     }
 }
 
+/// Lower the predicate of a refinement type `{T where p}`.
+///
+/// The predicate is an ordinary CHL `Bool` expression whose anonymous subject
+/// `_` denotes the value being refined. Lowering runs with
+/// [`LoweringContext::in_refinement_predicate`] set (save/restore, so a nested
+/// annotation cannot inherit it) so that a bare `_` resolves to the reserved
+/// refinement binder `__elem` rather than a variable named `_`. The result is a
+/// bare boolean [`Expr`] in which `__elem` is free — exactly the shape
+/// [`crate::ccl::Refinement`] stores.
+fn lower_refinement_predicate(
+    predicate: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let saved = ctx.in_refinement_predicate;
+    ctx.in_refinement_predicate = true;
+    let result = lower_expr(predicate, ctx);
+    ctx.in_refinement_predicate = saved;
+    result
+}
+
 /// Lower a type constructor `head` applied to `args`.
 fn lower_type_application(
     span: Span,
     head: &str,
     args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
     match head {
         // A list type is a mapping `index-range ⤇ element`; the length
@@ -1077,7 +1120,7 @@ fn lower_type_application(
                 name: None,
                 kind: crate::ccl::ty::FunKind::Data,
                 domain: Box::new(Type::Hole),
-                codomain: Box::new(lower_type_annotation(elem)?),
+                codomain: Box::new(lower_type_annotation(elem, ctx)?),
             })
         }
         // `Mut(…)` in a nested position is handled by `mut_annotation_parts`
@@ -1447,6 +1490,50 @@ x";
             message.contains("(name=value)"),
             "expected a paren-record hint, got: {message}"
         );
+    }
+
+    /// A refinement type annotation `{T where p}` lowers to a
+    /// [`Type::Refinement`], and — the rule that distinguishes it from an
+    /// ordinary predicate — the anonymous subject `_` in `p` lowers to the
+    /// reserved refinement binder `__elem` (`REFINEMENT_BINDER`), *not* a
+    /// variable named `_`. That resolution is what the
+    /// `in_refinement_predicate` flag buys: `_` denotes "the value being
+    /// refined" only inside a predicate.
+    ///
+    /// `symbolic` renders only a binding's inferred `ty`, and the annotation
+    /// rides `user_annotation` (still `Hole`-typed pre-inference), so the test
+    /// reads the annotation back off the `Let` and renders *its* type — one
+    /// string that surfaces the base, the predicate, and the resolved subject.
+    #[rstest]
+    // Flat refinement: the predicate's `_` becomes `__elem`.
+    #[case("x: {Int where _ != 0} = 5\nx", "{Int | __elem != 0}")]
+    // Nested refinement: both levels' `_` resolve to `__elem`, and the
+    // save/restore of `in_refinement_predicate` around the inner annotation
+    // keeps the flag from leaking — the outer `_` still lowers to `__elem`
+    // after the inner predicate closes.
+    #[case(
+        "x: { {Int where _ != 1} where _ != 0} = 5\nx",
+        "{{Int | __elem != 1} | __elem != 0}"
+    )]
+    fn test_lower_refinement_annotation(#[case] code: &str, #[case] expected_ty: &str) {
+        use crate::ccl::{Type, TypedExprNode};
+
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
+        let TypedExprNode::Let { binding, .. } = &ccl.node else {
+            panic!("expected a top-level Let, got {:?}", ccl.node);
+        };
+        let ann = binding
+            .user_annotation
+            .as_ref()
+            .expect("an annotated assignment must carry a user annotation");
+        assert!(
+            matches!(ann, Type::Refinement(..)),
+            "expected a Type::Refinement, got {ann:?}"
+        );
+        assert_eq!(format!("{ann}"), expected_ty);
     }
 
     // -----------------------------------------------------------------------
