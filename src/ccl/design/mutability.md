@@ -789,16 +789,19 @@ causal matcher (`letrec::check_letrec_causal`).
 | Letrec pattern | Engine |
 |---|---|
 | a binding referenced only via `get_prev_seq(𝑏, …)`, over a finite/stream induction domain | `InductionStore` — the position-driven changelog loop engine (read densely via `StoreDenseRead`) |
-| commit-record bindings + `begin_<site>` oracles + `Txn` histories read via `get_prev_txn` | the commit operator (`CommitOperator`, `TransactWriter`, cyclic `FanOut`, `StoreValueStream`) |
+| commit-record bindings + `begin_<site>` oracles + `Txn` histories read via `get_prev_txn` | the commit operator (`CommitOperator`, `TransactDrive`, `TransactWriter`, cyclic `FanOut`, `StoreValueStream`) |
 | a `Txn` history read out of a read-only block (any reading loop — a live request stream, a finite loop, or a standalone singleton) | the as-of read (`AsOf`), latching the store's value as of the reading transaction's position, indexed by the outer reading loop |
 | a non-causal cycle, or a causal shape loop planning does not know | compile error (no silent fallback) |
 
 ### The runtime engines
 
-- **`InductionStore` (+ `StoreDenseRead`)** — the induction loop. It drives the loop *sequentially
-  inside the producer* — folding each position's prev-accumulator from its own commit engine, so
-  there is no cyclic `FanOut` — and writes a `Tile::Store` changelog (`init` at position 0; a
-  `commit: false` position carries the prior value forward). `StoreDenseRead` then folds that
+- **`InductionDrive` + `InductionStore` (+ `StoreDenseRead`)** — the induction loop, as a cycle
+  through a `FanOut::new_cyclic`. The store consumes the body's decisions and writes a
+  `Tile::Store` changelog (`init` at position 0; a `commit: false` position carries the prior
+  value forward); the drive reads that changelog back to produce the body's `(prev…, item)`
+  input, taking the next position from the decided frontier and the prev-accumulator from the
+  value at it. The accumulator therefore crosses between them as a tile, like every other
+  operator-to-operator value, at one position per pull. `StoreDenseRead` then folds the
   changelog over the loop domain to the dense `𝐷 ⇀ 𝑉` stream (serving both a scalar-final
   `ExtractFinal` and a co-iterated `fan_in`). A single always-commit or commit-gated writer over a
   finite *or* async domain.

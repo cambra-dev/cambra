@@ -36,6 +36,8 @@ pub enum Extent {
     /// A restricted extent: wraps another extent with a restriction predicate.
     Restricted {
         base: Box<Extent>,
+        // shared-state-ok: part of the extent *value*, shared with its own clones so
+        // a release narrows every view of one extent. Extents are types, not operators.
         restriction: Rc<RefCell<Restriction>>,
     },
 }
@@ -401,6 +403,7 @@ impl Extent {
     }
 
     /// Return the restriction handle if this is an [`Extent::Restricted`] extent.
+    // shared-state-ok: hands out the extent's own restriction handle (see the field).
     pub fn restriction(&mut self) -> Option<Rc<RefCell<Restriction>>> {
         match self {
             Extent::Restricted { restriction, .. } => Some(restriction.clone()),
