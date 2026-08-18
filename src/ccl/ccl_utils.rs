@@ -1365,12 +1365,20 @@ impl<C: PartialEq + Clone> PredMemo<C> {
                 }
             }
         };
-        // The rebuild runs id-preserving, covering the rewrite as well as the
-        // copy-on-write above (a substitution firing inside a predicate
-        // materializes its template here). Nothing records a predicate rewrite,
-        // so an id minted here is one no record explains; preserving is honest
-        // because the rebuilt term *replaces* the original everywhere this walk
-        // reaches.
+        // The whole rebuild runs id-preserving, and the reason is that a rebuild
+        // is a **replacement**: the term this produces is installed in place of
+        // the original, so it is the same logical predicate and keeps its ids.
+        // `uniquify`'s multiset tripwire asserts exactly that for its own
+        // rebuilds.
+        //
+        // The scope covers the rewrite, not just the copy-on-write above,
+        // because `f` mints and copies *into* the term (a substitution
+        // materializing a template, a rule building a conjunction) and those
+        // products are part of the same replacement.
+        //
+        // Not justified by predicates being outside the id domain — they are in
+        // it, and the fold explains them (`design/provenance.md`, "Walking the
+        // ids").
         let reported = crate::ccl::lineage::preserving_ids(|| f(&mut pred));
         let mut store = self.0.borrow_mut();
         let changed = reported || store.revision != before;

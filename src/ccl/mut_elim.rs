@@ -50,6 +50,7 @@ use crate::ccl::{
     TypedExprNode,
     ccl_utils::{COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
+    lineage,
     subst::Subst,
     symbolic::symbolic,
 };
@@ -356,6 +357,7 @@ fn flatten_spine(mut e: Expr) -> Expr {
     if let TypedExprNode::Let { bound_expr, .. } = &e.node
         && spine_writes_mut(bound_expr)
     {
+        let let_id = e.node_id();
         let TypedExprNode::Let {
             binding,
             bound_expr,
@@ -364,12 +366,42 @@ fn flatten_spine(mut e: Expr) -> Expr {
         else {
             unreachable!()
         };
-        return flatten_spine(hoist_writer_body(binding, *bound_expr, *body));
+        // Unlike the two reassociations above, this one is not 1:1: the hoist
+        // splices `let y = ⟨terminal⟩` into the body's terminal position and
+        // wraps the lifted write in a statement, so it *mints* — the `ExprStmt`,
+        // the spliced `let`, and its `unit` value. They stand in for the `Let`
+        // being hoisted, so that is the slot. `Machinery`, because the spliced
+        // binding is plumbing that restores the flat-spine invariant rather than
+        // anything the user wrote.
+        //
+        // The recursion is outside the frame, so a nested hoist attributes to its
+        // own `Let`.
+        let hoisted = {
+            let _g = lineage::enter(
+                let_id,
+                "letrec.hoist_writer_body",
+                lineage::Nature::Machinery,
+            );
+            hoist_writer_body(binding, *bound_expr, *body)
+        };
+        return flatten_spine(hoisted);
     }
     // A bare write reached in value/terminal position: it is a `Unit`-valued
     // statement, not a value to bind.
     if is_mut_write(&e) {
-        return flatten_spine(Expr::expr_stmt(e, unit_expr()));
+        // The write keeps its own id and becomes the effect; the `ExprStmt` and
+        // the `unit` body are new, and they exist to put this write in statement
+        // position. So the write is the slot.
+        let write_id = e.node_id();
+        let terminalized = {
+            let _g = lineage::enter(
+                write_id,
+                "letrec.terminalize_write",
+                lineage::Nature::Machinery,
+            );
+            Expr::expr_stmt(e, unit_expr())
+        };
+        return flatten_spine(terminalized);
     }
     // Pass-through — recurse in place so this node's own `ty`/annotation are
     // preserved (rebuilding would drop them, corrupting e.g. join subplans).
@@ -387,13 +419,35 @@ fn flatten_spine(mut e: Expr) -> Expr {
 }
 
 fn rewrite(mut expr: Expr) -> Expr {
+    let stmt_id = expr.node_id();
     if let TypedExprNode::ExprStmt { expr: effect, body } = expr.node {
+        let effect_id = effect.node_id();
         if let TypedExprNode::For {
             target,
             iter,
             body: loop_body,
         } = effect.node
         {
+            // The loop → causal `LetRec` rewrite, bracketed on the statement node
+            // it rewrites. Everything the transform mints — the carrier `LetRec`,
+            // its histories, guards and decision scaffolding — attaches to
+            // `stmt_id` as its parent; everything it carries through (the
+            // iteration source, each value expression) keeps its id and is its
+            // own self-edge. Nothing here says what dies.
+            //
+            // In particular there is no drop-path test. Whether the whole loop
+            // vanishes — no accumulator, no feed, e.g. a transaction-emptied
+            // `For` — is a fact about which ids are absent from the tree
+            // afterwards, and the boundary's live-set difference reads it off
+            // directly. The pass does not have to predict it, which is the point:
+            // that prediction had to re-run `collect_writes` and `body_has_feed`
+            // here to guess what `transform_loop` would decide ~140 lines away.
+            //
+            // `blame` names the `For` rather than the `ExprStmt` so the products
+            // resolve to the loop keyword's span, not the statement's; blame ⊥
+            // consumption, so this asserts nothing about the `For`'s fate either.
+            let g = lineage::enter(stmt_id, "letrec.loop", lineage::Nature::Expansion);
+            g.blame(&[effect_id]);
             return transform_loop(target, *iter, *loop_body, *body);
         }
         // A `MutWrite` outside any `For` is a *sequential* mutation — a
@@ -401,6 +455,12 @@ fn rewrite(mut expr: Expr) -> Expr {
         // (`bump(cnt)`) spliced between statements. There is no recurrence to
         // build; normalize it to a shadowing `let` (see `normalize_bare_write`).
         if let TypedExprNode::MutWrite { name, value } = effect.node {
+            // The shadowing `let` this mints is captured against the statement
+            // node it replaces. The `MutWrite` marker and the `ExprStmt` wrapper
+            // both vanish, but neither is named: both are absent from the output
+            // tree, so the boundary difference reports them.
+            let g = lineage::enter(stmt_id, "letrec.bare_write", lineage::Nature::Machinery);
+            g.blame(&[effect_id]);
             return normalize_bare_write(name, *value, *body);
         }
         // Not a loop/write statement: rebuild and recurse.

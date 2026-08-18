@@ -443,7 +443,7 @@ in add"
     #[test]
     fn uncurry_projection_roots_carry_occurrence_spans() {
         use crate::ccl::TypedExprNode;
-        use crate::ccl::lineage::{Nature, RecorderSession, SourceProjection, collapse_lowering};
+        use crate::ccl::lineage::{LoweringSession, Nature, SourceProjection, collapse_lowering};
         use crate::ccl::provenance::NodeId;
         use crate::chl_parser::ast::Span;
         use std::collections::HashSet;
@@ -457,11 +457,11 @@ in add"
 
         let stmts = parse_module(src);
         let mut ctx = LoweringContext::default();
-        let session = RecorderSession::lowering();
+        let session = LoweringSession::install();
         let ccl = lower_stmts(&stmts, &mut ctx)
             .into_result()
             .expect("lowering failed");
-        let log = session.into_lowering_log();
+        let log = session.into_log();
 
         let mut ids: HashSet<NodeId> = HashSet::new();
         fn all_ids(e: &Expr, acc: &mut HashSet<NodeId>) {

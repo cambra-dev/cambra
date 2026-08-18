@@ -1470,8 +1470,10 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // refinement predicates) does any work; skip cloning the bound
             // expression when the discharge would be vacuous.
             if crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name) {
-                let sigma =
-                    crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone());
+                let sigma = crate::ccl::subst::Subst::discharge(
+                    &binding.name,
+                    bound_expr.clone_preserving_ids(),
+                );
                 Some(sigma.apply_type(&body.ty))
             } else {
                 Some(body.ty.clone())
@@ -1781,19 +1783,6 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     }
     let base_name = frame.name.clone();
     let cutoff = frame.cutoff;
-    // A freshened, independently-identified copy of the definition: `Clone`
-    // mints a new `NodeId` for every node, so N specializations cannot collide on
-    // one id. The clone itself covers the `walk_children` domain only: a predicate
-    // rides its type slot behind an `Rc` that `Type`'s `Clone` shares.
-    // `freshen_expr_type_slots` below re-mints those interiors separately, through
-    // `freshen_refinement_predicate`.
-    //
-    // TODO(mono-record): nothing captures these copies. `on_copy` records only
-    // into an open step, and no recorder spans inference. Whichever change adds
-    // one must open the step **before** this clone, because the clone is what
-    // fires `on_copy`: a step entered after it watches every pair fall on the
-    // floor and leaves the whole specialization `Unexplained`.
-    let mut clone = frame.def.clone();
     // A monomorphization name carrying the source binding as provenance and a
     // globally-fresh uid for identity — so it can neither capture nor be
     // captured (the uid is what the old `__mono{N}` counter hand-rolled).
@@ -1807,6 +1796,31 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // `solver::freshen_expr_type_slots` / `freshen_above`), so the clone's
     // predicates are proper freshen instances sharing no live inference state
     // with the definition — and no mutable state to keep in sync with it.
+    // Sink for the clone's `on_copy` pairs. `freshen_clone_node_ids` below re-mints
+    // every node in the clone and each re-mint fires `on_copy(old, new)` — complete
+    // parentage on its own. What the hook needs is somewhere to flush to: a session
+    // installs the log, but only an open *frame* captures. Bracketing on the use
+    // site gives that, plus the label and nature a record needs; the pairs keep
+    // their own origins, because copies flush as per-origin `Op::Copy` steps rather
+    // than inheriting the frame's. The use site is already the node this rewrite is
+    // performed for, and is already what a failed pin blames.
+    let _spec = crate::ccl::lineage::enter(
+        use_expr.node_id(),
+        "mono.specialize",
+        crate::ccl::lineage::Nature::Expansion,
+    );
+    // The clone must come *after* the frame opens. `Clone` freshens, so
+    // `frame.def.clone()` is what fires `on_copy` for every node in the
+    // specialization — complete parentage on its own, but only an open frame
+    // captures it. Entered afterwards, the frame watches every pair fall on the
+    // floor and the whole specialization folds as `Unexplained`; measured at 28
+    // such nodes on `generator_pipeline` before this ordering was fixed.
+    //
+    // A freshened, independently-identified copy of the definition: N
+    // specializations cannot collide on one id. It covers the `walk_children`
+    // domain only — predicate-embedded ids, reachable through type slots behind
+    // an `Rc`, are outside that domain and stay aliased.
+    let mut clone = frame.def.clone();
     let mut fresh = FreshenCache::new();
     // Quantified channel-domain names must instantiate to the SAME names the
     // use site's pass-1 instantiation minted — a rigid name, unlike a
@@ -1953,13 +1967,27 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // binding this rebuild deletes — see `src/ccl/design/type-inference.md`,
     // "Typechecking a never-called definition", for why that dangling reference is
     // unobservable today and what fixes it.
+    //
+    // The chain replaces the generalized `let`, whose id does not survive: each
+    // layer is a fresh node, so without a frame every one of them is an output
+    // node with no origin. The node the chain stands for is the generalized
+    // `let` itself, so that is what the layers copy from — one origin, K
+    // products, which is exactly what the body demanded of the binding. Opened
+    // here rather than around the body walk above: a frame there would adopt
+    // every node the body's own rewrites mint.
+    let _chain = crate::ccl::lineage::enter(
+        expr.node_id(),
+        "mono.coalesce_let",
+        crate::ccl::lineage::Nature::Expansion,
+    );
     let mut result = body;
     for spec in frame.specs.into_iter().rev().filter(|s| s.referenced) {
         // The discharge only does work when the specialization binder is free
         // in the body type's refinement predicates; skip cloning `spec.def`
         // otherwise (it is still moved into the rebuilt `let` below).
         let body_ty = if crate::ccl::subst::type_free_vars(&result.ty).contains(&spec.name) {
-            crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone()).apply_type(&result.ty)
+            crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone_preserving_ids())
+                .apply_type(&result.ty)
         } else {
             result.ty.clone()
         };
