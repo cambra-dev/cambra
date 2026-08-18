@@ -205,7 +205,7 @@ mod tests {
 
     /// Regression: mutually-constrained inference variables form an `Rc`
     /// cycle through their bounds (`?a <: ?b` stores `?b` in `?a`'s upper
-    /// bounds and vice versa). Reference counting alone never reclaims it;
+    /// bounds and vice versa). Reference counting alone never rerefinements it;
     /// the owning [`InferArena`](crate::ccl::infer::InferArena)'s `Drop` is
     /// what clears the bounds and breaks the cycle.
     /// If this fails, the cycle is leaking again.

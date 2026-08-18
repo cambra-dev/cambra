@@ -77,7 +77,7 @@ x"#,
 // function being applied says nothing about this parameter — the contribution has to
 // come off the head of the spine (`parameter_type`). Reading it off the applied type
 // instead covers `fw(x, n)` and silently skips this, which then fails the invariance
-// check against `Mut(Int)` because the mutable variable still claims its seed.
+// check against `Mut(Int)` because the mutable variable still refinements its seed.
 #[case(
     r#"
 def fw(n: Int, c: Mut(Int)):

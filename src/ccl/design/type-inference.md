@@ -552,7 +552,7 @@ Two things make this load-bearing rather than housekeeping:
 - **The keepalive.** The memo keys on the `Rc`'s *address*
   (`PredicateId`), which is sound only while that address cannot be reused.
   Overwriting a slot can drop the last reference to the origin and free an
-  address a later `Rc::new` in the same walk reclaims, at which point an
+  address a later `Rc::new` in the same walk rerefinements, at which point an
   unrelated predicate collides with the entry and inherits its rebuild. `PredMemo`
   retains every origin for its own lifetime; that is why passes use it rather
   than a bare map.
@@ -597,7 +597,7 @@ A walk over the slot set must still cover it, because the passes that use
 `subst`), and — because an erasure and its own post-condition share that walk — a
 slot the walk misses is a slot the check cannot report on.
 
-The claim is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
+The refinement is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
 stamps a distinct marker into every directly-carried `Type` in the AST and pins
 which ones the walk reaches. One is deliberately excluded — `Transact`'s `domain` —
 because that node is born by `plan_loops` after every pass on the walk, so covering
@@ -680,7 +680,7 @@ e.g. `make_restrict`).
 
 ### 3.2 The `InferArena`: who owns inference variables
 
-Recording `α <: β` pushes `Type::Infer(β)` into `α`'s bounds and `Type::Infer(α)` into `β`'s bounds (the shared-`Rc` linkage from §1). Mutual constraints — and self-recursive ones — therefore make each `InferVar` hold a *strong* `Rc` to the others through its `RefCell<InferBounds>`. After Pass 2 overwrites every `expr.ty` with a concrete, variable-free type, these cells become unreachable from the final AST yet keep one another alive: reference counting alone never reclaims the cycle, so the entire variable graph would leak after each `infer()` run.
+Recording `α <: β` pushes `Type::Infer(β)` into `α`'s bounds and `Type::Infer(α)` into `β`'s bounds (the shared-`Rc` linkage from §1). Mutual constraints — and self-recursive ones — therefore make each `InferVar` hold a *strong* `Rc` to the others through its `RefCell<InferBounds>`. After Pass 2 overwrites every `expr.ty` with a concrete, variable-free type, these cells become unreachable from the final AST yet keep one another alive: reference counting alone never rerefinements the cycle, so the entire variable graph would leak after each `infer()` run.
 
 **`InferArena` (`ccl/infer/`) is the single owner that breaks the cycle.** It retains one strong handle to *every* variable at the moment it is minted (captured through a thread-local mint sink wired into `InferVar::fresh`), and on `Drop` clears each variable's lower/upper bound lists — severing all bound edges so every refcount can reach zero. A flat `Vec` suffices: variables are never looked up by id (the `Type` carries the `Rc` directly), so the arena only enumerates them once, at teardown. Clearing bounds before the `Vec` drops handles self-cycles and N-way cycles uniformly. This is an end-of-inference lifetime invariant implemented as RAII: the arena is created at the top of `infer()` and drops on the `Ok` and error paths alike.
 
@@ -943,6 +943,212 @@ The expected binder is **always globally fresh** (proposal §5.2 verbatim; the �
 * **O4** — two *different* discharges of one refinement (`g(0)` vs `g(1)`) are distinguished once forced — `force_refinement` rewrites the predicate term and refinement equality is structural (§4) — and the constraint cache is σ-aware, so the two discharges record distinct edges rather than conflating. The residual domain-join corner is two *distinct non-invertible* morphisms meeting at one variable (O1/O4), guarded loudly by `bridge_holder_gap`'s panic tripwire rather than silently dropped.
 
 The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) and the nested filtered-source group-by both run end-to-end with correct values.
+
+### Scoped inference variables: stored fragments close against a telescope
+
+> **Status: designed, not implemented.** This section is the design of record
+> for retiring open type fragments from the solver. The flatten-time Pi-binder
+> canonicalization on the unmerged branch `dmills/canonical-pi-binders` is the
+> local repair this design replaces; its regression tests — α-variant bounds
+> merge to one refinement, `spec_key` shares α-variant dependent types, distinct
+> enclosing binders stay distinct — are this design's acceptance tests.
+
+#### The defect this removes
+
+A refinement predicate may reference an enclosing binder, and the fragment
+holding it travels away from that binder during inference. Group-by's lowering
+puts the dependent refinement in a cast target while the arrow that binds `__gb_k`
+is minted separately by `emit_lambda` (`src/ccl/lower/exprs.rs` pins the
+lowered shape), so the refinement reaches the solver as a bound on a variable whose
+position has no enclosing arrow; the suspended discharge riding the edge is
+all that relates the reference to its binder. In that window the refinement is an
+open term, and nothing checks it — `check_scope_valid` runs on coalesced node
+types after inference ends, never on bounds.
+
+Identity sites compare those open fragments structurally: `RefinementSet`
+dedup, `CompactType::merge`, the constraint cache, `SpecKey`. Structural
+comparison of open terms is α-sensitive, and at the merge the failure is worse
+than a split: `CompactFun::merge` keeps the first arrival's binder
+(`a.name.or_else(|| b.name)`) while unioning the refinement sets, so
+`(𝑥: 𝐷) ⤇ {Int | __elem == 𝑥}` and its `𝑦`-twin meeting at one variable
+coalesce to a type that binds one name and refinements under both — which type
+depends on constraint arrival order, and the loser's claim references a binder
+the type no longer binds.
+
+#### The invariant
+
+Every inference variable records the **telescope** of binders in lexical scope
+at its creation: Pi binders and `let` binders, interleaved in scope order.
+Emission already holds this context at every `fresh()` — `InferCtx::scopes`
+tracks in-scope bindings for `Var` typing — and discards it; the telescope
+keeps it.
+
+A bound recorded on a variable **closes against the holder's telescope**:
+every free term variable of the bound's type is in the telescope, in the
+edge's substitution domain, or a source. The check runs when the bound is
+recorded — a lookup, since uniquify gives every binding site one uid — and a
+violation is a record-time internal error naming the variable and the
+reference, not a fragment waiting for a coincidence to keep it unobserved.
+
+Sources stay name-referenced and outside the telescope: a source name is a
+unique global identifier with no binding structure, the same standing
+`check_scope_valid` gives it.
+
+#### The coordinate is locally nameless
+
+A binder reference is stored in one of two forms, and the form encodes whether
+the fragment itself binds it:
+
+- **Free references — to telescope entries — are names.** A uniquified name
+  identifies its telescope entry exactly, so the record-time check is a
+  lookup; the same name denotes the same binder at every holder that may
+  legally hold the fragment, so a bound crossing a variable-to-variable edge
+  keeps its coordinates and the reader re-runs the closure check against its
+  own telescope; and the discharge machinery keeps addressing binders by
+  name, unchanged.
+- **Bound references — to the fragment's own arrows — are de Bruijn indices,
+  assigned at abstraction.** Constructing an arrow over a body closes the
+  body: free references to the arrow's binder become indices counting
+  outward. `Type::pi` at emit and coalesce assembling a lambda's type are the
+  same operation, so the constructor owns it and an arrow whose codomain
+  carries a dangling internal name is unconstructible. A closed family is
+  α-canonical by construction — two α-variant families are structurally
+  identical, which is what the merge, the caches, and `SpecKey` need.
+
+The split is forced by where identity runs: an identity site sees a refinement
+without its enclosing arrows — `merge_refinements` compares refinement sets sitting
+beside `CompactFun`'s binder slot, one frame below it — so whether a reference
+is bound by the fragment or free in it must be readable off the reference
+alone. A name is ambiguous between the two; an index is self-evidently bound
+and says by what. The telescope supplies context for free references and
+cannot for internal ones, which are not in it. Closure does make α-aware
+comparison of a *whole* fragment well-defined — the comparison sees both
+binders and threads a correspondence, as `constrain_go`'s rename environments
+do today — and that route is rejected below on placement, not possibility:
+identity flows through keys, not comparison calls.
+
+Each coordinate fails if used for the other reference kind, and the failures
+are the two halves of this design's motivation. Names for bound references are
+the status quo: α-variant closed families spell one type two ways, and the
+merge keeps the first arrival's binder while unioning both spellings' refinements.
+Indices for free references collide across holders: two refinements from different
+scopes referencing different binders at the same telescope depth would compare
+equal wherever fragments from different holders meet — the `SpecKey` memo
+compares keys across uses — and wrong sharing is the miscompile class, where
+α-variant splitting was only wasted clones.
+
+Structural equality is therefore context-free sound: free names are globally
+unique, bound indices are anchored to arrows that travel with the fragment,
+and neither needs re-basing anywhere. The constraint cache's `(Type, Type)`
+key is unaffected.
+
+#### `let` binders and scope exit
+
+A `let` telescope entry carries its definiens. A refinement may reference it while
+in scope — this is what user-written refinement types need
+(`{Int | __elem > n}` with `n` let-bound) — and lifting a type past the
+binding discharges the reference to the definiens: the existing `let`-closing
+discharge in `coalesce_node`, re-addressed from name to telescope entry.
+Pi entries have no definiens; lifting past one abstracts instead of
+discharging, which is the family formation below.
+
+#### Discharge is application
+
+The two-sided edge storage already holds the pieces: a `Bound { self_subst,
+ty, ty_subst }` whose substitution discharges a binder is a **closed family
+applied at an argument** — `(λ𝑥. ty) arg` — written as a type with a free
+variable plus a map that promises to remove it. This design reads the form
+honestly: the substitution's domain binders count as *bound* in the record-time
+check, β fires at coalesce against the telescope, and the reconciliation of
+two application spines meeting at one variable replaces `bridge_holder_gap`'s
+intensional judgment of substitutions-as-maps. This is the `γ[σ]` form the
+vault issue `type-checker-first-class-dependent-functions` names as what the
+two-sided representation was chosen to graduate into, and it retires
+`Subst::licensed_correspondence_view` per that issue's acceptance criteria:
+with explicit applications there is nothing left to license, and two distinct
+discharges meeting at one variable (the O1/O4 corner) become two points of one
+family — representable, where today they are a panic tripwire.
+
+#### What this makes derivable
+
+- **Identity sites are sound by construction.** Refinements on one variable share
+  one telescope, so `merge_refinements`, the cache, and `SpecKey` compare
+  indices structurally with no rename. One invariant carries the keying story:
+  keys identify refinements up to binder position; fiber distinctions ride the
+  per-use discharges, which the σ-aware constraint cache already keeps
+  distinct (see [Keying a specialization](#keying-a-specialization)).
+- **`Type::Fun`'s binder slot degrades to display metadata.** A refinement's
+  binding is its index, not the arrow's name, so the Fun/Fun codomain edge
+  needs no binder correspondence and `extended_rename`'s production use
+  disappears.
+- **The formal model's rename machinery deletes.** `Ren`/`codRen` exist to
+  mirror `extended_rename`; with it gone, transitivity is stated for
+  telescope-indexed types directly, without the canonical-fragment
+  restriction, and the σ-gap is not dissolved but never formed.
+
+#### Approaches that do not work
+
+- *Source names plus the Barendregt convention* — the status quo; the
+  arrival-order merge above is its measured failure.
+- *Canonicalizing binders as types flatten* — correct, and the unmerged
+  branch does it, but the conversion runs in three walks that must agree, and
+  the birth-to-flatten window stays unchecked.
+- *Indices for free references* — with or without carried telescopes: an
+  index into the holder's context collides across holders, so cross-use key
+  comparisons identify refinements about different binders. Names collide never;
+  uniquify already paid for that.
+- *Names for bound references, compared α-aware* — well-defined once
+  fragments are closed, and rejected on placement. Identity sites use
+  fragments as **keys**: the constraint cache is a `HashMap` on
+  `(Type, Type)`, `SpecKey`'s views are `BTreeMap`s, claim dedup is
+  containment through `PartialEq` — all via `Eq`/`Ord`/`Hash`, which take no
+  environment, so quotient-respecting versions must compute the nameless view
+  inside every call while names remain the stored form: two views of one
+  structure that must agree at every impl. The merge must still pick a
+  surviving spelling, so coalesced output stays arrival-order-dependent even
+  when every judgment is α-correct. `Type::without_pi_names` is the lossy
+  on-demand version of this view the pipeline already computes. Assigning the
+  index once at abstraction is the same computation run once, after which the
+  derived operations are correct as derived — the trade `Refinement` already
+  made for `__elem` ("no α-renaming needed").
+- *α-invariant equality and hashing at claim granularity* — the compared
+  fragments do not contain their binders (the refinement set sits beside
+  `CompactFun`'s name slot, one frame below), so there is no correspondence to
+  thread.
+
+#### Implementation order
+
+1. **Thread and observe.** Telescopes on `InferVar`, populated from
+   `InferCtx::scopes`; the record-time check logs instead of failing.
+   Behaviour-neutral; the log enumerates every fragment the current system
+   stores open.
+2. **Convert and mediate.** In-telescope references stored as indices;
+   discharge edges read as applications; the `let`-closing re-address.
+3. **Enforce.** The record-time check becomes an internal error; the
+   observation log must be empty first.
+4. **Delete.** The name-keyed paths: the Fun/Fun correspondence,
+   `licensed_correspondence_view`, and the flatten-time canonicalization that
+   never merged.
+
+Validation is the formal model: rebuild `Sub` over telescope-indexed types
+(no rename environments), re-prove the battery, and re-run the differential
+oracle — the model getting simpler is the design working; the model needing
+new machinery is a finding about the design.
+
+#### Open questions
+
+- **Diagnostics.** An index renders poorly in an error message; the stored
+  reference should carry the source spelling as display metadata, with
+  identity on the index alone.
+- **Interior term lambdas in predicates.** A refinement's predicate may contain a
+  term lambda (`λ x → x // 2` in the group-by claim), whose parameter is a
+  bound-in-fragment reference one level down — the same α-sensitivity in
+  principle, unobserved in practice. Whether abstraction covers term binders
+  inside predicates or they stay named is undecided.
+- **Freshening.** A specialization clone's refinements keep definition-site
+  indices; `freshen_expr_type_slots` must copy them verbatim, and the pin to
+  the use's live type re-bases at the boundary. The interaction needs a
+  worked example before milestone 2.
 
 ## 4.6 Data vs compute functions
 

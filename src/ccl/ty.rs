@@ -1167,7 +1167,7 @@ impl Type {
     /// the handle accessors below.
     ///
     /// The all-depths counterpart, [`crate::ccl::ccl_utils::strip_refinements`],
-    /// is a different operation: it *drops* claims rather than looking past them,
+    /// is a different operation: it *drops* refinements rather than looking past them,
     /// allocates, and is only meaningful on a resolved type.
     pub fn peel_refinements(&self) -> &Type {
         let mut cur = self;
@@ -1870,13 +1870,13 @@ mod tests {
     /// A shape test looks *through* a refinement: a refined mutable variable is still
     /// one and a refined channel is still a channel. Nothing in the pipeline
     /// wraps a handle today — a handle type is built structurally rather than
-    /// resolved from a variable, so no position accumulates a claim onto one — which
+    /// resolved from a variable, so no position accumulates a refinement onto one — which
     /// is exactly why the rule needs stating here: it is the accessors' contract,
     /// not a shape a program can be written to exercise.
     #[test]
     fn handle_accessors_see_through_a_refinement() {
-        let claim = Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true))));
-        let refine = |t: Type| Type::Refinement(Box::new(t), claim.clone());
+        let refinement = Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true))));
+        let refine = |t: Type| Type::Refinement(Box::new(t), refinement.clone());
         let int = Type::Base(BaseType::Int);
         let mut_var = Type::History {
             value: Box::new(int.clone()),

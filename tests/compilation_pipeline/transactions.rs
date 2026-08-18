@@ -1000,7 +1000,7 @@ fn await_final_broadcast_over_a_reading_loop_stays_final() {
 /// A **bound** await, read inside a feed loop — the shape that separates the two reads
 /// by *term* rather than by position. `channelize` closes the channel over the bindings
 /// its contribution names, so `let f = ⟨read⟩` is copied in directly above the broadcast:
-/// the shape the as-of rewrite matches. The rewrite claims only `as_of_read`, so `f`
+/// the shape the as-of rewrite matches. The rewrite refinements only `as_of_read`, so `f`
 /// stays the completed 90 at both positions. Spelled `final_or_default`, as an as-of read
 /// once was, it would be matched instead and each position would latch its own arrival —
 /// the seed, reporting 101 and 102.

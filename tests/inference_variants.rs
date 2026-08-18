@@ -420,7 +420,7 @@ fn lambda_returns_variant() {
 /// branches at the positive polarity, yielding the union of tags.
 ///
 /// The payload of a tag only *one* arm carries keeps that arm's value claim: the
-/// join intersects claims across arms that meet, and these two never do — one
+/// join intersects refinements across arms that meet, and these two never do — one
 /// carries `` `some ``, the other `` `none ``. So `` `some ``'s payload stays the singleton `1`
 /// rather than widening to `Int`.
 #[test]
