@@ -745,8 +745,8 @@ pub(super) fn lower_middle_stmt(
             Ok(ctx.tag_machinery(Expr::expr_stmt(effect, body), stmt.span, "lower.stmt_seq"))
         }
         // A standalone `with begin():` transaction — one commit over a
-        // synthesized singleton source, `transact_phase` folds it into the
-        // shared commit store (see src/ccl/design/mutability.md).
+        // synthesized singleton source, which `transact_phase` folds into the commit
+        // store holding the mutable variables it touches (see src/ccl/design/mutability.md).
         ChlStmt::With { .. } => lower_standalone_transaction(stmt, body, ctx),
         // Parse-recovery placeholder: silently drop the broken statement and
         // pass the continuation through. See `ChlExpr::Error`.

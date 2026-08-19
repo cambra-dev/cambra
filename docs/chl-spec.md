@@ -2636,6 +2636,12 @@ interleaved (or parallel) otherwise. The events:
 
 Consequences a program may rely on:
 
+- **Commit order is not global.** Two `with begin():` blocks are ordered
+  relative to each other only if they mention a mutable variable in common —
+  a shared variable is what makes one block's commit visible to the other.
+  Blocks with no variable in common are **unordered**: nothing in the
+  language imposes an order between them, and their transactions interleave
+  freely. Two independent `for` loops relate their accumulators the same way.
 - **Commit order is not lexical order.** Two `with begin():` blocks do
   **not** commit in the order they appear in source; each block's position
   is fixed by its trigger event (a source arrival, or the loop index for a

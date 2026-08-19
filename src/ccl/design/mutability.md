@@ -503,6 +503,73 @@ mutable variables and channels they target. Generators survive inlining because 
 leaves nothing to lose — a generator body is `For` + `Feed` nodes against an implicit result feed,
 substituted wholesale.
 
+### How many commit stores a program has
+
+**One per set of mutable variables a `with begin():` block relates** — not one per program, and
+not one per mutable variable. `transact_phase::partition_keys` computes the partition; each part
+becomes its own `LetRec`, its own `Transact{domain: Txn}`, and its own `CommitOperator`. The
+induction path partitions the same way: `mut_elim::transform_loop` emits one letrec per loop.
+
+A block is what forces mutable variables together, for two reasons that coincide on the block's
+footprint. The store is not a user-facing concept: the
+[CHL spec's ordering model](../../../docs/chl-spec.md#85-ordering-and-concurrency) says only that
+two blocks are ordered when they mention a mutable variable in common, and that blocks sharing no
+variable are unordered. The partition is how that is realized — a program never has to reason
+about it.
+
+- **Atomicity.** A writing block produces one commit record, so every key it *writes*
+  advances at one tick, and every key it *reads* is read at that tick's snapshot.
+  `{reads ∪ writes}` is therefore one store — which is why the `limit` a guard consults is
+  in the same store as the `total` it guards, though nothing writes `limit`.
+- **Snapshot consistency.** A read-only block's reads are latched at one frontier, which
+  `rewrite_live_reads`'s `build_snapshot` realizes by handing `AsOf` a single mutable variable
+  record. Keys read together must be in that record. Such a block is *unwrapped* onto the
+  spine and leaves no `WriterSite`, so `strip` keeps its footprint explicitly
+  (`Stripped::read_only_footprints`).
+
+Nothing else forces sharing. Two consequences are observable:
+
+- **Completion.** A store reports terminal only once all of its writers have drained,
+  and a fed-out read is an `AsOf`, non-terminal until its store is. So a finite mutable
+  variable's trailing read settles even while an unrelated mutable variable has a live-source
+  writer (`a_finite_mut_var_completes_despite_a_live_unrelated_writer`).
+- **Commit clocks.** Unrelated mutable variables share no commit order, so nothing imposes an
+  interleaving between transactions that never interact.
+
+A mutable variable **no block writes at all** is not a key of any store, and relates nothing by
+being read. Nothing can advance it — the lowering write gate admits a mutable variable write only
+inside a block, and a block write would put it in a write set — so its history is constant at its
+seed and every read of it is that seed. It keeps its introduction on the spine. Only a read-only
+footprint reaches this case: `limit` above is unwritten too, but a *writing* block reads it, which
+makes its value a question about a commit snapshot rather than about a constant.
+
+**Placement.** `plan_store` plans each store (its keys' history bindings, its writers'
+commit records, its taps) and `splice_stores` places them in one spine walk. A store's
+letrec sits below everything its bindings need — a writer's iteration source, chiefly —
+and above everything that reads its keys. Each spine statement gets a **level**: 0 if it
+reads no store, else one past the last store it reads, transitively through statements
+already carried. Level 0 keeps its place above every letrec; the rest ride inside the
+store they read. A statement cannot read two stores at once, which is what makes the
+level well-defined — reading two mutable variables together is a block, and the partition put
+those keys in one store so the read has one snapshot to come from.
+
+"Reads a store" means *names anything that store's body binds*: a key, a history binding, or a
+**defer fed inside the store** — either an in-block feed, whose tap the store's body binds, or
+the feed of a read-only block, carried in as an effect statement. The defer has no fallback: a
+key left above the letrec would still find its seed introduction, whereas a defer fed only inside
+the store exists nowhere else. That is also why an effect statement counts for the transitive
+step — it binds no name, but it contributes to one.
+
+The folded cross-domain induction loops (`CrossDomain`) wrap the **whole** nest: an
+accumulator a commit decision reads must be bound outside any store that reads it, and
+outermost satisfies that for all of them at once (`a_cross_domain_read_coexists_with_a_second_store`
+pins the nesting).
+
+Both paths close a group through one shared routine, `mut_elim::close_recurrence_group`
+— trailing reads, then feed hoists, then the causality assert, then the `LetRec`. The two
+differ in how they *find* their bindings and where the group is spliced, not in how a group
+is closed.
+
 ### mut_elim: eliminating overwrite mutability
 
 Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` algebra) with every

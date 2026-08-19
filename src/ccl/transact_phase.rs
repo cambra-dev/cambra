@@ -6,6 +6,13 @@
 //! This unifies the transaction path with the induction path (`For`/`MutWrite`
 //! → a `get_prev_seq` `LetRec` → recognition → `Transact` → engine).
 //!
+//! **A program gets one store per set of mutable variables a block relates**, not one for
+//! the whole program — the same shape the induction path has, where
+//! `mut_elim::transform_loop` emits one letrec per loop. [`partition_keys`] states
+//! the rule and why; [`plan_store`] plans each partition, and [`splice_stores`]
+//! nests them into the continuation. Mutable variables nothing relates keep their own
+//! commit clocks and their own completion.
+//!
 //! Runs post-inline (cross-function writers already landed at their call sites)
 //! and *before* [`crate::ccl::mut_elim`], so the induction phase never sees a
 //! transaction loop. Lowering emits each `with begin():` block — standalone or
@@ -20,7 +27,8 @@
 //!    block by read-your-writes substitution — each in-block `<<` feed rides the
 //!    `` `commit `` payload as a `to_<defer>` tap). This is the **same** writer/key
 //!    building the direct fold used; only the assembly below differs.
-//! 2. **assembles** the `LetRec` (see [`build_letrec`]): one **history** binding
+//! 2. **partitions** the keys into commit stores ([`partition_keys`]) and
+//!    **assembles** one `LetRec` per store (see [`plan_store`]): one **history** binding
 //!    `reg_k : Txn ⇒ V = λ t → get_prev_txn(view, t, init)` per key — reading
 //!    its writing site's commit stream (or self-guarded for a read-only key) —
 //!    and one **commit-record** binding `commits_j : 𝐼 ⇒ {time, write_targets,
@@ -28,7 +36,8 @@
 //!    snapshot `(reg_rk(begin(r)) …, source(r))` of the variables it reads, at commit
 //!    time `begin(r)` (the [`Builtin::BeginTxn`] oracle). The `reg_k ↔
 //!    commits_j` cycle crosses `get_prev_txn` once, so it is guarded.
-//! 3. **rebinds** each key variable's `let x = init` to `let x =
+//! 3. **places** the stores ([`splice_stores`]), rebinding each key variable's
+//!    `let x = init` to `let x =
 //!    final_or_default(reg_x, init)` over its history binding, so a read of the
 //!    variable (only legal inside a `with begin():` block, where it is a bare
 //!    `Var(x)`) denotes the value at that snapshot; a read fed out of a block
@@ -68,8 +77,7 @@ use crate::ccl::{
     BaseType, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey,
     HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::{is_free_in_value, synthesize_arm_predicate},
-    letrec::check_letrec_causal,
-    mut_elim::{fold_induction_loop, hoist_feeds, mut_var_value_tys},
+    mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
 };
 
 /// Recognize a **fed-out mutable variable read** and rewrite it to an as-of join, *before*
@@ -531,8 +539,8 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
     if txn_mut_vars.is_empty() && !contains_begin(&expr) {
         return expr;
     }
-    let mut sites: Vec<RawSite> = Vec::new();
-    let stripped = strip(expr, txn_mut_vars, None, &mut sites);
+    let mut harvest = Stripped::default();
+    let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
     // Post-strip invariants (release asserts, like the letrec-phase
     // post-conditions): every `Begin` was consumed (stripped into a site or
     // unwrapped), and no transactional write survives outside a block — a
@@ -548,6 +556,10 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
         "transact_phase: a `MutWrite` to a transactional mutable variable survived stripping — an \
          out-of-block mutable variable write the lowering write gate should have rejected"
     );
+    let Stripped {
+        sites,
+        read_only_footprints,
+    } = harvest;
     if sites.is_empty() {
         return stripped;
     }
@@ -562,6 +574,9 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
             }
         }
     }
+    // One commit store per set of keys some block relates (see [`partition_keys`]),
+    // matching the induction path's one-letrec-per-loop.
+    let groups = partition_keys(&key_names, &sites, &read_only_footprints);
 
     // Each key's tick-0 `init`, located at its `MutDecl` (the value type is
     // the init's type — the snapshot/write element type of that variable).
@@ -575,7 +590,6 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
         );
     }
 
-    // A monotone counter across all sites gives each tap field a name unique
     // Fold induction loops whose accumulator a commit decision reads out of the
     // continuation and into an *outer* induction letrec: `commits(r)` is bound
     // inside the transaction letrec, so an accumulator it reads must be in scope
@@ -589,21 +603,116 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
     let mut cross = CrossDomain::default();
     let stripped = fold_cross_domain_loops(stripped, &cross_reads, &mut cross);
 
-    // A monotone counter across all sites gives each tap field a name unique
-    // within the shared mutable variable — two writers feeding the same defer contribute
-    // distinct `to_<defer>_k` keys, unioned by `channelize`. Feeds are kept
-    // *per site* (parallel to `writers`) so each tap binding reads its own
-    // commit-record stream.
+    // Which store each site commits into: the one holding its footprint. Every key a
+    // site touches is in one partition by construction, so any of them names it.
+    let store_of = |s: &RawSite| {
+        let k = s
+            .write_keys
+            .first()
+            .or_else(|| s.read_keys.first())
+            .expect("a writing site has a non-empty footprint");
+        groups
+            .iter()
+            .position(|g| g.contains(k))
+            .expect("a footprint key is in some partition")
+    };
+
+    // A monotone counter across **all** sites gives each tap field a name unique
+    // within its mutable variable — two writers feeding the same defer contribute distinct
+    // `to_<defer>_k` keys, unioned by `channelize`. It stays global rather than
+    // per-store so two stores' taps cannot collide either. Feeds are kept *per site*
+    // (parallel to `writers`) so each tap binding reads its own commit-record stream.
     let mut feed_counter = 0usize;
-    let mut writers: Vec<WriterSite> = Vec::with_capacity(sites.len());
-    let mut site_feeds: Vec<Vec<FeedSite>> = Vec::with_capacity(sites.len());
+    let mut per_store: Vec<(Vec<WriterSite>, Vec<Vec<FeedSite>>)> = (0..groups.len())
+        .map(|_| (Vec::new(), Vec::new()))
+        .collect();
     for s in sites {
+        let store = store_of(&s);
         let (writer, feeds) = build_writer(s, &key_init, &mut feed_counter, &cross.acc_views);
-        writers.push(writer);
-        site_feeds.push(feeds);
+        per_store[store].0.push(writer);
+        per_store[store].1.push(feeds);
     }
 
-    build_letrec(stripped, key_names, key_init, writers, site_feeds, cross)
+    let stores: Vec<StorePlan> = groups
+        .into_iter()
+        .zip(per_store)
+        .map(|(keys, (writers, site_feeds))| plan_store(keys, &key_init, writers, site_feeds))
+        .collect();
+    splice_stores(stripped, &stores, &key_init, cross)
+}
+
+/// Partition the mutable variable keys into **commit stores**: one store per set of keys
+/// that must commit and be sampled together.
+///
+/// A `with begin():` **block** is the unit that forces keys together, through its
+/// footprint: a writing block's `{reads ∪ writes}` advance at one commit tick and are
+/// read at one snapshot (atomicity), and a read-only block's reads are latched at one
+/// frontier (snapshot consistency). Nothing else forces sharing. The argument is in
+/// `src/ccl/design/mutability.md`, "How many commit stores a program has".
+///
+/// Returns one key list per store, each in `key_names` order, the stores themselves
+/// ordered by their first key's occurrence.
+fn partition_keys(
+    key_names: &[Name],
+    sites: &[RawSite],
+    read_only_footprints: &[Vec<Name>],
+) -> Vec<Vec<Name>> {
+    // Union-find over key indices.
+    let mut parent: Vec<usize> = (0..key_names.len()).collect();
+    fn find(parent: &mut Vec<usize>, i: usize) -> usize {
+        if parent[i] != i {
+            let root = find(parent, parent[i]);
+            parent[i] = root;
+        }
+        parent[i]
+    }
+    let index_of = |k: &Name| key_names.iter().position(|n| n == k);
+    let union_all = |parent: &mut Vec<usize>, keys: &mut dyn Iterator<Item = usize>| {
+        let mut first: Option<usize> = None;
+        for i in keys {
+            match first {
+                None => first = Some(i),
+                Some(f) => {
+                    let (a, b) = (find(parent, f), find(parent, i));
+                    parent[a] = b;
+                }
+            }
+        }
+    };
+    for s in sites {
+        union_all(
+            &mut parent,
+            &mut s.read_keys.iter().chain(s.write_keys.iter()).map(|k| {
+                index_of(k).expect("a writing site's footprint key is a mutable variable key")
+            }),
+        );
+    }
+    // A read-only footprint may name a mutable variable **no block writes**. Such a mutable variable
+    // is not a store key: nothing can advance it (the write gate admits a mutable variable
+    // write only inside a block, and a block write would put it in a write set), so
+    // its history is constant at its seed and every read of it is that seed. It keeps
+    // its `MutDecl` on the spine and relates nothing — sampling it at a frontier would
+    // cost a store key to learn what the declaration already says. Only the keys some
+    // writer does touch are unioned.
+    for f in read_only_footprints {
+        union_all(&mut parent, &mut f.iter().filter_map(&index_of));
+    }
+
+    // Group in `key_names` order, so each store's keys — and the stores
+    // themselves — come out in first-occurrence order.
+    let mut roots: Vec<usize> = Vec::new();
+    let mut groups: Vec<Vec<Name>> = Vec::new();
+    for (i, k) in key_names.iter().enumerate() {
+        let r = find(&mut parent, i);
+        match roots.iter().position(|x| *x == r) {
+            Some(g) => groups[g].push(k.clone()),
+            None => {
+                roots.push(r);
+                groups.push(vec![k.clone()]);
+            }
+        }
+    }
+    groups
 }
 
 /// Induction loops folded out of the transaction continuation so a commit
@@ -769,6 +878,19 @@ fn contains_begin(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Begin { .. }) || expr.any_child(contains_begin)
 }
 
+/// What [`strip`] harvests off the spine: one [`RawSite`] per writing `with
+/// begin():` block, and the mutable variable footprint of every **read-only** block.
+///
+/// A block's footprint is what decides its keys' store ([`partition_keys`]). A writing
+/// block's rides its `RawSite`; a read-only block is unwrapped onto the spine and leaves
+/// no site, so its footprint is collected here or lost.
+#[derive(Default)]
+struct Stripped {
+    sites: Vec<RawSite>,
+    /// One entry per read-only block: the mutable variable keys it reads together.
+    read_only_footprints: Vec<Vec<Name>>,
+}
+
 /// Replace every transaction `For` site (`ExprStmt(For{…}, cont)` whose block
 /// writes a transactional mutable variable) with its stripped continuation, accumulating a
 /// [`RawSite`] per site in source order (the commit serialization order).
@@ -776,7 +898,7 @@ fn strip(
     expr: Expr,
     txn_mut_vars: &HashSet<Name>,
     enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>)>,
-    sites: &mut Vec<RawSite>,
+    out: &mut Stripped,
 ) -> Expr {
     // A `with begin():` block (a `Begin` marker) on a statement spine.
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
@@ -806,7 +928,7 @@ fn strip(
             );
             let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
             let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
-            sites.push(RawSite {
+            out.sites.push(RawSite {
                 target: target.clone(),
                 source: source.clone(),
                 block: txn_block,
@@ -815,13 +937,19 @@ fn strip(
                 enclosing_writes: enclosing_writes.clone(),
             });
             let new_rest = prepend_effects(lifted, *rest);
-            return strip(new_rest, txn_mut_vars, enclosing, sites);
+            return strip(new_rest, txn_mut_vars, enclosing, out);
         }
         // A read-only block (feeds a mutable variable read, no txn write) → unwrap it onto
         // the loop spine. The fed mutable variable read then flows to `mut_elim`'s
         // live/terminal as-of path unchanged (the shape a get-loop had before).
+        // Its footprint is kept even though the block is not: the mutable variables it reads
+        // are latched at one frontier, so they must share a store ([`partition_keys`]).
+        let (reads, _) = collect_footprint(&block, txn_mut_vars);
+        if reads.len() > 1 {
+            out.read_only_footprints.push(reads);
+        }
         let spliced = splice_block(*block, *rest);
-        return strip(spliced, txn_mut_vars, enclosing, sites);
+        return strip(spliced, txn_mut_vars, enclosing, out);
     }
     // A `For`: thread it as the enclosing loop for its body (its source is
     // evaluated in the outer scope, so it keeps the outer `enclosing`).
@@ -835,7 +963,7 @@ fn strip(
         let TypedExprNode::For { target, iter, body } = node else {
             unreachable!("guarded above")
         };
-        let source = strip(*iter, txn_mut_vars, enclosing, sites);
+        let source = strip(*iter, txn_mut_vars, enclosing, out);
         // The loop's own induction accumulators (direct writes + those lifted
         // from its `with begin():` blocks). A site inside this loop co-indexes a
         // read of one of these; a read of any other accumulator is a completed
@@ -846,7 +974,7 @@ fn strip(
             *body,
             txn_mut_vars,
             Some((&target, &source, &enclosing_writes)),
-            sites,
+            out,
         );
         return Expr {
             node: TypedExprNode::For {
@@ -860,7 +988,7 @@ fn strip(
         };
     }
     let mut expr = expr;
-    expr.map_children(|c| strip(c, txn_mut_vars, enclosing, sites));
+    expr.map_children(|c| strip(c, txn_mut_vars, enclosing, out));
     expr
 }
 
@@ -2003,14 +2131,12 @@ struct HoistedFeed {
 /// `recover_writer`, not a compile error. (Planned simplification #3 in
 /// `design/mutability.md` retires this serialize/deserialize round-trip by
 /// recognizing on the point-free `LetRec` directly.)
-fn build_letrec(
-    expr: Expr,
+fn plan_store(
     key_names: Vec<Name>,
-    key_init: HashMap<Name, Expr>,
+    key_init: &HashMap<Name, Expr>,
     writers: Vec<WriterSite>,
     site_feeds: Vec<Vec<FeedSite>>,
-    cross: CrossDomain,
-) -> Expr {
+) -> StorePlan {
     // Fresh history-binding name per key, distinct from the surface variable so
     // the continuation's `let k = final_or_default(reg_k, init)` reads the
     // history without self-reference. recognition keys the `Transact` off these.
@@ -2248,164 +2374,250 @@ fn build_letrec(
     let mut bindings = hist_bindings;
     bindings.extend(commit_bindings);
     bindings.extend(tap_bindings);
-    debug_assert!(
-        check_letrec_causal(&bindings).is_ok(),
-        "transact_phase emitted an unguarded transaction letrec: {:?}",
-        check_letrec_causal(&bindings)
-    );
 
-    rebind_letrec(
-        expr,
-        &key_names,
-        &hist,
-        &key_init,
-        &hoisted,
-        Some(bindings),
-        cross,
-    )
+    StorePlan {
+        key_names,
+        hist,
+        bindings,
+        hoisted,
+    }
 }
 
-/// Splice the mutable variable `letrec` into the continuation and rebind each mutable variable key to
-/// a `final_or_default(reg_x, init)` read over its history binding.
+/// One commit store, planned but not yet placed: the keys it holds, their history
+/// bindings, the letrec bindings that realize it, and the in-block feeds to hoist
+/// over its body.
 ///
-/// **Splice point** — the letrec is spliced at the *tail*: below every `let`
-/// binding kept from the continuation, above the trailing mutable variable reads. Variable-key
-/// declarations (`let x: Mut(_, Txn) = init`, always top-level) are **dropped**
-/// (their inits ride `key_init` and are consumed by the history bindings) and
-/// each key is re-bound at the tail. This is what fixes a key declared *above* a
-/// writer's source binding (`pool: Mut(…); reqs = […]; for r in reqs: …`):
-/// splicing at the key would leave `reqs` bound below the letrec — a dangling
-/// reference the strict typecheck does not catch. Keeping every non-key `let`
-/// above the splice guarantees each writer's source is in scope. Mirrors the
-/// induction phase's trailing read + hoist, keyed off the history bindings.
-fn rebind_letrec(
+/// Planning is separate from placement so a program can have more than one store:
+/// [`run`] plans each partition of [`partition_keys`] independently, then
+/// [`splice_stores`] nests them into the continuation in one walk.
+struct StorePlan {
+    /// The store's keys, in first-occurrence order.
+    key_names: Vec<Name>,
+    /// Key → its `Txn` history binding.
+    hist: HashMap<Name, Name>,
+    /// History, commit-record and tap bindings — the letrec group.
+    bindings: Vec<(TypedBinding, Expr)>,
+    /// In-block feeds, to hoist over this store's body in source order.
+    hoisted: Vec<HoistedFeed>,
+}
+
+impl StorePlan {
+    /// Whether `e` reads this store — that is, whether it names anything this store's
+    /// body binds: a key (the trailing read's binder), a history binding directly, or
+    /// an in-block feed's defer ([`StorePlan::feed_views`] rebinds it to the tap).
+    ///
+    /// The defer has no other binding to fall back on: a key still has its seed
+    /// `MutDecl` further out, whereas a defer fed *inside* this store exists nowhere
+    /// else, so a consumer left above the letrec is a dangling reference rather than a
+    /// stale value.
+    fn is_read_by(&self, e: &Expr) -> bool {
+        self.key_names.iter().any(|k| is_free_in_value(k, e))
+            || self.hist.values().any(|h| is_free_in_value(h, e))
+            || self.hoisted.iter().any(|f| is_free_in_value(&f.defer, e))
+    }
+
+    /// The trailing reads to bind over this store's body: one
+    /// `let x = final_or_default(⟨history⟩, init)` per key — the same read an
+    /// induction accumulator gets after its loop, over a `Txn` history instead of an
+    /// iteration extent. The init's type is the mutable variable's value type `V` (the
+    /// `Mut(V, Txn)` wrapper rode the binding/annotation, not the init RHS);
+    /// `mut_var_value_ty` peels it defensively.
+    fn reads(&self, key_init: &HashMap<Name, Expr>) -> Vec<(TypedBinding, Expr)> {
+        self.key_names
+            .iter()
+            .map(|k| {
+                let v = mut_var_value_ty(&key_init[k].ty);
+                let stream = tvar(&self.hist[k], history_ty(&v));
+                let init = key_init.get(k).cloned().expect("key init present");
+                (
+                    binding(k.clone(), v.clone()),
+                    final_or_default_read(stream, init, v),
+                )
+            })
+            .collect()
+    }
+
+    /// The feed views to hoist over this store's body, in source order.
+    fn feed_views(&self) -> Vec<(Name, Expr)> {
+        self.hoisted
+            .iter()
+            .map(|f| (f.defer.clone(), tvar(&f.tap, f.tap_ty.clone())))
+            .collect()
+    }
+}
+
+/// Place the planned stores into the continuation, nesting them and distributing the
+/// statements between them.
+///
+/// **Where a store goes.** A store's letrec must sit *below* everything its bindings
+/// need — a writer's iteration source, chiefly — and *above* everything that reads its
+/// keys. Variable-key declarations (`let x: Mut(_, Txn) = init`, always top-level) are
+/// dropped on the way past: their seeds ride `key_init` and are consumed by the history
+/// bindings, and each key is re-bound by [`StorePlan::reads`] inside its own store. The
+/// lower bound is what fixes a key declared *above* a writer's source binding (`pool:
+/// Mut(…); reqs = […]; for r in reqs: …`): splicing at the key would leave `reqs` bound
+/// below the letrec, a dangling reference the strict typecheck does not catch.
+///
+/// **Where a statement goes.** Each spine statement gets a **level**: 0 if it reads no
+/// store, otherwise one past the index of the last store it reads — transitively, since
+/// a statement reading a level-2 binding is itself level 2. Level 0 keeps its place
+/// above every letrec; the rest are carried into the store they read. Only `let`s and
+/// effect statements move, and the transitive step is what keeps a statement from being
+/// reordered past one it depends on.
+///
+/// A statement cannot read two stores at once, which is what makes a single level
+/// well-defined: reading two mutable variables together is a `with begin():` block, and
+/// [`partition_keys`] put those keys in one store so that the read has one
+/// snapshot to come from.
+fn splice_stores(
     expr: Expr,
-    key_names: &[Name],
-    hist: &HashMap<Name, Name>,
+    stores: &[StorePlan],
     key_init: &HashMap<Name, Expr>,
-    hoisted: &[HoistedFeed],
-    bindings: Option<Vec<(TypedBinding, Expr)>>,
     cross: CrossDomain,
 ) -> Expr {
-    let Expr {
-        node,
-        ty,
-        user_annotation,
-        node_id,
-    } = expr;
-    match node {
-        // A mutable variable introduction. A *key* declaration is dropped (its seed was
-        // captured in `key_init`) and re-bound at the tail splice; a non-key
-        // mutable variable is an induction accumulator, whose seed must stay above its own
-        // history letrec, which reads it as the recurrence default.
-        TypedExprNode::MutDecl {
-            binding,
-            init,
-            body,
-        } => {
-            if key_names.contains(&binding.name) {
-                rebind_letrec(*body, key_names, hist, key_init, hoisted, bindings, cross)
-            } else {
-                let inner =
-                    rebind_letrec(*body, key_names, hist, key_init, hoisted, bindings, cross);
-                Expr {
-                    node: TypedExprNode::MutDecl {
-                        binding,
-                        init,
-                        body: Box::new(inner),
-                    },
-                    ty,
-                    user_annotation,
-                    node_id,
+    // Statements carried into each store's body, in source order. Index `i` holds the
+    // statements that ride inside `stores[i]`; level 0 keeps its place and is never
+    // collected here.
+    let mut carried: Vec<Vec<Expr>> = vec![Vec::new(); stores.len()];
+    let placed = walk_spine(expr, stores, key_init, cross, &mut carried);
+    debug_assert!(
+        carried.iter().all(Vec::is_empty),
+        "splice_stores: a carried statement was never placed"
+    );
+    placed
+}
+
+/// The spine walk of [`splice_stores`]: keep level-0 statements in place, carry the
+/// rest, and close every store at the tail.
+fn walk_spine(
+    expr: Expr,
+    stores: &[StorePlan],
+    key_init: &HashMap<Name, Expr>,
+    cross: CrossDomain,
+    carried: &mut Vec<Vec<Expr>>,
+) -> Expr {
+    // The innermost store `e` reads, directly or through a statement already carried.
+    // `None` is level 0 — above every letrec.
+    let level_of = |e: &Expr, carried: &[Vec<Expr>]| -> Option<usize> {
+        let direct = stores.iter().rposition(|s| s.is_read_by(e));
+        let inherited = carried.iter().enumerate().rev().find_map(|(i, stmts)| {
+            stmts
+                .iter()
+                .any(|c| carried_provides(c).iter().any(|n| is_free_in_value(n, e)))
+                .then_some(i)
+        });
+        direct.max(inherited)
+    };
+    let all_keys = |name: &Name| stores.iter().any(|s| s.key_names.contains(name));
+    match expr.node {
+        // A variable-key declaration: dropped, its seed already captured in `key_init`.
+        TypedExprNode::MutDecl { ref binding, .. } if all_keys(&binding.name) => {
+            let TypedExprNode::MutDecl { body, .. } = expr.node else {
+                unreachable!("matched a MutDecl")
+            };
+            walk_spine(*body, stores, key_init, cross, carried)
+        }
+        TypedExprNode::MutDecl { .. }
+        | TypedExprNode::Let { .. }
+        | TypedExprNode::ExprStmt { .. } => {
+            let mut node = expr;
+            let body = take_spine_body(&mut node);
+            match level_of(spine_value(&node), carried) {
+                Some(level) => {
+                    carried[level].push(node);
+                    walk_spine(body, stores, key_init, cross, carried)
+                }
+                None => {
+                    let inner = walk_spine(body, stores, key_init, cross, carried);
+                    relink_spine_body(node, inner)
                 }
             }
         }
-        // A `let` (a writer source, or an unrelated local): keep it *above* the
-        // splice so the letrec's writers can reference it.
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            let inner = rebind_letrec(*body, key_names, hist, key_init, hoisted, bindings, cross);
-            Expr {
-                node: TypedExprNode::Let {
-                    binding,
-                    bound_expr,
-                    body: Box::new(inner),
-                },
-                ty,
-                user_annotation,
-                node_id,
+        // The tail: close the stores from the inside out, each over its own carried
+        // statements, then wrap the whole nest in the folded cross-domain loops.
+        _ => {
+            let mut inner = expr;
+            for (i, store) in stores.iter().enumerate().rev() {
+                inner = carried[i]
+                    .drain(..)
+                    .rev()
+                    .fold(inner, |body, node| relink_spine_body(node, body));
+                inner = close_recurrence_group(
+                    store.bindings.clone(),
+                    store.reads(key_init),
+                    store.feed_views(),
+                    inner,
+                );
             }
+            wrap_cross_domain(inner, cross)
         }
-        // The tail — below every source binding, above the trailing variable reads.
-        other => splice_letrec(
-            Expr {
-                node: other,
-                ty,
-                user_annotation,
-                node_id,
-            },
-            key_names,
-            hist,
-            key_init,
-            hoisted,
-            bindings,
-            cross,
-        ),
     }
 }
 
-/// Wrap `tail` in `letrec { bindings } in <feed hoists> in <key rebinds> in tail`.
-/// Each key rebind is `let x = final_or_default(reg_x, init)` over its history
-/// binding; order among keys is immaterial (each reads its own history, and a key
-/// init cannot reference another `Txn` key — that would be an out-of-block read).
+/// The names a carried spine node makes a later statement depend on it: a `let` or
+/// mutable variable introduction's binder, and every defer an effect statement feeds.
 ///
-/// When cross-domain induction loops were folded ([`CrossDomain`]), each becomes
-/// its own single-binding induction letrec wrapping the transaction letrec
-/// (dependency order: a commit decision reads `acc(r)`, so the accumulator's
-/// history is bound *outside* the transaction group), with its trailing reads and
-/// feed hoists in the shared body — exactly the shape
-/// [`crate::ccl::mut_elim::transform_loop`] emits, so recognition nests the
-/// carriers with no cross-domain logic.
-fn splice_letrec(
-    tail: Expr,
-    key_names: &[Name],
-    hist: &HashMap<Name, Name>,
-    key_init: &HashMap<Name, Expr>,
-    hoisted: &[HoistedFeed],
-    bindings: Option<Vec<(TypedBinding, Expr)>>,
-    cross: CrossDomain,
-) -> Expr {
-    let Some(bindings) = bindings else {
-        // `run` guarantees at least one writer site, so the letrec is always
-        // present by the time we reach the tail; pass through defensively.
-        return tail;
+/// An effect statement binds no name but still provides its defers. A read-only `with
+/// begin():` block is unwrapped onto the spine, so `out << a` survives as an effect
+/// statement and is carried into the store it reads; `channelize` collects a defer's
+/// contributions from wherever they sit, so a consumer of `out` left above the letrec
+/// would read a defer whose only contribution is bound below it. Defers are collected
+/// from the whole value, not just its head, because a feed may sit under a conditional.
+fn carried_provides(node: &Expr) -> Vec<Name> {
+    let mut names = match &node.node {
+        TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
+            vec![binding.name.clone()]
+        }
+        _ => Vec::new(),
     };
-    let mut inner = tail;
-    for k in key_names.iter().rev() {
-        // The init's type is the mutable variable's value type `V` (the `Mut(V, Txn)` wrapper
-        // rode the binding/annotation, not the init RHS); `mut_var_value_ty` peels
-        // it defensively. `erase_mut` sweeps any surviving `Var(x)` reference type.
-        let v = mut_var_value_ty(&key_init[k].ty);
-        let stream = tvar(&hist[k], history_ty(&v));
-        let init = key_init.get(k).cloned().expect("key init present");
-        let bound = final_or_default_read(stream, init, v.clone());
-        inner = let_typed(k.clone(), v, bound, inner);
+    fn feeds(e: &Expr, out: &mut Vec<Name>) {
+        if let TypedExprNode::Feed { name, .. } | TypedExprNode::Define { name, .. } = &e.node {
+            out.push(name.clone());
+        }
+        e.walk_children(|c| feeds(c, out));
     }
-    let feed_views = hoisted
-        .iter()
-        .map(|f| (f.defer.clone(), tvar(&f.tap, f.tap_ty.clone())))
-        .collect();
-    let body = hoist_feeds(inner, feed_views);
-    let ty = body.ty.clone();
-    let txn_letrec = Expr::new(TypedExprNode::LetRec {
-        bindings,
-        body: Box::new(body),
-    })
-    .with_ty(ty);
-    wrap_cross_domain(txn_letrec, cross)
+    feeds(spine_value(node), &mut names);
+    names
+}
+
+/// The value a spine node holds — a `Let`'s bound expression, a mutable variable
+/// introduction's seed, an effect statement's effect.
+fn spine_value(node: &Expr) -> &Expr {
+    match &node.node {
+        TypedExprNode::Let { bound_expr, .. } => bound_expr,
+        TypedExprNode::MutDecl { init, .. } => init,
+        TypedExprNode::ExprStmt { expr, .. } => expr,
+        _ => unreachable!("not a spine node"),
+    }
+}
+
+/// Detach a spine node's continuation, leaving the reserved placeholder in the slot.
+/// Paired with [`relink_spine_body`], which must fill it before the node re-enters a
+/// tree.
+///
+/// A carried statement keeps its recorded type across the round trip even though it is
+/// relinked to a *different* body: a spine statement's type is its body's, and every
+/// wrapper the placement builds — a store's letrec, another carried statement — likewise
+/// takes its type from its body. So every node in the placed nest still ends at the same
+/// tail whose type it recorded.
+fn take_spine_body(node: &mut Expr) -> Expr {
+    match &mut node.node {
+        TypedExprNode::Let { body, .. }
+        | TypedExprNode::MutDecl { body, .. }
+        | TypedExprNode::ExprStmt { body, .. } => std::mem::take(&mut **body),
+        _ => unreachable!("not a spine node"),
+    }
+}
+
+/// Fill the slot [`take_spine_body`] emptied.
+fn relink_spine_body(mut node: Expr, inner: Expr) -> Expr {
+    match &mut node.node {
+        TypedExprNode::Let { body, .. }
+        | TypedExprNode::MutDecl { body, .. }
+        | TypedExprNode::ExprStmt { body, .. } => **body = inner,
+        _ => unreachable!("not a spine node"),
+    }
+    node
 }
 
 /// Wrap the transaction letrec in the folded cross-domain induction loops (see
@@ -2435,7 +2647,109 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{ArithmeticKind, BinOpKind, symbolic::symbolic};
+    use crate::ccl::{ArithmeticKind, BinOpKind, letrec::check_letrec_causal, symbolic::symbolic};
+
+    /// A [`RawSite`] with only the fields [`partition_keys`] reads. The rest are
+    /// placeholders — the partition is a question about footprints alone.
+    fn footprint_site(read_keys: &[&Name], write_keys: &[&Name]) -> RawSite {
+        let unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
+        RawSite {
+            target: binding(Name::fresh("__r"), Type::Base(BaseType::Unit)),
+            source: unit.clone(),
+            block: unit,
+            read_keys: read_keys.iter().map(|n| (*n).clone()).collect(),
+            write_keys: write_keys.iter().map(|n| (*n).clone()).collect(),
+            enclosing_writes: HashSet::new(),
+        }
+    }
+
+    fn base_names(groups: &[Vec<Name>]) -> Vec<Vec<String>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|n| n.base().to_string()).collect())
+            .collect()
+    }
+
+    /// Two mutable variables written by **separate blocks** have no operation relating
+    /// them, so they get separate stores.
+    #[test]
+    fn disjoint_writers_get_separate_stores() {
+        let (a, b) = (Name::fresh("a"), Name::fresh("b"));
+        let keys = vec![a.clone(), b.clone()];
+        let sites = [footprint_site(&[&a], &[&a]), footprint_site(&[&b], &[&b])];
+        assert_eq!(
+            base_names(&partition_keys(&keys, &sites, &[])),
+            vec![vec!["a"], vec!["b"]]
+        );
+    }
+
+    /// One block writing both keys is the atomicity case: they advance at one commit
+    /// tick, so they are one store.
+    #[test]
+    fn keys_written_in_one_block_share_a_store() {
+        let (a, b) = (Name::fresh("a"), Name::fresh("b"));
+        let keys = vec![a.clone(), b.clone()];
+        let sites = [footprint_site(&[&a, &b], &[&a, &b])];
+        assert_eq!(
+            base_names(&partition_keys(&keys, &sites, &[])),
+            vec![vec!["a", "b"]]
+        );
+    }
+
+    /// A block that *reads* `b` to decide a write to `a` reads it at that commit's
+    /// snapshot, so the read alone forces the shared store.
+    #[test]
+    fn a_read_in_a_writing_block_shares_the_store() {
+        let (a, b) = (Name::fresh("a"), Name::fresh("b"));
+        let keys = vec![a.clone(), b.clone()];
+        let sites = [
+            footprint_site(&[&a, &b], &[&a]),
+            footprint_site(&[&b], &[&b]),
+        ];
+        assert_eq!(
+            base_names(&partition_keys(&keys, &sites, &[])),
+            vec![vec!["a", "b"]]
+        );
+    }
+
+    /// Snapshot consistency: a **read-only** block reading two mutable variables latches them
+    /// at one frontier, so they share a store even though no block writes both. The
+    /// block leaves no `RawSite`, which is why [`strip`] keeps its footprint.
+    #[test]
+    fn keys_read_together_share_a_store() {
+        let (a, b) = (Name::fresh("a"), Name::fresh("b"));
+        let keys = vec![a.clone(), b.clone()];
+        let sites = [footprint_site(&[&a], &[&a]), footprint_site(&[&b], &[&b])];
+        let snapshots = [vec![a.clone(), b.clone()]];
+        assert_eq!(
+            base_names(&partition_keys(&keys, &sites, &snapshots)),
+            vec![vec!["a", "b"]]
+        );
+    }
+
+    /// Sharing is transitive, and both the stores and the keys within one come out in
+    /// first-occurrence order.
+    #[test]
+    fn sharing_is_transitive_and_order_is_first_occurrence() {
+        let (a, b, c, d) = (
+            Name::fresh("a"),
+            Name::fresh("b"),
+            Name::fresh("c"),
+            Name::fresh("d"),
+        );
+        let keys = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+        // a–c share a block, c–b share another: all three are one store. `d` stands
+        // alone, and sorts last because it is mentioned last.
+        let sites = [
+            footprint_site(&[], &[&a, &c]),
+            footprint_site(&[], &[&c, &b]),
+            footprint_site(&[], &[&d]),
+        ];
+        assert_eq!(
+            base_names(&partition_keys(&keys, &sites, &[])),
+            vec![vec!["a", "b", "c"], vec!["d"]]
+        );
+    }
 
     /// The typed direct-mirror tree for `pool: Mut(Int, Txn) = 100; for r in
     /// [10]: with begin(): pool = pool - r` as lowering + inference leave it:

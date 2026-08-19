@@ -582,6 +582,50 @@ fn hist_field_view(
     comp
 }
 
+/// Close a recurrence group: wrap `cont` in `letrec { bindings } in <feed hoists>
+/// in <trailing reads> in cont`.
+///
+/// Both mutability paths end at this shape, which is why it lives here rather than in
+/// either: an induction loop and a transaction store differ in how they *find* their
+/// bindings (one loop's accumulators, versus every writer site's footprint) and in where
+/// the group is spliced, not in how a group is closed. Both supply:
+///
+/// - `bindings` — the guarded history bindings (plus, for a transaction, its
+///   commit-record and tap bindings), whose causality is asserted here so neither
+///   caller can forget to;
+/// - `reads` — one `let x = final_or_default(⟨history⟩, init)` per key, the trailing
+///   read that reduces a history to the value the continuation names. Prepended in
+///   reverse so the first is outermost;
+/// - `feeds` — the in-group feeds to route ([`hoist_feeds`], whose source-order
+///   invariant this preserves by hoisting *outside* the reads).
+///
+/// The nesting order is load-bearing and shared: feeds outermost, then reads, then
+/// the continuation. A read may not be hoisted over a feed — `channelize` collects
+/// feeds outermost-first — and a feed's view names only group bindings, never a read.
+pub(crate) fn close_recurrence_group(
+    bindings: Vec<(TypedBinding, Expr)>,
+    reads: Vec<(TypedBinding, Expr)>,
+    feeds: Vec<(Name, Expr)>,
+    cont: Expr,
+) -> Expr {
+    let mut body = cont;
+    for (b, def) in reads.into_iter().rev() {
+        body = Expr::let_in(b, def, body);
+    }
+    let body = hoist_feeds(body, feeds);
+    debug_assert!(
+        check_letrec_causal(&bindings).is_ok(),
+        "mutability phase emitted a non-causal group: {:?}",
+        check_letrec_causal(&bindings)
+    );
+    let ty = body.ty.clone();
+    Expr::new(TypedExprNode::LetRec {
+        bindings,
+        body: Box::new(body),
+    })
+    .with_ty(ty)
+}
+
 /// Wrap `body` in one `Feed(defer, view)` per collected in-body feed, so
 /// `channelize` routes each per-position value stream to its channel. Each
 /// `view` is the feed's value stream over its contributing domain — for an
@@ -696,22 +740,12 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     for (acc, x_final) in &fold.renames {
         rename_uses(&mut cont, acc, x_final);
     }
-    let mut body_out = rewrite(cont);
-    for (b, def) in fold.reads.into_iter().rev() {
-        body_out = Expr::let_in(b, def, body_out);
-    }
-    body_out = hoist_feeds(body_out, fold.feed_views);
-    let bindings = vec![fold.binding];
-    debug_assert!(
-        check_letrec_causal(&bindings).is_ok(),
-        "letrec phase emitted a non-causal group"
-    );
-    let ty = body_out.ty.clone();
-    Expr::new(TypedExprNode::LetRec {
-        bindings,
-        body: Box::new(body_out),
-    })
-    .with_ty(ty)
+    close_recurrence_group(
+        vec![fold.binding],
+        fold.reads,
+        fold.feed_views,
+        rewrite(cont),
+    )
 }
 
 /// An induction loop folded into a single decision-factored history binding,
