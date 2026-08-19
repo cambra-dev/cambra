@@ -170,7 +170,7 @@ pub(crate) fn zip_pair(f: Expr, g: Expr) -> Expr {
 ///
 /// Currying is denotation-preserving, so `curry(λ (x, y) → body)` is the same
 /// `𝐴 ⇒ (𝐵 ⇒ 𝐶)` the nested `λ x → λ y → body` was, kinds included. Deriving the
-/// two arrows from `f`'s tuple domain instead would rebuild both bare: the
+/// two function types from `f`'s tuple domain instead would rebuild both bare: the
 /// *inner* one is a group of a partition — a collection — and reading it as a
 /// capability strands the per-group aggregate that consumes it.
 pub(crate) fn curry_at(f: Expr, curry_result: Type) -> Expr {
@@ -240,7 +240,7 @@ pub(crate) fn fun_ty_or_hole(domain: &Type, codomain: &Type) -> Type {
 /// Compute the type of `zip(f, g): A → (B, C)` from `f: A → B` and `g: A → C`.
 ///
 /// The pair shares its operands' domain, so it is a collection exactly when they
-/// are — the arrow's kind rides across from `f` rather than being rebuilt bare.
+/// are — the kind rides across from `f` rather than being rebuilt bare.
 ///
 /// Returns [`Type::Hole`] if either argument does not have a concrete function
 /// type; inference will fill in the gaps in that case.
@@ -721,7 +721,7 @@ fn build_value_case_fanout(
 /// **Precondition**: `body` must not itself be the lambda being eliminated —
 /// i.e. this function is called on the body of a `Lambda { param, body, .. }`.
 ///
-/// The arrow this builds is a **morphism** out of `param`, and it carries the
+/// The function this builds is a **morphism** out of `param`, and it carries the
 /// [`FunKind`] of the lambda being eliminated. Elimination is denotation-
 /// preserving, so the point-free form of a collection is that same collection;
 /// and every sub-morphism the recursion produces abstracts the *same* binder over
@@ -730,7 +730,7 @@ fn build_value_case_fanout(
 /// comprehension's own sub-morphisms read as capabilities.
 ///
 /// `Compute` is therefore the default only at an entry point with no enclosing
-/// arrow to inherit from — the kind of a bare `λ`.
+/// function to inherit from — the kind of a bare `λ`.
 fn elim_lambda(
     ctx: &mut ElimContext,
     param: &Name,
@@ -772,7 +772,7 @@ fn elim_lambda_impl(
     // bind them against.
     let body_ty = body.ty.clone();
     let result_ty = match fun_ty_or_hole(param_ty, &body_ty) {
-        // `fun_ty_or_hole` builds a bare combinator arrow, so both the Pi binder
+        // `fun_ty_or_hole` builds a bare combinator type, so both the Pi binder
         // and the kind are re-attached here: the binder when `param` survives in
         // the codomain's refinement, the kind always, since the caller is the one
         // that knows whether this morphism denotes a collection.
@@ -862,7 +862,7 @@ fn elim_lambda_impl(
             let merged = substitute(substitute(*inner_body, &y, &sub_y), param, &sub_x);
 
             // The merged pair morphism is the uncurried form of the same nested
-            // abstraction, so it carries the enclosing arrow's kind: currying a
+            // abstraction, so it carries the enclosing function's kind: currying a
             // collection does not make it a capability.
             let inner_elim = elim_lambda_kinded(ctx, &pair, &pair_ty, merged, fun_kind.clone())?;
             Ok(dbg_typecheck_mv(curry_at(inner_elim, result_ty)))
@@ -907,7 +907,7 @@ fn elim_lambda_impl(
             .with_ty(body_ty.clone());
             // The Pi keeps the eliminated lambda's own kind: a group-by partition
             // function denotes a collection, and `Type::pi` mints the capability
-            // arrow, which would flatten it.
+            // kind, which would flatten it.
             let result_pi = Type::Fun {
                 name: Some(param.clone()),
                 kind: fun_kind,
@@ -1000,7 +1000,7 @@ fn elim_lambda_impl(
             let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
             let fn_var = Expr::builtin(Builtin::BinOp(op)).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
-            // Desugaring rewrites the *same* lambda's body, so the arrow it ends up
+            // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
             // the capability default.
             elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
@@ -1018,7 +1018,7 @@ fn elim_lambda_impl(
             let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
             let fn_var = Expr::builtin(Builtin::Copair).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
-            // Desugaring rewrites the *same* lambda's body, so the arrow it ends up
+            // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
             // the capability default.
             elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
@@ -1031,7 +1031,7 @@ fn elim_lambda_impl(
             let fn_ty = fun_ty_or_hole(&inner.ty, &body_ty);
             let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let desugared = Expr::apply(inner, fn_var).with_ty(body_ty);
-            // Desugaring rewrites the *same* lambda's body, so the arrow it ends up
+            // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
             // the capability default.
             elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
@@ -1138,7 +1138,7 @@ fn elim_lambda_impl(
             let agg_ty = fun_ty_or_hole(&input.ty, &body_ty);
             let agg_var = Expr::builtin(agg_builtin).with_ty(agg_ty);
             let desugared = Expr::apply(input, agg_var).with_ty(body_ty);
-            // Desugaring rewrites the *same* lambda's body, so the arrow it ends up
+            // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
             // the capability default.
             elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
@@ -1540,7 +1540,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         user_annotation,
         ..
     } = expr;
-    // The node's own arrow, read in every build: the `Lambda` arm carries its
+    // The node's own function type, read in every build: the `Lambda` arm carries its
     // kind into elimination (a lambda's point-free form denotes what the lambda
     // did). The debug-build invariant asserts below also compare against it.
     let original_ty = ty.clone();
@@ -1565,7 +1565,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             )?;
             // Compare modulo Pi binder *presence*: the point-free
             // construction keeps a dependent morphism's own binder (same
-            // `Name`, uid-preserved) but rebuilds combinator arrows with
+            // `Name`, uid-preserved) but rebuilds combinator types with
             // `name: None`; see `Type::without_pi_names`.
             #[cfg(debug_assertions)]
             assert!(
@@ -1780,7 +1780,7 @@ mod tests {
     ///
     /// The point-free form denotes what the lambda denoted, so a lambda that was
     /// a collection stays one. It is not automatic: elimination rebuilds the
-    /// arrow through combinator constructors (`fun_ty_or_hole`, `Type::pi`) that
+    /// function type through combinator constructors (`fun_ty_or_hole`, `Type::pi`) that
     /// mint the capability kind, and after elimination the domain no longer
     /// distinguishes the two — a collection's is its index set, a morphism's its
     /// element type, and both are just types.
@@ -1802,7 +1802,10 @@ mod tests {
             });
             let out = run(lambda).expect("elimination succeeds");
             let Type::Fun { kind: got, .. } = &out.ty else {
-                panic!("eliminating a lambda yields an arrow, got {}", out.ty);
+                panic!(
+                    "eliminating a lambda yields a function type, got {}",
+                    out.ty
+                );
             };
             assert_eq!(
                 format!("{got:?}"),

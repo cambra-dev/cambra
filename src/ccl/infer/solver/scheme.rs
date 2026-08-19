@@ -84,7 +84,7 @@ pub struct FreshenCache {
     /// `specialize_use` with use-site pairings; unpaired names mint fresh.
     pub chan_doms: HashMap<crate::ccl::Name, crate::ccl::Name>,
     /// Original quantified kind variable → its fresh replacement. A generalized
-    /// function's arrow kind ([`FunKind::Var`]) must be decided *per use*, just
+    /// function's kind ([`FunKind::Var`]) must be decided *per use*, just
     /// like the type it quantifies: two instantiations that flow into differently
     /// -kinded contexts (one demanding `Data`, one `Compute`) must not share a
     /// `FunKindVar` cell, or forcing one contaminates the other into a spurious
@@ -128,7 +128,7 @@ pub enum FreshenLevel {
 /// The bounds of each quantified variable are themselves freshened
 /// (recursively), so the fresh copy carries the same constraints as the
 /// original.
-/// Freshen a function's arrow kind at instantiation. A concrete kind
+/// Freshen a function's kind at instantiation. A concrete kind
 /// (`Data`/`Compute`) is intrinsic and copies through. An unresolved
 /// [`FunKind::Var`] is *quantified*: mint one fresh `FunKindVar` per original
 /// (cached by `uid` so repeated occurrences of the same `κ` in one copy stay
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn freshening_mints_a_distinct_kind_var_per_instantiation() {
-        // A generalized function's arrow kind must be decided per use. Freshening
+        // A generalized function's kind must be decided per use. Freshening
         // a Fun whose kind is an unresolved var must mint a *new* FunKindVar (bounds
         // copied), not share the original — otherwise forcing one instantiation's
         // kind contaminates the other into a spurious `DomainJoinConflict`.
@@ -680,7 +680,7 @@ mod tests {
             "def-intrinsic bounds are copied to the fresh var"
         );
         // Equating the fresh instantiation must not reach back to the original.
-        kv2.equate_compute();
+        kv2.pin_compute();
         assert!(
             !kv.bounds.borrow().forced_compute,
             "the original var stays decoupled from this instantiation"

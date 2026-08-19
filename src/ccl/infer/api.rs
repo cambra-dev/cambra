@@ -218,7 +218,7 @@ impl TypeInferenceContext {
     /// source unrepresentable. Typically called by
     /// [`crate::ccl::context::GlobalContext`] when a source is registered.
     pub fn register_source_type(&mut self, name: &str, elem_ty: Type) {
-        // `elem_ty` is the source's *element* type, not the whole source arrow.
+        // `elem_ty` is the source's *element* type, not the whole source function.
         // A `Fun` over a `DataSource` domain is the source type itself, so seeing
         // one here means a caller passed the constructed source type by mistake
         // (the pre-Option-A signature took the full `Type::Fun`); catch that
@@ -226,7 +226,7 @@ impl TypeInferenceContext {
         debug_assert!(
             !matches!(&elem_ty, Type::Fun { domain, .. } if matches!(**domain, Type::DataSource(_))),
             "register_source_type: elem_ty is itself a source data function \
-             (`{elem_ty}`) — pass the element type, not the whole source arrow"
+             (`{elem_ty}`) — pass the element type, not the whole source function"
         );
         let ty = Type::Fun {
             name: None,

@@ -60,7 +60,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Loc
 fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
-    // The `Lambda` rule reads the node's own arrow for its kind (see
+    // The `Lambda` rule reads the node's own type for its kind (see
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
     let has_ann = expr.user_annotation.is_some();
@@ -170,7 +170,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // reading as a capability.
             debug_assert!(
                 has_ann || matches!(recorded_ty, Type::Fun { .. }),
-                "a Compose reached inference with no kind decision: {label}"
+                "a Compose reached inference with no kind stamp: {label}"
             );
             emit_compose(elts, &recorded_ty, ctx)?
         }
@@ -524,9 +524,9 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
             Box::new(complete_annotation(base, inferred.peel_refinements())),
             r.clone(),
         ),
-        // The arrow's binder and kind come from the *annotation*, per the rule
+        // The binder and kind come from the *annotation*, per the rule
         // above: a kind is something an annotation can state (`List(T)` is a data
-        // arrow by construction), so it is a claim to keep rather than a shape to
+        // function by construction), so it is a claim to keep rather than a shape to
         // fill in.
         (
             Type::Fun {
@@ -648,7 +648,7 @@ pub(super) fn emit_lambda<C: Typing>(
     // knows: a function of some kind. What decides it is everywhere the lambda is
     // used or declared, and those are ordinary constraints: a `data_fun`
     // annotation from lowering, a declared `Data` recurrence carrier, an
-    // aggregate's `Data` demand, a `Compute` parameter position. Each equates the
+    // aggregate's `Data` demand, a `Compute` parameter position. Each pins the
     // variable at the edge where the claim is actually made
     // (`constrain_kind`), and an unconstrained kind resolves to the capability
     // default at coalesce (`KindMerge::of`).
@@ -725,7 +725,7 @@ pub(super) fn emit_cast<C: Typing>(
     // comprehension / groupby a compute function again, and the aggregate that
     // consumes it would reject it as compute-where-data.
     // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
-    // still carries its arrow's kind, which a match on the raw target would drop
+    // still carries its kind, which a match on the raw target would drop
     // to the `Compute` default.
     let kind = match target.peel_refinements() {
         Type::Fun { kind, .. } => kind.clone(),
@@ -1791,13 +1791,13 @@ pub(super) fn emit_compose<C: Typing>(
     // value-preserving prefixes — the same direct-vs-opaque boundary as the
     // dependent-apply discharge; nothing else reaches a dependent final
     // morphism today.) A morphism types as a function in both modes — Emit's
-    // `Proj`/`Lambda`/source rules all return an arrow — so the binder is read off
+    // `Proj`/`Lambda`/source rules all return a function type — so the binder is read off
     // directly; only the groupby shape puts a `Some` there.
     let last_name = match tys.last().expect("len >= 2").peel_refinements() {
         Type::Fun { name, .. } => name.clone(),
         _ => None,
     };
-    // The chain's kind **rides its own arrow**, like a lambda's (`emit_lambda`).
+    // The chain's kind **rides its own type**, like a lambda's (`emit_lambda`).
     // It is not the head morphism's: a head can be a re-indexing rather than a
     // decision — `id ≫ xs` and `.0 ≫ xs` denote the collection `xs` re-addressed,
     // not the capability `id`/`.0` — so reading the head would flatten every

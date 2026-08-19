@@ -919,7 +919,7 @@ fn a_never_called_function_is_still_typechecked(#[case] defs: &str) {
 ///
 /// The cases are the constructs whose types a live use-site pin would normally
 /// settle — a collection parameter's element type and domain, a comprehension's
-/// arrow kind, an induction accumulator, a generator's feed, a mutable variable —
+/// `FunKind`, an induction accumulator, a generator's feed, a mutable variable —
 /// each of which must resolve to *under-determined*, not to a conflict, when
 /// nothing calls the definition.
 #[rstest]
@@ -1136,7 +1136,7 @@ fn test_conditional_collection_heterogeneous_domains_rejected() {
     // `Compute` capability the join would become an honest domain meet and
     // *succeed*, silently discarding one branch's rows. The rejection is the
     // evidence the kind is right (`register_source_type` constructs the `Data`
-    // arrow; the kind is intrinsic, not caller-supplied).
+    // function; the kind is intrinsic, not caller-supplied).
     let errs =
         infer_program_with_sources_err("[1, 2, 3] if True else mysrc()", &[("mysrc", int())]);
     let rendered = format!("{errs:?}");
@@ -2504,7 +2504,7 @@ mod letrec_typing {
 
 /// The domain-join rejection must not be reachable-around: a consumer downstream of
 /// the join cannot make it succeed, whichever way the domains arrive at the domain
-/// position. Directly, two arrow shapes meet there; through a `let` or a UDF
+/// position. Directly, two function types meet there; through a `let` or a UDF
 /// parameter, the two domains arrive as bounds on one position instead. Both routes
 /// reject, and so does a consumer that *preserves* the domain (a comprehension) as
 /// well as one that collapses it (`sum`).

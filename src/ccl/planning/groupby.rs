@@ -39,7 +39,7 @@ fn emit_groupby(
     value_ty: Type,
 ) -> Expr {
     // A partition is a **collection of collections**: keyed by `K`, each group the
-    // index set of its members. Both arrows are data — the transformer arrow
+    // index set of its members. Both are data — the transformer
     // (`map`, taking one collection to another) stays a capability.
     //
     // `group_idx_ty` is the group's *refined* index set `{I | key(i) == k}`, and
@@ -48,8 +48,8 @@ fn emit_groupby(
     // data function the domain *is* the data, so typing the group as the bare `I`
     // would claim every element belongs to every group. Consumers demand the
     // refined form (a per-group aggregate casts to it), and the bare one is only
-    // readable as its supertype under the contravariant reading of an arrow —
-    // wrong for a collection. The binder must ride the arrow as a Pi for the
+    // readable as its supertype under the contravariant reading of a function —
+    // wrong for a collection. The binder must ride the function type as a Pi for the
     // predicate's `k` to stay bound.
     let partition = |codomain: Type| Type::Fun {
         name: key_binder.clone(),

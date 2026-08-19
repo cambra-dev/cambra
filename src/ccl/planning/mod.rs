@@ -280,7 +280,7 @@ pub(crate) mod test_helpers {
         }
     }
 
-    /// A **collection** arrow — what a let-bound list or comprehension has, and
+    /// A **collection** function — what a let-bound list or comprehension has, and
     /// what distinguishes an iteration source from a capability of the same shape.
     pub(crate) fn data_fun_ty(domain: Type, codomain: Type) -> Type {
         Type::data_fun(domain, codomain)
@@ -319,7 +319,7 @@ pub(crate) mod test_helpers {
     }
 
     /// Build a finite list literal `[1, 2, 3]` typed `[0, 2] ⤇ Int` — a list
-    /// literal is a collection, so its arrow is `Data`.
+    /// literal is a collection, so its kind is `Data`.
     pub(crate) fn list_123() -> Expr {
         let int = int_ty();
         Expr::list(vec![

@@ -467,7 +467,7 @@ pub fn make_iterate(predicate: Expr) -> Expr {
         .expect("iterate predicate must have a function type")
         .clone();
     let refined = refine_with(domain, &predicate);
-    // A **data** arrow, by the audit rule *an arrow is data iff it denotes a
+    // A **data** function, by the audit rule *a function is data iff it denotes a
     // collection*: `iterate(p)` is the identity on the extent, so the extent
     // *is* its data. This is what makes the kind decide whether iterating is
     // acceptable at all — every chain led by an iteration source inherits `Data`
@@ -559,7 +559,7 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
 /// that is what the type must say: a data function's domain *is* its data, so the
 /// domain of this morphism is the refined extent, not the full product. Refining
 /// only the codomain would leave the domain claiming rows the join never produces
-/// — readable as a supertype under the contravariant reading of an arrow, but
+/// — readable as a supertype under the contravariant reading of a function, but
 /// wrong for a collection, and it puts every enclosing type at odds with the site.
 ///
 /// The symmetric `{D | p} ⇒ {D | p}` shape is the same one [`make_iterate`] gives
@@ -614,7 +614,7 @@ pub fn set_codomain(morphism: Expr, new_codomain: Type) -> Expr {
 /// type down the combinator's function spine. See [`set_codomain`], which fixes
 /// the domain, and [`refine_extent`], which refines both.
 pub fn set_extent(mut morphism: Expr, domain: Type, new_codomain: Type) -> Expr {
-    // `fun_like`: a codomain-only rewrite must not flip the arrow's kind or drop
+    // `fun_like`: a codomain-only rewrite must not flip the kind or drop
     // its Pi binder — restamping an iteration source's codomain leaves it the
     // same collection.
     let new_ty = Type::fun_like(&morphism.ty, domain, new_codomain);

@@ -117,7 +117,7 @@ impl KindMerge {
     /// concrete `Compute` (a capability, `emit_lambda`). Only an *inferred* kind
     /// ([`FunKind::Var`](crate::ccl::ty::FunKind::Var) — a function parameter or a
     /// freshened scheme kind) reaches the flags, and the two points are
-    /// incomparable, so those record *equations* rather than bounds: equated to
+    /// incomparable, so those record *pins* rather than bounds: pinned to
     /// `Compute` → `Compute`, to `Data` → `Data`, to both → the conflict, to
     /// neither → [`KindMerge::Unknown`], which coalesce resolves to the `Compute`
     /// capability default. No domain inspection is

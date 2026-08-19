@@ -678,7 +678,7 @@ mod tests {
         assert!(!should_inline(&ty));
     }
 
-    /// The same domain at the **capability** kind is inlined. A `Compute` arrow
+    /// The same domain at the **capability** kind is inlined. A `Compute` function
     /// over `[0, 3)` is a function that happens to accept those inputs, not a
     /// collection of them, and there is nothing behind it to share.
     #[test]

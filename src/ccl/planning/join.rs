@@ -802,7 +802,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             };
 
             // The build side is a hash index — a collection keyed by `K` whose
-            // groups are collections of build rows. Both arrows are data.
+            // groups are collections of build rows. Both are data.
             let converse_ty = Type::data_fun(
                 key_ty.clone(),
                 Type::data_fun(build_output_ty.clone(), build_output_ty.clone()),

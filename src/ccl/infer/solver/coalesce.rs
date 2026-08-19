@@ -67,12 +67,12 @@ pub enum CoalesceError {
         details: String,
     },
     /// A single function slot whose kind resolved contradictorily: one kind
-    /// variable equated to *both* points (`forced_compute ∧ forced_data`).
+    /// variable pinned to *both* points (`forced_compute ∧ forced_data`).
     ///
     /// The two kinds are incomparable, so an edge between them is a rejection
     /// wherever it is drawn; this is the coalesce-time face of
     /// [`super::constrain::ConstrainError::KindMismatch`], for the case where the
-    /// violation only becomes provable once the variable's equations are all in
+    /// violation only becomes provable once the variable's pins are all in
     /// (a kind-polymorphic parameter used as a collection at one site and as a
     /// capability at another). See `src/ccl/design/type-inference.md`,
     /// "4.6 Data vs compute functions".
@@ -172,7 +172,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                     .collect::<Vec<_>>()
                     .join(" ⊔ ");
                 // A single surviving domain means one function slot whose kind
-                // resolved contradictorily — one kind variable equated to both
+                // resolved contradictorily — one kind variable pinned to both
                 // points, the coalesce-time face of a `KindMismatch`.
                 // Two or more surviving domains mean a data function's domains
                 // would be dropped by collapsing to a compute meet (a genuine

@@ -124,7 +124,7 @@ struct KeyView {
     /// type-blind structural equality. Order is insertion order, so equality
     /// compares these as a set.
     refinements: Vec<Refinement>,
-    /// Function contributions, **keyed by kind** so a compute arrow and a data
+    /// Function contributions, **keyed by kind** so a compute function and a data
     /// collection at one position stay distinguishable rather than one shadowing
     /// the other — exactly as [`history`](Self::history) is keyed by
     /// [`HistoryKind`]. Each maps to `(domain, codomain)`.
@@ -706,7 +706,7 @@ mod tests {
     /// a specialization pinned at `⤇` iterates a domain a `⇒` use does not supply — so
     /// a clone keyed on one must not serve a use of the other.
     ///
-    /// The kind reaches the key through `KindMerge::of`, so a concrete arrow keys by
+    /// The kind reaches the key through `KindMerge::of`, so a concrete function keys by
     /// what it *is*. An unresolved `FunKind::Var` resolves from its bounds like any
     /// other position, which is what keeps two uses of one generic binding sharing a
     /// clone instead of splitting on a per-instantiation variable identity.
@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(
             merged.fun.len(),
             2,
-            "a compute and a data arrow at one position are distinct contributions: {merged}"
+            "a compute and a data function at one position are distinct contributions: {merged}"
         );
     }
 

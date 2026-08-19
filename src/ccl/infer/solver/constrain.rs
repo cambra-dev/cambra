@@ -194,34 +194,34 @@ pub fn constrain_subtype(
 /// caller raises as [`ConstrainError::KindMismatch`] with the full function types
 /// for the diagnostic.
 ///
-/// Variable edges *equate* rather than bound: a concrete kind on either side of
-/// an edge pins the variable to it ([`FunKindVar::equate_compute`] /
-/// [`FunKindVar::equate_data`]). A var pinned to *both* points is the conflict —
+/// A variable edge *pins* rather than bounds: a concrete kind on either side of
+/// an edge fixes the variable to it ([`FunKindVar::pin_compute`] /
+/// [`FunKindVar::pin_data`]). A var pinned to *both* points is the conflict —
 /// surfaced at coalesce, never here.
-fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<EquatedKind, ()> {
+fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<PinnedKind, ()> {
     use FunKind::*;
     match (k0, k1) {
         // Reflexivity is the whole of the concrete relation.
-        (Data, Data) => Ok(EquatedKind::Data),
-        (Compute, Compute) => Ok(EquatedKind::Compute),
+        (Data, Data) => Ok(PinnedKind::Data),
+        (Compute, Compute) => Ok(PinnedKind::Compute),
         // Either mismatch is a rejection: a capability supplied where a
         // collection is demanded, or a collection where a capability is.
         (Compute, Data) | (Data, Compute) => Err(()),
         // A concrete kind at either end pins the variable to it, so the edge is
         // that kind however the two sides were spelled.
         (Compute, Var(v)) | (Var(v), Compute) => {
-            v.equate_compute();
-            Ok(EquatedKind::Compute)
+            v.pin_compute();
+            Ok(PinnedKind::Compute)
         }
         (Data, Var(v)) | (Var(v), Data) => {
-            v.equate_data();
-            Ok(EquatedKind::Data)
+            v.pin_data();
+            Ok(PinnedKind::Data)
         }
         // Two variables meeting record nothing. What the pair resolves to is not
-        // known at this edge, and deciding it from equations that arrive later
+        // known at this edge, and deciding it from pins that arrive later
         // would make typing depend on constraint order; each is pinned by the
         // concrete kind that reaches it, if one does. See [`FunKindVar`].
-        (Var(_), Var(_)) => Ok(EquatedKind::Undetermined),
+        (Var(_), Var(_)) => Ok(PinnedKind::Undetermined),
     }
 }
 
@@ -234,7 +234,7 @@ fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<EquatedKind, ()> {
 /// whether *either* side looks like `Data`, a test that reads as though a
 /// cross-kind edge were possible when it is exactly what was just rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EquatedKind {
+enum PinnedKind {
     /// Both sides are collections.
     Data,
     /// Both sides are capabilities.
@@ -534,7 +534,7 @@ fn constrain_go_impl(
             // this asks one question of one kind rather than inspecting both
             // spellings — a var it just pinned to `Data` reads as `Data` here
             // like any other collection.
-            if kind == EquatedKind::Data {
+            if kind == PinnedKind::Data {
                 if constrain_go(d1, d0, sr, sl, cache).is_err()
                     || constrain_go(d0, d1, sl, sr, cache).is_err()
                 {
@@ -1357,7 +1357,7 @@ mod tests {
             .is_err()
         );
 
-        // Behind a data arrow, neither refinement direction relates.
+        // Behind a data function, neither refinement direction relates.
         assert!(
             matches!(
                 constrain_subtype(&bare, &refined, &mut ConstrainCache::new()),
@@ -1370,8 +1370,8 @@ mod tests {
             "nor drop one"
         );
 
-        // A *compute* arrow over the same domains keeps the contravariant lattice:
-        // invariance is about collections, not about refinements behind any arrow.
+        // A *compute* function over the same domains keeps the contravariant lattice:
+        // invariance is about collections, not about refinements behind any function.
         assert!(
             constrain_subtype(
                 &fun(Type::UIntRange(3), prim(BaseType::Int)),
@@ -2350,7 +2350,7 @@ mod tests {
 
     #[test]
     fn kind_var_demanded_as_data_is_forced_data() {
-        // A kind var meeting `Data` is *equated* to it — recorded as
+        // A kind var meeting `Data` is *pinned* to it — recorded as
         // `forced_data`, never an eager rejection — and resolves at coalesce. A
         // compute function meeting the same var would set `forced_compute`, and
         // both flags together is the conflict.
@@ -2368,7 +2368,7 @@ mod tests {
             &mut cache,
         )
         .expect("a var meeting Data records forced_data, never an eager rejection");
-        assert!(v.bounds.borrow().forced_data, "equated to data");
+        assert!(v.bounds.borrow().forced_data, "pinned to data");
         assert!(
             !v.bounds.borrow().forced_compute,
             "no compute function met this var"

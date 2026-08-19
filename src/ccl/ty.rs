@@ -359,7 +359,7 @@ impl Openness {
 ///
 /// Set at introduction (list literals, comprehensions, `++`, registered
 /// sources, and every `History` erasure are `Data`; `lambda`/`def` are
-/// `Compute`). The audit rule for a rebuilt or erased arrow: it is `Data` iff
+/// `Compute`). The audit rule for a rebuilt or erased function type: it is `Data` iff
 /// `extent_of` will drive iteration off its domain. See
 /// `design/type-inference.md`, "4.6 Data vs compute functions".
 ///
@@ -405,27 +405,27 @@ pub struct FunKindVarId(pub(crate) u32);
 
 static FUN_KIND_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// What a [`FunKindVar`] has been equated to.
+/// What a [`FunKindVar`] has been pinned to.
 ///
 /// `Data` and `Compute` are **incomparable**, so a kind edge is an equation, not
 /// a bound: a var records which of the two points it has been pinned to. There
 /// are only two points and no [`Type`] sits inside, so this collapses to two
 /// flags rather than the polar bound *lists* an [`crate::ccl::InferVar`] carries,
 /// and a `FunKindVar` never forms a cycle. Resolution is a flag read: both flags
-/// is the conflict (a var equated to both points at once); one flag is that
+/// is the conflict (a var pinned to both points at once); one flag is that
 /// point; neither → the caller's default.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FunKindBounds {
-    /// This kind has been equated to `Compute`.
+    /// This kind has been pinned to `Compute`.
     pub forced_compute: bool,
-    /// This kind has been equated to `Data`.
+    /// This kind has been pinned to `Data`.
     pub forced_data: bool,
 }
 
-/// A kind-inference variable — an unknown [`FunKind`] a consumption rule mints
+/// A kind-inference variable — an unknown [`FunKind`] an elimination mints
 /// and the value flowing in pins.
 ///
-/// The two consumption rules cannot know a function's kind: applying a value and
+/// The two eliminations cannot know a function's kind: applying a value and
 /// destructuring a function are one node for a collection and for a capability
 /// alike ([`Type::pi_eliminated`], [`Type::fun_eliminated`]). Each mints one of
 /// these, and the kind edge pins it to whatever concrete kind the value carries
@@ -442,12 +442,12 @@ pub struct FunKindBounds {
 pub struct FunKindVar {
     /// Stable, globally-unique identity.
     pub uid: FunKindVarId,
-    /// Which point(s) this var has been equated to.
+    /// Which point(s) this var has been pinned to.
     pub bounds: RefCell<FunKindBounds>,
 }
 
 impl FunKindVar {
-    /// Allocate a fresh kind variable, equated to nothing.
+    /// Allocate a fresh kind variable, pinned to nothing.
     pub fn fresh() -> Rc<FunKindVar> {
         Rc::new(FunKindVar {
             uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
@@ -455,15 +455,15 @@ impl FunKindVar {
         })
     }
 
-    /// Equate this kind to `Compute`. Recording both points is the conflict, read
+    /// Pin this kind to `Compute`. Recording both points is the conflict, read
     /// at coalesce ([`crate::ccl::infer::solver::compact::KindMerge::of`]) — one
     /// function required to be a collection at one site and a capability at another.
-    pub fn equate_compute(&self) {
+    pub fn pin_compute(&self) {
         self.bounds.borrow_mut().forced_compute = true;
     }
 
-    /// Equate this kind to `Data`. The dual of [`FunKindVar::equate_compute`].
-    pub fn equate_data(&self) {
+    /// Pin this kind to `Data`. The dual of [`FunKindVar::pin_compute`].
+    pub fn pin_data(&self) {
         self.bounds.borrow_mut().forced_data = true;
     }
 }
@@ -518,7 +518,7 @@ pub enum Type {
     /// it directly to `Extent::UIntRange { start: 0, end: n }`.
     UIntRange(usize),
     /// A function type. When `name` is `None` it is the ordinary
-    /// non-dependent arrow `domain ⇒ codomain`. When `name` is `Some(x)` it
+    /// non-dependent function type `domain ⇒ codomain`. When `name` is `Some(x)` it
     /// is a **Pi type** `(x: domain) ⇒ codomain`: the binder `x` is in scope
     /// in `codomain` and may be referenced by refinement predicates nested
     /// anywhere within it.
@@ -545,8 +545,8 @@ pub enum Type {
         ///
         /// Nothing structural distinguishes the two — only the construction
         /// site knows — so downstream the kind is *carried, never re-derived*:
-        /// a typing rule reads it off the node's own arrow and a rewrite copies
-        /// it from the arrow it replaces ([`Type::fun_like`]).
+        /// a typing rule reads it off the node's own type and a rewrite copies
+        /// it from the type it replaces ([`Type::fun_like`]).
         kind: FunKind,
         /// The parameter (argument) type. Contravariant position.
         domain: Box<Type>,
@@ -810,11 +810,10 @@ impl fmt::Display for Type {
             Type::BoundedHole(t) => write!(f, "<:{t}"),
             Type::UIntRange(0) => write!(f, "∅"),
             Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
-            // The arrow reflects the resolved `kind`: `⇒` for a compute
-            // capability (and an unresolved kind var), `⤇` for a data domain
-            // (see `FunKind::arrow`). Once kind inference resolves every arrow
-            // once resolved, a data collection renders `⤇`, making the domain/capability
-            // distinction legible in every type string.
+            // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
+            // capability (and an unresolved kind var), `⤇` for a data collection
+            // (see `FunKind::arrow`), making the collection/capability distinction
+            // legible in every type string.
             Type::Fun {
                 name: Some(x),
                 kind,
@@ -1106,9 +1105,9 @@ impl Type {
 
     /// Rebuild a function type copying `name` and `kind` from an `exemplar`
     /// `Fun`, so a downstream rebuild (lambda elimination, inlining, planning)
-    /// can never silently flip a data arrow to compute or drop its Pi binder. A
-    /// non-`Fun` exemplar yields a plain `Compute` arrow with no binder — the
-    /// safe default at a site with no arrow to copy from.
+    /// can never silently flip a data function to compute or drop its Pi binder. A
+    /// non-`Fun` exemplar yields a plain `Compute` function type with no binder —
+    /// the safe default at a site with no function type to copy from.
     pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
             Type::Fun { name, kind, .. } => Type::Fun {
@@ -1211,28 +1210,24 @@ impl Type {
     ///
     /// The binder is load-bearing only inside the type solver (it carries
     /// dependent-refinement correspondences); downstream passes treat function
-    /// types structurally and a `Some`/`None` binder is the same arrow to them.
+    /// types structurally and a `Some`/`None` binder is the same type to them.
     /// Use this when comparing types for structural equality across a pass that
     /// does not preserve the cosmetic binder.
     ///
-    /// FunKind is normalized for the same reason: **lambda elimination preserves a
-    /// function's denotation but not its kind representation** — a data
-    /// collection (`⤇`) becomes a point-free form built from compute combinators
-    /// (`zip`, `apply`, `const`), so the reconstructed arrow reads `Compute`
-    /// though it denotes the same collection. The kind did its work at inference
-    /// (lossless conditional-collection joins at coalesce); post-elimination it is not preserved, so
-    /// the structural-equality asserts (and the feed-operand agreement check)
-    /// compare modulo it. (FunKind-aware subtyping therefore acts in
-    /// *Emit*-mode inference, not the post-elimination Check-mode pass.)
+    /// FunKind is normalized for the same reason the binder is: these comparisons
+    /// are about domain and codomain structure, not provenance. Elimination does
+    /// carry a lambda's kind across (`elim_lambda_kinded`); normalizing here only
+    /// keeps the structural asserts (and the feed-operand agreement check) from
+    /// comparing it.
     ///
     /// Under the Barendregt convention the blindness needed at the remaining
     /// call sites (lambda elimination's type-preservation asserts) is exactly
     /// `Some` vs `None`: both compared types descend from one derivation, so
     /// when both carry a binder it is the *same* [`crate::ccl::Name`] (uids are preserved
     /// by every copy along the lineage). What elimination does not preserve is
-    /// the binder's presence — rebuilt combinator arrows (`fun_ty_or_hole`,
+    /// the binder's presence — rebuilt combinator types (`fun_ty_or_hole`,
     /// [`Type::fun`]) are constructed with `name: None`. If those sites ever
-    /// preserve binders on rebuilt arrows, this helper can retire.
+    /// preserve binders on rebuilt types, this helper can retire.
     pub fn without_pi_names(&self) -> Type {
         match self {
             Type::Fun {

@@ -283,7 +283,7 @@ impl Typing for CheckCtx {
             return Ok(((**d).clone(), (**c).clone()));
         }
         // A feed channel reads as its whole stream `domain ⇒ value`, so it
-        // destructures as that arrow.
+        // destructures as that function type.
         if let Some((domain, value)) = peeled.as_feed() {
             return Ok((domain.clone(), value.clone()));
         }
@@ -367,7 +367,7 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
 /// recorded `Type`.
 fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferError> {
     let label = symbolic(expr);
-    // The `Lambda` rule reads the node's own arrow for its kind (see
+    // The `Lambda` rule reads the node's own type for its kind (see
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
     let ty = match &mut expr.node {

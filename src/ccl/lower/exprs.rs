@@ -117,7 +117,7 @@ pub(super) fn lower_call(
             let target_ty = refined_data_fun(Type::Hole, bare_pred, Type::Hole);
             let cast = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
             // A group-by is a **data function** (a keyed collection): stamp its
-            // outer arrow `Data` by provenance (the `data_fun` annotation is a
+            // outer function `Data` by provenance (the `data_fun` annotation is a
             // concrete-kind stamp — see `emit_node`), so its kind is data-by-
             // construction rather than guessed from its (scalar key) domain.
             Ok(Expr::lambda("__gb_k", Type::Hole, cast)
