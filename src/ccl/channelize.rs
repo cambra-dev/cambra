@@ -114,7 +114,7 @@ use crate::ccl::ccl_utils::make_cast;
 use crate::ccl::{
     BaseType, Branch, Expr, HistoryKind, Lit, Name, Pattern, Refinement, Type, TypedBinding,
     TypedExpr, TypedExprNode,
-    ccl_utils::{count_free, synthesize_arm_predicate, typed_compose},
+    ccl_utils::{count_free, peel_refinements, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
 };
 
@@ -928,6 +928,7 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
             value: Box::new(drop_expr_stmts(*value)),
             target,
         },
+        TypedExprNode::Realize(value) => TypedExprNode::Realize(Box::new(drop_expr_stmts(*value))),
         TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
             left: Box::new(drop_expr_stmts(*left)),
             op,
@@ -1074,7 +1075,9 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
             assert_no_defer_residue(function)?;
             assert_no_defer_residue(argument)
         }
-        TypedExprNode::Cast { value, .. } => assert_no_defer_residue(value),
+        TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
+            assert_no_defer_residue(value)
+        }
         TypedExprNode::Begin { body } => assert_no_defer_residue(body),
         TypedExprNode::BinOp { left, right, .. } => {
             assert_no_defer_residue(left)?;
@@ -1741,7 +1744,9 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(function, bound, out);
                 rec(argument, bound, out);
             }
-            TypedExprNode::Cast { value, .. } => rec(value, bound, out),
+            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
+                rec(value, bound, out)
+            }
             TypedExprNode::Begin { body } => rec(body, bound, out),
             TypedExprNode::BinOp { left, right, .. } => {
                 rec(left, bound, out);
@@ -1959,15 +1964,6 @@ fn type_carries_refinement(ty: &Type, refinement: &Refinement) -> bool {
         cur = inner;
     }
     false
-}
-
-/// Peel outer `Refinement` wrappers off a type, returning the underlying type.
-fn peel_refinements(ty: &Type) -> &Type {
-    let mut t = ty;
-    while let Type::Refinement(inner, _) = t {
-        t = inner;
-    }
-    t
 }
 
 /// Build a [`TypedExprNode::Compose`] typed `Fun(first-domain, last-codomain)`.
@@ -2267,6 +2263,14 @@ fn extract_for_defer_impl(
                 }
             }
         }
+        // `realize` wraps a pure value exactly as `cast` does; recurse and keep `target`.
+        TypedExprNode::Realize(value) => TypedExprNode::Realize(Box::new(extract_for_defer(
+            *value,
+            defer_name,
+            feeds,
+            define,
+            in_inner_scope,
+        )?)),
         // `cast` wraps a pure value; recurse into it and keep `target`.
         TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
             value: Box::new(extract_for_defer(

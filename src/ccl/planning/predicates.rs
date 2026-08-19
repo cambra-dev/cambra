@@ -118,6 +118,7 @@ pub(crate) fn compile_refinement_predicates(expr: &mut Expr, memo: &PredMemo<Typ
 /// Fast-pathed when the bare predicate is already that single application;
 /// otherwise η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
 pub(crate) fn fn_of_bare_predicate(base: &Type, bare: &Expr) -> Expr {
+    let bare = &adopt_base_witnesses(base, bare);
     if let TypedExprNode::Apply { argument, function } = &bare.node
         && matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
     {
@@ -125,6 +126,61 @@ pub(crate) fn fn_of_bare_predicate(base: &Type, bare: &Expr) -> Expr {
     }
     lambda_elim::run(Expr::lambda(Name::elem(), base.clone(), bare.clone()))
         .expect("lambda-elim of refinement predicate")
+}
+
+/// `bare` with its witnesses renamed to the ones the refinement's `base` uses.
+///
+/// A predicate is a term with type slots of its own, derived independently of the
+/// refinement it rides — so its copy of a consumed sum carries its own witness binder,
+/// while the base carries the consuming site's. The two are the same witness under two
+/// names, and the predicate is about to be bound at the base (`λ __elem : base → …`), so
+/// the base's names are the ones that have to hold. The predicate's own view of the
+/// element is what pairs them: it is the type of `__elem` inside the predicate, which
+/// stands where `base` stands outside it.
+fn adopt_base_witnesses(base: &Type, bare: &Expr) -> Expr {
+    fn element_type(e: &Expr) -> Option<&Type> {
+        if matches!(&e.node, TypedExprNode::Var(n) if n.is_elem()) {
+            return Some(&e.ty);
+        }
+        let mut found = None;
+        e.walk_children(|c| found = found.or_else(|| element_type(c)));
+        found
+    }
+    let mut renaming = element_type(bare)
+        .map(|t| t.witness_correspondence(base))
+        .unwrap_or_default();
+    // **A predicate is closed over `__elem`,** so every witness it mentions is reached
+    // through the element — through a copy of a term it reads, when the positional
+    // correspondence above finds no counterpart to pair with. With exactly one witness in
+    // `base` there is exactly one thing such a copy can name, so the map is forced;
+    // with several it is not, and the rule declines rather than guessing.
+    let mut in_base = crate::ccl::ty::free_witness_refs(base, &[]);
+    if let Some(only) = in_base.pop().filter(|_| in_base.is_empty()) {
+        let mut seen = std::collections::BTreeSet::new();
+        bare_witnesses(bare, &mut seen);
+        for w in seen {
+            if w != only {
+                renaming.insert(w, only);
+            }
+        }
+    }
+    if renaming.is_empty() {
+        return bare.clone();
+    }
+    fn bare_witnesses(
+        e: &Expr,
+        out: &mut std::collections::BTreeSet<crate::ccl::infer_var::WitnessBinderId>,
+    ) {
+        e.walk_type_slots(|ty| out.extend(crate::ccl::ty::free_witness_refs(ty, &[])));
+        e.walk_children(|c| bare_witnesses(c, out));
+    }
+    fn rename(e: &Expr, renaming: &crate::ccl::ty::WitnessRenaming) -> Expr {
+        let mut out = e.clone();
+        out.walk_type_slots_mut(|ty| *ty = ty.rename_witnesses(renaming));
+        out.walk_children_mut(|c| *c = rename(c, renaming));
+        out
+    }
+    rename(bare, &renaming)
 }
 
 fn compile_predicates_in_type(ty: &mut Type, memo: &PredMemo<Type>) {

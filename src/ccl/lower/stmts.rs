@@ -1322,25 +1322,66 @@ fn lower_type_application(
     args: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
+    let arity_err = |want: &str| {
+        LoweringError::unsupported(
+            span,
+            format!("`{head}(…)` type takes {want}, got {}", args.len()),
+        )
+    };
     match head {
-        // A list type is a mapping `index-range ⤇ element`; the length
-        // (domain) is unknown at annotation time, so it is a `Hole` (inferred,
-        // like the value slot of a bare `_`). The element type is the sole
-        // argument lowered recursively. A `List` annotation is a collection
-        // type: a data function.
-        "List" => {
-            let [elem] = args else {
+        // `Array(n, T)` = `[0, n) ⤇ T` — a static index range. `n` is an integer
+        // literal (the length is known at annotation time).
+        "Array" => {
+            let [n_arg, elem] = args else {
+                return Err(arity_err("a length and an element type"));
+            };
+            let ChlExpr::Lit(ChlLit::Int(n)) = &n_arg.node else {
                 return Err(LoweringError::unsupported(
-                    span,
-                    "`List` takes one type argument: `List(T)`",
+                    n_arg.span,
+                    "`Array(n, T)` needs an integer-literal length `n`",
                 ));
             };
-            Ok(Type::Fun {
-                name: None,
-                kind: crate::ccl::ty::FunKind::Data,
-                domain: Box::new(Type::Hole),
-                codomain: Box::new(lower_type_expr(elem, ctx)?),
-            })
+            let n = usize::try_from(*n).map_err(|_| {
+                LoweringError::unsupported(n_arg.span, "`Array` length must be non-negative")
+            })?;
+            Ok(Type::data_fun(
+                Type::UIntRange(n),
+                lower_type_expr(elem, ctx)?,
+            ))
+        }
+        // `List(T)` = `Σ (D: UIntRanges). D ⤇ T` — the sum over every index range.
+        // A list literal of extent `k` reaches it as `box(lit)`, whose one-candidate sum
+        // is contained by width because `[0, k)` is a member of that kind. The `box` is
+        // required: a bare `[0, k) ⤇ T` is not below the sum
+        // (`Type::list_of`, `src/ccl/design/collections.md`, "Subtyping").
+        "List" => {
+            let [elem] = args else {
+                return Err(arity_err("one element type"));
+            };
+            Ok(Type::list_of(lower_type_expr(elem, ctx)?))
+        }
+        // The **keyed** collections (`Map`/`Set`/`Dict`) are data functions over a
+        // keyed extent `𝐸` with keys `{𝑘: 𝐾 | 𝑘 ∈ 𝐸}` (design/collections.md).
+        // Deferred: Cambra has no map/set/dict *values* yet, so a keyed Σ would be
+        // an uninhabited type. Wired once a keyed-collection value form exists
+        // (higher in the stack).
+        "Map" | "Dict" | "Set" => Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{head}(…)` is deferred — Cambra has no {head}/keyed-collection \
+                 values yet, so the type would be uninhabited (see \
+                 `src/ccl/design/collections.md` \"Status\"); \
+                 `Array(n, T)` and `List(T)` are available"
+            ),
+        )),
+        // `Collection(T)` = `Σ (𝐷: Any). 𝐷 ⤇ T` — the whole-domain-witness sum (a
+        // `TypeKind::Any` type-witness): an unordered, opaque-extent collection, the ⊤
+        // of the kind order (`Type::collection_of`, design/collections.md).
+        "Collection" => {
+            let [elem] = args else {
+                return Err(arity_err("one element type"));
+            };
+            Ok(Type::collection_of(lower_type_expr(elem, ctx)?))
         }
         // `Option(T)` abbreviates the two-tag variant `{some: T, none: Unit}` —
         // a peer of `List(T)` here, not a distinguished type. Its constructors

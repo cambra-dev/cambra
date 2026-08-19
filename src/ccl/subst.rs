@@ -877,6 +877,9 @@ impl Subst {
             | Type::Txn
             | Type::Hole
             | Type::SharedHole(_)
+            // A witness reference is a type-level binder occurrence, never a term
+            // binder the substitution acts on.
+            | Type::WitnessRef(_)
             | Type::Infer(_) => {}
 
             // a nominal channel domain names its defer
@@ -955,6 +958,17 @@ impl Subst {
             Type::Variant(tags, _) => tags
                 .iter_mut()
                 .for_each(|(_, t)| self.rewrite_type_go(t, memo)),
+
+            // A witness binder is a *type*-level binder, so a term substitution has no
+            // name here to map — only the witness's type children and the body need
+            // rewriting.
+            Type::Sigma(s) => {
+                s.witness
+                    .types_mut()
+                    .iter_mut()
+                    .for_each(|t| self.rewrite_type_go(t, memo));
+                self.rewrite_type_go(&mut s.body, memo);
+            }
         }
     }
 
@@ -1097,6 +1111,7 @@ impl Subst {
             | Type::Txn
             | Type::Hole
             | Type::SharedHole(_)
+            | Type::WitnessRef(_)
             | Type::Infer(_) => ty.clone(),
 
             // rename the named defer binder, mirroring the
@@ -1155,6 +1170,14 @@ impl Subst {
                 domain: Box::new(self.apply_type(domain)),
                 kind: *kind,
             },
+
+            // A substitution rewrites *predicates*, so only the witness's type children
+            // and the body are touched; the sum's own binder is not a term name and is
+            // carried through unchanged.
+            Type::Sigma(s) => Type::Sigma(Box::new(crate::ccl::SigmaType::bound(
+                s.witness.map_types(|t| self.apply_type(t)),
+                self.apply_type(&s.body),
+            ))),
         }
     }
 
@@ -1209,7 +1232,8 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
-        | Type::SharedHole(_) => false,
+        | Type::SharedHole(_)
+        | Type::WitnessRef(_) => false,
         Type::Infer(_) => true,
         Type::Fun {
             domain, codomain, ..
@@ -1225,6 +1249,9 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         // for the bounded type is the honest reading of the question; a `BoundedHole` that
         // reaches here at all is reported as `UnresolvedBoundedHole`, not by this test.
         Type::BoundedHole(t) => type_contains_infer(t),
+        Type::Sigma(s) => {
+            s.witness.types().iter().any(type_contains_infer) || type_contains_infer(&s.body)
+        }
     }
 }
 
@@ -1266,6 +1293,8 @@ fn collect_type_fv(
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
+        // A witness reference is type-level, never a free term variable.
+        | Type::WitnessRef(_)
         | Type::Infer(_) => {}
         Type::Fun {
             name,
@@ -1303,6 +1332,15 @@ fn collect_type_fv(
         Type::History { value, domain, .. } => {
             collect_type_fv(value, bound, visited, out);
             collect_type_fv(domain, bound, visited, out);
+        }
+        // A witness binder binds no *term* variable, so the body's free
+        // term vars are collected under the *enclosing* binders, with nothing
+        // subtracted for the Σ itself.
+        Type::Sigma(s) => {
+            for t in s.witness.types() {
+                collect_type_fv(t, bound, visited, out);
+            }
+            collect_type_fv(&s.body, bound, visited, out);
         }
     }
 }

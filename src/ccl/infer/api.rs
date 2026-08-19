@@ -660,6 +660,76 @@ impl LocatedInferError {
 ///
 /// Both messages are facts about the *pair*, true whichever side the solver reports as
 /// "expected" — an application's domain can be raised from either side of its edge.
+/// Where two types that **render identically** actually differ.
+///
+/// `Display` is deliberately lossy: a refinement prints its predicate through `symbolic`,
+/// which shows terms without their types, so two refinements whose predicates differ only in
+/// their *internal* annotations print the same. A mismatch between them reads as
+/// "expected 𝑇, found 𝑇" — a message that states the types agree while reporting that they
+/// do not, which sends a reader looking for the bug anywhere but where it is.
+///
+/// So when the rendered forms agree, fall through to the structural form and quote the first
+/// place it diverges. Only ever computed on this path: `Debug` of a type carrying a compiled
+/// predicate runs to a hundred kilobytes, which is exactly why the excerpt is a window and
+/// not the whole thing.
+fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
+    if type_a.to_string() != type_b.to_string() {
+        return None;
+    }
+    let (a, b) = (format!("{type_a:?}"), format!("{type_b:?}"));
+    let Some(at) = a
+        .char_indices()
+        .zip(b.chars())
+        .find(|((_, x), y)| x != y)
+        .map(|((i, _), _)| i)
+    else {
+        // No character disagrees. Either one structure is a *prefix* of the other — the
+        // difference is depth, something wrapping one side and not the other — or the two
+        // are structurally identical, in which case the types are not what disagree at all
+        // and the rule that rejected them is where to look.
+        if a.len() == b.len() {
+            return Some(
+                "note: these are structurally identical, not merely identical as printed — \
+                 so the disagreement is not in the types. Look at the rule that rejected \
+                 them: it failed on something the types do not carry (a witness range read \
+                 from the index, a kind obligation, a scope) rather than on their shape."
+                    .to_string(),
+            );
+        }
+        let (shorter, longer, which) = if a.len() < b.len() {
+            (a.len(), b.len(), "found")
+        } else {
+            (b.len(), a.len(), "expected")
+        };
+        return Some(format!(
+            "note: these render identically, and structurally one is a prefix of the other \
+             — `{which}` carries {} more characters of structure ({longer} vs {shorter}), so \
+             the two differ in *depth*: a wrapper on one side that the other lacks",
+            longer - shorter
+        ));
+    };
+    // A window wide enough to name the constructor that differs, narrow enough to read.
+    let window = |s: &str| {
+        let start = s[..at.min(s.len())]
+            .char_indices()
+            .rev()
+            .nth(60)
+            .map_or(0, |(i, _)| i);
+        let end = s
+            .char_indices()
+            .skip_while(|(i, _)| *i < at)
+            .nth(60)
+            .map_or(s.len(), |(i, _)| i);
+        s[start..end].to_string()
+    };
+    Some(format!(
+        "note: these render identically — they differ where `Display` does not look, \
+         most often a refinement predicate's own types. First structural difference:\n             expected: …{}…\n    found:    …{}…",
+        window(&a),
+        window(&b)
+    ))
+}
+
 fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     match (type_a, type_b) {
         (Type::Record(_), Type::Tuple(_)) | (Type::Tuple(_), Type::Record(_)) => Some(
@@ -687,6 +757,9 @@ impl std::fmt::Debug for InferError {
                         "Type mismatch for {ctx}: expected {expected}, found {found}"
                     )?;
                     if let Some(hint) = product_keying_hint(expected, found) {
+                        write!(f, "\n  {hint}")?;
+                    }
+                    if let Some(hint) = identical_rendering_hint(found, expected) {
                         write!(f, "\n  {hint}")?;
                     }
                     Ok(())
@@ -1009,6 +1082,74 @@ pub enum Strictness {
     PreDesugar,
 }
 
+/// Assert that no type slot in `expr` carries a **free** witness reference.
+///
+/// A pass that reaches into a sum for its body and forgets to close it leaves a type that
+/// is locally well-formed and globally meaningless: `WitnessRef` is a leaf, so every
+/// consumer downstream compares it against real domains and fails somewhere far from
+/// where it was made. This is the boundary that names the invariant instead.
+///
+/// **A node's binder slots are inside its own type's sum.** A Σ-typed lambda *is* a
+/// collection over the witness, so its parameter ranges over whichever domain the witness
+/// picked — the sum on `expr.ty` is what binds the `WitnessRef` in `param.ty`, even
+/// though the slot sits beside that type rather than inside it. Reading the slot in
+/// isolation would report the one form the binder is allowed to have.
+#[cfg(debug_assertions)]
+pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
+    fn check(t: &Type, scope: &[crate::ccl::infer_var::WitnessBinderId], e: &Expr, stage: &str) {
+        assert!(
+            !crate::ccl::ty::has_free_witness_ref(t, scope),
+            "{stage}: free witness reference in a type slot: {t} on {}",
+            symbolic(e)
+        );
+    }
+    if std::env::var("DBG_TREE").is_ok() {
+        eprintln!(
+            "TREE {stage}:\n{}",
+            crate::ccl::symbolic::symbolic_typed(expr)
+        );
+    }
+    fn go(e: &Expr, stage: &str, scope: &mut Vec<crate::ccl::infer_var::WitnessBinderId>) {
+        check(&e.ty, scope, e, stage);
+        if let Some(a) = &e.user_annotation {
+            check(a, scope, e, stage);
+        }
+        if let TypedExprNode::Cast { target, .. } = &e.node {
+            check(target, scope, e, stage);
+        }
+        // A node whose own type is a sum opens that binder over its binder slots and its
+        // whole subtree: the sum on `expr.ty` is what a decomposed term's scattered
+        // occurrences still name.
+        //
+        // **The whole chain, not just the head.** Consuming two conditional collections at
+        // once nests the closes — `Σ 𝜎₁ ∈ 𝐾₁. Σ 𝜎₂ ∈ 𝐾₂. (𝜎₁, 𝜎₂) ⤇ 𝑉` — and every binder
+        // in that chain scopes over the same subtree, so opening only the outermost
+        // reports the inner witness's occurrences as free.
+        let mut opened = 0;
+        let mut t = &e.ty;
+        while let Type::Sigma(s) = t {
+            scope.push(s.binder());
+            opened += 1;
+            t = &s.body;
+        }
+        e.walk_binders(|b| {
+            check(&b.ty, scope, e, stage);
+            if let Some(a) = &b.user_annotation {
+                check(a, scope, e, stage);
+            }
+        });
+        e.walk_children(|c| go(c, stage, scope));
+        scope.truncate(scope.len() - opened);
+    }
+    if std::env::var("DBG_TREE").is_ok() {
+        eprintln!(
+            "TREE {stage}:\n{}",
+            crate::ccl::symbolic::symbolic_typed(expr)
+        );
+    }
+    go(expr, stage, &mut Vec::new());
+}
+
 /// Check that every [`crate::ccl::TypedExpr::ty`] and [`crate::ccl::TypedBinding::ty`]
 /// in the tree is a fully concrete type — no [`Type::Hole`] or [`Type::Infer`] anywhere,
 /// including nested inside compound types like `Fun` or `Tuple` and inside refinements.
@@ -1164,7 +1305,7 @@ fn collect_type_errors(
         Type::Infer(var) => {
             // Pre-desugar, an induction accumulator's domain is still `Infer` (a
             // `Mut(V)` with no annotated domain — the unified phase resolves it
-            // to the writing loop's extent); the relaxation tolerates it (see
+            // to the writing loop's domain); the relaxation tolerates it (see
             // [`Strictness`]). Feed channel domains are the rigid `ChanDom`
             // handled below, not `Infer`.
             if strictness == Strictness::Strict {
@@ -1269,6 +1410,16 @@ fn collect_type_errors(
             }
             collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
         }
+        Type::Sigma(s) => {
+            // Recurse for holes/infers in the witness's type children and the
+            // body; the anonymous type-witness reference (`Type::WitnessRef`) is
+            // bound by this Sigma, so it carries no error.
+            for t in s.witness.types() {
+                collect_type_errors(t, context_sym, strictness, errors, seen_refinements);
+            }
+            collect_type_errors(&s.body, context_sym, strictness, errors, seen_refinements);
+        }
+        Type::WitnessRef(_) => {}
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
     }
 }
@@ -2135,6 +2286,145 @@ mod tests {
         assert_eq!(ty, int_lit_ty(42));
     }
 
+    /// `λ (xs: List(Int)) → Sum(xs)` — *consuming* a List param. The Σ-typed
+    /// param flows into the aggregate's `α ⤇ β` consumer, so the sum is consumed:
+    /// the length-bounded index domain flows to the
+    /// consumer (Σ-witness length opened), the element type `int` to the
+    /// result. Sum's result is `int`.
+    #[test]
+    fn test_infer_list_param_consumed_by_aggregate() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
+        });
+        let ty = infer(&mut expr, &mut ctx).expect("consuming a List param type-checks");
+        let Type::Fun { codomain, .. } = &ty else {
+            panic!("expected a function type, got {ty}");
+        };
+        assert_eq!(
+            codomain.as_ref(),
+            &Type::Base(BaseType::Int),
+            "Sum over a List(Int) is Int, got {codomain}"
+        );
+    }
+
+    /// `λ (xs: List(Int)) → let ys: List(Int) = xs in ys` — a List-typed value
+    /// (the param) ascribed at another List. `xs`'s type is the List Σ, so the
+    /// ascription emits `List Σ <: List Σ` — the Σ **width** edge.
+    /// This is an ordinary pattern (re-binding, passing, returning a list), so
+    /// width must be wired.
+    #[test]
+    fn test_infer_list_to_list_ascription_width() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::let_bind_annotated(
+                "ys",
+                Expr::var("xs"),
+                Expr::var("ys"),
+                Type::list_of(Type::Base(BaseType::Int)),
+            )),
+        });
+        infer(&mut expr, &mut ctx).expect("list-to-list ascription type-checks via Σ-width");
+
+        // The codomain still flows: a List(Int) is not a List(Str).
+        let mut ctx = TypeInferenceContext::new();
+        let mut bad = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::let_bind_annotated(
+                "ys",
+                Expr::var("xs"),
+                Expr::var("ys"),
+                Type::list_of(Type::Base(BaseType::String)),
+            )),
+        });
+        assert!(
+            infer(&mut bad, &mut ctx).is_err(),
+            "List(Int) must not ascribe at List(Str) — width flows the codomain"
+        );
+    }
+
+    /// `λ (xs: List(Int)) → xs` — a **parameter** List annotation. The annotation
+    /// bounds `xs`, and with no other demand on it the bound *is* the param type: it
+    /// rides the lambda's domain and body type through the compact/coalesce
+    /// round-trip as a described-kind domain, re-forming the identical Σ.
+    #[test]
+    fn test_infer_list_param_annotation_round_trips() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::var("xs")),
+        });
+        let ty = infer(&mut expr, &mut ctx).expect("List(Int) param annotation round-trips");
+        // The lambda's domain and codomain both re-form the List Σ.
+        let Type::Fun {
+            domain, codomain, ..
+        } = &ty
+        else {
+            panic!("expected a function type, got {ty}");
+        };
+        assert!(
+            matches!(domain.as_ref(), Type::Sigma(_)),
+            "param domain should be the `List` Σ, got {domain}"
+        );
+        assert!(
+            matches!(codomain.as_ref(), Type::Sigma(_)),
+            "body (returns xs) should be the `List` Σ, got {codomain}"
+        );
+    }
+
+    /// `([1, 2, 3] : List(Int))` on a *node* annotation is **rejected**: entering a
+    /// collection type is `box`, not a subtyping edge, so the concrete `[0, 3) ⤇ Int`
+    /// does not inject into `Σ (D: UIntRanges). D ⤇ Int`
+    /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). This pins the
+    /// annotation path specifically, which is one-way (`inferred <: ann`) and reaches the
+    /// witness kind through `emit_annotation_predicates`. A conflicting element type is
+    /// rejected too, and for a different reason — the element types meet inside the body,
+    /// with no sum involved.
+    #[test]
+    fn test_infer_list_node_annotation_needs_box() {
+        let mut ctx = TypeInferenceContext::new();
+        let ints = vec![
+            Expr::lit(Lit::Int(1)),
+            Expr::lit(Lit::Int(2)),
+            Expr::lit(Lit::Int(3)),
+        ];
+        let mut expr = Expr::new(TypedExprNode::List(ints))
+            .with_user_annotation(Type::list_of(Type::Base(BaseType::Int)));
+        let err = infer(&mut expr, &mut ctx)
+            .expect_err("a bare list literal does not enter List(Int); that needs `box`");
+        assert!(
+            format!("{err:?}").contains("Annotation mismatch"),
+            "expected an annotation mismatch, got {err:?}"
+        );
+
+        // A `List(Str)` annotation over an int list is a conflict.
+        let mut ctx = TypeInferenceContext::new();
+        let mut bad = Expr::new(TypedExprNode::List(vec![Expr::lit(Lit::Int(1))]))
+            .with_user_annotation(Type::list_of(Type::Base(BaseType::String)));
+        assert!(
+            infer(&mut bad, &mut ctx).is_err(),
+            "List(Str) annotation over an int list must be rejected"
+        );
+    }
+
     #[test]
     fn test_infer_type_annotation_overrides_inferred() {
         let mut ctx = TypeInferenceContext::new();
@@ -2688,7 +2978,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AnnotationMismatch: user_annotation conflicts with inferred type
+    // Param annotation conflicts (caught at the use site)
     // -----------------------------------------------------------------------
 
     /// A parameter annotation conflicting with the body's demand is caught, and
@@ -3484,11 +3774,9 @@ mod tests {
         assert_eq!(typecheck(&expr), Ok(()));
     }
 
-    /// A lambda that applies two different projections to the same parameter
-    /// should infer a tuple-typed domain after `set()` merging and `TupleField`
-    /// constraint accumulation.
+    /// A lambda that applies two different projections to the same parameter infers a
+    /// tuple-typed domain, after `set()` merging and `TupleField` constraint accumulation.
     #[test]
-    #[ignore]
     fn test_infer_lambda_two_proj_on_same_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ p → ((p ► .0) + 0, p ► .1)
@@ -3521,5 +3809,56 @@ mod tests {
         } else {
             panic!("expected Fun type for lambda");
         }
+    }
+
+    /// **A mismatch whose two sides render identically still says where they differ.**
+    ///
+    /// A sum prints its witness as `σ` whatever binder it names, so two sums built by
+    /// different derivations render identically while comparing unequal — the α-invariance
+    /// cost that naming the binder buys, recorded in
+    /// `src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness". A mismatch
+    /// between them reads as "expected 𝑇, found 𝑇": a message that states the two agree
+    /// while reporting that they do not, which sends a reader looking anywhere but at the
+    /// binder.
+    #[test]
+    fn a_mismatch_that_renders_identically_says_where_it_differs() {
+        use crate::ccl::infer_var::fresh_witness_binder_id;
+        use crate::ccl::ty::{SigmaType, Type, TypeKind, Witness};
+
+        let sum = || {
+            let binder = fresh_witness_binder_id();
+            Type::Sigma(Box::new(SigmaType::bound(
+                Witness::bound_to(binder, TypeKind::Enumerated(vec![Type::UIntRange(2)])),
+                Type::data_fun(Type::WitnessRef(binder), Type::Base(BaseType::Int)),
+            )))
+        };
+        let (a, b) = (sum(), sum());
+        assert_eq!(
+            a.to_string(),
+            b.to_string(),
+            "the premise: these must render identically"
+        );
+        assert_ne!(a, b, "the premise: these must actually differ");
+
+        let rendered = format!(
+            "{:?}",
+            InferError::TypeMismatch {
+                ctx: "type of x".to_string(),
+                found: Box::new(a),
+                expected: Some(Box::new(b)),
+            }
+        );
+        assert!(
+            rendered.contains("render identically"),
+            "no hint that the rendering is lossy: {rendered}"
+        );
+        assert!(
+            rendered.contains("First structural difference"),
+            "no structural excerpt: {rendered}"
+        );
+        assert!(
+            rendered.contains("WitnessBinderId"),
+            "the excerpt does not show what differs: {rendered}"
+        );
     }
 }

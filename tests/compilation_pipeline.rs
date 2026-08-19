@@ -44,6 +44,8 @@ mod records;
 mod scalars_collections;
 #[path = "compilation_pipeline/sources_incremental.rs"]
 mod sources_incremental;
+#[path = "compilation_pipeline/sums.rs"]
+mod sums;
 #[path = "compilation_pipeline/transactions.rs"]
 mod transactions;
 #[path = "compilation_pipeline/type_annotations.rs"]

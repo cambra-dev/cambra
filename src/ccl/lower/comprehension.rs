@@ -4,7 +4,7 @@
 use super::*;
 use crate::{
     ccl::{
-        BinOpKind, Branch, Expr, LogicKind, Name, Type, TypedExprNode,
+        BinOpKind, Expr, LogicKind, Name, Type, TypedExprNode,
         ccl_utils::{
             flatten_trailing_value_case, make_cast, refined_data_fun, synthesize_arm_predicate,
         },
@@ -156,37 +156,6 @@ pub(super) fn lower_list_comp(
             Expr::apply(vref, Expr::proj_index(i))
         }
     };
-
-    // ---- Phase 4.5: Float a value-`Case` source out of the comprehension --------
-    // `[e for x in (xs if c else ys)]` — a comprehension over a *conditional
-    // collection* — lowers with a value-`Case` source. Iterating it directly
-    // would bind the index variable to *both* choice domains (as the read index
-    // and the result domain), which inference rejects as an untagged-sum
-    // collision. Because the guards do not reference the comprehension variable,
-    // the `Case` floats out soundly: `[e for x in Case{gᵢ→srcᵢ}]` ⟹
-    // `Case{gᵢ → [e for x in srcᵢ]}` — each arm an ordinary map over a concrete
-    // collection, the enclosing `Case` a value-`Case` over collections (compiled by
-    // the gate fan-out). Single generator, no comprehension
-    // filter; a nested conditional source floats per arm by recursion. (A
-    // multi-generator or filtered comprehension over a conditional source is a
-    // follow-up — it falls through to the direct path.)
-    if single_gen
-        && pred_op.is_none()
-        && matches!(
-            &gen_sources[0].node,
-            TypedExprNode::Case { scrutinee: None, branches }
-                if branches.iter().all(|b| b.pattern.is_none())
-        )
-    {
-        let source = gen_sources.pop().expect("single generator has one source");
-        return Ok(float_comp_source_case(
-            source,
-            &gen_iter_vars[0],
-            &body,
-            comp.element.span,
-            ctx,
-        ));
-    }
 
     // ---- Phase 4.6: Fan out a value-`Case` *element* into filtered maps ----------
     // `[a if g(x) else b for x in xs]` — a comprehension whose *element* is a
@@ -348,67 +317,6 @@ fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
     use crate::ccl::lineage::copy_frame;
     let _frame = copy_frame(label);
     origin.clone()
-}
-
-/// Float a value-`Case` *source* out of a single-generator comprehension:
-/// `[e for x in Case{gᵢ→srcᵢ}]` ⟹ `Case{gᵢ → [e for x in srcᵢ]}`. Sound because
-/// the guards do not reference the comprehension variable `x`. Recurses so a
-/// nested conditional source flattens per arm; a concrete (non-`Case`) source
-/// builds the ordinary map chain `λ __idx → __idx ▷ src ▷ (λ x → body)`.
-fn float_comp_source_case(
-    source: Expr,
-    iter_var: &str,
-    body: &Expr,
-    span: Span,
-    ctx: &mut LoweringContext,
-) -> Expr {
-    let is_value_case = matches!(
-        &source.node,
-        TypedExprNode::Case { scrutinee: None, branches }
-            if branches.iter().all(|b| b.pattern.is_none())
-    );
-    if is_value_case {
-        let TypedExprNode::Case { branches, .. } = source.node else {
-            unreachable!("guarded by is_value_case")
-        };
-        let floated = branches
-            .into_iter()
-            .map(|b| Branch {
-                pattern: b.pattern,
-                guard: b.guard,
-                // The arm body *is* this arm's source collection; float into it.
-                body: float_comp_source_case(b.body, iter_var, body, span, ctx),
-            })
-            .collect();
-        // The rebuilt `Case` is the floated encoding of the rule, not an image of
-        // anything the user wrote.
-        return ctx.tag_machinery(
-            Expr::new(TypedExprNode::Case {
-                scrutinee: None,
-                branches: floated,
-            }),
-            span,
-            "lower.comp_source_case",
-        );
-    }
-    // Concrete source: `source ≫ (λ x → body)` — a `Compose`, *not* the apply
-    // chain Phase 5 builds. The compose form is equivalent (a map applies the
-    // body to each element) and is the shape the gate fan-out downstream reads.
-    //
-    // Stamped `Data` here, by the site that knows: a floated arm is a map over
-    // its own source, so it is a collection. That is what lets two such arms of
-    // a conditional source join as collections rather than colliding as
-    // capabilities whose index domains would meet — and saying it on the node
-    // lowering mints is what keeps it from being decided by whoever consumes it.
-    let body = fan_out_copy(body, "lower.comp_source_case_body");
-    let cs = "lower.comp_source_case";
-    let elem_map = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body), span, cs);
-    ctx.tag_machinery(
-        Expr::compose(vec![source, elem_map])
-            .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
-        span,
-        cs,
-    )
 }
 
 /// Fan out a single-generator comprehension whose *element* is a value-`Case`

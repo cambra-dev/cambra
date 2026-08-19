@@ -85,7 +85,7 @@ use crate::{
         lineage::{Nature, RewriteLabel},
     },
     chl_parser::ast::{
-        Expr as ChlExpr, RecordField, Span, Spanned, Stmt as ChlStmt,
+        Expr as ChlExpr, Lit as ChlLit, RecordField, Span, Spanned, Stmt as ChlStmt,
         VariantPayload as ChlVariantPayload,
     },
     interpreter::{DataSink, DataSourceDomainExtentImpl, http_server::SharedHttpServer},

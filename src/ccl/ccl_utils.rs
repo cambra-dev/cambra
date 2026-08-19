@@ -291,10 +291,36 @@ pub(crate) fn debug_assert_no_iteration_markers_in_type(ty: &Type) {
                 "iteration/restrict marker leaked into a refinement predicate: {}",
                 crate::ccl::symbolic::symbolic(&r.predicate)
             );
+            debug_assert!(
+                !expr_needs_iteration(&r.predicate),
+                "a source that must be *iterated* reached a refinement predicate: {}\n\
+                 A predicate looks its collection up at an index; it never sweeps one, and \
+                 it may carry no `iterate`/`restrict` to sweep with. Realizing a conditional \
+                 source inside a predicate produces exactly this — a gated union whose legs \
+                 need the markers the assertion above forbids — and op-conversion then \
+                 compiles one leg and silently answers from the wrong arm. The predicate has \
+                 to name a *plain* collection: under leg i the conditional is `arm i`, so \
+                 substitute it.",
+                crate::ccl::symbolic::symbolic(&r.predicate)
+            );
         }
         ty.walk_children(go);
     }
     go(ty);
+}
+
+/// Whether `e` contains a collection that op-conversion could only compile by **iterating**
+/// it — a realized conditional (`Realize`) or a union of collections.
+///
+/// The complement of [`debug_assert_no_iteration_markers_in_type`]'s own check, and the half
+/// it could not see. That one catches a marker that *leaked in*; this catches a term that
+/// would *need* one. Both say the same thing about a predicate — it is denotational — and
+/// only together do they close the gap, since a term needing iteration and carrying no
+/// marker passes the first check and miscompiles.
+#[cfg(debug_assertions)]
+fn expr_needs_iteration(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::Realize(_) | TypedExprNode::Copair(_))
+        || e.fold_children(false, |acc, c| acc || expr_needs_iteration(c))
 }
 
 /// Whether `e` applies `b` as its function (`Apply { function: Builtin(b) }`).
@@ -712,6 +738,24 @@ pub fn refined_data_fun(base_domain: Type, predicate: Expr, codomain: Type) -> T
     )
 }
 
+/// Peel the outer [`Type::Refinement`] wrappers off `ty`, exposing its head
+/// constructor and leaving everything nested inside untouched.
+///
+/// This is the peel to reach for when *dispatching* on a type's shape — asking
+/// "is this a function? a sum?" of a type that may be wrapped in refinements.
+/// [`strip_refinements`] is the wrong tool there and the difference is not
+/// cosmetic: it erases refinements at every depth, including a Σ's candidate
+/// domains, and a candidate's refinement is the program's filter. Reading a
+/// domain out of a deep-stripped copy silently drops that filter, and with it
+/// the `Restrict` it would have compiled to.
+pub(crate) fn peel_refinements(ty: &Type) -> &Type {
+    let mut t = ty;
+    while let Type::Refinement(inner, _) = t {
+        t = inner;
+    }
+    t
+}
+
 /// A structural copy of `ty` with every [`Type::Refinement`] layer removed,
 /// at any depth (inside tuples / records / function types).  Used to compare
 /// domains up to refinements (which are transparent to structural shape) —
@@ -767,6 +811,16 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             domain: Box::new(strip_refinements(domain)),
             kind: *kind,
         },
+        // The **witness kind is left alone.** A sum's candidates are domains, and the Σ
+        // rules match them by value, so two sums differing only in a candidate's
+        // refinement are different types — `Σ σ ∈ {{[0,2] | 𝑝}}. σ` is the filtered arm
+        // and `Σ σ ∈ {[0,2]}. σ` is not. Erasing there would make them compare equal,
+        // which is the opposite of what a comparison up to refinements is for: it drops a
+        // distinction rather than an incidental spelling.
+        Type::Sigma(s) => Type::Sigma(Box::new(crate::ccl::ty::SigmaType::bound(
+            s.witness.clone(),
+            strip_refinements(&s.body),
+        ))),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole
@@ -774,6 +828,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::WitnessRef(_)
         | Type::Txn => ty.clone(),
     }
 }
@@ -1516,4 +1571,105 @@ where
     }
     ty.walk_children_mut(|child| changed |= walk_refined_predicates_mut(child, memo, context, f));
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::ty::{SigmaType, TypeKind};
+
+    /// **A realized conditional inside a predicate is caught at the planning wall.**
+    ///
+    /// A predicate looks its collection up at an index; it never sweeps one, and it may
+    /// carry no `iterate`/`restrict` to sweep with. Realizing a conditional source inside a
+    /// predicate produces exactly the forbidden thing — a gated union whose legs need those
+    /// markers — and the marker check alone cannot see it, because the union arrives with
+    /// *no* markers at all. Without this the failure is a wrong arm at runtime, four passes
+    /// downstream.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must be *iterated* reached a refinement predicate")]
+    fn a_source_needing_iteration_in_a_predicate_is_caught() {
+        let arm = |n| {
+            Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(Type::data_fun(
+                Type::UIntRange(n),
+                Type::Base(BaseType::Int),
+            ))
+        };
+        let realized = Expr::new(TypedExprNode::Realize(Box::new(
+            Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
+                Type::UIntRange(2),
+                Type::Base(BaseType::Int),
+            )),
+        )))
+        .with_ty(Type::data_fun(
+            Type::UIntRange(2),
+            Type::Base(BaseType::Int),
+        ));
+        let ty = Type::Refinement(
+            Box::new(Type::UIntRange(2)),
+            Refinement::born(Rc::new(realized)),
+        );
+        debug_assert_no_iteration_markers_in_type(&ty);
+    }
+
+    /// `{[0, 2] | __elem}` — a refined range. The predicate's content is irrelevant
+    /// here; only that the two sides carry *different* ones.
+    fn refined(base: Type, tag: &str) -> Type {
+        Type::Refinement(
+            Box::new(base),
+            Refinement::born(Rc::new(Expr::var(Name::from(tag)))),
+        )
+    }
+
+    /// A Σ's candidates are **domains**, matched by value, so two sums differing only
+    /// in a candidate's refinement are different types — one is the filtered arm and
+    /// the other is not. Erasing there would collapse that distinction, which is a
+    /// stronger claim than "these two spellings of one predicate are the same".
+    #[test]
+    fn strip_refinements_keeps_a_sum_s_candidates_distinct() {
+        let filtered = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            refined(Type::UIntRange(3), "p"),
+        ]))));
+        let bare = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            Type::UIntRange(3),
+        ]))));
+        assert_ne!(strip_refinements(&filtered), strip_refinements(&bare));
+        assert_eq!(strip_refinements(&filtered), filtered);
+    }
+
+    /// A composition's kind comes from the element whose domain it inherits — the first.
+    /// Composing an element map onto a collection does not stop it being one, and
+    /// `Type::fun`'s hardcoded `Compute` was discarding the kind at every point-free
+    /// rebuild, which is exactly what [`Type::fun_like`] exists to prevent.
+    #[test]
+    fn typed_compose_keeps_the_chain_s_kind() {
+        let int = Type::Base(BaseType::Int);
+        let coll =
+            Expr::var(Name::from("xs")).with_ty(Type::data_fun(Type::UIntRange(2), int.clone()));
+        let map = Expr::var(Name::from("f")).with_ty(Type::fun(int.clone(), int.clone()));
+        let composed = typed_compose(vec![coll, map]);
+        assert!(
+            matches!(
+                &composed.ty,
+                Type::Fun {
+                    kind: crate::ccl::ty::FunKind::Data,
+                    ..
+                }
+            ),
+            "a collection composed with an element map is still a collection, got {}",
+            composed.ty
+        );
+    }
+
+    /// The dispatch peel reaches the head and stops. Anything nested — a candidate's
+    /// filter above all — is what the caller is about to read, so it must survive.
+    #[test]
+    fn peel_refinements_stops_at_the_head() {
+        let inner = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            refined(Type::UIntRange(3), "p"),
+        ]))));
+        let wrapped = refined(refined(inner.clone(), "q"), "r");
+        assert_eq!(peel_refinements(&wrapped), &inner);
+    }
 }

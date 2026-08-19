@@ -232,6 +232,27 @@ fn open_variant_admits_extra_tags_and_still_constrains_shared_payloads() {
     );
 }
 
+/// A **value ascription** `let x: [A(Unit), B(Unit)] = .A(())` accepts the
+/// narrower inferred value `[A(Unit)]` — a sound widening. This is the
+/// completeness gain of the one-way ascription rule (`inferred <: ann`): the
+/// old two-way rule additionally demanded `[A, B] <: [A(Unit)]`, which fails on
+/// the extra tag `B`, so it wrongly rejected the widening. Contrast the *param*
+/// pin (`bind_param_annotation`), which stays an equality because a declared
+/// domain is a contract, not a value flowing up.
+#[test]
+fn value_ascription_accepts_widening() {
+    let expr = TypedExpr::new(TypedExprNode::Let {
+        binding: TypedBinding {
+            name: "x".into(),
+            ty: Type::Hole,
+            user_annotation: Some(variant(&[("A", unit_ty()), ("B", unit_ty())])),
+        },
+        bound_expr: Box::new(TypedExpr::variant_ctor("A", lit_unit())),
+        body: Box::new(var("x")),
+    });
+    run(expr).expect("value ascription must accept a narrower (widenable) value");
+}
+
 // ---------------------------------------------------------------------------
 // Group C — Match elimination
 // ---------------------------------------------------------------------------

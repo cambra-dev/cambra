@@ -301,6 +301,25 @@ pub fn freshen_above(
             domain: Box::new(freshen_above(lim, domain, target, cache)),
             kind: *kind,
         },
+        // The witness's type children and the body freshen like any other position, and so
+        // does the **binder** ([`crate::ccl::ty::SigmaType::alpha_convert`]) — a scheme
+        // binds it, so each instantiation owes itself its own. `box`'s scheme is one
+        // `Σ 𝜎 ∈ {α}. 𝜎`; sharing its binder makes every `box` in a program name one
+        // witness, and two independent conditional collections then join onto a single
+        // binder.
+        //
+        // Parts first, then the rename: the other order would put the new binder on a body
+        // still naming the old one, which is the stranding the rename exists to avoid.
+        Type::Sigma(s) => Type::Sigma(Box::new(
+            crate::ccl::ty::SigmaType::bound(
+                s.witness
+                    .map_types(|t| freshen_above(lim, t, target, cache)),
+                freshen_above(lim, &s.body, target, cache),
+            )
+            .alpha_convert(),
+        )),
+        // A witness reference carries no solver content: it names a binder, not a var.
+        Type::WitnessRef(_) => ty.clone(),
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(freshen_above(lim, inner, target, cache)),
             // Faithfully freshen the predicate's own type slots through the same
@@ -326,9 +345,9 @@ pub fn freshen_above(
 
             // Snapshot bounds before recursing — the recursion may touch
             // other variables but must not see partially-mutated state.
-            let (lows, ups) = {
+            let (lows, ups, kinds) = {
                 let s = tv.bounds.borrow();
-                (Rc::clone(s.lower()), Rc::clone(s.upper()))
+                (Rc::clone(s.lower()), Rc::clone(s.upper()), s.kinds.clone())
             };
             // Freshen the bound's type *and* its edge substitutions' discharge
             // payloads: a payload is a captured argument *term* whose type
@@ -351,10 +370,20 @@ pub fn freshen_above(
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
                 })
                 .collect();
+            // Every instantiation gets its own copy of the kinding constraints. A
+            // generalized definition's requirement is part of its scheme, so dropping
+            // it here would make the requirement vanish at each use site — the
+            // constraint would be checked on a variable nothing resolves and never on
+            // the ones that do.
+            let new_kinds: Vec<_> = kinds
+                .iter()
+                .map(|k| k.map_children(|t| freshen_above(lim, t, target, cache)))
+                .collect();
             {
                 let mut s = v.bounds.borrow_mut();
                 s.set_lower(new_lows);
                 s.set_upper(new_ups);
+                s.kinds = new_kinds;
             }
             freshen_watches(lim, tv, &v, target, cache);
             Type::Infer(v)

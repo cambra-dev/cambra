@@ -20,7 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::ty::FunKind;
+use crate::ccl::ty::{FunKind, SigmaType, TypeKind};
 use crate::ccl::{BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
 
 use super::traits::{Trait, link_watches, notify_lower};
@@ -389,6 +389,546 @@ fn debug_assert_unique_keys<'a, K: Eq + std::fmt::Debug + 'a>(
     }
 }
 
+/// Two lower bounds that are **collections over distinct domains**, if the set contains
+/// any such pair.
+///
+/// Their join is a sum, and a sum is entered by a term — so with no subtyping edge into one, there
+/// is no type above both, and the author has to say which arms are boxed. Reported here
+/// rather than left to the pointwise fallback because that fallback relates each
+/// collection to the consumer separately, which is the silent narrowing a lossless data
+/// join rules out, and which does not terminate.
+fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
+    let mut seen: Vec<Type> = Vec::new();
+    for low in lows {
+        let Type::Fun {
+            kind: FunKind::Data,
+            domain,
+            ..
+        } = &low.ty
+        else {
+            continue;
+        };
+        let d = low.ty_subst.apply_type(domain);
+        if let Some(prev) = seen.iter().find(|p| **p != d) {
+            return Some((prev.clone(), d));
+        }
+        if !seen.contains(&d) {
+            seen.push(d);
+        }
+    }
+    None
+}
+
+/// A data function over a **free witness**, read as the sum it is: `𝑤 ⤇ 𝑉` with `𝑤 :: 𝐾`
+/// becomes `Σ 𝑤 ∈ 𝐾. 𝑤 ⤇ 𝑉`.
+///
+/// **Binding the witness, at constraint time.** Consuming a sum names its witness and
+/// leaves the consumer's result over that name; the carrier binds it at materialization
+/// (`free_witness_kind`, in `src/ccl/infer/solver/compact.rs`), but a comparison that
+/// runs *during* solving — an annotation check, most visibly — sees the type before then
+/// and would read a collection position as a bare witness. So the same fact is read here.
+///
+/// The range comes from the index, which is the only place it can come from: a reference
+/// is a name, and what it ranges over belongs to the binder rather than to the name —
+/// which is also why the witness stays a plain identity in
+/// [`AtomKey`](super::compact::AtomKey), whose `Ord` a range could not satisfy.
+fn closed_sum(ty: &Type) -> Option<Type> {
+    let Type::Fun {
+        name,
+        domain,
+        codomain,
+        ..
+    } = ty
+    else {
+        return None;
+    };
+    // **Bound by the witness it binds.** The sum this forms is the one the consuming rule
+    // named — `SigmaType::over` would mint a binder of its own and leave the consumer's
+    // other occurrences (its index term, its domain slot) naming the witness instead,
+    // which is a disagreement no single type is ill-formed enough to show.
+    let binder = free_witness_of(domain)?;
+    // An occurrence names a binder, and the binder is what has a range
+    // (`crate::ccl::ty::witness_ctx`). Total for the same reason [`determined_domain`] is:
+    // this domain *is* a witness, so a consuming rule named it, and naming records the
+    // range.
+    let kind = crate::ccl::ty::witness_ctx::range(binder)
+        .unwrap_or_else(|| unreachable!("a witness domain has no recorded range: {binder:?}"));
+    let w = Type::WitnessRef(binder);
+    Some(Type::Sigma(Box::new(SigmaType::bound(
+        crate::ccl::ty::Witness::bound_to(binder, kind),
+        Type::Fun {
+            name: name.clone(),
+            kind: FunKind::Data,
+            domain: Box::new(w),
+            codomain: codomain.clone(),
+        },
+    ))))
+}
+
+/// The range of the free witness a domain position **is** — written there, or demanded of
+/// a variable standing there.
+///
+/// Elimination names the consumed sum's witness against whatever domain the consumer
+/// declared, and a consumer mints a fresh one, so the position usually reads `?d` with the
+/// witness on its upper bounds. Following the bound is the move [`candidate_shape`] makes,
+/// in the direction this fact travels: a candidate is determined by what flows *into* it,
+/// a consumed domain by what is demanded *of* it.
+///
+/// The depth bound is a cycle guard, not a search budget — `?a <: ?b`, `?b <: ?a` is a
+/// recursive type the solver rejects later, and this must not hang first. Any real chain
+/// is one hop.
+/// The one domain `binder` can be, when its range leaves it no choice.
+///
+/// A range naming exactly one domain *determines* the witness, so it **is** that domain and
+/// an edge against it is the ordinary one between two domains. A range naming several does
+/// not: accepting a concrete demand would pin the witness to one of them, which is the
+/// silent narrowing a lossless data join exists to rule out.
+fn determined_domain(binder: crate::ccl::infer_var::WitnessBinderId) -> Option<Type> {
+    // A miss is a bug, not the ordinary `None` below: a witness reaching an edge was named
+    // when a sum was consumed, and naming it is what records the range.
+    let range = crate::ccl::ty::witness_ctx::range(binder).unwrap_or_else(|| {
+        unreachable!("a witness reached a subtyping edge with no recorded range: {binder:?}")
+    });
+    match range.listed() {
+        Some([sole]) => Some(sole.clone()),
+        _ => None,
+    }
+}
+
+/// Bring every sum among a variable's lower bounds under **one binder**, and answer the
+/// rewritten bounds.
+///
+/// A variable whose lower bounds are dependent sums holds one sum-typed value: however
+/// many arms describe it, the conditional that built it made one choice. Each arm arrives
+/// carrying whatever binder its own introduction minted, so those binders are competing
+/// names for one witness — and the rename settles it before anything consumes them. That is
+/// what lets each arm reach a consumer **on its own**: two arms of one conditional now
+/// emit the same domain edge instead of two, so no join has to be assembled first.
+///
+/// A binder is bound, so the rename is α-conversion and changes no type. The rewrite is
+/// written back to the variable, so the graph carries one binder from here on and
+/// compaction reads the same identity off these bounds that constraining used.
+fn unify_sum_witnesses(lv: &Rc<InferVar>, lows: Rc<Vec<Bound>>) -> Rc<Vec<Bound>> {
+    let sums: Vec<_> = lows
+        .iter()
+        .filter_map(|b| match &b.ty {
+            Type::Sigma(s) => Some(s.binder()),
+            _ => None,
+        })
+        .collect();
+    if sums.is_empty() {
+        return lows;
+    }
+    let w = lv.witness_binder(&sums);
+    if sums.iter().all(|b| *b == w) {
+        return lows;
+    }
+    let renamed: Vec<Bound> = lows
+        .iter()
+        .map(|b| match &b.ty {
+            Type::Sigma(s) => Bound {
+                ty: Type::Sigma(Box::new(s.rename_binder(w))),
+                ..b.clone()
+            },
+            _ => b.clone(),
+        })
+        .collect();
+    lv.bounds.borrow_mut().set_lower(renamed.clone());
+    Rc::new(renamed)
+}
+
+/// The **domain** half of consuming a sum: name the witness, and publish what it ranges
+/// over.
+///
+/// The consumer's domain is told *which* witness it ranges over — a reference to the
+/// sum's binder. A reference is a leaf and not a [`Type::Infer`], so nothing can unify it
+/// away, which is what stops a conditional collection being narrowed to one arm by a
+/// demand. Every sum
+/// describing one value has already been brought under one binder
+/// ([`crate::ccl::infer_var::InferVar::witness_binder`]), so the arms of a conditional
+/// reaching this consumer separately emit the *same* edge, and the ordinary pointwise
+/// closure needs no join assembled ahead of it.
+///
+/// The witness is **not bound here**: the consumer's result is an unresolved variable at
+/// this point, so the reference stays free in the graph until materialization binds it
+/// (in `src/ccl/infer/solver/compact.rs`). None may survive coalesce still free — that is
+/// the escape check.
+/// Bring the sum's witnesses under the **names the context already gave them**, position by
+/// position. Answers whether every witness in `body_domain` was named, in which case there is
+/// no edge left to draw.
+///
+/// A consumer whose domain is a witness reference was written against a consumption that
+/// already happened, and the sum's own binder is bound, so adopting the context's name is
+/// α-conversion and changes nothing. Nesting makes that positional rather than whole:
+/// two generators index a `Tuple`, one witness per component, and each names its own.
+///
+/// The range travels with the name — a `Type::WitnessRef` names a binder and nothing else,
+/// so a reader holding the context's name has to find the range under *that* binder. At one
+/// witness the range is the sum's own kind; deeper, each peeled binder published its range
+/// on the way in, so the index is where the inner ones are read from.
+fn adopt_the_contexts_names(consumer: &Type, body_domain: &Type, range: &TypeKind) -> bool {
+    match (consumer, body_domain) {
+        (Type::WitnessRef(named), Type::WitnessRef(w)) => {
+            let range = crate::ccl::ty::witness_ctx::range(*w).unwrap_or_else(|| range.clone());
+            crate::ccl::ty::witness_ctx::note_range(*named, &range);
+            true
+        }
+        (Type::Tuple(cs), Type::Tuple(bs)) if cs.len() == bs.len() => cs
+            .iter()
+            .zip(bs)
+            .all(|(c, b)| adopt_the_contexts_names(c, b, range)),
+        _ => false,
+    }
+}
+
+fn demand_domain_range(
+    domain: &Type,
+    body_domain: &Type,
+    binder: crate::ccl::infer_var::WitnessBinderId,
+    range: &TypeKind,
+    sl: &Subst,
+    sr: &Subst,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    // The range lives in the sum's context; the index is read from everywhere, so it is
+    // rendered into the common one first.
+    let range = range.map_children(|d| sl.apply_type(d));
+    // **The context may already have named this witness**, and then it names it. A
+    // consumer whose domain *is* a witness reference was written against a consumption
+    // that already happened — the post-λ-elimination wall re-deriving a recorded tree is
+    // the case that matters — and the sum's own binder is bound, so bringing it under the
+    // name the context supplies is α-conversion and changes nothing. Minting here instead
+    // would demand that two independent derivations agree on an id, which only a name
+    // carried by the *term* could deliver; taking the name the context offers is the same
+    // move the `Fun` rule makes for a Pi binder, which is derived from the correspondence
+    // rather than reproduced.
+    if adopt_the_contexts_names(domain, body_domain, &range) {
+        return Ok(());
+    }
+    // Publish before handing out a reference: a `Type::WitnessRef` names a binder and
+    // nothing else, so the range has to be findable from the binder alone.
+    crate::ccl::ty::witness_ctx::note_range(binder, &range);
+    // **The body's domain, not the bare witness.** At one binder deep the two are the same
+    // type — a sum's body is `𝑤 ⤇ 𝑉` — but once sums nest, the innermost body's domain is
+    // a `Tuple` naming a witness per position. Relating structurally puts each consumer
+    // position against the witness that indexes it, and needs no rule about tuples: the
+    // ordinary walk reaches the `Type::WitnessRef` leaves.
+    constrain_go(domain, body_domain, sr, sl, cache)
+}
+
+fn free_witness_of(domain: &Type) -> Option<crate::ccl::infer_var::WitnessBinderId> {
+    fn go(ty: &Type, depth: usize) -> Option<crate::ccl::infer_var::WitnessBinderId> {
+        match ty {
+            Type::WitnessRef(w) => Some(*w),
+            Type::Infer(v) if depth > 0 => {
+                let uppers: Vec<Type> = v
+                    .bounds
+                    .borrow()
+                    .upper()
+                    .iter()
+                    .map(|u| u.ty.clone())
+                    .collect();
+                uppers.iter().find_map(|u| go(u, depth - 1))
+            }
+            _ => None,
+        }
+    }
+    go(domain, 8)
+}
+
+/// The candidate **domains** a collection-shaped type contributes.
+///
+/// A plain data function has the one domain it was written with. A *factored* sum
+/// `Σ 𝐷 ∈ 𝐾. 𝐷 ⤇ 𝑉` contributes its candidates whole — they already *are* domains, and
+/// taking them whole is what makes the join **associative**: a nested conditional
+/// deposits an already-joined sum as one lower bound, and unioning its candidates into
+/// the outer join flattens `Σ 𝐷 ∈ {𝐷₀, Σ 𝐸 ∈ {𝐷₁, 𝐷₂}. 𝐸}. 𝐷` to `Σ 𝐷 ∈ {𝐷₀, 𝐷₁, 𝐷₂}. 𝐷`
+/// rather than nesting a sum inside a candidate list.
+///
+/// An *unfactored* sum `Σ σ ∈ {𝑇ᵢ}. σ` — what `box`ing each arm of a conditional builds —
+/// contributes the **domains of** its candidates, and only when every one of them is a
+/// data function. Its candidates are whole types, so reading them as domains directly
+/// would build `Σ 𝐷 ∈ {𝐷₀ ⤇ 𝑉₀, …}. 𝐷 ⤇ 𝑉`: a collection indexed by collections. The
+/// re-read is sound because `Σ σ ∈ {𝐷ᵢ ⤇ 𝑉ᵢ}. σ <: Σ 𝐷 ∈ {𝐷ᵢ}. 𝐷 ⤇ ⨆𝑉ᵢ` is plain
+/// Σ-width — pair `𝑖` with `𝑖`, and the bodies relate by the ordinary `Fun` rule, since
+/// the domains are equal (data domains being invariant) and the codomains join. Not an
+/// equality: the reverse holds only when the candidates already share an element type.
+///
+/// `None` for anything else, including a described kind (which lists no candidates) and a
+/// bare variable (which has no domain to read yet).
+fn collection_candidates(ty: &Type) -> Option<Vec<Type>> {
+    match ty {
+        Type::Fun {
+            kind: FunKind::Data,
+            domain,
+            ..
+        } => Some(vec![domain.as_ref().clone()]),
+        Type::Sigma(s) => {
+            let listed = s.kind().listed()?;
+            match s.body_residue() {
+                Some(_) => Some(listed.to_vec()),
+                None => data_candidate_domains(listed),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The element types a collection-shaped type carries — every one that has to flow into
+/// the join's shared element position.
+///
+/// One for a data function or a factored sum (the shared codomain). An unfactored sum
+/// carries one **per candidate**, and they need not agree: `⨆𝑉ᵢ` is the element type of
+/// the factored sum it lies below, so each candidate's contributes.
+fn collection_codomains(ty: &Type) -> Vec<Type> {
+    match ty {
+        Type::Fun { codomain, .. } => vec![codomain.as_ref().clone()],
+        Type::Sigma(s) => match s.body_residue() {
+            Some((_, cod)) => vec![cod.clone()],
+            // Read through the same [`candidate_shape`] the domains are read through, so
+            // the two halves of one candidate cannot disagree about whether it resolved.
+            None => s
+                .kind()
+                .listed()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| match candidate_shape(c)? {
+                    Type::Fun { codomain, .. } => Some(*codomain),
+                    _ => None,
+                })
+                .collect(),
+        },
+        _ => unreachable!("collection_codomains follows collection_candidates"),
+    }
+}
+
+/// The **shape** a Σ candidate has: itself, or — when it is still a variable — the
+/// structural type its bounds have already determined for it.
+///
+/// A candidate is the one position in a sum that is not reached by the ordinary polar
+/// bound walk. Every other position is a place the solver is *solving for*, and asking
+/// what it is before coalesce would be guessing. A candidate is not: it is the type of
+/// the term that was `box`ed, fixed by the argument edge of the introduction that built
+/// the sum, and that edge is emitted when the sum is *created* — necessarily before any
+/// edge that consumes it. So this reads a determined fact, and reads it exactly as
+/// compaction would, only earlier.
+///
+/// Variable-to-variable bounds are followed, since a chain of them still determines one
+/// shape; `depth` stops a cycle (`?a <: ?b`, `?b <: ?a`), which the solver rejects later
+/// as a recursive type and which must not hang here.
+fn candidate_shape(ty: &Type) -> Option<Type> {
+    fn go(ty: &Type, depth: usize) -> Option<Type> {
+        let Type::Infer(v) = ty else {
+            return Some(ty.clone());
+        };
+        if depth == 0 {
+            return None;
+        }
+        // A candidate is determined by what *flows into* it — the argument of the
+        // introduction — so it is the lower bounds that carry the shape.
+        let lower = Rc::clone(v.bounds.borrow().lower());
+        lower.iter().find_map(|b| go(&b.ty, depth - 1))
+    }
+    // Deep enough for any chain a real program builds, short enough that a cycle costs
+    // nothing; the shape is found at depth 1 whenever the sum was built by `box`.
+    go(ty, 8)
+}
+
+/// The candidates' domains, when **every** candidate is a data function — the test for
+/// "this unfactored sum is a conditional collection".
+///
+/// All-or-nothing: a sum mixing a collection with a scalar has no collection reading at
+/// all, and half of one would silently drop the scalar candidate. A candidate whose shape
+/// is not yet determined answers `None` the same way a scalar does — the sum is then
+/// related candidate-by-candidate, which is the rule, just without the refactoring.
+fn data_candidate_domains(candidates: &[Type]) -> Option<Vec<Type>> {
+    Some(
+        data_candidate_fibers(candidates)?
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect(),
+    )
+}
+
+/// Each candidate's `(domain, element)` — the **fibered view** of an unfactored sum whose
+/// candidates are all collections.
+///
+/// This is what makes `Σ σ ∈ {𝐷ᵢ ⤇ 𝑉ᵢ}. σ` comparable to a factored sum: read that way,
+/// both sides are a sum over *domains* carrying an element type, and Σ-width's
+/// `𝐵₀[𝑑] <: 𝐵₁[𝑒]` decomposes into a domain pairing plus element edges — the same two
+/// halves the factored/factored case already splits into. Comparing raw *candidates*
+/// instead asks `𝐷₀ ⤇ 𝑉 <: 𝐷₀`, an arrow below a range, which is why the relation between
+/// the two forms looked absent rather than derivable.
+///
+/// Each candidate is seen through [`candidate_shape`], so one still standing as an
+/// inference variable arrives resolved. All-or-nothing: a sum mixing a collection with a
+/// scalar has no collection reading at all, and half of one would silently drop the
+/// scalar candidate.
+fn data_candidate_fibers(candidates: &[Type]) -> Option<Vec<(Type, Type)>> {
+    candidates
+        .iter()
+        .map(|c| match candidate_shape(c)? {
+            Type::Fun {
+                kind: FunKind::Data,
+                domain,
+                codomain,
+                ..
+            } => Some((*domain, *codomain)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Σ-width: witness-range containment plus body subtyping. The **only** way a sum is
+/// related to another sum, and the only way one is entered — no arm puts a non-sum below a
+/// sum, because only a term builds one (`src/ccl/design/type-inference.md`, "Only a term
+/// builds a sum"). `lhs`/`rhs` are the original types, carried only for the mismatch
+/// diagnostic.
+#[allow(clippy::too_many_arguments)]
+fn constrain_sigma_width(
+    a: &SigmaType,
+    b: &SigmaType,
+    sl: &Subst,
+    sr: &Subst,
+    cache: &mut ConstrainCache,
+    lhs: &Type,
+    rhs: &Type,
+) -> Result<(), ConstrainError> {
+    // **Different forms.** An unfactored sum of collections below a factored one is
+    // ordinary Σ-width, but only when the rule is read as it is stated — on *instantiated
+    // bodies*. Pairing raw candidates instead asks `𝐷₀ ⤇ 𝑉 <: 𝐷₀`, an arrow below a range,
+    // which is why the two forms looked unrelated.
+    //
+    // Read through the fibered view both sides are a sum over domains carrying an element
+    // type, and `𝐵₀[𝑑] <: 𝐵₁[𝑒]` decomposes exactly as it does when both sides are
+    // factored: the domains pair, the element types flow. The difference is only that an
+    // unfactored sum has one element type *per candidate* rather than one shared, so the
+    // element edges are emitted per candidate instead of once.
+    if a.body_residue().is_none()
+        && let Some((_, cod_b)) = b.body_residue()
+        && let Some(candidates) = a.kind().listed()
+        && let Some(fibers) = data_candidate_fibers(candidates)
+    {
+        let domains = TypeKind::Enumerated(fibers.iter().map(|(d, _)| d.clone()).collect());
+        let Some(obligations) = domains.contains(b.kind()) else {
+            return Err(ConstrainError::Mismatch {
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+            });
+        };
+        for (v, k) in obligations.kinds {
+            v.bounds.borrow_mut().kinds.push(k);
+        }
+        if let Some((subs, sups)) = obligations.pairing {
+            let (subs, sups) = (subs, sups);
+            discharge_pairing(&subs, &sups, sl, sr, lhs, rhs)?;
+        }
+        for (_, elem) in fibers {
+            constrain_go(&elem, cod_b, sl, sr, cache)?;
+        }
+        return Ok(());
+    }
+    // Every witness is a type classified by a kind, so this is the whole rule: kind
+    // containment, then the body edge.
+    let Some(obligations) = a.kind().contains(b.kind()) else {
+        return Err(ConstrainError::Mismatch {
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+        });
+    };
+    // A candidate with no shape yet gets a **kinding constraint** on its variable
+    // rather than an optimistic acceptance: recorded during emission without knowing
+    // what the variable will become, read when it resolves, which is what the solver
+    // already does for every other constraint on a variable.
+    for (v, k) in obligations.kinds {
+        v.bounds.borrow_mut().kinds.push(k);
+    }
+    // The body of every sum is `𝑤 ⤇ 𝑉` ([`SigmaType::over`]), so instantiating a pairing
+    // `(𝑑, 𝑒)` gives `𝑑 ⤇ 𝑉₀ <: 𝑒 ⤇ 𝑉₁`, and the `Fun`/`Fun` decomposition of *that* is
+    // exactly the two halves below. They are emitted separately rather than by handing
+    // instantiated bodies to `constrain_go`, because their dependencies differ: one is
+    // per-pairing and one is not, and re-deriving the codomain edge inside a search
+    // would emit it once per attempt — including failed attempts.
+    if let Some((subs, sups)) = obligations.pairing {
+        discharge_pairing(&subs, &sups, sl, sr, lhs, rhs)?;
+    }
+    // The codomain edge, **once**: `𝑉` does not mention the witness (one codomain is
+    // shared across a sum's candidates), so it is the same edge for every pairing. It
+    // also *has* to be emitted here rather than deferred — post-coalesce records no
+    // bounds, so anything needed to resolve a variable must go in while the graph is
+    // still being built. Deferral is available only for what is purely a check.
+    let (Some((bind_a, cod_a)), Some((bind_b, cod_b))) = (a.body_residue(), b.body_residue())
+    else {
+        // No residue on one side: a body that *is* the witness varies entirely with it,
+        // so the pairing search above already compared the whole body and there is
+        // nothing left to emit. Two sums whose bodies differ in *shape* are related by
+        // that search too — an arrow candidate either does or does not lie below the
+        // other side's instantiated body — so a mixed pair needs no rule of its own.
+        return Ok(());
+    };
+    let cod_sl = match (bind_a, bind_b) {
+        (Some(k), Some(x)) => sl.extended_rename(k, x),
+        _ => sl.clone(),
+    };
+    constrain_go(cod_a, cod_b, &cod_sl, sr, cache)
+}
+
+/// Discharge a [`KindObligations::pairing`] — the `∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁` of Σ-width — by
+/// searching for a sup candidate each sub candidate's **domain** edge relates to.
+///
+/// The search is safe here for one reason: candidates are **ground**. A search inside a
+/// bounds-recording solver is otherwise hazardous, since different pairings record
+/// different constraints and a wrong commitment cannot be undone — but a comparison
+/// between two ground types records nothing on any variable, so an attempt that fails
+/// leaves no trace and the choice is confluent. A non-ground candidate therefore gets
+/// only the `𝑒 = 𝑑` instance (syntactic equality), which needs no search at all.
+///
+/// The per-pairing edge is the *domain* half of `𝑑 ⤇ 𝑉₀ <: 𝑒 ⤇ 𝑉₁`, so it runs in the
+/// same direction the `Fun`/`Fun` arm uses — contravariant, with the two sides'
+/// morphisms swapped rather than inverted.
+fn discharge_pairing(
+    subs: &[Type],
+    sups: &[Type],
+    sl: &Subst,
+    sr: &Subst,
+    lhs: &Type,
+    rhs: &Type,
+) -> Result<(), ConstrainError> {
+    for d in subs {
+        if !sups.iter().any(|e| probe_edge(e, d, sr, sl)) {
+            return Err(ConstrainError::Mismatch {
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `sub <: sup` holds **without recording anything** — the adjacency test a Σ
+/// pairing search runs before committing to a correspondence.
+///
+/// Two disciplines, both load-bearing, which is why both searches over Σ candidates go
+/// through here rather than each rolling its own probe.
+///
+/// A scratch cache keeps a failed attempt from leaving an entry in the real one's
+/// cycle-breaker memo. That is *not* what makes the attempt harmless, though: bounds live
+/// on the inference variables, not the cache, so a probe against a variable-bearing pair
+/// would record a constraint for a correspondence that may then be rejected — and no
+/// cache can undo that. Groundness is therefore the actual precondition, and a non-ground
+/// pair gets only the `𝑒 = 𝑑` instance, which needs no search at all.
+///
+fn probe_edge(sub: &Type, sup: &Type, ssub: &Subst, ssup: &Subst) -> bool {
+    if sub == sup {
+        return true;
+    }
+    if crate::ccl::subst::type_contains_infer(sub) || crate::ccl::subst::type_contains_infer(sup) {
+        return false;
+    }
+    let mut scratch = ConstrainCache::new();
+    constrain_go(sub, sup, ssub, ssup, &mut scratch).is_ok()
+}
+
 /// Constrain `lhs‹sl› <: rhs‹sr›` — each side under its own context morphism,
 /// both mapping into the constraint's shared ambient frame.
 ///
@@ -478,6 +1018,25 @@ fn constrain_go_impl(
         // to every other type (the catch-all `Mismatch` below).
         (Type::Txn, Type::Txn) => Ok(()),
 
+        // **Binding the witness, at constraint time.** A data function over a free
+        // witness — the shape consuming a sum leaves behind — *is* the sum
+        // `Σ 𝑤 ∈ 𝐾. 𝑤 ⤇ 𝑉` ([`closed_sum`]),
+        // so the edge is decided by the Σ rules rather than by the function rules. It has
+        // to run before the `Fun`/`Fun` arm below: data domains are invariant, so that arm
+        // would relate `𝑤` to the other side's domain in both directions, and a witness
+        // ranging over several candidates relates to no concrete domain at all. Two
+        // consumed `box`ed arms meet exactly that way, and would be reported as a domain
+        // conflict between the collections the author had just boxed.
+        //
+        // Only the **left** is closed. On the right the same shape is a consumer whose
+        // domain the consuming rule just named, and binding it would demand a sum of whatever
+        // flows in, which has no rule. Left-only is enough because the two
+        // spellings meet as soon as either side is a sum: `Σ <: Σ` is width.
+        (Type::Fun { .. }, _) if closed_sum(lhs).is_some() => {
+            let repaired = closed_sum(lhs).expect("guarded by the arm");
+            constrain_go(&repaired, rhs, sl, sr, cache)
+        }
+
         // Function: contravariant on domain, covariant on codomain. The
         // codomain edge *derives* the binder correspondence — aligning the two
         // Pi binders `k ↦ x` — and carries it onward (design §3.6); the domain
@@ -518,7 +1077,7 @@ fn constrain_go_impl(
             // parameter, nothing can enumerate it, and accepting more inputs than
             // demanded only under-promises. A **data** domain is *invariant* — it is
             // the loop bound op-conversion emits and it reappears in every
-            // eliminator's result, so narrowing or widening it changes which rows the
+            // consumer's result, so narrowing or widening it changes which rows the
             // consumer reads (`src/ccl/design/type-inference.md`, "Data domains are
             // invariant"). Invariance is spelled the only order-independent way it
             // can be, as both edges; anything conditional on *when* the edge fires
@@ -548,6 +1107,25 @@ fn constrain_go_impl(
             }
             constrain_go(c0, c1, &cod_sl, sr, cache)
         }
+
+        // (Dependent-sum (Σ) rules live just below, after the `Record` arm. They are
+        // rules on the sum itself: the solver knows dependent sums, not any surface
+        // concept — `List`, `Map`, `Collection` and a conditional collection are the
+        // same rules at different witness kinds, not four sets of arms. One is genuine
+        // subtyping: the width `Σ <: Σ` (a smaller sum is-a bigger sum). The other,
+        // `Σ <: Fun`, is **not** subsumption but a sum *consumed*, discharged through this
+        // solver: a Σ value is one branch, not a function total on the union, so it
+        // cannot be subsumed to one — consuming it distributes the consumer over the
+        // witness. There is deliberately no third, entering arm: a sum is introduced by
+        // `box`, a term, and never by subsumption from a bare collection.
+        //
+        // No arm dispatches on the kind, which is why a new kind needs no new arm here.
+        // Only **two** questions below are kind-dependent at all: containment
+        // ([`TypeKind::contains`], the width premise) and whether the kind names a finite
+        // set of candidates ([`TypeKind::listed`]). What a consumer is presented with is
+        // *not* a third — a sum names its witness the same way for every kind — so a kind
+        // has to supply containment and a listed/described answer, and nothing else. See
+        // `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions".)
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a
         // subtype, so every position rhs requires must exist in lhs.
@@ -588,6 +1166,189 @@ fn constrain_go_impl(
             Ok(())
         }
 
+        // **No subtyping edge builds a sum.** A data function is never below one, whatever
+        // its domain: entering a sum is a *term* (`box`), not a subtyping edge
+        // (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). Without this,
+        // `[1] if c else [2, 3]` acquires a sum type nobody wrote, which is exactly the
+        // implicitness `box` exists to remove — and the join of two collections over
+        // distinct domains silently becomes a sum instead of the error it is.
+        //
+        // A `Fun(Data)` against a `Sigma` therefore falls through to the structural
+        // mismatch below.
+
+        // **`Σ <: Fun`**: a sum *consumed* as a plain collection.
+        //
+        // One rule, for both spellings of a conditional collection. What consuming a sum
+        // needs from the sum is its candidate **domains** and the element types carried
+        // at them, and [`collection_candidates`] / [`collection_codomains`] answer that
+        // for the factored `Σ 𝐷 ∈ {𝐷ᵢ}. 𝐷 ⤇ 𝑉` and the unfactored `Σ σ ∈ {𝐷ᵢ ⤇ 𝑉ᵢ}. σ`
+        // alike. Nothing downstream of that point can tell which arrived, which is why
+        // there is no longer a split here.
+        //
+        // The domains do not become an edge. They become a **range demand** on the
+        // consumer's domain — see [`demand_domain_range`] — and the element types flow
+        // covariantly into its codomain, one edge each.
+        (
+            Type::Sigma(s),
+            Type::Fun {
+                name: n1,
+                domain: d1,
+                codomain: c1,
+                ..
+            },
+        ) => {
+            // **A sum whose body is a sum** publishes its own range and hands the body to
+            // this same rule. Binders peel one at a time and the demand lands on the
+            // innermost body, whose domain names every witness peeled on the way — so
+            // nothing here has to know how deep the nesting goes.
+            if matches!(&*s.body, Type::Sigma(_)) {
+                let range = s.kind().map_children(|d| sl.apply_type(d));
+                crate::ccl::ty::witness_ctx::note_range(s.binder(), &range);
+                return constrain_go(&s.body, rhs, sl, sr, cache);
+            }
+            match s.body_residue() {
+                // A **factored** sum, `Σ 𝐷 ∈ 𝐾. 𝐷 ⤇ 𝑉`. Naming the witness needs no
+                // candidates at all — that is exactly what naming buys over presenting —
+                // so a *described* kind (`List`'s `UIntRanges`, `Collection`'s `Any`)
+                // goes through here on the same rule as a listing one, with nothing to
+                // enumerate and nothing special to say.
+                //
+                // The body may be dependent, so the Pi binder correspondence the
+                // `Fun`/`Fun` arm would derive has to be derived here too — the body is
+                // destructured rather than recursed into.
+                Some((binder, cod)) => {
+                    let body_dom = s
+                        .body
+                        .domain()
+                        .expect("a residue means the body is an arrow");
+                    demand_domain_range(d1, &body_dom, s.binder(), s.kind(), sl, sr, cache)?;
+                    let cod_sl = match (binder.as_ref(), n1) {
+                        (Some(k), Some(x)) => sl.extended_rename(k, x),
+                        _ => sl.clone(),
+                    };
+                    constrain_go(cod, c1, &cod_sl, sr, cache)
+                }
+                // An **unfactored** sum, `Σ σ ∈ {𝐷ᵢ ⤇ 𝑉ᵢ}. σ`: the body *is* the witness,
+                // so the candidates are whole types and the domains have to be read out
+                // of them ([`collection_candidates`]) before there is a range to name.
+                // Each candidate carries its own element type, and they need not agree —
+                // a join of element types is lossless, so the consumer's codomain joins
+                // them by being their common upper bound, with no variable to join
+                // through.
+                None => match collection_candidates(lhs) {
+                    Some(domains) => {
+                        let range = TypeKind::Enumerated(domains);
+                        // The body *is* the witness here, so it is its own domain.
+                        demand_domain_range(
+                            d1,
+                            &Type::WitnessRef(s.binder()),
+                            s.binder(),
+                            &range,
+                            sl,
+                            sr,
+                            cache,
+                        )?;
+                        for cod in collection_codomains(lhs) {
+                            constrain_go(&cod, c1, sl, sr, cache)?;
+                        }
+                        Ok(())
+                    }
+                    // **Witness-forgetting consumption**, the rule for a sum this
+                    // consumer cannot read as a collection: `Σ σ ∈ {𝑇ᵢ}. σ <: 𝑈` exactly
+                    // when every `𝑇ᵢ <: 𝑈`. A Σ value is a pair, so a consumer valid at
+                    // *every* candidate is valid on it. A described kind lists nothing to
+                    // distribute over and stays a mismatch.
+                    None => {
+                        let Some(candidates) = s.kind().listed() else {
+                            return Err(ConstrainError::Mismatch {
+                                lhs: lhs.clone(),
+                                rhs: rhs.clone(),
+                            });
+                        };
+                        for c in candidates {
+                            constrain_go(c, rhs, sl, sr, cache)?;
+                        }
+                        Ok(())
+                    }
+                },
+            }
+        }
+
+        // **Σ-width** `Σ <: Σ` — the general rule, and the only Σ *subtyping* rule:
+        //
+        //     K₀ <: K₁      w: K₀ ⊢ B₀[w] <: B₁[w]
+        //     ─────────────────────────────────────
+        //       Σ (w: K₀). B₀  <:  Σ (w: K₁). B₁
+        //
+        // witness-kind containment ([`TypeKind::contains`]) plus **body** subtyping. The
+        // body is an arbitrary type — the witness may appear anywhere in it, not
+        // only in a domain position — so the bodies are compared by recursing
+        // through the ordinary arms rather than by destructuring a data function
+        // out of them. That is also what relates the two bodies' Pi binders: the
+        // Fun/Fun arm derives the correspondence itself.
+        (Type::Sigma(a), Type::Sigma(b)) => constrain_sigma_width(a, b, sl, sr, cache, lhs, rhs),
+
+        // **One witness, named twice.** A tree records its bound occurrences as
+        // [`Type::WitnessRef`], and Check re-runs the consuming rule on that tree — so the
+        // same witness meets itself here, once free and once bound. Reflexivity, and the only
+        // reason it needs a rule at all is that the two forms are separate leaves.
+        //
+        // Not the `𝑒 = 𝑑` reading the catch-all below rejects: that is about relating two
+        // *different* witnesses, where the left's choice is arbitrary-but-concrete and the
+        // right may answer it differently. Identity is what tells the two situations apart,
+        // and without it this case could not be stated.
+        (Type::WitnessRef(a), Type::WitnessRef(b)) if a == b => Ok(()),
+
+        // Only a **determined** witness relates. A kind naming exactly one domain leaves
+        // the witness no choice, so it *is* that domain and the edge is the ordinary one
+        // between two domains. A kind naming several does not: the witness could be any of
+        // them, and accepting a concrete demand would pin it to one — the silent narrowing
+        // a lossless data join exists to rule out, and the property
+        // `conditional_consumed_as_fun` pins. "Transparent through its kind" means
+        // transparent when the kind *determines* it, not whenever the kind admits it.
+        (_, Type::WitnessRef(w)) if !matches!(lhs, Type::Infer(_)) => match determined_domain(*w) {
+            Some(sole) => constrain_go(lhs, &sole, sl, sr, cache),
+            None => Err(ConstrainError::Mismatch {
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+            }),
+        },
+        (Type::WitnessRef(w), _) if !matches!(rhs, Type::Infer(_)) => match determined_domain(*w) {
+            Some(sole) => constrain_go(&sole, rhs, sl, sr, cache),
+            None => Err(ConstrainError::Mismatch {
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+            }),
+        },
+
+        // A bare witness reference never reaches an edge. Σ-width pairs *candidates*
+        // and emits the codomain edge directly ([`constrain_sigma_width`]), and every
+        // other Σ arm destructures the body through [`SigmaType::body_fun`] — so no
+        // uninstantiated body is ever compared. A `Type::WitnessRef` arriving here means one
+        // was, which is a bug and not a case to relate.
+        //
+        // Relating two witnesses to each other could only mean "treat the left and right
+        // witnesses as the same thing", which is the `𝑒 = 𝑑` reading of the rule rather
+        // than the rule: the left's choice of witness is arbitrary-but-concrete, and the
+        // right may answer it differently for each left choice.
+        // A witness meeting a **variable** is an ordinary edge and belongs to the variable
+        // arms below: a free witness flows into the consumer's domain slot, which is a
+        // variable, and that is how it reaches the graph at all. Only the non-variable
+        // cases are handled above — determined witnesses relate, undetermined ones are a
+        // mismatch — so nothing is left here to relate.
+        //
+        // The check this once made ("a *bound* witness reached an edge, so an
+        // uninstantiated body was compared") cannot be made at this site any more. Bound
+        // and free are one leaf now, and telling them apart needs the witness scope, which
+        // subtyping does not thread — compaction does, and asks there.
+        (Type::WitnessRef(_), _) | (_, Type::WitnessRef(_))
+            if !matches!(lhs, Type::Infer(_)) && !matches!(rhs, Type::Infer(_)) =>
+        {
+            unreachable!("a witness reached a subtyping edge unrelated: {lhs} <: {rhs}")
+        }
+
+        // Variant: width-subtyping is the dual. lhs's tags must all appear
+        // in rhs (with a payload subtype check). Payload depth is covariant.
         // Variant: width-subtyping is the dual of records — lhs's tags must all
         // appear in rhs, each with a payload subtype check. Payload depth is
         // covariant.
@@ -683,6 +1444,33 @@ fn constrain_go_impl(
                     .push(Bound::edge(sl.clone(), rhs.clone(), sr.clone()));
                 Rc::clone(s.lower())
             };
+            let lows = unify_sum_witnesses(lv, lows);
+            // **No join here.** A variable's lower bounds are joined where every other
+            // join is: at compaction, off these same bounds. Assembling one here as well
+            // would compute it twice, by two rules, and — because this arm runs again on
+            // every arriving upper edge — recompute it, which is what made the joined
+            // sum's binder need an identity stable under recomputation.
+            //
+            // Each Σ lower bound instead reaches the consumer on its own, below. That is
+            // sound because consuming a sum records its domain half as a *range* demand,
+            // whose conjunction is a union ([`demand_domain_range`]): the arms of one
+            // conditional arriving separately, in any order, converge on the same witness
+            // over the same candidates. Emitting a contravariant edge per candidate is
+            // what would break — the consumer's domain would have to lie below every
+            // arm's domain, their meet, which is the silent narrowing a lossless data
+            // join exists to rule out.
+            // A declined join over **collection** lower bounds is a type error, not a
+            // reason to fall back. Relating two collections over distinct domains to one
+            // consumer pointwise is exactly what the join exists to prevent — the
+            // consumer's domain would have to lie below both — and the transitive closure
+            // does not terminate on it. Now that only sums join, this is the case `box`
+            // is there to resolve: box each arm, and the arms join as sums.
+            if let Some(domains) = distinct_data_domains(&lows) {
+                return Err(ConstrainError::DataDomainMismatch {
+                    lhs: domains.0,
+                    rhs: domains.1,
+                });
+            }
             // A var-var edge carries the watch downward (see `link_watches`); the
             // closure below only re-offers `lv`'s lowers to `rhs` when the levels let
             // this arm run, which is precisely what a `let` RHS breaks.
@@ -717,6 +1505,13 @@ fn constrain_go_impl(
                     .push(Bound::edge(sr.clone(), lhs.clone(), sl.clone()));
                 Rc::clone(s.upper())
             };
+            // No join here, and none is needed: a candidate arriving at a variable that
+            // already holds others reaches the joining arm above when *its* own outgoing
+            // edge is drawn, and a variable's denotation is read from its lower bounds
+            // whenever that happens. Joining here as well would mean re-deriving a join
+            // per arriving candidate, and the pointwise closure this arm performs is
+            // exactly right for the edge it draws.
+            //
             // Deliver the contribution to any trait obligation this variable is an
             // operand of. This arm is the *only* hook site needed: an operand type
             // reaches an obligation as a lower bound, and the closure below plus its
@@ -933,6 +1728,56 @@ fn constrain_go_impl(
             }
         }
 
+        // **Elimination against a non-function**, and deliberately *last*: `Σ 𝐷 ∈ 𝐾. 𝐵[𝐷]
+        // <: 𝑈` for any `𝑈` the arms above did not already claim. A Σ value is a pair, so
+        // a `𝑈` valid at *every* candidate is valid on it. The two arms above are this
+        // same rule at the shapes that carry their own extra structure — a function
+        // consumer, whose domain and codomain edges run in opposite directions, and a sum
+        // consumer, which is width.
+        //
+        // Position matters: reaching this rule earlier would swallow a variable on the
+        // right, which must record the sum as a *bound* rather than distribute over it.
+        // Sitting immediately above the fallthrough, it claims only what would otherwise
+        // be a flat mismatch.
+        //
+        // The shape that reaches it is a sum standing in a **domain** position:
+        // `Σ 𝐷 ∈ 𝐾. 𝐷` is what a consumer is handed for "whichever domain the witness
+        // picked", and it meets a concrete domain
+        // whenever that demand resolved to one. With the consuming rule restricted to function
+        // consumers this edge had no rule at all, so an `Array(2, 𝑉)` demanded of a
+        // `List(𝑉)` that had already narrowed to exactly `{[0, 2)}` was rejected against
+        // its own sole candidate.
+        //
+        // A described kind lists nothing to distribute over and stays a mismatch: the
+        // consumer would have to be valid at domains not yet named.
+        //
+        // **Witness-bodied only**, which is the shape named above and not a further
+        // condition: distributing *instantiates* the witness, so a body that still mentions
+        // it after instantiation has had it pinned to one candidate — the silent narrowing
+        // the `Type::WitnessRef` arms refuse by name. Where the body is the witness there is
+        // nothing left to pin. The arm below is the same rule for a body that is not.
+        (Type::Sigma(s), _) if s.body_is_witness() && s.kind().listed().is_some() => {
+            for c in s.kind().listed().expect("guarded above") {
+                constrain_go(&s.instantiate_body(c), rhs, sl, sr, cache)?;
+            }
+            Ok(())
+        }
+
+        // **A demand that still names the witness is domain-*preserving*,** so it takes the
+        // naming rule rather than distribution — the same split the `(Σ, Fun)` arm makes,
+        // stated for the shapes that arm does not cover. A nested sum's body is a `Tuple`
+        // (two generators index a pair, one component per witness), and a tuple demand
+        // relates componentwise, so each witness meets its own position and none is pinned.
+        //
+        // Publish before recursing: the body's witness references are about to reach edges,
+        // and a reference names a binder and nothing else, so the range has to be findable
+        // from the binder alone.
+        (Type::Sigma(s), _) => {
+            let range = s.kind().map_children(|d| sl.apply_type(d));
+            crate::ccl::ty::witness_ctx::note_range(s.binder(), &range);
+            constrain_go(&s.body, rhs, sl, sr, cache)
+        }
+
         _ => Err(ConstrainError::Mismatch {
             lhs: lhs.clone(),
             rhs: rhs.clone(),
@@ -1048,6 +1893,26 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             Box::new(extrude(inner, pol, target_level, cache)),
             r.clone(),
         ),
+        // The witness's type children are the real (contravariant) domain, so
+        // they extrude at `!pol` — matching the single-`Fun` domain above; the
+        // body (a data function over the witness) extrudes covariantly. The
+        // witness reference is a leaf at level 0, so it short-circuits.
+        // A sum's **candidates** are an invariant position, so they cross a level
+        // boundary through two-way proxies rather than the polar one-way approximation
+        // below — the same reason a `History` payload does. Σ-width matches candidates
+        // *by value*, so neither direction of a candidate's bounds is the "unused" one:
+        // a one-way proxy inherits whichever side the polarity picked and silently drops
+        // the other, which for a candidate is usually fatal. A candidate is a *domain*,
+        // and a domain's content arrives as an **upper** bound (a comprehension's key
+        // must lie in its source's domain), so a positive one-way proxy — what `!pol`
+        // yields for a sum in a negative position — inherits only lower bounds and
+        // carries nothing at all.
+        Type::Sigma(s) => Type::Sigma(Box::new(SigmaType::bound(
+            s.witness
+                .map_types(|t| extrude_invariant(t, target_level, cache)),
+            extrude(&s.body, pol, target_level, cache),
+        ))),
+        Type::WitnessRef(_) => ty.clone(),
         // Invariant payload: polarity is meaningless under invariance, so
         // both children are extruded with two-way proxies (a history is read
         // *and* written) instead of the polar one-way approximation below.
@@ -1069,6 +1934,22 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             let nvs = InferVar::fresh(target_level);
             cache.insert((tv.uid, pol), Rc::clone(&nvs));
             copy_watches(tv, &nvs);
+            // Kinding constraints ride along at **both** polarities, unlike the bounds
+            // below. The proxy stands in for the original wherever the outer scope reads
+            // it, and "must inhabit 𝐾" is a property of what that resolves to, not of a
+            // direction of flow — a one-sided copy would let a scope boundary launder
+            // the constraint away. The kind's own type children extrude with it: a
+            // parameterized kind carries types like any other position.
+            {
+                let carried: Vec<_> = tv
+                    .bounds
+                    .borrow()
+                    .kinds
+                    .iter()
+                    .map(|k| k.map_children(|t| extrude(t, pol, target_level, cache)))
+                    .collect();
+                nvs.bounds.borrow_mut().kinds = carried;
+            }
 
             // Each branch snapshots only the list it does *not* push to — the
             // positive one seeds from `lower` and writes `upper`, the negative
@@ -1272,6 +2153,75 @@ mod tests {
         ]);
         let mut cache = ConstrainCache::new();
         let _ = constrain_subtype(&dup, &dup.clone(), &mut cache);
+    }
+
+    /// A kinding constraint must cross a scope boundary with its variable. `extrude`
+    /// mints a proxy at the target level and copies the variable's constraint state
+    /// onto it; a kinding constraint is part of that state, and unlike a bound it is
+    /// not polar, so both polarities carry it.
+    ///
+    /// Losing it here is a silent *acceptance* — the constraint would survive only on a
+    /// variable the outer scope no longer reads — which is the same failure mode
+    /// `test_kinding_constraint_survives_instantiation` pins for the freshening
+    /// boundary.
+    #[test]
+    fn extrusion_carries_a_kinding_constraint_at_both_polarities() {
+        for pol in [true, false] {
+            let inner = InferVar::fresh(2);
+            inner.bounds.borrow_mut().kinds.push(TypeKind::UIntRanges);
+            let mut cache = ExtrudeCache::new();
+            let out = extrude(&Type::Infer(Rc::clone(&inner)), pol, 0, &mut cache);
+            let Type::Infer(proxy) = out else {
+                panic!("extruding a variable yields a variable, got {out:?}");
+            };
+            assert_eq!(proxy.level, 0, "proxy sits at the target level");
+            assert_eq!(
+                proxy.bounds.borrow().kinds,
+                vec![TypeKind::UIntRanges],
+                "pol={pol}: the proxy must inhabit the same kind"
+            );
+        }
+    }
+
+    /// The Σ-width `∃` is a **search**, not set membership. A candidate with no verbatim
+    /// counterpart on the right can still be paired with one its body edge relates to —
+    /// here a bare range against a *refined* range, which the body edge admits as row
+    /// addition behind the arrow (`domain_refinement_edges_today` pins that edge).
+    ///
+    /// Under the identity pairing alone this is a mismatch, which is what made a
+    /// candidate-specific correspondence look like it needed a rule of its own.
+    #[test]
+    fn sigma_width_pairs_candidates_by_their_body_edge_not_by_equality() {
+        let sum = |kind| Type::Sigma(Box::new(SigmaType::over(kind, None, prim(BaseType::Int))));
+        let refined_range = refined(Type::UIntRange(3), 7);
+
+        let bare = sum(TypeKind::Enumerated(vec![Type::UIntRange(3)]));
+        let filtered = sum(TypeKind::Enumerated(vec![refined_range.clone()]));
+
+        // No candidate is shared, so set membership rejects; the pairing is found by
+        // running the body edge.
+        assert!(
+            constrain_subtype(&bare, &filtered, &mut ConstrainCache::new()).is_ok(),
+            "a bare candidate pairs with the refined one it widens into"
+        );
+
+        // Not symmetric, and for a reason outside this rule: the reverse pairing would
+        // need the *opposite* data-domain edge — dropping a domain refinement — which a
+        // data domain's invariance rejects outright, not pending a decision
+        // (`src/ccl/design/type-inference.md`, "Data domains are invariant"). The search
+        // finds a pairing when one exists; it does not invent the edge.
+        assert!(
+            constrain_subtype(&filtered, &bare, &mut ConstrainCache::new()).is_err(),
+            "and does not pair in the direction the body edge rejects"
+        );
+
+        // A candidate with *no* counterpart still fails, so the search has not become a
+        // blanket accept.
+        let unrelated = sum(TypeKind::Enumerated(vec![prim(BaseType::String)]));
+        assert!(
+            constrain_subtype(&bare, &unrelated, &mut ConstrainCache::new()).is_err(),
+            "no pairing exists, so the edge is a mismatch"
+        );
     }
 
     #[test]
@@ -2293,6 +3243,117 @@ mod tests {
     }
 
     // ----- FunKind edge (the two kinds are incomparable) -----------
+
+    // --- Conditional-collection Sigma rules (subtyping: width; consumption:
+    //     consume) — see `design/type-inference.md`, "4.6 Data vs compute functions" ---
+
+    /// The **factored** sum over `domains` — `Σ 𝐷 ∈ {domains}. 𝐷 ⤇ Int`, what
+    /// materializing a merged domain kind produces. The unfactored sibling `box`
+    /// builds is `SigmaType::of`.
+    fn conditional(domains: Vec<Type>) -> Type {
+        TypeKind::Enumerated(domains).into_data_fun(None, prim(BaseType::Int))
+    }
+
+    #[test]
+    fn conditional_width_is_subtype() {
+        // A conditional collection is a Sigma over candidate domains;
+        // width-subtyping is by-value subset — every lhs candidate domain
+        // appears among the rhs candidates. The reverse (rhs has an extra
+        // domain the lhs lacks) is not a subtype.
+        let sub = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let sup = conditional(vec![
+            Type::UIntRange(2),
+            Type::UIntRange(3),
+            Type::UIntRange(4),
+        ]);
+        assert!(constrain_subtype(&sub, &sup, &mut ConstrainCache::new()).is_ok());
+        assert!(constrain_subtype(&sup, &sub, &mut ConstrainCache::new()).is_err());
+    }
+
+    #[test]
+    fn conditional_consumed_as_fun() {
+        // Elimination: a conditional collection used as a plain function. A
+        // *fresh* domain var absorbs the discriminated union of the candidate
+        // domains (the `sum` / comprehension case).
+        let cond = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let consumer = fun(fresh_var(0), prim(BaseType::Int));
+        assert!(constrain_subtype(&cond, &consumer, &mut ConstrainCache::new()).is_ok());
+        // A consumer demanding a *concrete narrower* domain fails: the
+        // conditional collection never silently narrows to a single domain.
+        let narrow = fun(Type::UIntRange(2), prim(BaseType::Int));
+        assert!(constrain_subtype(&cond, &narrow, &mut ConstrainCache::new()).is_err());
+    }
+
+    // --- `UIntRanges`-kind Sigma rules (List): consumption, width ---
+
+    /// **A described range is consumed by the same rule a listing one is.** Naming the
+    /// witness needs no candidates — that is what naming buys over presenting — so
+    /// `List`'s `UIntRanges` and `Collection`'s `Any` reach a consumer through the
+    /// factored arm with nothing to enumerate.
+    ///
+    /// Worth its own test because the failure is silent in the other direction: a rule
+    /// written to read candidates first answers `None` for a described kind and falls
+    /// through to a flat mismatch, so a `List(𝑇)` annotation stops being consumable and
+    /// nothing else in the suite says why.
+    #[test]
+    fn a_described_range_is_consumed_by_naming_its_witness() {
+        let int = prim(BaseType::Int);
+        for kind in [TypeKind::UIntRanges, TypeKind::Any] {
+            let collection = kind.clone().into_data_fun(None, int.clone());
+            // A consumer with a fresh domain variable: the common case (`sum`, a
+            // comprehension). Its domain resolves to the witness.
+            let consumer = fun(fresh_var(0), int.clone());
+            assert!(
+                constrain_subtype(&collection, &consumer, &mut ConstrainCache::new()).is_ok(),
+                "a {kind} collection must be consumable: {collection}"
+            );
+        }
+    }
+
+    /// `into_data_fun` is the single materialization, so what it builds is decided by
+    /// one test: a **merged domain kind** listing exactly one domain determines that
+    /// domain and needs no witness; every other kind carries one. Says nothing about a
+    /// `box`ed value — `Σ σ ∈ {𝐷 ⤇ 𝑉}. σ` is a sum over one candidate and stays one.
+    #[test]
+    fn a_determined_domain_kind_materializes_without_a_witness() {
+        let int = prim(BaseType::Int);
+        let sole = TypeKind::Enumerated(vec![Type::UIntRange(3)]);
+        assert!(!sole.needs_witness());
+        assert_eq!(
+            sole.into_data_fun(None, int.clone()),
+            Type::data_fun(Type::UIntRange(3), int.clone())
+        );
+        for kind in [
+            TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]),
+            TypeKind::UIntRanges,
+            TypeKind::Any,
+        ] {
+            assert!(kind.needs_witness(), "{kind} must materialize as a sum");
+            assert!(matches!(
+                kind.into_data_fun(None, int.clone()),
+                Type::Sigma(_)
+            ));
+        }
+    }
+
+    /// The **cross-form** width edge: the unfactored sum `box` builds, below the
+    /// factored sum a `List(𝑉)` annotation is. Both spellings of one type, so this is
+    /// ordinary Σ-width read on instantiated bodies — and it is the edge every
+    /// `List`-annotated parameter depends on.
+    #[test]
+    fn a_boxed_collection_is_below_a_list_annotation() {
+        let int = prim(BaseType::Int);
+        let boxed = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            Type::data_fun(Type::UIntRange(2), int.clone()),
+        ]))));
+        let list = Type::list_of(int);
+        assert!(
+            constrain_subtype(&boxed, &list, &mut ConstrainCache::new()).is_ok(),
+            "box(xs) must reach List(V) by width"
+        );
+    }
+
+    // ----- FunKind edge (the `Compute <: Data` rejection) -----------
 
     fn data_fun(d: Type, c: Type) -> Type {
         Type::data_fun(d, c)

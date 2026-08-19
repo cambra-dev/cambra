@@ -100,6 +100,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Cast: an upcast re-viewing `value` at the supertype `target`. See
         // [`emit_cast`] (shared with `check_node`).
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
+        // Realization is a planning rewrite, so it is born after inference has finished:
+        // Emit only ever runs on a tree that has none. The post-inference check *does*
+        // meet them, and trusts the assertion ([`check_node_rule`]).
+        TypedExprNode::Realize(_) => {
+            unreachable!("Realize is born in planning, after inference")
+        }
 
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
@@ -388,10 +394,19 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             emit_annotation_predicates(value, ctx)?;
             emit_annotation_predicates(domain, ctx)
         }
+        Type::Sigma(s) => {
+            for t in s.witness.types_mut() {
+                emit_annotation_predicates(t, ctx)?;
+            }
+            // A witness is a type, referenced anonymously in the body's domain
+            // position, so it introduces no term binder to scope the body under.
+            emit_annotation_predicates(&mut s.body, ctx)
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::WitnessRef(_)
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
@@ -1611,7 +1626,7 @@ pub(super) fn emit_list<C: Typing>(
     // element (codomain) type takes the dereferenced element type so no `Mut`
     // appears in the list type. A list literal is a **data** function — its
     // domain is the index set, so a join with another collection may not narrow
-    // it — see `src/ccl/design/type-inference.md`, "The domain join is a Σ".
+    // it — see `src/ccl/design/type-inference.md`, "The domain join needs `box`".
     Ok(fun_ty(Type::UIntRange(n), read_through(&first_ty)))
 }
 
@@ -1702,10 +1717,10 @@ pub(super) fn emit_case<C: Typing>(
     // domain rides the contravariant `Fun` domain — it demands `D <: {D | p}`,
     // rejecting two arms that are the same expression.
     //
-    // Data-collection arms with distinct domains are rejected at coalesce rather
-    // than met (`CoalesceError::DomainJoinConflict`). (Heterogeneous *scalar* arms
-    // remain a hard `IncompatibleBounds` error — the sound union relaxation for
-    // them is deferred; see `coalesce`.)
+    // Data-collection arms with distinct domains coalesce to a
+    // conditional-collection Sigma. (Heterogeneous *scalar* arms remain a hard
+    // `IncompatibleBounds` error — the sound union relaxation for them is
+    // deferred; see `coalesce`.)
     //
     // A `Mut` arm needs no special case: it derefs into the join like any other
     // read, so a `Case` over two mutable variables types as their *value*. The
@@ -1779,6 +1794,9 @@ pub(super) fn emit_compose<C: Typing>(
     let (first_dom, mut prev_cod) = ctx.as_function(&tys[0], &|| "Compose[0]".to_string())?;
     for (i, t) in tys.iter().enumerate().skip(1) {
         let (d_i, c_i) = ctx.as_function(t, &|| "Compose[i]".to_string())?;
+        // The preceding morphism's codomain is the consuming position, so this morphism
+        // takes the witness names standing in it.
+        let (d_i, c_i) = crate::ccl::ty::adopt_witnesses_at(d_i, c_i, &prev_cod);
         // Strict refinement-aware adjacency: `prev_cod <: next_dom`, refinement
         // refinements and all — no cast escape. A producer must already supply the
         // refinement its consumer demands. Join planning surfaces the

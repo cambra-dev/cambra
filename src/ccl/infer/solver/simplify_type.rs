@@ -13,7 +13,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ccl::InferVarId;
 
-use super::compact::{AtomKey, CompactFun, CompactGraph, CompactType, CompactVariant};
+use super::compact::{
+    AtomKey, CompactFun, CompactGraph, CompactType, CompactVariant, CompactWitnessKind,
+};
 
 // ---------------------------------------------------------------------------
 // Type simplification: co-occurrence analysis
@@ -247,15 +249,17 @@ fn simplify_analyze(
         }
     }
     if let Some(cf) = &ct.fun {
-        for dom in &cf.domains {
-            simplify_analyze(
-                dom,
-                !pol,
-                input_rec_vars,
-                all_vars,
-                rec_processed,
-                co_occurrences,
-            );
+        {
+            {
+                simplify_analyze(
+                    &cf.domain,
+                    !pol,
+                    input_rec_vars,
+                    all_vars,
+                    rec_processed,
+                    co_occurrences,
+                );
+            }
         }
         simplify_analyze(
             &cf.codomain,
@@ -325,11 +329,7 @@ fn simplify_reconstruct(
     let new_fun = ct.fun.map(|cf| CompactFun {
         name: cf.name,
         kind: cf.kind,
-        domains: cf
-            .domains
-            .into_iter()
-            .map(|d| simplify_reconstruct(d, var_subst))
-            .collect(),
+        domain: Box::new(simplify_reconstruct(*cf.domain, var_subst)),
         codomain: Box::new(simplify_reconstruct(*cf.codomain, var_subst)),
     });
 
@@ -341,12 +341,34 @@ fn simplify_reconstruct(
         )
     });
 
+    // A sum's body and its listed candidates are ordinary positions, so both are
+    // reconstructed like any other. A described kind lists none.
+    let new_sigma = ct.sigma.map(|sg| {
+        let kind = match sg.kind.clone() {
+            CompactWitnessKind::Enumerated(cands) => CompactWitnessKind::Enumerated(
+                cands
+                    .into_iter()
+                    .map(|c| simplify_reconstruct(c, var_subst))
+                    .collect(),
+            ),
+            described => described,
+        };
+        sg.rebuild(kind, simplify_reconstruct(*sg.body.clone(), var_subst))
+    });
+
     CompactType {
         vars: new_vars,
+        // Carried through: the witness names *this* position, so simplifying away the
+        // variables that reached it must not lose which position it is.
+        witness: ct.witness,
         atoms: ct.atoms,
+        // Carried through unchanged: the constraint is already a property of this
+        // *position*, so merging away the variable that contributed it must not drop it.
+        kinds: ct.kinds,
         rec: new_rec,
         var: new_var,
         fun: new_fun,
+        sigma: new_sigma,
         refinements: ct.refinements,
         history_slot: new_history_slot,
     }
@@ -363,7 +385,7 @@ mod tests {
         Some(CompactFun {
             name: None,
             kind: KindMerge::Compute,
-            domains: vec![dom],
+            domain: Box::new(dom),
             codomain: Box::new(cod),
         })
     }
@@ -399,7 +421,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = &cf.domains[0];
+        let dom_s = &*cf.domain;
         let cod_s = &cf.codomain;
         assert!(dom_s.vars.contains(&uid_a), "a kept in dom");
         assert!(cod_s.vars.contains(&uid_a), "a kept in cod");
@@ -431,7 +453,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = &cf.domains[0];
+        let dom_s = &*cf.domain;
         let cod_s = &cf.codomain;
         assert!(dom_s.vars.is_empty(), "a absorbed in dom");
         assert!(cod_s.vars.is_empty(), "a absorbed in cod");
@@ -466,7 +488,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = &cf.domains[0];
+        let dom_s = &*cf.domain;
         let cod_s = &cf.codomain;
         assert_eq!(dom_s.vars.len(), 1, "one var after merge in dom");
         assert_eq!(cod_s.vars.len(), 1, "one var after merge in cod");
@@ -498,7 +520,7 @@ mod tests {
 
         let simplified = simplify_type(graph);
         let cf = simplified.term.fun.unwrap();
-        let dom_s = &cf.domains[0];
+        let dom_s = &*cf.domain;
         let cod_s = &cf.codomain;
         assert!(dom_s.vars.contains(&uid_a), "a preserved in dom");
         assert!(cod_s.vars.contains(&uid_a), "a preserved in cod");
