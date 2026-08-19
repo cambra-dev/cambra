@@ -3,7 +3,9 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
-use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fresh_var, prim};
+use crate::ccl::infer::solver::{
+    ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
+};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
@@ -71,10 +73,13 @@ pub(super) struct CheckCtx {
     /// telescope and the record-time closure observation stays meaningful in
     /// both modes.
     telescope: crate::ccl::infer_var::Telescope,
+    /// Whether this walk has the whole tree or a sub-tree cut from its context
+    /// — the two answer the closure invariant differently. See [`Derivation`].
+    derivation: Derivation,
 }
 
 impl CheckCtx {
-    fn new(root: NodeId) -> Self {
+    fn new(root: NodeId, derivation: Derivation) -> Self {
         // Level 0 matches inference (Stage 1 holds the level at 0) and the
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
@@ -85,6 +90,7 @@ impl CheckCtx {
             pred_memo: Default::default(),
             current_node: root,
             telescope: crate::ccl::infer_var::Telescope::empty(),
+            derivation,
         }
     }
 }
@@ -205,10 +211,11 @@ impl Typing for CheckCtx {
         // restriction refinements) refinement subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
         //
-        // A post-pass re-derivation: this runs over a tree a later pass has
-        // already rewritten, so a refinement referencing an erased binder is expected
-        // here rather than an internal error.
-        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::post_pass()) {
+        // The cache serves this walk's derivation: a whole tree enforces the
+        // closure invariant like the live solve, a sub-tree probe cannot (the
+        // binders its refinements reference are held by the context it was cut from).
+        let mut cache = ConstrainCache::for_derivation(self.derivation);
+        if let Err(e) = constrain_subtype(sub, sup, &mut cache) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }
@@ -583,9 +590,9 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 /// nothing but reads. Splitting the rules' slot access — a `&mut` writer in
 /// Infer mode, a reader in Check mode — removes the copy entirely rather than
 /// making it cheaper.
-pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn check(expr: &Expr, derivation: Derivation) -> Result<(), Vec<InferError>> {
     let mut cloned = expr.clone_preserving_ids();
-    let mut ctx = CheckCtx::new(cloned.node_id());
+    let mut ctx = CheckCtx::new(cloned.node_id(), derivation);
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
     // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned
@@ -634,7 +641,7 @@ mod tests {
         let (a_id, b_id) = (bad_a.node_id(), bad_b.node_id());
         let mut tree = TypedExpr::tuple(vec![bad_a, bad_b]);
 
-        let mut ctx = CheckCtx::new(tree.node_id());
+        let mut ctx = CheckCtx::new(tree.node_id(), Derivation::PostPass);
         let _ = check_node(&mut tree, &mut ctx);
 
         let blamed: Vec<_> = ctx.errors.iter().map(|e| e.node_id).collect();

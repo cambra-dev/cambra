@@ -1001,17 +1001,26 @@ recorded — a lookup, since uniquify gives every binding site one uid — and a
 violation is a record-time internal error naming the variable and the
 reference, not a fragment waiting for a coincidence to keep it unobserved.
 
-Enforcement is scoped to the **live solve** — emission and its
-specialization pins, the derivations a `ConstrainCache::new` cache serves.
-A post-pass re-derivation (`ConstrainCache::post_pass`) observes without
-enforcing: it walks trees where a later pass has erased binders (a
-post-elimination claim legitimately references a compiled-away comprehension
-binder), and its variables are throwaway comparison state that never
-reaches an output type. The `Fun`/`Fun` codomain opening reads the same flag,
-so one distinction serves both sites: the live solve opens only toward a side
-carrying inference variables, where a dangling index could land on a recorded
-fragment, and a re-derivation opens unconditionally because it is reconciling
-two passes' spellings of one type.
+Enforcement covers every derivation over a **self-contained tree**: the live
+solve — emission and its specialization pins — and the pass-boundary
+re-derivations that check what a pass produced. A re-derivation walks a tree
+where a pass has erased term binders, and the refinements it meets still name them;
+what binds them there is the family's *type*, whose Pi binder the chain walk
+enters (see [Where the conversions run](#where-the-conversions-run)), so the
+tree holds every binder its refinements reference and a reference to one it does not
+hold is the escape this invariant catches.
+
+One derivation is excused, and only because its context is what holds the
+binders: a **fragment probe** over a sub-tree cut from its tree, which is
+`debug_typecheck`'s per-operation check and nothing else. No walk of the
+sub-tree can enter a binder the enclosing tree holds, so a reference to one is
+expected there. Planning's in-place checks of a morphism it has just built are
+not excused — a morphism carries its own binder — and they enforce. `Derivation` names the three
+(`ConstrainCache::for_derivation`), and the `Fun`/`Fun` codomain opening reads
+the same value: the live solve opens only toward a side carrying inference
+variables, where a dangling index could land on a recorded fragment, and either
+re-derivation opens unconditionally because it is reconciling two passes'
+spellings of one type.
 
 Sources stay name-referenced and outside the telescope: a source name is a
 unique global identifier with no binding structure, the same standing
@@ -1150,7 +1159,12 @@ conversions, and the sites below are their only callers:
   `apply` transformer's domain, which sits under the pair morphism's binder;
   and the group-by recognizer opens the family it matches, because it
   identifies the key binder as the free `Var` on one side of the predicate's
-  equality.
+  equality. Opening at a name puts a free reference into the type being
+  compared, so the walk descends into the binder's *scope* as well: a chain is
+  typed morphism by morphism inside the families before it
+  (`emit_compose`'s `compose_chain`), which is what lets the variables those
+  steps mint close against the binder their refinements name. A family and the
+  transformers consuming it are siblings in the term and nested in scope.
 - **Application opens at the argument.** Applying a closed family — the
   dependent-application discharge, β at coalesce — replaces the binder's
   indices with the argument term. Opening at a name and opening at an

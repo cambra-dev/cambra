@@ -143,38 +143,64 @@ pub enum ConstrainError {
 /// composites grow along lexical nesting depth, not around cycles).
 pub struct ConstrainCache {
     edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
-    /// Whether this derivation is the **live solve** — emission and its
-    /// specialization pins, where a recorded fragment becomes solved output —
-    /// rather than a post-pass re-derivation over a tree a later pass has
-    /// already rewritten.
-    ///
-    /// Bounds recorded on the live solve enforce the telescope closure
-    /// invariant as a record-time internal error
-    /// (`src/ccl/design/type-inference.md`, "The invariant"). A post-pass
-    /// re-derivation does not: its refinements legitimately reference binders the
-    /// pass it runs after erased, and its variables are throwaway comparison
-    /// state that reaches no output type. The `Fun`/`Fun` codomain opening
-    /// asks the same question: the live solve opens only toward a side carrying
-    /// inference variables, a re-derivation unconditionally.
-    live_solve: bool,
+    /// Which derivation this cache serves. The coordinate poses two questions
+    /// and they do not have the same answer in all three
+    /// (`src/ccl/design/type-inference.md`, "Where the conversions run").
+    derivation: Derivation,
+}
+
+/// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
+/// draws an edge, which is what the coordinate questions are answered against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Derivation {
+    /// Emission and its specialization pins — where a recorded fragment becomes
+    /// solved output.
+    LiveSolve,
+    /// A pass-boundary re-derivation over a whole tree: it reconciles types two
+    /// passes spelled in different coordinates, but every binder the tree's
+    /// refinements reference is a binder the walk itself can enter.
+    PostPass,
+    /// A probe over a sub-tree cut from its context: `debug_typecheck`'s
+    /// per-operation check, its one caller. Its refinements reference binders the
+    /// absent context holds, which no walk of the sub-tree can see, so the
+    /// closure invariant is not a record-time error here. Planning's in-place
+    /// checks of a morphism it has just built do *not* need the excuse — a
+    /// morphism carries its own binder — and take [`PostPass`](Self::PostPass),
+    /// which enforces.
+    Fragment,
+}
+
+impl Derivation {
+    /// Whether bounds recorded through this derivation must close against the
+    /// holder's telescope (`src/ccl/design/type-inference.md`, "The invariant").
+    /// Every derivation over a self-contained tree does; only a fragment probe
+    /// is excused, and only because its context is what carries the binders.
+    fn enforces_closure(self) -> bool {
+        self != Derivation::Fragment
+    }
+
+    /// Whether a closed `Fun`/`Fun` codomain opens unconditionally rather than
+    /// only toward a side carrying inference variables. A re-derivation is
+    /// reconciling two passes' spellings of one type; the live solve is not, and
+    /// opening a ground pair at display names lets a free reference sharing a
+    /// binder's spelling capture the reopened index.
+    fn opens_unconditionally(self) -> bool {
+        self != Derivation::LiveSolve
+    }
 }
 
 impl ConstrainCache {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self {
-            edges: HashMap::new(),
-            live_solve: true,
-        }
+        Self::for_derivation(Derivation::LiveSolve)
     }
 
-    /// The cache for a post-pass re-derivation — `check`'s structural
-    /// re-derivation of types a later pass rewrote (see
-    /// [`live_solve`](Self::live_solve) for what that changes).
-    pub fn post_pass() -> Self {
+    /// The cache for one of the re-derivations — see [`Derivation`] for what
+    /// each one changes.
+    pub fn for_derivation(derivation: Derivation) -> Self {
         Self {
             edges: HashMap::new(),
-            live_solve: false,
+            derivation,
         }
     }
 
@@ -558,15 +584,15 @@ fn constrain_go_impl(
             // convention). A post-pass re-derivation opens unconditionally: it
             // reconciles types that different passes spelled in different
             // coordinates (a closed arrow's codomain against a rebuilt,
-            // discharged one). That is the same question
-            // [`ConstrainCache::live_solve`] already answers for the record
-            // sites, so this reads the flag rather than adding a second one.
+            // discharged one). Which derivation this is
+            // ([`Derivation`]) answers both this and the record sites'
+            // question, so the two read one field rather than two flags.
             // The pre-scan keeps the common index-free codomain untouched.
             let open = |n: &Option<crate::ccl::Name>, c: &Type, other: &Type| -> Option<Type> {
                 match n {
                     Some(b)
                         if crate::ccl::subst::contains_pi_bound(c)
-                            && (!cache.live_solve
+                            && (cache.derivation.opens_unconditionally()
                                 || crate::ccl::subst::type_contains_infer(other)) =>
                     {
                         Some(crate::ccl::subst::open_pi_binder(
@@ -750,7 +776,12 @@ fn constrain_go_impl(
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
                 let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone());
-                crate::ccl::infer_var::observe_bound_scope(lv, "upper", &bound, cache.live_solve);
+                crate::ccl::infer_var::observe_bound_scope(
+                    lv,
+                    "upper",
+                    &bound,
+                    cache.derivation.enforces_closure(),
+                );
                 let mut s = lv.bounds.borrow_mut();
                 s.upper_mut().push(bound);
                 Rc::clone(s.lower())
@@ -785,7 +816,12 @@ fn constrain_go_impl(
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
                 let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone());
-                crate::ccl::infer_var::observe_bound_scope(rv, "lower", &bound, cache.live_solve);
+                crate::ccl::infer_var::observe_bound_scope(
+                    rv,
+                    "lower",
+                    &bound,
+                    cache.derivation.enforces_closure(),
+                );
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);
                 Rc::clone(s.upper())
@@ -1327,6 +1363,47 @@ mod tests {
     use crate::ccl::{
         BaseType, BinOpKind, CompareKind, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode,
     };
+
+    /// `{Int | escaped}` — a refinement naming a uniquified binder that nothing in
+    /// scope binds, the shape the closure invariant rejects.
+    #[cfg(debug_assertions)]
+    fn escaped_claim() -> Type {
+        crate::ccl::ccl_utils::refine_with_bare(
+            Type::Base(BaseType::Int),
+            &TypedExpr::var(Name::fresh("escaped")),
+        )
+    }
+
+    /// A whole-tree re-derivation enforces the closure invariant, exactly as the
+    /// live solve does: the tree it walks holds every binder its refinements name, so
+    /// a reference to one it does not is the escape the invariant catches.
+    ///
+    /// This is what a `Derivation::Fragment` cache is excused from, and the two
+    /// tests together are the reason that excuse is narrow: a probe over a
+    /// sub-tree has no context to hold the binder, a walk over the whole tree
+    /// does.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "open fragment recorded")]
+    fn a_whole_tree_re_derivation_enforces_the_closure_invariant() {
+        let escaped = escaped_claim();
+        let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
+        let v = fresh_var(0);
+        let _ = constrain_subtype(&escaped, &v, &mut cache);
+    }
+
+    /// A fragment probe records the same bound without complaint: its refinements
+    /// reference binders the context it was cut from holds, and no walk of the
+    /// sub-tree can enter them.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_fragment_probe_admits_a_reference_its_context_binds() {
+        let escaped = escaped_claim();
+        let mut cache = ConstrainCache::for_derivation(Derivation::Fragment);
+        let v = fresh_var(0);
+        constrain_subtype(&escaped, &v, &mut cache)
+            .expect("a fragment's free reference is admitted");
+    }
 
     /// The tripwire is armed for the one place the record/variant arms and the
     /// trivial-equality short-circuit can disagree.
