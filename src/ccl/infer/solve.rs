@@ -735,14 +735,13 @@ fn with_shadows<R>(
 ///   *after* its body, so the pin still reaches the parameter type — but only if it
 ///   precedes the branch walk.
 ///
-/// Returns whether it pinned. "No value reached this position" is meant to imply
-/// *unreachable*, and the caller checks that rather than assuming it: a **live** arm's
-/// binder takes its bound from the scrutinee (`scrut.c <: αᵢ`, the width rule with the
-/// scrutinee on the left), so a pinned binder on a tag the scrutinee *does* carry
-/// would mean that edge went missing — the bug the `Openness` marker exists to prevent
-/// recurring. The check reads the scrutinee's resolved tags, so it cannot live here:
-/// the pin runs *before* the scrutinee's walk, exactly so that walk reads payloads
-/// this has already decided.
+/// Returns whether it pinned, which
+/// [`assert_pinned_tags_are_unreachable`] checks against the scrutinee's tags: no value
+/// reaching a position is meant to imply the arm is unreachable. A live arm's binder
+/// takes its bound from the scrutinee (`scrut.c <: αᵢ`, the width rule with the
+/// scrutinee on the left), so a pinned binder on a tag the scrutinee carries would mean
+/// that edge went missing. That check reads the scrutinee's resolved tags and so cannot
+/// run here; the pin precedes the scrutinee's walk.
 fn pin_unobservable_arm_payload(p: &Pattern) -> bool {
     // Unobservability is *transitive*: the variable's bound list is rarely empty
     // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
@@ -964,11 +963,11 @@ pub(super) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
 /// Hold [`pin_unobservable_arm_payload`] to its premise: a tag it pinned is one the
 /// scrutinee cannot carry.
 ///
-/// A pinned payload on a tag the scrutinee *does* carry would mean the width rule's
-/// `scrut.cᵢ <: αᵢ` edge went missing, and that failure is silent — the pin supplies a
-/// type either way, so the arm's binder would simply have the wrong one. Checked here
-/// rather than inside the pin because it reads the scrutinee's *resolved* tags, and the
-/// pin deliberately runs before the scrutinee's walk.
+/// A pinned payload on a tag the scrutinee carries would mean the width rule's
+/// `scrut.cᵢ <: αᵢ` edge went missing. That failure is silent without this check: the
+/// pin supplies a type either way, so the arm's binder ends up with the wrong one.
+/// Checked here rather than inside the pin because it reads the scrutinee's resolved
+/// tags, and the pin precedes the scrutinee's walk.
 #[cfg(debug_assertions)]
 fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[String]) {
     let Some(Type::Variant(tags, _)) =

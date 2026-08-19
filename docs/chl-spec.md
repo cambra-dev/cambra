@@ -1595,8 +1595,8 @@ match x:
 ```
 
 A pattern spells its tag exactly as a constructor does (§3.15), so an arm
-reads as the inverse of what it matches. There are three payload spellings,
-making **two** statements:
+reads as the inverse of what it matches. Three payload spellings make two
+statements:
 
 | Pattern | Means |
 |---|---|
@@ -1604,16 +1604,15 @@ making **two** statements:
 | `` case `tag(_): `` | the tag carries a payload this arm does not read |
 | `` case `tag: `` | the tag carries **nothing** |
 
-A binder is an ordinary local, scoped to its arm. `_` is not a name — the body
-cannot refer to it — it is the unused-binder spelling, the same sense in which
-`case _:` names no tag.
+A binder is an ordinary local, scoped to its arm. `_` is the unused-binder
+spelling and not a name, so the body cannot refer to it. `case _:` uses `_` in
+the same sense, for an arm that names no tag.
 
-**The third form is a claim about the type, not an elision of the binder.**
+**The third form states the payload's type rather than eliding the binder.**
 `` `some{Int} `` and `` `some `` are different types (§6.5), so `` case `some: ``
-matches only a payload-less `` `some ``; against one carrying an `Int` it is an
-error, and the fix is `` case `some(_): ``. There is no silent conversion
-between a tag with a payload and a tag without one, in a pattern any more than
-anywhere else.
+matches a payload-less `` `some `` and is an error against one carrying an
+`Int`. An arm that has a payload and does not read it is written
+`` case `some(_): ``.
 
 The default arm below takes no backtick: `_` is the absence of a tag, not a
 tag.
@@ -1651,22 +1650,21 @@ and bare calls. Dispatching per element is written as a `def` that matches
 on its parameter and is called from the loop or a comprehension, which is
 the same first-match rule reached through a call.
 
-> **Direction [Tentative].** A `match` in a value position yields a value
-> exactly as an `if` chain does (§4.5), so what is missing is not
-> expression-ness but a **one-line** spelling. The obvious one is the block
-> with its line breaks removed — `` match scrut: case `foo(x): x case
-> `bar(y): to_x(y) `` — where `case` delimits the arms, so no separator is
-> needed. What it waits on is a one-line block rule, which **no** block
-> statement has today (`if c: x` does not parse either): granting `match`
-> one alone would make it the exception. Tuple destructuring on assignment
-> targets (§4.3) is unaffected and remains the only other pattern-like form.
+> **Direction [Tentative].** What is missing is a **one-line** spelling, not
+> expression-ness: a `match` in a value position yields a value as an `if`
+> chain does (§4.5). The candidate spelling is the block with its line breaks
+> removed — `` match scrut: case `foo(x): x case `bar(y): to_x(y) `` — where
+> `case` delimits the arms, so no separator is needed. It waits on a one-line
+> block rule, which no block statement has today (`if c: x` does not parse
+> either), so the rule to settle is layout's rather than `match`'s. Tuple
+> destructuring on assignment targets (§4.3) is unaffected and remains the
+> only other pattern-like form.
 >
-> `_` is accepted as an unused binder in a **pattern payload** only. Generalizing
-> it to every binder position — a lambda parameter, a `for` target, a tuple
-> destructuring slot — is the obvious extension and is **[Tentative]**: it needs
-> a rule for how `_` in a *type* position (§2.4, where it already means "infer
-> this") and `_` in a *binder* position stay distinguishable, which is by
-> position but has not been written down.
+> `_` is accepted as an unused binder in a **pattern payload** only.
+> Extending it to every binder position — a lambda parameter, a `for` target,
+> a tuple destructuring slot — is **[Tentative]**. It needs a written rule for
+> what distinguishes `_` in a type position (§2.4, where it means "infer this")
+> from `_` in a binder position; position decides it, and nothing states so.
 >
 > A per-arm guard (`` case `some(v) if v > 0: ``) is the natural next
 > addition — the IR already carries a guard alongside each arm's pattern —

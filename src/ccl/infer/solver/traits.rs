@@ -713,30 +713,27 @@ pub fn seal_emission() {
 /// emission may still be narrowed, but only by delivering a base its position already
 /// accepted.
 ///
-/// This is the timing assumption [`resolve_operand_requirements`] rests on, and it is
-/// exactly the kind that fails silently. The sweep's verdict is *joint non-emptiness*
-/// of the accepted sets it reads at end of emission, so the write that would leave
-/// that verdict stale is one which **restricts** a position past what the sweep saw. A
-/// write that picks a base from inside the swept set records a choice the sweep already
-/// licensed, and re-running it would reach the same verdict.
+/// This is the timing assumption [`resolve_operand_requirements`] rests on, and it
+/// fails silently. The sweep's verdict is joint non-emptiness of the accepted sets it
+/// reads at end of emission, so a later write that **restricts** a position past what
+/// the sweep saw leaves that verdict stale. A write that picks a base from inside the
+/// swept set records a choice the sweep already licensed, and re-running the sweep
+/// reaches the same verdict.
 ///
 /// One pass narrows after emission and it is of the second kind:
-/// `pin_unobservable_arm_payload` (`src/ccl/infer/solve.rs`) types an unreachable
-/// arm's payload. No value reaches that position, so nothing but the arm body's own
-/// reads can determine it — and it pins to a base drawn from the *intersection* of
-/// what those reads' requirements accept, which is the same joint question the sweep
-/// asks.
+/// `pin_unobservable_arm_payload` (`src/ccl/infer/solve.rs`) types an unreachable arm's
+/// payload. No value reaches that position, so its type comes from a demand recorded on
+/// it or from the arm body's own reads, and both are sets this sweep read.
 ///
-/// An obligation minted *since* the mark is unconstrained: a freshened clone is a
+/// An obligation minted since the mark is unconstrained: a freshened clone is a
 /// per-instantiation copy the sweep never read, and one that goes unsatisfiable fails
 /// by delivery.
 ///
-/// **The sibling positions are not re-read.** Delivering to one position also tightens
-/// what this obligation's *other* positions accept (`Addable` pinned to `Int` at
-/// position 0 accepts only `Int` at 1), and nothing compares that against the
-/// requirements a variable standing there carries. The verdict survives because of
-/// what a pin can choose, not because the check covers it — see
-/// `src/ccl/design/type-inference.md`, "Requirements are read together, once".
+/// **The sibling positions are not re-read.** Delivering to one position tightens what
+/// this obligation's other positions accept (`Addable` narrowed to `Int` at position 0
+/// accepts only `Int` at 1), and nothing compares that against the requirements a
+/// variable standing there carries. What bounds the exposure is what a pin can deliver
+/// — see `src/ccl/design/type-inference.md`, "Requirements are read together, once".
 #[cfg(debug_assertions)]
 fn assert_post_emission_narrowing_selects(
     obligation: &Rc<TraitObligation>,

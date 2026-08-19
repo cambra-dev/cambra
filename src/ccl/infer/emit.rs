@@ -1610,13 +1610,12 @@ pub(super) fn emit_case<C: Typing>(
             variant_type(expected_tags)
         };
         ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
-        // An arm that names no payload claims the tag carries nothing, and the claim
-        // is checked here rather than folded into the variant above so that the
-        // rejection names the arm: `` `some{Int} `` and `` `some `` are different
-        // types, and the fix is to write `` case `some(_): ``, which the arm-specific
-        // message can point at. Recorded *after* the scrutinee constraint so the
-        // payload has already flowed in — the other order leaves this one vacuous and
-        // fails the scrutinee's instead.
+        // An arm that names no payload claims the tag carries nothing. The claim is
+        // checked per arm rather than folded into the variant above so that the
+        // rejection names the arm, and the message can point at `` case `some(_): ``.
+        // Recorded after the scrutinee constraint so the payload has flowed in by
+        // then; the other order leaves this constraint vacuous and fails the
+        // scrutinee's instead.
         for b in branches.iter() {
             if let Some(p) = &b.pattern.as_ref().filter(|p| p.empty_payload) {
                 let tag = p.tag.clone();
