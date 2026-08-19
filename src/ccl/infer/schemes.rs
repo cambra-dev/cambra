@@ -8,8 +8,8 @@ use crate::ccl::FieldKey;
 use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
 use crate::ccl::{
-    AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Level, Type,
-    UnaryOpKind,
+    AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, HistoryKind, Level,
+    Type, UnaryOpKind,
 };
 
 use super::product;
@@ -110,6 +110,14 @@ pub struct OperatorSchemes {
     /// concrete commit-time `Txn`. `ν` is shared across the `write` field, the
     /// default, and the result, so this is inline-built like `get_prev_seq`.
     get_prev_txn: PolyScheme,
+    /// `∀ν. Mut(ν, Txn) → ν` — the terminal read of a transactional mutable variable
+    /// ([`Builtin::AwaitFinal`]). Inline-built for two reasons the generic
+    /// `Hole → fresh_var` conversion cannot express: `ν` is shared between the
+    /// mutable variable's value slot and the result, and the sequencing domain is the
+    /// **concrete** `Txn`. The latter is what makes awaiting an induction
+    /// accumulator (`Mut(V, [0, 3])`) a type error rather than a silent success,
+    /// since two histories of the same kind equate invariantly in their domain.
+    await_final: PolyScheme,
 }
 
 impl OperatorSchemes {
@@ -204,6 +212,22 @@ impl OperatorSchemes {
         tup.insert(FieldKey::Index(2), nu.clone());
         let get_prev_txn = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), nu));
 
+        // AwaitFinal: ∀ν. Mut(ν, Txn) → ν. The domain is the mutable variable
+        // **handle**, not a value, and its sequencing domain is the concrete `Txn`
+        // rather than a quantified one — see the field's doc for what that pins.
+        let nu = fresh_var(BODY_LEVEL);
+        let await_final = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(
+                Type::History {
+                    value: Box::new(nu.clone()),
+                    domain: Box::new(Type::Txn),
+                    kind: HistoryKind::Overwrite,
+                },
+                nu,
+            ),
+        );
+
         Self {
             bool_logic,
             concat,
@@ -213,6 +237,7 @@ impl OperatorSchemes {
             final_or_default,
             get_prev_seq,
             get_prev_txn,
+            await_final,
         }
     }
 
@@ -287,6 +312,7 @@ impl OperatorSchemes {
             Builtin::FinalOrDefault => Some(&self.final_or_default),
             Builtin::GetPrevSeq => Some(&self.get_prev_seq),
             Builtin::GetPrevTxn => Some(&self.get_prev_txn),
+            Builtin::AwaitFinal => Some(&self.await_final),
             _ => None,
         }
     }

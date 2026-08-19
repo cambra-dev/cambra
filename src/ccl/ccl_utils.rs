@@ -945,6 +945,40 @@ pub fn is_free_in_value(name: &Name, expr: &Expr) -> bool {
     count_free_in_value(name, expr) > 0
 }
 
+/// Every name free in `expr`'s **value** — the set counterpart of
+/// [`is_free_in_value`], for when the question is *which* names escaped rather than
+/// whether a particular one did.
+///
+/// A pass that only rearranges a tree can check itself against this: its output's free
+/// names must be a subset of its input's, since rearranging binds no new outside name.
+/// That is a post-condition a pass which moves statements between scopes cannot
+/// establish by construction, and one whose violation is otherwise found much later —
+/// a reference that escaped its binder survives every typecheck and surfaces as an
+/// unrecognised variable in op-conversion.
+pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
+    fn go(e: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
+        for_each_scoped_item(e, &mut |item| match item {
+            ScopedItem::VarRef(n) => {
+                if !bound.contains(n) {
+                    out.insert(n.clone());
+                }
+            }
+            // A key label names a field of the mutable variable record the node denotes, not a
+            // variable use — the same exclusion `count_free_in_value` makes.
+            ScopedItem::KeyRef(_) => {}
+            ScopedItem::Child { expr, binders } => {
+                let depth = bound.len();
+                bound.extend(binders.iter().map(|b| b.name.clone()));
+                go(expr, bound, out);
+                bound.truncate(depth);
+            }
+        });
+    }
+    let mut out = HashSet::new();
+    go(expr, &mut Vec::new(), &mut out);
+    out
+}
+
 /// Value-only worker for [`is_free_in_value`]: the same fold over
 /// [`crate::ccl::scope::for_each_scoped_item`] as [`count_free`], minus the type
 /// slots (so a refinement on a `Lambda` param — which lives in the type — is

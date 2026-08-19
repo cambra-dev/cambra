@@ -36,25 +36,27 @@
 //!    snapshot `(reg_rk(begin(r)) …, source(r))` of the variables it reads, at commit
 //!    time `begin(r)` (the [`Builtin::BeginTxn`] oracle). The `reg_k ↔
 //!    commits_j` cycle crosses `get_prev_txn` once, so it is guarded.
-//! 3. **places** the stores ([`splice_stores`]), rebinding each key variable's
-//!    `let x = init` to `let x =
-//!    final_or_default(reg_x, init)` over its history binding, so a read of the
-//!    variable (only legal inside a `with begin():` block, where it is a bare
-//!    `Var(x)`) denotes the value at that snapshot; a read fed out of a block
-//!    that does not write `x` is broadcast over the reading loop and, after
-//!    `channelize`, rewritten to an `AsOf` (an as-of read at an arbitrary commit
-//!    position) by [`rewrite_live_reads`] (this module, pre-lambda-elim); and
+//! 3. **places** the stores ([`splice_stores`]), rebinding each key variable still
+//!    named in the continuation from `let x = init` to `let x = as_of_read(reg_x)` over
+//!    its history binding — an as-of read of it, at a position nothing has supplied yet.
+//!    A read fed out of a block that does not write `x` is broadcast over the reading
+//!    loop and, after `channelize`, joined with that loop into an `AsOf` by
+//!    [`rewrite_as_of_reads`] (this module, pre-lambda-elim), which is where the
+//!    position comes from; and
 //!    **hoists** each in-block feed to
 //!    `Feed(defer, tap)` over its tap binding, for `channelize` to route as an
 //!    ordinary channel contribution.
 //!
-//! Recognition rebuilds the `Transact{domain: Txn}` op-conversion's
+//! Recognition rebuilds the `Transact{domain: Txn}` node that op-conversion's
 //! `build_commit_store` compiles to the commit engine (`CommitOperator` + fused
 //! `TransactWriter`s in a cyclic `FanOut`). A read fed *out* of a block is
 //! rewritten to an `AsOf` (an as-of read at an arbitrary commit position) by
-//! [`rewrite_live_reads`] below — every such read, regardless of the reading
-//! loop's domain; there is no terminal/"final" read of a transactional variable
-//! (`ExtractFinal` serves a terminating induction accumulator only). Each
+//! [`rewrite_as_of_reads`] below — every such read, regardless of the reading
+//! loop's domain. The one **terminal** mutable variable read is the surface
+//! [`Builtin::AwaitFinal`] marker, which [`resolve_await_finals`] replaces with a
+//! [`Builtin::FinalRead`] over the key's history binding. The two reads are **different
+//! terms** over the same history — [`Builtin::AsOfRead`] and [`Builtin::FinalRead`] — so
+//! neither pass can claim the other's read whatever the tree around it looks like. Each
 //! `to_<defer>` tap compiles to a per-commit value-stream (`body_tap_fields`).
 //! The in-block feed mirrors the induction phase's in-loop feeds
 //! ([`crate::ccl::mut_elim`]).
@@ -76,7 +78,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ccl::{
     BaseType, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey,
     HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::{is_free_in_value, synthesize_arm_predicate},
+    ccl_utils::{free_names_in_value, is_free_in_value, synthesize_arm_predicate},
     mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
 };
 
@@ -91,9 +93,20 @@ use crate::ccl::{
 /// the reading transaction sees the mutable variable as of where it lands in the commit
 /// order — so it folds to `AsOf` uniformly, whatever the reading loop's domain (a
 /// live request stream, a finite loop, or a standalone singleton). There is no
-/// finiteness or standalone-vs-loop split and no terminal/"final" alternative: a
-/// `Txn` mutable variable has no final-value term (a future `await_final` would be it). The
-/// rewrite depends on how many mutable variables `e` reads:
+/// finiteness or standalone-vs-loop split.
+///
+/// **A terminal read is a different term.** The walk below matches only
+/// [`Builtin::AsOfRead`], the term [`StorePlan::reads`] mints; a terminal read is a
+/// [`Builtin::FinalRead`] ([`resolve_await_finals`]) and is not a chain element here
+/// whatever shape it sits in. Position would not be enough on its own: `channelize` copies a
+/// channel's captured bindings inside the channel, which puts a bound await's read
+/// (`f = await_final(x)`, read by a feed loop) directly above a broadcast — the shape
+/// this walk matches.
+///
+/// Every sample must find a trigger, so [`rewrite_as_of_reads`] rejects a survivor rather
+/// than leaving a read with no reducer.
+///
+/// The rewrite depends on how many mutable variables `e` reads:
 ///
 /// - **one mutable variable** → `as_of((trigger, balance.f)) ≫ (λ k → e)`: the join latches
 ///   `f`'s current value per trigger position (a bare read `resp << balance` is the
@@ -108,39 +121,104 @@ use crate::ccl::{
 /// clock. Running **pre-lambda-elim** is what makes a computed reply work at all:
 /// after elimination the body is a point-free `const`, and lifting `e` back into a
 /// per-request map would mean synthesizing a combinator by hand.
-pub fn rewrite_live_reads(expr: &mut Expr) {
+pub fn rewrite_as_of_reads(expr: &mut Expr) -> Result<(), String> {
+    rewrite_as_of_reads_go(expr);
+    drop_dead_as_of_reads(expr);
+    // Every as-of read must have found its trigger. A survivor names a reading loop this
+    // pass did not recognize, and nothing downstream can read it — the position it reads
+    // at is exactly what the `AsOf` join supplies. Reporting it here names the pass that
+    // failed; op-conversion's arm for the builtin is the backstop if one escapes by
+    // another route.
+    match first_unpaired_as_of_read(expr) {
+        Some(hist) => Err(format!(
+            "the fed-out read of mutable variable `{}` was not paired with a reading loop \
+             — an as-of read is positioned by the loop that indexes it \
+             (transact_phase::rewrite_as_of_reads)",
+            hist.base()
+        )),
+        None => Ok(()),
+    }
+}
+
+fn rewrite_as_of_reads_go(expr: &mut Expr) {
     // Match the whole read-chain at its outermost `let` *before* recursing, so an
     // outer read binding captures the chain rather than the innermost `let` firing a
     // single-variable rewrite in isolation (which would strand the outer reads
     // unresolved).
-    if let Some(rewritten) = as_live_read(expr) {
+    if let Some(rewritten) = as_of_join(expr) {
         *expr = rewritten;
     }
-    expr.walk_children_mut(rewrite_live_reads);
+    expr.walk_children_mut(rewrite_as_of_reads_go);
 }
 
-/// One live-variable read in a reply chain: its `let` binder, the history-binding
+/// Drop `let x = as_of_read(⟨history⟩) in body` where `body` does not name `x`.
+///
+/// A fed-out read leaves two copies of its binding: the one on the spine where
+/// [`StorePlan::reads`] bound it, and the one `channelize` carries inside the channel it
+/// closes over ([`crate::ccl::channelize`]'s contribution wrap). The rewrite above pairs
+/// the copy adjacent to the broadcast, which is what leaves the other unread. Dropping it
+/// is not tidying: converted, it is a second reducer subscribed to the same store — and
+/// [`crate::interpreter::commit_operator::StoreValueStream`]'s changelog GC holds the
+/// whole stream for a scalar-final reader, so a dead one would bound nothing.
+fn drop_dead_as_of_reads(e: &mut Expr) {
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &e.node
+        && as_of_read_source(bound_expr).is_some()
+        && !is_free_in_value(&binding.name, body)
+    {
+        *e = (**body).clone();
+        drop_dead_as_of_reads(e);
+        return;
+    }
+    e.walk_children_mut(drop_dead_as_of_reads);
+}
+
+/// The history binding of the first [`Builtin::AsOfRead`] left in `e`, if any.
+///
+/// [`as_of_read`] applies the builtin to a bare history `Var`, so there is always a name
+/// to report; a read over anything else did not come from this phase, and op-conversion's
+/// arm for the builtin is what catches it.
+fn first_unpaired_as_of_read(e: &Expr) -> Option<Name> {
+    if let TypedExprNode::Apply { function, argument } = &e.node
+        && matches!(&function.node, TypedExprNode::Builtin(Builtin::AsOfRead))
+        && let TypedExprNode::Var(hist) = &argument.node
+    {
+        return Some(hist.clone());
+    }
+    let mut found = None;
+    e.walk_children(|c| {
+        if found.is_none() {
+            found = first_unpaired_as_of_read(c);
+        }
+    });
+    found
+}
+
+/// One as-of read in a reply chain: its `let` binder, the history-binding
 /// reference (the as-of source for a single-variable read — recognition later
 /// rewrites it to a variable-record projection), the variable-record field its
 /// history will occupy (`hist.field_key()`, matching recognition's read map),
 /// and the mutable variable's value type.
-struct LiveRead {
+struct BoundRead {
     name: Name,
     reg_read: Expr,
     field: String,
     value_ty: Type,
 }
 
-/// Match a chain of live-variable reads feeding a broadcast (see
-/// [`rewrite_live_reads`]) and return its as-of rewrite, or `None` if the shape /
+/// Match a chain of as-of reads feeding a broadcast (see
+/// [`rewrite_as_of_reads`]) and return its as-of rewrite, or `None` if the shape /
 /// liveness / footprint guards don't hold.
-fn as_live_read(expr: &Expr) -> Option<Expr> {
+fn as_of_join(expr: &Expr) -> Option<Expr> {
     // Walk consecutive `let kᵢ = final_or_default((⟨histᵢ⟩, _))` bindings —
     // each a bare reference to a live history binding — down to the broadcast
     // body. Pre-recognition there is no shared mutable variable record: several
     // mutable variables are several history bindings; the snapshot case rebuilds
     // their record below and recognition collapses it onto the mutable variable.
-    let mut reads: Vec<LiveRead> = Vec::new();
+    let mut reads: Vec<BoundRead> = Vec::new();
     let mut cur = expr;
     while let TypedExprNode::Let {
         binding,
@@ -148,10 +226,10 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
         body,
     } = &cur.node
     {
-        let Some((reg_read, field)) = live_mut_var_read(bound_expr) else {
+        let Some((reg_read, field)) = as_of_read_source(bound_expr) else {
             break;
         };
-        reads.push(LiveRead {
+        reads.push(BoundRead {
             name: binding.name.clone(),
             reg_read: reg_read.clone(),
             field,
@@ -173,10 +251,10 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
     // position** — the mutable variable's value as of wherever the reading transaction lands
     // in the commit order, indexed by the reading loop. This holds regardless of
     // whether the reading loop is a live request stream, a finite literal, or the
-    // synthesized singleton of a standalone read: there is no "final"/terminal
-    // read (a program cannot request the mutable variable's final value — a future
-    // `await_final` builtin would, but does not exist). So no finiteness or
-    // standalone-vs-loop classification here; all such reads fold to `AsOf`.
+    // synthesized singleton of a standalone read, so there is no finiteness or
+    // standalone-vs-loop classification here; all such reads fold to `AsOf`. A
+    // program that wants the *completed* value asks for it by name (`await_final`),
+    // whose read is a different term — see this function's docs.
     let TypedExprNode::Lambda {
         param,
         body: lam_body,
@@ -184,7 +262,7 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
     else {
         return None;
     };
-    let used: Vec<&LiveRead> = reads
+    let used: Vec<&BoundRead> = reads
         .iter()
         .filter(|r| is_free_in_value(&r.name, lam_body))
         .collect();
@@ -204,7 +282,7 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
     }
 }
 
-/// A live read whose reply combines the **request element** with the mutable variable
+/// An as-of read whose reply combines the **request element** with the mutable variable
 /// read(s): `zip((trigger, as_of((trigger, source)))) ≫ (λ p → e[r ↦ p.0, kᵢ ↦
 /// p.1(.fᵢ)])`. The `zip` pairs each request with its mutable variable snapshot; the reply
 /// projects the request off `.0` and each mutable variable off `.1` (bare for one
@@ -215,7 +293,7 @@ fn as_live_read(expr: &Expr) -> Option<Expr> {
 fn build_zip_read(
     trigger: &Expr,
     param: &TypedBinding,
-    used: &[&LiveRead],
+    used: &[&BoundRead],
     lam_body: &Expr,
     out_ty: Type,
 ) -> Option<Expr> {
@@ -282,7 +360,7 @@ fn proj_pair(p: &Name, pair_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
 }
 
 /// Replace each free `Var(name)` in `e` with `replacement` (α-unique names, so no
-/// capture; the live-read reply body contains no shadowing binder for these).
+/// capture; an as-of read's reply body contains no shadowing binder for these).
 fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
     if let TypedExprNode::Var(n) = &e.node {
         if n == name {
@@ -293,36 +371,26 @@ fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
     e.walk_children_mut(|c| subst_var_with(c, name, replacement));
 }
 
-/// Match `final_or_default((⟨hist⟩, _))` over a **commit-log** history — a bare
-/// reference to a `Txn`-domained letrec history binding — returning the read
-/// and the variable-record field its history will occupy. `None` for a
-/// non-matching bound expression or a non-`Txn` (induction-accumulator) mutable variable.
+/// Match `as_of_read(⟨hist⟩)` over a **commit-log** history — a bare reference to a
+/// `Txn`-domained letrec history binding — returning the read and the variable-record
+/// field its history will occupy. `None` for any other bound expression.
 ///
-/// The domain test is the exact `Type::Txn` commit-sequencing domain, not a
-/// derived finiteness classification: a transactional mutable variable's history is
-/// `Fun(Txn, V)` by construction, and only such a read folds to an as-of join.
-/// (An induction accumulator's history — over any iteration extent — is left for
-/// `mut_elim`'s `ExtractFinal` path.)
-fn live_mut_var_read(bound_expr: &Expr) -> Option<(&Expr, String)> {
+/// The domain test is the exact `Type::Txn` commit-sequencing domain, not a derived
+/// finiteness classification: a transactional mutable variable's history is
+/// `Fun(Txn, V)` by construction. An induction accumulator never reaches here at all —
+/// its trailing read is a `final_or_default` `mut_elim` mints and `ExtractFinal`
+/// reduces, a different term from this one.
+fn as_of_read_source(bound_expr: &Expr) -> Option<(&Expr, String)> {
     let TypedExprNode::Apply {
-        function: lod_fn,
-        argument: lod_arg,
+        function: sample_fn,
+        argument: reg_read,
     } = &bound_expr.node
     else {
         return None;
     };
-    if !matches!(
-        &lod_fn.node,
-        TypedExprNode::Builtin(Builtin::FinalOrDefault)
-    ) {
+    if !matches!(&sample_fn.node, TypedExprNode::Builtin(Builtin::AsOfRead)) {
         return None;
     }
-    let TypedExprNode::Tuple(elts) = &lod_arg.node else {
-        return None;
-    };
-    let [reg_read, _init] = elts.as_slice() else {
-        return None;
-    };
     if !matches!(reg_read.ty.domain(), Some(Type::Txn)) {
         return None;
     }
@@ -343,9 +411,9 @@ fn build_as_of(trigger: &Expr, source: &Expr, codomain: Type) -> Option<Expr> {
     Some(Expr::apply(arg, as_of_fn).with_ty(out))
 }
 
-/// A single-variable live read: `as_of((trigger, balance.f))`, bare when the reply
+/// A single-variable as-of read: `as_of((trigger, balance.f))`, bare when the reply
 /// is the identity `read`, else `≫ (λ read → e)`.
-fn build_single(trigger: &Expr, read: &LiveRead, lam_body: &Expr, out_ty: Type) -> Option<Expr> {
+fn build_single(trigger: &Expr, read: &BoundRead, lam_body: &Expr, out_ty: Type) -> Option<Expr> {
     let as_of = build_as_of(trigger, &read.reg_read, read.value_ty.clone())?;
     if matches!(&lam_body.node, TypedExprNode::Var(n) if *n == read.name) {
         return Some(as_of);
@@ -354,7 +422,7 @@ fn build_single(trigger: &Expr, read: &LiveRead, lam_body: &Expr, out_ty: Type) 
     Some(Expr::compose(vec![as_of, reply]).with_ty(out_ty))
 }
 
-/// A multi-variable live read: `as_of((trigger, (f_a: ⟨a-hist⟩, f_b:
+/// A multi-variable as-of read: `as_of((trigger, (f_a: ⟨a-hist⟩, f_b:
 /// ⟨b-hist⟩))) ≫ (λ snap → e[kᵢ ↦ snap.fᵢ])` — one snapshot record per
 /// request (§I-c), the reply projecting each mutable variable off it. The source is a
 /// record *literal* of the history-binding reads (the shared mutable variable record
@@ -363,7 +431,7 @@ fn build_single(trigger: &Expr, read: &LiveRead, lam_body: &Expr, out_ty: Type) 
 /// so the engine latches one whole-variable snapshot per request.
 fn build_snapshot(
     trigger: &Expr,
-    used: &[&LiveRead],
+    used: &[&BoundRead],
     lam_body: &Expr,
     out_ty: Type,
 ) -> Option<Expr> {
@@ -393,7 +461,7 @@ fn build_snapshot(
 
 /// Replace each `Var(read.name)` in `e` with `snap.read.field` — the projection
 /// of that mutable variable off the latched snapshot record.
-fn project_reads(e: &mut Expr, used: &[&LiveRead], snap: &Name, snap_ty: &Type) {
+fn project_reads(e: &mut Expr, used: &[&BoundRead], snap: &Name, snap_ty: &Type) {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(r) = used.iter().find(|r| &r.name == n)
     {
@@ -530,14 +598,14 @@ struct FeedSite {
 /// [`collect_txn_mut_vars`]). Keying on the exact binder identity (not the surface
 /// base name) makes the fold immune to an unrelated local variable merely
 /// *spelled* like a mutable variable.
-pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
+pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     // Strip whenever a `with begin():` block is present. A block need not write a
     // transactional mutable variable — a read-only block (`out << balance`) has no write
     // yet must still be unwrapped off the loop spine — so we cannot short-circuit
     // on `txn_mut_vars` alone; but with neither a mutable variable nor a block there is
     // nothing to do.
     if txn_mut_vars.is_empty() && !contains_begin(&expr) {
-        return expr;
+        return Ok(expr);
     }
     let mut harvest = Stripped::default();
     let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
@@ -560,11 +628,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
         sites,
         read_only_footprints,
     } = harvest;
-    if sites.is_empty() {
-        return stripped;
-    }
-
-    // Variable keys: the union of every writer's footprint (read ∪ write), in
+    // Mutable variable keys: the union of every writer's footprint (read ∪ write), in
     // first-occurrence order. These are exact (α-unique) `Name`s.
     let mut key_names: Vec<Name> = Vec::new();
     for s in &sites {
@@ -578,6 +642,31 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
     // matching the induction path's one-letrec-per-loop.
     let groups = partition_keys(&key_names, &sites, &read_only_footprints);
 
+    // A mutable variable **no site touches** has no commit history to complete, so its final
+    // value is its seed — the empty-history case of `final_or_default`, with the
+    // history known empty statically. Resolving those awaits here (rather than at the
+    // history bindings, which such a mutable variable has none of) is also what makes the
+    // no-site early return below safe: `await_final(pool)` with no `with begin():`
+    // anywhere is that same program with `sites` empty.
+    let mut stripped = stripped;
+    // Gated on the **write** footprints, not on `key_names`: a key some block only
+    // reads is a footprint key (`{reads ∪ writes}` is one store) yet nothing can write
+    // it, so its final value is statically its seed just as an untouched variable's is.
+    let written_keys: Vec<Name> = sites
+        .iter()
+        .flat_map(|s| s.write_keys.iter().cloned())
+        .collect();
+    resolve_writer_free_awaits(&mut stripped, &written_keys);
+
+    if sites.is_empty() {
+        assert!(
+            !contains_await_final(&stripped),
+            "transact_phase: an `await_final` marker survived a writer-free program — every \
+             mutable variable in it is writer-free, so every marker resolves to a seed"
+        );
+        return Ok(stripped);
+    }
+
     // Each key's tick-0 `init`, located at its `MutDecl` (the value type is
     // the init's type — the snapshot/write element type of that variable).
     let mut key_init: HashMap<Name, Expr> = HashMap::new();
@@ -590,6 +679,11 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
         );
     }
 
+    // A store's own bindings may not depend on the completion of that same store.
+    // Checked here rather than before the phase because the rule is per store, and the
+    // partition is what says which awaits a given writer or seed is forbidden.
+    check_store_acyclicity(&stripped, &sites, &key_init, &groups)?;
+
     // Fold induction loops whose accumulator a commit decision reads out of the
     // continuation and into an *outer* induction letrec: `commits(r)` is bound
     // inside the transaction letrec, so an accumulator it reads must be in scope
@@ -601,7 +695,45 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
     // `mut_elim`.
     let cross_reads = cross_domain_reads(&sites, txn_mut_vars);
     let mut cross = CrossDomain::default();
-    let stripped = fold_cross_domain_loops(stripped, &cross_reads, &mut cross);
+    let mut stripped = fold_cross_domain_loops(stripped, &cross_reads, &mut cross);
+
+    // Fresh history-binding name per key, distinct from the surface variable so a read
+    // of the history is not a self-reference; recognition keys the `Transact` off these.
+    // Minted for every key at once, before any store is planned, because resolving an
+    // await needs the *awaited* key's history name and the awaited key may belong to a
+    // store planned later.
+    let hist: HashMap<Name, Name> = key_names
+        .iter()
+        .map(|k| (k.clone(), Name::fresh(k.base())))
+        .collect();
+
+    // Resolve every `await_final` marker to a terminal read over its mutable variable's
+    // history binding, seeds first. A seed is resolved to a *fixpoint* because one seed
+    // may await a mutable variable whose own seed is an await (phase separation, chained); that
+    // terminates because a seed can only await a mutable variable declared above it, so the
+    // await relation on seeds is acyclic. The continuation is then one pass — its
+    // markers read the finished seeds.
+    //
+    // Doing this before placement is what keeps placement await-blind: a resolved read
+    // *names* a history binding, so [`StorePlan::is_read_by`] puts the statement inside
+    // the right store with no await-specific logic, and the shared
+    // `let k = as_of_read(…)` rebind is left to serve the as-of reads only.
+    for _ in 0..=key_names.len() {
+        if !key_init.values().any(contains_await_final) {
+            break;
+        }
+        for k in key_names.clone() {
+            let mut init = key_init[&k].clone();
+            resolve_await_finals(&mut init, &hist, &key_init);
+            key_init.insert(k, init);
+        }
+    }
+    assert!(
+        !key_init.values().any(contains_await_final),
+        "transact_phase: a mutable variable seed still awaits after one resolution round per key — \
+         the await relation on seeds must be acyclic"
+    );
+    resolve_await_finals(&mut stripped, &hist, &key_init);
 
     // Which store each site commits into: the one holding its footprint. Every key a
     // site touches is in one partition by construction, so any of them names it.
@@ -636,9 +768,22 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Expr {
     let stores: Vec<StorePlan> = groups
         .into_iter()
         .zip(per_store)
-        .map(|(keys, (writers, site_feeds))| plan_store(keys, &key_init, writers, site_feeds))
+        .map(|(keys, (writers, site_feeds))| {
+            plan_store(keys, &hist, &key_init, writers, site_feeds)
+        })
         .collect();
-    splice_stores(stripped, &stores, &key_init, cross)
+
+    let out = splice_stores(stripped, &stores, &key_init, cross);
+    // Every `await_final` marker was resolved to a terminal read over a history
+    // binding. A survivor would be a marker on a mutable variable this phase did not fold
+    // into a key — it has no history to complete — and would reach op-conversion's
+    // deliberate-error arm as an opaque builtin instead of being diagnosed here.
+    assert!(
+        !contains_await_final(&out),
+        "transact_phase: an `await_final` marker survived — it names a mutable variable with no \
+         commit history in any store"
+    );
+    Ok(out)
 }
 
 /// Partition the mutable variable keys into **commit stores**: one store per set of keys
@@ -691,7 +836,7 @@ fn partition_keys(
     // is not a store key: nothing can advance it (the write gate admits a mutable variable
     // write only inside a block, and a block write would put it in a write set), so
     // its history is constant at its seed and every read of it is that seed. It keeps
-    // its `MutDecl` on the spine and relates nothing — sampling it at a frontier would
+    // its `MutDecl` on the spine and relates nothing — reading it at a frontier would
     // cost a store key to learn what the declaration already says. Only the keys some
     // writer does touch are unioned.
     for f in read_only_footprints {
@@ -1124,7 +1269,7 @@ fn partition_spine(expr: Expr, txn_mut_vars: &HashSet<Name>, lifted: &mut Vec<Ex
         // Unreachable for the same reason as in `splice_block`: this walks a
         // *block's* spine, and a mutable variable cannot be declared inside a block.
         // A top-level mutable variable introduction is not this spine — it is above the
-        // block, where `rebind_letrec` handles it.
+        // block, where `walk_spine` handles it.
         TypedExprNode::MutDecl { .. } => todo!(
             "partition_spine: a mutable variable declared inside a `with begin():` block — \
              lowering cannot produce one yet"
@@ -1254,6 +1399,300 @@ pub fn check_no_guarded_induction_write_in_block(
         }
     });
     result
+}
+
+/// Enforce that `await_final` **consumes** its mutable variable: no mention of a mutable variable
+/// may follow its own `await_final`.
+///
+/// `await_final(x)` declares `x`'s commit history complete, which is what makes "final"
+/// name a fixed value: it closes the writer set (the CHL spec,
+/// [`await_final`](../../../docs/chl-spec.md#86-await_final-decided)). A later mention
+/// uses something already used up — a write would extend a history the program reduced,
+/// a read would sample a store nothing can still drive, and a second `await_final(x)` is
+/// such a mention too.
+///
+/// One occurrence check covers every route, because a mention is always a `Var` or a
+/// `MutWrite` target:
+///
+/// - A **write** inside a later block is a `MutWrite` targeting `x`; a **read** inside one
+///   is a bare `Var(x)` in the writer body. Outside a block both are already rejected at
+///   lowering (`lower_expr`'s read gate, `check_mut_write_context`).
+/// - A **pass-by-reference argument** is the one mention lowering lets through — a
+///   `Mut`-typed argument is a bare `Var` by rule, so `lower_call_arg` bypasses the
+///   gate — and `inline` beta-reduces it into the callee body, where it becomes one of
+///   the two above.
+///
+/// Two edges of the rule:
+///
+/// - A callee that *ignores* its mutable variable parameter is accepted against the
+///   letter of the spec, because beta-reduction erases the mention: `ignore(x, …)` after
+///   `await_final(x)` leaves nothing to find. It denotes no read, write, or operator, so
+///   it is inert rather than unsound.
+/// - The awaited set is not scoped to a conditional arm, so an await in one arm rejects a
+///   mention in the sibling arm, and awaits in two arms read as awaiting twice. Both are
+///   conservative: an await under a guard does not close the writer set the way an
+///   unconditional one does.
+///
+/// A block after an await is accepted here: a block committing some other
+/// mutable variable is a separate store, unordered against this one. A block that reaches
+/// back into the awaited mutable variable's own store is what [`check_store_acyclicity`]
+/// rejects, and only through a store-mate, since this rule already forbids naming the
+/// awaited mutable variable itself.
+///
+/// **Why post-inline and not at lowering.** A callee's mention only becomes a read or a
+/// write once inlined, exactly as a callee's `Begin` only becomes a nested transaction
+/// once inlined ([`check_no_nested_transactions`]). It also needs source order, which the
+/// continuation spine here supplies ([`Expr::walk_children`] visits `bound_expr` before `body`
+/// for every spine node) and lowering's right-to-left statement chain is not.
+pub fn check_await_final_linearity(expr: &Expr) -> Result<(), String> {
+    fn used_up(reg: &Name) -> String {
+        format!(
+            "`{reg}` is unreferenceable after `await_final({reg})`: the await consumes the \
+             mutable variable, declaring its commit history complete",
+            reg = reg.base()
+        )
+    }
+    fn go(e: &Expr, awaited: &mut HashSet<Name>) -> Result<(), String> {
+        match &e.node {
+            TypedExprNode::Var(reg) if awaited.contains(reg) => return Err(used_up(reg)),
+            TypedExprNode::MutWrite { name, .. } if awaited.contains(name) => {
+                return Err(used_up(name));
+            }
+            // The await itself. Its operand is a handle, not a read, so the `Var` is
+            // not descended into — otherwise the await would report itself.
+            TypedExprNode::Apply { argument, function }
+                if matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal)) =>
+            {
+                let TypedExprNode::Var(reg) = &argument.node else {
+                    return Err(
+                        "await_final's operand must be a bare mutable variable reference"
+                            .to_string(),
+                    );
+                };
+                if !awaited.insert(reg.clone()) {
+                    return Err(used_up(reg));
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        let mut result = Ok(());
+        e.walk_children(|c| {
+            if result.is_ok() {
+                result = go(c, awaited);
+            }
+        });
+        result
+    }
+    go(expr, &mut HashSet::new())
+}
+
+/// Reject an `await_final` a commit store's **own** bindings depend on — a cycle.
+///
+/// `await_final(k)` reduces `k`'s store to completion, so nothing that store needs may
+/// depend on it. Three positions do, each of them read by the store's own letrec
+/// bindings:
+///
+/// - a **writer's iteration source** — the block's extent would depend on the completion
+///   of a store that cannot complete until that block has committed;
+/// - a **writer's decision body** — the same cycle through the value rather than the
+///   extent. Always by *taint*, since lowering rejects an `await_final` written inside a
+///   block outright;
+/// - a **mutable variable key's seed** — the store's tick-0 value would await the
+///   completion of the store it is a key of.
+///
+/// Every reachable instance reaches the store through a **store-mate** of the awaited
+/// key, never through the key itself: [`check_await_final_linearity`] already rejects a
+/// later write or read of `k`, so a block that commits into `k`'s store after the await
+/// gets there by writing some other key that block relates to `k`. `f =
+/// await_final(a)` followed by `with begin(): b := b + f`, where an earlier block writes
+/// both `a` and `b`, is the shape — one per position, in
+/// `writer_body_depending_on_its_own_store_s_await_rejected` and its two siblings.
+///
+/// The rule is per store. An await of a key in another store is an ordinary
+/// dependency between two recurrences — a one-way edge between two letrecs, which
+/// [`check_letrec_causal`](crate::ccl::letrec::check_letrec_causal) permits since it
+/// forbids only cycles. That is what makes **phase separation** compile; the CHL spec,
+/// [`await_final`](../../../docs/chl-spec.md#86-await_final-decided), gives the program.
+/// Everything outside a store's own bindings is likewise fine: a block may follow an
+/// await, an await may be bound and used (`f = await_final(pool)`), and an **induction**
+/// accumulator may be seeded from one (`x := await_final(pool)`) — a different
+/// recurrence, so no cycle to have.
+///
+/// **How the taint is computed.** A pre-order walk of the stripped continuation in source
+/// order marks each name with the *keys* whose awaits it depends on, directly or through
+/// an already-marked name. "Name" rather than "binder": an induction accumulator written
+/// inside a loop picks up the taint of that write, so a dependency laundered through the
+/// loop body is caught alongside one written into the seed. (Only induction writes reach
+/// here — a mutable variable write lives in a block, which is stripped into a site.)
+/// Source order is what makes one pass enough: a name is marked before any statement that
+/// could read it is visited. Writer sites are checked against the finished set rather than
+/// in place, since they no longer sit on the spine; that over-approximates only in the
+/// safe direction, because linearity puts every mention of an awaited mutable variable
+/// *above* its await.
+fn check_store_acyclicity(
+    stripped: &Expr,
+    sites: &[RawSite],
+    key_init: &HashMap<Name, Expr>,
+    groups: &[Vec<Name>],
+) -> Result<(), String> {
+    /// Every awaited key `e` depends on, directly or through a marked binder.
+    ///
+    /// The marked names are found by looking up `e`'s free names, not by testing each
+    /// marked name against `e`: both are one walk of `e`, but the lookup direction keeps
+    /// the cost independent of how many names are already marked. `mark` calls this once
+    /// per binding *value* — the spine continues through the body — so the whole check
+    /// stays linear in the tree. The result is sorted, so the `HashSet` iteration order
+    /// does not reach the caller's error message.
+    fn awaited_in(e: &Expr, marked: &HashMap<Name, Vec<Name>>) -> Vec<Name> {
+        fn direct(e: &Expr, out: &mut Vec<Name>) {
+            if let TypedExprNode::Apply { argument, function } = &e.node
+                && matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))
+                && let TypedExprNode::Var(reg) = &argument.node
+            {
+                out.push(reg.clone());
+            }
+            e.walk_children(|c| direct(c, out));
+        }
+        let mut out = Vec::new();
+        direct(e, &mut out);
+        for n in free_names_in_value(e) {
+            if let Some(keys) = marked.get(&n) {
+                out.extend(keys.iter().cloned());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+    fn mark(e: &Expr, marked: &mut HashMap<Name, Vec<Name>>) {
+        // Every way a name acquires a value, not just the ones that introduce it: an
+        // induction accumulator written in a loop (`acc := acc + f`) carries the taint of
+        // whatever that write reads, so a store dependency laundered through the loop is
+        // the same cycle as one written into the accumulator's seed. A write *adds* to
+        // the name's taint rather than replacing it — the accumulator's value after the
+        // loop depends on its seed and on every write.
+        let bound = match &e.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                ..
+            } => Some((&binding.name, &**bound_expr)),
+            TypedExprNode::MutDecl { binding, init, .. } => Some((&binding.name, &**init)),
+            TypedExprNode::MutWrite { name, value } => Some((name, &**value)),
+            _ => None,
+        };
+        if let Some((name, value)) = bound {
+            let keys = awaited_in(value, marked);
+            if !keys.is_empty() {
+                let entry = marked.entry(name.clone()).or_default();
+                entry.extend(keys);
+                entry.sort();
+                entry.dedup();
+            }
+        }
+        e.walk_children(|c| mark(c, marked));
+    }
+    let mut marked: HashMap<Name, Vec<Name>> = HashMap::new();
+    mark(stripped, &mut marked);
+    if marked.is_empty() {
+        return Ok(());
+    }
+
+    let store_of = |k: &Name| groups.iter().position(|g| g.contains(k));
+    // An await of `awaited` is a cycle for a binding of the store `store` belongs to.
+    let clash = |awaited: &[Name], store: Option<usize>| -> Option<Name> {
+        let store = store?;
+        awaited.iter().find(|k| store_of(k) == Some(store)).cloned()
+    };
+
+    // Seeds before sites: a block reading a mutable variable whose *seed* awaits is derivatively
+    // in the cycle too, and the seed is the root cause — reporting the block instead
+    // would point at the statement that merely inherits the problem.
+    // In key order — `groups` is built in `key_names` order — rather than `key_init`'s
+    // hash order, so a program with two clashing seeds names the same one every run.
+    for k in groups.iter().flatten() {
+        if let Some(j) = clash(&awaited_in(&key_init[k], &marked), store_of(k)) {
+            return Err(format!(
+                "the seed of transactional mutable variable `{}` depends on `await_final({})`, and the \
+                 two share a commit store — `{}`'s value at commit tick 0 would await that \
+                 store's own completion. (An induction accumulator may be seeded from an await: \
+                 it is a different recurrence. Two transactional mutable variables land in one store \
+                 only when some `with begin():` block mentions them together.)",
+                k.base(),
+                j.base(),
+                k.base()
+            ));
+        }
+    }
+    for s in sites {
+        let store = s
+            .write_keys
+            .first()
+            .or_else(|| s.read_keys.first())
+            .and_then(store_of);
+        for (what, e) in [("iteration source", &s.source), ("body", &s.block)] {
+            if let Some(k) = clash(&awaited_in(e, &marked), store) {
+                return Err(format!(
+                    "a `with begin():` block's {what} depends on `await_final({0})`, and the \
+                     block commits into `{0}`'s own store — it would await a history it has not \
+                     finished writing",
+                    k.base()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `await_final(x)` for a mutable variable **no writer site writes**: replace it
+/// with `x`'s seed, read off `x`'s own `MutDecl`.
+///
+/// Such a mutable variable's write history is statically empty, so its final value is its
+/// seed and no runtime completion has to be waited on. Two shapes reach here. One no site
+/// mentions at all is not a footprint key and gets no history binding. One a block only
+/// *reads* is a footprint key — `{reads ∪ writes}` is one store, which is why the `limit` a
+/// guard consults sits beside the `total` it guards — and its history binding simply goes
+/// unread by the await. The `MutDecl` itself is left in place either way, and `mut_elim`
+/// turns it into an ordinary `let` as it does any other.
+fn resolve_writer_free_awaits(e: &mut Expr, written_keys: &[Name]) {
+    let mut awaited: Vec<Name> = Vec::new();
+    fn collect(e: &Expr, written_keys: &[Name], out: &mut Vec<Name>) {
+        if let TypedExprNode::Apply { argument, function } = &e.node
+            && matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))
+            && let TypedExprNode::Var(reg) = &argument.node
+            && !written_keys.contains(reg)
+            && !out.contains(reg)
+        {
+            out.push(reg.clone());
+        }
+        e.walk_children(|c| collect(c, written_keys, out));
+    }
+    collect(e, written_keys, &mut awaited);
+    if awaited.is_empty() {
+        return;
+    }
+    let mut seeds: HashMap<Name, Expr> = HashMap::new();
+    collect_key_inits(e, &awaited, &mut seeds);
+    fn rewrite(e: &mut Expr, seeds: &HashMap<Name, Expr>) {
+        if let TypedExprNode::Apply { argument, function } = &e.node
+            && matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))
+            && let TypedExprNode::Var(reg) = &argument.node
+            && let Some(seed) = seeds.get(reg)
+        {
+            *e = seed.clone();
+            return;
+        }
+        e.walk_children_mut(|c| rewrite(c, seeds));
+    }
+    rewrite(e, &seeds);
+}
+
+/// Whether `e` contains an [`Builtin::AwaitFinal`] application anywhere.
+fn contains_await_final(e: &Expr) -> bool {
+    (matches!(&e.node, TypedExprNode::Apply { function, .. }
+        if matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))))
+        || e.any_child(contains_await_final)
 }
 
 /// The first non-txn `MutWrite` target that appears **inside a statement-`Case`**
@@ -1980,19 +2419,6 @@ fn fun_parts(ty: &Type) -> (Type, Type) {
     }
 }
 
-/// `final_or_default((stream, init)) : value_ty` — the current/final committed
-/// value of a scalar mutable variable's history, defaulting to `init`.
-fn final_or_default_read(stream: Expr, init: Expr, value_ty: Type) -> Expr {
-    let arg_ty = Type::Tuple(vec![stream.ty.clone(), init.ty.clone()]);
-    let mut arg = Expr::tuple(vec![stream, init]);
-    arg.ty = arg_ty.clone();
-    let mut lod = Expr::builtin(Builtin::FinalOrDefault);
-    lod.ty = Type::fun(arg_ty, value_ty.clone());
-    let mut app = Expr::apply(arg, lod);
-    app.ty = value_ty;
-    app
-}
-
 /// One site's **per-key commit view** — the point-free projection of its
 /// commit-record stream to `{time, write}` for one written key, eliminating the
 /// `` {`commit{𝑃} | `abort} `` decision with a one-arm `commit` read:
@@ -2133,16 +2559,14 @@ struct HoistedFeed {
 /// recognizing on the point-free `LetRec` directly.)
 fn plan_store(
     key_names: Vec<Name>,
+    all_hist: &HashMap<Name, Name>,
     key_init: &HashMap<Name, Expr>,
     writers: Vec<WriterSite>,
     site_feeds: Vec<Vec<FeedSite>>,
 ) -> StorePlan {
-    // Fresh history-binding name per key, distinct from the surface variable so
-    // the continuation's `let k = final_or_default(reg_k, init)` reads the
-    // history without self-reference. recognition keys the `Transact` off these.
     let hist: HashMap<Name, Name> = key_names
         .iter()
-        .map(|k| (k.clone(), Name::fresh(k.base())))
+        .map(|k| (k.clone(), all_hist[k].clone()))
         .collect();
     // One commit-record binding name per `with begin():` site.
     let commits: Vec<Name> = (0..writers.len())
@@ -2416,23 +2840,33 @@ impl StorePlan {
             || self.hoisted.iter().any(|f| is_free_in_value(&f.defer, e))
     }
 
-    /// The trailing reads to bind over this store's body: one
-    /// `let x = final_or_default(⟨history⟩, init)` per key — the same read an
-    /// induction accumulator gets after its loop, over a `Txn` history instead of an
-    /// iteration extent. The init's type is the mutable variable's value type `V` (the
-    /// `Mut(V, Txn)` wrapper rode the binding/annotation, not the init RHS);
-    /// `mut_var_value_ty` peels it defensively.
-    fn reads(&self, key_init: &HashMap<Name, Expr>) -> Vec<(TypedBinding, Expr)> {
+    /// The **as-of reads** to bind over `body`: one `let x = as_of_read(⟨history⟩)` per key
+    /// still *named* there.
+    ///
+    /// Every read that reaches here is fed out of a block, so every one of them is an
+    /// as-of sample; [`rewrite_as_of_reads`] pairs each with the reading loop that indexes
+    /// it and builds the `AsOf` join. The term is [`Builtin::AsOfRead`] rather than the
+    /// `final_or_default` an induction accumulator's trailing read gets, because a `Txn`
+    /// history has no final until a program asks for one by name — that read is
+    /// [`resolve_await_finals`]', and keeping the two terms distinct is what stops either
+    /// pass from claiming the other's read (`Builtin::AsOfRead`).
+    ///
+    /// One binding per key, shared by every read of it, rather than a sample substituted
+    /// at each read site: the chain of bindings is what lets [`as_of_join`] fold several
+    /// keys' reads into a single snapshot record at one commit frontier, which is
+    /// snapshot consistency for a reply that reads two variables.
+    ///
+    /// A key whose every read was an `await_final` has no reference left to bind:
+    /// [`resolve_await_finals`] already gave each await its own terminal read, so
+    /// binding an as-of read here too would leave a second, unconsumed read on the
+    /// store.
+    fn reads(&self, key_init: &HashMap<Name, Expr>, body: &Expr) -> Vec<(TypedBinding, Expr)> {
         self.key_names
             .iter()
+            .filter(|k| is_free_in_value(k, body))
             .map(|k| {
                 let v = mut_var_value_ty(&key_init[k].ty);
-                let stream = tvar(&self.hist[k], history_ty(&v));
-                let init = key_init.get(k).cloned().expect("key init present");
-                (
-                    binding(k.clone(), v.clone()),
-                    final_or_default_read(stream, init, v),
-                )
+                (binding(k.clone(), v.clone()), as_of_read(&self.hist[k], v))
             })
             .collect()
     }
@@ -2469,12 +2903,27 @@ impl StorePlan {
 /// well-defined: reading two mutable variables together is a `with begin():` block, and
 /// [`partition_keys`] put those keys in one store so that the read has one
 /// snapshot to come from.
+///
+/// **Nesting order.** Store 0 is outermost, so store `i`'s bindings are in scope for
+/// every later store but not the reverse — a store may only reference the histories of
+/// stores that precede it. `partition_keys` orders stores by the first site that mentions
+/// each key, and an `await_final` that seeds a later store names a mutable variable every
+/// mention of which is above the await ([`check_await_final_linearity`]) — so a store's
+/// seeds reference only stores whose sites came first.
+///
+/// That is an ordering *argument* rather than a construction, as is every placement here:
+/// the level assignment, the cross-domain group's own level ([`cross_level`]), and the
+/// nesting are three separate reasons a reference stays in scope, none enforced by the
+/// shapes being built. One post-condition covers all three — the placed tree may not have
+/// gained a free name — as a release assert, because an escape survives the strict
+/// typecheck and surfaces much later as an unrecognised variable in op-conversion.
 fn splice_stores(
     expr: Expr,
     stores: &[StorePlan],
     key_init: &HashMap<Name, Expr>,
     cross: CrossDomain,
 ) -> Expr {
+    let free_before = free_names_in_value(&expr);
     // Statements carried into each store's body, in source order. Index `i` holds the
     // statements that ride inside `stores[i]`; level 0 keeps its place and is never
     // collected here.
@@ -2483,6 +2932,16 @@ fn splice_stores(
     debug_assert!(
         carried.iter().all(Vec::is_empty),
         "splice_stores: a carried statement was never placed"
+    );
+    let escaped: Vec<String> = free_names_in_value(&placed)
+        .difference(&free_before)
+        .map(Name::to_string)
+        .collect();
+    assert!(
+        escaped.is_empty(),
+        "splice_stores: {} escaped its binder — a statement was placed outside the scope it \
+         reads, or a store outside one it depends on",
+        escaped.join(", ")
     );
     placed
 }
@@ -2496,18 +2955,6 @@ fn walk_spine(
     cross: CrossDomain,
     carried: &mut Vec<Vec<Expr>>,
 ) -> Expr {
-    // The innermost store `e` reads, directly or through a statement already carried.
-    // `None` is level 0 — above every letrec.
-    let level_of = |e: &Expr, carried: &[Vec<Expr>]| -> Option<usize> {
-        let direct = stores.iter().rposition(|s| s.is_read_by(e));
-        let inherited = carried.iter().enumerate().rev().find_map(|(i, stmts)| {
-            stmts
-                .iter()
-                .any(|c| carried_provides(c).iter().any(|n| is_free_in_value(n, e)))
-                .then_some(i)
-        });
-        direct.max(inherited)
-    };
     let all_keys = |name: &Name| stores.iter().any(|s| s.key_names.contains(name));
     match expr.node {
         // A variable-key declaration: dropped, its seed already captured in `key_init`.
@@ -2522,7 +2969,7 @@ fn walk_spine(
         | TypedExprNode::ExprStmt { .. } => {
             let mut node = expr;
             let body = take_spine_body(&mut node);
-            match level_of(spine_value(&node), carried) {
+            match level_of(spine_value(&node), stores, carried) {
                 Some(level) => {
                     carried[level].push(node);
                     walk_spine(body, stores, key_init, cross, carried)
@@ -2534,24 +2981,81 @@ fn walk_spine(
             }
         }
         // The tail: close the stores from the inside out, each over its own carried
-        // statements, then wrap the whole nest in the folded cross-domain loops.
+        // statements, with the folded cross-domain loops at their own level in the nest.
         _ => {
+            let cross_level = cross_level(&cross, stores, carried);
+            let mut cross = Some(cross);
             let mut inner = expr;
             for (i, store) in stores.iter().enumerate().rev() {
+                // Inside store `i` but outside every store nested in it — the same
+                // placement a statement carried into store `i` gets.
+                if cross_level == Some(i)
+                    && let Some(c) = cross.take()
+                {
+                    inner = wrap_cross_domain(inner, c);
+                }
                 inner = carried[i]
                     .drain(..)
                     .rev()
                     .fold(inner, |body, node| relink_spine_body(node, body));
+                let reads = store.reads(key_init, &inner);
                 inner = close_recurrence_group(
                     store.bindings.clone(),
-                    store.reads(key_init),
+                    reads,
                     store.feed_views(),
                     inner,
                 );
             }
-            wrap_cross_domain(inner, cross)
+            match cross {
+                Some(c) => wrap_cross_domain(inner, c),
+                None => inner,
+            }
         }
     }
+}
+
+/// Where the folded cross-domain induction letrecs sit in the store nest — the same
+/// **level** a spine statement gets, computed over everything the group references.
+///
+/// Outermost (`None`) is the usual answer and the one the invariant demands: an
+/// accumulator a commit decision reads must be bound outside every store that reads it.
+/// But the group can itself depend on a store, through an `await_final`: in
+/// `fa = await_final(a)` followed by `for x in xs: acc := acc + fa`, the accumulator's
+/// loop reads `fa`, which is carried into `a`'s store — so hoisting the loop outermost
+/// would leave it naming a binding below itself.
+///
+/// The two demands never conflict, because the store an await-derived binding comes
+/// from is always *outside* the store that reads the accumulator. Every writer of the
+/// awaited mutable variable precedes the await ([`check_await_final_linearity`] rejects a later
+/// mention), and a store reading the accumulator commits after the accumulator's loop,
+/// hence after the await — so its keys occur later and [`partition_keys`] gives it the
+/// higher index. The two cannot be one store either: that is the cycle
+/// [`check_store_acyclicity`] rejects.
+fn cross_level(cross: &CrossDomain, stores: &[StorePlan], carried: &[Vec<Expr>]) -> Option<usize> {
+    if cross.bindings.is_empty() {
+        return None;
+    }
+    cross
+        .bindings
+        .iter()
+        .chain(cross.reads.iter())
+        .map(|(_, e)| e)
+        .chain(cross.feeds.iter().map(|(_, e)| e))
+        .filter_map(|e| level_of(e, stores, carried))
+        .max()
+}
+
+/// The innermost store `e` reads, directly or through a statement already carried into
+/// one. `None` is level 0 — above every letrec.
+fn level_of(e: &Expr, stores: &[StorePlan], carried: &[Vec<Expr>]) -> Option<usize> {
+    let direct = stores.iter().rposition(|s| s.is_read_by(e));
+    let inherited = carried.iter().enumerate().rev().find_map(|(i, stmts)| {
+        stmts
+            .iter()
+            .any(|c| carried_provides(c).iter().any(|n| is_free_in_value(n, e)))
+            .then_some(i)
+    });
+    direct.max(inherited)
 }
 
 /// The names a carried spine node makes a later statement depend on it: a `let` or
@@ -2618,6 +3122,73 @@ fn relink_spine_body(mut node: Expr, inner: Expr) -> Expr {
         _ => unreachable!("not a spine node"),
     }
     node
+}
+
+/// Replace every `await_final(x)` marker — `x ▷ await_final` —
+/// with `x`'s terminal read over its history binding ([`final_key`]).
+///
+/// The read is a sample of the key's carried value, at the position `x`'s writers finish:
+/// [`Builtin::FinalRead`], reaching op-conversion as
+/// [`StoreFinalRead`](crate::interpreter::commit_operator::StoreFinalRead) over the store
+/// branch. It carries no seed, tick 0 of the store being its keys' seeds.
+///
+/// What keeps this read distinct from a fed-out one is the **term**, not where it sits:
+/// a fed-out read is [`Builtin::AsOfRead`], the only thing [`rewrite_as_of_reads`]
+/// matches. Position alone would leave the two indistinguishable for a bound await a feed
+/// loop reads, since `channelize` copies such a read into the channel it closes, directly
+/// above the broadcast.
+///
+/// A marker naming a non-key mutable variable cannot occur: one with no writer site is
+/// still a footprint key of any site that reads it, and one nothing touches at all is
+/// resolved earlier by [`resolve_writer_free_awaits`]. The post-condition assert in
+/// [`run`] confirms none survives.
+fn resolve_await_finals(e: &mut Expr, hist: &HashMap<Name, Name>, key_init: &HashMap<Name, Expr>) {
+    if let TypedExprNode::Apply { argument, function } = &e.node
+        && matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))
+        && let TypedExprNode::Var(reg) = &argument.node
+        && hist.contains_key(reg)
+    {
+        *e = final_key(reg, hist, key_init);
+        return;
+    }
+    e.walk_children_mut(|c| resolve_await_finals(c, hist, key_init));
+}
+
+/// `final_read(reg_k)` — key `k`'s **terminal read**: its value at the position its own
+/// writers finish. Minted only for a [`Builtin::AwaitFinal`] marker.
+///
+/// No seed operand, for the same reason [`as_of_read`] has none: this samples the carried
+/// value, and tick 0 of every store is its keys' seeds. The key's `init` is still read
+/// here, for its *type* — the value type of the history the read names — and not as a
+/// term. A key no writer site writes never reaches here at all:
+/// [`resolve_writer_free_awaits`] has replaced its await with the seed.
+fn final_key(k: &Name, hist: &HashMap<Name, Name>, key_init: &HashMap<Name, Expr>) -> Expr {
+    let init = key_init.get(k).cloned().expect("key init present");
+    let v = mut_var_value_ty(&init.ty);
+    sampling_read(&hist[k], v, Builtin::FinalRead)
+}
+
+/// `as_of_read(reg_k)` — a key's **as-of read**, awaiting the reading loop
+/// [`rewrite_as_of_reads`] pairs it with. No seed operand: the sampled position always
+/// has a value, because tick 0 of every store is its keys' seeds.
+fn as_of_read(hist: &Name, value_ty: Type) -> Expr {
+    sampling_read(hist, value_ty, Builtin::AsOfRead)
+}
+
+/// `⟨sample⟩(hist_k)` — a read of key `k`'s history that samples its carried value, applied
+/// to the history binding and carrying its own recorded type.
+///
+/// The two such reads differ only in which builtin names the sampling position:
+/// [`Builtin::AsOfRead`] leaves it to the reading loop [`rewrite_as_of_reads`] pairs the read
+/// with, [`Builtin::FinalRead`] takes the point the key's own writers finish. Neither takes a
+/// seed operand, tick 0 of every store being its keys' seeds.
+fn sampling_read(hist: &Name, value_ty: Type, sample: Builtin) -> Expr {
+    let stream = tvar(hist, history_ty(&value_ty));
+    let mut sample = Expr::builtin(sample);
+    sample.ty = Type::fun(stream.ty.clone(), value_ty.clone());
+    let mut app = Expr::apply(stream, sample);
+    app.ty = value_ty;
+    app
 }
 
 /// Wrap the transaction letrec in the folded cross-domain induction loops (see
@@ -2837,7 +3408,7 @@ mod tests {
     fn phase_emits_guarded_get_prev_txn_letrec() {
         let (tree, pool) = direct_mirror_txn();
         let names = HashSet::from([pool]);
-        let out = run(tree, &names);
+        let out = run(tree, &names).expect("no await, so no store cycle to reject");
         let s = symbolic(&out);
         assert!(s.contains("letrec"), "should emit a letrec: {s}");
         assert!(
@@ -2848,9 +3419,13 @@ mod tests {
             s.contains("begin"),
             "each site mints a `begin` commit-time oracle: {s}"
         );
+        // No `final_or_default` here, and that is the rule rather than an omission:
+        // this program's continuation never reads `pool`, and the key's shared read
+        // is bound exactly for the reads that name it (`StorePlan::reads`). Binding it
+        // unread would leave an unconsumed `ExtractFinal` branch on the store.
         assert!(
-            s.contains("final_or_default"),
-            "the mutable variable read reduces its history: {s}"
+            !s.contains("final_or_default"),
+            "an unread mutable variable key gets no history read: {s}"
         );
 
         let mut bindings = None;

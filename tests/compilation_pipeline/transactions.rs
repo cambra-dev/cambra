@@ -1,17 +1,20 @@
 //! Transactional stores (`Mut(V, Txn)` + `with begin():`) — the commit-operator
 //! path. Batch (finite-loop and standalone) single-variable transactions run
 //! end-to-end: `x: Mut(V, Txn)` folds into a commit store shared with the mutable variables
-//! some block relates it to, each `with
-//! begin():` block is a writer. A transactional mutable variable is read only inside a
-//! `with begin():` block; the batch tests read a value with a trailing standalone
-//! read-only transaction (`out = defer(); …; with begin(): out << x`) and assert
-//! the fed stream. Every fed-out mutable variable read compiles to `AsOf` — an as-of read
-//! at the reading transaction's (arbitrary) commit position, indexed by the
-//! reading loop — uniformly, whether the reading loop is a live `DataSource`
-//! stream, a finite loop, or the standalone read's synthesized singleton. There
-//! is no terminal/"final" mutable variable read; the trailing standalone read's `out` is
-//! the one-element as-of stream at position 0, which under the batch scheduler
-//! observes the drained store (a scheduling coincidence, not a promise).
+//! some block relates it to, and each `with begin():` block is a writer.
+//!
+//! **Reading a mutable variable: two constructs, and the difference is what these tests
+//! assert.** A mutable variable read *fed out* of a `with begin():` block is an as-of read
+//! at the reading transaction's (arbitrary) commit position, indexed by the reading loop —
+//! compiled to `AsOf` uniformly, whether that loop is a live `DataSource` stream, a finite
+//! loop, or a standalone read's synthesized singleton. Each position latches at its own
+//! arrival, so such a read has no assertable value unless the program orders the arrival
+//! after the commits. `await_final(x)` is the **terminal** read: `x`'s final committed
+//! value once every writer has drained, compiled to `ExtractFinal` over the key's
+//! commit-value stream, and it consumes `x`. The batch tests below read their result with
+//! `await_final`, which is what makes a scalar-valued expected tile a *semantic*
+//! assertion.
+//!
 //! Translated from the prototype's transaction suite (its `txn x = e` introducer
 //! is the `x: Mut(V, Txn) := e` annotation here).
 
@@ -50,51 +53,35 @@ fn check_compile_error(code: &str, needle: &str) {
     );
 }
 
-// NOTE — these batch programs are *ordering-undefined*, and every expected value
-// below is a **timing accident of the current single-threaded engine**, not a
-// pinned semantics. A transaction's meaning depends on the commit order, but
-// nothing in these programs pins it: a literal-list loop and the synthesized
-// standalone singleton leave the order to the engine's serialization
-// (`drain_start`), not the program. The only context that *pins* commit order is a
-// loop over a live external stream (a `DataSource`), where real arrival order is a
-// denotational anchor. These blocks depend only on program start (no source
-// arrival, no cross-transaction data dependence), and program start is a single
-// event that imposes no order *among* the blocks it triggers — so the event model
-// *defines* their commit order as mutually unordered, and the engine may serialize
-// them any way, correct under all of them. That is the contract, not a defect; see
+// NOTE — **`await_final` pins when these reads happen, not the order the commits
+// land in.** The read is semantic: it waits for completeness, so the value it reports
+// is the store's last, not whichever one the scheduler happened to leave visible. It
+// supplies no commit order, and these programs pin none either: a literal-list loop
+// leaves the order to the engine's serialization
+// (`drain_start`). The only context that pins commit order is a loop over a live
+// external stream (a `DataSource`), where real arrival order is a denotational
+// anchor. These blocks depend only on program start (no source arrival, no
+// cross-transaction data dependence), and program start is a single event that
+// imposes no order *among* the blocks it triggers — so the event model *defines*
+// their commit order as mutually unordered, and the engine may serialize them any
+// way, correct under all of them. That is the contract, not a defect; see
 // `src/ccl/design/mutability.md` "Ordering and concurrency".
 //
-// So these are effectively **engine tests**: they assert what one particular
-// serialization produces. They would not survive a concurrent scheduler — reorder
-// the drain and a different admissible answer appears — and the engine has its own
-// direct `CommitEngine` unit tests besides. `multi_writer_grant_deny` looks
-// order-independent only because it asserts the final pool, not *which* writer
-// succeeded.
-//
-// TODO(await_final): every trailing `with begin(): out << <mutable variable>` in this file
-// carries an inline `# TODO(await_final)` marking the same thing at the offending
-// line — it reads the mutable variable with an arbitrary as-of sample (latched to the
-// singleton trigger at that read's own commit position, so `out` is the one-element
-// stream at position 0) and observes the drained store only because the
-// single-threaded scheduler happens to run it last. The designed `await_final`
-// primitive is the real terminal read (`src/ccl/design/mutability.md`
-// "await_final"): once it exists, rewrite each of those reads as
-// `await_final(<mutable variable>)` and the assertions become semantic rather than
-// scheduling artifacts.
+// So an expected value here is pinned exactly when the body is order-insensitive.
+// Commutative draws (`pool := pool - r`) are: every serialization agrees, and the
+// assertion is a real one. A body whose outcome differs per serialization has no
+// single answer to assert, which is why `grant_deny_two_writers_single_commit`
+// asserts a disjunction rather than a number.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Single writer draws down a pool: 100 − 10 − 20 − 30 = 40.
 #[case::counter(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         for r in [10, 20, 30]:
             with begin():
                 pool := pool - r
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     40
 )]
@@ -102,7 +89,6 @@ fn check_compile_error(code: &str, needle: &str) {
 // total: 100 − 30 − 40 = 30.
 #[case::two_writers(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         for r in [30]:
             with begin():
@@ -110,10 +96,7 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in [40]:
             with begin():
                 pool := pool - r
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     30
 )]
@@ -121,7 +104,6 @@ fn check_compile_error(code: &str, needle: &str) {
 // = 67; B: 67 ≥ 44 → 67 − 44 = 23.
 #[case::multi_stmt(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         for r in [30]:
             with begin():
@@ -133,10 +115,7 @@ fn check_compile_error(code: &str, needle: &str) {
                 fee = r // 10
                 if pool >= r + fee:
                     pool := pool - r - fee
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     23
 )]
@@ -144,15 +123,11 @@ fn check_compile_error(code: &str, needle: &str) {
 // operator at tick 0; one writer draws 60 → 40.
 #[case::computed_init(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := sum([40, 30, 30])
         for r in [60]:
             with begin():
                 pool := pool - r
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     40
 )]
@@ -162,16 +137,12 @@ fn check_compile_error(code: &str, needle: &str) {
 // unrecognised-variable error. 100 − 10 − 20 − 30 = 40.
 #[case::source_bound_after_store(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         reqs = [10, 20, 30]
         for r in reqs:
             with begin():
                 pool := pool - r
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     40
 )]
@@ -179,30 +150,22 @@ fn check_compile_error(code: &str, needle: &str) {
 // synthesized singleton source: 100 − 10 = 90.
 #[case::standalone_single(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         with begin():
             pool := pool - 10
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     90
 )]
 // Two standalone transactions in sequence: two commits on one clock → 70.
 #[case::standalone_sequential(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         with begin():
             pool := pool - 10
         with begin():
             pool := pool - 20
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     70
 )]
@@ -210,17 +173,13 @@ fn check_compile_error(code: &str, needle: &str) {
 // 100 − 1 − 10 − 20 = 69.
 #[case::standalone_then_loop(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         with begin():
             pool := pool - 1
         for r in [10, 20]:
             with begin():
                 pool := pool - r
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     69
 )]
@@ -229,7 +188,6 @@ fn check_compile_error(code: &str, needle: &str) {
 // total regardless of interleaving: 100 − 10 − 20 − 5 − 15 = 50.
 #[case::multi_writer_contention(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         for r in [10, 20]:
             with begin():
@@ -237,17 +195,13 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in [5, 15]:
             with begin():
                 pool := pool - r
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     50
 )]
 // Three writers on one mutable variable compose the same as one: 100 − 10 − 20 − 30 = 40.
 #[case::three_writers(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         for r in [10]:
             with begin():
@@ -258,10 +212,7 @@ fn check_compile_error(code: &str, needle: &str) {
         for r in [30]:
             with begin():
                 pool := pool - r
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     40
 )]
@@ -270,7 +221,6 @@ fn check_compile_error(code: &str, needle: &str) {
 // `40 >= 60`, and denies. Order-independent final: 40.
 #[case::multi_writer_grant_deny(
     indoc! {r#"
-        out = defer()
         pool: Mut(Int, Txn) := 100
         for r in [60]:
             with begin():
@@ -280,10 +230,7 @@ fn check_compile_error(code: &str, needle: &str) {
             with begin():
                 if pool >= r:
                     pool := pool - r
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << pool
-        out
+        await_final(pool)
     "#},
     40
 )]
@@ -295,21 +242,17 @@ fn check_compile_error(code: &str, needle: &str) {
 // transaction and left x = 100.
 #[case::spine_write_commits_beside_false_guard(
     indoc! {r#"
-        out = defer()
         x: Mut(Int, Txn) := 100
         with begin():
             x := x + 1
             if x > 1000:
                 x := x + 10
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << x
-        out
+        await_final(x)
     "#},
     101
 )]
 fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
-    check_tile(code, commit_stream(&[0], &[expected]));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
 // ---------------------------------------------------------------------------
@@ -318,23 +261,19 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-// A single trailing read-only transaction reads *both* keys under one snapshot
-// (`out << a * 100 + b`) — one consistent view of the finished mutable variable.
-// `a` and `b` update atomically each iteration: a := sum([1,2,3]) = 6, b := sum of
+// Both keys read at completion (`await_final(a)`, `await_final(b)`) — one
+// consistent view of the finished mutable variable, with no dependence on where a sample
+// would have landed. `a` and `b` update atomically each iteration: a := sum([1,2,3]) = 6, b := sum of
 // squares = 14 → a*100 + b := 614.
 #[case::multi_var(
     indoc! {r#"
-        out = defer()
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
         for x in [1, 2, 3]:
             with begin():
                 a := a + x
                 b := b + x * x
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << a * 100 + b
-        out
+        await_final(a) * 100 + await_final(b)
     "#},
     614
 )]
@@ -342,17 +281,13 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 // runs 5,6,8 → b := 19, a ends 11 → 1119.
 #[case::multi_var_cross_read(
     indoc! {r#"
-        out = defer()
         a: Mut(Int, Txn) := 5
         b: Mut(Int, Txn) := 0
         for x in [1, 2, 3]:
             with begin():
                 b := b + a
                 a := a + x
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << a * 100 + b
-        out
+        await_final(a) * 100 + await_final(b)
     "#},
     1119
 )]
@@ -360,17 +295,13 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 // 0→1→3→6, b: 1,3,6 → final a=6, b=6 → 606.
 #[case::read_your_writes_cross_key(
     indoc! {r#"
-        out = defer()
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
         for x in [1, 2, 3]:
             with begin():
                 a := a + x
                 b := a
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << a * 100 + b
-        out
+        await_final(a) * 100 + await_final(b)
     "#},
     606
 )]
@@ -378,16 +309,12 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 // x=10: 0→10→11; x=20: 11→31→32 → 32.
 #[case::read_your_writes_same_key(
     indoc! {r#"
-        out = defer()
         a: Mut(Int, Txn) := 0
         for x in [10, 20]:
             with begin():
                 a := a + x
                 a := a + 1
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << a
-        out
+        await_final(a)
     "#},
     32
 )]
@@ -395,17 +322,13 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 // commits (10 ≤ 25); 20/30 denied → total := 10.
 #[case::multi_var_readonly_key(
     indoc! {r#"
-        out = defer()
         limit: Mut(Int, Txn) := 25
         total: Mut(Int, Txn) := 0
         for x in [10, 20, 30]:
             with begin():
                 if total + x <= limit:
                     total := total + x
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << total
-        out
+        await_final(total)
     "#},
     10
 )]
@@ -413,7 +336,6 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 // invalidates the other. `a` = 1+2 = 3, `b` = 10+20 = 30 → 3*100 + 30 = 330.
 #[case::multi_writer_disjoint_keys(
     indoc! {r#"
-        out = defer()
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
         for x in [1, 2]:
@@ -422,10 +344,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
         for y in [10, 20]:
             with begin():
                 b := b + y
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << a * 100 + b
-        out
+        await_final(a) * 100 + await_final(b)
     "#},
     330
 )]
@@ -435,7 +354,6 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 // = 33330.
 #[case::multi_writer_overlapping_keys(
     indoc! {r#"
-        out = defer()
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
         c: Mut(Int, Txn) := 0
@@ -447,10 +365,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
             with begin():
                 b := b + y
                 c := c + y
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << a * 10000 + b * 100 + c
-        out
+        await_final(a) * 10000 + await_final(b) * 100 + await_final(c)
     "#},
     33330
 )]
@@ -459,7 +374,6 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
 // 14*100 + 3 = 61403.
 #[case::read_three_vars_one_snapshot(
     indoc! {r#"
-        out = defer()
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
         c: Mut(Int, Txn) := 0
@@ -468,15 +382,12 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
                 a := a + x
                 b := b + x * x
                 c := c + 1
-        # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-        with begin():
-            out << a * 10000 + b * 100 + c
-        out
+        await_final(a) * 10000 + await_final(b) * 100 + await_final(c)
     "#},
     61403
 )]
 fn test_multi_variable_transactions(#[case] code: &str, #[case] expected: i64) {
-    check_tile(code, commit_stream(&[0], &[expected]));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
 // ---------------------------------------------------------------------------
@@ -496,21 +407,21 @@ fn commit_stream(ticks: &[usize], values: &[i64]) -> Tile {
     }
 }
 
-/// Drive a program whose result is a single trailing-commit read and return the
-/// committed `Value` at position 0. A compound (tuple/record) mutable variable reads back
-/// boxed (`Scalar(Record)`) or struct-of-arrays depending on the read path; both
-/// fold to the same `Value` through `scalar_tile_to_column_value`, so this asserts
-/// on the *value* rather than the (path-dependent) tile shape.
-fn trailing_commit_value(code: &str) -> Value {
+/// Drive a program whose result is an `await_final` read and return the `Value` it
+/// settles on. A compound (tuple/record) mutable variable reads back boxed
+/// (`Scalar(Record)`) or struct-of-arrays depending on the read path; both fold to
+/// the same `Value` through `scalar_tile_to_column_value`, so this asserts on the
+/// *value* rather than the (path-dependent) tile shape.
+fn final_mut_var_value(code: &str) -> Value {
     use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
-    let Tile::SealedFunction {
-        domain, codomain, ..
-    } = run_pipeline(code)
-    else {
-        panic!("expected a commit stream");
-    };
-    assert_eq!(domain.len(), 1, "expected exactly one trailing commit");
-    scalar_tile_to_column_value(*codomain).index_at(0)
+    let tile = run_pipeline(code);
+    let column = scalar_tile_to_column_value(tile);
+    assert_eq!(
+        column.len(),
+        1,
+        "a final mutable variable value is one value"
+    );
+    column.index_at(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -527,31 +438,24 @@ fn trailing_commit_value(code: &str) -> Value {
 #[timeout(Duration::from_secs(10))]
 // Unconditional tuple mutable variable: (100,0) −10/+10 → (90,10) −20/+20 → (70,30).
 #[case(indoc! {r#"
-    out = defer()
     p: Mut({Int, Int}, Txn) := (100, 0)
     for r in [10, 20]:
         with begin():
             p := (p.0 - r, p.1 + r)
-    with begin():
-        out << p
-    out
+    await_final(p)
 "#}, make_tuple(&[Value::Int(70), Value::Int(30)]))]
 // Conditional tuple write with a deny: r=60 commits (100≥60 → (40,60)); r=60 again
 // denies (40≥60 false) → stays (40,60).
 #[case(indoc! {r#"
-    out = defer()
     p: Mut({Int, Int}, Txn) := (100, 0)
     for r in [60, 60]:
         with begin():
             if p.0 >= r:
                 p := (p.0 - r, p.1 + r)
-    with begin():
-        out << p
-    out
+    await_final(p)
 "#}, make_tuple(&[Value::Int(40), Value::Int(60)]))]
 // if/else both arms write a tuple: r=3 → r>2 arm → (3, 30).
 #[case(indoc! {r#"
-    out = defer()
     p: Mut({Int, Int}, Txn) := (0, 0)
     for r in [1, 2, 3]:
         with begin():
@@ -559,51 +463,40 @@ fn trailing_commit_value(code: &str) -> Value {
                 p := (r, r * 10)
             else:
                 p := (r, r)
-    with begin():
-        out << p
-    out
+    await_final(p)
 "#}, make_tuple(&[Value::Int(3), Value::Int(30)]))]
 // Named record mutable variable.
 #[case(r"
-out = defer()
 p: Mut({x: Int, y: Int}, Txn) := (x=100, y=0)
 for r in [10, 20]:
     with begin():
         p := (x=p.x - r, y=p.y + r)
-with begin():
-    out << p
-out", make_record(&[("x", Value::Int(70)), ("y", Value::Int(30))]))]
+await_final(p)", make_record(&[("x", Value::Int(70)), ("y", Value::Int(30))]))]
 // Mixed multi-key store: a scalar key `s` and a tuple key `p`, atomic per commit.
-// s = 10+20 = 30; p = (70, 30); trailing read `(s, p)`.
+// s = 10+20 = 30; p = (70, 30); both read at completion.
 #[case(indoc! {r#"
-    out = defer()
     s: Mut(Int, Txn) := 0
     p: Mut({Int, Int}, Txn) := (100, 0)
     for r in [10, 20]:
         with begin():
             s := s + r
             p := (p.0 - r, p.1 + r)
-    with begin():
-        out << (s, p)
-    out
+    (await_final(s), await_final(p))
 "#}, make_tuple(&[Value::Int(30), make_tuple(&[Value::Int(70), Value::Int(30)])]))]
 fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
-    assert_eq!(trailing_commit_value(code), expected);
+    assert_eq!(final_mut_var_value(code), expected);
 }
 
-/// A field projected off a tuple transactional mutable variable in the trailing read.
+/// A field projected off a tuple transactional mutable variable's completion read.
 #[test]
 fn test_compound_txn_mut_var_field() {
     assert_eq!(
-        trailing_commit_value(indoc! {r#"
-                out = defer()
+        final_mut_var_value(indoc! {r#"
                 p: Mut({Int, Int}, Txn) := (100, 0)
                 for r in [10, 20]:
                     with begin():
                         p := (p.0 - r, p.1 + r)
-                with begin():
-                    out << p.0
-                out
+                await_final(p).0
             "#}),
         Value::Int(70),
     );
@@ -613,10 +506,10 @@ fn test_compound_txn_mut_var_field() {
 /// (read-your-writes) value: `pool - r` after the write — 90, 70, 40 over commit
 /// ticks 1, 2, 3. The feed rides the writer decision as a `to_out` tap,
 /// committed atomically with the mutable variable write and read back as a per-commit
-/// value-stream (commit-tick-indexed). Contrast a *trailing* standalone read-only
-/// transaction `with begin(): out << pool` (an as-of read latched to the singleton
-/// trigger at that read's own commit position — one value at position 0, the
-/// drained 40 under the batch scheduler) — a different construct.
+/// value-stream (commit-tick-indexed). Contrast `await_final(pool)` (one scalar, the
+/// completed 40) and a *fed-out* read `with begin(): out << pool` (an as-of sample
+/// latched to that read's own commit position) — three different constructs over the
+/// same store.
 #[test]
 fn progress_feed_inside_tx() {
     check_tile(
@@ -658,34 +551,19 @@ fn progress_feed_grant_deny() {
 // Value types: a transactional mutable variable holds any base value, not just int
 // ---------------------------------------------------------------------------
 
-/// A single-element scalar stream over `domain` — the shape of a trailing
-/// read-only transaction's reply for a non-int mutable variable.
-fn scalar_stream(domain: &[usize], codomain: ColumnValue) -> Tile {
-    Tile::SealedFunction {
-        domain: ColumnValue::UInts(domain.to_vec()),
-        codomain: Box::new(Tile::Scalar(codomain)),
-        domain_predicate: Predicate::True,
-        deleted: BitSet::new(),
-    }
-}
-
-/// A `bool`-valued transactional mutable variable: both writers set `flag = True`; the
-/// trailing read observes the committed `True`.
+/// A `bool`-valued transactional mutable variable: both writers set `flag = True`, so the
+/// completion read reports `True`.
 #[test]
 fn bool_valued_store() {
     check_tile(
         indoc! {r#"
-            out = defer()
             flag: Mut(Bool, Txn) := False
             for x in [1, 2]:
                 with begin():
                     flag := True
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << flag
-            out
+            await_final(flag)
         "#},
-        scalar_stream(&[0], ColumnValue::Bools(BitVec::from_elem(1, true))),
+        Tile::Scalar(ColumnValue::Bools(BitVec::from_elem(1, true))),
     );
 }
 
@@ -694,17 +572,13 @@ fn bool_valued_store() {
 fn string_valued_store() {
     check_tile(
         indoc! {r#"
-            out = defer()
             name: Mut(String, Txn) := "init"
             for x in [1, 2]:
                 with begin():
                     name := "bob"
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << name
-            out
+            await_final(name)
         "#},
-        scalar_stream(&[0], ColumnValue::Strings(vec![SmolStr::new("bob")])),
+        Tile::Scalar(ColumnValue::Strings(vec![SmolStr::new("bob")])),
     );
 }
 
@@ -845,7 +719,7 @@ fn ryw_of_conditionally_written_key_after_case() {
 
 /// A **conditional feed in a read-only `with begin():` block** — a conditional
 /// reply that reads a mutable variable (`if r > 1: resp << pool`). The block commits no
-/// mutable variable, so the reply is a filtered live read: `channelize` fans the guard-
+/// mutable variable, so the reply is a filtered as-of read: `channelize` fans the guard-
 /// `Case` out into a refined-source channel (the same path a non-transactional
 /// `if r > 1: resp << r` takes), rather than the feed-only hoist which handles
 /// only straight-line replies. `pool` is never written, so its as-of value is its
@@ -1002,13 +876,12 @@ fn three_writers_single_defer_feed() {
 /// and the final pool is 30 or 50 — schedule-dependent but always a single
 /// valid, non-negative outcome. (A fixed declaration-order engine always gave
 /// 30; under round-robin fairness either serialization is admissible.)
-/// Like every trailing read in this file (see the `TODO(await_final)` inline),
-/// that the read sees *either* settled value rather than the seed is the
-/// single-threaded scheduler's doing, not a guarantee about relative order.
+/// `await_final` is what makes the read report a *settled* value rather than
+/// whichever position the scheduler left visible — but it supplies no commit order,
+/// which is why the assertion is a disjunction and not a number.
 #[test]
 fn grant_deny_two_writers_single_commit() {
     let tile = run_pipeline(indoc! {r#"
-            out = defer()
             pool: Mut(Int, Txn) := 100
             for r in [70]:
                 with begin():
@@ -1018,18 +891,12 @@ fn grant_deny_two_writers_single_commit() {
                 with begin():
                     if pool >= r:
                         pool := pool - r
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << pool
-            out
+            await_final(pool)
         "#});
-    let Tile::SealedFunction { codomain, .. } = &tile else {
-        panic!("expected a reply stream, got {tile:?}");
+    let Tile::Scalar(ColumnValue::Ints(vals)) = &tile else {
+        panic!("expected a scalar final value, got {tile:?}");
     };
-    let Tile::Scalar(ColumnValue::Ints(vals)) = codomain.as_ref() else {
-        panic!("expected Ints codomain, got {codomain:?}");
-    };
-    assert_eq!(vals.len(), 1, "one trailing read");
+    assert_eq!(vals.len(), 1, "one final value");
     assert!(
         vals[0] == 30 || vals[0] == 50,
         "exactly one draw committed; pool = {}",
@@ -1052,7 +919,6 @@ fn grant_deny_two_writers_single_commit() {
 fn sustained_contention_conserves_pool() {
     let ones = "[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]";
     let code = formatdoc! {"
-        out = defer()
         pool: Mut(Int, Txn) := 1000
         for r in {ones}:
             with begin():
@@ -1060,11 +926,495 @@ fn sustained_contention_conserves_pool() {
         for r in {ones}:
             with begin():
                 pool := pool - r
+        await_final(pool)
+    "};
+    check_tile(&code, Tile::Scalar(ColumnValue::Ints(vec![980])));
+}
+
+// ---------------------------------------------------------------------------
+// `await_final`: the terminal read
+//
+// The cases above use it as their result, so its ordinary path is covered
+// throughout. What is pinned here is what makes it a different read from a
+// fed-out one, and the rules that make "final" well-defined.
+// ---------------------------------------------------------------------------
+
+/// **The point of the primitive.** The same mutable variable, read both ways in one program:
+/// a fed-out read inside a `with begin():` block samples an arbitrary commit position,
+/// and `await_final` reports the completed value.
+///
+/// Only the completion read's value is asserted. The as-of half is asserted to be
+/// *present* and not to be anything in particular — that is the difference between the
+/// two constructs, and pinning its number would pin whichever sample the scheduler
+/// happened to leave visible.
+#[test]
+fn await_final_and_as_of_read_the_same_mut_var() {
+    let code = indoc! {r#"
+        out = defer()
+        pool: Mut(Int, Txn) := 100
+        for r in [10, 20]:
+            with begin():
+                pool := pool - r
         with begin():
             out << pool
-        out
-    "};
-    check_tile(&code, commit_stream(&[0], &[980]));
+        (sum(out), await_final(pool))
+    "#};
+    let Tile::Record(fields) = run_pipeline(code) else {
+        panic!("expected a record of both reads")
+    };
+    // 100 − 10 − 20 = 70, and it is the *completed* value, not a sample of it.
+    assert_eq!(
+        fields.get("_1"),
+        Some(&Tile::Scalar(ColumnValue::Ints(vec![70])))
+    );
+    assert!(
+        fields.get("_0").is_some_and(|t| !t.is_empty()),
+        "the as-of read resolves to some sample"
+    );
+}
+
+/// A completeness read stays one **inside a reading loop**. Broadcast over a
+/// two-element loop, `await_final(pool)` is the same settled 70 at both positions: the
+/// loop indexes the broadcast, not the mutable variable, so the as-of rewrite (which
+/// fires on a mutable variable read a reading loop indexes) must not claim it.
+///
+/// The values separate the two compilations: an as-of sample latches at each position's
+/// arrival, so a rewritten read would report the seed (101, 102) rather than 71 and 72.
+#[test]
+fn await_final_broadcast_over_a_reading_loop_stays_final() {
+    check_tile(
+        indoc! {r#"
+            out = defer()
+            pool: Mut(Int, Txn) := 100
+            for r in [10, 20]:
+                with begin():
+                    pool := pool - r
+            for q in [1, 2]:
+                out << await_final(pool) + q
+            out
+        "#},
+        commit_stream(&[0, 1], &[71, 72]),
+    );
+}
+
+/// A **bound** await, read inside a feed loop — the shape that separates the two reads
+/// by *term* rather than by position. `channelize` closes the channel over the bindings
+/// its contribution names, so `let f = ⟨read⟩` is copied in directly above the broadcast:
+/// the shape the as-of rewrite matches. The rewrite claims only `as_of_read`, so `f`
+/// stays the completed 90 at both positions. Spelled `final_or_default`, as an as-of read
+/// once was, it would be matched instead and each position would latch its own arrival —
+/// the seed, reporting 101 and 102.
+#[test]
+fn await_final_bound_then_read_in_a_feed_loop_stays_final() {
+    check_tile(
+        indoc! {r#"
+            out = defer()
+            pool: Mut(Int, Txn) := 100
+            for r in [10]:
+                with begin():
+                    pool := pool - r
+            f = await_final(pool)
+            for q in [1, 2]:
+                out << f + q
+            out
+        "#},
+        commit_stream(&[0, 1], &[91, 92]),
+    );
+}
+
+/// Bound to a name and used downstream: the await need not be the program's tail.
+/// The letrec splice moves above the `let` that reads the history binding, which is
+/// what keeps `reg_pool` in scope there.
+#[test]
+fn await_final_bound_then_computed_with() {
+    check_tile(
+        indoc! {r#"
+            pool: Mut(Int, Txn) := 100
+            for r in [10, 20, 30]:
+                with begin():
+                    pool := pool - r
+            final = await_final(pool)
+            final * 2
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![80])),
+    );
+}
+
+/// Every transaction denies, so nothing is ever committed and the final value is
+/// the seed — `final_or_default`'s default, which is what the CHL spec means by
+/// "or the initializer if it was never committed".
+#[test]
+fn await_final_of_an_all_deny_history_is_the_seed() {
+    check_tile(
+        indoc! {r#"
+            pool: Mut(Int, Txn) := 5
+            for r in [10, 20]:
+                with begin():
+                    if pool >= r:
+                        pool := pool - r
+            await_final(pool)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![5])),
+    );
+}
+
+/// A mutable variable **no writer touches** has no commit history at all, so its final
+/// value is statically its seed. Distinct from the all-deny case above: there a
+/// commit store exists and reports nothing, here there is no store to build.
+#[test]
+fn await_final_of_a_writer_free_mut_var_is_the_seed() {
+    check_tile(
+        indoc! {r#"
+            pool: Mut(Int, Txn) := 100
+            await_final(pool)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![100])),
+    );
+}
+
+/// A writer-free mutable variable **alongside** writers: `spare` is a key of no site, so it
+/// gets no history binding even though a commit store is built for `pool`. Its await
+/// resolves to its seed, and `pool`'s to the store's final — the two paths in one
+/// program. 100 − 10 = 90, then `90 * 100 + 7`.
+#[test]
+fn await_final_mixes_a_writer_free_mut_var_with_a_written_one() {
+    check_tile(
+        indoc! {r#"
+            pool: Mut(Int, Txn) := 100
+            spare: Mut(Int, Txn) := 7
+            for r in [10]:
+                with begin():
+                    pool := pool - r
+            await_final(pool) * 100 + await_final(spare)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![9007])),
+    );
+}
+
+/// A later block that **writes the awaited mutable variable** extends a history the await
+/// already reduced. This is the linearity rule reaching a `MutWrite` target, not a
+/// blanket ban on blocks after an await — see
+/// `await_final_permits_a_later_block_on_another_mut_var` for the shape that is fine.
+#[test]
+fn write_to_awaited_mut_var_in_a_later_block_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            pool: Mut(Int, Txn) := 100
+            for r in [10]:
+                with begin():
+                    pool := pool - r
+            f = await_final(pool)
+            for r in [1]:
+                with begin():
+                    pool := pool - r
+            f
+        "#},
+        "unreferenceable after `await_final(pool)`",
+    );
+}
+
+/// A later block that **reads** the awaited mutable variable is the same violation reaching a
+/// `Var` in the writer body.
+#[test]
+fn read_of_awaited_mut_var_in_a_later_block_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            a: Mut(Int, Txn) := 100
+            b: Mut(Int, Txn) := 0
+            for r in [10]:
+                with begin():
+                    a := a - r
+            f = await_final(a)
+            for r in [1]:
+                with begin():
+                    b := b + a
+            f
+        "#},
+        "unreferenceable after `await_final(a)`",
+    );
+}
+
+/// **A block after an await is otherwise fine.** It commits another mutable variable, so
+/// it touches nothing the await consumed; it joins the same store, which the
+/// await was always going to wait for. `a` = 100 - 10 = 90, `b` = 5 -> 9005.
+#[test]
+fn await_final_permits_a_later_block_on_another_mut_var() {
+    check_tile(
+        indoc! {r#"
+            a: Mut(Int, Txn) := 100
+            b: Mut(Int, Txn) := 0
+            for r in [10]:
+                with begin():
+                    a := a - r
+            fa = await_final(a)
+            for r in [5]:
+                with begin():
+                    b := b + r
+            fa * 100 + await_final(b)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![9005])),
+    );
+}
+
+/// A writer's iteration source bound **after** an await, which the splice has to keep
+/// above the letrec while the await's read rides below it. `b` = 1 + 2 = 3 -> 9003.
+#[test]
+fn await_final_permits_a_later_writer_source_binding() {
+    check_tile(
+        indoc! {r#"
+            a: Mut(Int, Txn) := 100
+            b: Mut(Int, Txn) := 0
+            for r in [10]:
+                with begin():
+                    a := a - r
+            fa = await_final(a)
+            reqs = [1, 2]
+            for r in reqs:
+                with begin():
+                    b := b + r
+            fa * 100 + await_final(b)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![9003])),
+    );
+}
+
+/// An **induction** accumulator seeded from an await: a different recurrence, so there
+/// is no cycle. 100 - 10 - 20 = 70, then 70 + 1 + 2 = 73.
+#[test]
+fn induction_accumulator_seeded_from_an_await() {
+    check_tile(
+        indoc! {r#"
+            pool: Mut(Int, Txn) := 100
+            for r in [10, 20]:
+                with begin():
+                    pool := pool - r
+            x := await_final(pool)
+            for i in [1, 2]:
+                x := x + i
+            x
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![73])),
+    );
+}
+
+/// The await **consumes** the mutable variable, which is what closes its writer set and so
+/// makes "final" a fixed value. A second await is a reference to a consumed
+/// mutable variable.
+#[test]
+fn awaiting_a_mut_var_twice_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            pool: Mut(Int, Txn) := 100
+            for r in [10]:
+                with begin():
+                    pool := pool - r
+            await_final(pool) + await_final(pool)
+        "#},
+        "unreferenceable after `await_final(pool)`",
+    );
+}
+
+/// Consumption also covers a **pass-by-reference argument**, the one mutable variable mention
+/// lowering's read gate lets through (a `Mut`-typed argument is a bare `Var` by rule).
+/// Inlining beta-reduces it into the callee body, where it becomes the write the
+/// occurrence check finds — which is why that check runs post-inline.
+#[test]
+fn by_ref_pass_after_await_final_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            def draw(p: Mut(Int, Txn), amt: Int):
+                with begin():
+                    p := p - amt
+
+            pool: Mut(Int, Txn) := 100
+            draw(pool, 10)
+            f = await_final(pool)
+            draw(pool, 20)
+            f
+        "#},
+        "unreferenceable after `await_final(pool)`",
+    );
+}
+
+/// Inside a block, the await would wait on the very history that block extends. A
+/// block's mutable variable read is the bare snapshot, and that is its only read.
+#[test]
+fn await_final_inside_a_block_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            out = defer()
+            pool: Mut(Int, Txn) := 100
+            for r in [10]:
+                with begin():
+                    pool := pool - r
+            with begin():
+                out << await_final(pool)
+            out
+        "#},
+        "would wait on the commit history that block extends",
+    );
+}
+
+/// An induction accumulator has no commit history — its final value is read by
+/// naming it after its loop, which is the trailing induction read.
+#[test]
+fn await_final_of_an_induction_accumulator_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            x := 0
+            for i in [1, 2, 3]:
+                x := x + i
+            await_final(x)
+        "#},
+        "is not a transactional mutable variable",
+    );
+}
+
+/// **Phase separation** — drain one transaction, seed the next from its final value.
+/// The shape a single program-wide store made impossible: `b`'s seed names `a`'s
+/// completion, so with one store `b`'s tick-0 value would await the store `b` itself
+/// writes. No block mentions `a` and `b` together, so they partition into two stores
+/// and the dependency is an ordinary one-way edge between two letrecs — `reg_a` bound
+/// outside, `reg_b`'s seed reading it. `a` reaches 1 + 1 = 2, seeding `b`, which
+/// reaches 3.
+#[test]
+fn a_mut_var_seeded_from_another_store_s_final_value() {
+    let code = indoc! {r#"
+        a: Mut(Int, Txn) := 1
+        for r in [1]:
+            with begin():
+                a := a + r
+        b: Mut(Int, Txn) := await_final(a)
+        for r in [1]:
+            with begin():
+                b := b + r
+        await_final(b)
+    "#};
+    assert_eq!(commit_stores(code), vec!["Txn[a]", "Txn[b]"]);
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3])));
+}
+
+/// Phase separation through a writer's **iteration source** rather than a seed: the
+/// second transaction runs over an extent computed from the first's final value. Same
+/// two-store partition, so the source is an ordinary read of a completed store. `a`
+/// drains to 100 - 10 = 90, so `reqs` is `[91, 92]` and `b` reaches 183.
+#[test]
+fn a_writer_source_computed_from_another_store_s_final_value() {
+    let code = indoc! {r#"
+        a: Mut(Int, Txn) := 100
+        b: Mut(Int, Txn) := 0
+        for r in [10]:
+            with begin():
+                a := a - r
+        fa = await_final(a)
+        reqs = [x + fa for x in [1, 2]]
+        for r in reqs:
+            with begin():
+                b := b + r
+        await_final(b)
+    "#};
+    assert_eq!(commit_stores(code), vec!["Txn[a]", "Txn[b]"]);
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![183])));
+}
+
+/// A cycle, and what reaching one takes: the await must reach a writer of its **own** store.
+/// The first block relates `a` and `b` (it writes both), so they share a store; the
+/// second block commits into that same store while its decision depends on `a`'s
+/// completion — the store would have to finish before it could finish.
+///
+/// Note the shape the sibling key is doing work for: `b := b + fa` cannot name `a`
+/// directly, because `await_final` consumes its mutable variable (`check_await_final_linearity`)
+/// and would reject the mention first. A store-mate is the only way to reach back in.
+#[test]
+fn writer_body_depending_on_its_own_store_s_await_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            a: Mut(Int, Txn) := 100
+            b: Mut(Int, Txn) := 0
+            for r in [10]:
+                with begin():
+                    a := a - r
+                    b := b + r
+            fa = await_final(a)
+            for r in [1]:
+                with begin():
+                    b := b + fa
+            await_final(b)
+        "#},
+        "body depends on `await_final(a)`",
+    );
+}
+
+/// The same cycle through a writer's **iteration source** — the block's extent, rather
+/// than its decision, would await the store it commits into.
+#[test]
+fn writer_source_depending_on_its_own_store_s_await_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            a: Mut(Int, Txn) := 100
+            b: Mut(Int, Txn) := 0
+            for r in [10]:
+                with begin():
+                    a := a - r
+                    b := b + r
+            fa = await_final(a)
+            reqs = [x + fa for x in [1, 2]]
+            for r in reqs:
+                with begin():
+                    b := b + r
+            await_final(b)
+        "#},
+        "iteration source depends on `await_final(a)`",
+    );
+}
+
+/// And through a **seed**: `c` joins `a`'s store (its block reads store-mate `b`) while
+/// its tick-0 value awaits that store's completion.
+#[test]
+fn a_seed_depending_on_its_own_store_s_await_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            a: Mut(Int, Txn) := 100
+            b: Mut(Int, Txn) := 0
+            for r in [10]:
+                with begin():
+                    a := a - r
+                    b := b + r
+            c: Mut(Int, Txn) := await_final(a)
+            for r in [1]:
+                with begin():
+                    c := c + b
+            await_final(c)
+        "#},
+        "seed of transactional mutable variable `c` depends on `await_final(a)`",
+    );
+}
+
+/// The same cycle **laundered through an induction accumulator's in-loop write**.
+/// `acc`'s seed is a constant, so the taint enters only at `acc := acc + fa` — a name
+/// acquires a value by being written, not just by being introduced, and the cycle is
+/// the same one whichever way the await reaches the writer's decision.
+#[test]
+fn writer_body_depending_on_an_await_laundered_through_an_accumulator_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            a: Mut(Int, Txn) := 100
+            b: Mut(Int, Txn) := 0
+            for r in [10]:
+                with begin():
+                    a := a - r
+                    b := b + r
+            fa = await_final(a)
+            acc := 0
+            for x in [1, 2]:
+                acc := acc + fa
+            for r in [1]:
+                with begin():
+                    b := b + acc
+            await_final(b)
+        "#},
+        "body depends on `await_final(a)`",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,14 +1454,14 @@ fn commit_stores(code: &str) -> Vec<String> {
     stores_in(&ast)
 }
 
-/// Two mutable variables written by separate blocks and read separately have no
-/// operation relating them, so they get their own stores — and their own commit clocks,
-/// and their own completion.
+/// Two mutable variables written by separate blocks, with no block mentioning them
+/// together, have no operation relating them — so they get their own stores, and their
+/// own commit clocks, and their own completion.
+/// `mut_vars_read_together_share_a_store` is this program plus the one thing that does
+/// relate them: a block reading both.
 #[test]
 fn unrelated_mut_vars_get_separate_stores() {
     let code = indoc! {r#"
-        oa = defer()
-        ob = defer()
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
         for x in [1, 2]:
@@ -1120,11 +1470,7 @@ fn unrelated_mut_vars_get_separate_stores() {
         for y in [10, 20]:
             with begin():
                 b := b + y
-        with begin():
-            oa << a
-        with begin():
-            ob << b
-        (sum(oa), sum(ob))
+        (await_final(a), await_final(b))
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[a]", "Txn[b]"]);
     check_tile(
@@ -1142,25 +1488,27 @@ fn unrelated_mut_vars_get_separate_stores() {
 #[test]
 fn registers_written_in_one_block_share_a_store() {
     let code = indoc! {r#"
-        out = defer()
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
         for x in [1, 2]:
             with begin():
                 a := a + x
                 b := b - x
-        with begin():
-            out << a * 100 + b
-        out
+        await_final(a) * 100 + await_final(b)
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[a,b]"]);
-    check_tile(code, commit_stream(&[0], &[297]));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![297])));
 }
 
-/// **Snapshot consistency** holds a store together too, and writes alone do not show
-/// it: nothing writes both mutable variables, but the trailing read latches them at one
-/// frontier, so they must come from one mutable variable record. The writers are exactly
-/// those of `unrelated_mut_vars_get_separate_stores` — only the read differs.
+/// **Snapshot consistency** holds a store together too, and writes alone do not show it:
+/// nothing writes both mutable variables, but one block reads both, latching them at a
+/// single frontier, so they must come from one mutable variable record. The writers are
+/// exactly those of `unrelated_mut_vars_get_separate_stores` — only this read is added.
+///
+/// The read stays a `with begin():` block because it *is* the subject; what is dropped is
+/// any assertion on the value it feeds. That value is an as-of sample at the reading
+/// transaction's arbitrary commit position, so pinning a number would pin a scheduling
+/// artifact.
 #[test]
 fn mut_vars_read_together_share_a_store() {
     let code = indoc! {r#"
@@ -1178,7 +1526,6 @@ fn mut_vars_read_together_share_a_store() {
         out
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[a,b]"]);
-    check_tile(code, commit_stream(&[0], &[330]));
 }
 
 /// A register a *writing* block reads to decide its commit is read at that commit's
@@ -1189,19 +1536,16 @@ fn mut_vars_read_together_share_a_store() {
 #[test]
 fn a_mut_var_read_by_a_writing_block_joins_its_store() {
     let code = indoc! {r#"
-        out = defer()
         limit: Mut(Int, Txn) := 25
         total: Mut(Int, Txn) := 0
         for x in [10, 20]:
             with begin():
                 if total + x <= limit:
                     total := total + x
-        with begin():
-            out << total
-        out
+        await_final(total)
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[total,limit]"]);
-    check_tile(code, commit_stream(&[0], &[10]));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![10])));
 }
 
 /// A mutable variable **no block writes** is not a store key. Nothing can advance it, so its
@@ -1211,6 +1555,10 @@ fn a_mut_var_read_by_a_writing_block_joins_its_store() {
 /// (Contrast `a_mut_var_read_by_a_writing_block_joins_its_store`, whose unwritten
 /// `limit` *is* a key: a **writing** block reads it, so it is read at that block's
 /// commit snapshot.)
+///
+/// The read-only block is required — it is the only way an unwritten mutable variable reaches
+/// a footprint at all — so the fed value is an arbitrary as-of sample and is not
+/// asserted. The store list is what this test owns.
 #[test]
 fn a_mut_var_no_block_writes_is_not_a_store_key() {
     let code = indoc! {r#"
@@ -1225,7 +1573,6 @@ fn a_mut_var_no_block_writes_is_not_a_store_key() {
         out
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[tot]"]);
-    check_tile(code, commit_stream(&[0], &[8]));
 }
 
 /// A defer fed **inside** a store is consumed inside it. The tap that carries `out`
@@ -1252,6 +1599,10 @@ fn a_defer_fed_inside_a_store_is_consumed_inside_it() {
 /// spine, so its feed survives as an effect statement and is carried into the store it
 /// reads — and an effect statement that feeds a defer is therefore something a later
 /// statement can depend on, even though it binds nothing.
+///
+/// The defect this pins was a *compile* failure (`as_of source must be a bare store
+/// mutable variable read`), so compiling and evaluating is the assertion; the fed value is an
+/// arbitrary as-of sample and is not pinned.
 #[test]
 fn a_defer_fed_by_a_read_only_block_is_consumed_inside_its_store() {
     let code = indoc! {r#"
@@ -1265,7 +1616,7 @@ fn a_defer_fed_by_a_read_only_block_is_consumed_inside_its_store() {
         t = sum(out)
         t
     "#};
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3])));
+    assert_eq!(commit_stores(code), vec!["Txn[a]"]);
 }
 
 /// A **cross-domain induction read** alongside a second, unrelated store, pinning the
@@ -1277,8 +1628,6 @@ fn a_defer_fed_by_a_read_only_block_is_consumed_inside_its_store() {
 #[test]
 fn a_cross_domain_read_coexists_with_a_second_store() {
     let code = indoc! {r#"
-        oa = defer()
-        ob = defer()
         cnt := 0
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
@@ -1289,11 +1638,7 @@ fn a_cross_domain_read_coexists_with_a_second_store() {
         for y in [10, 20]:
             with begin():
                 b := b + y
-        with begin():
-            oa << a
-        with begin():
-            ob << b
-        (sum(oa), sum(ob))
+        (await_final(a), await_final(b))
     "#};
     assert_eq!(commit_stores(code), vec!["[0, 1][acc]", "Txn[a]", "Txn[b]"]);
     check_tile(
@@ -1305,18 +1650,74 @@ fn a_cross_domain_read_coexists_with_a_second_store() {
     );
 }
 
+/// **Phase separation through a writer's iteration source.** The extent of `b`'s block
+/// is computed from `a`'s final value, so the source binding is carried into `a`'s store
+/// and `b`'s letrec — nested inside it — reads it there. Legal, and the shape the
+/// nesting order exists for: `a`'s writers all precede the await, so `a`'s store is
+/// always the outer one.
+#[test]
+fn a_writer_source_may_be_computed_from_an_earlier_store_s_await() {
+    let code = indoc! {r#"
+        a: Mut(Int, Txn) := 100
+        for r in [10]:
+            with begin():
+                a := a - r
+        fa = await_final(a)
+        reqs = [x + fa for x in [1, 2]]
+        b: Mut(Int, Txn) := 0
+        for r in reqs:
+            with begin():
+                b := b + r
+        await_final(b)
+    "#};
+    assert_eq!(commit_stores(code), vec!["Txn[a]", "Txn[b]"]);
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![183])));
+}
+
+/// A cross-domain accumulator that itself **depends on an await** does not go
+/// outermost. `acc` is seeded from `await_final(a)`, so its letrec has to be inside
+/// `a`'s store — while still being outside `b`'s store, which reads it. The store list
+/// is the assertion: the induction carrier sits *between* the two commit stores rather
+/// than wrapping both.
+///
+/// The two demands cannot conflict. `a`'s writers all precede the await (a later
+/// mention is rejected by linearity) and `b`'s block follows the accumulator's loop, so
+/// `a`'s keys always occur first and `b`'s store is always the inner one; and the two
+/// cannot be one store, which is the cycle `check_store_acyclicity` rejects.
+#[test]
+fn a_cross_domain_accumulator_depending_on_an_await_nests_inside_that_store() {
+    let code = indoc! {r#"
+        a: Mut(Int, Txn) := 100
+        for r in [10]:
+            with begin():
+                a := a - r
+        acc := await_final(a)
+        for x in [1, 2]:
+            acc := acc + 1
+        b: Mut(Int, Txn) := 0
+        for r in [1]:
+            with begin():
+                b := b + acc
+        await_final(b)
+    "#};
+    assert_eq!(commit_stores(code), vec!["Txn[a]", "[0, 1][acc]", "Txn[b]"]);
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![92])));
+}
+
 /// A finite mutable variable completes even though an unrelated one never does.
 ///
-/// `b` is driven by a live source that never ends, so its store never reports terminal.
-/// `a`'s writers are a finite loop, and nothing relates the two — so `a`'s store is its
-/// own, and the trailing read of `a` resolves. A store is terminal only when *every* one
-/// of its writers has drained, and `AsOf` stays non-terminal until its store is, so this
-/// read would not settle if `b` were a key of the same store.
+/// `b` is driven by a live source that never ends, so its store never reports terminal
+/// and `await_final(b)` cannot resolve — correctly, since there is no final value to
+/// report. `a`'s writers are a finite loop and nothing relates the two, so `a`'s store is
+/// its own and its completion read *does* resolve. A store is terminal only when *every*
+/// one of its writers has drained, so neither read would settle if `a` and `b` were keys
+/// of one store.
+///
+/// The two halves of the reply are the assertion: one settles, the other stays
+/// unresolved, in the same program and the same pull.
 #[test]
 fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     let code = indoc! {r#"
-        oa = defer()
-        ob = defer()
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
         for x in [1, 2]:
@@ -1325,11 +1726,7 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
         for req in source1():
             with begin():
                 b := b + req
-        with begin():
-            oa << a
-        with begin():
-            ob << b
-        (sum(oa), sum(ob))
+        (await_final(a), await_final(b))
     "#};
 
     let mut ctx = GlobalContext::default();
@@ -1355,15 +1752,69 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
         result = producer.get(ug.clone());
     }
 
-    // `a`'s half is settled at its final 1 + 2 = 3 even though the program as a whole
-    // cannot be terminal — `b`'s store is still open.
     let Tile::Record(fields) = &result else {
         panic!("expected a record of both replies, got {result:?}");
     };
     assert_eq!(
         fields.get("_0"),
         Some(&Tile::Scalar(ColumnValue::Ints(vec![3]))),
-        "the finite mutable variable's read must settle; got {result:?}"
+        "the finite mutable variable's completion read must settle; got {result:?}"
+    );
+    assert!(
+        fields.get("_1").is_some_and(Tile::is_empty),
+        "the live mutable variable has no final value to report; got {result:?}"
+    );
+}
+
+/// A key a block only **reads** has a statically empty write history, so its terminal read
+/// is its seed — settled even while a live writer keeps that store open.
+///
+/// `{reads ∪ writes}` is one store (`src/ccl/design/mutability.md`, "How many commit stores
+/// a program has"), so `limit` shares `total`'s commit clock though nothing writes `limit`.
+/// `resolve_writer_free_awaits` gates on the **write** footprints for exactly this reason:
+/// gated on footprint keys instead, `limit` would reach a runtime completion read and wait
+/// on a store that never closes. The store-count assertion pins the two keys together —
+/// without it the program could pass by being partitioned instead.
+#[test]
+fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
+    let code = indoc! {r#"
+        total: Mut(Int, Txn) := 0
+        limit: Mut(Int, Txn) := 100
+        for req in source1():
+            with begin():
+                total := total + req + limit
+        await_final(limit)
+    "#};
+
+    let mut ctx = GlobalContext::default();
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(src.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    assert_eq!(
+        stores_in(&compiled.ast),
+        vec!["Txn[total,limit]"],
+        "the read must put both keys in one store, or this tests nothing"
+    );
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let ug = producer.tiling().universal_guard();
+
+    src.borrow_mut()
+        .add_data(&[(Value::UInt(0), Value::Int(5))]);
+    ctx.scheduler().check_for_notifications();
+    let mut result = producer.get(ug.clone());
+    for _ in 0..64 {
+        result = producer.get(ug.clone());
+    }
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::Ints(vec![100])),
+        "nothing writes `limit`, so its terminal read is its initializer even though \
+         `total`'s live writer keeps the store open; got {result:?}"
     );
 }
 
@@ -1387,7 +1838,7 @@ fn bare_txn_read_outside_tx_rejected() {
 }
 
 /// A *computed* live cross-endpoint read (`resp << latest + 1`) compiles: the
-/// pre-lambda-elim live-read rewrite turns it into `as_of(…) ≫ (λ x → x + 1)`,
+/// pre-lambda-elim as-of-read rewrite turns it into `as_of(…) ≫ (λ x → x + 1)`,
 /// whose reply lambda the elim pass point-frees. Running the rewrite before
 /// lambda-elim is what keeps the reply a liftable lambda rather than a
 /// point-free `const`.
@@ -1413,7 +1864,7 @@ fn computed_live_cross_endpoint_read_compiles() {
 }
 
 /// A live cross-endpoint read that combines the *request element* with a mutable variable
-/// read (`resp << a + req`) compiles: the live-read rewrite turns it into
+/// read (`resp << a + req`) compiles: the as-of-read rewrite turns it into
 /// `zip((trigger, as_of(store))) ≫ (λ (req, snap) → e)`, pairing each request with
 /// its mutable variable snapshot. The end-to-end value is checked in
 /// `live_reply_combines_request_and_store`.
@@ -1441,9 +1892,12 @@ fn live_read_combining_request_and_store_compiles() {
 
 /// End-to-end live check of the request-plus-variable reply (3b): a batch loop
 /// commits the mutable variable to 60, then a **live** source drives replies
-/// `resps << store + req`. Each reply pairs the request with the store's as-of
-/// snapshot (60, after the batch commits), so requests 5 and 15 yield 65 and 75 —
-/// the `zip((trigger, as_of)) ≫ (λ (req, s) → req + s)` shape driven incrementally.
+/// `resps << store + req`, each pairing the request with the store's as-of snapshot
+/// — the `zip((trigger, as_of)) ≫ (λ (req, s) → req + s)` shape driven incrementally.
+///
+/// The requests are delivered only after the store has drained, which is what makes
+/// 65 and 75 assertable: an as-of read latches at its position's arrival, so a request
+/// arriving mid-drain would legally observe 0, 10 or 30 instead.
 #[test]
 fn live_reply_combines_request_and_store() {
     use cambra::ccl::context::CompileResultExt;
@@ -1473,6 +1927,13 @@ fn live_reply_combines_request_and_store() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    // Drain the commit store first, with no request present: the reader pulls the
+    // store on every `get`, and the writer's self-re-arm steps one commit per pull.
+    for _ in 0..16 {
+        producer.get(producer.tiling().universal_guard());
+        ctx.scheduler().check_for_notifications();
+    }
 
     src.borrow_mut().add_data(&[
         (Value::UInt(0), Value::Int(5)),
@@ -1533,19 +1994,15 @@ fn tx_if_else_routes_across_keys() {
         indoc! {r#"
             a: Mut(Int, Txn) := 0
             b: Mut(Int, Txn) := 0
-            out = defer()
             for x in [1, 2, 3]:
                 with begin():
                     if x >= 2:
                         a := a + x
                     else:
                         b := b + x
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << a + b
-            out
+            await_final(a) + await_final(b)
         "#},
-        commit_stream(&[0], &[6]),
+        Tile::Scalar(ColumnValue::Ints(vec![6])),
     );
 }
 
@@ -1563,46 +2020,58 @@ fn tx_if_else_absolute_writes_route_across_keys() {
         indoc! {r#"
             a: Mut(Int, Txn) := 0
             b: Mut(Int, Txn) := 0
-            out = defer()
             for x in [1, 2, 3]:
                 with begin():
                     if x >= 2:
                         a := 5
                     else:
                         b := 6
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << a + b
-            out
+            await_final(a) + await_final(b)
         "#},
-        commit_stream(&[0], &[11]),
+        Tile::Scalar(ColumnValue::Ints(vec![11])),
     );
 }
 
 /// An `elif` chain (no `else`) inside a transaction: first-match per position,
 /// the trailing implicit arm the deny (a position matching no guard does not
 /// commit). `a := 0`, over `[3, 2, 1]`: x=3 → `if` → a += 3; x=2 → `elif` →
-/// a += 1; x=1 → neither → deny. Final a = 4. (The loop leads with a committing
-/// position so the trailing as-of read observes the drained store — a leading
-/// *deny* delays the first commit past that read's position-0 sample.)
+/// a += 1; x=1 → neither → deny. Final a = 4, which `await_final` reports whatever
+/// order the three positions commit in.
 #[test]
 fn tx_if_elif_first_match() {
     check_tile(
         indoc! {r#"
             a: Mut(Int, Txn) := 0
-            out = defer()
             for x in [3, 2, 1]:
                 with begin():
                     if x >= 3:
                         a := a + x
                     elif x >= 2:
                         a := a + 1
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << a
-            out
+            await_final(a)
         "#},
-        commit_stream(&[0], &[4]),
+        Tile::Scalar(ColumnValue::Ints(vec![4])),
+    );
+}
+
+/// The same chain **leading with a deny**: `x=1` matches no guard, so the first
+/// transaction commits nothing and the store's first commit lands at a later position.
+/// `await_final` reports 4 regardless, because it reduces the whole history rather than
+/// sampling it — the ordering of commits within the store never reaches the value.
+#[test]
+fn tx_if_elif_leading_deny() {
+    check_tile(
+        indoc! {r#"
+            a: Mut(Int, Txn) := 0
+            for x in [1, 2, 3]:
+                with begin():
+                    if x >= 3:
+                        a := a + x
+                    elif x >= 2:
+                        a := a + 1
+            await_final(a)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![4])),
     );
 }
 
@@ -1617,19 +2086,15 @@ fn multiple_if_guards_route_independently() {
         indoc! {r#"
             a: Mut(Int, Txn) := 0
             b: Mut(Int, Txn) := 0
-            out = defer()
             for r in [5]:
                 with begin():
                     if a >= 0:
                         a := a + r
                     if r > 100:
                         b := b + r
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << a
-            out
+            await_final(a)
         "#},
-        commit_stream(&[0], &[5]),
+        Tile::Scalar(ColumnValue::Ints(vec![5])),
     );
 }
 
@@ -1814,17 +2279,13 @@ fn bare_mut_var_arg_to_ordinary_fn_is_gated() {
 fn like_named_comprehension_var_does_not_panic() {
     check_tile(
         indoc! {r#"
-            out = defer()
             store: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
                     store := store - sum([store for store in [1, 2, 3]])
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << store
-            out
+            await_final(store)
         "#},
-        commit_stream(&[0], &[94]),
+        Tile::Scalar(ColumnValue::Ints(vec![94])),
     );
 }
 
@@ -1880,19 +2341,15 @@ fn mixed_txn_and_induction_reply_reads_accumulator() {
 fn mixed_txn_and_induction_store_accumulates() {
     check_tile(
         indoc! {r#"
-            out = defer()
             store: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 with begin():
                     store := store + r
                 cnt := cnt + 1
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << store
-            out
+            await_final(store)
         "#},
-        commit_stream(&[0], &[60]),
+        Tile::Scalar(ColumnValue::Ints(vec![60])),
     );
 }
 
@@ -1927,19 +2384,15 @@ fn mixed_txn_and_induction_write_inside_block() {
 fn mixed_txn_and_induction_write_inside_block_store_accumulates() {
     check_tile(
         indoc! {r#"
-            out = defer()
             store: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 with begin():
                     store := store + r
                     cnt := cnt + 1
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << store
-            out
+            await_final(store)
         "#},
-        commit_stream(&[0], &[60]),
+        Tile::Scalar(ColumnValue::Ints(vec![60])),
     );
 }
 
@@ -1953,19 +2406,15 @@ fn mixed_txn_and_induction_write_inside_block_store_accumulates() {
 fn commit_decision_reads_induction_accumulator() {
     check_tile(
         indoc! {r#"
-            out = defer()
             store: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
                 cnt := cnt + 1
                 with begin():
                     store := store + cnt
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << store
-            out
+            await_final(store)
         "#},
-        commit_stream(&[0], &[6]),
+        Tile::Scalar(ColumnValue::Ints(vec![6])),
     );
 }
 
@@ -2194,14 +2643,18 @@ fn in_block_reply_with_deny_is_dense() {
 /// with a middle deny (`[10, 0, 20]`: total 0→10, r=0 denies, →30), and a **live**
 /// request stream reads `total + req` as an as-of read latched at each request's
 /// arrival. The consumer-driven store steps past the deny under the writer's own
-/// self-re-arm (no reader-side drive-to-fixpoint), so **every request is served**
-/// (no freeze — one reply per request) and a request delivered after the writer
-/// completes observes the **post-deny** commit (`total = 30`), which the old
+/// self-re-arm (no reader-side drive-to-fixpoint), so **every request is served** (no
+/// freeze — one reply per request), and the request delivered *after* the writer
+/// completes observes the **post-deny** commit (`total = 30`) — which the old
 /// producer-side `drive_store_to_fixpoint` stopped short of (a deny stalls the
 /// frontier, so the drive returned the pre-deny `total = 10` and a request latching
-/// then froze there). Observations are asserted **non-decreasing** (a monotone
-/// accumulator sampled at arrival) and members of the committed set — never a
-/// specific "final" value.
+/// then froze there).
+///
+/// The two requests arrive at different times because that is the only thing an as-of
+/// read's value follows. The first arrives before the writer has drained, so its
+/// observation is asserted only to be **non-decreasing** and a member of the committed
+/// set; a specific value there would pin whichever commit the schedule happened to
+/// reach. The completed value has a name of its own (`await_final`).
 #[test]
 fn live_read_progresses_past_deny() {
     use cambra::interpreter::sort_sealed_function_by_domain;
@@ -2230,16 +2683,26 @@ fn live_read_progresses_past_deny() {
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     let ug = producer.tiling().universal_guard();
 
-    // Two requests (req = 100 at position 0, req = 200 at position 1); drive the
-    // cyclic store — with its interior deny — to completion.
-    src.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::Int(100)),
-        (Value::UInt(1), Value::Int(200)),
-    ]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    // Request 0 (req = 100) arrives first and latches whatever the store has then.
+    src.borrow_mut()
+        .add_data(&[(Value::UInt(0), Value::Int(100))]);
+    src.borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(0usize)));
     ctx.scheduler().check_for_notifications();
     let mut result = producer.get(ug.clone());
-    for _ in 0..64 {
+
+    // Drive the cyclic store — with its interior deny — to completion, then deliver
+    // request 1 (req = 200). Arrival order is what makes its observation assertable:
+    // it latches after the writer has drained.
+    for _ in 0..32 {
+        result = producer.get(ug.clone());
+        ctx.scheduler().check_for_notifications();
+    }
+    src.borrow_mut()
+        .add_data(&[(Value::UInt(1), Value::Int(200))]);
+    src.borrow_mut().set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    for _ in 0..32 {
         result = producer.get(ug.clone());
     }
     result.compact();
@@ -2272,11 +2735,12 @@ fn live_read_progresses_past_deny() {
         observed_total[0] <= observed_total[1],
         "later request observes a value >= the earlier one, got {observed_total:?}"
     );
-    // The later request observes the post-deny commit — the store stepped past the
-    // interior deny (which the old drive-to-fixpoint stalled on).
+    // The request delivered after the writer completed observes the post-deny commit —
+    // the store stepped past the interior deny (which the old drive-to-fixpoint stalled
+    // on).
     assert_eq!(
         observed_total[1], 30,
-        "the post-writer request observes the drained total 30 (past the r=0 deny)"
+        "the request arriving after the writer drained observes total 30 (past the r=0 deny)"
     );
 }
 
@@ -2295,16 +2759,12 @@ fn cross_function_transfer_conserves_total() {
                 with begin():
                     src := src - amt
                     dst := dst + amt
-            out = defer()
             a: Mut(Int, Txn) := 100
             b: Mut(Int, Txn) := 0
             transfer(a, b, 30)
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << a + b
-            out
+            await_final(a) + await_final(b)
         "#},
-        commit_stream(&[0], &[100]),
+        Tile::Scalar(ColumnValue::Ints(vec![100])),
     );
 }
 
@@ -2319,26 +2779,15 @@ fn cross_function_transfer_conserves_total() {
 fn heterogeneous_multi_key_store_reads_string_key() {
     check_tile(
         indoc! {r#"
-            out = defer()
             label: Mut(String, Txn) := "init"
             count: Mut(Int, Txn) := 0
             for x in [1, 2, 3]:
                 with begin():
                     count := count + x
                     label := "seen"
-            # TODO(await_final): arbitrary as-of read — sees the drained store only by single-threaded timing.
-            with begin():
-                out << label
-            out
+            await_final(label)
         "#},
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Strings(vec![SmolStr::new(
-                "seen",
-            )]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        },
+        Tile::Scalar(ColumnValue::Strings(vec![SmolStr::new("seen")])),
     );
 }
 
@@ -2367,7 +2816,6 @@ fn heterogeneous_multi_key_store_reads_string_key() {
 fn txn_off_path_guarded_division_does_not_fault() {
     check_tile(
         indoc! {r#"
-            out = defer()
             d: Mut(Int, Txn) := 3
             acc: Mut(Int, Txn) := 100
             for r in [1, 2]:
@@ -2375,11 +2823,9 @@ fn txn_off_path_guarded_division_does_not_fault() {
                     if d != 0:
                         acc := acc // d
                         d := d - 3
-            with begin():
-                out << acc
-            out
+            await_final(acc)
         "#},
-        commit_stream(&[0], &[33]),
+        Tile::Scalar(ColumnValue::Ints(vec![33])),
     );
 }
 
@@ -2397,7 +2843,6 @@ fn txn_off_path_guarded_division_does_not_fault() {
 fn interleaved_two_writer_commit_abort_through_store() {
     check_tile(
         indoc! {r#"
-            out = defer()
             pool: Mut(Int, Txn) := 100
             for r in [10, 200]:
                 with begin():
@@ -2407,10 +2852,8 @@ fn interleaved_two_writer_commit_abort_through_store() {
                 with begin():
                     if pool >= r:
                         pool := pool - r
-            with begin():
-                out << pool
-            out
+            await_final(pool)
         "#},
-        commit_stream(&[0], &[70]),
+        Tile::Scalar(ColumnValue::Ints(vec![70])),
     );
 }

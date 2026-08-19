@@ -2582,11 +2582,11 @@ around `reserve` + `quote` + the feed).
   lands in the commit order, replied indexed by the *reading* loop. This
   is uniform whether the reader is a live request stream, a finite loop,
   or the synthesized singleton of a standalone read.
-- **Terminal read — `await_final(x)` [Decided].** The one term that reads a
-  mutable variable's *final* committed value, waiting for its whole commit history
-  to complete, is `await_final` (§8.6). There is deliberately no other
-  terminal mutable variable read; absent it, every fed-out mutable variable read is an
-  arbitrary as-of sample, not a promised final.
+- **Terminal read — `await_final(x)` [Decided].** `await_final(x)` waits for
+  `x`'s whole commit history to complete and yields its final value (§8.6). It
+  is the only terminal read of a mutable variable: every other read is an
+  arbitrary as-of sample, so a program that means the final value has to say
+  so.
 
 ### 8.4 Feeds are the second form of mutability
 
@@ -2671,33 +2671,71 @@ Consequences a program may rely on:
 
 ### 8.6 `await_final` [Decided]
 
-**Designed, not yet built** — a program that names `await_final` does not
-compile today.
-
 `await_final(x)` is a builtin call on a transactional mutable variable
 `x: Mut(V, Txn)`, an expression of type `V`: the mutable variable's **final
-committed value**, once its entire commit history is complete (every
-writer source drained), or the initializer if it was never committed. It
-is the commit-domain counterpart of the trailing induction read (§8.3)
-and the completion event of the ordering model (§8.5) — the *only* read
-that waits for a `Txn` mutable variable's completeness rather than the frontier.
+committed value**, once every block that writes `x` has finished, or the
+initializer if it was never committed. It is the commit-domain counterpart of
+the trailing induction read (§8.3) and the completion event of the ordering
+model (§8.5) — the one read that waits for a `Txn` mutable variable's
+completeness rather than sampling its frontier.
 
 ```python
 pool: Mut(Int, Txn) := 100
 for r in reqs:
     with begin():
         pool -= r
-final = await_final(pool)      # waits for every writer of `pool`, then the final commit
+final = await_final(pool)      # `pool` once every writer of it has finished
 ```
 
-**`x` is unreferenceable afterward.** After `await_final(x)`, `x` may not be
-read or written — any later reference is a compile error. This is what makes
-the completion event well-defined: `await_final` declares `x`'s history
-complete, and a later write would extend a history already declared
-finished. Forbidding later references closes the writer set at the await
-point, so "final" names a fixed value. (A `for` loop's accumulator gets the
-same terminal read for free because the loop has a lexical end; a mutable variable
-has none, so the barrier is drawn explicitly by consuming it.)
+**`x` is unreferenceable afterward.** After `await_final(x)`, any later
+reference to `x` — a read, a write, or a second `await_final(x)` — is a compile
+error. That is what makes the completion event well-defined: the await closes
+`x`'s writer set at that point, so "final" names a fixed value. (A `for` loop's
+accumulator gets a terminal read for free because the loop has a lexical end; a
+mutable variable has none, so the barrier is drawn by consuming it.) The rule is
+about `x` alone — a later block that does not mention `x` is an ordinary
+transaction.
+
+**Nothing a writer of `x` needs may depend on `await_final(x)`**: the await
+completes only once every block writing `x` has finished, so such a dependency
+is a cycle. Three positions are rejected — a writer's iteration source, a
+writer's decision body, and a transactional mutable variable's seed. Awaiting a
+mutable variable written *elsewhere* is an ordinary dependency between two
+computations, which is what makes **phase separation** — drain one transaction,
+then seed the next from its final value — compile:
+
+```python
+a: Mut(Int, Txn) := 100
+for r in reqs1:
+    with begin():
+        a := a - r
+b: Mut(Int, Txn) := await_final(a)   # `b`'s seed is `a`'s final value
+for r in reqs2:
+    with begin():
+        b := b - r
+```
+
+An **induction** accumulator may likewise be seeded from an await
+(`x := await_final(pool)`): a different recurrence, so there is no cycle.
+
+One restriction unrelated to cycles: `await_final` may not appear inside a `with
+begin():` block, which reads its mutable variables bare as a snapshot; awaiting
+there would wait on the history that block extends.
+
+**Completeness is per variable.** `await_final(x)` waits for every block that
+may write `x` and for nothing else, so a mutable variable whose writing blocks
+are all finite settles while other variables — including ones `x` shares a block
+with — are still being written by a live source. If no block writes `x` at all,
+or every transaction denies, the await is `x`'s initializer.
+
+> **Current limitation.** The implementation is coarser: variables that some
+> `with begin():` block mentions together report completion as a group. Two
+> consequences, both defects against this section rather than intended
+> restrictions. `await_final(x)` does not settle while a variable `x` shares a
+> block with still has a live writer. And the cycle rule above is enforced against
+> that group, so a writer of a *store-mate* of `x` may not depend on
+> `await_final(x)` either, though no block writing `x` follows the await.
+> Variables that no block relates are unaffected by either.
 
 ### 8.7 Direction [Decided]: transactions as contextual parameters
 

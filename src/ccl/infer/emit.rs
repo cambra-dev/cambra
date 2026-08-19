@@ -81,10 +81,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         // Builtins with a polymorphic signature (shared type variables
         // across positions) live in the `OperatorSchemes` registry — at
-        // each use site we freshen a copy. Currently only `FinalOrDefault`
-        // qualifies (`∀α β. ((α → β), β) → β`); the registry generalizes
-        // as more polymorphic builtins land. All other builtins arrive
-        // pre-stamped from lowering and just get converted in place.
+        // each use site instantiates a fresh copy. `FinalOrDefault`
+        // (`∀α β. ((α → β), β) → β`), the two `get_prev_*` causal accessors,
+        // and `AwaitFinal` (`∀ν. Mut(ν, Txn) → ν`) qualify. All other
+        // builtins arrive pre-stamped from lowering and just get converted
+        // in place.
         TypedExprNode::Builtin(b) => {
             if let Some(scheme) = ctx.schemes.builtin(b.clone()) {
                 scheme.instantiate(ctx.level)

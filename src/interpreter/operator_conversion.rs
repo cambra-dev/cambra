@@ -23,7 +23,8 @@ use crate::{
         // node-field carrier imported from `ccl` above).
         commit_operator::{
             AsOf, AsOfField, BodyInputBuffer, BodyInputSource, CommitOperator, InductionStore,
-            StoreDenseRead, StoreValueStream, TransactWriter as CommitWriter, WriterBuffer,
+            StoreDenseRead, StoreFinalRead, StoreValueStream, TransactWriter as CommitWriter,
+            WriterBuffer,
         },
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
@@ -772,7 +773,7 @@ fn convert_impl_inner(
         // `as_of((trigger, source))` — the live cross-endpoint read. For each
         // trigger position (a request loop), latch the shared store as of that
         // request; the reply is indexed by the trigger (outer-indexed). Emitted by
-        // `transact_phase::rewrite_live_reads`. `AsOf` folds the raw `Tile::Store`
+        // `transact_phase::rewrite_as_of_reads`. `AsOf` folds the raw `Tile::Store`
         // fan directly (via `store_current`), so no `StoreValueStream`
         // intermediary. Two source shapes:
         //   - `__reg.k` (a bare mutable variable read) → a scalar `AsOf` sampling key `k`;
@@ -1002,6 +1003,56 @@ fn convert_impl_inner(
                 "begin (the transaction commit-time oracle) reached operator \
                  conversion — letrec pattern recognition (the unified phase, \
                  src/ccl/design/mutability.md) must consume it before this pass"
+                    .into(),
+            ))
+        }
+
+        // `as_of_read` is a fed-out mutable variable read still missing its position, and
+        // `rewrite_as_of_reads` pairs every one with its reading loop to build the `AsOf`
+        // join. Reaching this arm means one was never paired and the check at the end of
+        // that pass did not see it — a compiler bug, since the sampled position has no
+        // other source.
+        TypedExprNode::Apply { function, .. }
+            if as_builtin(function) == Some(Builtin::AsOfRead) =>
+        {
+            Err(ConversionError::Unsupported(
+                "as_of_read (a fed-out mutable variable read) reached operator conversion — \
+                 `transact_phase::rewrite_as_of_reads` must pair it with its reading loop \
+                 and build the `as_of` join before this pass"
+                    .into(),
+            ))
+        }
+
+        // `final_read` is the terminal read of a commit key: a sample of the key's carried
+        // value at the position its own writers finish. Unlike `as_of_read` it needs no
+        // pairing — the position comes from the store's closure, not from a reading loop —
+        // so it is compiled here, to a `StoreFinalRead` over the store branch.
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::FinalRead) =>
+        {
+            expect_no_input(input, "final_read")?;
+            let Some((store_name, field)) = as_store_read(argument, ctx) else {
+                return Err(ConversionError::Unsupported(
+                    "final_read's operand is not a store history binding — `transact_phase` \
+                     mints it naming one (src/ccl/design/mutability.md, \"`await_final`\")"
+                        .into(),
+                ));
+            };
+            convert_store_final_read(&store_name, &field, ctx)
+        }
+
+        // `await_final` is a surface marker: `transact_phase` replaces each occurrence
+        // with `final_or_default` over the mutable variable's history binding (or, for a
+        // writer-free mutable variable, with its seed). Reaching this arm means a marker
+        // escaped that phase — a compiler bug, not an unsupported program, since the
+        // phase asserts its own absence on the way out.
+        TypedExprNode::Apply { function, .. }
+            if as_builtin(function) == Some(Builtin::AwaitFinal) =>
+        {
+            Err(ConversionError::Unsupported(
+                "await_final (the terminal mutable variable read) reached operator conversion — \
+                 `transact_phase` must resolve it to a terminal read over the mutable variable's \
+                 history binding (src/ccl/design/mutability.md, \"`await_final`\") before this pass"
                     .into(),
             ))
         }
@@ -1756,10 +1807,10 @@ fn build_induction_store_single(
     })
 }
 
-/// Resolve an `as_of` live read's `source` — a bare mutable variable read `__reg.k`
+/// Resolve an `as_of` read's `source` — a bare mutable variable read `__reg.k`
 /// off a registered commit store — to the raw store fan branch, its runtime key,
 /// and the key's value extent. `AsOf` folds the [`Tile::Store`] fan directly (via
-/// `store_current`), so the live-read path takes the fan + key rather than
+/// `store_current`), so the as-of path takes the fan + key rather than
 /// compiling `source` to a per-key [`StoreValueStream`].
 fn as_of_store_source(
     source: &Expr,
@@ -1789,7 +1840,7 @@ fn as_of_store_source(
     // never a per-commit reply tap — the tap has no `keys` entry.
     debug_assert!(
         matches!(info.kind, StoreReadKind::Commit),
-        "as_of live read must sample a commit-store mutable variable"
+        "an as_of read's source is a commit-store mutable variable"
     );
     let runtime_key = key.runtime_key.clone();
     let value_extent = key.value_extent.clone();
@@ -1830,6 +1881,54 @@ fn as_of_snapshot_fields(
             })
         })
         .collect()
+}
+
+/// The `(store, field)` of a `__reg.field` read on a registered store, if `e` is one.
+/// The same shape the generic `Apply`/`Proj` arm matches, factored out so the
+/// `FinalRead` arm can recognise its own operand.
+fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, String)> {
+    let TypedExprNode::Apply { argument, function } = &e.node else {
+        return None;
+    };
+    let (TypedExprNode::Var(name), TypedExprNode::Proj(ProjKey::Field(field))) =
+        (&argument.node, &function.node)
+    else {
+        return None;
+    };
+    ctx.lookup_store(name)?;
+    Some((name.clone(), field.clone()))
+}
+
+/// Compile a surface `await_final(x)` — a [`Builtin::FinalRead`] naming `x`'s history
+/// binding — as a [`StoreFinalRead`] over the store branch.
+///
+/// A commit store only: an induction accumulator's trailing read is a genuine reduction
+/// over its dense per-position stream, because a loop ends positionally rather than by a
+/// key's writers draining, and `transact_phase` never mints a `FinalRead` for one.
+fn convert_store_final_read(
+    store_name: &Name,
+    field: &str,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let info = ctx.lookup_store(store_name).ok_or_else(|| {
+        ConversionError::Unsupported(format!("unknown transactional store {store_name}"))
+    })?;
+    if info.kind != StoreReadKind::Commit {
+        return Err(ConversionError::Unsupported(format!(
+            "final_read on {store_name}.{field}, which is not a commit store — a terminal \
+             read is only minted for a `Mut(V, Txn)` key"
+        )));
+    }
+    let key = info.keys.get(field).ok_or_else(|| {
+        ConversionError::Unsupported(format!("unknown key {field} on store {store_name}"))
+    })?;
+    let (runtime_key, value_extent) = (key.runtime_key.clone(), key.value_extent.clone());
+    let fan = info.fan.clone();
+    Ok(Box::new(StoreFinalRead::new(
+        fan.branch(),
+        runtime_key,
+        value_extent,
+    )))
 }
 
 /// Compile a per-variable read `__reg.field` off a registered transactional
@@ -2215,11 +2314,11 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
 // `scalar_tile_to_column_value` later in the pipeline.  Filtering here
 // keeps that caller from ever seeing a function-typed argument.
 /// Whether a `zip` arm is a **leaf source** over its own domain — a store read
-/// `__reg.k` or an `as_of((trigger, store))` live read — rather than an
+/// `__reg.k` or an `as_of((trigger, store))` read — rather than an
 /// iteration-driven morphism. Such an arm is converted with *no* input (it would
 /// reject the fanned iteration input); `fan_in` co-aligns it with the
 /// input-driven arms by domain position. This is the cross-domain co-iteration
-/// shape: a commit writer's source (`zip((reqs, __cnt.acc))`) or a live reply
+/// shape: a commit writer's source (`zip((reqs, __cnt.acc))`) or a reply
 /// combining the request with a store read (`zip((trigger, as_of(store)))`).
 fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
     match &expr.node {

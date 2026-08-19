@@ -236,7 +236,7 @@ pub enum UnaryOpKind {
 ///   type is the uncurried `𝐴 ⇒ 𝐵`.
 /// - The handful of built-ins that *are* visible to inference (the binary
 ///   operators, the aggregations, `final_or_default`, `get_prev_seq`,
-///   `get_prev_txn`) additionally carry a polymorphic scheme in
+///   `get_prev_txn`, `await_final`) additionally carry a polymorphic scheme in
 ///   [`OperatorSchemes`](crate::ccl::infer::OperatorSchemes), which is the
 ///   authority for those. The rest are minted post-inference: their type is
 ///   stamped on the node at emission, and the post-phase CHECK-mode
@@ -440,12 +440,66 @@ pub enum Builtin {
     /// lives in the commit-record binding, not in the oracle.
     BeginTxn,
 
+    /// `await_final : Mut(𝑉, Txn) ⇒ 𝑉` — the **terminal read** of a transactional
+    /// mutable variable: its final committed value, once the whole commit history is
+    /// complete. Applied to the mutable variable *handle* (`x ▷ await_final`), which is
+    /// why its domain is a `Mut` and not a `𝑉`: `await_final` reduces the history rather than
+    /// consuming one sampled value, so the operand is a handle position like a
+    /// pass-by-reference argument or a write target (see
+    /// `src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation").
+    /// Its scheme `∀ν. Mut(ν, Txn) ⇒ ν` lives in
+    /// [`crate::ccl::infer::OperatorSchemes`] — the domain pins `Txn`, so awaiting
+    /// an induction accumulator is a type error and not a silent success.
+    ///
+    /// This is the only surface term that waits for a `Txn` history's
+    /// *completeness*; every other fed-out mutable variable read is an arbitrary as-of
+    /// sample ([`Self::AsOf`]). It is a surface marker in the sense the `For` /
+    /// `Begin` / `MutWrite` nodes are: [`crate::ccl::transact_phase`] consumes it,
+    /// replacing each occurrence with `final_or_default(reg_x, init)` over the
+    /// mutable variable's history binding — the single sanctioned application of
+    /// [`Self::FinalOrDefault`] to a commit history. So it never reaches
+    /// op-conversion, and its arm there is a deliberate error like
+    /// [`Self::BeginTxn`]'s.
+    AwaitFinal,
+
     /// `copair : (Fun(A, B), Fun(C, D)) → Fun(Variant({.0: A, .1: C}), dedup(B, D))`
     ///
     /// Merges two function-typed (collection) values into a single collection whose
     /// domain is the discriminated union of both input domains and whose codomain is
     /// the deduplicated union of both input codomains.  Lowered from Python `a @ b`.
     Copair,
+
+    /// `as_of_read : (Txn ⇒ 𝑉) ⇒ 𝑉` — an **as-of read of a commit history whose position
+    /// is not yet supplied**, which is what every fed-out mutable variable read is.
+    /// [`crate::ccl::transact_phase`] binds each store key the continuation still names to
+    /// one; `rewrite_as_of_reads` then pairs it with the reading loop that indexes it and
+    /// rewrites the pair to an [`Self::AsOf`] join, which supplies the position. The two
+    /// are one construct in two stages, which is why they share the name.
+    ///
+    /// The stage exists so that an as-of read and a terminal read are **different terms**.
+    /// Both sample the same `Fun(Txn, V)` history and differ only in the position sampled, so
+    /// a single term for the pair would separate them by position alone — which does not
+    /// survive the passes that legitimately move a read (`channelize` copies a channel's
+    /// captured bindings inside the channel), letting an `await_final` land where the rewrite
+    /// matches. Distinct terms also make a *missed* rewrite loud: an unpaired `as_of_read` is
+    /// rejected after the rewrite rather than compiling to a read that waits forever.
+    ///
+    /// Minted post-inference, so it carries its own recorded type and has no scheme.
+    AsOfRead,
+
+    /// `final_read : (Txn ⇒ 𝑉) ⇒ 𝑉` — the **terminal read** of a transactional mutable
+    /// variable: its value at the position its own writers finish.
+    /// [`crate::ccl::transact_phase`] mints it for a surface [`Self::AwaitFinal`] marker,
+    /// naming the mutable variable's history binding.
+    ///
+    /// Like [`Self::AsOfRead`] it is a *sample* of the carried value rather than a
+    /// reduction of a stream, so it takes no seed operand — tick 0 of every store is its
+    /// keys' seeds. Unlike `AsOfRead` it needs no pairing: the position comes from the
+    /// store's own closure rather than from a reading loop, so it reaches op-conversion
+    /// and compiles to the `StoreFinalRead` tile operator.
+    ///
+    /// Minted post-inference, so it carries its own recorded type and has no scheme.
+    FinalRead,
 
     /// `as_of : Tuple(Fun(B, _), Fun(Txn, V)) → Fun(B, V)` — the **as-of
     /// (temporal) join**, the live cross-endpoint read. Applied as a tupled
@@ -455,11 +509,11 @@ pub enum Builtin {
     /// position. The reply is indexed by the *trigger* (the enclosing request
     /// loop), not the commit clock — an outer-indexed read.
     ///
-    /// Born in [`crate::ccl::transact_phase`]'s `rewrite_live_reads`, run
-    /// **pre-lambda-elim** (after `channelize`): it recognizes a read-only
-    /// reply — a chain of live-variable reads `let k₁ = final_or_default((balance.f₁, _))
-    /// in … in trigger ≫ (λ r → e)` — and rewrites it, dropping the never-resolving
-    /// `final_or_default`s. Reading **one** mutable variable → `as_of((trigger, balance.f)) ≫
+    /// Born in [`crate::ccl::transact_phase`]'s `rewrite_as_of_reads`, run
+    /// **pre-lambda-elim** (after `channelize`): it recognizes a read-only reply — a chain
+    /// of as-of reads `let k₁ = as_of_read(balance.f₁) in … in trigger ≫ (λ r → e)` —
+    /// and supplies each read's position from the trigger, which is the one thing
+    /// [`Self::AsOfRead`] leaves open. Reading a single mutable variable → `as_of((trigger, balance.f)) ≫
     /// (λ k → e)`; reading **several** → `as_of((trigger, balance)) ≫ (λ snap → e[kᵢ
     /// ↦ snap.fᵢ])`, a single snapshot record folded at one commit frontier so the
     /// mutable variables are read atomically (§I-c). Running before lambda elimination
@@ -558,7 +612,10 @@ impl Builtin {
             Self::GetPrevSeq => "get_prev_seq",
             Self::GetPrevTxn => "get_prev_txn",
             Self::BeginTxn => "begin",
+            Self::AwaitFinal => "await_final",
             Self::Copair => "copair",
+            Self::AsOfRead => "as_of_read",
+            Self::FinalRead => "final_read",
             Self::AsOf => "as_of",
             // The arm index is rendered by `symbolic` (a `&'static str` cannot
             // carry it); this bare name is the fallback for other callers.
