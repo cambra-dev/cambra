@@ -377,6 +377,11 @@ pub(crate) fn bound_scope_gaps(
 /// Log a recorded bound's closure gaps to the file `CAMBRA_TELESCOPE_LOG`
 /// names. Debug builds only, and inert unless the variable is set; one line
 /// per open name, so the file enumerates every fragment the run stored open.
+///
+/// A line the enforcement excused reads `OPEN(fragment)`: the derivation was a
+/// probe over a sub-tree, whose free references its absent context binds. The
+/// tag is what keeps the log a measurement of escapes rather than a count of
+/// sub-tree checks.
 pub(crate) fn observe_bound_scope(
     holder: &InferVar,
     side: &'static str,
@@ -414,8 +419,11 @@ pub(crate) fn observe_bound_scope(
         let mut out = String::new();
         for n in &gaps {
             out.push_str(&format!(
-                "OPEN ?{} {side} free={n} telescope={:?} ty={}\n",
-                holder.uid, holder.telescope, bound.ty
+                "OPEN{} ?{} {side} free={n} telescope={:?} ty={}\n",
+                if enforce { "" } else { "(fragment)" },
+                holder.uid,
+                holder.telescope,
+                bound.ty
             ));
         }
         if std::env::var_os("CAMBRA_TELESCOPE_BT").is_some() {

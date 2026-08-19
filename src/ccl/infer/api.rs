@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::infer::solver::Derivation;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     Expr, FieldKey, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode,
@@ -1296,7 +1297,7 @@ fn collect_type_errors(
 /// `Err(errs)`.
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
-    super::check(expr)
+    super::check(expr, Derivation::PostPass)
 }
 
 /// [`typecheck`] for the window between inference and `channelize`:
@@ -1305,6 +1306,22 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// are permitted — the unified phase and `channelize` erase them (see
 /// [`Strictness::PreDesugar`]).
 pub fn check_pre_desugar(expr: &Expr) -> Result<(), Vec<InferError>> {
+    check_pre_desugar_as(expr, Derivation::PostPass)
+}
+
+/// [`check_pre_desugar`] for a **sub-tree cut from its context**, which is
+/// `debug_typecheck`'s per-operation probe and nothing else.
+///
+/// The difference is the telescope closure invariant, not the typing rules: a
+/// sub-tree's refinements reference binders the enclosing tree holds, and no walk of
+/// the sub-tree can enter them, so recording such a bound is expected here and a
+/// record-time internal error over a whole tree
+/// (`src/ccl/design/type-inference.md`, "The invariant").
+pub fn check_pre_desugar_fragment(expr: &Expr) -> Result<(), Vec<InferError>> {
+    check_pre_desugar_as(expr, Derivation::Fragment)
+}
+
+fn check_pre_desugar_as(expr: &Expr, derivation: Derivation) -> Result<(), Vec<InferError>> {
     // The relaxation applies only when the tree carries transient histories
     // (feed/mutable machinery). A program with none should be fully resolved
     // after inference, so a residual `Infer` there is an ambiguous program
@@ -1316,7 +1333,7 @@ pub fn check_pre_desugar(expr: &Expr) -> Result<(), Vec<InferError>> {
         Strictness::Strict
     };
     check_annotated(expr, strictness)?;
-    crate::ccl::infer::check(expr)
+    crate::ccl::infer::check(expr, derivation)
 }
 
 /// Whether the tree carries pre-desugar artifacts: a `Defer`/`Feed`/
@@ -1707,7 +1724,7 @@ fn check_mut_write_targets_go(
 pub fn debug_typecheck(expr: &Expr) {
     #[cfg(feature = "deep-typecheck")]
     assert_eq!(
-        check_pre_desugar(expr),
+        check_pre_desugar_fragment(expr),
         Ok(()),
         "Failed post-transform typecheck: {}",
         crate::ccl::symbolic::symbolic_typed(expr)
@@ -3333,7 +3350,7 @@ mod tests {
     fn typecheck_surfaces_a_propagated_error() {
         let empty_case =
             Expr::match_expr(Expr::lit(Lit::Int(1)), Vec::new()).with_ty(Type::Base(BaseType::Int));
-        let errs = super::super::check(&empty_case)
+        let errs = super::super::check(&empty_case, Derivation::PostPass)
             .expect_err("an empty Case must be reported, not silently accepted");
         assert!(
             errs.iter()

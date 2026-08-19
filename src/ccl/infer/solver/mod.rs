@@ -53,7 +53,9 @@ pub mod traits;
 // directory split is path-transparent.
 pub use coalesce::{CoalesceError, coalesce_compact};
 pub use compact::{CompactGraph, CompactType, compact_type, compact_type_polarity_only};
-pub use constrain::{ConstrainCache, ConstrainError, ExtrudeCache, constrain_subtype, extrude};
+pub use constrain::{
+    ConstrainCache, ConstrainError, Derivation, ExtrudeCache, constrain_subtype, extrude,
+};
 pub use scheme::{
     FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots,
     seed_chan_dom_pairings,
