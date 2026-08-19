@@ -39,14 +39,14 @@ fn unit_ty() -> Type {
 }
 
 fn variant(tags: &[(&str, Type)]) -> Type {
-    Type::Variant(
+    Type::variant(
         tags.iter()
             .map(|(t, ty)| (FieldKey::Name((*t).into()), ty.clone()))
             .collect(),
     )
 }
 
-/// Build a pattern-matching [`Branch`]: `.tag(binding) [if guard] → body`.
+/// Build a pattern-matching [`Branch`]: `` `tag(binding) [if guard] → body ``.
 /// A `None` guard becomes the literal-`true` "no secondary filter" guard.
 fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> Branch {
     Branch {
@@ -57,6 +57,7 @@ fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> B
                 ty: Type::Hole,
                 user_annotation: None,
             },
+            empty_payload: false,
         }),
         guard: guard.unwrap_or_else(|| TypedExpr::lit(Lit::Bool(true))),
         body,
@@ -98,28 +99,28 @@ fn run_full(mut expr: TypedExpr) -> Result<TypedExpr, Vec<InferError>> {
 // Group A — Variant construction
 // ---------------------------------------------------------------------------
 
-/// `.Some(5)` infers to `[Some(Int)]`.
+/// `` `some(5) `` infers to `` {`some{Int}} ``.
 #[test]
 fn variant_ctor_int() {
-    let ty = run(TypedExpr::variant_ctor("Some", lit_int(5))).expect("inference ok");
-    assert_eq!(ty, variant(&[("Some", int_lit(5))]));
+    let ty = run(TypedExpr::variant_ctor("some", lit_int(5))).expect("inference ok");
+    assert_eq!(ty, variant(&[("some", int_lit(5))]));
 }
 
-/// `.None(())` infers to `[None(Unit)]`.
+/// `` `none(()) `` infers to `` {`none} ``.
 #[test]
 fn variant_ctor_unit() {
-    let ty = run(TypedExpr::variant_ctor("None", lit_unit())).expect("inference ok");
-    assert_eq!(ty, variant(&[("None", unit_ty())]));
+    let ty = run(TypedExpr::variant_ctor("none", lit_unit())).expect("inference ok");
+    assert_eq!(ty, variant(&[("none", unit_ty())]));
 }
 
-/// `.Pair((1, "x"))` infers to `[Pair((Int, String))]`.
+/// `` `pair((1, "x")) `` infers to `` {`pair{Int, String}} ``.
 #[test]
 fn variant_ctor_nested_payload() {
     let payload = TypedExpr::tuple(vec![lit_int(1), lit_string("x")]);
-    let ty = run(TypedExpr::variant_ctor("Pair", payload)).expect("inference ok");
+    let ty = run(TypedExpr::variant_ctor("pair", payload)).expect("inference ok");
     assert_eq!(
         ty,
-        variant(&[("Pair", Type::Tuple(vec![int_lit(1), str_lit_ty_local("x")]))])
+        variant(&[("pair", Type::Tuple(vec![int_lit(1), str_lit_ty_local("x")]))])
     );
 }
 
@@ -127,20 +128,20 @@ fn variant_ctor_nested_payload() {
 // Group B — Width subtyping (polarity-trap closer)
 // ---------------------------------------------------------------------------
 
-/// A lambda annotated with parameter type `[Some(Int), None(Unit)]` accepts
-/// a call argument of `.Some(5)` (singleton variant `[Some(Int)]`). The
-/// width-sub rule `[Some] <: [Some, None]` is the polarity-trap closer.
+/// A lambda annotated with parameter type `` {`some{Int} | `none} `` accepts
+/// a call argument of `` `some(5) `` (singleton variant `` {`some{Int}} ``). The
+/// width-sub rule `` {`some} <: {`some | `none} `` is the polarity-trap closer.
 ///
 /// **Ignored**: the widening itself now infers correctly (the one-way Apply
-/// edges admit `[Some] <: [Some, None]` at the call site), but the coalesced
-/// variant comes back with canonicalized tag order (`[None, Some]`) rather
+/// edges admit `` {`some} <: {`some | `none} `` at the call site), but the
+/// coalesced variant comes back with canonicalized tag order (`` {`none | `some} ``) rather
 /// than the annotation's declaration order, so the structural equality
 /// fails. Un-ignore once variant tag order is preserved (or the comparison
 /// is made order-insensitive).
 #[test]
 #[ignore = "coalesce canonicalizes variant tag order, losing declaration order"]
 fn variant_param_accepts_subtype() {
-    let param_ty = variant(&[("Some", int()), ("None", unit_ty())]);
+    let param_ty = variant(&[("some", int()), ("none", unit_ty())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         param: TypedBinding {
             name: "v".into(),
@@ -149,17 +150,17 @@ fn variant_param_accepts_subtype() {
         },
         body: Box::new(var("v")),
     });
-    let arg = TypedExpr::variant_ctor("Some", lit_int(5));
+    let arg = TypedExpr::variant_ctor("some", lit_int(5));
     let app = TypedExpr::apply(arg, lambda);
     let ty = run(app).expect("inference ok");
     assert_eq!(ty, param_ty);
 }
 
-/// A lambda annotated with parameter type `[Some(Int)]` rejects `.Other(5)` —
+/// A lambda annotated with parameter type `` {`some{Int}} `` rejects `` `other(5) `` —
 /// the tag is not in the parameter's accepted set.
 #[test]
 fn variant_extra_tag_rejected() {
-    let param_ty = variant(&[("Some", int())]);
+    let param_ty = variant(&[("some", int())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         param: TypedBinding {
             name: "v".into(),
@@ -168,11 +169,66 @@ fn variant_extra_tag_rejected() {
         },
         body: Box::new(var("v")),
     });
-    let arg = TypedExpr::variant_ctor("Other", lit_int(5));
+    let arg = TypedExpr::variant_ctor("other", lit_int(5));
     let app = TypedExpr::apply(arg, lambda);
     assert!(
         run(app).is_err(),
-        "Other tag should be rejected by [Some]-typed param"
+        "the `other` tag should be rejected by a one-arm `some` param"
+    );
+}
+
+/// An **open** arm set admits a subtype carrying tags it does not list, and still
+/// constrains the payloads of the tags it does.
+///
+/// The two halves of the variant width rule, which are separable only by openness: a
+/// closed arm set rejects the extra tag (`variant_extra_tag_rejected` above), an open
+/// one skips it — while both recurse into every shared tag. Skipping rather than
+/// bailing is what keeps the shared payloads constrained regardless of where the
+/// unlisted tag falls in canonical tag order.
+#[test]
+fn open_variant_admits_extra_tags_and_still_constrains_shared_payloads() {
+    use cambra::ccl::infer::solver::ConstrainCache;
+    use cambra::ccl::infer::solver::constrain_subtype;
+
+    let open_demand = Type::open_variant(vec![
+        (FieldKey::Name("b".into()), int()),
+        (FieldKey::Name("d".into()), int()),
+    ]);
+    // The subtype carries `a` and `c` — neither listed, and ordered *around* the
+    // listed ones so a bail-on-first-miss would skip `b`'s or `d`'s payload edge.
+    let subtype = Type::variant(vec![
+        (FieldKey::Name("a".into()), int()),
+        (FieldKey::Name("b".into()), int()),
+        (FieldKey::Name("c".into()), int()),
+        (FieldKey::Name("d".into()), int()),
+    ]);
+    let mut cache = ConstrainCache::new();
+    assert!(
+        constrain_subtype(&subtype, &open_demand, &mut cache).is_ok(),
+        "an open arm set admits tags it does not list"
+    );
+
+    // Closed: the same pair is a mismatch, because `a` is not accepted.
+    let closed_demand = Type::variant(vec![
+        (FieldKey::Name("b".into()), int()),
+        (FieldKey::Name("d".into()), int()),
+    ]);
+    let mut cache = ConstrainCache::new();
+    assert!(
+        constrain_subtype(&subtype, &closed_demand, &mut cache).is_err(),
+        "a closed arm set rejects a tag it does not list"
+    );
+
+    // And a *shared* tag's payload is still checked under openness: `b: String`
+    // cannot flow into `b: Int` just because the arm set is open.
+    let bad = Type::variant(vec![
+        (FieldKey::Name("a".into()), int()),
+        (FieldKey::Name("b".into()), string()),
+    ]);
+    let mut cache = ConstrainCache::new();
+    assert!(
+        constrain_subtype(&bad, &open_demand, &mut cache).is_err(),
+        "openness relaxes the tag set, not the shared payloads"
     );
 }
 
@@ -180,11 +236,11 @@ fn variant_extra_tag_rejected() {
 // Group C — Match elimination
 // ---------------------------------------------------------------------------
 
-/// `match .Some(7) { .Some(n) → n + 1; .None(_) → 0 }` typed at `Int`
+/// ``match `some(7) { `some(n) → n + 1; `none(_) → 0 }`` typed at `Int`
 /// when arm bodies are both `Int`.
 ///
-/// The scrutinee here is a singleton `[Some(Int)]`. `emit_match` builds
-/// the expected shape `[Some(α), None(β)]` and constrains `scrutinee <:
+/// The scrutinee here is a singleton `` {`some{Int}} ``. `emit_match` builds
+/// the expected shape `` {`some{α} | `none{β}} `` and constrains `scrutinee <:
 /// expected` (one-way), so the singleton flows through via variant
 /// width-sub without hitting the bidirectional-Apply collapse.
 #[test]
@@ -192,7 +248,7 @@ fn match_unifies_arm_bodies() {
     use cambra::ccl::{ArithmeticKind, BinOpKind};
     let arms = vec![
         arm(
-            "Some",
+            "some",
             "n",
             None,
             TypedExpr::binop(
@@ -201,14 +257,14 @@ fn match_unifies_arm_bodies() {
                 lit_int(1),
             ),
         ),
-        arm("None", "_", None, lit_int(0)),
+        arm("none", "_", None, lit_int(0)),
     ];
-    let scrutinee = TypedExpr::variant_ctor("Some", lit_int(7));
+    let scrutinee = TypedExpr::variant_ctor("some", lit_int(7));
     let ty = run(TypedExpr::match_expr(scrutinee, arms)).expect("match unification ok");
     assert_eq!(ty, int());
 }
 
-/// Per-arm payload narrowing: in `case .Some(n)`, `n` types at `Int` (the
+/// Per-arm payload narrowing: in `` case `some(n) ``, `n` types at `Int` (the
 /// narrowed payload), not as a union. We assert by using `n` in an Int
 /// context that would fail if the binding had a non-Int type.
 #[test]
@@ -217,7 +273,7 @@ fn match_per_arm_payload_narrowing() {
     let arms = vec![
         // `n + 1` only typechecks if `n: Int`.
         arm(
-            "Some",
+            "some",
             "n",
             None,
             TypedExpr::binop(
@@ -226,15 +282,15 @@ fn match_per_arm_payload_narrowing() {
                 lit_int(1),
             ),
         ),
-        arm("None", "_", None, lit_int(42)),
+        arm("none", "_", None, lit_int(42)),
     ];
-    let scrutinee = TypedExpr::variant_ctor("Some", lit_int(3));
+    let scrutinee = TypedExpr::variant_ctor("some", lit_int(3));
     let ty = run(TypedExpr::match_expr(scrutinee, arms)).expect("payload narrowing ok");
     assert_eq!(ty, int());
 }
 
 /// After inference, `arm.binding.ty` must be the resolved per-tag payload
-/// type (`Int` here for `.Some(n)`), and a `Var(arm.binding.name)`
+/// type (`Int` here for `` `some(n) ``), and a `Var(arm.binding.name)`
 /// reference inside the arm body must also carry that type. Downstream
 /// passes (lambda elimination, dictionary passing) read these slots and
 /// will fail to typecheck if either is `Type::Hole`.
@@ -244,7 +300,7 @@ fn match_fills_arm_binding_and_body_var_types() {
     let arms = vec![
         // body = `n + 1` so the `Var(n)` reference is visible.
         arm(
-            "Some",
+            "some",
             "n",
             None,
             TypedExpr::binop(
@@ -253,9 +309,9 @@ fn match_fills_arm_binding_and_body_var_types() {
                 lit_int(1),
             ),
         ),
-        arm("None", "_", None, lit_int(42)),
+        arm("none", "_", None, lit_int(42)),
     ];
-    let scrutinee = TypedExpr::variant_ctor("Some", lit_int(3));
+    let scrutinee = TypedExpr::variant_ctor("some", lit_int(3));
     let expr = run_full(TypedExpr::match_expr(scrutinee, arms)).expect("inference ok");
 
     let TypedExprNode::Case { branches, .. } = &expr.node else {
@@ -263,7 +319,7 @@ fn match_fills_arm_binding_and_body_var_types() {
     };
     let some_arm = branches
         .iter()
-        .find(|b| b.pattern.as_ref().is_some_and(|p| p.tag == "Some"))
+        .find(|b| b.pattern.as_ref().is_some_and(|p| p.tag == "some"))
         .expect("Some arm");
     let some_pat = some_arm.pattern.as_ref().expect("Some arm has a pattern");
     assert_eq!(
@@ -298,13 +354,13 @@ fn match_scrutinee_must_be_variant() {
     assert!(run(expr).is_err(), "Int scrutinee should be rejected");
 }
 
-/// `case .Some(n) if n > 0 → n` — a Bool guard on a Match arm.
+/// `` case `some(n) if n > 0 → n `` — a Bool guard on a Match arm.
 /// Verifies the guard is required to type at Bool.
 #[test]
 fn match_with_guard() {
     use cambra::ccl::{BinOpKind, CompareKind};
     let arms = vec![arm(
-        "Some",
+        "some",
         "n",
         Some(TypedExpr::binop(
             var("n"),
@@ -313,7 +369,7 @@ fn match_with_guard() {
         )),
         var("n"),
     )];
-    let scrutinee = TypedExpr::variant_ctor("Some", lit_int(3));
+    let scrutinee = TypedExpr::variant_ctor("some", lit_int(3));
     // The arm returns its binding, and the binding is the scrutinee's payload — so
     // the match's type is the payload's own, singleton included.
     let ty = run(TypedExpr::match_expr(scrutinee, arms)).expect("guarded match ok");
@@ -324,8 +380,8 @@ fn match_with_guard() {
 #[test]
 fn match_with_non_bool_guard_rejected() {
     // Int-typed guard — should be rejected.
-    let arms = vec![arm("Some", "n", Some(lit_int(1)), var("n"))];
-    let scrutinee = TypedExpr::variant_ctor("Some", lit_int(3));
+    let arms = vec![arm("some", "n", Some(lit_int(1)), var("n"))];
+    let scrutinee = TypedExpr::variant_ctor("some", lit_int(3));
     assert!(
         run(TypedExpr::match_expr(scrutinee, arms)).is_err(),
         "non-Bool guard should be rejected"
@@ -335,7 +391,7 @@ fn match_with_non_bool_guard_rejected() {
 /// Empty `Match` arms should fail.
 #[test]
 fn match_empty_arms_rejected() {
-    let scrutinee = TypedExpr::variant_ctor("Some", lit_int(1));
+    let scrutinee = TypedExpr::variant_ctor("some", lit_int(1));
     let expr = TypedExpr::match_expr(scrutinee, vec![]);
     assert!(run(expr).is_err(), "empty arm list should be rejected");
 }
@@ -344,7 +400,7 @@ fn match_empty_arms_rejected() {
 // Group D — Flow through lambdas / Case
 // ---------------------------------------------------------------------------
 
-/// `(λ x: Int → .Some(x)) 5` → `[Some(Int)]`.
+/// `` (λ x: Int → `some(x)) 5 `` → `` {`some{Int}} ``.
 #[test]
 fn lambda_returns_variant() {
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
@@ -353,19 +409,19 @@ fn lambda_returns_variant() {
             ty: int(),
             user_annotation: Some(int()),
         },
-        body: Box::new(TypedExpr::variant_ctor("Some", var("x"))),
+        body: Box::new(TypedExpr::variant_ctor("some", var("x"))),
     });
     let app = TypedExpr::apply(lit_int(5), lambda);
     let ty = run(app).expect("inference ok");
-    assert_eq!(ty, variant(&[("Some", int())]));
+    assert_eq!(ty, variant(&[("some", int())]));
 }
 
-/// `if True then .Some(1) else .None(())` — Case unifies the two variant
+/// `` if True then `some(1) else `none(()) `` — Case unifies the two variant
 /// branches at the positive polarity, yielding the union of tags.
 ///
 /// The payload of a tag only *one* arm carries keeps that arm's value claim: the
 /// join intersects claims across arms that meet, and these two never do — one
-/// carries `Some`, the other `None`. So `Some`'s payload stays the singleton `1`
+/// carries `` `some ``, the other `` `none ``. So `` `some ``'s payload stays the singleton `1`
 /// rather than widening to `Int`.
 #[test]
 fn if_returns_variant() {
@@ -373,12 +429,12 @@ fn if_returns_variant() {
         Branch {
             pattern: None,
             guard: lit_bool(true),
-            body: TypedExpr::variant_ctor("Some", lit_int(1)),
+            body: TypedExpr::variant_ctor("some", lit_int(1)),
         },
         Branch {
             pattern: None,
             guard: lit_bool(true),
-            body: TypedExpr::variant_ctor("None", lit_unit()),
+            body: TypedExpr::variant_ctor("none", lit_unit()),
         },
     ];
     let expr = TypedExpr::new(TypedExprNode::Case {
@@ -387,10 +443,10 @@ fn if_returns_variant() {
     });
     let ty = run(expr).expect("inference ok");
     // Each arm flows one-way into a shared result variable, so coalescing at
-    // positive polarity unions the tags. `Some`'s payload is the literal's
-    // singleton, not `Int`, because no sibling arm carries `Some` to intersect it
-    // with.
-    let expected = variant(&[("None", unit_ty()), ("Some", int_lit(1))]);
+    // positive polarity unions the tags. `` `some ``'s payload is the literal's
+    // singleton, not `Int`, because no sibling arm carries `` `some `` to intersect
+    // it with.
+    let expected = variant(&[("none", unit_ty()), ("some", int_lit(1))]);
     assert_eq!(ty, expected, "expected union of tags, got {ty}");
 }
 
@@ -398,12 +454,12 @@ fn if_returns_variant() {
 // Group E — Payload variance / depth
 // ---------------------------------------------------------------------------
 
-/// `.A(5)` flowing into a `[A(Int), B(Str)]`-annotated lambda parameter.
+/// `` `a(5) `` flowing into a `` {`a{Int} | `b{Str}} ``-annotated lambda parameter.
 /// Payload covariance accepts the Int payload against the Int slot.
 ///
 #[test]
 fn payload_covariance_accept() {
-    let param_ty = variant(&[("A", int()), ("B", string())]);
+    let param_ty = variant(&[("a", int()), ("b", string())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         param: TypedBinding {
             name: "v".into(),
@@ -412,15 +468,15 @@ fn payload_covariance_accept() {
         },
         body: Box::new(var("v")),
     });
-    let arg = TypedExpr::variant_ctor("A", lit_int(5));
+    let arg = TypedExpr::variant_ctor("a", lit_int(5));
     let ty = run(TypedExpr::apply(arg, lambda)).expect("payload variance ok");
     assert_eq!(ty, param_ty);
 }
 
-/// `.A(5)` against a `[A(Str)]`-typed parameter — payload-type mismatch.
+/// `` `a(5) `` against a `` {`a{Str}} ``-typed parameter — payload-type mismatch.
 #[test]
 fn payload_mismatch_reject() {
-    let param_ty = variant(&[("A", string())]);
+    let param_ty = variant(&[("a", string())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         param: TypedBinding {
             name: "v".into(),
@@ -429,7 +485,7 @@ fn payload_mismatch_reject() {
         },
         body: Box::new(var("v")),
     });
-    let arg = TypedExpr::variant_ctor("A", lit_int(5));
+    let arg = TypedExpr::variant_ctor("a", lit_int(5));
     assert!(
         run(TypedExpr::apply(arg, lambda)).is_err(),
         "Int payload should not satisfy String payload slot"

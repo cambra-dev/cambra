@@ -60,7 +60,8 @@ use smol_str::SmolStr;
 
 use crate::chl_parser::ast::{
     AnnotationMode, AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, Comprehension, Expr,
-    IfBranch, Lit, Module, Param, RecordField, Span, Spanned, Stmt, TypeAnnotation, UnaryOp,
+    IfBranch, Lit, MatchArm, MatchPattern, Module, Param, PayloadPattern, RecordField, Span,
+    Spanned, Stmt, TypeAnnotation, UnaryOp, VariantPayload,
 };
 use crate::chl_parser::lexer::{self, Token};
 
@@ -314,20 +315,22 @@ where
         //   - every item `field: T`, all bare-ident fields → record type
         //     (`Expr::BraceRecord`)
         //   - no item has a value → colon-free brace group `{T, U}`
-        //     (tuple type, `Expr::BraceGroup`); the empty group `{}` is the
-        //     unit type
+        //     (`Expr::BraceGroup`) — a tuple type, a variant type's `|`-chain of
+        //     arms, or, empty, the unit type; lowering knows which
         //   - anything else (expression keys, mixed) → error: it is neither a
         //     record type nor a tuple type
         //
         // Parsing items as `expr (":" expr)?` keeps a single committed brace
         // parser, so classification is a total function of what was matched.
         //
-        // The trailing comma on `{T,}` is required, so it is captured rather
-        // than silently allowed.
+        // The trailing comma on `{T,}` is captured rather than silently allowed,
+        // because it is the token that distinguishes the form. Whether a
+        // *missing* one is an error depends on the position, so that judgment is
+        // the caller's (see `brace_type`) and rides out as the `bool`.
         let brace_item = expr
             .clone()
             .then(just(Token::Colon).ignore_then(expr.clone()).or_not());
-        let brace_type = just(Token::LBrace)
+        let brace_group = just(Token::LBrace)
             .ignore_then(
                 brace_item
                     .separated_by(just(Token::Comma))
@@ -354,29 +357,147 @@ where
                             _ => unreachable!("guarded by all_idents"),
                         })
                         .collect();
-                    Spanned::new(span, Expr::BraceRecord(fields))
-                } else if items.len() == 1 && with_value == 0 && trailing_comma.is_none() {
-                    // `{T}` — a product of one type with no comma to say so.
-                    emitter.emit(Rich::custom(
-                        span,
-                        "a one-element tuple type is written `{T,}`, with the trailing \
-                         comma; `{…}` in type position is always a product, never \
-                         grouping",
-                    ));
-                    Spanned::new(span, Expr::Error)
+                    (Spanned::new(span, Expr::BraceRecord(fields)), false)
                 } else if with_value == 0 {
-                    // Tuple type `{T, U}` / one-tuple `{T,}` / unit `{}`
-                    // (`lower_type_annotation` reads the empty group as `Unit`).
+                    // A colon-free group: a tuple type `{T, U}` / one-tuple
+                    // `{T,}`, the unit type `{}`, or a variant type's arms
+                    // (`lower_type_annotation` sorts them out).
+                    //
+                    // A single **backticked** item is a one-arm variant type,
+                    // which needs no comma: the backtick already marks the form,
+                    // so there is no one-tuple reading to tell it from.
+                    let lone_uncommaed = items.len() == 1
+                        && trailing_comma.is_none()
+                        && !items[0].0.node.is_variant_arms();
                     let elts = items.into_iter().map(|(k, _)| k).collect();
-                    Spanned::new(span, Expr::BraceGroup(elts))
+                    (Spanned::new(span, Expr::BraceGroup(elts)), lone_uncommaed)
                 } else {
                     emitter.emit(Rich::custom(
                         span,
                         "`{…}` is type syntax: a record type `{field: T}` or a \
                          tuple type `{T, U}`; a map is written `[k -> v]`",
                     ));
-                    Spanned::new(span, Expr::Error)
+                    (Spanned::new(span, Expr::Error), false)
                 }
+            })
+            .boxed();
+
+        // A brace group in **standalone** type position, where `{…}` is always a
+        // product and never grouping (§2.4): a one-element product therefore
+        // carries the comma that says so, and a comma-free `{T}` has no other
+        // reading left to it.
+        //
+        // A tag's field list is the other position a brace group appears in, and
+        // it does not take this rule — a field list is not a standalone product
+        // type, so `` `some{Int} `` is unambiguously the tag's one positional
+        // field. See `docs/chl-spec.md`, "3.15 Variant constructors".
+        let brace_type = brace_group
+            .clone()
+            .validate(|(group, lone_uncommaed), e, emitter| {
+                if lone_uncommaed {
+                    emitter.emit(Rich::custom(
+                        e.span(),
+                        "a one-element tuple type is written `{T,}`, with the trailing \
+                         comma; `{…}` in type position is always a product, never \
+                         grouping",
+                    ));
+                    return Spanned::new(e.span(), Expr::Error);
+                }
+                group
+            })
+            .boxed();
+
+        // A variant arm: `` `tag ``, `` `tag(payload) `` or `` `tag{fields} ``.
+        //
+        // The backtick is what makes a tag a tag, in every position. Tags are
+        // structural and undeclared, so name resolution cannot tell `some(v)`
+        // from a call to a function named `some`, nor `{some{Int}}` from a type
+        // application — the introducer does, and it is the *same* introducer in
+        // a term, a pattern and a type.
+        //
+        // Both payload brackets are accepted here and sorted out in lowering,
+        // where the position is known: parens carry a term, braces carry a type.
+        // Parsing only one of them per position would need the parser to know
+        // which it was in, which it does not. See `docs/chl-spec.md`, "3.15
+        // Variant constructors".
+        //
+        // **The tag's bracket is the payload's own bracket, elided.** Both arms
+        // below are the ordinary product production for their level, so a tag
+        // needs no bracket rule of its own:
+        //
+        //   - the term payload is `paren_group`, the same `( … )` that builds
+        //     every product term — so `` `a(1, 2) `` carries the tuple and
+        //     `` `a(1,) `` the one-tuple, exactly as a call's argument does.
+        //   - the type payload is `brace_group`, and its `bool` (a lone
+        //     comma-free item, `{T}`) is what says the braces are the *tag's*
+        //     rather than the payload type's. That is the one form a standalone
+        //     type rejects, which is why it is free to mean this here.
+        let variant_ctor = just(Token::Backtick)
+            .ignore_then(ident_only)
+            .then(
+                choice((
+                    paren_group.clone().map(PayloadBracket::Paren),
+                    brace_group
+                        .clone()
+                        .map(|(group, lone)| PayloadBracket::Brace(group, lone)),
+                ))
+                .or_not(),
+            )
+            .validate(|((tag, tag_span), bracket), e, emitter| {
+                let payload = match bracket {
+                    None => None,
+                    // `` `tag() `` is the nullary form written the long way: the
+                    // empty product is unit, which is what the bare tag carries,
+                    // so both reach lowering as the same payload-less shape.
+                    Some(PayloadBracket::Paren(term))
+                        if matches!(&term.node, Expr::Tuple(elts) if elts.is_empty()) =>
+                    {
+                        None
+                    }
+                    Some(PayloadBracket::Paren(term)) => {
+                        Some(VariantPayload::Term(Box::new(term)))
+                    }
+                    // `` `tag{T} `` — a lone comma-free item. The braces are the
+                    // tag's, so `T` is the payload type as written.
+                    Some(PayloadBracket::Brace(group, true)) => {
+                        let inner = match group.node {
+                            Expr::BraceGroup(mut elts) => elts.remove(0),
+                            // `brace_group` reports `true` only for a colon-free
+                            // group of exactly one item.
+                            other => Spanned::new(group.span, other),
+                        };
+                        // A *braced* `T` here means both brackets were written.
+                        // The payload's braces are the tag's, so there is one
+                        // spelling and this is not it.
+                        if matches!(
+                            inner.node,
+                            Expr::BraceGroup(_) | Expr::BraceRecord(_) | Expr::Error
+                        ) {
+                            emitter.emit(Rich::custom(
+                                e.span(),
+                                "a tag's braces are its payload's braces: write the \
+                                 payload's fields directly, `` `tag{Int,} `` or \
+                                 `` `tag{a: Int} ``, not `` `tag{{…}} ``",
+                            ));
+                            return Spanned::new(e.span(), Expr::Error);
+                        }
+                        Some(VariantPayload::Fields(Box::new(inner)))
+                    }
+                    // Any other brace group — `{T, U}`, `{T,}`, `{a: T}`, `{}`,
+                    // or a `|`-chain of arms — is a braced type in its own right,
+                    // and the tag's braces are that type's.
+                    Some(PayloadBracket::Brace(group, false)) => {
+                        Some(VariantPayload::Fields(Box::new(group)))
+                    }
+                };
+                Spanned::new(
+                    e.span(),
+                    Expr::VariantCtor {
+                        tag,
+                        tag_span,
+                        payload,
+                    },
+                )
             })
             .boxed();
 
@@ -385,36 +506,43 @@ where
         // We label it so error messages collapse the 5+ atom alternatives
         // (literal, name, `(…)`, list, brace type) into a single "expression"
         // label when the failure is at the atom's start position.
-        let atom = choice((lit, list_or_listcomp, paren_group, brace_type, name))
-            .labelled("expression")
-            .recover_with(via_parser(nested_delimiters(
-                Token::LParen,
-                Token::RParen,
-                [
-                    (Token::LBracket, Token::RBracket),
-                    (Token::LBrace, Token::RBrace),
-                ],
-                |span| Spanned::new(span, Expr::Error),
-            )))
-            .recover_with(via_parser(nested_delimiters(
-                Token::LBracket,
-                Token::RBracket,
-                [
-                    (Token::LParen, Token::RParen),
-                    (Token::LBrace, Token::RBrace),
-                ],
-                |span| Spanned::new(span, Expr::Error),
-            )))
-            .recover_with(via_parser(nested_delimiters(
-                Token::LBrace,
-                Token::RBrace,
-                [
-                    (Token::LParen, Token::RParen),
-                    (Token::LBracket, Token::RBracket),
-                ],
-                |span| Spanned::new(span, Expr::Error),
-            )))
-            .boxed();
+        let atom = choice((
+            lit,
+            variant_ctor,
+            list_or_listcomp,
+            paren_group,
+            brace_type,
+            name,
+        ))
+        .labelled("expression")
+        .recover_with(via_parser(nested_delimiters(
+            Token::LParen,
+            Token::RParen,
+            [
+                (Token::LBracket, Token::RBracket),
+                (Token::LBrace, Token::RBrace),
+            ],
+            |span| Spanned::new(span, Expr::Error),
+        )))
+        .recover_with(via_parser(nested_delimiters(
+            Token::LBracket,
+            Token::RBracket,
+            [
+                (Token::LParen, Token::RParen),
+                (Token::LBrace, Token::RBrace),
+            ],
+            |span| Spanned::new(span, Expr::Error),
+        )))
+        .recover_with(via_parser(nested_delimiters(
+            Token::LBrace,
+            Token::RBrace,
+            [
+                (Token::LParen, Token::RParen),
+                (Token::LBracket, Token::RBracket),
+            ],
+            |span| Spanned::new(span, Expr::Error),
+        )))
+        .boxed();
 
         // ---- Postfix: call, subscript, attribute ---------------------
         let call_args = expr
@@ -788,6 +916,20 @@ enum GroupTail {
     Gen(Vec<CompClause>),
 }
 
+/// Which bracket followed a variant tag, before lowering decides whether the
+/// position wanted that one.
+///
+/// Each arm holds what the ordinary product production for its level built — a
+/// term for parens, a braced type for braces — because a tag's bracket *is* the
+/// payload's bracket. The `bool` on `Brace` is `brace_group`'s lone-comma-free
+/// report (`{T}`), the one shape whose braces belong to the tag rather than to
+/// the payload type.
+#[derive(Clone)]
+enum PayloadBracket {
+    Paren(Spanned<Expr>),
+    Brace(Spanned<Expr>, bool),
+}
+
 /// Intermediate type used by the postfix-chain fold.
 #[derive(Clone)]
 enum PostfixOp {
@@ -878,6 +1020,78 @@ where
                         else_body,
                     },
                 )
+            });
+
+        // ---- match scrutinee: case `tag(binder): body ---------------
+        //
+        // The arm list is itself an indented block, so a `match` is two levels
+        // of layout: `Indent` for the arms, then each arm's own `block` for its
+        // body. A pattern spells its tag exactly as a constructor does — ``
+        // `tag(binder) `` — so an arm reads as the inverse of what it matches.
+        let match_ident = select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span()));
+        // `case _:` is the **default arm**, and takes no backtick: `_` is not a
+        // tag, it is the absence of one. Accepting it here rather than as a tag
+        // named `_` is what keeps it from silently matching nothing (no
+        // constructor can spell that name).
+        let case_pattern = choice((
+            just(Token::Backtick).ignore_then(match_ident),
+            select! { Token::Ident(s) if s.as_str() == "_" => s }.map_with(|s, e| (s, e.span())),
+        ));
+        // The payload position takes a name or `_`. `_` is the **unused-binder**
+        // spelling — the arm has a payload and declines to read it — so it is mapped
+        // to `Ignored` rather than to a variable called `_`: nothing may refer to it.
+        let case_binder = choice((
+            select! { Token::Ident(s) if s.as_str() == "_" => s }.map(|_| None),
+            match_ident.map(|(name, _)| Some(name)),
+        ));
+        let case_arm = just(Token::Case)
+            .ignore_then(case_pattern)
+            .then(
+                case_binder
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .or_not(),
+            )
+            .then_ignore(just(Token::Colon))
+            .then(block.clone())
+            .then_ignore(just(Token::Newline).repeated())
+            .validate(|(((tag, tag_span), binder), body), e, emitter| {
+                if tag.as_str() == "_" {
+                    if binder.is_some() {
+                        emitter.emit(Rich::custom(
+                            e.span(),
+                            "the default arm `case _:` binds no payload: the tags it \
+                             covers have different payload types",
+                        ));
+                    }
+                    return MatchArm {
+                        pattern: None,
+                        body,
+                    };
+                }
+                let payload = match binder {
+                    Some(Some(name)) => PayloadPattern::Named(name),
+                    Some(None) => PayloadPattern::Ignored,
+                    None => PayloadPattern::Absent,
+                };
+                MatchArm {
+                    pattern: Some(MatchPattern {
+                        tag,
+                        tag_span,
+                        payload,
+                    }),
+                    body,
+                }
+            });
+
+        let match_stmt = just(Token::Match)
+            .ignore_then(expr.clone())
+            .then_ignore(just(Token::Colon))
+            .then_ignore(just(Token::Newline))
+            .then_ignore(just(Token::Indent).labelled("indented `case` arms"))
+            .then(case_arm.repeated().at_least(1).collect::<Vec<_>>())
+            .then_ignore(just(Token::Dedent))
+            .map_with(|(scrutinee, arms), e| {
+                Spanned::new(e.span(), Stmt::Match { scrutinee, arms })
             });
 
         // ---- for x in iter: body ------------------------------------
@@ -1125,11 +1339,18 @@ where
             .then(skip_indented_block)
             .map_with(|_, e| Spanned::new(e.span(), Stmt::Error));
 
-        choice((if_stmt, for_stmt, with_stmt, def_stmt, simple_stmt))
-            .labelled("statement")
-            .as_context()
-            .recover_with(via_parser(stmt_recovery))
-            .boxed()
+        choice((
+            if_stmt,
+            match_stmt,
+            for_stmt,
+            with_stmt,
+            def_stmt,
+            simple_stmt,
+        ))
+        .labelled("statement")
+        .as_context()
+        .recover_with(via_parser(stmt_recovery))
+        .boxed()
     })
 }
 
@@ -1301,6 +1522,34 @@ mod tests {
         assert!(
             rendered.contains("{T,}"),
             "the error should point at the trailing-comma spelling, got: {rendered}"
+        );
+    }
+
+    /// The comma-free one-element rule is a property of the **standalone** brace
+    /// type, and the two positions that opt out of it do so for different reasons.
+    #[test]
+    fn comma_free_one_element_brace_is_fine_where_it_is_not_a_product() {
+        // A one-arm variant type: comma-free and accepted, because the backtick
+        // already marks the form and no one-tuple reading competes.
+        assert!(
+            parse_expression("{`a}").errors.is_empty(),
+            "a one-arm variant type needs no trailing comma"
+        );
+        assert!(
+            parse_expression("{`a{Int} | `b}").errors.is_empty(),
+            "a `|`-chain of arms is one comma-free item"
+        );
+        // A tag's field list is not a standalone product type either, so its one
+        // positional field carries no comma: `` `some{Int} ``, not `` `some{Int,} ``.
+        assert!(
+            parse_expression("`some{Int}").errors.is_empty(),
+            "a tag's one positional field needs no trailing comma"
+        );
+        // The rule still applies to a genuine standalone product, nested or not.
+        assert!(!parse_expression("{Int}").errors.is_empty());
+        assert!(
+            !parse_expression("{`a{Int}, {Bool}}").errors.is_empty(),
+            "a comma-free `{{Bool}}` is still a product with no comma to say so"
         );
     }
 
@@ -1541,5 +1790,160 @@ mod tests {
         let src = "def doubles(xs):\n    for x in xs:\n        yield x * 2\n";
         let m = parse_m(src);
         assert_eq!(m.body.len(), 1);
+    }
+
+    #[test]
+    fn variant_ctor_with_and_without_payload() {
+        match parse_e("`some(1)").node {
+            Expr::VariantCtor { tag, payload, .. } => {
+                assert_eq!(tag.as_str(), "some");
+                match payload.expect("payload") {
+                    VariantPayload::Term(p) => {
+                        assert!(matches!(p.node, Expr::Lit(Lit::Int(1))))
+                    }
+                    other => panic!("expected a term payload, got {other:?}"),
+                }
+            }
+            other => panic!("expected VariantCtor, got {other:?}"),
+        }
+        // `` `tag `` and `` `tag() `` are the same nullary constructor.
+        for src in ["`none", "`none()"] {
+            match parse_e(src).node {
+                Expr::VariantCtor { tag, payload, .. } => {
+                    assert_eq!(tag.as_str(), "none");
+                    assert!(payload.is_none(), "{src} should have no payload");
+                }
+                other => panic!("expected VariantCtor for {src}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A tag's braces are its **field list**, and reach the AST as the brace
+    /// group or brace record they are spelled with — the shape the tuple and
+    /// record types use, so an arm's payload needs no grammar of its own.
+    #[test]
+    fn variant_arm_takes_a_brace_field_list() {
+        // A tag's braces are the payload type's own braces, elided. So a lone
+        // comma-free item leaves the *bare* type as the payload — `{T}` is not a
+        // product (§2.4), which is what frees those braces to be the tag's —
+        // while every other brace form is a braced type in its own right.
+        let payload_of = |src: &str| match parse_e(src).node {
+            Expr::VariantCtor { payload, .. } => match payload.expect("payload") {
+                VariantPayload::Fields(f) => f.node,
+                other => panic!("expected a field payload for {src}, got {other:?}"),
+            },
+            other => panic!("expected VariantCtor for {src}, got {other:?}"),
+        };
+        assert!(matches!(payload_of("`some{Int}"), Expr::Name(_)));
+        assert!(matches!(payload_of("`pair{Int, Bool}"), Expr::BraceGroup(v) if v.len() == 2));
+        assert!(matches!(
+            payload_of("`pair{a: Int, b: Bool}"),
+            Expr::BraceRecord(_)
+        ));
+        // The trailing comma is the one-tuple's, exactly as it is standalone.
+        assert!(matches!(payload_of("`some{Int,}"), Expr::BraceGroup(v) if v.len() == 1));
+        // The empty product is unit, so `` `a{} `` and a bare `` `a `` agree.
+        assert!(matches!(payload_of("`a{}"), Expr::BraceGroup(v) if v.is_empty()));
+        // Doubling the braces writes the payload's brackets twice; there is one
+        // spelling, and each rejection names it.
+        for src in ["`some{{Int,}}", "`some{{a: Int}}", "`some{{Int, Bool}}"] {
+            let result = parse_expression(src);
+            assert!(!result.errors.is_empty(), "expected {src} to be rejected");
+            assert!(
+                result.errors[0].to_string().contains("payload's braces"),
+                "the error should name the elided spelling, got: {}",
+                result.errors[0]
+            );
+        }
+    }
+
+    /// The backtick is what makes a tag a tag: without it the same spellings are
+    /// an ordinary name, a call, and attribute access.
+    #[test]
+    fn only_a_backtick_introduces_a_tag() {
+        assert!(matches!(parse_e("`name").node, Expr::VariantCtor { .. }));
+        assert!(matches!(parse_e("name").node, Expr::Name(_)));
+        assert!(matches!(parse_e("some(1)").node, Expr::Call { .. }));
+        assert!(matches!(parse_e("r.name").node, Expr::Attribute { .. }));
+        // A constructor is an ordinary atom, so it takes a postfix chain: the
+        // payload is the *constructor's*, and `.x` after it is attribute access.
+        match parse_e("`some(r).x").node {
+            Expr::Attribute { target, attr, .. } => {
+                assert_eq!(attr.as_str(), "x");
+                assert!(matches!(target.node, Expr::VariantCtor { .. }));
+            }
+            other => panic!("expected Attribute over a VariantCtor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_arms_bind_payloads() {
+        let m = parse_m("match x:\n    case `some(v):\n        v\n    case `none:\n        0\n");
+        match &m.body[0].node {
+            Stmt::Match { scrutinee, arms } => {
+                assert!(matches!(scrutinee.node, Expr::Name(_)));
+                assert_eq!(arms.len(), 2);
+                let p0 = arms[0].pattern.as_ref().expect("tagged arm");
+                assert_eq!(p0.tag.as_str(), "some");
+                assert_eq!(p0.payload, PayloadPattern::Named("v".into()));
+                let p1 = arms[1].pattern.as_ref().expect("tagged arm");
+                assert_eq!(p1.tag.as_str(), "none");
+                assert_eq!(p1.payload, PayloadPattern::Absent);
+            }
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    /// The scrutinee is a full expression and each arm body is a full block.
+    #[test]
+    fn match_scrutinee_expression_and_block_arms() {
+        let m = parse_m("match f(y)[0]:\n    case `ok(v):\n        d = v\n        d + 1\n");
+        match &m.body[0].node {
+            Stmt::Match { scrutinee, arms } => {
+                assert!(matches!(scrutinee.node, Expr::Subscript { .. }));
+                assert_eq!(arms.len(), 1);
+                assert_eq!(arms[0].body.len(), 2);
+            }
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    /// `case _:` is the default arm, not a tag named `_` — `_` lexes as an ordinary
+    /// identifier, so without the special case it would parse as an unmatchable tag.
+    #[test]
+    fn default_arm_is_not_a_tag_named_underscore() {
+        let m = parse_m("match x:\n    case `some(v):\n        v\n    case _:\n        0\n");
+        match &m.body[0].node {
+            Stmt::Match { arms, .. } => {
+                assert_eq!(arms.len(), 2);
+                assert!(arms[0].pattern.is_some(), "tagged arm keeps its pattern");
+                assert!(arms[1].pattern.is_none(), "`case _:` has no pattern");
+            }
+            other => panic!("expected Match, got {other:?}"),
+        }
+    }
+
+    /// A tag's parens are the product term's, so a constructor reads like a call
+    /// (§3.8): several values need no second bracket, and the one payload slot is
+    /// filled by the product they form.
+    #[test]
+    fn multi_value_ctor_carries_the_product() {
+        let payload_of = |src: &str| match parse_e(src).node {
+            Expr::VariantCtor { payload, .. } => payload.map(|p| match p {
+                VariantPayload::Term(t) => t.node,
+                other => panic!("expected a term payload for {src}, got {other:?}"),
+            }),
+            other => panic!("expected VariantCtor for {src}, got {other:?}"),
+        };
+        assert!(matches!(payload_of("`pair(1, 2)"), Some(Expr::Tuple(v)) if v.len() == 2));
+        assert!(matches!(payload_of("`pair(x=1)"), Some(Expr::Record(_))));
+        // `(e)` is grouping, so the doubled form denotes the same product — a
+        // consequence of the term-level delimiter, not a second spelling rule.
+        assert!(matches!(payload_of("`pair((1, 2))"), Some(Expr::Tuple(v)) if v.len() == 2));
+        // The one-tuple keeps its comma, and `` `a() `` is the nullary form: the
+        // empty product is unit, which is what the bare tag carries.
+        assert!(matches!(payload_of("`some(1,)"), Some(Expr::Tuple(v)) if v.len() == 1));
+        assert!(payload_of("`a()").is_none());
+        assert!(payload_of("`a").is_none());
     }
 }

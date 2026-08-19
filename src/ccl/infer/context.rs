@@ -257,10 +257,11 @@ impl InferCtx {
                     .map(|(n, t)| (n.clone(), self.normalize_annotation(t)))
                     .collect(),
             ),
-            Type::Variant(tags) => Type::Variant(
+            Type::Variant(tags, openness) => Type::Variant(
                 tags.iter()
                     .map(|(k, t)| (k.clone(), self.normalize_annotation(t)))
                     .collect(),
+                *openness,
             ),
             // Structural recursion like `Fun` — normalizing each child turns a
             // nested `Hole` into a fresh var. (No `Mut`-specific `Hole` logic

@@ -286,6 +286,62 @@ impl<T> IntoIterator for TagMap<T> {
     }
 }
 
+/// Whether a [`Type::Variant`]'s listed arms are the **whole** arm set, or only the
+/// part the type commits to.
+///
+/// A record needs no such distinction, because record width subtyping already gives
+/// it: a producer with *extra* fields is a *subtype*, so demanding
+/// `producer <: Record({core})` pins the core and lets the extras through
+/// (`design/lowering.md` calls this the open-record pattern). For a sum the
+/// subtyping runs the other way — fewer tags is the subtype — so a producer with
+/// extra tags is a **supertype**, and no closed judgment can both allow those extras
+/// and still say anything about the arms it *does* share.
+///
+/// That is exactly what a `match` with a `case _:` needs. Its arms describe a
+/// consumer, so each arm's payload binder has to receive the scrutinee's payload at
+/// that tag (an edge *into* the binder), while the scrutinee stays free to carry tags
+/// no arm names (no constraint on the tag *set*). On the tag axis the scrutinee is
+/// the supertype; on the payload axis its payload sits *below* the binder. One
+/// closed subtyping judgment cannot point both ways, so the arm set is marked
+/// [`Open`](Self::Open) and the width rule skips the missing-tag rejection while
+/// keeping the per-tag recursion.
+///
+/// **Openness is a property of a demand, never of a value.** Every *producer* of a
+/// sum — a constructor, an annotation, anything a value flows out of — is
+/// [`Closed`](Self::Closed): it knows its own tags. Only a consumer's expectation is
+/// open, so `Open` appears on the right of a subtyping edge and nowhere else.
+///
+/// It survives compaction and coalescing (`CompactVariant` carries it) rather than
+/// being flattened there, because a **diagnostic** naming a demand goes through that
+/// same round-trip: a report closing the arm set would say the scrutinee failed to
+/// *be* that sum, where what it failed was to be a subtype of a partial one. The
+/// rendering keeps the two apart with a trailing `| …`.
+///
+/// Nothing else reads it. [`Extent`](crate::interpreter::Extent) has no counterpart,
+/// and no AST node's coalesced type comes out open — a demand is what a consumer
+/// requires, not what any expression *is*. That is an invariant rather than a
+/// theorem, so it is watched instead of assumed: `types_agree_modulo_unread`
+/// compares openness, and an `Open` that escaped onto a node surfaces there as a
+/// disagreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Openness {
+    /// These arms and no others. The default, and what every sum *value* has.
+    #[default]
+    Closed,
+    /// These arms, and possibly more this type says nothing about.
+    ///
+    /// Only ever demanded, never produced. A subtype may carry tags absent from an
+    /// open arm set; the shared arms still constrain pointwise.
+    Open,
+}
+
+impl Openness {
+    /// Whether a subtype may carry tags this arm set does not list.
+    pub fn permits_extra_tags(self) -> bool {
+        matches!(self, Openness::Open)
+    }
+}
+
 /// Whether a [`Type::Fun`]'s domain is a **capability** or a **collection** — the
 /// compute-function vs data-function distinction.
 ///
@@ -548,7 +604,11 @@ pub enum Type {
     /// positional and named sums share one constructor, one coalesce
     /// path, and one width-subtyping rule. `Vec` order is preserved for
     /// display.
-    Variant(Vec<(FieldKey, Type)>),
+    ///
+    /// The [`Openness`] says whether those arms are the *whole* arm set or only
+    /// the part this type commits to — see that type for why a sum needs the
+    /// distinction where a record does not.
+    Variant(Vec<(FieldKey, Type)>, Openness),
     /// A refinement of another type
     Refinement(Box<Type>, Refinement),
     /// Pre-inference placeholder stamped by lowering on every new node.
@@ -757,7 +817,7 @@ fn synthetic_payloads(tags: &[(FieldKey, Type)]) -> Option<Vec<Type>> {
     let mut out = Vec::with_capacity(tags.len());
     for (_, t) in tags {
         match t {
-            Type::Variant(inner) => match synthetic_payloads(inner) {
+            Type::Variant(inner, _) => match synthetic_payloads(inner) {
                 Some(mut flat) => out.append(&mut flat),
                 None => out.push(t.clone()),
             },
@@ -812,7 +872,15 @@ impl fmt::Display for Type {
                 let parts: Vec<_> = fields.iter().map(|(n, t)| format!("{n}: {t}")).collect();
                 write!(f, "{{{}}}", parts.join(", "))
             }
-            Type::Variant(tags) => {
+            Type::Variant(tags, openness) => {
+                // An **open** arm set renders with a trailing `| …`, so a demand that
+                // admits further tags never reads as an exact sum in a diagnostic or a
+                // symbolic dump. (Only a demand is ever open — see `Openness`.)
+                let ellipsis = if openness.permits_extra_tags() {
+                    " | …"
+                } else {
+                    ""
+                };
                 // Anonymous positional variants (all tags are
                 // `FieldKey::Index`, as `++`/`Copair` produces) are
                 // rendered as a flat `A | B` join — the positional tags
@@ -822,7 +890,7 @@ impl fmt::Display for Type {
                 // `[._0: [._0: A | ._1: B] | ._1: C]`.
                 if let Some(payloads) = synthetic_payloads(tags) {
                     let parts: Vec<_> = payloads.iter().map(|t| t.to_string()).collect();
-                    write!(f, "{}", parts.join(" | "))
+                    write!(f, "{}{ellipsis}", parts.join(" | "))
                 } else {
                     // CHL's surface spelling — see `fmt_variant_arms`. A `Unit`
                     // payload is the nullary constructor and renders bare.
@@ -835,6 +903,7 @@ impl fmt::Display for Type {
                             };
                             (n.to_string(), payload)
                         }),
+                        openness.permits_extra_tags(),
                     )
                 }
             }
@@ -940,6 +1009,44 @@ impl Type {
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
+    }
+
+    /// `Option(𝑇)` — the two-tag variant `{some: 𝑇, none: Unit}`.
+    ///
+    /// A built-in type *abbreviation*, in the same category as `List(T)` — see
+    /// `docs/chl-spec.md`, "3.15 Variant constructors".
+    /// It is **not** a distinguished kind of type: the result is an ordinary
+    /// structural [`Type::Variant`], and the constructors `` `some(𝑒) `` / `` `none ``
+    /// are ordinary variant constructors that no pass gives special treatment.
+    /// This function is the only place in the compiler that mentions either tag
+    /// spelling; when type aliases land it is replaced by a prelude
+    /// `` Option(T) = {`some{T} | `none} `` and deleted.
+    ///
+    /// Tags are listed in **name order** (`none` before `some`) on purpose: the
+    /// solver materializes a coalesced variant from a `BTreeMap`, so an inferred
+    /// variant's tags always come out name-ordered. Writing the abbreviation in
+    /// that same order is what lets an `Option(T)` *annotation* compare equal to
+    /// the inferred type structurally instead of differing only by tag order.
+    pub fn option_of(payload: Self) -> Self {
+        Type::variant(vec![
+            (FieldKey::Name("none".into()), Type::Base(BaseType::Unit)),
+            (FieldKey::Name("some".into()), payload),
+        ])
+    }
+
+    /// A **closed** tagged sum: these arms and no others.
+    ///
+    /// The constructor for every *producer* of a sum. See [`Openness`].
+    pub fn variant(arms: Vec<(FieldKey, Type)>) -> Self {
+        Type::Variant(arms, Openness::Closed)
+    }
+
+    /// An **open** tagged sum: these arms, and possibly more.
+    ///
+    /// Only for a *demand* — the arm set a consumer commits to handling, where a
+    /// subtype carrying further tags is admissible. See [`Openness`].
+    pub fn open_variant(arms: Vec<(FieldKey, Type)>) -> Self {
+        Type::Variant(arms, Openness::Open)
     }
 
     /// Helper for creating a dependent (Pi) **compute** function type
@@ -1114,10 +1221,11 @@ impl Type {
                     .map(|(n, t)| (n.clone(), t.without_pi_names()))
                     .collect(),
             ),
-            Type::Variant(tags) => Type::Variant(
+            Type::Variant(tags, openness) => Type::Variant(
                 tags.iter()
                     .map(|(k, t)| (k.clone(), t.without_pi_names()))
                     .collect(),
+                *openness,
             ),
             Type::Refinement(base, r) => {
                 Type::Refinement(Box::new(base.without_pi_names()), r.clone())
@@ -1199,7 +1307,7 @@ impl Type {
                 f(value);
                 f(domain);
             }
-            Type::Variant(tags) => {
+            Type::Variant(tags, _) => {
                 for (_, t) in tags {
                     f(t);
                 }
@@ -1245,7 +1353,7 @@ impl Type {
                 f(value);
                 f(domain);
             }
-            Type::Variant(tags) => {
+            Type::Variant(tags, _) => {
                 for (_, t) in tags {
                     f(t);
                 }
@@ -1764,7 +1872,7 @@ mod tests {
     /// is not special-cased: it is just the general form with one arm.
     #[test]
     fn variant_type_display_is_surface_syntax() {
-        let commit_abort = Type::Variant(vec![
+        let commit_abort = Type::variant(vec![
             (FieldKey::Name("commit".into()), Type::Base(BaseType::Int)),
             (FieldKey::Name("abort".into()), Type::Base(BaseType::Unit)),
         ]);
@@ -1772,7 +1880,7 @@ mod tests {
 
         // Single arm, with and without a stored type.
         assert_eq!(
-            Type::Variant(vec![(
+            Type::variant(vec![(
                 FieldKey::Name("none".into()),
                 Type::Base(BaseType::Unit)
             )])
@@ -1780,7 +1888,7 @@ mod tests {
             "{`none}"
         );
         assert_eq!(
-            Type::Variant(vec![(
+            Type::variant(vec![(
                 FieldKey::Name("some".into()),
                 Type::Base(BaseType::Int)
             )])
@@ -1794,7 +1902,7 @@ mod tests {
             ("b".to_string(), Type::Base(BaseType::Int)),
         ]);
         assert_eq!(
-            Type::Variant(vec![(FieldKey::Name("pair".into()), record)]).to_string(),
+            Type::variant(vec![(FieldKey::Name("pair".into()), record)]).to_string(),
             "{`pair{a: Int, b: Int}}"
         );
     }
@@ -1805,7 +1913,7 @@ mod tests {
     /// rather than being dressed up as surface arms nobody wrote.
     #[test]
     fn anonymous_positional_sum_still_renders_as_a_flat_join() {
-        let anon = Type::Variant(vec![
+        let anon = Type::variant(vec![
             (FieldKey::Index(0), Type::Base(BaseType::Int)),
             (FieldKey::Index(1), Type::Base(BaseType::String)),
         ]);

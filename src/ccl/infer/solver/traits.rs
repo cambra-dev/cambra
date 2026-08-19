@@ -489,7 +489,7 @@ impl TraitObligation {
             // contributes, so only a shrink is worth policing.
             #[cfg(debug_assertions)]
             if candidates.len() < before {
-                assert_narrowing_is_still_open(self);
+                assert_post_emission_narrowing_selects(self, pos, base, &accepted);
             }
             if candidates.is_empty() {
                 return Err(ConstrainError::NoTraitInstance {
@@ -670,8 +670,9 @@ thread_local! {
     /// coalesced in place, so its variables take no new bounds afterwards, and the
     /// narrowing that does continue during coalesce acts on the per-instantiation
     /// clones `freshen_watches` mints — obligations that did not exist when the sweep
-    /// ran. The mark is what makes that checkable rather than merely argued: see
-    /// [`assert_narrowing_is_still_open`].
+    /// ran, and the one pass that does narrow an emission-era obligation afterwards only
+    /// ever *selects* from a set the sweep read. The mark is what makes that checkable
+    /// rather than merely argued: see [`assert_post_emission_narrowing_selects`].
     static EMISSION_MARK: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
@@ -682,7 +683,7 @@ thread_local! {
 /// the variable capture is. Resetting it is not optional bookkeeping. The mark is a
 /// high-water mark of a *process-global* counter, so a stale one left by an earlier run
 /// on this thread sits below every obligation the current run mints, and
-/// [`assert_narrowing_is_still_open`] would pass vacuously instead of being inert —
+/// [`assert_post_emission_narrowing_selects`] would pass vacuously instead of being inert —
 /// checking nothing, and silently, which is the failure mode it exists to prevent.
 #[cfg(debug_assertions)]
 pub fn unseal_emission() {
@@ -708,27 +709,48 @@ pub fn seal_emission() {
     });
 }
 
-/// After emission, only an obligation minted *since* emission — a freshened clone —
-/// may still narrow.
+/// After emission, a narrowing may only **select**: an obligation minted during
+/// emission may still be narrowed, but only by delivering a base its position already
+/// accepted.
 ///
-/// This is the timing assumption [`resolve_operand_requirements`] rests on, and it is
-/// exactly the kind that fails silently: a pass that narrowed a *definition's*
-/// obligation during coalesce would leave the check reading a stale candidate set and
-/// quietly stop rejecting programs it used to reject. Measured across the suite the
-/// violation count is zero; this keeps it that way by name rather than by
-/// re-measurement.
+/// This is the timing assumption [`resolve_operand_requirements`] rests on, and it
+/// fails silently. The sweep's verdict is joint non-emptiness of the accepted sets it
+/// reads at end of emission, so a later write that **restricts** a position past what
+/// the sweep saw leaves that verdict stale. A write that picks a base from inside the
+/// swept set records a choice the sweep already licensed, and re-running the sweep
+/// reaches the same verdict.
+///
+/// One pass narrows after emission and it is of the second kind:
+/// `pin_unobservable_arm_payload` (`src/ccl/infer/solve.rs`) types an unreachable arm's
+/// payload. No value reaches that position, so its type comes from a demand recorded on
+/// it or from the arm body's own reads, and both are sets this sweep read.
+///
+/// An obligation minted since the mark is unconstrained: a freshened clone is a
+/// per-instantiation copy the sweep never read, and one that goes unsatisfiable fails
+/// by delivery.
+///
+/// **The sibling positions are not re-read.** Delivering to one position tightens what
+/// this obligation's other positions accept (`Addable` narrowed to `Int` at position 0
+/// accepts only `Int` at 1), and nothing compares that against the requirements a
+/// variable standing there carries. What bounds the exposure is what a pin can deliver
+/// — see `src/ccl/design/type-inference.md`, "Requirements are read together, once".
 #[cfg(debug_assertions)]
-fn assert_narrowing_is_still_open(obligation: &Rc<TraitObligation>) {
+fn assert_post_emission_narrowing_selects(
+    obligation: &Rc<TraitObligation>,
+    pos: u8,
+    base: &BaseType,
+    accepted: &[BaseType],
+) {
     EMISSION_MARK.with(|m| {
         let Some(mark) = m.get() else {
             return;
         };
         debug_assert!(
-            obligation.uid.0 >= mark,
-            "{obligation:?} was minted during emission but narrowed after it — \
-             `resolve_operand_requirements` read this obligation's candidate set as \
-             final at end of emission, so whatever narrowed it here is invisible to the \
-             check. Either the check has to move later, or this write belongs in \
+            obligation.uid.0 >= mark || accepted.contains(base),
+            "{obligation:?} was minted during emission, and narrowing it at position \
+             {pos} to `{base}` restricts a set `resolve_operand_requirements` already \
+             read as final ({accepted:?} did not accept it), so the sweep's verdict is \
+             now stale. Either the check has to move later, or this write belongs in \
              emission.",
         );
     });
@@ -920,7 +942,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                         descend(ty, &path, Step::Field(key), &mut frontier);
                     }
                 }
-                Type::Variant(arms) => {
+                Type::Variant(arms, _) => {
                     for (tag, payload) in arms {
                         descend(payload, &path, Step::Arm(tag.clone()), &mut frontier);
                     }
@@ -1223,7 +1245,9 @@ pub fn offered(ty: &Type) -> Offered<'_> {
         Type::Base(b) => Offered::Base(b),
         // Products, sums and functions are fully determined and are not bases. A
         // collection compared or added is the same mistake as a tuple.
-        Type::Tuple(_) | Type::Record(_) | Type::Variant(_) | Type::Fun { .. } => Offered::NotABase,
+        Type::Tuple(_) | Type::Record(_) | Type::Variant(_, _) | Type::Fun { .. } => {
+            Offered::NotABase
+        }
         // Everything else is either a variable, a placeholder, or a carrier whose
         // payload reaches the watch by another route.
         _ => Offered::Unknown,

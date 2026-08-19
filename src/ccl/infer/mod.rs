@@ -139,7 +139,7 @@ pub(super) fn product(fields: BTreeMap<FieldKey, Type>) -> Type {
 
 /// Build a [`Type::Variant`] from a `FieldKey`-keyed tag map.
 pub(super) fn variant_type(tags: BTreeMap<FieldKey, Type>) -> Type {
-    Type::Variant(tags.into_iter().collect())
+    Type::variant(tags.into_iter().collect())
 }
 
 /// The node to blame for a fact about a *place* — given the variables standing at it,
@@ -187,7 +187,7 @@ fn blame_node_for_place(
             Type::History { value, domain, .. } => mentions(value, uid) || mentions(domain, uid),
             Type::Tuple(elems) => elems.iter().any(|t| mentions(t, uid)),
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
-            Type::Variant(arms) => arms.iter().any(|(_, t)| mentions(t, uid)),
+            Type::Variant(arms, _) => arms.iter().any(|(_, t)| mentions(t, uid)),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole

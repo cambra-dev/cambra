@@ -288,7 +288,7 @@ fn iterate_extent(extent: &Extent, producer: &str) -> ColumnValue {
         Extent::Restricted { .. } => {
             panic!("Iterating over restricted extents not supported; use Filter operators instead")
         }
-        _ => panic!("Attempted to iterate on infinite Extent"),
+        other => panic!("Attempted to iterate on infinite Extent: {other:?}"),
     }
 }
 

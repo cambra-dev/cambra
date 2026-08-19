@@ -392,8 +392,15 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                     nx == ny && types_agree_modulo_unread(x, y, refinements)
                 })
         }
-        (Type::Variant(xs), Type::Variant(ys)) => {
-            xs.len() == ys.len()
+        // Openness is compared, not ignored: two variants differing only in it are
+        // different *demands*. Nothing should reach this check open at all — it runs
+        // on post-phase trees, and a demand is never an expression's own type — but
+        // coalesce does *carry* openness (a diagnostic naming a demand has to render
+        // it), so nothing upstream forces the closure. Comparing it here is what
+        // makes an `Open` that escaped onto a node show up as a disagreement.
+        (Type::Variant(xs, ox), Type::Variant(ys, oy)) => {
+            ox == oy
+                && xs.len() == ys.len()
                 && xs.iter().zip(ys).all(|((kx, x), (ky, y))| {
                     kx == ky && types_agree_modulo_unread(x, y, refinements)
                 })
@@ -686,6 +693,8 @@ fn with_shadows<R>(
 ///   pin would reject the very read that makes the payload observable. So the
 ///   obligations choose, from the types their surviving instances still accept
 ///   ([`TraitObligation::accepted_at`]).
+/// - **Neither.** Nothing observes the payload, so `Unit` — carrying no information
+///   — is the choice.
 ///
 /// The two recorded forms do not compete for the same payload — an operand's
 /// upper bound is the operator's own requirement variable, not a concrete type —
@@ -725,8 +734,15 @@ fn with_shadows<R>(
 ///   being resolved. And a `Lambda` resolves `param.ty` from its coalesced domain
 ///   *after* its body, so the pin still reaches the parameter type — but only if it
 ///   precedes the branch walk.
-#[allow(clippy::mutable_key_type)]
-fn pin_unobservable_arm_payload(p: &Pattern) {
+///
+/// Returns whether it pinned, which
+/// [`assert_pinned_tags_are_unreachable`] checks against the scrutinee's tags: no value
+/// reaching a position is meant to imply the arm is unreachable. A live arm's binder
+/// takes its bound from the scrutinee (`scrut.c <: αᵢ`, the width rule with the
+/// scrutinee on the left), so a pinned binder on a tag the scrutinee carries would mean
+/// that edge went missing. That check reads the scrutinee's resolved tags and so cannot
+/// run here; the pin precedes the scrutinee's walk.
+fn pin_unobservable_arm_payload(p: &Pattern) -> bool {
     // Unobservability is *transitive*: the variable's bound list is rarely empty
     // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
     // a lower bound — and what matters is whether anything concrete reaches it
@@ -741,7 +757,7 @@ fn pin_unobservable_arm_payload(p: &Pattern) {
     // over the arms cannot see it contribute: the node ends up *narrower* than the
     // join, and the post-inference wall rejects a program that type-checks.
     if value_reaches(&p.binding.ty) {
-        return;
+        return false;
     }
     let chosen = payload_pin(&p.binding.ty);
     let mut cache = ConstrainCache::new();
@@ -754,6 +770,7 @@ fn pin_unobservable_arm_payload(p: &Pattern) {
          still accept (arm `` `{} ``)",
         p.tag,
     );
+    true
 }
 
 /// The type to pin an unreachable arm's payload to: the concrete type it is
@@ -942,6 +959,35 @@ pub(super) fn check_scope_valid(
 pub(super) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     coalesce_compact(&simplify_type(compact_type(ty)))
 }
+
+/// Hold [`pin_unobservable_arm_payload`] to its premise: a tag it pinned is one the
+/// scrutinee cannot carry.
+///
+/// A pinned payload on a tag the scrutinee carries would mean the width rule's
+/// `scrut.cᵢ <: αᵢ` edge went missing. That failure is silent without this check: the
+/// pin supplies a type either way, so the arm's binder ends up with the wrong one.
+/// Checked here rather than inside the pin because it reads the scrutinee's resolved
+/// tags, and the pin precedes the scrutinee's walk.
+#[cfg(debug_assertions)]
+fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[String]) {
+    let Some(Type::Variant(tags, _)) =
+        scrutinee.map(|s| crate::ccl::ccl_utils::strip_refinements(&s.ty))
+    else {
+        return;
+    };
+    for tag in pinned_tags {
+        debug_assert!(
+            !tags
+                .iter()
+                .any(|(k, _)| *k == crate::ccl::FieldKey::Name(tag.as_str().into())),
+            "Case arm `{tag} had no value reach its payload, but the scrutinee carries \
+             that tag — the width rule should have constrained it from the scrutinee",
+        );
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn assert_pinned_tags_are_unreachable(_scrutinee: Option<&Expr>, _pinned_tags: &[String]) {}
 
 /// Whether a **value** has reached `ty` — as opposed to merely something
 /// determining what it must be.
@@ -1280,14 +1326,16 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // invariant `assert_reads_stable` enforces. The pin reads only the
             // constraint graph, which emission has already finished building, so
             // nothing here depends on the scrutinee having been coalesced.
-            for b in branches.iter() {
-                if let Some(p) = &b.pattern {
-                    pin_unobservable_arm_payload(p);
-                }
-            }
+            let pinned_tags: Vec<String> = branches
+                .iter()
+                .filter_map(|b| b.pattern.as_ref())
+                .filter(|p| pin_unobservable_arm_payload(p))
+                .map(|p| p.tag.clone())
+                .collect();
             if let Some(s) = scrutinee {
                 coalesce_node(s, level, ctx);
             }
+            assert_pinned_tags_are_unreachable(scrutinee.as_deref(), &pinned_tags);
             for b in branches.iter_mut() {
                 // A pattern's payload binding scopes the branch's guard and
                 // body, shadowing an outer generalized binding of its name.
@@ -1575,7 +1623,7 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
         Type::Record(fs) => fs
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
-        Type::Variant(tags) => tags
+        Type::Variant(tags, _) => tags
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
         Type::History { value, domain, .. } => {
@@ -2622,6 +2670,7 @@ mod tests {
                     ty: Type::Hole,
                     user_annotation: None,
                 },
+                empty_payload: false,
             }),
             guard: TypedExpr::lit(Lit::Bool(true)),
             body: TypedExpr::var(b),
@@ -2674,7 +2723,7 @@ mod tests {
     #[test]
     fn specialization_domain_is_its_own_argument() {
         let variant_of = |t: Type| {
-            Type::Variant(vec![(
+            Type::variant(vec![(
                 crate::ccl::FieldKey::Name(smol_str::SmolStr::new("a")),
                 t,
             )])

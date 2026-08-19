@@ -132,6 +132,7 @@ if     elif   else
 for    in
 def    return yield
 with
+match  case
 pass
 where
 ```
@@ -149,18 +150,18 @@ A lambda is written `\x -> body` (§3.10); `\` and `->` are punctuation
 `del`, `assert`, `raise`, `is`, are **not** keywords in CHL today. Some are
 reserved for future use.
 
+`match` and `case` introduce tag dispatch over a variant (§4.10).
+
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
 > `summon` (the transactions-as-contextual-parameters layer — §8.7,
 > **[Decided]**), `import` (built-in modules — the `http` module surface,
-> **[Decided]**; general modules remain future work, §9), `assert` and its
+> **[Decided]**; general modules remain future work, §9), and `assert` and its
 > `static assert` form (function contracts — §6, **[Decided]** as the
-> surface, **[Open]** as to what `static` demands), and `match` /
-> `case` (pattern matching, **[Tentative]** — it appears in the north-star
-> `txn_kv` program and inside refinement predicates (§6.4), but the block
-> syntax has no design writeup). Avoid taking these names for
-> other purposes. (`with`, `:=`, and `where` are **already** lexed — the first
-> two carry today's transactions and mutation, §8, and `where` is reserved ahead
+> surface, **[Open]** as to what `static` demands). Avoid taking these names
+> for other purposes. (`with`, `:=`, `match`, `case` and `where` are
+> **already** lexed — the first two carry today's transactions and mutation,
+> §8, `match`/`case` carry tag dispatch, §4.10, and `where` is reserved ahead
 > of the refinement syntax that will use it, §6.4 — so they are not in this
 > list.)
 
@@ -184,7 +185,7 @@ surface level.
 =  += -= *= //=
 :=
 <<  <<=
-(  )  [  ]  {  }  ,  :  .  ;  \
+(  )  [  ]  {  }  ,  :  .  ;  \  `
 ```
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
@@ -208,21 +209,17 @@ parsing-then-erroring.
 > **[Decided]**); the token is lexed today but that *use* is not yet
 > parsed.
 
-> **Direction — the backtick and `|` [Decided].** One new token and one
-> new role for an existing one, both carrying variants (§6.5):
->
-> - **`` ` ``** (backtick) prefixes a **variant tag**, in every position —
->   type, term, and pattern: `` `none ``, `` `some(1) ``,
->   ``{ `some{Int} | `none }``. It is not lexed today. A tag is
->   `` ` `` immediately followed by an identifier with no intervening
->   whitespace; tag names are lowercase, since a tag builds a *value*
->   and `Caps` means type (§6.1).
-> - **`|`** keeps its logical-or meaning in term position (§3.3) and
->   additionally separates the tags of a variant **type** (§6.5). The two
->   never meet: a variant type's alternatives are `` ` ``-tagged, and a
->   refinement predicate — the one place a term appears inside `{…}` — is
->   introduced by `where` (§6.4), which is exactly why the refinement
->   separator moved off `|`.
+`` ` `` (backtick) prefixes a **variant tag**, in every position — type, term,
+and pattern: `` `none ``, `` `some(1) ``, ``{ `some{Int} | `none }`` (§3.15,
+§6.5). A tag is `` ` `` immediately followed by an identifier with no
+intervening whitespace; tag names are lowercase, since a tag builds a *value*
+and `Caps` means type (§6.1).
+
+`|` is the logical-or operator in term position (§3.3) and additionally
+separates the arms of a variant **type** (§6.5). The two never meet: a variant
+type's arms are `` ` ``-tagged, and a refinement predicate — the one place a
+term appears inside `{…}` — is introduced by `where` (§6.4), which is exactly
+why the refinement separator moved off `|`.
 
 ### 1.9 Semicolons
 
@@ -394,7 +391,7 @@ list makes a tuple type (`{T, U}`). A `{...}` in value position is a lowering
 error pointing at the `(…)` form. (Finite maps are a collection, written
 `[k -> v, …]` — §6.3 — not a brace form.)
 
-**Braces in type position are always a product, never grouping.** Two
+**Braces in type position are always a product or a sum, never grouping.** Two
 consequences, both enforced:
 
 - A **one-element** tuple type carries the trailing comma — `{T,}` — exactly
@@ -406,47 +403,55 @@ consequences, both enforced:
   and not an empty record type — those are not types at all; `{}` is simply how
   unit is spelled.
 
-> **Direction — brace forms [Decided].** `{…}` acquires two more
-> structural-type forms, so what a brace group means becomes a
-> classification over what it contains. Neither added form is lexed or
-> parsed today; the rest of the table is implemented:
->
-> ```ebnf
-> brace_type  ::= "{" typed_ident ( "," typed_ident )* [ "," ] "}"  -- record type
->              |  "{" type "," "}"                                   -- one-tuple type
->              |  "{" type ( "," type )+ [ "," ] "}"                 -- tuple type
->              |  "{" "}"                                            -- unit (§6.6)
->              |  "{" tag_type ( "|" tag_type )* "}"                 -- variant type (§6.5)
->              |  "{" type "where" expression "}"                    -- refinement (§6.4)
->
-> tag_type    ::= "`" tagname [ "{" tag_fields "}" ]
-> tag_fields  ::= type ( "," type )* [ "," ]
->              |  typed_ident ( "," typed_ident )* [ "," ]
-> tagname     ::= [a-z_] [A-Za-z0-9_]*
-> ```
->
-> The forms are told apart by their first distinguishing token, so
-> classification never needs lookahead past one item:
->
-> | Contains | Form | Example |
-> | --- | --- | --- |
-> | a top-level `where` | refinement (§6.4) | `{Int where _ > 0}` |
-> | `` ` ``-prefixed items | variant type (§6.5) | ``{ `some{Int} \| `none }`` |
-> | `ident : type` items | record type | `{x: Int, y: Int}` |
-> | types, ≥2 or 1-plus-comma | tuple type | `{Int, Bool}`, `{Int,}` |
-> | nothing | unit (§6.6) | `{}` |
-> | one type, no comma | **error** — write `{T,}` | `{Int}` |
->
-> A top-level `where` wins over every other reading and takes the rest of
-> the brace group as its predicate, so `{T where p | q}` refines `T` by
-> `p | q` (§3.3) rather than declaring a variant.
->
-> One spelling that looks adjacent but is not: **a tag's field braces are
-> not a nested type.** `` `some{Int} `` is the tag `some` with one
-> positional field of type `Int`; a tag's `{…}` *is* its field list, so a
-> record payload is `` `some{a: Int} ``, never `` `some{{a: Int}} ``
-> (§6.5). In particular the one-tuple comma does not apply inside a tag —
-> a tag's field list is not a standalone product type.
+**What a brace group means is a classification over what it contains.** Every
+form below is parsed except the refinement, whose `where` is lexed and reserved
+but whose brace form has no production (§1.6, §6.4):
+
+```ebnf
+brace_type  ::= "{" typed_ident ( "," typed_ident )* [ "," ] "}"  -- record type
+             |  "{" type "," "}"                                   -- one-tuple type
+             |  "{" type ( "," type )+ [ "," ] "}"                 -- tuple type
+             |  "{" "}"                                            -- unit (§6.6)
+             |  "{" tag_type ( "|" tag_type )* "}"                 -- variant type (§6.5)
+             |  "{" type "where" expression "}"                    -- refinement (§6.4)
+
+tag_type    ::= "`" tagname [ "{" tag_fields "}" ]
+tag_fields  ::= type ( "," type )* [ "," ]
+             |  typed_ident ( "," typed_ident )* [ "," ]
+tagname     ::= [a-z_] [A-Za-z0-9_]*
+```
+
+The forms are told apart by their first distinguishing token, so classification
+never needs lookahead past one item:
+
+| Contains | Form | Example |
+| --- | --- | --- |
+| a top-level `where` | refinement (§6.4) | `{Int where _ > 0}` |
+| `` ` ``-prefixed items | variant type (§6.5) | ``{ `some{Int} \| `none }`` |
+| `ident : type` items | record type | `{x: Int, y: Int}` |
+| types, ≥2 or 1-plus-comma | tuple type | `{Int, Bool}`, `{Int,}` |
+| nothing | unit (§6.6) | `{}` |
+| one type, no comma | **error** — write `{T,}` | `{Int}` |
+
+The backtick row sits above the error row and that ordering is load-bearing: a
+one-arm variant type is a single comma-free item, so classifying it as a tag
+first is what keeps `` {`a} `` from being read as a malformed `{T,}`.
+
+A top-level `where` wins over every other reading and takes the rest of the
+brace group as its predicate, so `{T where p | q}` refines `T` by `p | q` (§3.3)
+rather than declaring a variant.
+
+**A tag's braces are its payload type's own braces, elided** (§6.5). A record
+payload is `` `some{a: Int} ``, a tuple payload `` `some{Int, Bool} ``, and
+doubling the braces — `` `some{{a: Int}} `` — is rejected, which is what keeps
+one spelling per type. Every brace form above reads the same inside a tag as
+outside it, including the one-tuple's comma: `` `some{Int,} `` stores `{Int,}`.
+
+The one form that differs is the one a standalone type has no reading for. A
+comma-free `{T}` is a parse error above, so inside a tag those braces are free to
+be the **tag's** — `` `some{Int} `` stores a bare `Int`, which is what makes
+`` `some(1) `` its constructor. That is the elision: the braces you write are the
+payload's whenever the payload has any, and the tag's when it does not.
 
 > **Direction — term-level delimiters [Decided].** The three
 > delimiters split by role
@@ -1032,6 +1037,74 @@ text didn't parse."
 
 ---
 
+### 3.15 Variant constructors
+
+A **variant** is a tagged sum. `` `tag(e) `` injects `e` at tag `tag`; the
+bare form `` `tag `` (equivalently `` `tag() ``) injects `()`, the value that
+carries no information (§3.11). How a variant *type* is written is §6.5;
+matching one is §4.10.
+
+A tag carries exactly **one** payload, and the parens after it are the ordinary
+product-term parens (§3.11), so a constructor reads like a call whose argument is
+the product its values form (§3.8):
+
+```python
+x = `some(1)
+y = `none
+z = `ok(1, 2)       # one payload: the tuple those two values form
+w = `pt(x=1, y=2)   # ... or the record, as with a call's arguments
+u = `one(1,)        # the comma is the one-tuple's, as everywhere else
+```
+
+Variants are **structural**, exactly as records are: a tag has no
+declaration and no owner. `` `some(1) `` has the one-tag type
+`` {`some{Int}} ``, and *width subtyping* — the dual of the record rule —
+lets it flow into any variant type whose tag set contains it, so the same
+value is usable as an `Option(Int)`. Two consequences worth stating
+outright:
+
+- There is **one flat space of tag names**. The same spelling means the
+  same tag everywhere, so `` `ok(1) `` written in two unrelated places
+  denotes the same tag. They are still independent *values*; they
+  interact only if they meet in one variant type, where their payloads
+  must agree.
+- A tag's payload type is fixed by **where the tags meet**, not at the
+  constructor. `` `ok(1) `` and `` `ok("s") `` are each fine alone; if both
+  flow into one variant, the mismatch is reported where they join.
+
+This is the polymorphic-variant model, and the **backtick** plays the role
+capitalization plays in languages that capitalize constructors. Tags are
+structural and undeclared, so name resolution cannot tell `some(v)` from a
+call to a function named `some`, nor bare `none` from a variable read. The
+backtick resolves that, and it is the *same* mark in every position — term,
+pattern (§4.10) and type — so a tag never has to be recognised from
+context.
+
+A constructor is an ordinary atom, so it takes a postfix chain:
+`` `some(r).x `` is the attribute `x` of `` `some(r) `` (§3.9).
+
+An annotation may write the arms out or use the `Option(T)` abbreviation, and a
+constructor flows into either:
+
+```python
+x: {`some{Int} | `none} = `some(1)
+y: Option(Int) = `some(1)
+z: {`ok{Int} | `err{String}} = `err("nope")
+```
+
+> **Direction [Tentative].** A variant type can be *written* but not yet
+> *named*: tags have no declaration site, so a misspelled tag is caught only
+> where it fails to meet its counterpart, and a constructor's payload arity is
+> not checked at the constructor. The planned refinement is the structural type
+> alias of §6.1 — `` Option(T) = {`some{T} | `none} ``,
+> `` Result(T) = {`ok{T} | `err{String}} `` — which gives a tag a resolution
+> site and checks the payload there. It would also replace the
+> built-in `Option(T)` above with a prelude definition. An alias is still
+> structural: it names a shape, so two aliases with the same tags are the same
+> type. Nominality is the separate `type` declaration direction (§6.1).
+
+---
+
 ## 4. Statement semantics
 
 A CHL **program** is its top-level block (§2.1): a sequence of
@@ -1235,7 +1308,7 @@ this section for what today's grammar accepts.
 
 A binding LHS is a **pattern**: a shape that names the parts of the value
 being bound. Patterns appear in three positions — an assignment target
-(§4.3), a `for` binder (§4.6), and a `case` arm (§6.5) — and the same
+(§4.3), a `for` binder (§4.6), and a `case` arm (§4.10) — and the same
 grammar serves all three.
 
 ```ebnf
@@ -1507,6 +1580,101 @@ statement or an inert mistake is decidable from the callee's type.
 
 ---
 
+### 4.10 `match` — tag dispatch
+
+`match` dispatches on the tag of a variant. It is a **block statement**,
+mirroring `if` (§4.5): each `case` names a tag and optionally binds its
+payload for that arm's block.
+
+```python
+match x:
+    case `some(v):
+        v + 1
+    case `none:
+        0
+```
+
+A pattern spells its tag exactly as a constructor does (§3.15), so an arm
+reads as the inverse of what it matches. Three payload spellings make two
+statements:
+
+| Pattern | Means |
+|---|---|
+| `` case `tag(v): `` | the tag carries a payload; bind it to `v` |
+| `` case `tag(_): `` | the tag carries a payload this arm does not read |
+| `` case `tag: `` | the tag carries **nothing** |
+
+A binder is an ordinary local, scoped to its arm. `_` is the unused-binder
+spelling and not a name, so the body cannot refer to it. `case _:` uses `_` in
+the same sense, for an arm that names no tag.
+
+**The third form states the payload's type rather than eliding the binder.**
+`` `some{Int} `` and `` `some `` are different types (§6.5), so `` case `some: ``
+matches a payload-less `` `some `` and is an error against one carrying an
+`Int`. An arm that has a payload and does not read it is written
+`` case `some(_): ``.
+
+The default arm below takes no backtick: `_` is the absence of a tag, not a
+tag.
+
+Like `if`, a `match` is value-yielding by position: where a value is
+required (a function body, the program value), every arm's block must end
+in a value-yielding statement.
+
+**Each tag is handled by exactly one arm.** Two arms for one tag is an
+error — the arms *partition* the scrutinee's tags, so first-match never
+arbitrates and arm order is not observable. A per-arm guard would change
+that: two arms could then name one tag and be told apart by their guards,
+which is order-sensitive. Guards are a **[Tentative]** direction (see the
+note at the end of this section), so the partition rule is stated for the
+guard-free language of today.
+
+**`case _:` is the default arm**, matching whatever the tagged arms did
+not. It binds no payload — the tags it covers have different payload
+types, so there is nothing single to bind — and it must be the **last**
+arm, since an arm after it could never be selected. At most one is
+allowed.
+
+A `match` whose *only* arm is the default names no tag, so it dispatches
+on nothing: its value is that arm's, whatever the scrutinee is. It is
+legal and says nothing about the scrutinee's type — which therefore need
+not be a variant. The scrutinee is still an expression in scope and is
+type-checked as one.
+
+Patterns are **shallow**: an arm matches one tag and binds the whole
+payload, with no nesting, no literal patterns, and no per-arm guard.
+
+A `match` is not yet accepted **inside a `for`-loop body**, which admits
+only assignments, `<<` feeds, `yield`, `if` guards, `with begin():` blocks
+and bare calls. Dispatching per element is written as a `def` that matches
+on its parameter and is called from the loop or a comprehension, which is
+the same first-match rule reached through a call.
+
+> **Direction [Tentative].** What is missing is a **one-line** spelling, not
+> expression-ness: a `match` in a value position yields a value as an `if`
+> chain does (§4.5). The candidate spelling is the block with its line breaks
+> removed — `` match scrut: case `foo(x): x case `bar(y): to_x(y) `` — where
+> `case` delimits the arms, so no separator is needed. It waits on a one-line
+> block rule, which no block statement has today (`if c: x` does not parse
+> either), so the rule to settle is layout's rather than `match`'s. Tuple
+> destructuring on assignment targets (§4.3) is unaffected and remains the
+> only other pattern-like form.
+>
+> `_` is accepted as an unused binder in a **pattern payload** only.
+> Extending it to every binder position — a lambda parameter, a `for` target,
+> a tuple destructuring slot — is **[Tentative]**. It needs a written rule for
+> what distinguishes `_` in a type position (§2.4, where it means "infer this")
+> from `_` in a binder position; position decides it, and nothing states so.
+>
+> A per-arm guard (`` case `some(v) if v > 0: ``) is the natural next
+> addition — the IR already carries a guard alongside each arm's pattern —
+> and needs a *tag-test* predicate term so the arm's gate can combine "is
+> this tag" with the guard. It also relaxes the one-arm-per-tag rule above:
+> two arms may then name one tag, and arm order becomes observable between
+> them.
+
+---
+
 ## 5. Scoping and binding
 
 CHL is **lexically scoped**. The scopes are:
@@ -1574,8 +1742,9 @@ marked one carries its status per "How to read this document".)
   itself — the unit type (§6.6).
 - `{name: T, …}` — record type. Two records are the same type iff they
   have the same field names with the same field types.
-- ``{ `tag₀{…} | `tag₁{…} | … }`` — variant type (**[Decided]**, §6.5).
-  Not writable yet.
+- ``{ `tag₀{…} | `tag₁{…} | … }`` — variant type (§6.5). Two variants are the
+  same type iff they have the same tags with the same payload types; the arms
+  are a set, so their written order does not matter.
 - `{T where p(_)}` — refinement type (**[Decided]**, §6.4). Not writable
   yet.
 - `Mut(V)` / `Mut(V, Txn)` — mutable-variable / transactional-variable
@@ -1678,7 +1847,7 @@ so they are lowercase — `` `some ``/`` `none ``, `` `ok ``/`` `err `` — and
 only the type (`Option(T)`) is capitalized. `Caps` means *type*, without
 exception (unlike ML and Rust, which capitalize constructors). Those
 constructors are **variant tags**, so they additionally carry the `` ` ``
-prefix in every position (**[Decided]**, §6.5); the capitalization rule is
+prefix in every position (§6.5); the capitalization rule is
 what fixes their case, and the backtick is what marks them as tags rather
 than ordinary names.
 
@@ -1932,9 +2101,9 @@ A `match` over `_` is the idiomatic way to refine a variant:
 > would have to delimit each arm by the next `case` or the closing brace
 > instead. That is parseable — neither token can continue an expression —
 > but it is a second, delimiter-derived block discipline for `match`
-> alongside the indentation-derived one. A **single-line `match`** form
-> would collapse the two; its spelling is undecided. Pattern matching's
-> block syntax is **[Tentative]** in any case (§1.6).
+> alongside the indentation-derived one it has today (§4.10). A
+> **single-line `match`** form would collapse the two; its spelling is
+> undecided, and so is any expression form of `match` at all (§4.10).
 
 `_` is the value being refined, so a predicate that mentions *another* value
 relies on that value having a name where the refinement sits. In a function
@@ -1956,8 +2125,7 @@ subject.
 
 ### 6.5 Variants
 
-**[Decided]** — not implemented: no part of the CHL surface below is lexed or
-parsed.
+This section is the **type** side; construction is §3.15 and `match` is §4.10.
 
 A **variant** is a tagged sum: a value is one of a fixed set of tags, each
 carrying its own fields. Every tag is prefixed with a backtick, in every
@@ -1981,31 +2149,51 @@ The rules, and what each one is doing:
   structural type like any other (§2.4), and the alternation reads as the
   sum it is. A single-tag variant still takes its braces —
   ``{ `unit }`` — and needs no trailing comma, since the `` ` `` already
-  marks the form (unlike a one-*tuple* type, §3.11).
-- **A tag's fields are `{…}`-enclosed in the type** and follow the
-  record/tuple type spellings: positional (`` `some{Int, Bool} ``) or named
-  (`` `some{a: Int, b: Bool} ``). A **nullary** tag has no braces at all.
-- **Field braces are the tag's own field list**, not a nested type — which
-  is the elision: a record payload is `` `some{a: Int} ``, not
-  `` `some{{a: Int}} ``. Write the fields where the braces already are.
+  marks the form (unlike a one-*tuple* type, §3.11). The braces are what say
+  where the `|`-chain ends, so a bare arm outside them is not a type.
+- **A tag's braces are its payload type's braces, elided**, and doubling them is
+  an error. So a record payload is `` `some{a: Int} ``, never
+  `` `some{{a: Int}} ``; a tuple payload `` `some{Int, Bool} ``; a one-tuple
+  `` `some{Int,} ``, keeping the comma that says so (§3.11); and a nested
+  *variant* payload reuses the arm's own braces,
+  ``{ `outer{`some{Int} | `none} | `done }``. That last is also how a variant
+  type prints, so a rendered type reads back as itself.
+
+  Requiring the elision is what keeps **one spelling per type**, the same reason
+  a standalone `{T}` must carry its comma (§2.4). It is available because a
+  comma-free `{T}` has no standalone reading: those braces are therefore the
+  **tag's**, and `` `some{Int} `` stores a bare `Int` — which is what makes it
+  the type of `` `some(1) ``. A **nullary** tag writes no braces at all, and
+  `` `some{} `` agrees with it, the empty product being unit (§6.6).
 - **Terms and patterns use `( … )`**, because they are terms, and `( … )`
-  is the product constructor at the term level (§2.4). So construction
-  reads like a call — `` `some(1) ``, `` `some(a=0) `` — matching the
-  functions-take-one-product-argument model (§3.8), and a pattern reads
-  like the construction it matches (§4.3.1).
+  is the product constructor at the term level (§2.4). The tag's parens are that
+  product's, elided the same way, so construction *is* a call in shape (§3.8):
+  `` `some(1) ``, `` `pair(1, True) ``, `` `some(a=0) ``, and the one-tuple
+  `` `some(1,) ``. A pattern reads like the construction it matches (§4.3.1).
+
+  Unlike the type level this yields no uniqueness, and does not try to: `( e )`
+  is also *grouping* at the term level (§3.11), so `` `pair((1, True)) `` denotes
+  the same value and no rule could forbid it. Braces and parens remain
+  non-interchangeable across levels, and each rejection names the form that
+  belongs in that position.
 - **Tags are lowercase** because a tag builds a value, and `Caps` means
   type without exception (§6.1).
 
+**The arms are a set**, canonicalized by tag name: ``{ `none | `some{Int} }``
+and ``{ `some{Int} | `none }`` are the same type, and an annotation written in
+either order compares equal to what inference produced.
+
 `Option(T)` is the canonical variant — ``{ `some{T} | `none }`` — and is
 what a partial lookup returns under the collections direction (§3.9,
-§6.3). `Result` is the same shape with `` `ok ``/`` `err ``.
+§6.3). It is a built-in *abbreviation* in the same category as `List(T)`, not a
+distinguished kind of type: nothing in the language privileges the spellings
+`some` and `none`, and writing the arms out gives the same type. `Result` is the
+same shape with `` `ok ``/`` `err `` and has no built-in spelling — write its
+arms out, or wait for the type alias (§3.15).
 
-Variants are matched with `match`/`case` (**[Tentative]** as to block
-syntax — §1.6), or destructured directly against a single-tag variant type
-where the match cannot fail (§4.3.1).
-
-Nothing in CHL constructs a variant today — no backtick is lexed, and neither
-`match` nor a tag is parsed.
+Variants are matched with `match`/`case` (§4.10). Destructuring one directly
+against a single-tag variant type, where the match cannot fail, is **[Decided]**
+and not implemented (§4.3.1).
 
 ### 6.6 The empty product is unit
 
@@ -2668,21 +2856,22 @@ with parser-level support that lowering rejects:
   predicate. Function contracts are written either as those annotations or as
   `assert`s lifted to refinements (**[Decided]**, §6) — `assert` is likewise not
   yet a statement.
-- **Variants** — the tagged-sum surface, ``{ `some{Int} | `none }`` as a
-  type and `` `some(1) `` as a term (**[Decided]**, §6.5). CHL has none of
-  the syntax: the backtick is not
-  lexed at all, so it is the *first* blocker in every north-star program
-  that matches an `Option` — `txn_kv`, `nonneg_inventory`, and both
-  `storefront` versions pin that lex failure today.
-- **Pattern matching** beyond tuple destructuring on assignment
-  targets — a `match`/`case` form appears in the north-star `txn_kv` and
-  in refinement predicates (§6.4) (**[Tentative]**, §1.6) but its block
-  syntax has no design writeup; a single-line form is **[Open]**, and
-  the layout rules (§1.4) force the question for a `match` inside a
-  refinement.
+- **Named variant types** — a tag has no declaration site, so a misspelled tag
+  is caught only where it fails to meet its counterpart, and a constructor's
+  payload arity is not checked at the constructor. The structural type alias
+  (`` Option(T) = {`some{T} | `none} ``) is the planned resolution site, and
+  would replace the built-in `Option(T)` with a prelude definition
+  (**[Tentative]**, §3.15, §6.1).
+- **Pattern matching** beyond a `match` arm's single tag — `match` / `case`
+  tag dispatch over a variant is implemented (§4.10), but patterns are
+  shallow: no nesting, no literal patterns, and no per-arm guard. `match` is a
+  statement only; an expression form is **[Open]**, and the layout rules
+  (§1.4) force the question for a `match` inside a refinement predicate
+  (§6.4).
 - **Destructuring patterns** beyond tuples — record, variant, and
-  wildcard patterns, and per-component annotations with `:` binding
-  tighter than `,` (**[Decided]**, §4.3.1).
+  wildcard patterns in assignment targets and `for` binders (a `match`
+  arm's tag pattern is §4.10), and per-component annotations with `:`
+  binding tighter than `,` (**[Decided]**, §4.3.1).
 - **Unit values do not run** — the type surface is settled (`{}` for the type,
   `()` for the value, §6.6) and both typecheck, but a unit-valued program
   output cannot be materialized by the interpreter: it has no column
@@ -2702,10 +2891,11 @@ with parser-level support that lowering rejects:
   feeds — §8), now spelled in the canonical target syntax: parenthesised type
   application (`Mut(V, Txn)`, `List(T)`) and capitalized primitive names
   (`Int`, `Bool`, `String`), with record types `{name: T, …}` and tuple types
-  `{T, U}` writable in annotation position (§6.1). The remaining **Direction**
-  notes are unimplemented: `rec` bindings (§4.3), destructuring patterns
-  (§4.3.1), membership `in` (§3.4), the `->` pair/map-entry syntax (§2.4),
-  refinements (§6.4), variants (§6.5), the `Feed(_)`
+  `{T, U}` writable in annotation position (§6.1), and variants writable in all
+  three positions — type, term and pattern (§6.5, §3.15, §4.10). The remaining
+  **Direction** notes are unimplemented: `rec` bindings (§4.3), destructuring
+  patterns (§4.3.1), membership `in` (§3.4), the `->` pair/map-entry syntax
+  (§2.4), refinements (§6.4), the `Feed(_)`
   forward-declaration surface (§3.7, §6.2), and
   transactions-as-contextual-parameters (§8.7). The north-star programs
   pin the target; the sequencing is tracked

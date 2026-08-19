@@ -1901,7 +1901,7 @@ fn copair_type(feeds: &[Expr]) -> Type {
         }
     }
     match cod {
-        Some(c) => Type::data_fun(Type::Variant(tags), c),
+        Some(c) => Type::data_fun(Type::variant(tags), c),
         None => Type::Hole,
     }
 }

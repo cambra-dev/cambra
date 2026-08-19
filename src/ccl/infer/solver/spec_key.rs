@@ -426,7 +426,9 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 .collect(),
             ..Default::default()
         },
-        Type::Variant(tags) => KeyView {
+        // Openness is a property of a *demand*, never of the value a
+        // specialization is keyed on, so it does not enter the key.
+        Type::Variant(tags, _) => KeyView {
             var: tags
                 .iter()
                 .map(|(k, t)| (k.clone(), key_go(t, pol, subst_acc, ctx)))

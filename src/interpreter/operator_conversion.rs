@@ -436,7 +436,7 @@ impl OpConversionContext {
             // sums that `++`/`Copair` produces (all `Index` tags)
             // and named source-level variants. The tags carry through: they are
             // the arm identities every union column and predicate is keyed by.
-            Type::Variant(tags) => {
+            Type::Variant(tags, _) => {
                 let mut arms = Vec::with_capacity(tags.len());
                 for (k, t) in tags {
                     arms.push((k.clone(), self.extent_of(t)?));
@@ -712,7 +712,13 @@ fn convert_impl_inner(
                     operands.len()
                 )));
             }
-            union_operand_ops(operands, UnionShape::Copair, input, ctx)
+            union_operand_ops(
+                operands,
+                UnionShape::Copair,
+                union_codomain_extent(&expr.ty, ctx)?,
+                input,
+                ctx,
+            )
         }
 
         // A **disjoint join**: the operands are partial collections over one domain,
@@ -725,7 +731,13 @@ fn convert_impl_inner(
                     "disjoint_join expects at least one operand".to_string(),
                 ));
             }
-            union_operand_ops(operands, UnionShape::DisjointJoin, input, ctx)
+            union_operand_ops(
+                operands,
+                UnionShape::DisjointJoin,
+                union_codomain_extent(&expr.ty, ctx)?,
+                input,
+                ctx,
+            )
         }
 
         // `Apply(Tuple(ops), Builtin::Copair)` — the point-free
@@ -748,7 +760,13 @@ fn convert_impl_inner(
                     elts.len()
                 )));
             }
-            union_operand_ops(elts, UnionShape::Copair, input, ctx)
+            union_operand_ops(
+                elts,
+                UnionShape::Copair,
+                union_codomain_extent(&expr.ty, ctx)?,
+                input,
+                ctx,
+            )
         }
 
         // `as_of((trigger, source))` — the live cross-endpoint read. For each
@@ -911,29 +929,33 @@ fn convert_impl_inner(
         }
 
         // `FinalOrDefault` is the stream-to-scalar primitive that extracts the
-        // codomain value at the final position of an iteration stream, falling
-        // back to a default scalar when the stream is empty.  Argument is a
-        // 2-element `Tuple([stream, default])`; compiles directly to the
-        // `ExtractFinal` tile operator (which takes both ops).
+        // codomain value at the final position of an iteration stream. Compiles
+        // directly to the `ExtractFinal` tile operator.
+        //
+        // **Two argument shapes.** A 2-element `Tuple([stream, default])` falls back
+        // to `default` when the stream is empty — the guard-`Case` C-form, whose
+        // trailing `true` arm supplies it, and the mutation loop whose pre-loop
+        // accumulator does. A **bare stream** declares the source *total*: an
+        // exhaustive tag partition always covers exactly one position, so there is
+        // no empty case and no default value has to be invented.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::FinalOrDefault) =>
         {
             expect_no_input(input, "final_or_default")?;
-            let TypedExprNode::Tuple(elts) = &argument.node else {
-                return Err(ConversionError::Unsupported(format!(
-                    "FinalOrDefault expects a 2-element Tuple argument, got {:?}",
-                    argument.node
-                )));
-            };
-            if elts.len() != 2 {
-                return Err(ConversionError::Unsupported(format!(
-                    "FinalOrDefault expects a 2-element Tuple argument, got {} elements",
+            match &argument.node {
+                TypedExprNode::Tuple(elts) if elts.len() == 2 => {
+                    let stream_op = convert_impl(&elts[0], None, ctx)?;
+                    let default_op = convert_impl(&elts[1], None, ctx)?;
+                    Ok(Box::new(ExtractFinal::new(stream_op, default_op)))
+                }
+                TypedExprNode::Tuple(elts) => Err(ConversionError::Unsupported(format!(
+                    "FinalOrDefault with a Tuple argument expects 2 elements, got {}",
                     elts.len()
-                )));
+                ))),
+                _ => Ok(Box::new(ExtractFinal::without_default(convert_impl(
+                    argument, None, ctx,
+                )?))),
             }
-            let stream_op = convert_impl(&elts[0], None, ctx)?;
-            let default_op = convert_impl(&elts[1], None, ctx)?;
-            Ok(Box::new(ExtractFinal::new(stream_op, default_op)))
         }
 
         // `GetPrevSeq` is a letrec guard accessor, never compiled directly:
@@ -1063,7 +1085,21 @@ fn convert_impl_inner(
                             input.tiling()
                         )));
                     }
-                    Ok(Box::new(VariantProject::new(input, tag.clone())))
+                    // The projected arm's extent comes from this node's codomain:
+                    // the scrutinee may be a width-subtype that never carries the
+                    // tag, in which case its extent has no arm to read it from.
+                    let payload_ty = expr.ty.codomain().ok_or_else(|| {
+                        ConversionError::TypeError(format!(
+                            "variant_project({tag}) node must have a function type, got {}",
+                            expr.ty
+                        ))
+                    })?;
+                    let payload_extent = ctx.extent_of(&payload_ty)?;
+                    Ok(Box::new(VariantProject::new(
+                        input,
+                        tag.clone(),
+                        payload_extent,
+                    )))
                 }
                 // `variant_wrap(c)` — the point-free constructor. Consumes the fed
                 // payload stream and injects it at tag `c`. The union extents come
@@ -1081,7 +1117,7 @@ fn convert_impl_inner(
                     while let Type::Refinement(inner, _) = union_ty {
                         union_ty = inner;
                     }
-                    let Type::Variant(variants) = union_ty else {
+                    let Type::Variant(variants, _) = union_ty else {
                         return Err(ConversionError::TypeError(format!(
                             "variant_wrap({tag}) codomain must be a Variant, got {codomain}"
                         )));
@@ -1113,7 +1149,18 @@ fn convert_impl_inner(
 
         // List literal: materialise as SealedFunction(UIntRange(n), T).
         TypedExprNode::List(elts) => {
-            let fn_const = compile_list_fn(elts)?;
+            // The element extent comes from the list's own type — see
+            // `compile_list_fn` for why a value cannot supply it.
+            let elt_extent = match ctx.extent_of(&expr.ty)? {
+                Extent::Function { codomain, .. } => *codomain,
+                other => {
+                    return Err(ConversionError::TypeError(format!(
+                        "a list literal's type is a function from its index set to its \
+                         element type, got extent {other}"
+                    )));
+                }
+            };
+            let fn_const = compile_list_fn(elts, elt_extent)?;
             let index_stream = input.ok_or_else(|| {
                 ConversionError::Unsupported(
                     "list literal reached op-conversion without an input — planning \
@@ -1170,7 +1217,7 @@ fn convert_impl_inner(
             while let Type::Refinement(inner, _) = ty {
                 ty = inner;
             }
-            let Type::Variant(variants) = ty else {
+            let Type::Variant(variants, _) = ty else {
                 return Err(ConversionError::TypeError(format!(
                     "VariantCtor `{tag}` has non-variant type {}; inference should have \
                      width-subtyped it to a Type::Variant before op-conversion",
@@ -1250,15 +1297,25 @@ fn expect_no_input(
 
 /// Compile a list literal to a [`Constant`] holding a `Value::Function` binding table.
 ///
-fn compile_list_fn(elts: &[Expr]) -> Result<Box<dyn TileOperator>, ConversionError> {
+/// `elt_extent` is the element extent taken from the list's **declared type**, not
+/// re-derived from the element values. Two reasons it has to be:
+///
+/// - A value does not determine its own extent for a sum: it knows the arm it
+///   occupies, not the arm set it belongs to. A list of variants needs the whole
+///   `Extent::Union` — the merged tag set — which only the type has.
+/// - The declared element type already *is* the join inference computed over the
+///   elements, so it covers a mixed-tag list correctly by construction. Deriving from
+///   the values instead means picking one element's extent and hoping it speaks for
+///   the rest.
+fn compile_list_fn(
+    elts: &[Expr],
+    elt_extent: Extent,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     let mut bindings = Vec::with_capacity(elts.len());
-    let mut elt_extent = Extent::Base(BaseType::Unit);
     for (i, elt) in elts.iter().enumerate() {
-        let value = expr_to_value(elt)?;
-        elt_extent = Extent::for_value(&value);
         bindings.push(FuncBinding {
             input: Value::UInt(i),
-            output: value,
+            output: expr_to_value(elt)?,
         });
     }
     let fn_value = Value::Function(bindings);
@@ -1271,7 +1328,9 @@ fn compile_list_fn(elts: &[Expr]) -> Result<Box<dyn TileOperator>, ConversionErr
 
 /// Evaluate a constant CCL expression to a [`Value`].
 ///
-/// Only [`TypedExprNode::Lit`] and constant [`TypedExprNode::Tuple`] are supported.
+/// The constant *value* formers, each recursing on its children so a constant
+/// nests: a literal, a tuple, a record, and a variant constructor. Anything else is
+/// a computation, which a list literal's element position cannot express.
 fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
     match &expr.node {
         TypedExprNode::Lit(lit) => Ok(match lit {
@@ -1295,8 +1354,19 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
                 .collect();
             Ok(Value::Record(map?))
         }
+        // A variant value is constant exactly when its payload is, so this recurses
+        // like the product formers above — `` `some(`none) `` is as constant as `1`.
+        // Without it, a list literal of variants (``[`a(1), `b(2)]``) is rejected even
+        // though `ColumnValue::from_values` builds a union column from a `Union`
+        // extent perfectly well.
+        TypedExprNode::VariantCtor { tag, payload } => Ok(Value::Union {
+            tag: FieldKey::Name(tag.as_str().into()),
+            inner: Box::new(expr_to_value(payload)?),
+        }),
         _ => Err(ConversionError::Unsupported(format!(
-            "only literals and constant tuples are supported in list elements, got: {expr:?}"
+            "a list element must be a constant — a literal, tuple, record or variant \
+             constructor — but this one is a computation: {}",
+            symbolic(expr)
         ))),
     }
 }
@@ -1349,7 +1419,7 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
         return Vec::new();
     };
     // Peel the `commit` payload record out of the decision variant.
-    let Type::Variant(tags) = codom else {
+    let Type::Variant(tags, _) = codom else {
         return Vec::new();
     };
     let Some((_, Type::Record(fields))) = tags
@@ -1918,9 +1988,30 @@ enum UnionShape {
     DisjointJoin,
 }
 
+/// The merged column's value extent, read off the union **node's** type.
+///
+/// A union node is typed `D ⤇ V`, and `V` is the arms' join as inference computed
+/// it — in the full type lattice, with the record and variant width rules the
+/// runtime [`Extent`] has no counterpart for. So the operator is told what its
+/// codomain is rather than re-deriving one from the operand tilings, which is the
+/// same move `compile_list_fn` and `VariantProject` make for their element and
+/// payload extents.
+fn union_codomain_extent(
+    node_ty: &Type,
+    ctx: &mut OpConversionContext,
+) -> Result<Extent, ConversionError> {
+    let codomain = node_ty.codomain().ok_or_else(|| {
+        ConversionError::TypeError(format!(
+            "a union node is a collection `D ⤇ V`, so its type has a codomain; got {node_ty}"
+        ))
+    })?;
+    ctx.extent_of(&codomain)
+}
+
 fn union_operand_ops(
     operands: &[Expr],
     shape: UnionShape,
+    declared_codomain: Extent,
     input: Option<Box<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
@@ -1931,8 +2022,12 @@ fn union_operand_ops(
                 .map(|e| convert_impl(e, None, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(match shape {
-                UnionShape::Copair => Box::new(UnionOperator::new(ops)) as Box<dyn TileOperator>,
-                UnionShape::DisjointJoin => Box::new(UnionOperator::new_flat(ops)),
+                UnionShape::Copair => {
+                    Box::new(UnionOperator::new(ops, declared_codomain)) as Box<dyn TileOperator>
+                }
+                UnionShape::DisjointJoin => {
+                    Box::new(UnionOperator::new_flat(ops, declared_codomain))
+                }
             })
         }
         // A **fed** union: fan the input to every operand (each restricts its own
@@ -1962,7 +2057,7 @@ fn union_operand_ops(
                 .iter()
                 .map(|e| convert_impl(e, Some(fan.branch()), ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Box::new(UnionOperator::new_flat(ops)))
+            Ok(Box::new(UnionOperator::new_flat(ops, declared_codomain)))
         }
     }
 }
@@ -2252,7 +2347,7 @@ mod variant_ctor_tests {
     /// A `[commit(Int), abort(Unit)]` variant type — the shape the transaction
     /// decision will carry.
     fn commit_abort_ty(payload: Type) -> Type {
-        Type::Variant(vec![
+        Type::variant(vec![
             (FieldKey::Name("commit".into()), payload),
             (FieldKey::Name("abort".into()), Type::Base(CclBase::Unit)),
         ])
@@ -2400,6 +2495,7 @@ mod variant_ctor_tests {
             pattern: Some(Pattern {
                 tag: "commit".into(),
                 binding: binding("w", int_ty.clone()),
+                empty_payload: false,
             }),
             guard: bool_true(),
             body: w_plus_1,
@@ -2408,6 +2504,7 @@ mod variant_ctor_tests {
             pattern: Some(Pattern {
                 tag: "abort".into(),
                 binding: binding("a", Type::Base(CclBase::Unit)),
+                empty_payload: false,
             }),
             guard: bool_true(),
             body: typed(TypedExprNode::Lit(Lit::Int(0)), int_ty.clone()),
@@ -2510,7 +2607,7 @@ mod variant_ctor_tests {
     #[test]
     fn variant_elim_one_arm() {
         let int_ty = Type::Base(CclBase::Int);
-        let commit_only_ty = Type::Variant(vec![(FieldKey::Name("commit".into()), int_ty.clone())]);
+        let commit_only_ty = Type::variant(vec![(FieldKey::Name("commit".into()), int_ty.clone())]);
 
         let w_plus_1 = typed(
             TypedExprNode::BinOp {
@@ -2530,6 +2627,7 @@ mod variant_ctor_tests {
                     pattern: Some(Pattern {
                         tag: "commit".into(),
                         binding: binding("w", int_ty.clone()),
+                        empty_payload: false,
                     }),
                     guard: bool_true(),
                     body: w_plus_1,
@@ -2624,7 +2722,7 @@ mod variant_ctor_tests {
     #[test]
     fn variant_elim_outer_binder_zip() {
         let int_ty = Type::Base(CclBase::Int);
-        let decision_ty = Type::Variant(vec![(FieldKey::Name("commit".into()), int_ty.clone())]);
+        let decision_ty = Type::variant(vec![(FieldKey::Name("commit".into()), int_ty.clone())]);
         let rec_ty = Type::Record(vec![
             ("time".into(), int_ty.clone()),
             ("decision".into(), decision_ty.clone()),
@@ -2672,6 +2770,7 @@ mod variant_ctor_tests {
                     pattern: Some(Pattern {
                         tag: "commit".into(),
                         binding: binding("w", int_ty.clone()),
+                        empty_payload: false,
                     }),
                     guard: bool_true(),
                     body: arm_body,
