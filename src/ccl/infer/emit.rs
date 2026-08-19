@@ -315,7 +315,10 @@ fn stamp_kind_from(target: &mut Type, reference: &Type) {
 /// enclosing scope; this must run while those bindings are live (i.e.
 /// during `emit_node` of the annotated node). Each predicate is rebuilt in
 /// place ([`emit_bare_predicate`]) so the typed term lands on the annotation.
-fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
+fn emit_annotation_predicates<C: Typing>(
+    ty: &mut Type,
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
     match ty {
         Type::Refinement(inner, r) => {
             // The annotation's refinement is bare over REFINEMENT_BINDER, just
@@ -501,8 +504,23 @@ pub(super) fn emit_lambda<C: Typing>(
         None => body_ty,
     };
 
-    // Param user-annotation: reconcile the inferred param type with the
-    // annotation (two-way; see `bind_annotation`).
+    // Param user-annotation: type any refinement predicates it carries, then
+    // reconcile the inferred param type with the annotation (see
+    // `bind_annotation`).
+    //
+    // A parameter's annotation may carry refinement predicates (`x: {Int where
+    // _ != 0}`, or a dependent `{ {Int, Int} where __elem.1 < __elem.0 }` over
+    // the tupled domain), which are ordinary `Bool` expressions whose free
+    // variables must be in scope: the reserved element binder for `_`, and any
+    // enclosing binder the predicate names. `emit_annotation_predicates` types
+    // each in the scope live here — which already contains the enclosing
+    // parameters (an outer curried param, the sources) — so a genuinely
+    // out-of-scope name raises `UnboundVariable` rather than riding through
+    // untyped. This mirrors the tail `emit_node`/`emit_let` run for a binding
+    // annotation, which a lambda node's *param* annotation does not reach.
+    if let Some(user_ann) = param.user_annotation.as_mut() {
+        emit_annotation_predicates(user_ann, ctx)?;
+    }
     if let Some(ann) = param.user_annotation.clone() {
         ctx.bind_annotation(&param_simple, &ann)?;
     }
@@ -1109,13 +1127,21 @@ pub(super) fn emit_let<C: Typing>(
     // deref'd `bound_ty`, so it means what `b = a` means.
     let bound_ty = read_through(&bound_ty);
     // The type the variable is bound at over the body.
-    let scheme_ty = match &binding.user_annotation {
+    let scheme_ty = match &mut binding.user_annotation {
         // The annotation reconciles the initializer as an ascription. The
         // deref-copy case that used to be special here (`y: Int = x` off a
         // mutable variable, bound at the annotation rather than at the mutable
         // type) is gone: `bound_ty` was already read through above, so annotation
         // and initializer agree and there is nothing to choose between.
         Some(ann) => {
+            // A binding annotation may carry refinement predicates (`x: {Int
+            // where p} = e`). Type them in the current scope — where the
+            // initializer's siblings are bound — so a free variable that names
+            // nothing in scope raises `UnboundVariable`, exactly as the lambda
+            // param annotation and node annotation tails do. Runs before
+            // `bind_annotation` so an unbound reference is reported as such,
+            // rather than surfacing later as an `AnnotationMismatch`.
+            emit_annotation_predicates(ann, ctx)?;
             ctx.bind_annotation(&bound_ty, ann)?;
             bound_ty
         }

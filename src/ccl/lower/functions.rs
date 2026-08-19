@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::{
-    ccl::{Expr, Name, Type, TypedExprNode},
+    ccl::{BinOpKind, Expr, LogicKind, Name, Type, TypedExprNode},
     chl_parser::ast::{Param, Span, Spanned},
 };
 
@@ -203,11 +203,73 @@ pub(super) fn uncurry_params(
             None => Type::Hole,
         });
     }
-    let mut lam = Expr::lambda(&tuple_name, Type::Hole, body_with_subs);
-    if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
-        && let TypedExprNode::Lambda { param, .. } = &mut lam.node
+    // Hoist a *dependent* element refinement — one that names an earlier
+    // parameter (`def foo(x, y: {Int where _ < x})`) — to a refinement over the
+    // whole tupled domain. Such a predicate relates two elements, so it is a
+    // statement about the domain value, not the element alone; and the
+    // domain-native way to say that is a refinement whose subject is the
+    // `REFINEMENT_BINDER` (`__elem`), the element's own value becoming `__elem.i`
+    // and each earlier parameter `p_j` becoming `__elem.j`. Encoding it this way
+    // (rather than as a reference to the tupled-domain *binder*) is what makes it
+    // resolve: uniquify walks a parameter annotation in the enclosing scope,
+    // before introducing the binder, so a binder reference there could not bind —
+    // whereas `__elem` is bound by the refinement itself.
+    //
+    // An element refinement that names no earlier parameter is independent and
+    // stays on the element (behaviour and diagnostics unchanged). Only strictly
+    // earlier parameters are in scope (left-to-right); a forward reference to a
+    // later parameter is left a free name and rejected by inference. These
+    // predicate nodes live inside a type slot, outside the lineage / id domain
+    // (`collect_tree_ids`), so they need no provenance tagging or fresh ids.
+    //
+    // Only the *outermost* refinement layer of each element is examined: a
+    // dependent reference buried under an independent layer (`y: {{Int where
+    // _ < x} where _ != 0}`) is not hoisted and stays a free name inference
+    // rejects. Handling that would mean hoisting a middle layer out of a nested
+    // refinement, which no current program needs; revisit if one does.
+    let mut domain_preds: Vec<Expr> = Vec::new();
+    for i in 0..elem_anns.len() {
+        let Type::Refinement(_, r) = &elem_anns[i] else {
+            continue;
+        };
+        let names_earlier = params[..i]
+            .iter()
+            .any(|p| crate::ccl::ccl_utils::is_free(&Name::raw(p.name.as_str()), &r.predicate));
+        if !names_earlier {
+            continue;
+        }
+        let mut pred = (*r.predicate).clone();
+        // Rewrite the element's own value (`__elem`) first, so the projections the
+        // earlier-parameter rewrites introduce are not themselves re-projected.
+        let elem_proj = Expr::apply(Expr::var(Name::elem()), Expr::proj_index(i));
+        crate::ccl::subst::Subst::discharge(Name::elem(), elem_proj).rewrite_expr(&mut pred);
+        for (j, earlier) in params[..i].iter().enumerate() {
+            let proj = Expr::apply(Expr::var(Name::elem()), Expr::proj_index(j));
+            crate::ccl::subst::Subst::discharge(Name::raw(earlier.name.as_str()), proj)
+                .rewrite_expr(&mut pred);
+        }
+        domain_preds.push(pred);
+        // The relation now lives on the domain; the element reverts to its base.
+        let Type::Refinement(base, _) = std::mem::replace(&mut elem_anns[i], Type::Hole) else {
+            unreachable!("matched Refinement immediately above");
+        };
+        elem_anns[i] = *base;
+    }
+    let any_annotated =
+        !domain_preds.is_empty() || elem_anns.iter().any(|t| !matches!(t, Type::Hole));
+    let mut domain_ty = Type::Tuple(elem_anns);
+    if let Some(pred) = domain_preds
+        .into_iter()
+        .reduce(|a, b| Expr::binop(a, BinOpKind::BoolLogic(LogicKind::And), b))
     {
-        param.declare(Type::Tuple(elem_anns));
+        domain_ty = Type::Refinement(
+            Box::new(domain_ty),
+            crate::ccl::Refinement::born(Rc::new(pred)),
+        );
+    }
+    let mut lam = Expr::lambda(&tuple_name, Type::Hole, body_with_subs);
+    if any_annotated && let TypedExprNode::Lambda { param, .. } = &mut lam.node {
+        param.declare(domain_ty);
     }
     Ok(lam)
 }
