@@ -407,19 +407,24 @@ static FUN_KIND_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// What a [`FunKindVar`] has been pinned to.
 ///
-/// `Data` and `Compute` are **incomparable**, so a kind edge is an equation, not
-/// a bound: a var records which of the two points it has been pinned to. There
-/// are only two points and no [`Type`] sits inside, so this collapses to two
-/// flags rather than the polar bound *lists* an [`crate::ccl::InferVar`] carries,
-/// and a `FunKindVar` never forms a cycle. Resolution is a flag read: both flags
-/// is the conflict (a var pinned to both points at once); one flag is that
-/// point; neither → the caller's default.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FunKindBounds {
-    /// This kind has been pinned to `Compute`.
-    pub forced_compute: bool,
-    /// This kind has been pinned to `Data`.
-    pub forced_data: bool,
+/// `Data` and `Compute` are **incomparable**, so a kind edge fixes a variable
+/// rather than bounding it, and there is nothing to accumulate but which of the
+/// two points something pinned it to. An [`crate::ccl::InferVar`] carries polar
+/// bound *lists*; this carries one of four states, and since no [`Type`] sits
+/// inside, a `FunKindVar` never forms a cycle.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum KindPin {
+    /// Nothing pinned this kind. Resolves to the reader's default.
+    #[default]
+    Unpinned,
+    /// Pinned to `Compute`.
+    Compute,
+    /// Pinned to `Data`.
+    Data,
+    /// Pinned to both points — one function required to be a collection at one
+    /// site and a capability at another. Read at coalesce
+    /// ([`crate::ccl::infer::solver::compact::KindMerge::of`]).
+    Conflict,
 }
 
 /// A kind-inference variable — an unknown [`FunKind`] an elimination mints
@@ -442,8 +447,10 @@ pub struct FunKindBounds {
 pub struct FunKindVar {
     /// Stable, globally-unique identity.
     pub uid: FunKindVarId,
-    /// Which point(s) this var has been pinned to.
-    pub bounds: RefCell<FunKindBounds>,
+    /// Which point this var has been pinned to. Private so that every write goes
+    /// through a pin, which is what makes reaching [`KindPin::Conflict`] the only
+    /// way to hold two points at once.
+    pin: RefCell<KindPin>,
 }
 
 impl FunKindVar {
@@ -451,20 +458,38 @@ impl FunKindVar {
     pub fn fresh() -> Rc<FunKindVar> {
         Rc::new(FunKindVar {
             uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
-            bounds: RefCell::new(FunKindBounds::default()),
+            pin: RefCell::new(KindPin::Unpinned),
         })
     }
 
-    /// Pin this kind to `Compute`. Recording both points is the conflict, read
-    /// at coalesce ([`crate::ccl::infer::solver::compact::KindMerge::of`]) — one
-    /// function required to be a collection at one site and a capability at another.
+    /// What this variable has been pinned to.
+    pub fn pin(&self) -> KindPin {
+        *self.pin.borrow()
+    }
+
+    /// Pin this kind to `Compute`. Pinning to the point already recorded is
+    /// idempotent; pinning to the other one is the conflict, which absorbs.
     pub fn pin_compute(&self) {
-        self.bounds.borrow_mut().forced_compute = true;
+        let pin = &mut *self.pin.borrow_mut();
+        *pin = match *pin {
+            KindPin::Unpinned | KindPin::Compute => KindPin::Compute,
+            KindPin::Data | KindPin::Conflict => KindPin::Conflict,
+        };
     }
 
     /// Pin this kind to `Data`. The dual of [`FunKindVar::pin_compute`].
     pub fn pin_data(&self) {
-        self.bounds.borrow_mut().forced_data = true;
+        let pin = &mut *self.pin.borrow_mut();
+        *pin = match *pin {
+            KindPin::Unpinned | KindPin::Data => KindPin::Data,
+            KindPin::Compute | KindPin::Conflict => KindPin::Conflict,
+        };
+    }
+
+    /// Copy `other`'s pin onto this variable, for a scheme instantiation carrying
+    /// the definition site's answer onto the freshened copy.
+    pub fn adopt_pin(&self, other: &FunKindVar) {
+        *self.pin.borrow_mut() = other.pin();
     }
 }
 
@@ -1022,6 +1047,17 @@ impl Type {
         }
     }
 
+    /// This type's [`FunKind`] if it is a function, looking through refinements.
+    ///
+    /// A refined function (`{Fun | p}`) still carries a kind, and a match on the
+    /// bare type drops it, so every reader that wants the kind wants this.
+    pub fn fun_kind(&self) -> Option<&FunKind> {
+        match self.peel_refinements() {
+            Type::Fun { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
     /// `self` re-stamped with `provenance`'s [`FunKind`], through any
     /// refinements on either side. A non-`Fun` on either side is a no-op.
     ///
@@ -1034,7 +1070,7 @@ impl Type {
     /// the value *is*. Everything else (refinements, the Pi binder, the domain and
     /// codomain) stays, because only the kind moved.
     pub fn with_kind_of(&self, provenance: &Type) -> Type {
-        let Type::Fun { kind, .. } = provenance.peel_refinements() else {
+        let Some(kind) = provenance.fun_kind() else {
             return self.clone();
         };
         fn restamp(t: &Type, kind: &FunKind) -> Type {

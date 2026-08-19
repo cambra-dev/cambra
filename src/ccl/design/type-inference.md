@@ -946,21 +946,26 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ## 4.6 Data vs compute functions
 
-Functions can either represent collections or a computation that can be run.  This
-is stored as a `FunKind` on `Type::Fun` and is either `Data` or `Compute`.  The kind
-is chosen at lowering time based on the CHL construct used.  For example, UDFs are
-`Compute` if they use `return` and `Data` if they use `yield`, list comprehensions
-are always `Data`, etc.
+A function either represents a collection or is a capability that can be called.
+`Type::Fun` stores which as a `FunKind`, either `Data` or `Compute`.
 
-The key differences are how these are used by downstream compilation and the subtyping
-relation.  Compute functions follow standard contravariance rules on the domain, but
-Data functions are invariant.  For a Data function, the domain represents the exact
-set of elements that exist in the collection, so silently changing that is incorrect.
-Downstream phases like inlining and planning rely on the distinction, so it must be
-preserved through all of compilation.
+Lowering chooses the kind from the CHL construct. List literals, comprehensions,
+`groupby`, `++`, and registered sources are `Data`; a `lambda` and a `def` are
+`Compute`, a generator `def` included — it is a capability whose *result* is a
+collection. Where lowering does not yet know the domain and codomain, it states the
+kind as a `data_fun` annotation and inference reads that as the stamp. A function
+parameter is the one thing lowering cannot decide, having no construct to read: it
+gets a kind variable, which the argument pins.
 
-Data functions and Compute functions are not related by subtyping; nothing should
-implicitly convert between them.
+Compute functions follow the usual contravariance on the domain. Data functions are
+invariant, because the domain is the exact set of elements the collection holds, so
+changing it changes the data. Neither kind converts to the other; they are unrelated
+by subtyping.
+
+Downstream phases including inlining and planning dispatch on the distinction, so
+every pass carries a function's kind rather than rebuilding one. `Type::fun_like` is
+the rebuild that does: it copies the exemplar's kind, so rewriting only a domain or a
+codomain cannot turn a collection into a capability.
 
 ### Generalizing a collection is filter pushdown
 
@@ -1232,6 +1237,15 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
   variable, and closure relates a lower to an upper rather than a lower to a lower,
   so neither is ever the left of an edge whose right is the other and
   `ConstrainError::KindMismatch` cannot see it.
+
+- **A var-var kind edge carries nothing, and no program in the suite draws one.**
+  A concrete kind on either side of an edge pins the variable; two variables meeting
+  record nothing, since what the pair resolves to is not known there and deciding it
+  from pins arriving later would make typing depend on constraint order. That is only
+  sound while the two sides agree, and instrumenting the arm across the suite fired
+  zero times — the case is unreached rather than merely benign. A `debug_assert!` in
+  the arm catches a disagreement already present when the edge is drawn; a pin that
+  lands on one side afterwards is outside what it can see.
 
 - **Σ is the missing type, and it is missing at two sites.** Because a domain join
   can be forced from a `Fun`/`Fun` edge as well as at coalesce, the Σ work has to

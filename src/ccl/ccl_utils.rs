@@ -792,12 +792,16 @@ pub fn bare_predicate_of_fn(base: &Type, predicate: Expr) -> Expr {
 /// Re-point every [`TypedExprNode::Cast`]'s `target` type slot at the cast
 /// node's own `expr.ty`. A cast's recorded type *is* its target type, so the
 /// two are equal by construction — but the `target` carries its **own**
-/// immutable refinement-predicate `Rc`, and a predicate-rewriting pass
-/// (inlining's beta step, lambda elimination, planning's point-free
-/// compilation) rebuilds the predicate on `expr.ty` without touching `target`,
-/// so they drift apart. The post-pass `typecheck` reconstructs a cast from its
-/// `target` ([`cast_target_refinement`]) and compares against the recorded
-/// `expr.ty`; re-syncing after each such pass keeps that match exact.
+/// immutable refinement-predicate `Rc`, and lambda elimination rebuilds the
+/// predicate on `expr.ty` without touching `target`, so they drift apart. The
+/// post-pass `typecheck` reconstructs a cast from its `target`
+/// ([`cast_target_refinement`]) and compares against the recorded `expr.ty`;
+/// re-syncing after that pass keeps the match exact.
+///
+/// Only lambda elimination needs it. Inlining and planning each ran it too, and
+/// removing those calls changes no test — a whole-tree repair after a pass is
+/// weaker than writing both copies at the rewrite, which is what
+/// [`sync_cast_target_kind`] does for the arrow kind.
 pub fn sync_cast_targets(expr: &mut Expr) {
     if matches!(expr.node, TypedExprNode::Cast { .. }) {
         let ty = expr.ty.clone();
@@ -823,7 +827,7 @@ pub fn sync_cast_targets(expr: &mut Expr) {
 /// re-kinds it — `⟨id, const 𝑥⟩ ≫ apply` collapsing to a `𝑥` that is a collection
 /// standing in a morphism position. Only the kind moves; the claims stay the
 /// cast's.
-pub fn sync_cast_target_kind(expr: &mut Expr) {
+pub(crate) fn sync_cast_target_kind(expr: &mut Expr) {
     if matches!(expr.node, TypedExprNode::Cast { .. }) {
         let ty = expr.ty.clone();
         if let TypedExprNode::Cast { target, .. } = &mut expr.node {

@@ -1518,19 +1518,18 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
 }
 
 fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimError> {
+    // A `Cast` records its function type twice, on the node and on `target`, and
+    // `emit_cast` reads the kind off `target`. `simplify` re-kinds a surviving
+    // cast through `sync_cast_target_kind`, so the two agree by the time
+    // elimination sees one; a disagreement here means a rewrite wrote one copy
+    // and not the other.
+    #[cfg(debug_assertions)]
     if let TypedExprNode::Cast { target, .. } = &expr.node {
-        let k = |t: &Type| match t.peel_refinements() {
-            Type::Fun { kind, .. } => format!("{kind:?}"),
-            _ => "-".into(),
-        };
-        if k(&expr.ty) != k(target) {
-            eprintln!(
-                "DBGIN node={} target={} {}",
-                k(&expr.ty),
-                k(target),
-                symbolic(&expr)
-            );
-        }
+        debug_assert!(
+            expr.ty.fun_kind() == target.fun_kind(),
+            "a cast's node and target disagree on kind: {}",
+            symbolic(&expr)
+        );
     }
     log::trace!("elim_lambdas: eliminating {}", symbolic(&expr));
     debug_typecheck(&expr);

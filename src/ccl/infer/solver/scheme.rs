@@ -153,7 +153,7 @@ fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKind
         return f.clone();
     }
     let f = FunKindVar::fresh();
-    *f.bounds.borrow_mut() = *kv.bounds.borrow();
+    f.adopt_pin(kv);
     cache.kind_vars.insert(kv.uid, Rc::clone(&f));
     f
 }
@@ -643,17 +643,17 @@ fn freshen_subst_payloads(
 mod tests {
     use super::super::type_level;
     use super::*;
-    use crate::ccl::ty::{FunKind, FunKindVar};
+    use crate::ccl::ty::{FunKind, FunKindVar, KindPin};
     use crate::ccl::{BaseType, InferVar};
 
     #[test]
     fn freshening_mints_a_distinct_kind_var_per_instantiation() {
         // A generalized function's kind must be decided per use. Freshening
-        // a Fun whose kind is an unresolved var must mint a *new* FunKindVar (bounds
-        // copied), not share the original — otherwise forcing one instantiation's
+        // a Fun whose kind is an unpinned var must mint a *new* FunKindVar (the pin
+        // copied), not share the original — otherwise pinning one instantiation's
         // kind contaminates the other into a spurious `DomainJoinConflict`.
         let kv = FunKindVar::fresh();
-        kv.bounds.borrow_mut().forced_data = true; // a def-intrinsic bound to carry
+        kv.pin_data(); // a def-intrinsic answer to carry onto each instantiation
         // A quantified domain (level > lim) so the Fun is instantiated, not
         // early-returned as a captured/monomorphic shape.
         let f = Type::Fun {
@@ -675,14 +675,16 @@ mod tests {
             kv.uid, kv2.uid,
             "instantiation must mint a distinct kind var"
         );
-        assert!(
-            kv2.bounds.borrow().forced_data,
-            "def-intrinsic bounds are copied to the fresh var"
+        assert_eq!(
+            kv2.pin(),
+            KindPin::Data,
+            "the definition's pin is copied to the fresh var"
         );
-        // Equating the fresh instantiation must not reach back to the original.
+        // Pinning the fresh instantiation must not reach back to the original.
         kv2.pin_compute();
-        assert!(
-            !kv.bounds.borrow().forced_compute,
+        assert_eq!(
+            kv.pin(),
+            KindPin::Data,
             "the original var stays decoupled from this instantiation"
         );
     }

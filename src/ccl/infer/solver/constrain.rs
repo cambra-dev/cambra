@@ -198,12 +198,19 @@ pub fn constrain_subtype(
 /// an edge fixes the variable to it ([`FunKindVar::pin_compute`] /
 /// [`FunKindVar::pin_data`]). A var pinned to *both* points is the conflict —
 /// surfaced at coalesce, never here.
-fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<PinnedKind, ()> {
+///
+/// On success, reports whether the two domains relate **invariantly**, which is
+/// what the caller needs next and what neither side alone reliably spells: one
+/// may be a `FunKind::Var` this edge pinned a moment ago. Deciding it here rather
+/// than at the caller also keeps it with the case analysis that settled it — a
+/// caller-side "is either side `Data`?" happens to agree today only because a var
+/// reaches `Data` only from a concrete `Data` on the other end.
+fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<bool, ()> {
     use FunKind::*;
     match (k0, k1) {
         // Reflexivity is the whole of the concrete relation.
-        (Data, Data) => Ok(PinnedKind::Data),
-        (Compute, Compute) => Ok(PinnedKind::Compute),
+        (Data, Data) => Ok(true),
+        (Compute, Compute) => Ok(false),
         // Either mismatch is a rejection: a capability supplied where a
         // collection is demanded, or a collection where a capability is.
         (Compute, Data) | (Data, Compute) => Err(()),
@@ -211,37 +218,31 @@ fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<PinnedKind, ()> {
         // that kind however the two sides were spelled.
         (Compute, Var(v)) | (Var(v), Compute) => {
             v.pin_compute();
-            Ok(PinnedKind::Compute)
+            Ok(false)
         }
         (Data, Var(v)) | (Var(v), Data) => {
             v.pin_data();
-            Ok(PinnedKind::Data)
+            Ok(true)
         }
         // Two variables meeting record nothing. What the pair resolves to is not
         // known at this edge, and deciding it from pins that arrive later
         // would make typing depend on constraint order; each is pinned by the
         // concrete kind that reaches it, if one does. See [`FunKindVar`].
-        (Var(_), Var(_)) => Ok(PinnedKind::Undetermined),
+        //
+        // Carrying nothing is only sound while the two sides agree, since a pin
+        // on one side would otherwise be dropped. No program in the suite reaches
+        // this arm at all, so the guard is what would notice one starting to: it
+        // catches a disagreement already present, not one a later pin creates.
+        (Var(a), Var(b)) => {
+            debug_assert_eq!(
+                a.pin(),
+                b.pin(),
+                "a var-var kind edge relates two differently-pinned kinds, so this \
+                 arm would drop one side's pin"
+            );
+            Ok(false)
+        }
     }
-}
-
-/// The kind a [`constrain_kind`] edge equated its two sides to.
-///
-/// The edge is an equation, so after it succeeds the two sides denote **one**
-/// kind — which is the thing the domain rule needs to know, and which neither
-/// side alone reliably spells (one may be a `FunKind::Var` the edge just pinned).
-/// Reporting it here is what keeps the caller from re-deriving it by asking
-/// whether *either* side looks like `Data`, a test that reads as though a
-/// cross-kind edge were possible when it is exactly what was just rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PinnedKind {
-    /// Both sides are collections.
-    Data,
-    /// Both sides are capabilities.
-    Compute,
-    /// Two kind variables, peered; which point they land on is not known at this
-    /// edge.
-    Undetermined,
 }
 
 /// Bridge the holder gap when chaining two edges through one variable.
@@ -503,7 +504,7 @@ fn constrain_go_impl(
             // incomparable, so the edge is an equation: a concrete mismatch
             // either way is the rejection, and a `FunKind` var is pinned here or
             // peered and resolved at coalesce.
-            let Ok(kind) = constrain_kind(k0, k1) else {
+            let Ok(invariant_domains) = constrain_kind(k0, k1) else {
                 return Err(ConstrainError::KindMismatch {
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
@@ -530,11 +531,10 @@ fn constrain_go_impl(
             // no answer, which is the error below; the same fact reaches coalesce as
             // `CoalesceError::DomainJoinConflict` when no edge forces it earlier.
             //
-            // The kind edge above reports what it equated the two sides to, so
-            // this asks one question of one kind rather than inspecting both
-            // spellings — a var it just pinned to `Data` reads as `Data` here
-            // like any other collection.
-            if kind == PinnedKind::Data {
+            // The kind edge above reports which rule its two sides call for, so
+            // this asks one question rather than inspecting both spellings — a var
+            // it just pinned to `Data` counts as a collection here like any other.
+            if invariant_domains {
                 if constrain_go(d1, d0, sr, sl, cache).is_err()
                     || constrain_go(d0, d1, sl, sr, cache).is_err()
                 {
@@ -1240,7 +1240,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
 
 #[cfg(test)]
 mod tests {
-    use crate::ccl::ty::FunKindVar;
+    use crate::ccl::ty::{FunKindVar, KindPin};
     use std::rc::Rc;
 
     use smol_str::SmolStr;
@@ -2349,11 +2349,10 @@ mod tests {
     }
 
     #[test]
-    fn kind_var_demanded_as_data_is_forced_data() {
-        // A kind var meeting `Data` is *pinned* to it — recorded as
-        // `forced_data`, never an eager rejection — and resolves at coalesce. A
-        // compute function meeting the same var would set `forced_compute`, and
-        // both flags together is the conflict.
+    fn kind_var_demanded_as_data_is_pinned_data() {
+        // A kind var meeting `Data` is *pinned* to it, never an eager rejection,
+        // and resolves at coalesce. A compute function meeting the same var would
+        // pin it the other way, and holding both points is `KindPin::Conflict`.
         let v = FunKindVar::fresh();
         let var_fun = Type::Fun {
             name: None,
@@ -2367,11 +2366,11 @@ mod tests {
             &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
             &mut cache,
         )
-        .expect("a var meeting Data records forced_data, never an eager rejection");
-        assert!(v.bounds.borrow().forced_data, "pinned to data");
-        assert!(
-            !v.bounds.borrow().forced_compute,
-            "no compute function met this var"
+        .expect("a var meeting Data records the pin, never an eager rejection");
+        assert_eq!(
+            v.pin(),
+            KindPin::Data,
+            "pinned to data, and no compute function met this var"
         );
     }
 }

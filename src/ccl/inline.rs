@@ -89,11 +89,7 @@ use crate::ccl::{
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
-    let mut expr = inline_impl(expr);
-    // Beta-reduction rebuilds predicates on `expr.ty` (immutable terms); keep
-    // each `Cast`'s `target` slot in step so the post-pass typecheck matches.
-    crate::ccl::ccl_utils::sync_cast_targets(&mut expr);
-    expr
+    inline_impl(expr)
 }
 
 /// Returns `true` when a `Let` binding of type `bound_ty` should be inlined.

@@ -250,8 +250,9 @@ impl fmt::Display for KeyView {
                 KindMerge::Data => "⤇",
                 KindMerge::Compute => "⇒",
                 KindMerge::Conflict => "⇒!",
-                // The capability default this resolves to at coalesce.
-                KindMerge::Unknown => "⇒",
+                // Never reaches a key (`key_go` resolves it to the capability
+                // default), but `KeyView` renders whatever it is handed.
+                KindMerge::Unknown => "⇒?",
             };
             parts.push(format!("({d} {arrow} {c})"));
         }
@@ -401,10 +402,20 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let cod = key_go(codomain, pol, &cod_acc, ctx);
             // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
-            // so keying on it would split every use; its *bounds* are the answer, and
+            // so keying on it would split every use; its pins are the answer, and
             // reading them here is what compaction does at the same point in the solve.
+            //
+            // An unpinned var keys as `Compute`, not as its own `Unknown`: nothing
+            // required a kind, so coalesce gives it the capability default, and the
+            // two would only ever differ before that. Keeping them apart would split
+            // a generic use from a concrete compute one over a distinction that does
+            // not reach the materialized type.
+            let key_kind = match KindMerge::of(kind) {
+                KindMerge::Unknown => KindMerge::Compute,
+                resolved => resolved,
+            };
             KeyView {
-                fun: BTreeMap::from([(KindMerge::of(kind), (Box::new(dom), Box::new(cod)))]),
+                fun: BTreeMap::from([(key_kind, (Box::new(dom), Box::new(cod)))]),
                 ..Default::default()
             }
         }
@@ -717,8 +728,8 @@ mod tests {
             spec_key(&Type::data_fun(int(), int())),
             "a capability and a collection of the same shape must not share a clone"
         );
-        // An *unresolved* kind does not split: both uses read the same unpinned var
-        // through `KindMerge::of`, which answers `KindMerge::Unknown` for either.
+        // An *unresolved* kind does not split: both uses read the same unpinned var,
+        // which keys as the `Compute` default rather than as its own point.
         let unresolved = || Type::Fun {
             name: None,
             kind: crate::ccl::ty::FunKind::fresh_var(),
@@ -729,6 +740,12 @@ mod tests {
             spec_key(&unresolved()),
             spec_key(&unresolved()),
             "two fresh kind vars are the same unresolved answer, not two identities"
+        );
+        assert_eq!(
+            spec_key(&unresolved()),
+            spec_key(&Type::fun(int(), int())),
+            "an unpinned kind is the capability default, so it shares a clone with \
+             a concrete compute function rather than splitting off its own"
         );
         // And the merge keeps two concrete kinds apart rather than one shadowing the
         // other — what keying `fun` by `KindMerge` buys, and why it needs `Ord`.

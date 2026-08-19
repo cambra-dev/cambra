@@ -67,7 +67,7 @@ pub enum CoalesceError {
         details: String,
     },
     /// A single function slot whose kind resolved contradictorily: one kind
-    /// variable pinned to *both* points (`forced_compute ∧ forced_data`).
+    /// variable at [`crate::ccl::ty::KindPin::Conflict`].
     ///
     /// The two kinds are incomparable, so an edge between them is a rejection
     /// wherever it is drawn; this is the coalesce-time face of

@@ -322,7 +322,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 /// this never silently relabels a user's kind.
 fn stamp_kind_from(target: &mut Type, reference: &Type) {
     use crate::ccl::ty::FunKind;
-    if let Type::Fun { kind: ref_kind, .. } = reference.peel_refinements()
+    if let Some(ref_kind) = reference.fun_kind()
         && !matches!(ref_kind, FunKind::Var(_))
         && let Type::Fun { kind, .. } = target
     {
@@ -727,10 +727,7 @@ pub(super) fn emit_cast<C: Typing>(
     // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
     // still carries its kind, which a match on the raw target would drop
     // to the `Compute` default.
-    let kind = match target.peel_refinements() {
-        Type::Fun { kind, .. } => kind.clone(),
-        _ => FunKind::Compute,
-    };
+    let kind = target.fun_kind().cloned().unwrap_or(FunKind::Compute);
     // Preserve the value's Pi binder so the cast result stays a *named* function.
     // A dependent application of the cast then reconciles binders by the identity
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
@@ -1200,10 +1197,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
     // eliminated lambda's, and reconstructing a kind here instead would let this
     // rule disagree with the pass that built the node. A join with no function type to
     // read is a collection: the node *is* the merged map.
-    let kind = match recorded.peel_refinements() {
-        Type::Fun { kind, .. } => kind.clone(),
-        _ => FunKind::Data,
-    };
+    let kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data);
     Ok(Type::Fun {
         name: None,
         kind,
@@ -1571,10 +1565,7 @@ pub(super) fn emit_list<C: Typing>(
     // typed as the morphism it replaced, denoting the same function. Reading the
     // kind back reproduces what that position settled on instead of re-asserting
     // `Data` over it.
-    let kind = match recorded.peel_refinements() {
-        Type::Fun { kind, .. } => kind.clone(),
-        _ => FunKind::Data,
-    };
+    let kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data);
     let fun_ty = |domain, codomain| Type::Fun {
         name: None,
         kind: kind.clone(),

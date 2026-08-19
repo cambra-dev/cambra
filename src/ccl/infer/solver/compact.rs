@@ -126,24 +126,21 @@ impl KindMerge {
     /// demand, rejected up front in [`constrain_kind`](super::constrain) — it
     /// never reaches a var here.
     pub(super) fn of(kind: &crate::ccl::ty::FunKind) -> Self {
-        use crate::ccl::ty::FunKind;
+        use crate::ccl::ty::{FunKind, KindPin};
         match kind {
             FunKind::Compute => KindMerge::Compute,
             FunKind::Data => KindMerge::Data,
-            FunKind::Var(v) => {
-                let b = v.bounds.borrow();
-                match (b.forced_compute, b.forced_data) {
-                    (true, true) => KindMerge::Conflict,
-                    // A var demanded as data with no compute lower bound is `Data`
-                    // (e.g. a parameter used only as a collection). A capability
-                    // flowing in would carry a concrete `Compute`, forcing the
-                    // `(true, _)` arms or failing at `constrain_kind` first.
-                    (false, true) => KindMerge::Data,
-                    (true, false) => KindMerge::Compute,
-                    // Unconstrained: not yet an answer — see `KindMerge::Unknown`.
-                    (false, false) => KindMerge::Unknown,
-                }
-            }
+            FunKind::Var(v) => match v.pin() {
+                KindPin::Conflict => KindMerge::Conflict,
+                // A var pinned only as data is `Data` (e.g. a parameter used only
+                // as a collection). A capability flowing in would carry a concrete
+                // `Compute`, reaching `KindPin::Conflict` or failing at
+                // `constrain_kind` first.
+                KindPin::Data => KindMerge::Data,
+                KindPin::Compute => KindMerge::Compute,
+                // Unpinned: not yet an answer — see `KindMerge::Unknown`.
+                KindPin::Unpinned => KindMerge::Unknown,
+            },
         }
     }
 }
