@@ -808,6 +808,30 @@ pub fn sync_cast_targets(expr: &mut Expr) {
     expr.walk_children_mut(sync_cast_targets);
 }
 
+/// Carry a re-typed node's [`FunKind`](crate::ccl::ty::FunKind) onto its `target`,
+/// when that node is a [`TypedExprNode::Cast`].
+///
+/// A cast's `target` states the claims the cast asserts, and those are the cast's
+/// own — a rewrite must not overwrite them with a type derived from the
+/// surrounding term. The `FunKind` is different: nothing asserts it
+/// independently, `emit_cast` reads it off `target` to type the node, and so the
+/// two copies have to agree or the node contradicts itself.
+///
+/// The caller is a rewrite that hands a node over to one of its own
+/// sub-expressions (`simplify`'s collapse rules). Such a rewrite writes the
+/// position's type onto the survivor, and where the survivor is a cast that
+/// re-kinds it — `⟨id, const 𝑥⟩ ≫ apply` collapsing to a `𝑥` that is a collection
+/// standing in a morphism position. Only the kind moves; the claims stay the
+/// cast's.
+pub fn sync_cast_target_kind(expr: &mut Expr) {
+    if matches!(expr.node, TypedExprNode::Cast { .. }) {
+        let ty = expr.ty.clone();
+        if let TypedExprNode::Cast { target, .. } = &mut expr.node {
+            *target = target.with_kind_of(&ty);
+        }
+    }
+}
+
 /// Wrap `base` in a fresh `Type::Refinement` whose bare predicate filters the
 /// element by the point-free function `predicate : base ⇒ Bool` (stored as
 /// `__elem ▷ predicate`, see [`bare_predicate_of_fn`]). Returns `base` unchanged

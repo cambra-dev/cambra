@@ -1184,11 +1184,10 @@ fn test_aggregate_over_scalar_lambda_is_rejected() {
     // Summing a plain lambda: a bare `λ` is a capability, built concrete
     // `Compute` (kind is a provenance property, not a domain guess). `sum`
     // demands a `Data` collection to iterate, so the argument constraint is
-    // `(Int ⇒ Int) <: (?  ⤇ Int)` — the `Compute <: Data` violation, rejected up
-    // front in `constrain_kind` (emission), never routed through a kind var.
+    // `(Int ⇒ Int) <: (?  ⤇ Int)` — a concrete kind mismatch, rejected up front
+    // in `constrain_kind` (emission), never routed through a kind var.
     // Regression that a capability supplied where a collection is demanded is a
-    // clean error, not a
-    // silent miskind or a debug panic.
+    // clean error, not a silent miskind or a debug panic.
     let errs = infer_program_err(
         r"
 f = \i -> i + 1
@@ -2433,8 +2432,8 @@ mod letrec_typing {
         // The recurrence carrier is a *data collection* (`⤇`): `cnt` is indexed
         // by the iteration domain `[0, 2]` and read back through `get_prev_seq`,
         // whose history argument demands `Data`. Declaring it `Compute`
-        // (`Type::fun`) is the miskind the `Compute <: Data` rejection now
-        // catches at the recurrence's introduction.
+        // (`Type::fun`) is the miskind the kind edge catches at the recurrence's
+        // introduction.
         let cnt_ty = Type::data_fun(Type::UIntRange(3), int());
         let def = Expr::lambda(
             "r",
@@ -3186,4 +3185,33 @@ mod annotation_kinds {
             "write to mutable variable `a`",
         );
     }
+}
+
+/// Joining a capability with a collection has no answer, and the two can reach
+/// one position without ever meeting at an edge.
+///
+/// `f` is a bare lambda, so `Compute`; `xs` is a list literal, so `Data`. Both
+/// are `[0, 1] ⇒/⤇ Int` — the domains agree, so nothing rejects them before the
+/// kinds are compared, and they arrive as two *lower* bounds on one variable.
+/// Subtyping closure relates a lower to an upper, never a lower to a lower, so
+/// neither arm is ever the left of an edge whose right is the other: the
+/// constraint-time `ConstrainError::KindMismatch` cannot see this. The merge
+/// does, and reports `CoalesceError::KindConflict`.
+///
+/// See `src/ccl/design/type-inference.md`, "Deliberately incomplete here".
+#[test]
+fn joining_a_capability_with_a_collection_is_a_kind_conflict() {
+    let errs = infer_program_err(indoc! {r#"
+        xs = [1, 2]
+        f = \x -> xs(x)
+        f if True else xs
+    "#});
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            InferError::Unsupported(msg)
+                if msg.contains("compute function") && msg.contains("data collection")
+        )),
+        "expected a kind conflict, got {errs:?}"
+    );
 }

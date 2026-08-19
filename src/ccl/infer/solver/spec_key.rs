@@ -250,6 +250,8 @@ impl fmt::Display for KeyView {
                 KindMerge::Data => "⤇",
                 KindMerge::Compute => "⇒",
                 KindMerge::Conflict => "⇒!",
+                // The capability default this resolves to at coalesce.
+                KindMerge::Unknown => "⇒",
             };
             parts.push(format!("({d} {arrow} {c})"));
         }
@@ -715,8 +717,8 @@ mod tests {
             spec_key(&Type::data_fun(int(), int())),
             "a capability and a collection of the same shape must not share a clone"
         );
-        // An *unresolved* kind does not split: both uses read the same unbounded var
-        // through `KindMerge::of`, which answers `Compute` (the capability default).
+        // An *unresolved* kind does not split: both uses read the same unpinned var
+        // through `KindMerge::of`, which answers `KindMerge::Unknown` for either.
         let unresolved = || Type::Fun {
             name: None,
             kind: crate::ccl::ty::FunKind::fresh_var(),

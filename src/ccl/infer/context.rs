@@ -497,7 +497,10 @@ impl Typing for InferCtx {
     ) -> Result<(Type, Type), LocatedInferError> {
         let d = self.fresh();
         let c = self.fresh();
-        self.require_sub(t, &fun(d.clone(), c.clone()), at)?;
+        // Destructuring is kind-agnostic — see `Type::fun_eliminated`. Stamping
+        // the demand `Compute` would make "what is this function's domain?" reject
+        // every collection.
+        self.require_sub(t, &Type::fun_eliminated(d.clone(), c.clone()), at)?;
         Ok((d, c))
     }
 
@@ -510,7 +513,9 @@ impl Typing for InferCtx {
         let c = self.fresh();
         // One-way `domain ⇒ codomain <: t`: the node supplies the function
         // shape as a lower bound on its own seed; nothing flows back into
-        // `d`/`c` from `t`'s other bounds.
+        // `d`/`c` from `t`'s other bounds. Concretely `Compute`, unlike
+        // `as_function`'s demand: the node *providing* a shape here is a `Proj`,
+        // and a projection is a capability.
         self.require_sub(&fun(d.clone(), c.clone()), t, at)?;
         Ok((d, c))
     }
@@ -556,7 +561,7 @@ impl Typing for InferCtx {
         let x = Name::solver_arg();
         let d = self.fresh();
         let result = self.fresh();
-        let expected = Type::pi(&x, d.clone(), result.clone());
+        let expected = Type::pi_eliminated(&x, d.clone(), result.clone());
         self.require_sub(fn_ty, &expected, at)?;
         self.constrain_argument(arg_ty, &d, at)?;
         // The application's type is `result` with the binder discharged to the

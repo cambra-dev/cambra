@@ -1221,7 +1221,9 @@ mod tests {
         // leaving `λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ x → x)`.
         let int = Type::Base(BaseType::Int);
         let range = Type::UIntRange(3);
-        let list = fn_ty(range.clone(), int.clone());
+        // The list, and the `λ __iter_record` that denotes it, are **collections**
+        // (`⤇`); the UDF around them is a capability taking one to another.
+        let list = Type::data_fun(range.clone(), int.clone());
         let udf_ty = fn_ty(list.clone(), list.clone());
 
         let inner_lambda_body = TypedExpr::apply(
@@ -1283,7 +1285,7 @@ mod tests {
         // outer-lambda beta-reduction behaviour.
         let int = Type::Base(BaseType::Int);
         let range = Type::UIntRange(3);
-        let list = fn_ty(range.clone(), int.clone());
+        let list = Type::data_fun(range.clone(), int.clone());
         let arg_pair_ty = Type::Tuple(vec![list.clone(), int.clone()]);
         let udf_ty = fn_ty(arg_pair_ty.clone(), list.clone());
 

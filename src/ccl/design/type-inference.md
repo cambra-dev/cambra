@@ -946,73 +946,21 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ## 4.6 Data vs compute functions
 
-> **Status: implemented, minus Σ.** The `FunKind` marker, kind inference,
-> kind-aware subtyping (the `Compute <: Data` rejection), the invariant data
-> domain, and the compilation of a value-selecting `Case` whose arms share one
-> domain are all live. What is missing is the type the model says a domain join
-> *produces* — the Σ — so a join over distinct domains is diagnosed rather than
-> typed. The heterogeneous-scalar union is separately deferred. See the callout
-> below.
+Functions can either represent collections or a computation that can be run.  This
+is stored as a `FunKind` on `Type::Fun` and is either `Data` or `Compute`.  The kind
+is chosen at lowering time based on the CHL construct used.  For example, UDFs are
+`Compute` if they use `return` and `Data` if they use `yield`, list comprehensions
+are always `Data`, etc.
 
-The unresolved domain-join corner of §4.5 (O1/O4 — two collections meeting at one
-join point) is resolved by making a missing distinction explicit. The distinction
-does not by itself make every such join *typeable*; what it does is make the
-untypeable ones an **error** rather than a silently short collection. See
-[The domain join is a Σ](#the-domain-join-is-a-σ).
+The key differences are how these are used by downstream compilation and the subtyping
+relation.  Compute functions follow standard contravariance rules on the domain, but
+Data functions are invariant.  For a Data function, the domain represents the exact
+set of elements that exist in the collection, so silently changing that is incorrect.
+Downstream phases like inlining and planning rely on the distinction, so it must be
+preserved through all of compilation.
 
-**The distinction.** A function's domain can mean two things. A **compute
-function** `α ⇒ β` treats it as a *capability* — the inputs accepted; no data
-behind it; shrinking under-promises, so the lossy contravariant meet at a
-join is fine. A **data function** `α ⤇ β` treats it as a *collection* — the
-domain *is* the data map, so a lossy domain is lost data. `Type::Fun` carries
-a `kind: FunKind` (`Compute | Data | Var`). **FunKind is a *provenance* property,
-not a function of the domain** — the *same* domain can back a data collection or
-a capability (`Map(Color, V)` vs `Color ⇒ V`), so it is decided by *what the
-value is*, stamped concretely at introduction. `Data`: list literals, `++`,
-registered sources, comprehensions and `groupby` (a comprehension over a
-collection, a keyed collection — stamped via the `data_fun` provenance annotation
-that `emit_node` reads as a concrete-kind stamp; a *filtered* comprehension's
-`refined_data_fun` cast target carries the same `Data`), induction recurrence
-carriers (a `letrec` binder declared `Data` — an accumulator indexed by the
-iteration domain — whose declared type stamps the accumulator lambda's kind,
-same `stamp_kind_from` mechanism), aggregate consumers, and every `History`
-erasure. `Compute`: scalar/combinator builtins and ordinary user lambdas
-(capabilities) — a bare `λ` is built **concrete `Compute`** (`Expr::lambda`),
-because a lambda that denotes a collection is not born bare, it is one of the
-stamped `Data` forms above. A `FunKind::Var` is minted only where the kind is
-genuinely *inferred* — a function parameter or a freshened polymorphic scheme —
-resolved by uses (below); an **unconstrained var defaults to `Compute`** (the
-capability default). No arm inspects the domain shape. The audit rule for the
-*concrete* stamps: *an arrow is data iff it denotes a collection*, which the
-construction site knows.
-Constructor `data_fun` mints a data arrow directly; `fun_like(exemplar, d, c)`
-rebuilds an arrow copying the exemplar's `name` and `kind`, so a domain/codomain-
-only rewrite (`subst`, `strip_refinements`, source-domain refinement) can never
-silently flip a data arrow to compute or drop its Pi binder. A rebuild that
-*intends* a new binder or mixes two arrows' kinds (the compose-chain rebuild in
-`coalesce_node`, the Pi-adding rebuild in `lambda_elim`) constructs directly and
-sets `kind` explicitly.
-
-> **FunKind-aware subtyping (landed).** Concrete kinds (the common case — data
-> collections and capabilities are stamped at construction, above) pass through;
-> only a kind-*polymorphic* function carries a `FunKind::Var`, resolved from its
-> bounds, defaulting to `Compute` when unconstrained (no domain-shape guess). The
-> Fun-vs-Fun arm adds a kind edge over `Data ⊑ Compute`: `data <: compute`
-> upcasts, a concrete `compute <: data` is rejected
-> (`ConstrainError::ComputeWhereDataRequired`), and a var picks up
-> `forced_compute`/`forced_data` flags. A **capability demanded as data** —
-> e.g. `sum(λ x → x + 1)`, summing a plain `Int ⇒ Int` lambda — is caught right
-> here at the edge: the lambda is *concrete* `Compute`, so `sum`'s `Data` demand
-> is the concrete `compute <: data` reject, no domain inspection needed. (This is
-> why the domain-shape guess is gone: a capability is `Compute` by construction,
-> a collection `Data` by construction, so a scalar/keyed domain never decides a
-> kind.) For a genuinely *var*-kinded function (a parameter, a freshened scheme)
-> the violation is invisible at the edge — the flags are merely recorded — so a
-> var that ends with `forced_compute ∧ forced_data` is the same `Compute <: Data`
-> error, surfaced at coalesce as `CoalesceError::ComputeWhereDataRequired`; a var
-> with only `forced_data` resolves to `Data` (a parameter used only as a collection).
-> The same arm carries the data-domain invariance guard — see
-> [Data domains are invariant](#data-domains-are-invariant) below.
+Data functions and Compute functions are not related by subtyping; nothing should
+implicitly convert between them.
 
 ### Generalizing a collection is filter pushdown
 
@@ -1089,8 +1037,8 @@ Coalesce materializes each alternative to a `Type` and deduplicates *again*, and
 that second comparison is the one that decides — one survivor is a plain data
 function, two or more is the rejection. A `Data ⊔ Compute` collision is a third
 outcome, `KindMerge::Conflict`, reported as `DomainJoinConflict` when it would drop
-≥ 2 alternatives and as `ComputeWhereDataRequired` when a single slot is a
-capability demanded as a collection.
+≥ 2 alternatives and as `KindConflict` when a single slot's kind resolved
+contradictorily.
 
 Refinements ride *inside* each alternative domain, so differently-filtered arms of
 one source (`[x for x in xs if x > 1]` vs `[x for x in xs if x < 3]`) are two
@@ -1259,9 +1207,8 @@ depending on whether a consumer forces the question early (see
 that candidate domains must be expected at a domain variable, not only at a `Case`
 result.
 
-Like the `Compute <: Data` rejection, the rule fires only when the cache is
-kind-aware, because elimination preserves denotation but not kind representation and
-the post-inference re-check must not see it.
+The rule fires wherever the edge is drawn, the kind edge with it, including the
+post-inference re-check in `check.rs`.
 
 ### Deliberately incomplete here
 
@@ -1276,18 +1223,15 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
   [The domain join is a Σ](#the-domain-join-is-a-σ) is the answer, and it
   arrives with the collections work.
 
-- **`KindMerge::Conflict` is covered only by hand-constructed compact graphs.** Both
-  of its coalesce outcomes are exercised (`coalesce_domain_join_conflict_errs`,
-  `coalesce_single_domain_conflict_is_compute_where_data_required`), but no *source
-  program* in the suite reaches either. The `Data ⊔ Compute` collision needs a slot
-  that is simultaneously fed a capability and demanded as a collection, and the
-  single-slot case needs a `FunKind::Var` ending with both `forced_compute` and
-  `forced_data` — a kind-polymorphic function whose two uses disagree. The
-  constraint-level face of the same rejection *is* reachable from source
-  (`ConstrainError::ComputeWhereDataRequired`, e.g. `sum(λ x → x + 1)`), which is
-  why the coalesce-time face is a backstop rather than the primary check. If a
-  source-level route is found, it belongs in the suite; if one provably does not
-  exist, the branch should collapse into the constraint-level check.
+- **`KindMerge::Conflict` reaches coalesce with two or more domains only in
+  hand-constructed compact graphs** (`coalesce_domain_join_conflict_errs`). That
+  outcome needs a `Data ⊔ Compute` collision *and* arms at differing domains; no
+  source program in the suite produces both at once. Its single-domain outcome is
+  reachable from source, and `joining_a_capability_with_a_collection_is_a_kind_conflict`
+  is the route: a capability and a collection arrive as two *lower* bounds on one
+  variable, and closure relates a lower to an upper rather than a lower to a lower,
+  so neither is ever the left of an edge whose right is the other and
+  `ConstrainError::KindMismatch` cannot see it.
 
 - **Σ is the missing type, and it is missing at two sites.** Because a domain join
   can be forced from a `Fun`/`Fun` edge as well as at coalesce, the Σ work has to

@@ -208,6 +208,21 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
             if is_internalising_builtin_function(function) =>
         {
             wrap_with_iterate(argument);
+            // `wrap_with_iterate` re-kinds the site to the iteration source's
+            // `Data` (that kind is what says the site may be swept — see its
+            // doc), and the head consuming it declares the *old* kind in its
+            // domain. Nothing else restores that: a builtin head's type is
+            // derived from the operand it is applied to, so it has to follow the
+            // operand here rather than be repaired by a later pass. The rest of
+            // the declared domain stands; only the kind moved.
+            let domain = function.ty.domain();
+            if let (Some(domain), Type::Fun { codomain, .. }) = (domain, &function.ty) {
+                function.ty = Type::fun_like(
+                    &function.ty,
+                    domain.with_kind_of(&argument.ty),
+                    (**codomain).clone(),
+                );
+            }
         }
         // Each transaction writer's source is iterated internally by the
         // mutable variable engine (`Recurse` for an induction accumulator); op-conversion
@@ -327,6 +342,11 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
             wrap_with_iterate(bound_expr);
         }
         wrap_with_iterate(body);
+        // A `Let` takes its type from its body, so re-kinding the body to the
+        // iteration source's `Data` re-kinds the `Let` with it. Only the kind
+        // moves: the recorded type is closed over the binder by inference's
+        // let-closing and is not otherwise derivable from `body.ty`.
+        expr.ty = expr.ty.with_kind_of(&body.ty);
         return;
     }
     if is_iteration_bearing(expr) {

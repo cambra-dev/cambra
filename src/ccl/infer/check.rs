@@ -442,7 +442,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // The projection's function type is already recorded; decompose it.
         TypedExprNode::Proj(key) => emit_proj(key, &expr.ty, ctx)?,
 
-        TypedExprNode::List(elts) => emit_list(elts, ctx)?,
+        TypedExprNode::List(elts) => emit_list(elts, &recorded_ty, ctx)?,
 
         TypedExprNode::Case {
             scrutinee,
@@ -456,7 +456,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
-        TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, ctx)?,
+        TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, &recorded_ty, ctx)?,
 
         TypedExprNode::Transact {
             keys,

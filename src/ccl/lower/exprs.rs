@@ -102,8 +102,15 @@ pub(super) fn lower_call(
             let gb = "lower.groupby";
             let inner_var = ctx.tag_machinery(Expr::var("__gb_i"), func.span, gb);
             let inner_body = ctx.tag_machinery(Expr::apply(inner_var, collection), func.span, gb);
+            // The group is a **collection** — the members sharing one key — so the
+            // lambda under the cast carries the same `Data` stamp the outer function
+            // does. The cast target's `Data` alone is not enough: a cast re-views
+            // its value at the target's kind, so an unstamped lambda underneath is
+            // a second, contradictory answer about what this function is, and it is
+            // the one elimination reads when it point-frees the group.
             let unrefined_inner = ctx.tag_machinery(
-                Expr::lambda("__gb_i", Type::Hole, inner_body),
+                Expr::lambda("__gb_i", Type::Hole, inner_body)
+                    .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
                 func.span,
                 gb,
             );

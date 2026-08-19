@@ -281,11 +281,11 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             found: Box::new(coalesce_for_error(&found)),
             expected: Some(Box::new(coalesce_for_error(&required))),
         },
-        ConstrainError::ComputeWhereDataRequired { lhs, rhs } => InferError::TypeMismatch {
+        ConstrainError::KindMismatch { lhs, rhs } => InferError::TypeMismatch {
             ctx: format!(
-                "{ctx_label} (a compute function ⇒ was supplied where a data \
-                 collection ⤇ is required — using a capability as a collection \
-                 would iterate a declared domain the value does not cover)"
+                "{ctx_label} (a compute function ⇒ and a data collection ⤇ met \
+                 at one position — the two kinds are incomparable, so neither \
+                 stands in for the other)"
             ),
             found: Box::new(coalesce_for_error(&lhs)),
             expected: Some(Box::new(coalesce_for_error(&rhs))),
@@ -342,10 +342,9 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
              (a collection's domain is its data, so a join may not narrow it)",
             ctx_label, details
         )),
-        CoalesceError::ComputeWhereDataRequired { details } => InferError::Unsupported(format!(
-            "a compute function ⇒ was supplied where a data collection ⤇ is required at {}: {} \
-             (using a capability as a collection would iterate a declared domain the value \
-             does not cover)",
+        CoalesceError::KindConflict { details } => InferError::Unsupported(format!(
+            "one function was required to be both a compute function ⇒ and a data collection ⤇ \
+             at {}: {} (the two kinds are incomparable, so no function is both)",
             ctx_label, details
         )),
     }

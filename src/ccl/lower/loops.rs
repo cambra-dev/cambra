@@ -194,6 +194,11 @@ pub(super) fn lower_generator_for(
 /// Build the `Compose([source, Lambda(iter_var, body)])` loop encoding (the
 /// shape of [`Expr::for_loop`]), tagging **both** minted nodes — the `Compose`
 /// and the interior `Lambda` — as the for statement's direct image.
+///
+/// Stamped `Data`: a loop over a collection *is* that collection mapped, and
+/// this is the site that knows it. Leaving the function unstamped would hand the
+/// question to whatever consumed the chain, which is how a loop ends up reading
+/// as a capability.
 fn tagged_for_loop(
     iter_var: String,
     source: Expr,
@@ -202,7 +207,11 @@ fn tagged_for_loop(
     ctx: &mut LoweringContext,
 ) -> Expr {
     let lambda = ctx.tag_image(Expr::lambda(iter_var, Type::Hole, body), for_span);
-    ctx.tag_image(Expr::compose(vec![source, lambda]), for_span)
+    ctx.tag_image(
+        Expr::compose(vec![source, lambda])
+            .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
+        for_span,
+    )
 }
 
 /// Wrap a generator's lowered loop in its synthesized defer binding,

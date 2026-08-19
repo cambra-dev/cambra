@@ -20,7 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::ty::{FunKind, FunKindVar};
+use crate::ccl::ty::FunKind;
 use crate::ccl::{BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
 
 use super::traits::{Trait, link_watches, notify_lower};
@@ -79,15 +79,16 @@ pub enum ConstrainError {
         /// The feed type demanded.
         required: Type,
     },
-    /// A compute function (a capability, `⇒`) was supplied where a data
-    /// collection (`⤇`) is demanded. `Data <: Compute` is the safe
-    /// upcast — a collection is callable at any index in its domain — but the
-    /// reverse would iterate a *declared* domain the value does not actually
-    /// cover, silently dropping rows.
-    ComputeWhereDataRequired {
-        /// The supplied compute function.
+    /// Two function types met whose kinds disagree: a compute function (a
+    /// capability, `⇒`) where a data collection (`⤇`) is demanded, or the
+    /// reverse. The kinds are incomparable, so neither direction is a legal
+    /// coercion — a capability used as a collection would iterate a *declared*
+    /// domain the value does not actually cover, and a collection used as a
+    /// capability would lose the invariance its domain is typed under.
+    KindMismatch {
+        /// The supplied function.
         lhs: Type,
-        /// The demanded data collection.
+        /// The function demanded at the position.
         rhs: Type,
     },
     /// Two collections over domains that are not the same domain met at one
@@ -96,9 +97,7 @@ pub enum ConstrainError {
     /// neither collection stands in for the other; their join is a Σ over the two
     /// candidate domains, which is not yet representable. The coalesce-time face
     /// of the same fact — reached when no edge forces the question earlier — is
-    /// [`super::coalesce::CoalesceError::DomainJoinConflict`]. Like
-    /// [`Self::ComputeWhereDataRequired`], raised only when the cache is
-    /// kind-aware.
+    /// [`super::coalesce::CoalesceError::DomainJoinConflict`].
     DataDomainMismatch {
         /// The supplied collection's domain.
         lhs: Type,
@@ -183,46 +182,66 @@ pub fn constrain_subtype(
     constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache)
 }
 
-/// Constrain the kind edge `k0 <: k1` over the two-point lattice
-/// `Data ⊑ Compute` (`Data` bottom / most specific, `Compute` top).
+/// Constrain the kind edge `k0 <: k1` over the two **incomparable** points
+/// `Data` and `Compute`.
 ///
-/// Concrete edges: `Data <: κ` and `κ <: Compute` always hold; `Compute <: Data`
-/// is the sole failure — returned as `true` (the caller raises
-/// [`ConstrainError::ComputeWhereDataRequired`], having the full function types
-/// for the diagnostic).
+/// The kinds carry no order, so subtyping on them is *equality*: a function's kind
+/// is a property of what the value is, and neither reading is a weaker version
+/// of the other. A capability is not a collection with the rows forgotten (it has
+/// no rows), and a collection is not a capability that happens to be enumerable
+/// (its domain is invariant, so it does not obey the contravariant domain rule a
+/// capability does). Either mismatch is therefore a failure, `Err(())`, which the
+/// caller raises as [`ConstrainError::KindMismatch`] with the full function types
+/// for the diagnostic.
 ///
-/// Variable edges set `forced_*` flags, resolved at coalesce
-/// ([`super::compact::KindMerge`]): a compute value flowing *into* a var forces
-/// it `Compute`; a var *demanded* as data forces it `Data`; a var-to-var edge
-/// records a `<:` link ([`FunKindVar::link`]). Forces propagate transitively along
-/// links as they arrive, so ordering does not matter (a force after its link
-/// still reaches the far end). A var that ends up with both flags is the
-/// conflict — surfaced loudly at coalesce, never here.
-fn constrain_kind(k0: &FunKind, k1: &FunKind) -> bool {
+/// Variable edges *equate* rather than bound: a concrete kind on either side of
+/// an edge pins the variable to it ([`FunKindVar::equate_compute`] /
+/// [`FunKindVar::equate_data`]). A var pinned to *both* points is the conflict —
+/// surfaced at coalesce, never here.
+fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<EquatedKind, ()> {
     use FunKind::*;
     match (k0, k1) {
-        // `Data` is bottom, `Compute` is top: these edges always hold.
-        (Data, _) | (_, Compute) => false,
-        // The one rejection — a capability supplied where a collection is demanded.
-        (Compute, Data) => true,
-        // A compute value flows into this var: it cannot be `Data`. The force
-        // propagates up any `<:` links already drawn to this var.
-        (Compute, Var(v1)) => {
-            v1.force_compute();
-            false
+        // Reflexivity is the whole of the concrete relation.
+        (Data, Data) => Ok(EquatedKind::Data),
+        (Compute, Compute) => Ok(EquatedKind::Compute),
+        // Either mismatch is a rejection: a capability supplied where a
+        // collection is demanded, or a collection where a capability is.
+        (Compute, Data) | (Data, Compute) => Err(()),
+        // A concrete kind at either end pins the variable to it, so the edge is
+        // that kind however the two sides were spelled.
+        (Compute, Var(v)) | (Var(v), Compute) => {
+            v.equate_compute();
+            Ok(EquatedKind::Compute)
         }
-        // This var is demanded as data: it cannot be `Compute`. Propagates down.
-        (Var(v0), Data) => {
-            v0.force_data();
-            false
+        (Data, Var(v)) | (Var(v), Data) => {
+            v.equate_data();
+            Ok(EquatedKind::Data)
         }
-        // A var-to-var edge `v0 <: v1`: record the link so a force arriving on
-        // either end *after* this edge still reaches the other. See [`FunKindVar`].
-        (Var(v0), Var(v1)) => {
-            FunKindVar::link(v0, v1);
-            false
-        }
+        // Two variables meeting record nothing. What the pair resolves to is not
+        // known at this edge, and deciding it from equations that arrive later
+        // would make typing depend on constraint order; each is pinned by the
+        // concrete kind that reaches it, if one does. See [`FunKindVar`].
+        (Var(_), Var(_)) => Ok(EquatedKind::Undetermined),
     }
+}
+
+/// The kind a [`constrain_kind`] edge equated its two sides to.
+///
+/// The edge is an equation, so after it succeeds the two sides denote **one**
+/// kind — which is the thing the domain rule needs to know, and which neither
+/// side alone reliably spells (one may be a `FunKind::Var` the edge just pinned).
+/// Reporting it here is what keeps the caller from re-deriving it by asking
+/// whether *either* side looks like `Data`, a test that reads as though a
+/// cross-kind edge were possible when it is exactly what was just rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EquatedKind {
+    /// Both sides are collections.
+    Data,
+    /// Both sides are capabilities.
+    Compute,
+    /// Two kind variables, peered; which point they land on is not known at this
+    /// edge.
+    Undetermined,
 }
 
 /// Bridge the holder gap when chaining two edges through one variable.
@@ -480,17 +499,16 @@ fn constrain_go_impl(
                 codomain: c1,
             },
         ) => {
-            // The kind edge over the lattice `Data ⊑ Compute` (see
-            // `constrain_kind`): `Data <: κ` and `κ <: Compute` always hold; a
-            // concrete `Compute <: Data` is the rejection (a capability where a
-            // domain is demanded → silent row loss). FunKind vars accumulate
-            // `forced_*` flags here and resolve at coalesce.
-            if constrain_kind(k0, k1) {
-                return Err(ConstrainError::ComputeWhereDataRequired {
+            // The kind edge (see `constrain_kind`). `Data` and `Compute` are
+            // incomparable, so the edge is an equation: a concrete mismatch
+            // either way is the rejection, and a `FunKind` var is pinned here or
+            // peered and resolved at coalesce.
+            let Ok(kind) = constrain_kind(k0, k1) else {
+                return Err(ConstrainError::KindMismatch {
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
                 });
-            }
+            };
             let cod_sl = match (n0, n1) {
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
                 _ => sl.clone(),
@@ -511,7 +529,12 @@ fn constrain_go_impl(
             // exactly as at a `Case` result. Until Σ is representable that join has
             // no answer, which is the error below; the same fact reaches coalesce as
             // `CoalesceError::DomainJoinConflict` when no edge forces it earlier.
-            if matches!(k0, FunKind::Data) && matches!(k1, FunKind::Data) {
+            //
+            // The kind edge above reports what it equated the two sides to, so
+            // this asks one question of one kind rather than inspecting both
+            // spellings — a var it just pinned to `Data` reads as `Data` here
+            // like any other collection.
+            if kind == EquatedKind::Data {
                 if constrain_go(d1, d0, sr, sl, cache).is_err()
                     || constrain_go(d0, d1, sl, sr, cache).is_err()
                 {
@@ -1217,6 +1240,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
 
 #[cfg(test)]
 mod tests {
+    use crate::ccl::ty::FunKindVar;
     use std::rc::Rc;
 
     use smol_str::SmolStr;
@@ -1741,14 +1765,14 @@ mod tests {
 
     #[test]
     fn feed_reads_transparently_as_stream() {
-        // feed(D, Int) <: (D ⇒ Int) — a non-feed consumer reads the whole
-        // stream…
+        // feed(D, Int) <: (D ⤇ Int) — a non-feed consumer reads the whole
+        // stream, which is the accumulated *collection*…
         let d = Type::UIntRange(3);
         let mut cache = ConstrainCache::new();
         assert!(
             constrain_subtype(
                 &feed_ty(d.clone(), prim(BaseType::Int)),
-                &fun(d.clone(), prim(BaseType::Int)),
+                &data_fun(d.clone(), prim(BaseType::Int)),
                 &mut cache
             )
             .is_ok()
@@ -1758,7 +1782,7 @@ mod tests {
         assert!(matches!(
             constrain_subtype(
                 &feed_ty(d.clone(), prim(BaseType::Int)),
-                &fun(d, prim(BaseType::String)),
+                &data_fun(d, prim(BaseType::String)),
                 &mut cache
             ),
             Err(ConstrainError::Mismatch { .. })
@@ -1785,13 +1809,13 @@ mod tests {
     #[test]
     fn feed_in_var_bounds_discharges_through_read() {
         // `x << y` chains feed(D, ρ_y) as a lower bound of ρ_x; a later read
-        // `ρ_x <: (D ⇒ Int)` must discharge through the feed handle
+        // `ρ_x <: (D ⤇ Int)` must discharge through the feed handle
         // transparently.
         let d = Type::UIntRange(3);
         let x = fresh_var(0);
         let mut cache = ConstrainCache::new();
         constrain_subtype(&feed_ty(d.clone(), prim(BaseType::Int)), &x, &mut cache).unwrap();
-        assert!(constrain_subtype(&x, &fun(d, prim(BaseType::Int)), &mut cache).is_ok());
+        assert!(constrain_subtype(&x, &data_fun(d, prim(BaseType::Int)), &mut cache).is_ok());
     }
 
     #[test]
@@ -2268,30 +2292,33 @@ mod tests {
         drop(arena);
     }
 
-    // ----- FunKind edge (the `Compute <: Data` rejection) -----------
+    // ----- FunKind edge (the two kinds are incomparable) -----------
 
     fn data_fun(d: Type, c: Type) -> Type {
         Type::data_fun(d, c)
     }
 
     #[test]
-    fn kind_data_upcasts_to_compute() {
-        // `Data <: Compute` is the safe upcast — a collection is callable at any
-        // index in its domain. `[0, 2] ⤇ Int <: [0, 2] ⇒ Int`.
+    fn kind_data_where_compute_is_rejected() {
+        // `Data ⋠ Compute`: there is no upcast from a collection to a
+        // capability. A collection's domain is invariant — it *is* the data — so
+        // re-viewing it as a capability, whose domain is contravariant, is not a
+        // weakening of the same claim but a different one.
+        // `[0, 2] ⤇ Int ⊀ [0, 2] ⇒ Int`.
         let mut cache = ConstrainCache::new();
-        assert!(
+        assert!(matches!(
             constrain_subtype(
                 &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &mut cache,
-            )
-            .is_ok()
-        );
+            ),
+            Err(ConstrainError::KindMismatch { .. })
+        ));
     }
 
     #[test]
     fn kind_compute_where_data_is_rejected() {
-        // `Compute ⋢ Data`: a capability supplied where a collection is demanded is
+        // `Compute ⋠ Data`: a capability supplied where a collection is demanded is
         // the rejection (the silent-row-loss guard). `[0, 2] ⇒ Int ⊀ [0, 2] ⤇ Int`.
         let mut cache = ConstrainCache::new();
         assert!(matches!(
@@ -2300,14 +2327,14 @@ mod tests {
                 &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &mut cache,
             ),
-            Err(ConstrainError::ComputeWhereDataRequired { .. })
+            Err(ConstrainError::KindMismatch { .. })
         ));
     }
 
     #[test]
     fn kind_rejection_is_live_in_every_cache() {
-        // There is one mode: a `Compute <: Data` edge is a rejection wherever it
-        // is drawn. The post-inference structural check runs the same cache, so a
+        // There is one mode: a kind mismatch is a rejection wherever the edge is
+        // drawn. The post-inference structural check runs the same cache, so a
         // capability reaching a collection position is caught there too rather
         // than being waved through as an elimination artifact.
         let mut cache = ConstrainCache::new();
@@ -2317,16 +2344,16 @@ mod tests {
                 &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &mut cache,
             ),
-            Err(ConstrainError::ComputeWhereDataRequired { .. })
+            Err(ConstrainError::KindMismatch { .. })
         ));
     }
 
     #[test]
     fn kind_var_demanded_as_data_is_forced_data() {
-        // A kind var *demanded* as `Data` acquires `forced_data` (no eager
-        // rejection — the var may still legitimately resolve `Data`); it
-        // resolves at coalesce. A compute value flowing into it would set
-        // `forced_compute`, and both flags together is the conflict.
+        // A kind var meeting `Data` is *equated* to it — recorded as
+        // `forced_data`, never an eager rejection — and resolves at coalesce. A
+        // compute function meeting the same var would set `forced_compute`, and
+        // both flags together is the conflict.
         let v = FunKindVar::fresh();
         let var_fun = Type::Fun {
             name: None,
@@ -2340,44 +2367,11 @@ mod tests {
             &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
             &mut cache,
         )
-        .expect("var <: Data records forced_data, never an eager rejection");
-        assert!(v.bounds.borrow().forced_data, "demanded as data");
+        .expect("a var meeting Data records forced_data, never an eager rejection");
+        assert!(v.bounds.borrow().forced_data, "equated to data");
         assert!(
             !v.bounds.borrow().forced_compute,
-            "no compute value flowed in"
-        );
-    }
-
-    #[test]
-    fn kind_var_link_then_late_force_propagates() {
-        // Regression: a force that arrives *after* a var-var link must still
-        // reach the far end. Draw `v0 <: v1` first, then force `v0` compute via
-        // a later edge (`Compute <: v0`). Transitive propagation must carry
-        // `forced_compute` up to `v1`; the old one-shot copy dropped it, letting
-        // `v1` fall to its (possibly `Data`) domain default — a silent miskind.
-        let v0 = FunKindVar::fresh();
-        let v1 = FunKindVar::fresh();
-        let fun_of = |v: &Rc<FunKindVar>| Type::Fun {
-            name: None,
-            kind: FunKind::Var(Rc::clone(v)),
-            domain: Box::new(Type::UIntRange(3)),
-            codomain: Box::new(prim(BaseType::Int)),
-        };
-        let mut cache = ConstrainCache::new();
-        // Link first: `v0 <: v1`.
-        constrain_subtype(&fun_of(&v0), &fun_of(&v1), &mut cache).expect("var-var link");
-        assert!(!v1.bounds.borrow().forced_compute, "not forced yet");
-        // Force later: a compute function flows into `v0` (`Compute <: v0`).
-        constrain_subtype(
-            &fun(Type::UIntRange(3), prim(BaseType::Int)),
-            &fun_of(&v0),
-            &mut cache,
-        )
-        .expect("compute <: var records forced_compute");
-        assert!(v0.bounds.borrow().forced_compute, "v0 forced compute");
-        assert!(
-            v1.bounds.borrow().forced_compute,
-            "compute force propagates up the link to v1 after the fact"
+            "no compute function met this var"
         );
     }
 }

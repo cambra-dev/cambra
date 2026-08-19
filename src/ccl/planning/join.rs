@@ -879,23 +879,31 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                             .map(|i| Expr::lit(Lit::Int(*i)).with_ty(Type::Base(BaseType::Int)))
                             .collect(),
                     )
-                    .with_ty(Type::fun(
+                    // A list literal is a collection, and the kinds are
+                    // incomparable — stamping the capability kind here makes the
+                    // post-planning wall reject the node against its own rule.
+                    .with_ty(Type::data_fun(
                         Type::UIntRange(indices_to_flatten.len()),
                         Type::Base(BaseType::Int),
                     )),
                     Builtin::FlattenDomain,
+                    // Both functions are collections: the operand is the uncurried
+                    // join output (stamped `data_fun` above) and the result is
+                    // that same output re-addressed over a flattened domain.
+                    // Flattening re-indexes rows; it does not turn them into a
+                    // capability.
                     Type::fun(
-                        Type::fun(
+                        Type::data_fun(
                             Type::Tuple(vec![probe_output_ty.clone(), build_output_ty.clone()]),
                             build_output_ty.clone(),
                         ),
-                        Type::fun(flat_ty.clone(), build_output_ty.clone()),
+                        Type::data_fun(flat_ty.clone(), build_output_ty.clone()),
                     ),
                 );
                 let flattened = apply_function(
                     uncurry,
                     flatten_func,
-                    Type::fun(flat_ty.clone(), build_output_ty.clone()),
+                    Type::data_fun(flat_ty.clone(), build_output_ty.clone()),
                 );
 
                 trace!(
@@ -982,7 +990,10 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
             .map(|&i| Expr::lit(Lit::Int(i)).with_ty(Type::Base(BaseType::Int)))
             .collect(),
     )
-    .with_ty(Type::fun(
+    // A list literal is a collection (`emit_list`), and the kinds are
+    // incomparable — the capability kind here is a claim the node's own rule
+    // contradicts at the next wall.
+    .with_ty(Type::data_fun(
         Type::UIntRange(perm.len()),
         Type::Base(BaseType::Int),
     ));
@@ -1002,13 +1013,13 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
         Builtin::PermuteDomain,
         Type::fun(
             morphism_ty,
-            Type::fun(canonical_ty.clone(), actual_ty.clone()),
+            Type::data_fun(canonical_ty.clone(), actual_ty.clone()),
         ),
     );
     let permuted = apply_function(
         expr,
         permute_func,
-        Type::fun(canonical_ty.clone(), actual_ty.clone()),
+        Type::data_fun(canonical_ty.clone(), actual_ty.clone()),
     );
     let result = apply_primitive(
         permuted,

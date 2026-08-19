@@ -198,20 +198,21 @@ pub enum TypedExprNode {
     /// it for list-comprehension filters, for-loop `if`-guards, and
     /// `groupby` (see [`crate::ccl::ccl_utils::make_cast`]).
     ///
-    /// `Cast` is an **upcast**: its whole typing rule is the single subtype
-    /// obligation `value_ty <: target`.  For the domain refinement lowering
-    /// emits, that holds by contravariance — `(𝐷 ⇒ 𝑉) <: ({𝐷 | 𝑝} ⇒ 𝑉)`
-    /// because `{𝐷 | 𝑝} <: 𝐷` — so viewing an unrefined-domain collection
-    /// function at a refined-domain type is sound.  The
-    /// refinement-aware solver ([`crate::ccl::infer::solver::constrain_subtype`])
-    /// flows the refinement onto the fresh target-domain variable, *stacking* it
-    /// onto any refinements the value already carries, so nested casts compose
-    /// (nested list comprehensions).  `target`'s predicate is inferred by the
+    /// `Cast` is an **upcast**: the refined-domain function it produces is a
+    /// supertype of `value`.  The refinement is attached *constructively* —
+    /// inference's `emit_cast` decomposes `value`'s type and re-wraps its
+    /// domain — rather than discharged as a `value_ty <: target`
+    /// edge, because no such edge exists: the refinement lattice is strict
+    /// (`unrefined ⊀ refined`), and the target lowering emits for a
+    /// comprehension is a **data** function, whose domain is invariant rather
+    /// than contravariant.  Re-wrapping stacks the refinement onto any the
+    /// value already carries, so nested casts compose (nested list
+    /// comprehensions).  `target`'s predicate is inferred by the
     /// same `emit_annotation_predicates` / `coalesce_type_predicates` path as
     /// any refinement-bearing type.  A *covariant* refinement (e.g. casting
-    /// `Int` to `{Int | p}`) correctly fails the subtype check — acquiring a
-    /// value-level refinement is a runtime/SMT-checked narrowing, not an
-    /// upcast.
+    /// `Int` to `{Int | p}`) has no such construction and is rejected —
+    /// acquiring a value-level refinement is a runtime/SMT-checked narrowing,
+    /// not an upcast.
     ///
     /// `target` is the lowering-time *specification* (its domain/codomain
     /// are typically `Type::Hole`, carrying only the refinement); the

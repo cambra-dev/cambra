@@ -419,3 +419,57 @@ sum(doubles(add_one([1, 2, 3])))"#,
 fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
+
+// ---------------------------------------------------------------------------
+// Function-kind inference on a parameter
+// ---------------------------------------------------------------------------
+
+/// A parameter's `FunKind` is **inferred from the argument**, and the resolved
+/// kind is read downstream.
+///
+/// `xs` is a parameter, so lowering has nothing to stamp its type with and
+/// inference mints a `FunKind::Var`
+/// (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions"). Iterating it pins that variable to the `Data` of the
+/// collection passed in, and compilation *reads* the resolved kind — `inline`
+/// only inlines a capability, so a parameter left at the `Compute` default is
+/// inlined as one and the program compiles to the wrong shape.
+///
+/// This is the one place a kind is genuinely solved rather than declared, so it
+/// pins the part of the kind-variable machinery that has to stay. Deliberately
+/// one level deep: the wrapper chains above cover the same fact through
+/// monomorphization, and this is the minimal program that depends on it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_parameter_iterated_as_a_collection_resolves_data() {
+    check_tile(
+        "f = \\xs -> [x for x in xs if x > 1]\nf([1, 2, 3])",
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+/// Destructuring a function does not care which kind it is.
+///
+/// A filtered comprehension lowers to a `cast`, and `emit_cast` destructures the
+/// cast's value to reach its domain and codomain (`Typing::as_function`). That
+/// value is the comprehension's collection, `Data` by construction, so a demand
+/// stamping `Compute` rejects the program — the kinds are incomparable, and
+/// "what is this function's domain?" is the same question for either
+/// (`Type::fun_eliminated`).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn destructuring_a_collection_does_not_demand_a_capability() {
+    check_tile(
+        "[x for x in [1, 2, 3] if x > 1]",
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}

@@ -143,14 +143,11 @@ fn freshen_kind(kind: &FunKind, cache: &mut FreshenCache) -> FunKind {
 }
 
 /// Mint (or retrieve, cached by `uid`) the per-instantiation copy of a
-/// quantified kind var, mirroring its def-site `<:` links onto the fresh copies.
+/// quantified kind var, carrying across whatever the def site was pinned to.
 ///
-/// Copying the bounds alone is not enough: a `<:` link is load-bearing when a
-/// force arrives *after* instantiation (a use-site force on one instantiation
-/// must still reach a linked sibling). Each edge `x <: y` is drawn exactly once
-/// — from `x`'s `uppers` — while `lowers` are recursed only to guarantee every
-/// linked var is minted; inserting into the cache before recursing terminates a
-/// link cycle on the cache hit.
+/// Caching by `uid` is what keeps repeated occurrences of one `κ` in a single
+/// copy identified; the copy decouples *this* instantiation's pin from the
+/// definition's and from every sibling instantiation's.
 fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKindVar> {
     if let Some(f) = cache.kind_vars.get(&kv.uid) {
         return f.clone();
@@ -158,16 +155,6 @@ fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKind
     let f = FunKindVar::fresh();
     *f.bounds.borrow_mut() = *kv.bounds.borrow();
     cache.kind_vars.insert(kv.uid, Rc::clone(&f));
-    let (uppers, lowers) = kv.links();
-    for u in &uppers {
-        let fu = freshen_kind_var(u, cache);
-        FunKindVar::link(&f, &fu);
-    }
-    for l in &lowers {
-        // The edge `l <: kv` is drawn from `l`'s side (its `uppers` include
-        // `kv`); recurse only so `l`'s copy exists to carry it.
-        freshen_kind_var(l, cache);
-    }
     f
 }
 
@@ -692,8 +679,8 @@ mod tests {
             kv2.bounds.borrow().forced_data,
             "def-intrinsic bounds are copied to the fresh var"
         );
-        // Forcing the fresh instantiation must not reach back to the original.
-        kv2.force_compute();
+        // Equating the fresh instantiation must not reach back to the original.
+        kv2.equate_compute();
         assert!(
             !kv.bounds.borrow().forced_compute,
             "the original var stays decoupled from this instantiation"
@@ -755,62 +742,6 @@ mod tests {
             "a quantified variable reachable only through a predicate must be \
              freshened — sharing it with the definition mints a duplicate \
              specialization"
-        );
-    }
-
-    #[test]
-    fn freshening_mirrors_kind_var_links_onto_instantiation() {
-        // Two `<:`-linked kind vars in one scheme must stay linked after
-        // freshening, so a use-site force on one instantiation still reaches its
-        // sibling. Copying the bounds alone (the flags present at def time) would
-        // drop the link and let a later force miss the far end.
-        let lower = FunKindVar::fresh(); // κ₁
-        let upper = FunKindVar::fresh(); // κ₂, with κ₁ <: κ₂
-        FunKindVar::link(&lower, &upper);
-        // A higher-order type with κ₁ on the (quantified) domain arrow and κ₂ on
-        // the outer arrow; the Infer domain lifts both above `lim` so both are
-        // instantiated rather than early-returned.
-        let inner = Type::Fun {
-            name: None,
-            kind: FunKind::Var(Rc::clone(&lower)),
-            domain: Box::new(Type::Infer(InferVar::fresh(5))),
-            codomain: Box::new(Type::Base(BaseType::Int)),
-        };
-        let outer = Type::Fun {
-            name: None,
-            kind: FunKind::Var(Rc::clone(&upper)),
-            domain: Box::new(inner),
-            codomain: Box::new(Type::Base(BaseType::Int)),
-        };
-        let mut cache = FreshenCache::new();
-        let fresh = freshen_above(0, &outer, FreshenLevel::At(1), &mut cache);
-        let Type::Fun {
-            kind: FunKind::Var(fresh_upper),
-            domain: fresh_domain,
-            ..
-        } = fresh
-        else {
-            panic!("expected a kind var on the freshened outer function");
-        };
-        let Type::Fun {
-            kind: FunKind::Var(fresh_lower),
-            ..
-        } = *fresh_domain
-        else {
-            panic!("expected a kind var on the freshened inner function");
-        };
-        assert_ne!(fresh_lower.uid, lower.uid);
-        assert_ne!(fresh_upper.uid, upper.uid);
-        // A `Compute` force on the fresh lower must propagate up the mirrored
-        // link to the fresh upper — and not touch the originals.
-        fresh_lower.force_compute();
-        assert!(
-            fresh_upper.bounds.borrow().forced_compute,
-            "the def-site link κ₁ <: κ₂ must be mirrored onto the instantiation"
-        );
-        assert!(
-            !upper.bounds.borrow().forced_compute,
-            "the original vars stay decoupled from the instantiation"
         );
     }
 }

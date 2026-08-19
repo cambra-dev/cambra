@@ -405,103 +405,66 @@ pub struct FunKindVarId(pub(crate) u32);
 
 static FUN_KIND_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Bounds on a [`FunKindVar`], over the two-point kind lattice `Data ⊑ Compute`.
+/// What a [`FunKindVar`] has been equated to.
 ///
-/// The lattice has only two points, so "bounds" collapse to two flags rather
-/// than the polar bound *lists* an [`crate::ccl::InferVar`] carries — and no
-/// [`Type`] sits inside, so a `FunKindVar` never forms a cycle. Resolution is a
-/// flag read: `forced_compute ∧ forced_data` is the conflict (`Compute ⊑ κ ⊑
-/// Data`, impossible — the `Compute <: Data` rejection); `forced_compute` alone
-/// → `Compute`; `forced_data` alone → `Data`; neither → the caller's
-/// domain-derived default.
+/// `Data` and `Compute` are **incomparable**, so a kind edge is an equation, not
+/// a bound: a var records which of the two points it has been pinned to. There
+/// are only two points and no [`Type`] sits inside, so this collapses to two
+/// flags rather than the polar bound *lists* an [`crate::ccl::InferVar`] carries,
+/// and a `FunKindVar` never forms a cycle. Resolution is a flag read: both flags
+/// is the conflict (a var equated to both points at once); one flag is that
+/// point; neither → the caller's default.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FunKindBounds {
-    /// A `Compute` value flows *into* this kind (`κ ⊒ Compute ⟹ κ = Compute`).
+    /// This kind has been equated to `Compute`.
     pub forced_compute: bool,
-    /// This kind is *demanded* as `Data` (`κ ⊑ Data ⟹ κ = Data`).
+    /// This kind has been equated to `Data`.
     pub forced_data: bool,
 }
 
-/// A kind-inference variable — an unknown [`FunKind`] the solver pins down by
-/// accumulating [`FunKindBounds`]. Identity (`uid`) is immutable and lives outside
-/// the `RefCell`, so equality/hashing is borrow-free and never inspects the
-/// bounds (mirroring [`crate::ccl::InferVar`]).
+/// A kind-inference variable — an unknown [`FunKind`] a consumption rule mints
+/// and the value flowing in pins.
+///
+/// The two consumption rules cannot know a function's kind: applying a value and
+/// destructuring a function are one node for a collection and for a capability
+/// alike ([`Type::pi_eliminated`], [`Type::fun_eliminated`]). Each mints one of
+/// these, and the kind edge pins it to whatever concrete kind the value carries
+/// (`constrain_kind`). Nothing else mints one — no scheme is kind-polymorphic and
+/// lowering stamps every function type it builds — so a variable is **written by the one
+/// value that reaches it**, never solved against other variables: two variables
+/// meeting record nothing, because what they resolve to is not known at that edge
+/// and no program needs it to be.
+///
+/// Identity (`uid`) is immutable and lives outside the `RefCell`, so
+/// equality/hashing is borrow-free and never inspects the pin (mirroring
+/// [`crate::ccl::InferVar`]). [`Rc`] because the same cell has to be visible
+/// wherever the type was cloned to.
 pub struct FunKindVar {
     /// Stable, globally-unique identity.
     pub uid: FunKindVarId,
-    /// Mutable kind bounds.
+    /// Which point(s) this var has been equated to.
     pub bounds: RefCell<FunKindBounds>,
-    /// Vars `u` such that `self <: u` (this kind is below them). A `Compute`
-    /// force propagates *up* to them (`self = Compute ⟹ u = Compute`).
-    uppers: RefCell<Vec<Rc<FunKindVar>>>,
-    /// Vars `l` such that `l <: self` (this kind is above them). A `Data` force
-    /// propagates *down* to them (`self = Data ⟹ l = Data`).
-    lowers: RefCell<Vec<Rc<FunKindVar>>>,
 }
 
 impl FunKindVar {
-    /// Allocate a fresh kind variable with empty bounds and no links.
+    /// Allocate a fresh kind variable, equated to nothing.
     pub fn fresh() -> Rc<FunKindVar> {
         Rc::new(FunKindVar {
             uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
             bounds: RefCell::new(FunKindBounds::default()),
-            uppers: RefCell::new(Vec::new()),
-            lowers: RefCell::new(Vec::new()),
         })
     }
 
-    /// Force this kind to `Compute` and propagate transitively up the `<:` links.
-    ///
-    /// Propagation keeps the flags at a fixpoint *incrementally*, so — unlike a
-    /// one-shot copy of the flags present when a link is first drawn — a force
-    /// that arrives strictly after its link still reaches every var it must. The
-    /// monotone flag (false → true) both terminates the walk and makes it
-    /// cycle-safe: a var already `Compute` short-circuits before recursing.
-    pub fn force_compute(self: &Rc<Self>) {
-        if self.bounds.borrow().forced_compute {
-            return;
-        }
+    /// Equate this kind to `Compute`. Recording both points is the conflict, read
+    /// at coalesce ([`crate::ccl::infer::solver::compact::KindMerge::of`]) — one
+    /// function required to be a collection at one site and a capability at another.
+    pub fn equate_compute(&self) {
         self.bounds.borrow_mut().forced_compute = true;
-        for u in self.uppers.borrow().iter() {
-            u.force_compute();
-        }
     }
 
-    /// Force this kind to `Data` and propagate transitively down the `<:` links.
-    /// The dual of [`FunKindVar::force_compute`]; same fixpoint/termination argument.
-    pub fn force_data(self: &Rc<Self>) {
-        if self.bounds.borrow().forced_data {
-            return;
-        }
+    /// Equate this kind to `Data`. The dual of [`FunKindVar::equate_compute`].
+    pub fn equate_data(&self) {
         self.bounds.borrow_mut().forced_data = true;
-        for l in self.lowers.borrow().iter() {
-            l.force_data();
-        }
-    }
-
-    /// A snapshot `(uppers, lowers)` of this var's `<:` links. Freshening uses
-    /// it to mirror def-site links onto the per-instantiation copies — the flags
-    /// alone are not enough, since a force arriving *after* instantiation must
-    /// still traverse the link to the sibling instantiation.
-    pub fn links(&self) -> (Vec<Rc<FunKindVar>>, Vec<Rc<FunKindVar>>) {
-        (self.uppers.borrow().clone(), self.lowers.borrow().clone())
-    }
-
-    /// Record the edge `lower <: upper` and reconcile the flags already present
-    /// on either end. Later forces on either var propagate through the stored
-    /// link via [`FunKindVar::force_compute`]/[`FunKindVar::force_data`].
-    pub fn link(lower: &Rc<FunKindVar>, upper: &Rc<FunKindVar>) {
-        if Rc::ptr_eq(lower, upper) {
-            return;
-        }
-        lower.uppers.borrow_mut().push(Rc::clone(upper));
-        upper.lowers.borrow_mut().push(Rc::clone(lower));
-        if lower.bounds.borrow().forced_compute {
-            upper.force_compute();
-        }
-        if upper.bounds.borrow().forced_data {
-            lower.force_data();
-        }
     }
 }
 
@@ -1055,6 +1018,76 @@ impl Type {
         Type::Fun {
             name: Some(name.into()),
             kind: FunKind::Compute,
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
+    }
+
+    /// `self` re-stamped with `provenance`'s [`FunKind`], through any
+    /// refinements on either side. A non-`Fun` on either side is a no-op.
+    ///
+    /// A pass that **re-kinds one node** and has to carry that onto a second type
+    /// stating the same function type needs this: `wrap_with_iterate` re-kinding an
+    /// iteration site, whose consuming combinator head declares the site as its
+    /// domain, or a `Let` whose kind follows its body, or a `Cast`'s `target`
+    /// (`ccl_utils::sync_cast_target_kind`). The kinds are incomparable, so a
+    /// stale copy is not a harmless widening — it is a different claim about what
+    /// the value *is*. Everything else (refinements, the Pi binder, the domain and
+    /// codomain) stays, because only the kind moved.
+    pub fn with_kind_of(&self, provenance: &Type) -> Type {
+        let Type::Fun { kind, .. } = provenance.peel_refinements() else {
+            return self.clone();
+        };
+        fn restamp(t: &Type, kind: &FunKind) -> Type {
+            match t {
+                Type::Fun {
+                    name,
+                    domain,
+                    codomain,
+                    ..
+                } => Type::Fun {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    domain: domain.clone(),
+                    codomain: codomain.clone(),
+                },
+                Type::Refinement(base, r) => {
+                    Type::Refinement(Box::new(restamp(base, kind)), r.clone())
+                }
+                other => other.clone(),
+            }
+        }
+        restamp(self, kind)
+    }
+
+    /// The function type an **elimination** demands: a Pi whose kind is a fresh
+    /// [`FunKind::Var`].
+    ///
+    /// `Data` and `Compute` are incomparable, so a demand stamped with either
+    /// one rejects the other. Application does not care: indexing a collection
+    /// and calling a capability are the same node, and the rule that types them
+    /// only needs *some* function with this domain and codomain. Leaving the kind
+    /// inferred says exactly that — the applied value's own kind flows in and
+    /// pins it, and a demand nothing pins defaults to `Compute` like any other
+    /// unconstrained kind.
+    ///
+    /// Contrast [`Type::pi`] / [`Type::fun`] / [`Type::data_fun`], which *stamp*
+    /// a kind and are for a position that genuinely means one of the two.
+    pub fn pi_eliminated(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
+        Type::Fun {
+            name: Some(name.into()),
+            kind: FunKind::fresh_var(),
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
+    }
+
+    /// The non-dependent [`Type::pi_eliminated`] — an elimination's demand
+    /// with no Pi binder.
+    pub fn fun_eliminated(domain: Self, codomain: Self) -> Self {
+        Type::Fun {
+            name: None,
+            kind: FunKind::fresh_var(),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }

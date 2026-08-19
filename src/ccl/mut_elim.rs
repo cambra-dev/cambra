@@ -1714,7 +1714,7 @@ mod tests {
     /// leave it: `let x = 0 in ExprStmt(For{i, [1,2,3], x := x+i}, x)`.
     fn direct_mirror_sum() -> (Expr, Name, Name) {
         let int = Type::Base(BaseType::Int);
-        let list_ty = Type::fun(Type::UIntRange(3), int.clone());
+        let list_ty = Type::data_fun(Type::UIntRange(3), int.clone());
         let x = Name::fresh("x");
         let i = Name::fresh("i");
 
