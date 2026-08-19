@@ -855,12 +855,12 @@ impl Subst {
     /// itself). The α-rename fallback is therefore asserted unreachable,
     /// which is also what deletes the same-discharge-twice determinism
     /// hazard: no fresh names are minted on any equality-mediated path.
-    fn under_binder(&self, binder: &Name, body: &TypedExpr) -> (Binder, Subst) {
+    fn under_binder(&self, binder: &Name, body: &TypedExpr) -> (Binder, Cow<'_, Subst>) {
         let restricted = self.shadow(binder);
         // If no substituted binder occurs free in the body, the substitution
         // is inert there — return the identity so the body is left untouched.
         if !restricted.0.keys().any(|k| is_free(k, body)) {
-            return (binder.clone(), Subst::id());
+            return (binder.clone(), Cow::Owned(Subst::id()));
         }
         restricted.assert_no_capture(binder);
         (binder.clone(), restricted)
@@ -928,13 +928,12 @@ impl Subst {
 
     /// This substitution with `binder` removed from its source domain (the
     /// binder shadows the outer mapping inside its scope).
-    pub fn shadow(&self, binder: &Name) -> Subst {
-        if !self.0.contains_key(binder) {
-            return self.clone();
+    pub fn shadow(&self, binder: &Name) -> Cow<'_, Subst> {
+        let mut out = Cow::Borrowed(self);
+        if out.0.contains_key(binder) {
+            out.to_mut().0.remove(binder);
         }
-        let mut m = self.0.clone();
-        m.remove(binder);
-        Subst(m)
+        out
     }
 
     /// This substitution restricted so it acts on **none** of `binders` — the
@@ -944,9 +943,11 @@ impl Subst {
     ///
     /// Returns a borrow when the restriction is vacuous, which is the common
     /// case: a substitution's domain is usually a single binder and the scope
-    /// being crossed usually does not name it. Folding [`Self::shadow`] over the
-    /// group instead would clone the map once per binder even on a miss, since
-    /// `shadow` returns an owned `Subst`.
+    /// being crossed usually does not name it. [`Self::shadow`] preserves the
+    /// borrow the same way, but cannot be *folded* over a group: each call
+    /// borrows from its receiver, so the intermediate `Cow` a fold would thread
+    /// has nothing outliving it to borrow from. This restricts against one
+    /// receiver for the whole group instead.
     ///
     /// The `contains_key` guard is what makes that true and is therefore
     /// load-bearing, not a micro-optimization: `to_mut()` on a `Cow::Borrowed`

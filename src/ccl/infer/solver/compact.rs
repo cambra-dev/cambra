@@ -6,6 +6,7 @@
 //! [`CompactType`] / [`CompactGraph`] are the shared currency consumed by the
 //! sibling [`mod@super::simplify_type`] and [`super::coalesce`] modules.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -638,7 +639,7 @@ fn compact_go(
             // codomain (it binds the name locally), so restrict it there.
             let cod_acc = match name {
                 Some(b) => subst_acc.shadow(b),
-                None => subst_acc.clone(),
+                None => Cow::Borrowed(subst_acc),
             };
             let cod = compact_go(c, pol, &cod_acc, None, st);
             CompactType {

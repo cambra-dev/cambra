@@ -87,6 +87,7 @@
 //! under either use's pin is the same code*, because every edge the clone's own
 //! resolution can follow is followed, from the same side, by one of the two reads.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry};
 use std::fmt;
 use std::rc::Rc;
@@ -394,7 +395,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             // of the key — see `SpecKey::fun`.
             let cod_acc = match name {
                 Some(b) => subst_acc.shadow(b),
-                None => subst_acc.clone(),
+                None => Cow::Borrowed(subst_acc),
             };
             let cod = key_go(codomain, pol, &cod_acc, ctx);
             // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
