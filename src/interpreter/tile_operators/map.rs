@@ -423,6 +423,55 @@ impl TileProducer for MapResultProducer {
             };
         }
 
+        // A data function may be applied before it has answered every key:
+        // `domain_predicate` separates a key the function will never answer from
+        // one it has not answered yet. Rows keyed on an unanswered value are
+        // withheld — dropped from this tile, and their domain positions subtracted
+        // from its predicate — so the consumer pulls again once the function has
+        // them. The `CurriedFunction` branch above draws the same distinction
+        // through `incomplete_domain`.
+        if let Tile::SealedFunction {
+            domain_predicate: f_domain_predicate,
+            ..
+        } = &function_tile
+            && let Tile::SealedFunction {
+                domain,
+                codomain,
+                domain_predicate,
+                ..
+            } = &mut input_tile
+        {
+            let Tile::Scalar(keys) = &**codomain else {
+                panic!("MapResult over a SealedFunction expects a Scalar codomain");
+            };
+            debug_assert_eq!(
+                domain.len(),
+                keys.len(),
+                "a compacted tile's domain and codomain are the same length"
+            );
+            let domain_extent = i_tiling.domain_extent().unwrap();
+            let mut answered = Vec::new();
+            let mut withheld = ColumnValue::from_values(Vec::new(), &domain_extent);
+            for i in 0..keys.len() {
+                if f_domain_predicate.contains(&keys.index_at(i)) {
+                    answered.push(i);
+                } else {
+                    withheld.append(ColumnValue::from_values(
+                        vec![domain.index_at(i)],
+                        &domain_extent,
+                    ));
+                }
+            }
+            if !withheld.is_empty() {
+                let kept = answered.len();
+                let new_keys = keys.select_indices(answered.iter().copied(), kept);
+                *domain = domain.select_indices(answered.iter().copied(), kept);
+                **codomain = Tile::Scalar(new_keys);
+                *domain_predicate =
+                    domain_predicate.minus(&Predicate::from_column_value(&withheld));
+            }
+        }
+
         // Standard logic for non-CurriedFunction outputs
         process_tile_result(self.tiling(), input_tile, move |codomain| {
             apply_function_tile(function_tile, codomain, f_domain_extent, f_codomain_extent)
