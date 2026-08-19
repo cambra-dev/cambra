@@ -196,8 +196,8 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     // `c` reaches the output on both legs — once under `keys`, once as the value
     // source below — so the keys leg carries a freshened sibling and the value
     // leg (the collection the composition already denoted) keeps `c`'s own ids.
-    let keys = compose(c.fresh_copy(), key_pf)
-        .with_ty(Type::fun(value_idx_ty.clone(), (**key_ty).clone()));
+    let keys =
+        compose((**c).clone(), key_pf).with_ty(Type::fun(value_idx_ty.clone(), (**key_ty).clone()));
     let key_binder = match &head.ty {
         Type::Fun { name, .. } => name.clone(),
         _ => None,

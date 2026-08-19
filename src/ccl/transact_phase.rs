@@ -374,9 +374,10 @@ fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
             // Plain freshening would instead delete the read from the output and
             // move its hover onto machinery.
             let occurrence = e.node_id();
-            let mut copy = replacement.clone();
-            copy.freshen_interior_node_ids();
-            *e = copy.re_root(occurrence);
+            // `Clone` freshens, so the interior arrives already distinct. The
+            // root id it mints is discarded by the `re_root` below; that stranded
+            // id folds as a death, not a defect.
+            *e = replacement.clone().re_root(occurrence);
         }
         return;
     }
@@ -417,11 +418,8 @@ fn build_as_of(trigger: &Expr, source: &Expr, codomain: Type) -> Option<Expr> {
     let b = trigger.ty.domain()?;
     let out = Type::fun(b, codomain);
     let arg_ty = Type::Tuple(vec![trigger.ty.clone(), source.ty.clone()]);
-    let arg = Expr::new(TypedExprNode::Tuple(vec![
-        trigger.fresh_copy(),
-        source.fresh_copy(),
-    ]))
-    .with_ty(arg_ty.clone());
+    let arg = Expr::new(TypedExprNode::Tuple(vec![trigger.clone(), source.clone()]))
+        .with_ty(arg_ty.clone());
     let as_of_fn = Expr::builtin(Builtin::AsOf).with_ty(Type::fun(arg_ty, out.clone()));
     Some(Expr::apply(arg, as_of_fn).with_ty(out))
 }
@@ -1093,7 +1091,7 @@ fn strip(
                 // The enclosing `For` keeps its `iter` in the stripped tree while
                 // the site carries the same expression into the writer's source,
                 // so the site's copy is its own.
-                source: source.fresh_copy(),
+                source: source.clone(),
                 block: txn_block,
                 read_keys,
                 write_keys,
@@ -1914,7 +1912,7 @@ fn build_writer(
         if site.enclosing_writes.contains(n) {
             // `acc_views` is shared across writer sites, and each site zips the
             // view into its own source, so every site takes its own copy.
-            site_accs.push((n.clone(), info.view.fresh_copy(), info.value_ty.clone()));
+            site_accs.push((n.clone(), info.view.clone(), info.value_ty.clone()));
         } else {
             broadcasts.push((n.clone(), info.final_var.clone(), info.value_ty.clone()));
         }
@@ -2066,7 +2064,7 @@ fn proj_item(item: &Expr, item_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
     // One item expression, one projection per slot: every slot's projection ends
     // up in the environment and thence in the decision, so each needs its own
     // copy of the item it projects from.
-    let mut app = Expr::apply(item.fresh_copy(), proj);
+    let mut app = Expr::apply(item.clone(), proj);
     app.ty = elt_ty.clone();
     app
 }
@@ -2172,7 +2170,7 @@ fn walk_block(
                     // Several writes (and feeds) can share one path, and `disjoin`
                     // puts every contribution in the output, so each contribution
                     // is its own copy.
-                    commit_paths.push(path.fresh_copy());
+                    commit_paths.push(path.clone());
                 }
                 TypedExprNode::Case {
                     scrutinee: None,
@@ -2211,9 +2209,9 @@ fn walk_block(
                     *feed_counter += 1;
                     // The tap's `__fire` gate and the commit disjunction both carry
                     // this path into the decision record, so each gets its own copy.
-                    feeds.push((name.clone(), field, val, path.fresh_copy()));
+                    feeds.push((name.clone(), field, val, path.clone()));
                     // A read-only transaction commits to emit its reply.
-                    commit_paths.push(path.fresh_copy());
+                    commit_paths.push(path.clone());
                 }
                 other => panic!(
                     "transact_phase: unexpected statement in `with begin():` block: {other:?}"
@@ -2282,7 +2280,7 @@ fn walk_case(
         // pair is a manufactured death.
         let mut arm_env: HashMap<Name, Expr> = snapshot
             .iter()
-            .map(|(k, v)| (k.clone(), v.fresh_copy()))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         walk_block(
             &br.body,
@@ -2328,11 +2326,11 @@ fn walk_case(
             .map(|(g, ae)| crate::ccl::Branch {
                 pattern: None,
                 // The guard is spliced into one `Case` per rejoined key.
-                guard: g.fresh_copy(),
+                guard: g.clone(),
                 body: ae
                     .get(wk)
                     .or(snap_v)
-                    .map(Expr::fresh_copy)
+                    .cloned()
                     .expect("a rejoined write key has a per-arm or snapshot value"),
             })
             .collect();
@@ -2379,9 +2377,10 @@ fn subst_env(e: &Expr, env: &HashMap<Name, Expr>) -> Expr {
         // thing the `Var` did — the value of `n` *here* — so the read site keeps
         // its own id (and with it its span/attribution) and only the interior is
         // freshened. N reads still give N distinct roots, so uniqueness holds.
-        let mut copy = rep.clone();
-        copy.freshen_interior_node_ids();
-        return copy.re_root(e.node_id());
+        // `Clone` freshens, so the interior arrives already distinct. The root id
+        // it mints is discarded by the `re_root` below; that stranded id folds as
+        // a death, not a defect.
+        return rep.clone().re_root(e.node_id());
     }
     let mut out = e.clone();
     out.map_children(|c| subst_env(&c, env));
@@ -2396,7 +2395,11 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, Expr>) 
         && keys.contains(&binding.name)
         && !out.contains_key(&binding.name)
     {
-        out.insert(binding.name.clone(), (**init).clone());
+        // A stash, not a duplication: this records *the* init term so a later
+        // stage can place it, and the `let` that held it is dropped rather than
+        // kept alongside. Preserving its ids is what makes the two later
+        // placements copies **of the original**.
+        out.insert(binding.name.clone(), init.clone_preserving_ids());
     }
     expr.walk_children(|c| collect_key_inits(c, keys, out));
 }
@@ -2768,7 +2771,7 @@ fn plan_store(
         // here and as the trailing `final_or_default` default in `splice_letrec`
         // — while the `let` that held the original is dropped by
         // `rebind_letrec`, so both placements are copies.
-        let init = key_init.get(k).expect("key init present").fresh_copy();
+        let init = key_init.get(k).expect("key init present").clone();
         // The `get_prev_txn` history slot — the design's denotation: the
         // `⧺`-merged **per-key commit views** of every site writing this key
         // ("multiple writer sites for one variable merge their commit

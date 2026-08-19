@@ -1287,13 +1287,27 @@ impl<C: PartialEq + Clone> PredMemo<C> {
                 }
                 None => {
                     let keepalive = Rc::clone(&refinement.predicate);
-                    let copy = (*refinement.predicate).clone();
+                    // Copy-on-write, not duplication: the rebuilt term is
+                    // installed *in place of* the original, so it is the same
+                    // logical node at a new allocation and keeps its ids. A
+                    // freshening clone here would re-mint the whole predicate
+                    // domain on every rewriting pass, and trips `uniquify`'s
+                    // id-stability tripwire on the first one.
+                    let copy = refinement.predicate.clone_preserving_ids();
                     let rev = store.revision;
                     (copy, keepalive, rev)
                 }
             }
         };
-        let reported = f(&mut pred);
+        // The whole rebuild runs id-preserving. Nothing records a predicate
+        // rewrite: lowering anchors a predicate's nodes as it builds one, but no
+        // step covers this rebuild, so an id minted here is one no record
+        // explains and a `Copy` rowed against a predicate-interior origin folds
+        // as `CopyOfUnknown`. Preserving is honest because the rebuilt term
+        // *replaces* the original everywhere this walk reaches. This covers the
+        // rewrite too, not just the copy-on-write above: a substitution firing
+        // inside a predicate materializes its template here.
+        let reported = crate::ccl::lineage::preserving_ids(|| f(&mut pred));
         let mut store = self.0.borrow_mut();
         let changed = reported || store.revision != before;
         let installed = if changed {
@@ -1329,8 +1343,10 @@ impl TermMemo {
     /// caller) still leaves the occurrence rebuilt and recorded.
     pub fn rebuild_always(&self, refinement: &mut Refinement, f: impl FnOnce(&mut Expr)) {
         let keepalive = Rc::clone(&refinement.predicate);
-        let mut pred = (*refinement.predicate).clone();
-        f(&mut pred);
+        // Copy-on-write; see `rebuild`.
+        let mut pred = refinement.predicate.clone_preserving_ids();
+        // Id-preserving; see `rebuild`.
+        crate::ccl::lineage::preserving_ids(|| f(&mut pred));
         let mut store = self.0.0.borrow_mut();
         let shared = store
             .entries

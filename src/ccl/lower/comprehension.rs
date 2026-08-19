@@ -321,6 +321,7 @@ pub(super) fn lower_list_comp(
             element_span,
             lc,
         );
+        ctx.tag_predicate(&pred_expr, element_span, "lower.comp_filter_pred");
         let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole);
         Ok(ctx.tag_machinery(make_cast(unrefined_lambda, target_ty), element_span, lc))
     } else {
@@ -356,9 +357,11 @@ fn fan_out_copy(origin: &Expr, used: &mut bool, label: &'static str) -> Expr {
     let copy = if *used {
         use crate::ccl::lineage::copy_frame;
         let _frame = copy_frame(label);
-        origin.fresh_copy()
-    } else {
         origin.clone()
+    } else {
+        // Keep-first: this placement *is* the original, so it keeps its ids and
+        // records nothing. Only the second and later arms are siblings.
+        origin.clone_preserving_ids()
     };
     *used = true;
     copy
@@ -480,9 +483,11 @@ fn fan_out_element_case(
                 ),
                 Expr::lambda(iter_var, Type::Hole, gate),
             );
-            // `gate_on_source` rides the cast target's refinement predicate, so its
-            // interior is outside the NodeId domain — carried, never checked — and
-            // needs no tagging (`src/ccl/design/provenance.md`, "The id domain").
+            // `gate_on_source` rides the cast target's refinement predicate, so
+            // its interior is in the domain the fold must explain and nothing in
+            // the main-tree walk reaches it. Sweep it
+            // (`src/ccl/design/provenance.md`, "The id domain").
+            ctx.tag_predicate(&gate_on_source, span, "lower.comp_arm_gate_pred");
             let target = refined_data_fun(Type::Hole, gate_on_source, Type::Hole);
             ctx.tag_machinery(make_cast(elem_map, target), span, ec)
         })

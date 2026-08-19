@@ -412,7 +412,7 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
         // alias main-tree ids (lowering shares a comprehension's source term
         // between the generator and the guard), and one predicate `Rc` reached
         // from two iteration sites would land twice. Freshen at the lift.
-        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate).fresh_copy());
+        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate).clone());
         current = base.as_ref();
     }
     preds.reverse();

@@ -73,13 +73,60 @@ pub type Binder = Name;
 /// what lets [`Subst::invert`] and [`Subst::split_renames`] be exact by
 /// construction: inversion legality is type-enforced, and "the rename part"
 /// means precisely the entries constructed as correspondences.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Mapping {
     /// `binder ↦ other binder` — a correspondence between frames. Invertible.
     Rename(Binder),
     /// `binder ↦ term` — plug a term in for the binder. No inverse.
     /// (Boxed: a term is much larger than a binder name.)
+    ///
+    /// **Considered and deferred: `Rc<TypedExpr>`.** The payload is a
+    /// *template* — never a tree node, cloned afresh at every read
+    /// ([`Mapping::as_expr`]) — so sharing it is sound, and the solver copies
+    /// substitutions constantly (`Bound::render_subst`, [`Subst::then`],
+    /// `compact`, `constrain`). With a `Box`, every one of those ~28 sites deep-
+    /// copies the payload tree; with an `Rc` they are refcount bumps. That cost
+    /// is not something the freshening `Clone` introduced, so the change is an
+    /// improvement in its own right and wants its own before/after rather than
+    /// riding along here.
+    ///
+    /// One trap if it is ever done: [`Subst::for_each_discharge_term_mut`] would
+    /// become `Rc::make_mut`, which copies out through `TypedExpr`'s freshening
+    /// `Clone`. `freshen_subst_payloads` clones the `Subst` while the source
+    /// `Bound` is still alive, so the payload is **always** shared at that point
+    /// and it would freshen every time. The fix is to stop mutating in place —
+    /// map to a new `Rc` per payload instead. See the vault's
+    /// `freshening-clone-report`.
     Discharge(Box<TypedExpr>),
+}
+
+/// Hand-written so that **copying a substitution does not duplicate its terms**
+/// — the one place `TypedExpr`'s freshening `Clone` is deliberately opted out
+/// of, and the reason it can be opted out of exactly here.
+///
+/// A `Discharge` payload is a **template**, not a tree node. It is cloned again
+/// at every read ([`Mapping::as_expr`] / [`as_expr_preserving`]), and *that*
+/// read is where the sibling gets minted, once per occurrence actually filled.
+/// So copying the map itself must mint nothing: the template is never in a tree,
+/// and no two nodes can end up sharing an id because of it.
+///
+/// Without this, every `Subst` copy inherits the freshening and re-mints its
+/// payloads. That is not merely wasteful. The solver copies
+/// substitutions constantly — `Bound::render_subst`, [`Subst::then`],
+/// `compact`, `constrain` — and a bound edge's payloads are **type-domain**
+/// terms whose ids no step ever produced, so each such copy records a `Copy`
+/// against an origin the log never saw and the pane fold reports it as
+/// [`Leak::CopyOfUnknown`](crate::ccl::lineage::Leak::CopyOfUnknown). Measured on
+/// `generator_pipeline`: 200 of them at the first pane boundary.
+///
+/// [`as_expr_preserving`]: Mapping::as_expr_preserving
+impl Clone for Mapping {
+    fn clone(&self) -> Self {
+        match self {
+            Mapping::Rename(b) => Mapping::Rename(b.clone()),
+            Mapping::Discharge(t) => Mapping::Discharge(Box::new(t.clone_preserving_ids())),
+        }
+    }
 }
 
 /// A substitution must never leave a **typed** occurrence holding an untyped
@@ -110,8 +157,10 @@ fn assert_preserves_typedness(replacement: &TypedExpr, occurrence_ty: &Type) {
 
 impl Mapping {
     /// The mapping's replacement as a term (a `Rename` materializes as a bare
-    /// variable reference). The replacement carries a **new** identity: a fresh
-    /// mint for a `Rename`, the discharged term's own ids for a `Discharge`.
+    /// variable reference). The replacement carries a **new** identity
+    /// throughout: a fresh mint for a `Rename`, and — since `Clone` freshens —
+    /// a wholly fresh node-set for a `Discharge`, rather than the template's own
+    /// ids duplicated into every occurrence it fills.
     fn as_expr(&self, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
             // α-renaming cannot change a term's type: the occurrence's type is a
@@ -133,10 +182,15 @@ impl Mapping {
     ///
     /// A `Rename` is built directly at `node_id` rather than minted and then
     /// overwritten: a mint fires `on_mint`, and an id no node ends up carrying is
-    /// a phantom birth in the lineage log. A `Discharge` clones (which mints
-    /// nothing) and re-roots that clone
-    /// ([`re_root`](TypedExpr::re_root)) — the two shapes reach a preserved
-    /// identity by different routes, and neither mints.
+    /// a phantom birth in the lineage log.
+    ///
+    /// A `Discharge` clones and re-roots that clone
+    /// ([`re_root`](TypedExpr::re_root)). `Clone` freshens, so the clone's
+    /// interior arrives already distinct from the template, and the root id it
+    /// mints is immediately discarded by the re-root. That discarded id is the one
+    /// place the freshening `Clone` costs an id per substituted occurrence; it
+    /// strands an `on_copy` edge whose product is never live, so it folds as a
+    /// death rather than a defect.
     fn as_expr_preserving(&self, node_id: NodeId, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
             // See [`as_expr`]: the rename keeps the occurrence's type.
@@ -651,19 +705,10 @@ impl Subst {
             let occurrence_ty = e.ty.clone();
             *e = repl.as_expr_preserving(e.node_id, &occurrence_ty);
             if !matches!(e.node, TypedExprNode::Var(_)) {
-                // Compound replacement: `as_expr_preserving` bare-`clone()`s the
-                // whole subtree, sharing the source's NodeIds. Freshen only the
-                // INTERIOR (the children) — the root keeps the carried id. Each
-                // interior re-mint fires the ambient `on_copy` lineage hook into
-                // any open step. Type slots are out of the id domain, so the
-                // predicate `Rc`s the clone shares with its source stay shared.
-                //
-                // Interior only: the carry above already put the occurrence's id
-                // on the root. Deep-freshening resolves to the same use-site span,
-                // because the carry precedes the freshen and the recorded origin is
-                // the occurrence, but it costs a row, an id, and a hop, and drops
-                // the occurrence out of the live set.
-                e.freshen_interior_node_ids();
+                // `Clone` freshens, so the compound replacement's interior
+                // arrives already distinct from the template. The carry above put
+                // the occurrence's id on the root, discarding the one the clone
+                // minted.
             }
             return;
         }

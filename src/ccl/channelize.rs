@@ -284,7 +284,10 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
 /// the lifted body, with stale Feed/Define target names renamed to `y`.
 fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option<(Expr, Name)> {
     let mut prefix: Vec<Expr> = Vec::new();
-    let mut current = bound_expr.clone();
+    // A move out of a borrow, not a duplication: the walk below destructures
+    // `current` and rebuilds it at its own ids, and what it yields *replaces*
+    // `bound_expr` in the output rather than standing beside it.
+    let mut current = bound_expr.clone_preserving_ids();
     loop {
         let cur_id = current.node_id;
         match current.node {
@@ -744,7 +747,11 @@ fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
         erase_chan_domains(bound_expr, map);
         erase_chan_domains(body, map);
         // §6.2 Let-closing on the substitution content (see fn docs).
-        let discharge = crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone());
+        // A type-level discharge. The term keeps its ids because it is a
+        // *template*, cloned again at every read; that read is where the sibling
+        // is minted.
+        let discharge =
+            crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone_preserving_ids());
         for dom in map.values_mut() {
             *dom = discharge.apply_type(dom);
         }
@@ -2138,9 +2145,8 @@ fn extract_for_defer_impl(
                         // `bound_expr` in the body, and each extracted feed that
                         // captures the binder gets its own re-binding of the same
                         // definition, so every wrap is a copy.
-                        *feed =
-                            Expr::let_bind(binding.name.clone(), bound_expr.fresh_copy(), original)
-                                .with_ty(let_ty);
+                        *feed = Expr::let_bind(binding.name.clone(), bound_expr.clone(), original)
+                            .with_ty(let_ty);
                     }
                 }
                 new_body
@@ -2226,8 +2232,7 @@ fn extract_for_defer_impl(
                     let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
                     // Each companion channel applies the same source, which also
                     // stays on the rebuilt `Apply` below, so each gets its own copy.
-                    let channel =
-                        Expr::apply(new_argument.fresh_copy(), channel_lambda).with_ty(v_ty);
+                    let channel = Expr::apply(new_argument.clone(), channel_lambda).with_ty(v_ty);
                     feeds.push(channel);
                 }
                 let new_function = TypedExpr {
@@ -2389,7 +2394,7 @@ fn extract_for_defer_impl(
                                     // each arm's copy must carry its own ids —
                                     // a bare clone would put one identity at N
                                     // live positions.
-                                    let mut refined_prefix = source_prefix.fresh_copy();
+                                    let mut refined_prefix = source_prefix.clone();
                                     refine_source_domain(&mut refined_prefix, refinement_struct);
                                     let channel_lambda =
                                         Expr::lambda(&param.name, param.ty.clone(), value);
@@ -2450,7 +2455,7 @@ fn extract_for_defer_impl(
                             // The prefix stays in `new_elts` for the rebuilt
                             // compose, so each companion channel takes its own copy.
                             let mut channel_elts: Vec<Expr> =
-                                new_elts.iter().map(Expr::fresh_copy).collect();
+                                new_elts.iter().map(Expr::clone).collect();
                             channel_elts.push(channel_lambda);
                             // A single-element "compose" is just that
                             // element; otherwise build a Compose.

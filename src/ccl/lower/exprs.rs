@@ -87,7 +87,13 @@ pub(super) fn lower_call(
             let key_ty = ctx.fresh_shared_hole();
             // `bare_pred` (and the `collection` clone inside it) lives in the
             // cast target's refinement predicate — a type slot outside the
-            // `walk_children` domain — so its nodes are deliberately untagged.
+            // `walk_children` domain. It used to be left deliberately untagged
+            // for exactly that reason; it is now swept by `tag_predicate` below,
+            // because `collect_tree_ids` reaches refinement predicates and the
+            // lowering fold therefore has to explain them. The `collection`
+            // clone is the reason this matters more than it used to: `Clone`
+            // freshens, so that clone no longer aliases an already-tagged
+            // main-tree id.
             let bare_pred = Expr::binop(
                 Expr::apply(
                     Expr::apply(Expr::var(Name::elem()), collection.clone()),
@@ -114,6 +120,7 @@ pub(super) fn lower_call(
                 func.span,
                 gb,
             );
+            ctx.tag_predicate(&bare_pred, func.span, "lower.groupby_key_pred");
             let target_ty = refined_data_fun(Type::Hole, bare_pred, Type::Hole);
             let cast = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
             // A group-by is a **data function** (a keyed collection): stamp its
@@ -472,8 +479,10 @@ pub(super) fn lower_compare(
             CmpOp::GtE => CompareKind::GreaterOrEq,
         };
         let lhs = if i == 0 {
-            // Operand 0's only use.
-            operands[0].clone()
+            // Operand 0's only use — a move out of a borrowed `Vec`, so it keeps
+            // its ids: nothing is duplicated and the operand's own attribution
+            // is what this position should carry.
+            operands[0].clone_preserving_ids()
         } else {
             // Operand i's second use (its first was pair i-1's right side). A
             // bare clone would share NodeIds; freshen a copy inside a lowering
@@ -482,9 +491,11 @@ pub(super) fn lower_compare(
             // attribution wanted for the duplicated operand.
             use crate::ccl::lineage::copy_frame;
             let _frame = copy_frame("lower.compare_operand");
-            operands[i].fresh_copy()
+            operands[i].clone()
         };
-        let rhs = operands[i + 1].clone();
+        // Operand i+1's *first* use (its second, if any, is pair i+1's left
+        // side and is freshened there). A move out of a borrowed `Vec` again.
+        let rhs = operands[i + 1].clone_preserving_ids();
         // Each pair comparison images its `<op>` in the chain, spanning its two
         // operands. It is *not* `Nature::Source` — a chained comparison is one of
         // the cost cases of the structural rule (see `tag_source`): only the

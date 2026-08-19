@@ -408,7 +408,7 @@ fn build_value_case_cform(
     // gated arm, and as `final_or_default`'s default. The arm is the copy that
     // actually fires, so it keeps the source ids and the unreachable type anchor
     // is the freshened sibling.
-    let default_body = default_body.fresh_copy();
+    let default_body = default_body.clone();
 
     // Union domain = Variant({Index(i): {UIntRange(1)|π̂ᵢ}}) — the same tagged
     // union `emit_copair` produces, so op-conversion's `UnionOperator`
@@ -579,7 +579,7 @@ fn build_scrutinee_case_cform(
         // `scrut_stream` is built once and composed into every arm, and all arms
         // stay live in the union below, so each placement needs its own identity.
         arms.push(arm_compose(
-            vec![scrut_stream.fresh_copy(), vp, arm_fn],
+            vec![scrut_stream.clone(), vp, arm_fn],
             driver_dom.clone(),
             &result_ty,
             // A value-position scrutinee case reads a one-element *stream* driver
@@ -1403,7 +1403,7 @@ fn elim_lambda_impl(
                         // bare clone here: the catch-all arm re-mints every
                         // pass-through node, which launders the duplicate before any
                         // boundary walk reaches it.
-                        chain.push(scrut_pf.fresh_copy());
+                        chain.push(scrut_pf.clone());
                     }
                     chain.push(vp);
                     chain.push(arm_fn);
@@ -1434,7 +1434,7 @@ fn elim_lambda_impl(
                         vp
                     } else {
                         // Per-arm placement, as above.
-                        typed_compose(vec![scrut_pf.fresh_copy(), vp])
+                        typed_compose(vec![scrut_pf.clone(), vp])
                     };
                     // Outer morphism `param_ty ⇒ param_ty` — the full element; the
                     // zip's `FanIn` restricts it to the tag-`cᵢ` keys by inner-join.

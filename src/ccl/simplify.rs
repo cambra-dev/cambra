@@ -964,7 +964,7 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             // downstream product-beta hides only when it happens to consume one
             // copy per leg (`⟨.0, .1⟩` arms); arms that read the *same* slot
             // (`⟨.0, .0⟩`) leave both copies live.
-            let h_left = left.fresh_copy();
+            let h_left = left.clone();
             let g_compose = Expr::compose(vec![left, g.clone()]).with_ty(g_ty);
             let h_compose = Expr::compose(vec![h_left, h.clone()]).with_ty(h_ty);
             vec![zip_pair(g_compose, h_compose)]

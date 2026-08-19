@@ -1683,22 +1683,6 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
 // the use's own instantiation resolution, where refinements are excluded and the
 // reason is on `ReadPurpose::Instantiation`. Debug builds only; free in release.
 
-/// Mint a fresh [`NodeId`](crate::ccl::provenance::NodeId) for every node in a
-/// monomorphization clone.
-///
-/// Walks the main expression tree — the `walk_children` domain, which is the
-/// whole `NodeId` domain. Type slots are *not* walked: a `Type` carries no
-/// identity, and the predicate `Rc<TypedExpr>`s reachable through one are outside
-/// the id domain, so a specialization's predicate-embedded ids may alias the
-/// definition's. Nothing checks or reads them (see `ccl/design/provenance.md`,
-/// "The id domain"), and freshening them would split the predicate `Rc` sharing
-/// planning's compile memo depends on.
-fn freshen_clone_node_ids(expr: &mut Expr) {
-    // The deep walk lives on `TypedExpr::freshen_node_ids_deep`; each re-mint
-    // fires the ambient `on_copy` hook, captured by the open Mono Copy step.
-    expr.freshen_node_ids_deep();
-}
-
 /// Specialize a use of a generalized binding (frame at `frame_idx` in the
 /// walk's scope) to its instantiation, then rewrite the use to reference the
 /// specialization and stamp the specialization's resolved type on it.
@@ -1797,6 +1781,18 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     }
     let base_name = frame.name.clone();
     let cutoff = frame.cutoff;
+    // A freshened, independently-identified copy of the definition: `Clone`
+    // mints a new `NodeId` for every node, so N specializations cannot collide on
+    // one id. The clone itself covers the `walk_children` domain only: a predicate
+    // rides its type slot behind an `Rc` that `Type`'s `Clone` shares.
+    // `freshen_expr_type_slots` below re-mints those interiors separately, through
+    // `freshen_refinement_predicate`.
+    //
+    // TODO(mono-record): nothing captures these copies. `on_copy` records only
+    // into an open step, and no recorder spans inference. Whichever change adds
+    // one must open the step **before** this clone, because the clone is what
+    // fires `on_copy`: a step entered after it watches every pair fall on the
+    // floor and leaves the whole specialization `Unexplained`.
     let mut clone = frame.def.clone();
     // A monomorphization name carrying the source binding as provenance and a
     // globally-fresh uid for identity — so it can neither capture nor be
@@ -1821,16 +1817,6 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // binder slots, predicate slots, and bound edges alike).
     seed_chan_dom_pairings(&resolved, &clone.ty, cutoff, &mut fresh.chan_doms);
     freshen_expr_type_slots(&mut clone, cutoff, FreshenLevel::Preserve, &mut fresh);
-
-    // `Clone` copies `node_id`, so every node in this clone currently shares
-    // the original definition's id — N specializations would collide on one id,
-    // breaking any post-inference index keyed by `NodeId`. Mint a fresh id for
-    // every cloned node. This is a dedicated walk scoped to monomorphization
-    // (not folded into the shared `freshen_expr_type_slots`, which also runs on
-    // refinement-predicate copies outside any mono context). It covers the
-    // `walk_children` domain only — predicate-embedded ids, reachable through
-    // type slots, are outside the id domain and stay aliased.
-    freshen_clone_node_ids(&mut clone);
 
     // Pin the clone to the use's live instantiation type, two-way. Inward,
     // this drives the use site's accumulated bounds into the clone's

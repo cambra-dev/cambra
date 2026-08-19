@@ -489,6 +489,34 @@ impl LoweringContext {
         expr
     }
 
+    /// Record every node of a finished **refinement predicate** that nothing
+    /// else has explained.
+    ///
+    /// A predicate is assembled from sub-expressions that were lowered — and so
+    /// recorded — in the main tree, plus the nodes minted and copied to join them
+    /// up. Sealed into a `Refinement` it lives in a *type slot*, outside the
+    /// `walk_children` domain, so those assembly nodes have no leaf of their own
+    /// and the widened `collect_tree_ids` would report them `Unexplained`.
+    ///
+    /// Call this on the predicate **immediately before** handing it to
+    /// `ccl_utils::refined_data_fun`, which is the single point a lowering
+    /// predicate is born. Nodes already recorded keep their own precise
+    /// attribution — see [`lowering_predicate_leaf`].
+    ///
+    /// [`lowering_predicate_leaf`]: crate::ccl::lineage::lowering_predicate_leaf
+    pub(super) fn tag_predicate(&mut self, pred: &Expr, span: Span, label: RewriteLabel) {
+        fn go(e: &Expr, span: Span, label: RewriteLabel) {
+            crate::ccl::lineage::lowering_predicate_leaf(
+                e.node_id(),
+                span,
+                Nature::Machinery,
+                label,
+            );
+            e.walk_children(|c| go(c, span, label));
+        }
+        go(pred, span, label);
+    }
+
     /// Mint a fresh `{prefix}_{id}` name from the monotonic synthetic-id
     /// counter, bumping it so every minted name is distinct within a lowering.
     /// The `fresh_*` methods below wrap this, each fixing its own `prefix`.
