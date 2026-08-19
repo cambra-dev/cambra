@@ -476,16 +476,30 @@ pub enum Builtin {
     /// rewrites the pair to an [`Self::AsOf`] join, which supplies the position. The two
     /// are one construct in two stages, which is why they share the name.
     ///
-    /// The stage exists so that an as-of read and a completeness read are **different
-    /// terms**. Both reduce the same `Fun(Txn, V)` history, and spelling the as-of one
-    /// [`Self::FinalOrDefault`] made them differ only in position — which does not survive
-    /// the passes that legitimately move a read (`channelize` copies a channel's captured
-    /// bindings inside the channel), so an `await_final` could land where the rewrite
-    /// matches. It also makes a *missed* rewrite loud: an unpaired `as_of_read` is rejected
-    /// after the rewrite instead of compiling to a completeness read that waits forever.
+    /// The stage exists so that an as-of read and a terminal read are **different terms**.
+    /// Both sample the same `Fun(Txn, V)` history and differ only in the position sampled, so
+    /// a single term for the pair would separate them by position alone — which does not
+    /// survive the passes that legitimately move a read (`channelize` copies a channel's
+    /// captured bindings inside the channel), letting an `await_final` land where the rewrite
+    /// matches. Distinct terms also make a *missed* rewrite loud: an unpaired `as_of_read` is
+    /// rejected after the rewrite rather than compiling to a read that waits forever.
     ///
     /// Minted post-inference, so it carries its own recorded type and has no scheme.
     AsOfRead,
+
+    /// `final_read : (Txn ⇒ 𝑉) ⇒ 𝑉` — the **terminal read** of a transactional mutable
+    /// variable: its value at the position its own writers finish.
+    /// [`crate::ccl::transact_phase`] mints it for a surface [`Self::AwaitFinal`] marker,
+    /// naming the mutable variable's history binding.
+    ///
+    /// Like [`Self::AsOfRead`] it is a *sample* of the carried value rather than a
+    /// reduction of a stream, so it takes no seed operand — tick 0 of every store is its
+    /// keys' seeds. Unlike `AsOfRead` it needs no pairing: the position comes from the
+    /// store's own closure rather than from a reading loop, so it reaches op-conversion
+    /// and compiles to the `StoreFinalRead` tile operator.
+    ///
+    /// Minted post-inference, so it carries its own recorded type and has no scheme.
+    FinalRead,
 
     /// `as_of : Tuple(Fun(B, _), Fun(Txn, V)) → Fun(B, V)` — the **as-of
     /// (temporal) join**, the live cross-endpoint read. Applied as a tupled
@@ -601,6 +615,7 @@ impl Builtin {
             Self::AwaitFinal => "await_final",
             Self::Copair => "copair",
             Self::AsOfRead => "as_of_read",
+            Self::FinalRead => "final_read",
             Self::AsOf => "as_of",
             // The arm index is rendered by `symbolic` (a `&'static str` cannot
             // carry it); this bare name is the fallback for other callers.

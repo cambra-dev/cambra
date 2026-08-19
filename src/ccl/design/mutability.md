@@ -969,20 +969,25 @@ unreferenceable-after rule are specified in the
 model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the commit-domain analog of
 loop completion — a **completeness** edge on the `Txn` domain.
 
-The realization is **coarser than that contract**: completion is a property of the whole store, so
-an await settles once every writer of the *store* has drained rather than every writer of `𝑥`, and a
-variable whose own writers are finite hangs on a store-mate's live writer. Two changes close the
-gap, both toward per-key completion. The store would have to know which writers may write each key —
-`WriterSite::write_keys` holds that at the CCL level, and only the per-writer terminal flags reach
-`CommitEngine` — and the completeness read would have to reduce the key's *change* stream, whose
-entries are the ticks that wrote `𝑥`, rather than its carry stream, which gains an entry at every
-tick any store-mate commits.
+**A sample, not a reduction.** A `Txn` read takes the key's carried value at some commit
+position, and this read's position is where `𝑥`'s writers finish. `await_final(𝑥)` becomes
+`final_read(𝑥.history)`, which op-conversion compiles to `StoreFinalRead` over the store branch.
+That operator takes the same sample the fed-out as-of read does, through the same `store_current`;
+the two differ in what fixes the position — a trigger's arrival there, the store's own closure here.
+Neither term carries a seed operand, because tick 0 of every store is its keys' seeds.
 
-**No new engine.** `await_final(𝑥)` becomes `final_or_default(𝑥.history, init)` — the only
-application of `final_or_default` to a `Txn` history (a fed-out read is an `as_of_read`; see the
-CHL spec, [reads](../../../docs/chl-spec.md#83-reads)) — compiled through the existing
-`final_or_default → ExtractFinal` path over the key's `StoreValueStream`. The fed-out as-of read
-pulls that same stream and differs only in the reducer: fold-to-final vs. sample-at-trigger.
+Completion is **coarser than the contract**: `StoreFinalRead` waits for the whole store, so an
+await settles once every writer of the *store* has drained rather than every writer of `𝑥`, and a
+variable whose own writers are finite waits on a store-mate's live writer. Closing the gap takes one
+fact and one disjunct: the store publishes which keys can no longer be written, computed from the
+per-writer write footprints `WriterSite::write_keys` holds at the CCL level, and the operator's gate
+becomes that fact or the store's own closure.
+
+A key **no writer site writes** never reaches the operator. `resolve_writer_free_awaits` replaces
+its await with its seed, its write history being statically empty. That covers a variable no block
+mentions and a variable some block only reads — a footprint key under `{reads ∪ writes}`, whose
+runtime completion would otherwise wait on writers that cannot write it
+(`a_read_only_mentioned_key_completes_while_a_live_writer_runs`).
 
 `resolve_await_finals` mints the read at the await's own site, and placement then needs no
 await-specific logic: the resolved read names the history binding, which is already how a statement
@@ -996,8 +1001,7 @@ captured bindings inside the channel it closes, which lands a bound await's read
 (`f = await_final(pool)`, read by a feed loop) directly above the broadcast, where the rewrite
 matches (`await_final_bound_then_read_in_a_feed_loop_stays_final`). Distinct terms also make a
 missed pairing loud: an unpaired `as_of_read` is rejected at the end of the rewrite, where spelling
-it `final_or_default` compiled it to a completeness read that waits for a store nothing will
-drain.
+it `final_read` would compile it to a terminal read that waits for a store nothing will drain.
 
 The operand is the mutable variable **handle** — the third position alongside a pass-by-reference
 argument and a write target (["A mutable variable read is an explicit

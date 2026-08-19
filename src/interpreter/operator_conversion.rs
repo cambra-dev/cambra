@@ -23,7 +23,8 @@ use crate::{
         // node-field carrier imported from `ccl` above).
         commit_operator::{
             AsOf, AsOfField, BodyInputBuffer, BodyInputSource, CommitOperator, InductionStore,
-            StoreDenseRead, StoreValueStream, TransactWriter as CommitWriter, WriterBuffer,
+            StoreDenseRead, StoreFinalRead, StoreValueStream, TransactWriter as CommitWriter,
+            WriterBuffer,
         },
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
@@ -1022,6 +1023,24 @@ fn convert_impl_inner(
             ))
         }
 
+        // `final_read` is the terminal read of a commit key: a sample of the key's carried
+        // value at the position its own writers finish. Unlike `as_of_read` it needs no
+        // pairing — the position comes from the store's closure, not from a reading loop —
+        // so it is compiled here, to a `StoreFinalRead` over the store branch.
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::FinalRead) =>
+        {
+            expect_no_input(input, "final_read")?;
+            let Some((store_name, field)) = as_store_read(argument, ctx) else {
+                return Err(ConversionError::Unsupported(
+                    "final_read's operand is not a store history binding — `transact_phase` \
+                     mints it naming one (src/ccl/design/mutability.md, \"`await_final`\")"
+                        .into(),
+                ));
+            };
+            convert_store_final_read(&store_name, &field, ctx)
+        }
+
         // `await_final` is a surface marker: `transact_phase` replaces each occurrence
         // with `final_or_default` over the mutable variable's history binding (or, for a
         // writer-free mutable variable, with its seed). Reaching this arm means a marker
@@ -1032,7 +1051,7 @@ fn convert_impl_inner(
         {
             Err(ConversionError::Unsupported(
                 "await_final (the terminal mutable variable read) reached operator conversion — \
-                 `transact_phase` must resolve it to a completeness read over the mutable variable's \
+                 `transact_phase` must resolve it to a terminal read over the mutable variable's \
                  history binding (src/ccl/design/mutability.md, \"`await_final`\") before this pass"
                     .into(),
             ))
@@ -1862,6 +1881,54 @@ fn as_of_snapshot_fields(
             })
         })
         .collect()
+}
+
+/// The `(store, field)` of a `__reg.field` read on a registered store, if `e` is one.
+/// The same shape the generic `Apply`/`Proj` arm matches, factored out so the
+/// `FinalRead` arm can recognise its own operand.
+fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, String)> {
+    let TypedExprNode::Apply { argument, function } = &e.node else {
+        return None;
+    };
+    let (TypedExprNode::Var(name), TypedExprNode::Proj(ProjKey::Field(field))) =
+        (&argument.node, &function.node)
+    else {
+        return None;
+    };
+    ctx.lookup_store(name)?;
+    Some((name.clone(), field.clone()))
+}
+
+/// Compile a surface `await_final(x)` — a [`Builtin::FinalRead`] naming `x`'s history
+/// binding — as a [`StoreFinalRead`] over the store branch.
+///
+/// A commit store only: an induction accumulator's trailing read is a genuine reduction
+/// over its dense per-position stream, because a loop ends positionally rather than by a
+/// key's writers draining, and `transact_phase` never mints a `FinalRead` for one.
+fn convert_store_final_read(
+    store_name: &Name,
+    field: &str,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let info = ctx.lookup_store(store_name).ok_or_else(|| {
+        ConversionError::Unsupported(format!("unknown transactional store {store_name}"))
+    })?;
+    if info.kind != StoreReadKind::Commit {
+        return Err(ConversionError::Unsupported(format!(
+            "final_read on {store_name}.{field}, which is not a commit store — a terminal \
+             read is only minted for a `Mut(V, Txn)` key"
+        )));
+    }
+    let key = info.keys.get(field).ok_or_else(|| {
+        ConversionError::Unsupported(format!("unknown key {field} on store {store_name}"))
+    })?;
+    let (runtime_key, value_extent) = (key.runtime_key.clone(), key.value_extent.clone());
+    let fan = info.fan.clone();
+    Ok(Box::new(StoreFinalRead::new(
+        fan.branch(),
+        runtime_key,
+        value_extent,
+    )))
 }
 
 /// Compile a per-variable read `__reg.field` off a registered transactional

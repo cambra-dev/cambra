@@ -54,8 +54,8 @@
 //! [`rewrite_as_of_reads`] below — every such read, regardless of the reading
 //! loop's domain. The one **terminal** mutable variable read is the surface
 //! [`Builtin::AwaitFinal`] marker, which [`resolve_await_finals`] replaces with a
-//! `final_or_default` over the key's history binding. The two reads are **different
-//! terms** over the same history — [`Builtin::AsOfRead`] and `final_or_default` — so
+//! [`Builtin::FinalRead`] over the key's history binding. The two reads are **different
+//! terms** over the same history — [`Builtin::AsOfRead`] and [`Builtin::FinalRead`] — so
 //! neither pass can claim the other's read whatever the tree around it looks like. Each
 //! `to_<defer>` tap compiles to a per-commit value-stream (`body_tap_fields`).
 //! The in-block feed mirrors the induction phase's in-loop feeds
@@ -95,10 +95,10 @@ use crate::ccl::{
 /// live request stream, a finite loop, or a standalone singleton). There is no
 /// finiteness or standalone-vs-loop split.
 ///
-/// **A completeness read is a different term.** The walk below matches only
-/// [`Builtin::AsOfRead`], the term [`StorePlan::reads`] mints; a completeness read is a
-/// `final_or_default` ([`resolve_await_finals`]) and is not a chain element here whatever
-/// shape it sits in. Position would not be enough on its own: `channelize` copies a
+/// **A terminal read is a different term.** The walk below matches only
+/// [`Builtin::AsOfRead`], the term [`StorePlan::reads`] mints; a terminal read is a
+/// [`Builtin::FinalRead`] ([`resolve_await_finals`]) and is not a chain element here
+/// whatever shape it sits in. Position would not be enough on its own: `channelize` copies a
 /// channel's captured bindings inside the channel, which puts a bound await's read
 /// (`f = await_final(x)`, read by a feed loop) directly above a broadcast — the shape
 /// this walk matches.
@@ -649,7 +649,14 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     // no-site early return below safe: `await_final(pool)` with no `with begin():`
     // anywhere is that same program with `sites` empty.
     let mut stripped = stripped;
-    resolve_writer_free_awaits(&mut stripped, &key_names);
+    // Gated on the **write** footprints, not on `key_names`: a key some block only
+    // reads is a footprint key (`{reads ∪ writes}` is one store) yet nothing can write
+    // it, so its final value is statically its seed just as an untouched variable's is.
+    let written_keys: Vec<Name> = sites
+        .iter()
+        .flat_map(|s| s.write_keys.iter().cloned())
+        .collect();
+    resolve_writer_free_awaits(&mut stripped, &written_keys);
 
     if sites.is_empty() {
         assert!(
@@ -700,7 +707,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
         .map(|k| (k.clone(), Name::fresh(k.base())))
         .collect();
 
-    // Resolve every `await_final` marker to a completeness read over its mutable variable's
+    // Resolve every `await_final` marker to a terminal read over its mutable variable's
     // history binding, seeds first. A seed is resolved to a *fixpoint* because one seed
     // may await a mutable variable whose own seed is an await (phase separation, chained); that
     // terminates because a seed can only await a mutable variable declared above it, so the
@@ -767,7 +774,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
         .collect();
 
     let out = splice_stores(stripped, &stores, &key_init, cross);
-    // Every `await_final` marker was resolved to a completeness read over a history
+    // Every `await_final` marker was resolved to a terminal read over a history
     // binding. A survivor would be a marker on a mutable variable this phase did not fold
     // into a key — it has no history to complete — and would reach op-conversion's
     // deliberate-error arm as an opaque builtin instead of being diagnosed here.
@@ -1638,28 +1645,30 @@ fn check_store_acyclicity(
     Ok(())
 }
 
-/// Resolve `await_final(x)` for a mutable variable **no writer site touches**: replace it
+/// Resolve `await_final(x)` for a mutable variable **no writer site writes**: replace it
 /// with `x`'s seed, read off `x`'s own `MutDecl`.
 ///
-/// Such a mutable variable has no commit history — no site proposes to it and none reads it,
-/// so it is not a footprint key and gets no history binding. Its history is
-/// statically the empty one, whose `final_or_default` is the default, i.e. the seed.
-/// The `MutDecl` itself is left in place, and `mut_elim` turns it into an ordinary `let`
-/// as it does any other.
-fn resolve_writer_free_awaits(e: &mut Expr, key_names: &[Name]) {
+/// Such a mutable variable's write history is statically empty, so its final value is its
+/// seed and no runtime completion has to be waited on. Two shapes reach here. One no site
+/// mentions at all is not a footprint key and gets no history binding. One a block only
+/// *reads* is a footprint key — `{reads ∪ writes}` is one store, which is why the `limit` a
+/// guard consults sits beside the `total` it guards — and its history binding simply goes
+/// unread by the await. The `MutDecl` itself is left in place either way, and `mut_elim`
+/// turns it into an ordinary `let` as it does any other.
+fn resolve_writer_free_awaits(e: &mut Expr, written_keys: &[Name]) {
     let mut awaited: Vec<Name> = Vec::new();
-    fn collect(e: &Expr, key_names: &[Name], out: &mut Vec<Name>) {
+    fn collect(e: &Expr, written_keys: &[Name], out: &mut Vec<Name>) {
         if let TypedExprNode::Apply { argument, function } = &e.node
             && matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))
             && let TypedExprNode::Var(reg) = &argument.node
-            && !key_names.contains(reg)
+            && !written_keys.contains(reg)
             && !out.contains(reg)
         {
             out.push(reg.clone());
         }
-        e.walk_children(|c| collect(c, key_names, out));
+        e.walk_children(|c| collect(c, written_keys, out));
     }
-    collect(e, key_names, &mut awaited);
+    collect(e, written_keys, &mut awaited);
     if awaited.is_empty() {
         return;
     }
@@ -2410,19 +2419,6 @@ fn fun_parts(ty: &Type) -> (Type, Type) {
     }
 }
 
-/// `final_or_default((stream, init)) : value_ty` — the current/final committed
-/// value of a scalar mutable variable's history, defaulting to `init`.
-fn final_or_default_read(stream: Expr, init: Expr, value_ty: Type) -> Expr {
-    let arg_ty = Type::Tuple(vec![stream.ty.clone(), init.ty.clone()]);
-    let mut arg = Expr::tuple(vec![stream, init]);
-    arg.ty = arg_ty.clone();
-    let mut lod = Expr::builtin(Builtin::FinalOrDefault);
-    lod.ty = Type::fun(arg_ty, value_ty.clone());
-    let mut app = Expr::apply(arg, lod);
-    app.ty = value_ty;
-    app
-}
-
 /// One site's **per-key commit view** — the point-free projection of its
 /// commit-record stream to `{time, write}` for one written key, eliminating the
 /// `` {`commit{𝑃} | `abort} `` decision with a one-arm `commit` read:
@@ -2861,7 +2857,7 @@ impl StorePlan {
     /// snapshot consistency for a reply that reads two variables.
     ///
     /// A key whose every read was an `await_final` has no reference left to bind:
-    /// [`resolve_await_finals`] already gave each await its own completeness read, so
+    /// [`resolve_await_finals`] already gave each await its own terminal read, so
     /// binding an as-of read here too would leave a second, unconsumed read on the
     /// store.
     fn reads(&self, key_init: &HashMap<Name, Expr>, body: &Expr) -> Vec<(TypedBinding, Expr)> {
@@ -3129,12 +3125,12 @@ fn relink_spine_body(mut node: Expr, inner: Expr) -> Expr {
 }
 
 /// Replace every `await_final(x)` marker — `x ▷ await_final` —
-/// with `x`'s completeness read over its history binding ([`read_key`]).
+/// with `x`'s terminal read over its history binding ([`final_key`]).
 ///
-/// This is the whole realization of the primitive: the reducing term already exists
-/// (`final_or_default`, the induction path's trailing read), and it reaches op-conversion
-/// as `ExtractFinal` over the key's
-/// [`StoreValueStream`](crate::interpreter::commit_operator::StoreValueStream).
+/// The read is a sample of the key's carried value, at the position `x`'s writers finish:
+/// [`Builtin::FinalRead`], reaching op-conversion as
+/// [`StoreFinalRead`](crate::interpreter::commit_operator::StoreFinalRead) over the store
+/// branch. It carries no seed, tick 0 of the store being its keys' seeds.
 ///
 /// What keeps this read distinct from a fed-out one is the **term**, not where it sits:
 /// a fed-out read is [`Builtin::AsOfRead`], the only thing [`rewrite_as_of_reads`]
@@ -3158,22 +3154,37 @@ fn resolve_await_finals(e: &mut Expr, hist: &HashMap<Name, Name>, key_init: &Has
     e.walk_children_mut(|c| resolve_await_finals(c, hist, key_init));
 }
 
-/// `final_or_default(reg_k, init)` — key `k`'s **completeness** read: its whole history
-/// reduced to the last committed value, or the seed if it never committed. The one
-/// application of `final_or_default` to a commit history, minted only for an
-/// [`Builtin::AwaitFinal`] marker.
+/// `final_read(reg_k)` — key `k`'s **terminal read**: its value at the position its own
+/// writers finish. Minted only for a [`Builtin::AwaitFinal`] marker.
+///
+/// No seed operand, for the same reason [`as_of_read`] has none: this samples the carried
+/// value, and tick 0 of every store is its keys' seeds. The key's `init` is still read
+/// here, for its *type* — the value type of the history the read names — and not as a
+/// term. A key no writer site writes never reaches here at all:
+/// [`resolve_writer_free_awaits`] has replaced its await with the seed.
 fn final_key(k: &Name, hist: &HashMap<Name, Name>, key_init: &HashMap<Name, Expr>) -> Expr {
     let init = key_init.get(k).cloned().expect("key init present");
     let v = mut_var_value_ty(&init.ty);
-    final_or_default_read(tvar(&hist[k], history_ty(&v)), init, v)
+    sampling_read(&hist[k], v, Builtin::FinalRead)
 }
 
 /// `as_of_read(reg_k)` — a key's **as-of read**, awaiting the reading loop
 /// [`rewrite_as_of_reads`] pairs it with. No seed operand: the sampled position always
 /// has a value, because tick 0 of every store is its keys' seeds.
 fn as_of_read(hist: &Name, value_ty: Type) -> Expr {
+    sampling_read(hist, value_ty, Builtin::AsOfRead)
+}
+
+/// `⟨sample⟩(hist_k)` — a read of key `k`'s history that samples its carried value, applied
+/// to the history binding and carrying its own recorded type.
+///
+/// The two such reads differ only in which builtin names the sampling position:
+/// [`Builtin::AsOfRead`] leaves it to the reading loop [`rewrite_as_of_reads`] pairs the read
+/// with, [`Builtin::FinalRead`] takes the point the key's own writers finish. Neither takes a
+/// seed operand, tick 0 of every store being its keys' seeds.
+fn sampling_read(hist: &Name, value_ty: Type, sample: Builtin) -> Expr {
     let stream = tvar(hist, history_ty(&value_ty));
-    let mut sample = Expr::builtin(Builtin::AsOfRead);
+    let mut sample = Expr::builtin(sample);
     sample.ty = Type::fun(stream.ty.clone(), value_ty.clone());
     let mut app = Expr::apply(stream, sample);
     app.ty = value_ty;

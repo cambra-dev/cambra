@@ -1760,6 +1760,117 @@ impl TileProducer for StoreValueStreamProducer {
     }
 }
 
+/// The **terminal read** of a transactional mutable variable: `key`'s value at the
+/// position its own writers finish, or the store's seed if no commit wrote it.
+///
+/// A Txn read samples the key's carried value; this one's position is where the key
+/// closes. It takes the same sample [`AsOf`] does, through the same
+/// [`store_current`] — the difference is what fixes the position: a trigger arrival
+/// there, the store's own closure here. So it is neither a reduction nor a
+/// projection of the history, and needs no seed operand, because tick 0 of the
+/// changelog holds the seed.
+pub struct StoreFinalRead {
+    /// Output tiling `Scalar(V)` — a terminal read is one value, not a stream.
+    tiling: Tiling,
+    /// The commit store (a [`Tile::Store`] fan branch).
+    store_op: Box<dyn TileOperator>,
+    /// The key whose settled value this reads.
+    key: Value,
+    value_extent: Extent,
+}
+
+impl StoreFinalRead {
+    pub fn new(store_op: Box<dyn TileOperator>, key: Value, value_extent: Extent) -> Self {
+        Self {
+            tiling: Tiling::Scalar(value_extent.clone()),
+            store_op,
+            key,
+            value_extent,
+        }
+    }
+}
+
+impl TileOperator for StoreFinalRead {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("store", self.store_op.inspect(opts))
+    }
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        mut consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        // Forward store progress downstream, as [`StoreValueStream`] does: the key is
+        // not settled until the store says so, and the consumer has to be woken to
+        // re-pull when that happens. Kick once to start the drain loop.
+        let consumer = Rc::new(RefCell::new(move || consumer.notify()));
+        consumer.borrow_mut().notify();
+        let g = self.store_op.tiling().universal_guard();
+        let store_producer = self
+            .store_op
+            .subscribe(g, Box::new(consumer.clone()), scheduler);
+        Box::new(StoreFinalReadProducer {
+            base: ProducerBase::new(StoreFinalReadProducer::alloc_id(), &self.tiling),
+            store_producer,
+            key: self.key.clone(),
+            value_extent: self.value_extent.clone(),
+            released: false,
+        })
+    }
+}
+
+struct StoreFinalReadProducer {
+    base: ProducerBase,
+    store_producer: Box<dyn TileProducer>,
+    key: Value,
+    value_extent: Extent,
+    /// Whether the consumer has released this read. A scalar has one position, so a
+    /// release is total and the value must not come back out after it.
+    released: bool,
+}
+
+impl TileProducer for StoreFinalReadProducer {
+    fn base(&self) -> &ProducerBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut ProducerBase {
+        &mut self.base
+    }
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        if self.released {
+            return self.tiling().empty_tile();
+        }
+        let sg = self.store_producer.tiling().universal_guard();
+        let store = self.store_producer.get(sg);
+        if !store.is_terminal() {
+            // A writer may still commit, so the key has no settled value to report.
+            // An empty scalar is non-terminal, so the consumer pulls again.
+            return self.tiling().empty_tile();
+        }
+        // `store_current` bounds the sample at the decided frontier; a key no commit
+        // wrote folds to tick 0's seed.
+        let value = store_current(&store, &self.key).map(|(_, v)| v);
+        Tile::Scalar(ColumnValue::from_values(
+            value.into_iter().collect(),
+            &self.value_extent,
+        ))
+    }
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // A universal release from the one consumer of a scalar retires this read, and
+        // releasing the store branch with it is safe: every other reader of the store
+        // holds its own guard through the fan, which the fan intersects, so the store
+        // reclaims a version only once all of them have released it too.
+        if obsolete_guard.is_universal() {
+            self.released = true;
+            self.store_producer
+                .release(self.store_producer.tiling().universal_guard());
+        }
+    }
+}
+
 /// A **dense** induction-accumulator read: `key`'s value at *every* position of
 /// the loop extent `D`, folded from the [`Tile::Store`] changelog —
 /// `Fun(D, V)` where position `p ↦ store_value_at(store, p, key)` (carry-forward,

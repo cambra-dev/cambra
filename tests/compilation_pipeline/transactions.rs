@@ -1766,6 +1766,58 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     );
 }
 
+/// A key a block only **reads** has a statically empty write history, so its terminal read
+/// is its seed — settled even while a live writer keeps that store open.
+///
+/// `{reads ∪ writes}` is one store (`src/ccl/design/mutability.md`, "How many commit stores
+/// a program has"), so `limit` shares `total`'s commit clock though nothing writes `limit`.
+/// `resolve_writer_free_awaits` gates on the **write** footprints for exactly this reason:
+/// gated on footprint keys instead, `limit` would reach a runtime completion read and wait
+/// on a store that never closes. The store-count assertion pins the two keys together —
+/// without it the program could pass by being partitioned instead.
+#[test]
+fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
+    let code = indoc! {r#"
+        total: Mut(Int, Txn) := 0
+        limit: Mut(Int, Txn) := 100
+        for req in source1():
+            with begin():
+                total := total + req + limit
+        await_final(limit)
+    "#};
+
+    let mut ctx = GlobalContext::default();
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(src.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    assert_eq!(
+        stores_in(&compiled.ast),
+        vec!["Txn[total,limit]"],
+        "the read must put both keys in one store, or this tests nothing"
+    );
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let ug = producer.tiling().universal_guard();
+
+    src.borrow_mut()
+        .add_data(&[(Value::UInt(0), Value::Int(5))]);
+    ctx.scheduler().check_for_notifications();
+    let mut result = producer.get(ug.clone());
+    for _ in 0..64 {
+        result = producer.get(ug.clone());
+    }
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::Ints(vec![100])),
+        "nothing writes `limit`, so its terminal read is its initializer even though \
+         `total`'s live writer keeps the store open; got {result:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Read rules and rejected shapes
 // ---------------------------------------------------------------------------
