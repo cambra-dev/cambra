@@ -115,11 +115,7 @@ pub fn run(mut expr: Expr) -> Expr {
     // the `Apply(_, Iterate)` / `Apply(_, Restrict)` markers just inserted,
     // so the only rules that fire here are the always-safe cleanups (plus
     // any reduction of a fully marker-free sub-tree, which is sound).
-    let mut expr = simplify(expr);
-    // Compilation rebuilt the immutable predicate on each node's `expr.ty`;
-    // re-sync every `Cast`'s `target` slot so the post-planning typecheck's
-    // reconstruction (which reads `target`) matches the compiled recorded type.
-    ccl_utils::sync_cast_targets(&mut expr);
+    let expr = simplify(expr);
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
     // such read is already an `as_of` join — nothing to do at planning time.
@@ -280,7 +276,7 @@ pub(crate) mod test_helpers {
         }
     }
 
-    /// A **collection** arrow — what a let-bound list or comprehension has, and
+    /// A **collection** function — what a let-bound list or comprehension has, and
     /// what distinguishes an iteration source from a capability of the same shape.
     pub(crate) fn data_fun_ty(domain: Type, codomain: Type) -> Type {
         Type::data_fun(domain, codomain)
@@ -319,7 +315,7 @@ pub(crate) mod test_helpers {
     }
 
     /// Build a finite list literal `[1, 2, 3]` typed `[0, 2] ⤇ Int` — a list
-    /// literal is a collection, so its arrow is `Data`.
+    /// literal is a collection, so its kind is `Data`.
     pub(crate) fn list_123() -> Expr {
         let int = int_ty();
         Expr::list(vec![

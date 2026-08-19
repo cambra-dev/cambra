@@ -101,6 +101,12 @@ pub enum KindMerge {
     Data,
     /// A data/compute or multi-domain collision; deferred to coalesce.
     Conflict,
+    /// A kind variable nothing pinned. **Not** the same as `Compute`: nothing
+    /// *required* a capability here, so meeting or joining this with a resolved
+    /// kind yields that kind rather than a collision. It becomes `Compute` only
+    /// at coalesce, where the capability default applies because nothing else
+    /// determined it.
+    Unknown,
 }
 
 impl KindMerge {
@@ -110,32 +116,31 @@ impl KindMerge {
     /// `groupby` — are concrete-stamped `Data` at construction; a bare lambda is
     /// concrete `Compute` (a capability, `emit_lambda`). Only an *inferred* kind
     /// ([`FunKind::Var`](crate::ccl::ty::FunKind::Var) — a function parameter or a
-    /// freshened scheme kind) resolves from its bounds over the two-point lattice
-    /// `Data ⊑ Compute`: a `Compute` lower bound → `Compute`, a `Data` upper bound
-    /// (demand) → `Data`, both → the `Compute <: Data` conflict, neither → the
-    /// `Compute` capability default. No domain inspection is involved: a capability
-    /// supplied where a collection is demanded (e.g. `sum(λ x → x + 1)`) is a concrete
-    /// `Compute` value against a `Data` demand, rejected up front in
-    /// [`constrain_kind`](super::constrain) — it never reaches a var here.
+    /// freshened scheme kind) reaches the flags, and the two points are
+    /// incomparable, so those record *pins* rather than bounds: pinned to
+    /// `Compute` → `Compute`, to `Data` → `Data`, to both → the conflict, to
+    /// neither → [`KindMerge::Unknown`], which coalesce resolves to the `Compute`
+    /// capability default. No domain inspection is
+    /// involved: a capability supplied where a collection is demanded (e.g.
+    /// `sum(λ x → x + 1)`) is a concrete `Compute` value against a concrete `Data`
+    /// demand, rejected up front in [`constrain_kind`](super::constrain) — it
+    /// never reaches a var here.
     pub(super) fn of(kind: &crate::ccl::ty::FunKind) -> Self {
-        use crate::ccl::ty::FunKind;
+        use crate::ccl::ty::{FunKind, KindPin};
         match kind {
             FunKind::Compute => KindMerge::Compute,
             FunKind::Data => KindMerge::Data,
-            FunKind::Var(v) => {
-                let b = v.bounds.borrow();
-                match (b.forced_compute, b.forced_data) {
-                    (true, true) => KindMerge::Conflict,
-                    // A var demanded as data with no compute lower bound is `Data`
-                    // (e.g. a parameter used only as a collection). A capability
-                    // flowing in would carry a concrete `Compute`, forcing the
-                    // `(true, _)` arms or failing at `constrain_kind` first.
-                    (false, true) => KindMerge::Data,
-                    (true, false) => KindMerge::Compute,
-                    // Unconstrained → `Compute` (a capability is the default).
-                    (false, false) => KindMerge::Compute,
-                }
-            }
+            FunKind::Var(v) => match v.pin() {
+                KindPin::Conflict => KindMerge::Conflict,
+                // A var pinned only as data is `Data` (e.g. a parameter used only
+                // as a collection). A capability flowing in would carry a concrete
+                // `Compute`, reaching `KindPin::Conflict` or failing at
+                // `constrain_kind` first.
+                KindPin::Data => KindMerge::Data,
+                KindPin::Compute => KindMerge::Compute,
+                // Unpinned: not yet an answer — see `KindMerge::Unknown`.
+                KindPin::Unpinned => KindMerge::Unknown,
+            },
         }
     }
 }
@@ -199,29 +204,35 @@ impl CompactFun {
         };
         let (kind, domains) = if a.kind == Conflict || b.kind == Conflict {
             (Conflict, widest(a.domains, b.domains))
+        } else if a.kind == Unknown || b.kind == Unknown {
+            // Nothing required a kind on one side, so the other side's answer
+            // stands — at either polarity, and with the domains combined the way
+            // that answer calls for.
+            let kind = if a.kind == Unknown { b.kind } else { a.kind };
+            let domains = if pol && kind == Data {
+                union_domains(a.domains, b.domains)
+            } else if a.domains.len() == 1 && b.domains.len() == 1 {
+                meet(a.domains, b.domains)
+            } else {
+                widest(a.domains, b.domains)
+            };
+            (kind, domains)
         } else if pol {
             // Positive (join).
             match (a.kind, b.kind) {
                 (Data, Data) => (Data, union_domains(a.domains, b.domains)),
                 (Compute, Compute) => (Compute, meet(a.domains, b.domains)),
-                // Data ⊔ Compute: an honest upcast to a callable (Compute) iff
-                // the data side is a single domain; collapsing several alternatives
-                // to a meet would drop domains → Conflict.
-                _ => {
-                    if a.domains.len() == 1 && b.domains.len() == 1 {
-                        (Compute, meet(a.domains, b.domains))
-                    } else {
-                        (Conflict, widest(a.domains, b.domains))
-                    }
-                }
+                // `Data ⊔ Compute` has no answer. The kinds are incomparable, so
+                // neither arm stands in for the other, and the contravariant meet
+                // the compute reading would take is row loss on the data one.
+                _ => (Conflict, widest(a.domains, b.domains)),
             }
+        } else if a.kind != b.kind {
+            // Negative (meet): `Data ⊓ Compute` has no answer either — one
+            // position cannot require both readings of a function.
+            (Conflict, widest(a.domains, b.domains))
         } else {
-            // Negative (meet): the stronger contract wins (Data if either is).
-            let k = if a.kind == Data || b.kind == Data {
-                Data
-            } else {
-                Compute
-            };
+            let k = a.kind;
             if a.domains.len() == 1 && b.domains.len() == 1 {
                 (k, meet(a.domains, b.domains))
             } else {

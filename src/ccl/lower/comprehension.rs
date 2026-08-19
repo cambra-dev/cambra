@@ -308,8 +308,16 @@ pub(super) fn lower_list_comp(
         // whichever of them is the comprehension's root is re-tagged as the
         // expression's direct image by `lower_expr`.
         let element_span = comp.element.span;
+        // The lambda under the cast is the *same collection* the cast re-views,
+        // so it carries the same `Data` provenance stamp the unfiltered branch
+        // puts on its lambda (below). The cast target's `Data` alone is not
+        // enough: a cast re-views its value at the target's kind, so a `Compute`
+        // lambda underneath is a second, contradictory answer to what this function
+        // is — one that survives into elimination, where the point-free form of
+        // the collection inherits the lambda's kind and reads as a capability.
         let unrefined_lambda = ctx.tag_machinery(
-            Expr::lambda(outer_var, Type::Hole, body_expr),
+            Expr::lambda(outer_var, Type::Hole, body_expr)
+                .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
             element_span,
             lc,
         );
@@ -320,8 +328,9 @@ pub(super) fn lower_list_comp(
         // domain): stamp it `Data` by provenance. The `data_fun(_, _)` annotation
         // is a concrete-kind stamp (`emit_node`), the unfiltered counterpart of
         // the filtered branch's `refined_data_fun` (also `Data`) cast target — so a
-        // comprehension is data-by-construction, not by a domain guess. (Filtered
-        // comprehensions above already get `Data` from their cast.)
+        // comprehension is data-by-construction, not by a domain guess. (The
+        // filtered branch above stamps its own lambda the same way, under a cast
+        // whose `refined_data_fun` target then refines the domain.)
         Ok(ctx.tag_machinery(
             Expr::lambda(outer_var, Type::Hole, body_expr)
                 .with_user_annotation(Type::data_fun(iter_dom.unwrap_or(Type::Hole), Type::Hole)),
@@ -393,15 +402,22 @@ fn float_comp_source_case(
     }
     // Concrete source: `source ≫ (λ x → body)` — a `Compose`, *not* the apply
     // chain Phase 5 builds. The compose form is equivalent (a map applies the
-    // body to each element) but `emit_compose` stamps it with the *source's*
-    // data kind (a map over a collection is itself a collection). That data kind
-    // is what lets two such arms of a conditional source join as collections
-    // (compiled by the gate fan-out) rather than colliding as compute-kinded
-    // lambdas whose index domains would meet.
+    // body to each element) and is the shape the gate fan-out downstream reads.
+    //
+    // Stamped `Data` here, by the site that knows: a floated arm is a map over
+    // its own source, so it is a collection. That is what lets two such arms of
+    // a conditional source join as collections rather than colliding as
+    // capabilities whose index domains would meet — and saying it on the node
+    // lowering mints is what keeps it from being decided by whoever consumes it.
     let body = fan_out_copy(body, body_used, "lower.comp_source_case_body");
     let cs = "lower.comp_source_case";
     let elem_map = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body), span, cs);
-    ctx.tag_machinery(Expr::compose(vec![source, elem_map]), span, cs)
+    ctx.tag_machinery(
+        Expr::compose(vec![source, elem_map])
+            .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
+        span,
+        cs,
+    )
 }
 
 /// Fan out a single-generator comprehension whose *element* is a value-`Case`
@@ -444,8 +460,16 @@ fn fan_out_element_case(
             let read = ctx.tag_machinery(Expr::apply(idx_var, arm_src), span, ec);
             let arm_body = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, b.body), span, ec);
             let applied = ctx.tag_machinery(Expr::apply(read, arm_body), span, ec);
-            let elem_map =
-                ctx.tag_machinery(Expr::lambda(outer_var, Type::Hole, applied), span, ec);
+            // The arm *is* a filtered comprehension — a collection — so it carries
+            // the `Data` stamp, like every other comprehension lambda. The cast
+            // below refines its domain by the arm's gate; the target's `Data`
+            // does not reach the lambda underneath.
+            let elem_map = ctx.tag_machinery(
+                Expr::lambda(outer_var, Type::Hole, applied)
+                    .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
+                span,
+                ec,
+            );
             // Gate over the source domain: `__elem ▷ src ▷ (λ x → π̂ᵢ)` — the bare
             // refinement predicate, matching Phase 6's loop-join filter shape.
             let gate_on_source = Expr::apply(

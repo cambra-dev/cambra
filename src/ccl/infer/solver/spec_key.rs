@@ -124,7 +124,7 @@ struct KeyView {
     /// type-blind structural equality. Order is insertion order, so equality
     /// compares these as a set.
     refinements: Vec<Refinement>,
-    /// Function contributions, **keyed by kind** so a compute arrow and a data
+    /// Function contributions, **keyed by kind** so a compute function and a data
     /// collection at one position stay distinguishable rather than one shadowing
     /// the other — exactly as [`history`](Self::history) is keyed by
     /// [`HistoryKind`]. Each maps to `(domain, codomain)`.
@@ -250,6 +250,9 @@ impl fmt::Display for KeyView {
                 KindMerge::Data => "⤇",
                 KindMerge::Compute => "⇒",
                 KindMerge::Conflict => "⇒!",
+                // Never reaches a key (`key_go` resolves it to the capability
+                // default), but `KeyView` renders whatever it is handed.
+                KindMerge::Unknown => "⇒?",
             };
             parts.push(format!("({d} {arrow} {c})"));
         }
@@ -399,10 +402,20 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let cod = key_go(codomain, pol, &cod_acc, ctx);
             // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
-            // so keying on it would split every use; its *bounds* are the answer, and
+            // so keying on it would split every use; its pins are the answer, and
             // reading them here is what compaction does at the same point in the solve.
+            //
+            // An unpinned var keys as `Compute`, not as its own `Unknown`: nothing
+            // required a kind, so coalesce gives it the capability default, and the
+            // two would only ever differ before that. Keeping them apart would split
+            // a generic use from a concrete compute one over a distinction that does
+            // not reach the materialized type.
+            let key_kind = match KindMerge::of(kind) {
+                KindMerge::Unknown => KindMerge::Compute,
+                resolved => resolved,
+            };
             KeyView {
-                fun: BTreeMap::from([(KindMerge::of(kind), (Box::new(dom), Box::new(cod)))]),
+                fun: BTreeMap::from([(key_kind, (Box::new(dom), Box::new(cod)))]),
                 ..Default::default()
             }
         }
@@ -704,7 +717,7 @@ mod tests {
     /// a specialization pinned at `⤇` iterates a domain a `⇒` use does not supply — so
     /// a clone keyed on one must not serve a use of the other.
     ///
-    /// The kind reaches the key through `KindMerge::of`, so a concrete arrow keys by
+    /// The kind reaches the key through `KindMerge::of`, so a concrete function keys by
     /// what it *is*. An unresolved `FunKind::Var` resolves from its bounds like any
     /// other position, which is what keeps two uses of one generic binding sharing a
     /// clone instead of splitting on a per-instantiation variable identity.
@@ -715,8 +728,8 @@ mod tests {
             spec_key(&Type::data_fun(int(), int())),
             "a capability and a collection of the same shape must not share a clone"
         );
-        // An *unresolved* kind does not split: both uses read the same unbounded var
-        // through `KindMerge::of`, which answers `Compute` (the capability default).
+        // An *unresolved* kind does not split: both uses read the same unpinned var,
+        // which keys as the `Compute` default rather than as its own point.
         let unresolved = || Type::Fun {
             name: None,
             kind: crate::ccl::ty::FunKind::fresh_var(),
@@ -727,6 +740,12 @@ mod tests {
             spec_key(&unresolved()),
             spec_key(&unresolved()),
             "two fresh kind vars are the same unresolved answer, not two identities"
+        );
+        assert_eq!(
+            spec_key(&unresolved()),
+            spec_key(&Type::fun(int(), int())),
+            "an unpinned kind is the capability default, so it shares a clone with \
+             a concrete compute function rather than splitting off its own"
         );
         // And the merge keeps two concrete kinds apart rather than one shadowing the
         // other — what keying `fun` by `KindMerge` buys, and why it needs `Ord`.
@@ -745,7 +764,7 @@ mod tests {
         assert_eq!(
             merged.fun.len(),
             2,
-            "a compute and a data arrow at one position are distinct contributions: {merged}"
+            "a compute and a data function at one position are distinct contributions: {merged}"
         );
     }
 

@@ -1295,7 +1295,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // chain type, mirroring `emit_compose`: the chain's codomain is
                 // the final codomain, which may reference that binder, and the
                 // dependent-application discharge dispatches on the name —
-                // rebuilding with a bare arrow would silently drop the
+                // rebuilding with a bare function type would silently drop the
                 // dependence.
                 expr.ty = Type::Fun {
                     name: last_name.clone(),
@@ -2114,7 +2114,7 @@ pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
         && let Some(dom) = morphism.ty.domain()
         && let Some(cod) = morphism.ty.codomain()
     {
-        // A projection is non-dependent, so the rebuilt arrow keeps `name: None`.
+        // A projection is non-dependent, so the rebuilt function type keeps `name: None`.
         morphism.ty = Type::fun(recovered_input(&dom, input), cod);
     }
 }

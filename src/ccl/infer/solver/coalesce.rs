@@ -66,16 +66,18 @@ pub enum CoalesceError {
         /// Pretty representation of the conflicting function shapes.
         details: String,
     },
-    /// A single function slot whose kind resolved contradictorily: it was
-    /// demanded as a data domain (`forced_data`) while being — or being fed as
-    /// — a compute capability (a provably-scalar domain, or `forced_compute`).
-    /// This is the coalesce-time face of `Compute <: Data`, the counterpart of
-    /// [`super::constrain::ConstrainError::ComputeWhereDataRequired`] for the
-    /// case where the violation only becomes provable once the kind variable's
-    /// bounds and domain are resolved (e.g. summing a plain `Int ⇒ Int`
-    /// lambda). See `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions".
-    ComputeWhereDataRequired {
-        /// Pretty representation of the offending capability.
+    /// A single function slot whose kind resolved contradictorily: one kind
+    /// variable at [`crate::ccl::ty::KindPin::Conflict`].
+    ///
+    /// The two kinds are incomparable, so an edge between them is a rejection
+    /// wherever it is drawn; this is the coalesce-time face of
+    /// [`super::constrain::ConstrainError::KindMismatch`], for the case where the
+    /// violation only becomes provable once the variable's pins are all in
+    /// (a kind-polymorphic parameter used as a collection at one site and as a
+    /// capability at another). See `src/ccl/design/type-inference.md`,
+    /// "4.6 Data vs compute functions".
+    KindConflict {
+        /// Pretty representation of the offending function slot.
         details: String,
     },
 }
@@ -170,15 +172,14 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                     .collect::<Vec<_>>()
                     .join(" ⊔ ");
                 // A single surviving domain means one function slot whose kind
-                // resolved contradictorily: it was demanded as a data domain
-                // (`forced_data`) while being (or being fed as) a compute
-                // capability — the coalesce-time face of `Compute <: Data`.
+                // resolved contradictorily — one kind variable pinned to both
+                // points, the coalesce-time face of a `KindMismatch`.
                 // Two or more surviving domains mean a data function's domains
                 // would be dropped by collapsing to a compute meet (a genuine
                 // domain-join collision). See `src/ccl/design/type-inference.md`,
                 // "The domain join is a Σ".
                 if doms.len() <= 1 {
-                    return Err(CoalesceError::ComputeWhereDataRequired {
+                    return Err(CoalesceError::KindConflict {
                         details: format!("a compute function (capability) over {{{doms_s}}}"),
                     });
                 }
@@ -186,7 +187,11 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                     details: format!("a data function over {{{doms_s}}}"),
                 });
             }
-            KindMerge::Compute => {
+            // Nothing pinned this kind, so the capability default applies — the
+            // same shape as `Compute` below, decided here rather than at the
+            // merge, where "unrequired" still had to stay distinct from
+            // "required to be a capability" (`KindMerge::Unknown`).
+            KindMerge::Unknown | KindMerge::Compute => {
                 debug_assert_eq!(doms.len(), 1, "compute fun accumulated domain alternatives");
                 shapes.push(Type::Fun {
                     name: kept_name,
@@ -576,11 +581,11 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_single_domain_conflict_is_compute_where_data_required() {
+    fn coalesce_single_domain_conflict_is_a_kind_conflict() {
         use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
         // A `Conflict` over a *single* domain is one function slot demanded as a
         // data domain while being a compute capability — the coalesce-time face
-        // of `Compute <: Data`, reported as `ComputeWhereDataRequired` rather
+        // of a kind conflict, reported as `KindConflict` rather
         // than the multi-domain `DomainJoinConflict`.
         let graph = CompactGraph {
             term: CompactType {
@@ -596,7 +601,7 @@ mod tests {
         };
         assert!(matches!(
             coalesce_compact(&graph),
-            Err(CoalesceError::ComputeWhereDataRequired { .. })
+            Err(CoalesceError::KindConflict { .. })
         ));
     }
 

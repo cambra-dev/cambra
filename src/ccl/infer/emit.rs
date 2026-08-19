@@ -60,9 +60,10 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Loc
 fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
-    // The `Lambda` rule reads the node's own arrow for its kind (see
+    // The `Lambda` rule reads the node's own type for its kind (see
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
+    let has_ann = expr.user_annotation.is_some();
     let mut ty = match &mut expr.node {
         TypedExprNode::Lit(lit) => ctx.lit_singleton(lit),
 
@@ -145,7 +146,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             emit_proj(key, &seed, ctx)?
         }
 
-        TypedExprNode::List(elts) => emit_list(elts, ctx)?,
+        TypedExprNode::List(elts) => emit_list(elts, &recorded_ty, ctx)?,
 
         TypedExprNode::Case {
             scrutinee,
@@ -159,7 +160,20 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
         },
 
-        TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, ctx)?,
+        TypedExprNode::Compose(elts) => {
+            // A chain's kind is *decided where it is built*, never by what
+            // consumes it: lowering stamps the one shape it mints (a loop / a
+            // floated comprehension arm — both `Data`) with a `data_fun`
+            // annotation, and a later pass rebuilding a chain carries the
+            // original node's function type across. A chain with neither would fall to
+            // the `Compute` default silently, which is how a collection ends up
+            // reading as a capability.
+            debug_assert!(
+                has_ann || matches!(recorded_ty, Type::Fun { .. }),
+                "a Compose reached inference with no kind stamp: {label}"
+            );
+            emit_compose(elts, &recorded_ty, ctx)?
+        }
 
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
@@ -189,7 +203,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         }
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
-        TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, ctx)?,
+        TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, &recorded_ty, ctx)?,
 
         // `Transact` is born by `planning::plan_loops`, which runs *after*
         // inference, so constraint emission never sees one. Gathered
@@ -293,21 +307,22 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 }
 
 /// Stamp a concrete function **kind** from a *provenance-declaring* reference
-/// type onto a `target` function type. FunKind is a provenance property, not a
-/// function of the domain (see `KindMerge::of`, `src/ccl/infer/solver/compact.rs`),
-/// and a bare lambda is built `Compute` by construction (`emit_lambda`). The two
-/// sites that *declare* a lambda to be a data collection instead — a `data_fun`
-/// annotation on a comprehension / `groupby`, and a declared `Data` recurrence
-/// carrier on a `letrec` binder — carry a concrete (non-`Var`) function kind;
-/// this copies that kind onto the target so it is data by construction over *any*
-/// domain, rather than routed through `bind_annotation`/`require_sub` (which only
-/// draws a kind *edge* — and `Compute <: Data` is a hard reject, not a coercion).
-/// A concrete `Data` kind here is always lowering-internal or a declared carrier
-/// type — user function annotations are `Compute`/unkinded — so this never
-/// silently relabels a user's kind.
+/// type onto a `target` function type. FunKind is a provenance property decided
+/// at lowering, not a function of the domain (see `KindMerge::of`,
+/// `src/ccl/infer/solver/compact.rs`), and a bare lambda is built `Compute` by
+/// construction (`emit_lambda`). The two sites that *declare* a lambda to be a
+/// data collection instead — a `data_fun` annotation on a comprehension /
+/// `groupby`, and a declared `Data` recurrence carrier on a `letrec` binder —
+/// carry a concrete (non-`Var`) function kind; this copies that kind onto the
+/// target so it is data by construction over *any* domain, rather than routed
+/// through `bind_annotation`/`require_sub` (which only draws a kind *edge* — and
+/// the two kinds are incomparable, so an edge between them is a hard reject, not
+/// a coercion). A concrete `Data` kind here is always lowering-internal or a
+/// declared carrier type — user function annotations are `Compute`/unkinded — so
+/// this never silently relabels a user's kind.
 fn stamp_kind_from(target: &mut Type, reference: &Type) {
     use crate::ccl::ty::FunKind;
-    if let Type::Fun { kind: ref_kind, .. } = reference.peel_refinements()
+    if let Some(ref_kind) = reference.fun_kind()
         && !matches!(ref_kind, FunKind::Var(_))
         && let Type::Fun { kind, .. } = target
     {
@@ -509,9 +524,9 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
             Box::new(complete_annotation(base, inferred.peel_refinements())),
             r.clone(),
         ),
-        // The arrow's binder and kind come from the *annotation*, per the rule
+        // The binder and kind come from the *annotation*, per the rule
         // above: a kind is something an annotation can state (`List(T)` is a data
-        // arrow by construction), so it is a claim to keep rather than a shape to
+        // function by construction), so it is a claim to keep rather than a shape to
         // fill in.
         (
             Type::Fun {
@@ -626,20 +641,21 @@ pub(super) fn emit_lambda<C: Typing>(
     // reference it (see `coalesce_compact_go`) — so monomorphic output is
     // unchanged.
     //
-    // The rule derives the domain and the codomain; the **kind rides the node's
-    // own arrow**. Nothing about the parameter type or the body type says whether
-    // a `λ` denotes a collection or a capability — a comprehension's
-    // `λ __iter_record → __iter_record ▷ xs ▷ f` and a plain `λ x → x + 1` are the
-    // same node — so re-deciding it here would be inventing an answer the parts do
-    // not contain. A bare `λ` is born `Compute` (`Expr::lambda`); lowering marks a
-    // collection with a `data_fun` annotation, which `emit_node` resolves onto this
-    // type, and from then on the arrow carries its own kind. Reading it back is
-    // what makes the rule reproduce in Check rather than reconstruct a `Compute`
-    // the annotation had already settled.
+    // The rule derives the domain and the codomain; the **kind is inferred**. A
+    // `λ` node is the same node whether it denotes a collection or a capability —
+    // a comprehension's `λ __iter_record → __iter_record ▷ xs ▷ f` and a plain
+    // `λ x → x + 1` are indistinguishable *here* — so the rule says what it
+    // knows: a function of some kind. What decides it is everywhere the lambda is
+    // used or declared, and those are ordinary constraints: a `data_fun`
+    // annotation from lowering, a declared `Data` recurrence carrier, an
+    // aggregate's `Data` demand, a `Compute` parameter position. Each pins the
+    // variable at the edge where the claim is actually made
+    // (`constrain_kind`), and an unconstrained kind resolves to the capability
+    // default at coalesce (`KindMerge::of`).
     //
-    // Because a capability stays concrete `Compute`, one supplied where a
-    // collection is demanded (`sum(λ x → x + 1)`) is the plain `Compute <: Data`
-    // rejection in `constrain_kind` — no domain-shape guess is needed to catch it.
+    // In Check mode `recorded` is the node's resolved type, so reading the kind
+    // back reproduces what inference settled instead of minting a second
+    // variable that nothing would constrain.
     Ok(Type::Fun {
         name: Some(param.name.clone()),
         kind: match recorded {
@@ -655,12 +671,13 @@ pub(super) fn emit_lambda<C: Typing>(
 /// `target`, attaching `target`'s domain refinement `r` to `value`'s type.
 ///
 /// The rule decomposes `value`'s type into `D ⇒ V` and re-wraps the domain
-/// with `r`, yielding `{D | r} ⇒ V`. This is an upcast — the refined-domain
-/// function is a *supertype* of `value` (`D ⇒ V <: {D | r} ⇒ V` by
-/// contravariance, since `{D | r} <: D`) — but it is built *constructively*
-/// rather than as a bare `value <: target` obligation, because the refinement
-/// lattice is strict (`unrefined ⊀ refined`) so the value cannot flow *into*
-/// the refined target by subtyping. Re-wrapping the domain stacks `r` over any
+/// with `r`, yielding `{D | r} ⇒ V`. The refined-domain function is a
+/// *supertype* of `value`, but the rule builds it *constructively* rather than
+/// raising a bare `value <: target` obligation, and has to: the refinement
+/// lattice is strict (`unrefined ⊀ refined`), so the value cannot flow into the
+/// refined target by subsumption, and behind a data function — the kind a filtered
+/// comprehension's target carries — the domain is invariant, so contravariance
+/// supplies no edge either. Re-wrapping the domain stacks `r` over any
 /// refinements `value` already carries, so chained casts (nested list-comprehension
 /// filters) compose.
 ///
@@ -708,12 +725,9 @@ pub(super) fn emit_cast<C: Typing>(
     // comprehension / groupby a compute function again, and the aggregate that
     // consumes it would reject it as compute-where-data.
     // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
-    // still carries its arrow's kind, which a match on the raw target would drop
+    // still carries its kind, which a match on the raw target would drop
     // to the `Compute` default.
-    let kind = match target.peel_refinements() {
-        Type::Fun { kind, .. } => kind.clone(),
-        _ => FunKind::Compute,
-    };
+    let kind = target.fun_kind().cloned().unwrap_or(FunKind::Compute);
     // Preserve the value's Pi binder so the cast result stays a *named* function.
     // A dependent application of the cast then reconciles binders by the identity
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
@@ -1028,7 +1042,9 @@ pub(super) fn emit_feed<C: Typing>(
     // is no demand for a handle to be reconciled against — an undereferenced
     // `Mut(V, D)` would simply collide with a plain-`V` feed to the same channel.
     let value_ty = emit_value_read(value, ctx)?;
-    let contribution = fun(ctx.fresh(), value_ty);
+    // A **data** function: the contribution is one row of the channel's collection,
+    // and the channel it flows into is that collection (`constrain_into_feed`).
+    let contribution = Type::data_fun(ctx.fresh(), value_ty);
     constrain_into_feed(target_ty, &contribution, label, ctx)
 }
 
@@ -1065,10 +1081,14 @@ fn constrain_into_feed<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     match target_ty.as_feed() {
         Some((domain, value)) => {
-            // The channel is the history's `domain ⇒ value` stream; the
+            // The channel is the history's `domain ⤇ value` stream; the
             // contribution flows into it (`Fun(δ, elem)` for a feed, the whole
-            // collection for a define).
-            let rho = fun(domain.clone(), value.clone());
+            // collection for a define). A **data** function, matching the read view
+            // `constrain_go` reconstructs for an `Append` history — the stream
+            // *is* the accumulated collection, and the kinds are incomparable,
+            // so a `Compute` channel here would reject every collection fed into
+            // it.
+            let rho = Type::data_fun(domain.clone(), value.clone());
             ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
         }
         None => {
@@ -1087,7 +1107,7 @@ fn constrain_into_feed<C: Typing>(
             ctx.require_sub(target_ty, &required, &|| {
                 format!("feed target of {label} must be a feed handle")
             })?;
-            let rho = fun(rho_domain, rho_value);
+            let rho = Type::data_fun(rho_domain, rho_value);
             ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
         }
     }
@@ -1153,6 +1173,7 @@ pub(super) fn emit_copair<C: Typing>(
 /// records, so it is checked where it is relied on (`flat_merge`).
 pub(super) fn emit_disjoint_join<C: Typing>(
     exprs: &mut [Expr],
+    recorded: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     assert!(
@@ -1170,7 +1191,19 @@ pub(super) fn emit_disjoint_join<C: Typing>(
         ctx.require_sub(&dom, &dom_var, &|| "DisjointJoin domain".to_string())?;
         ctx.require_sub(&cod, &cod_var, &|| "DisjointJoin codomain".to_string())?;
     }
-    Ok(Type::data_fun(dom_var, cod_var))
+    // The kind rides the node's own function type, as at every other rebuilt shape
+    // (`emit_compose`). Only `lambda_elim` mints a `DisjointJoin` — it is the
+    // point-free form of a value-`Case` fan-out — so the type it stamped is the
+    // eliminated lambda's, and reconstructing a kind here instead would let this
+    // rule disagree with the pass that built the node. A join with no function type to
+    // read is a collection: the node *is* the merged map.
+    let kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data);
+    Ok(Type::Fun {
+        name: None,
+        kind,
+        domain: Box::new(dom_var),
+        codomain: Box::new(cod_var),
+    })
 }
 
 /// Aggregate (`Sum`, `Max`): the scheme is the full operator type
@@ -1366,7 +1399,7 @@ pub(super) fn emit_letrec<C: Typing>(
             // is a `Data` collection (an induction store indexed by the iteration
             // domain), it declares the value lambda's kind by provenance — stamp
             // it, so a `Compute`-by-construction accumulator body reconciles rather
-            // than tripping the `Compute <: Data` reject in `require_sub`.
+            // than tripping the kind-mismatch reject in `require_sub`.
             stamp_kind_from(&mut def_ty, &declared[i].1);
             stamp_kind_from(&mut def.ty, &declared[i].1);
             let label = b.name.clone();
@@ -1522,10 +1555,25 @@ pub(super) fn emit_proj<C: Typing>(
 
 pub(super) fn emit_list<C: Typing>(
     elts: &mut [Expr],
+    recorded: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
+    // A list literal is a collection where lowering mints it, and the kind rides
+    // the node's own function type from then on — the same rule as `emit_lambda` and
+    // `emit_compose`. Point-free rewriting is why the two can differ: eta
+    // contracting `λ i → xs(i)` to `xs` leaves the literal standing at a position
+    // typed as the morphism it replaced, denoting the same function. Reading the
+    // kind back reproduces what that position settled on instead of re-asserting
+    // `Data` over it.
+    let kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data);
+    let fun_ty = |domain, codomain| Type::Fun {
+        name: None,
+        kind: kind.clone(),
+        domain: Box::new(domain),
+        codomain: Box::new(codomain),
+    };
     if elts.is_empty() {
-        return Ok(Type::data_fun(Type::UIntRange(0), prim(BaseType::Unit)));
+        return Ok(fun_ty(Type::UIntRange(0), prim(BaseType::Unit)));
     }
     // Element type: the **join** of the elements, not a type the first one fixes and
     // the rest must equal. Every element flows one-way into a shared variable, so
@@ -1548,7 +1596,7 @@ pub(super) fn emit_list<C: Typing>(
     // appears in the list type. A list literal is a **data** function — its
     // domain is the index set, so a join with another collection may not narrow
     // it — see `src/ccl/design/type-inference.md`, "The domain join is a Σ".
-    Ok(Type::data_fun(Type::UIntRange(n), read_through(&first_ty)))
+    Ok(fun_ty(Type::UIntRange(n), read_through(&first_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified
@@ -1734,25 +1782,27 @@ pub(super) fn emit_compose<C: Typing>(
     // value-preserving prefixes — the same direct-vs-opaque boundary as the
     // dependent-apply discharge; nothing else reaches a dependent final
     // morphism today.) A morphism types as a function in both modes — Emit's
-    // `Proj`/`Lambda`/source rules all return an arrow — so the binder is read off
+    // `Proj`/`Lambda`/source rules all return a function type — so the binder is read off
     // directly; only the groupby shape puts a `Some` there.
     let last_name = match tys.last().expect("len >= 2").peel_refinements() {
         Type::Fun { name, .. } => name.clone(),
         _ => None,
     };
-    // The chain's kind **rides its own arrow**, like a lambda's (`emit_lambda`).
+    // The chain's kind **rides its own type**, like a lambda's (`emit_lambda`).
     // It is not the head morphism's: a head can be a re-indexing rather than a
     // decision — `id ≫ xs` and `.0 ≫ xs` denote the collection `xs` re-addressed,
     // not the capability `id`/`.0` — so reading the head would flatten every
     // multi-generator comprehension's columns to capabilities. A rewrite that
     // rebuilds a chain carries the original node's type across, which is what puts
-    // the right kind here to read. In Emit a chain lowered fresh has no arrow yet,
-    // and its kind is genuinely use-dependent: mint a fresh kind var so a
-    // `Data`-demanding consumer (an aggregate) forces it via `constrain_kind` and
-    // it otherwise resolves at coalesce.
+    // the right kind here to read.
+    //
+    // A chain lowered fresh has no function type yet; its kind arrives as the `data_fun`
+    // annotation lowering stamps on the node, which `emit_node` applies to this
+    // result. The value here is only the placeholder that stamp overwrites — it is
+    // not the answer, and `emit_node` asserts that an answer exists.
     let kind = match recorded.peel_refinements() {
         Type::Fun { kind, .. } => kind.clone(),
-        _ => FunKind::fresh_var(),
+        _ => FunKind::Compute,
     };
     Ok(Type::Fun {
         name: last_name,

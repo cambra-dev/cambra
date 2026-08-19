@@ -473,6 +473,13 @@ fn try_pairwise_in_compose(
         Expr::compose(elts)
     };
     expr.ty = ty;
+    // A `Cast` states its `FunKind` twice — on the node and on `target`, which is
+    // where its typing rule reads it — so writing the position's type above
+    // without the second copy leaves the node contradicting itself. Only the kind
+    // is carried across: the `target`'s *claims* are the cast's own assertion, and
+    // a rewrite that overwrote them with a type derived from the surrounding term
+    // would make the assertion track its own consumer.
+    crate::ccl::ccl_utils::sync_cast_target_kind(expr);
     expr.user_annotation = user_annotation;
     true
 }
@@ -746,7 +753,7 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             // Both are minted, and both span `g`'s domain, so they take
             // `mint_kind` (see `try_pairwise_in_compose`). This is the site that
             // makes `id`'s kind matter: `zip_pair_ty` reads the *first* operand's
-            // arrow, so a bare `Compute` here would propagate out through the zip
+            // kind, so a bare `Compute` here would propagate out through the zip
             // to every consumer of the rewritten chain — `id` is the unit of
             // composition and has no kind of its own to lend.
             let g_dom = g.ty.domain();

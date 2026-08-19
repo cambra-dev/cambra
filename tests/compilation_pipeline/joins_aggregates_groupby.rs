@@ -290,11 +290,11 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     //
     // These are **post-planning** types, so a `⇒` here does not mean inference
     // typed the collection as a capability: lambda elimination and planning are
-    // denotation-preserving but *not* kind-preserving — a reconstructed arrow is
+    // denotation-preserving but *not* kind-preserving — a reconstructed type is
     // canonicalized to `Compute` (`Type::without_pi_names`; see
     // `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions"). So
-    // the cases that keep `⤇` are the ones whose arrow rides through unrebuilt,
-    // and the `⇒` cases below are all arrows planning restructured (the
+    // the cases that keep `⤇` are the ones whose type rides through unrebuilt,
+    // and the `⇒` cases below are all functions planning restructured (the
     // `uncurry`/`map_domain` joins). Inference itself types every comprehension
     // here `⤇`, let-bound and multi-source sources included.
     "[x for x in [x for x in [x for x in [1,2,3]]]]",
@@ -347,9 +347,9 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     make_int_list(&[10, 20])
 )]
 #[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
-// The result arrow is **data** (`⤇`): a comprehension over a `groupby` is a
+// The result is **data** (`⤇`): a comprehension over a `groupby` is a
 // collection keyed by the group key, and elimination now carries that kind
-// across instead of rebuilding the arrow as a bare combinator `⇒`.
+// across instead of rebuilding the type as a bare combinator `⇒`.
 #[case(
     "[sum(x) for x in groupby([1,2,3,4], \\y -> y // 2)]",
     "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⤇ Int)",

@@ -170,7 +170,7 @@ pub(crate) fn zip_pair(f: Expr, g: Expr) -> Expr {
 ///
 /// Currying is denotation-preserving, so `curry(λ (x, y) → body)` is the same
 /// `𝐴 ⇒ (𝐵 ⇒ 𝐶)` the nested `λ x → λ y → body` was, kinds included. Deriving the
-/// two arrows from `f`'s tuple domain instead would rebuild both bare: the
+/// two function types from `f`'s tuple domain instead would rebuild both bare: the
 /// *inner* one is a group of a partition — a collection — and reading it as a
 /// capability strands the per-group aggregate that consumes it.
 pub(crate) fn curry_at(f: Expr, curry_result: Type) -> Expr {
@@ -240,7 +240,7 @@ pub(crate) fn fun_ty_or_hole(domain: &Type, codomain: &Type) -> Type {
 /// Compute the type of `zip(f, g): A → (B, C)` from `f: A → B` and `g: A → C`.
 ///
 /// The pair shares its operands' domain, so it is a collection exactly when they
-/// are — the arrow's kind rides across from `f` rather than being rebuilt bare.
+/// are — the kind rides across from `f` rather than being rebuilt bare.
 ///
 /// Returns [`Type::Hole`] if either argument does not have a concrete function
 /// type; inference will fill in the gaps in that case.
@@ -432,7 +432,7 @@ fn build_value_case_cform(
 ///   is the arms' tag set ([`arms_variant`]).
 ///
 /// The `Case`'s types serve only as fallbacks for a chain end that declares none.
-fn arm_compose(chain: Vec<Expr>, fallback_dom: Type, joined_cod: &Type) -> Expr {
+fn arm_compose(chain: Vec<Expr>, fallback_dom: Type, joined_cod: &Type, kind: &FunKind) -> Expr {
     let dom = chain
         .first()
         .and_then(|e| e.ty.domain())
@@ -441,7 +441,16 @@ fn arm_compose(chain: Vec<Expr>, fallback_dom: Type, joined_cod: &Type) -> Expr 
         .last()
         .and_then(|e| e.ty.codomain())
         .unwrap_or_else(|| joined_cod.clone());
-    typed_compose(chain).with_ty(Type::data_fun(dom, cod))
+    // The arms are columns of the *one* function being eliminated — their join
+    // lands back on its domain — so each carries that function's kind rather than
+    // asserting a collection. Stamping `Data` here contradicts the `const` that
+    // lifts the same value, which is built from the eliminated lambda's kind.
+    typed_compose(chain).with_ty(Type::Fun {
+        name: None,
+        kind: kind.clone(),
+        domain: Box::new(dom),
+        codomain: Box::new(cod),
+    })
 }
 
 /// The variant the arms of a scrutinee-`Case` *consume*: every branch tag mapped to
@@ -557,6 +566,9 @@ fn build_scrutinee_case_cform(
             vec![scrut_stream.clone(), vp, arm_fn],
             driver_dom.clone(),
             &result_ty,
+            // A value-position scrutinee case reads a one-element *stream* driver
+            // (`scrut_stream`), so these arms really are collections.
+            &FunKind::Data,
         ));
     }
 
@@ -709,7 +721,7 @@ fn build_value_case_fanout(
 /// **Precondition**: `body` must not itself be the lambda being eliminated —
 /// i.e. this function is called on the body of a `Lambda { param, body, .. }`.
 ///
-/// The arrow this builds is a **morphism** out of `param`, and it carries the
+/// The function this builds is a **morphism** out of `param`, and it carries the
 /// [`FunKind`] of the lambda being eliminated. Elimination is denotation-
 /// preserving, so the point-free form of a collection is that same collection;
 /// and every sub-morphism the recursion produces abstracts the *same* binder over
@@ -718,7 +730,7 @@ fn build_value_case_fanout(
 /// comprehension's own sub-morphisms read as capabilities.
 ///
 /// `Compute` is therefore the default only at an entry point with no enclosing
-/// arrow to inherit from — the kind of a bare `λ`.
+/// function to inherit from — the kind of a bare `λ`.
 fn elim_lambda(
     ctx: &mut ElimContext,
     param: &Name,
@@ -735,10 +747,10 @@ fn elim_lambda_kinded(
     param: &Name,
     param_ty: &Type,
     body: Expr,
-    arrow_kind: FunKind,
+    fun_kind: FunKind,
 ) -> Result<Expr, LambdaElimError> {
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        elim_lambda_impl(ctx, param, param_ty, body, arrow_kind)
+        elim_lambda_impl(ctx, param, param_ty, body, fun_kind)
     })
 }
 
@@ -747,7 +759,7 @@ fn elim_lambda_impl(
     param: &Name,
     param_ty: &Type,
     body: Expr,
-    arrow_kind: FunKind,
+    fun_kind: FunKind,
 ) -> Result<Expr, LambdaElimError> {
     log::trace!("elim_lambda: eliminating λ {param}: {}", symbolic(&body));
     debug_typecheck(&body);
@@ -760,7 +772,7 @@ fn elim_lambda_impl(
     // bind them against.
     let body_ty = body.ty.clone();
     let result_ty = match fun_ty_or_hole(param_ty, &body_ty) {
-        // `fun_ty_or_hole` builds a bare combinator arrow, so both the Pi binder
+        // `fun_ty_or_hole` builds a bare combinator type, so both the Pi binder
         // and the kind are re-attached here: the binder when `param` survives in
         // the codomain's refinement, the kind always, since the caller is the one
         // that knows whether this morphism denotes a collection.
@@ -770,7 +782,7 @@ fn elim_lambda_impl(
             name: crate::ccl::subst::type_free_vars(&body_ty)
                 .contains(param)
                 .then(|| param.clone()),
-            kind: arrow_kind.clone(),
+            kind: fun_kind.clone(),
             domain,
             codomain,
         },
@@ -850,9 +862,9 @@ fn elim_lambda_impl(
             let merged = substitute(substitute(*inner_body, &y, &sub_y), param, &sub_x);
 
             // The merged pair morphism is the uncurried form of the same nested
-            // abstraction, so it carries the enclosing arrow's kind: currying a
+            // abstraction, so it carries the enclosing function's kind: currying a
             // collection does not make it a capability.
-            let inner_elim = elim_lambda_kinded(ctx, &pair, &pair_ty, merged, arrow_kind.clone())?;
+            let inner_elim = elim_lambda_kinded(ctx, &pair, &pair_ty, merged, fun_kind.clone())?;
             Ok(dbg_typecheck_mv(curry_at(inner_elim, result_ty)))
         }
 
@@ -895,10 +907,10 @@ fn elim_lambda_impl(
             .with_ty(body_ty.clone());
             // The Pi keeps the eliminated lambda's own kind: a group-by partition
             // function denotes a collection, and `Type::pi` mints the capability
-            // arrow, which would flatten it.
+            // kind, which would flatten it.
             let result_pi = Type::Fun {
                 name: Some(param.clone()),
-                kind: arrow_kind,
+                kind: fun_kind,
                 domain: Box::new(param_ty.clone()),
                 codomain: Box::new(body_ty.clone()),
             };
@@ -909,8 +921,8 @@ fn elim_lambda_impl(
 
         // Application: λ x → e ▷ f  ⟹  ⟨λx→e, λx→f⟩ ≫ apply
         TypedExprNode::Apply { argument, function } => {
-            let elim_arg = elim_lambda_kinded(ctx, param, param_ty, *argument, arrow_kind.clone())?;
-            let elim_fn = elim_lambda_kinded(ctx, param, param_ty, *function, arrow_kind.clone())?;
+            let elim_arg = elim_lambda_kinded(ctx, param, param_ty, *argument, fun_kind.clone())?;
+            let elim_fn = elim_lambda_kinded(ctx, param, param_ty, *function, fun_kind.clone())?;
             let pair = zip_pair(elim_arg, elim_fn);
             // apply: Tuple([B, B→C]) → C; its domain is the codomain of pair
             let apply_ty = match &pair.ty {
@@ -932,7 +944,7 @@ fn elim_lambda_impl(
         TypedExprNode::Compose(elts) => {
             let mut elim_elts = elts
                 .into_iter()
-                .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, arrow_kind.clone()))
+                .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
             // Fold pairwise from the left: ⟨e0, e1⟩ ≫ compose, then compose
             // the result with e2, etc.
@@ -948,13 +960,21 @@ fn elim_lambda_impl(
                     } => match cod.as_ref() {
                         Type::Tuple(elts) if elts.len() == 2 => match (&elts[0], &elts[1]) {
                             (
-                                Type::Fun { domain: a, .. },
+                                first @ Type::Fun { domain: a, .. },
                                 Type::Fun {
                                     domain: _,
                                     codomain: c,
                                     ..
                                 },
-                            ) => fun_ty_or_hole(cod, &Type::fun(*a.clone(), *c.clone())),
+                            ) => {
+                                // `compose`'s codomain is the *chain it produces*,
+                                // `A → C`, and a chain's kind is its head's — the
+                                // rule `typed_compose` builds by. A bare function type
+                                // makes composing onto a collection yield a
+                                // capability.
+                                let chain = Type::fun_like(first, *a.clone(), *c.clone());
+                                fun_ty_or_hole(cod, &chain)
+                            }
                             _ => Type::Hole,
                         },
                         _ => Type::Hole,
@@ -980,10 +1000,10 @@ fn elim_lambda_impl(
             let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
             let fn_var = Expr::builtin(Builtin::BinOp(op)).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
-            // Desugaring rewrites the *same* lambda's body, so the arrow it ends up
+            // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
             // the capability default.
-            elim_lambda_kinded(ctx, param, param_ty, desugared, arrow_kind)
+            elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
         }
 
         // Copair inside a lambda body: lift via the
@@ -998,10 +1018,10 @@ fn elim_lambda_impl(
             let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
             let fn_var = Expr::builtin(Builtin::Copair).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
-            // Desugaring rewrites the *same* lambda's body, so the arrow it ends up
+            // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
             // the capability default.
-            elim_lambda_kinded(ctx, param, param_ty, desugared, arrow_kind)
+            elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
         }
 
         // UnaryOp — desugar to Apply, then apply the application rule.
@@ -1011,10 +1031,10 @@ fn elim_lambda_impl(
             let fn_ty = fun_ty_or_hole(&inner.ty, &body_ty);
             let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let desugared = Expr::apply(inner, fn_var).with_ty(body_ty);
-            // Desugaring rewrites the *same* lambda's body, so the arrow it ends up
+            // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
             // the capability default.
-            elim_lambda_kinded(ctx, param, param_ty, desugared, arrow_kind)
+            elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
         }
 
         // Tuple: λ x → (e1, ..., en)  ⟹  zip(λx→e1, ..., λx→en)
@@ -1022,7 +1042,7 @@ fn elim_lambda_impl(
         TypedExprNode::Tuple(elts) => {
             let elim_elts: Vec<Expr> = elts
                 .into_iter()
-                .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, arrow_kind.clone()))
+                .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()))
                 .collect::<Result<_, _>>()?;
             let inner_tuple = typed_tuple(elim_elts);
             let zip_fn_ty = fun_ty_or_hole(&inner_tuple.ty, &result_ty);
@@ -1038,7 +1058,7 @@ fn elim_lambda_impl(
             let elim_fields: Vec<(String, Expr)> = fields
                 .into_iter()
                 .map(|(k, e)| {
-                    elim_lambda_kinded(ctx, param, param_ty, e, arrow_kind.clone()).map(|r| (k, r))
+                    elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()).map(|r| (k, r))
                 })
                 .collect::<Result<_, _>>()?;
             let inner_ty = Type::Record(
@@ -1070,7 +1090,7 @@ fn elim_lambda_impl(
             body: let_body,
         } => {
             let v = binding.name;
-            let new_def = elim_lambda_kinded(ctx, param, param_ty, *def, arrow_kind.clone())?;
+            let new_def = elim_lambda_kinded(ctx, param, param_ty, *def, fun_kind.clone())?;
             // In the let body, each free occurrence of v is replaced by x ▷ v
             // (i.e. the renamed function v applied to the current argument x).
             // Type `call_v` using the types already computed for `new_def` and
@@ -1091,7 +1111,7 @@ fn elim_lambda_impl(
             .with_ty(call_v_result_ty);
             let substituted_body = substitute(*let_body, &v, &call_v);
             let new_body =
-                elim_lambda_kinded(ctx, param, param_ty, substituted_body, arrow_kind.clone())?;
+                elim_lambda_kinded(ctx, param, param_ty, substituted_body, fun_kind.clone())?;
             // The let's type is its body's type lifted out of `v`'s scope, so
             // any refinement predicate mentioning `v` must have it discharged
             // to the bound expression (design §6.2 move-site rule) — the same
@@ -1106,7 +1126,7 @@ fn elim_lambda_impl(
         TypedExprNode::List(elts) => {
             let elim_elts: Result<Vec<_>, _> = elts
                 .into_iter()
-                .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, arrow_kind.clone()))
+                .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()))
                 .collect();
             Ok(Expr::list(elim_elts?).with_ty(result_ty))
         }
@@ -1118,10 +1138,10 @@ fn elim_lambda_impl(
             let agg_ty = fun_ty_or_hole(&input.ty, &body_ty);
             let agg_var = Expr::builtin(agg_builtin).with_ty(agg_ty);
             let desugared = Expr::apply(input, agg_var).with_ty(body_ty);
-            // Desugaring rewrites the *same* lambda's body, so the arrow it ends up
+            // Desugaring rewrites the *same* lambda's body, so the type it ends up
             // with is still this lambda's — carry the kind rather than re-entering at
             // the capability default.
-            elim_lambda_kinded(ctx, param, param_ty, desugared, arrow_kind)
+            elim_lambda_kinded(ctx, param, param_ty, desugared, fun_kind)
         }
 
         // `Defer`, `Feed`, `Define`, and `ExprStmt` are eliminated by
@@ -1176,9 +1196,8 @@ fn elim_lambda_impl(
                 // element-varying predicate morphism `param_ty ⇒ Bool`.
                 let pi_hat = synthesize_arm_predicate(&br.guard, &prior_guards);
                 prior_guards.push(br.guard);
-                let gate_fn = elim_lambda_kinded(ctx, param, param_ty, pi_hat, arrow_kind.clone())?;
-                let value_fn =
-                    elim_lambda_kinded(ctx, param, param_ty, br.body, arrow_kind.clone())?;
+                let gate_fn = elim_lambda_kinded(ctx, param, param_ty, pi_hat, fun_kind.clone())?;
+                let value_fn = elim_lambda_kinded(ctx, param, param_ty, br.body, fun_kind.clone())?;
                 // `filter_values(π̂ᵢ) ≫ eᵢ`: filter the fed element stream to the gate
                 // (keeping the element value), then map by `eᵢ`. The filtered stream
                 // is typed by the plain `param` domain, **not** a `{param | π̂ᵢ}`
@@ -1203,7 +1222,15 @@ fn elim_lambda_impl(
                 // A **disjoint join**, not a copairing: these arms restrict the
                 // *same* fed domain — by first-match, or by tag — so the result
                 // lands back on it rather than on a coproduct of per-arm domains.
-                _ => Ok(Expr::disjoint_join(arms).with_ty(Type::fun(param_ty.clone(), value_ty))),
+                // It carries the eliminated lambda's kind for the same reason
+                // every other rebuild here does: the join is that lambda's
+                // point-free form, not a new decision about what the value is.
+                _ => Ok(Expr::disjoint_join(arms).with_ty(Type::Fun {
+                    name: None,
+                    kind: fun_kind.clone(),
+                    domain: Box::new(param_ty.clone()),
+                    codomain: Box::new(value_ty),
+                })),
             }
         }
 
@@ -1229,8 +1256,7 @@ fn elim_lambda_impl(
             );
             let payload_ty = payload.ty.clone();
             // eᵢ  ⟹  point-free `param_ty ⇒ P_c`.
-            let payload_pf =
-                elim_lambda_kinded(ctx, param, param_ty, *payload, arrow_kind.clone())?;
+            let payload_pf = elim_lambda_kinded(ctx, param, param_ty, *payload, fun_kind.clone())?;
             // variant_wrap(c) : P_c ⇒ Union (the tag injection).
             let vw = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(tag.as_str().into())))
                 .with_ty(Type::fun(payload_ty, body_ty.clone()));
@@ -1307,7 +1333,7 @@ fn elim_lambda_impl(
             // The scrutinee as a point-free morphism `param_ty ⇒ scrut_ty`. When
             // the scrutinee is the bound parameter itself it collapses to `id`,
             // which is dropped from the compose chain.
-            let scrut_pf = elim_lambda_kinded(ctx, param, param_ty, scrut, arrow_kind.clone())?;
+            let scrut_pf = elim_lambda_kinded(ctx, param, param_ty, scrut, fun_kind.clone())?;
             let scrut_is_id = matches!(&scrut_pf.node, TypedExprNode::Builtin(Builtin::Id));
 
             // What the arms consume: the projections' shared domain.
@@ -1359,7 +1385,7 @@ fn elim_lambda_impl(
                     }
                     chain.push(vp);
                     chain.push(arm_fn);
-                    arm_compose(chain, param_ty.clone(), &value_ty)
+                    arm_compose(chain, param_ty.clone(), &value_ty, &fun_kind)
                 } else {
                     // Outer-binder: zip the whole element alongside the projected
                     // payload, then feed the pair to `eᵢ`. Merge `param` and `wᵢ`
@@ -1392,7 +1418,12 @@ fn elim_lambda_impl(
                     let outer_pf = id().with_ty(Type::fun(param_ty.clone(), param_ty.clone()));
                     // ⟨id, scrut ≫ variant_project(cᵢ)⟩ : param_ty ⇒ (param_ty, Pᵢ).
                     let pair_stream = zip_pair(outer_pf, payload_pf);
-                    arm_compose(vec![pair_stream, arm_fn2], param_ty.clone(), &value_ty)
+                    arm_compose(
+                        vec![pair_stream, arm_fn2],
+                        param_ty.clone(),
+                        &value_ty,
+                        &fun_kind,
+                    )
                 };
                 arms.push(arm);
             }
@@ -1430,7 +1461,15 @@ fn elim_lambda_impl(
                 // A **disjoint join**, not a copairing: these arms restrict the
                 // *same* fed domain — by first-match, or by tag — so the result
                 // lands back on it rather than on a coproduct of per-arm domains.
-                _ => Ok(Expr::disjoint_join(arms).with_ty(Type::fun(param_ty.clone(), value_ty))),
+                // It carries the eliminated lambda's kind for the same reason
+                // every other rebuild here does: the join is that lambda's
+                // point-free form, not a new decision about what the value is.
+                _ => Ok(Expr::disjoint_join(arms).with_ty(Type::Fun {
+                    name: None,
+                    kind: fun_kind.clone(),
+                    domain: Box::new(param_ty.clone()),
+                    codomain: Box::new(value_ty),
+                })),
             }
         }
 
@@ -1479,6 +1518,19 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
 }
 
 fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimError> {
+    // A `Cast` records its function type twice, on the node and on `target`, and
+    // `emit_cast` reads the kind off `target`. `simplify` re-kinds a surviving
+    // cast through `sync_cast_target_kind`, so the two agree by the time
+    // elimination sees one; a disagreement here means a rewrite wrote one copy
+    // and not the other.
+    #[cfg(debug_assertions)]
+    if let TypedExprNode::Cast { target, .. } = &expr.node {
+        debug_assert!(
+            expr.ty.fun_kind() == target.fun_kind(),
+            "a cast's node and target disagree on kind: {}",
+            symbolic(&expr)
+        );
+    }
     log::trace!("elim_lambdas: eliminating {}", symbolic(&expr));
     debug_typecheck(&expr);
     let TypedExpr {
@@ -1487,7 +1539,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         user_annotation,
         ..
     } = expr;
-    // The node's own arrow, read in every build: the `Lambda` arm carries its
+    // The node's own function type, read in every build: the `Lambda` arm carries its
     // kind into elimination (a lambda's point-free form denotes what the lambda
     // did). The debug-build invariant asserts below also compare against it.
     let original_ty = ty.clone();
@@ -1512,7 +1564,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             )?;
             // Compare modulo Pi binder *presence*: the point-free
             // construction keeps a dependent morphism's own binder (same
-            // `Name`, uid-preserved) but rebuilds combinator arrows with
+            // `Name`, uid-preserved) but rebuilds combinator types with
             // `name: None`; see `Type::without_pi_names`.
             #[cfg(debug_assertions)]
             assert!(
@@ -1566,7 +1618,12 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let source_codomain = target_elim.ty.codomain().unwrap();
             let refinement = Refinement::born(Rc::new(pred_on_source));
             let refined_domain = Type::Refinement(Box::new(source_domain), refinement);
-            let refined_source = target_elim.with_ty(Type::fun(refined_domain, source_codomain));
+            // A **domain-only** rewrite of the source, so it keeps the source's
+            // own function type: `fun_like`, not a bare `Type::fun`, which would rebuild
+            // a collection as a capability (`src/ccl/design/type-inference.md`,
+            // "4.6 Data vs compute functions").
+            let refined_ty = Type::fun_like(&target_elim.ty, refined_domain, source_codomain);
+            let refined_source = target_elim.with_ty(refined_ty);
             let body_elim = elim_lambda(ctx, &param.name, &param.ty, true_body)?;
             let result = typed_compose(vec![refined_source, elim_lambdas(ctx, body_elim)?]);
             debug_typecheck(&result);
@@ -1722,12 +1779,12 @@ mod tests {
     ///
     /// The point-free form denotes what the lambda denoted, so a lambda that was
     /// a collection stays one. It is not automatic: elimination rebuilds the
-    /// arrow through combinator constructors (`fun_ty_or_hole`, `Type::pi`) that
+    /// function type through combinator constructors (`fun_ty_or_hole`, `Type::pi`) that
     /// mint the capability kind, and after elimination the domain no longer
     /// distinguishes the two — a collection's is its index set, a morphism's its
     /// element type, and both are just types.
     #[test]
-    fn elim_lambda_preserves_the_arrow_kind() {
+    fn elim_lambda_preserves_the_fun_kind() {
         let int = Type::Base(BaseType::Int);
         let body = Expr::binop(
             var("x").with_ty(int.clone()),
@@ -1744,7 +1801,10 @@ mod tests {
             });
             let out = run(lambda).expect("elimination succeeds");
             let Type::Fun { kind: got, .. } = &out.ty else {
-                panic!("eliminating a lambda yields an arrow, got {}", out.ty);
+                panic!(
+                    "eliminating a lambda yields a function type, got {}",
+                    out.ty
+                );
             };
             assert_eq!(
                 format!("{got:?}"),

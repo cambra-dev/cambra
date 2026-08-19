@@ -753,9 +753,9 @@ A refinement is **required**, so `constrain_subtype` is strict for *concrete* ba
 
 For the reconcile to hold, the passes that *introduce* refined types post-inference (lambda-elim, join-planning) must leave each node's recorded type **reconstructable** — consistent with what the bottom-up rules rebuild from its children. These sites were emitting internally-inconsistent or under-refined nodes and are now fixed at the source rather than papered over by relaxing the check:
 
-* **Iterated / join-satisfying extents on producers** (`planning`'s `set_extent` / `refine_extent`). An iteration source produces the refined domain it iterates, so it is symmetric `{D | p} ⇒ {D | p}` (`make_iterate`); a hash join folds its equi-conditions into the key structure with no residual `Restrict`, so the extent it yields would otherwise reach the body's `cast` *bare*. `refine_extent` refines **both sides** for that reason: a data function's domain *is* its data, so refining only the codomain would leave the domain claiming rows the join never produces — readable as a supertype under the contravariant reading of an arrow, but wrong for a collection, and it puts every enclosing type at odds with the site. Threaded down the combinator's whole function spine so the leaf builtin the Check pass rebuilds from agrees. Reconstructable because a combinator node carries its own function type and `emit_apply` returns *that* codomain verbatim. `make_restrict` builds its refinement directly rather than through `refine_with`, whose trivially-true degeneracy is right for `make_iterate` (an unrefined site should not print `{D | true}`) but wrong here: the caller emits one `restrict` per layer the *site* declared, so dropping a vacuous one leaves the source producing a bare extent while the site — and the body's `{D | true}` cast — still demand the refined one.
+* **Iterated / join-satisfying extents on producers** (`planning`'s `set_extent` / `refine_extent`). An iteration source produces the refined domain it iterates, so it is symmetric `{D | p} ⇒ {D | p}` (`make_iterate`); a hash join folds its equi-conditions into the key structure with no residual `Restrict`, so the extent it yields would otherwise reach the body's `cast` *bare*. `refine_extent` refines **both sides** for that reason: a data function's domain *is* its data, so refining only the codomain would leave the domain claiming rows the join never produces — readable as a supertype under the contravariant reading of a function, but wrong for a collection, and it puts every enclosing type at odds with the site. Threaded down the combinator's whole function spine so the leaf builtin the Check pass rebuilds from agrees. Reconstructable because a combinator node carries its own function type and `emit_apply` returns *that* codomain verbatim. `make_restrict` builds its refinement directly rather than through `refine_with`, whose trivially-true degeneracy is right for `make_iterate` (an unrefined site should not print `{D | true}`) but wrong here: the caller emits one `restrict` per layer the *site* declared, so dropping a vacuous one leaves the source producing a bare extent while the site — and the body's `{D | true}` cast — still demand the refined one.
 
-* **Dependent groupby refinement** (`lambda_elim`'s cast-wrapped-lambda arm). `groupby` lowers to `λ k → cast({I | key(i) == k} ⇒ A, λ i → c(i))`. Because the key binder `k` is now a genuine **Pi binder** (the refinement closes over it but the *value* does not mention it), lambda-elim emits the Pi-const form `const(cast(c)) : (k) ⇒ ({I | i ▷ c ▷ key == k} ⇒ A)` — the `k`-dependence rides the refinement and is materialized as a `Restrict` at the iteration boundary (the dependent-application model, §4.5). Planning's pointful recogniser (`recognize_groupby_sites` / `convert_groupby_pointful`) matches that Pi-const source directly — identifying the key binder structurally as the free variable on one side of the predicate's equality — and emits the bucketize chain `converse(c ≫ key) ≫ map(c)` **at the source's own type** — `(k: K) ⤇ ({I | key(i) == k} ⤇ V)`, group refinement and Pi binder intact. A group holds the members sharing one key, and a data function's domain *is* its data, so typing a group as the bare `I` would claim every element belongs to every group; the binder has to ride the arrow as a Pi or the predicate's `k` dangles.
+* **Dependent groupby refinement** (`lambda_elim`'s cast-wrapped-lambda arm). `groupby` lowers to `λ k → cast({I | key(i) == k} ⇒ A, λ i → c(i))`. Because the key binder `k` is now a genuine **Pi binder** (the refinement closes over it but the *value* does not mention it), lambda-elim emits the Pi-const form `const(cast(c)) : (k) ⇒ ({I | i ▷ c ▷ key == k} ⇒ A)` — the `k`-dependence rides the refinement and is materialized as a `Restrict` at the iteration boundary (the dependent-application model, §4.5). Planning's pointful recogniser (`recognize_groupby_sites` / `convert_groupby_pointful`) matches that Pi-const source directly — identifying the key binder structurally as the free variable on one side of the predicate's equality — and emits the bucketize chain `converse(c ≫ key) ≫ map(c)` **at the source's own type** — `(k: K) ⤇ ({I | key(i) == k} ⤇ V)`, group refinement and Pi binder intact. A group holds the members sharing one key, and a data function's domain *is* its data, so typing a group as the bare `I` would claim every element belongs to every group; the binder has to ride the function type as a Pi or the predicate's `k` dangles.
 * **`permute_domain` over a refined morphism** (`join_plan::convert_loop_join`). The combinator is polymorphic in the morphism it rearranges; its declared input type is the morphism's *actual* type (which may carry the join-condition refinement), not a bare `actual ⇒ actual`. Otherwise `apply_function` re-stamps the partially-applied combinator's recorded type to `fun(expr.ty, …)` (carrying the refinement) while its inner `PermuteDomain` builtin keeps the bare declaration — an inconsistent node the reconstruction can't rebuild, because the refinement rides the morphism's *invariant* domain⇒codomain position (where subtyping would demand `T <: {T|p}` *and* `{T|p} <: T` at once).
 
 #### Feed handles as an invariant `History` constructor (`Type::History { kind: Feed }`)
@@ -918,7 +918,7 @@ Once constraints are resolved (Pass 2), `coalesce_compact` resolves each node's 
 
 Some refinement predicates **close over an outer binder**. The motivating case is group-by: partitioning `xs` by `key_fn` produces, per key `𝑘`, the partition `{𝑖: 𝐼 | 𝑖 ▷ xs ▷ key_fn == 𝑘} ⇒ 𝑉` — the predicate references `𝑘`, bound *outside* the refinement. Expressing, propagating, and discharging such predicates inside the solver is what the Pi-type machinery adds. (This folds in the durable material from the original point-in-time design proposal for dependent refinements via Pi types.)
 
-**Pi types.** `Type::Fun` carries an optional binder: `Fun { name: Option<Name>, domain, codomain }`. `name: Some(𝑥)` is the dependent type `(𝑥: domain) ⇒ codomain`, with `𝑥` bound in `codomain`; `name: None` is the ordinary arrow. `emit_lambda` always names the binder from the lambda parameter, so a predicate that closes over the parameter stays bound. The binder is **cosmetic for ordinary functions** — `coalesce_compact_go` keeps it only when the codomain's refinement predicates actually reference it (queried via `subst::type_free_vars`) and strips it otherwise, so monomorphic output is unchanged and equality/printing don't churn.
+**Pi types.** `Type::Fun` carries an optional binder: `Fun { name: Option<Name>, domain, codomain }`. `name: Some(𝑥)` is the dependent type `(𝑥: domain) ⇒ codomain`, with `𝑥` bound in `codomain`; `name: None` is the ordinary function type. `emit_lambda` always names the binder from the lambda parameter, so a predicate that closes over the parameter stays bound. The binder is **cosmetic for ordinary functions** — `coalesce_compact_go` keeps it only when the codomain's refinement predicates actually reference it (queried via `subst::type_free_vars`) and strips it otherwise, so monomorphic output is unchanged and equality/printing don't churn.
 
 **Substitutions and contexts (`ccl::subst`).** A `Subst` is a context morphism that maps *term* binders (`Var` names) to replacement `TypedExpr`s. It never relabels a type variable — that is freshening's job. Two flavours: a **rename** `[𝑘 ↦ 𝑥]` (invertible) and a **discharge** `[𝑥 ↦ arg]` (one-way). The traversal is uniform over terms and types: `apply_expr` rewrites each node's type slots via `apply_type` in the same pass, so a substituted binder occurring inside a type-borne refinement predicate is discharged where it sits (no value-only contract, no dangling residual for §6.2 to catch in release builds). It is a true no-op when no substituted binder occurs free in the term — value or type slots — so a vacuous discharge from a non-dependent application changes nothing and shares the predicate `Rc`. Capture is impossible under the Barendregt convention (binder uids are minted once at lowering; copies preserve them) and the engine *asserts* it instead of α-renaming. Predicates are immutable, so a substitution always *rebuilds* a changed predicate (a fresh `Rc`); the engine drives two modes that differ only in what else they touch: **transport** (`apply_expr`/`apply_type`, builds new terms — the constraint-edge flavour) and **in-place rewrite** (`rewrite_expr`, mutates the term tree the caller owns; a predicate the substitution actually touches is rebuilt, one it merely walks past keeps its `Rc` — the pass-level flavour that `lambda_elim::substitute`, `channelize::desugar_substitute`, inlining's beta step, and lowering's uncurrying all wrap). Both modes thread the same `PredMemo`, so occurrences that shared one term are re-pointed at the same result. A **context** (`well_formed` / `type_free_vars`) is the dual *checking* device: a type is well-formed iff its predicates' free term-vars are in scope.
 
@@ -946,73 +946,26 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ## 4.6 Data vs compute functions
 
-> **Status: implemented, minus Σ.** The `FunKind` marker, kind inference,
-> kind-aware subtyping (the `Compute <: Data` rejection), the invariant data
-> domain, and the compilation of a value-selecting `Case` whose arms share one
-> domain are all live. What is missing is the type the model says a domain join
-> *produces* — the Σ — so a join over distinct domains is diagnosed rather than
-> typed. The heterogeneous-scalar union is separately deferred. See the callout
-> below.
+A function either represents a collection or is a capability that can be called.
+`Type::Fun` stores which as a `FunKind`, either `Data` or `Compute`.
 
-The unresolved domain-join corner of §4.5 (O1/O4 — two collections meeting at one
-join point) is resolved by making a missing distinction explicit. The distinction
-does not by itself make every such join *typeable*; what it does is make the
-untypeable ones an **error** rather than a silently short collection. See
-[The domain join is a Σ](#the-domain-join-is-a-σ).
+Lowering chooses the kind from the CHL construct. List literals, comprehensions,
+`groupby`, `++`, and registered sources are `Data`; a `lambda` and a `def` are
+`Compute`, a generator `def` included — it is a capability whose *result* is a
+collection. Where lowering does not yet know the domain and codomain, it states the
+kind as a `data_fun` annotation and inference reads that as the stamp. A function
+parameter is the one thing lowering cannot decide, having no construct to read: it
+gets a kind variable, which the argument pins.
 
-**The distinction.** A function's domain can mean two things. A **compute
-function** `α ⇒ β` treats it as a *capability* — the inputs accepted; no data
-behind it; shrinking under-promises, so the lossy contravariant meet at a
-join is fine. A **data function** `α ⤇ β` treats it as a *collection* — the
-domain *is* the data map, so a lossy domain is lost data. `Type::Fun` carries
-a `kind: FunKind` (`Compute | Data | Var`). **FunKind is a *provenance* property,
-not a function of the domain** — the *same* domain can back a data collection or
-a capability (`Map(Color, V)` vs `Color ⇒ V`), so it is decided by *what the
-value is*, stamped concretely at introduction. `Data`: list literals, `++`,
-registered sources, comprehensions and `groupby` (a comprehension over a
-collection, a keyed collection — stamped via the `data_fun` provenance annotation
-that `emit_node` reads as a concrete-kind stamp; a *filtered* comprehension's
-`refined_data_fun` cast target carries the same `Data`), induction recurrence
-carriers (a `letrec` binder declared `Data` — an accumulator indexed by the
-iteration domain — whose declared type stamps the accumulator lambda's kind,
-same `stamp_kind_from` mechanism), aggregate consumers, and every `History`
-erasure. `Compute`: scalar/combinator builtins and ordinary user lambdas
-(capabilities) — a bare `λ` is built **concrete `Compute`** (`Expr::lambda`),
-because a lambda that denotes a collection is not born bare, it is one of the
-stamped `Data` forms above. A `FunKind::Var` is minted only where the kind is
-genuinely *inferred* — a function parameter or a freshened polymorphic scheme —
-resolved by uses (below); an **unconstrained var defaults to `Compute`** (the
-capability default). No arm inspects the domain shape. The audit rule for the
-*concrete* stamps: *an arrow is data iff it denotes a collection*, which the
-construction site knows.
-Constructor `data_fun` mints a data arrow directly; `fun_like(exemplar, d, c)`
-rebuilds an arrow copying the exemplar's `name` and `kind`, so a domain/codomain-
-only rewrite (`subst`, `strip_refinements`, source-domain refinement) can never
-silently flip a data arrow to compute or drop its Pi binder. A rebuild that
-*intends* a new binder or mixes two arrows' kinds (the compose-chain rebuild in
-`coalesce_node`, the Pi-adding rebuild in `lambda_elim`) constructs directly and
-sets `kind` explicitly.
+Compute functions follow the usual contravariance on the domain. Data functions are
+invariant, because the domain is the exact set of elements the collection holds, so
+changing it changes the data. Neither kind converts to the other; they are unrelated
+by subtyping.
 
-> **FunKind-aware subtyping (landed).** Concrete kinds (the common case — data
-> collections and capabilities are stamped at construction, above) pass through;
-> only a kind-*polymorphic* function carries a `FunKind::Var`, resolved from its
-> bounds, defaulting to `Compute` when unconstrained (no domain-shape guess). The
-> Fun-vs-Fun arm adds a kind edge over `Data ⊑ Compute`: `data <: compute`
-> upcasts, a concrete `compute <: data` is rejected
-> (`ConstrainError::ComputeWhereDataRequired`), and a var picks up
-> `forced_compute`/`forced_data` flags. A **capability demanded as data** —
-> e.g. `sum(λ x → x + 1)`, summing a plain `Int ⇒ Int` lambda — is caught right
-> here at the edge: the lambda is *concrete* `Compute`, so `sum`'s `Data` demand
-> is the concrete `compute <: data` reject, no domain inspection needed. (This is
-> why the domain-shape guess is gone: a capability is `Compute` by construction,
-> a collection `Data` by construction, so a scalar/keyed domain never decides a
-> kind.) For a genuinely *var*-kinded function (a parameter, a freshened scheme)
-> the violation is invisible at the edge — the flags are merely recorded — so a
-> var that ends with `forced_compute ∧ forced_data` is the same `Compute <: Data`
-> error, surfaced at coalesce as `CoalesceError::ComputeWhereDataRequired`; a var
-> with only `forced_data` resolves to `Data` (a parameter used only as a collection).
-> The same arm carries the data-domain invariance guard — see
-> [Data domains are invariant](#data-domains-are-invariant) below.
+Downstream phases including inlining and planning dispatch on the distinction, so
+every pass carries a function's kind rather than rebuilding one. `Type::fun_like` is
+the rebuild that does: it copies the exemplar's kind, so rewriting only a domain or a
+codomain cannot turn a collection into a capability.
 
 ### Generalizing a collection is filter pushdown
 
@@ -1067,7 +1020,7 @@ and **diagnoses** instead. That is an acceptable interim state only because it i
 end-to-end by `conditional_collection_rejected_cleanly`.
 
 Tracking the kind is what makes the three rules statable at all. Without it both
-arrows are just functions, the compute lattice's meet applies, and the join silently
+are just functions, the compute lattice's meet applies, and the join silently
 narrows — correct for capabilities, row-destroying for collections.
 
 **The same fact surfaces at two phases**, because a join can be forced at either.
@@ -1089,8 +1042,8 @@ Coalesce materializes each alternative to a `Type` and deduplicates *again*, and
 that second comparison is the one that decides — one survivor is a plain data
 function, two or more is the rejection. A `Data ⊔ Compute` collision is a third
 outcome, `KindMerge::Conflict`, reported as `DomainJoinConflict` when it would drop
-≥ 2 alternatives and as `ComputeWhereDataRequired` when a single slot is a
-capability demanded as a collection.
+≥ 2 alternatives and as `KindConflict` when a single slot's kind resolved
+contradictorily.
 
 Refinements ride *inside* each alternative domain, so differently-filtered arms of
 one source (`[x for x in xs if x > 1]` vs `[x for x in xs if x < 3]`) are two
@@ -1259,9 +1212,8 @@ depending on whether a consumer forces the question early (see
 that candidate domains must be expected at a domain variable, not only at a `Case`
 result.
 
-Like the `Compute <: Data` rejection, the rule fires only when the cache is
-kind-aware, because elimination preserves denotation but not kind representation and
-the post-inference re-check must not see it.
+The rule fires wherever the edge is drawn, the kind edge with it, including the
+post-inference re-check in `check.rs`.
 
 ### Deliberately incomplete here
 
@@ -1276,18 +1228,24 @@ Recorded so a reader can tell a deliberate boundary from an oversight.
   [The domain join is a Σ](#the-domain-join-is-a-σ) is the answer, and it
   arrives with the collections work.
 
-- **`KindMerge::Conflict` is covered only by hand-constructed compact graphs.** Both
-  of its coalesce outcomes are exercised (`coalesce_domain_join_conflict_errs`,
-  `coalesce_single_domain_conflict_is_compute_where_data_required`), but no *source
-  program* in the suite reaches either. The `Data ⊔ Compute` collision needs a slot
-  that is simultaneously fed a capability and demanded as a collection, and the
-  single-slot case needs a `FunKind::Var` ending with both `forced_compute` and
-  `forced_data` — a kind-polymorphic function whose two uses disagree. The
-  constraint-level face of the same rejection *is* reachable from source
-  (`ConstrainError::ComputeWhereDataRequired`, e.g. `sum(λ x → x + 1)`), which is
-  why the coalesce-time face is a backstop rather than the primary check. If a
-  source-level route is found, it belongs in the suite; if one provably does not
-  exist, the branch should collapse into the constraint-level check.
+- **`KindMerge::Conflict` reaches coalesce with two or more domains only in
+  hand-constructed compact graphs** (`coalesce_domain_join_conflict_errs`). That
+  outcome needs a `Data ⊔ Compute` collision *and* arms at differing domains; no
+  source program in the suite produces both at once. Its single-domain outcome is
+  reachable from source, and `joining_a_capability_with_a_collection_is_a_kind_conflict`
+  is the route: a capability and a collection arrive as two *lower* bounds on one
+  variable, and closure relates a lower to an upper rather than a lower to a lower,
+  so neither is ever the left of an edge whose right is the other and
+  `ConstrainError::KindMismatch` cannot see it.
+
+- **A var-var kind edge carries nothing, and no program in the suite draws one.**
+  A concrete kind on either side of an edge pins the variable; two variables meeting
+  record nothing, since what the pair resolves to is not known there and deciding it
+  from pins arriving later would make typing depend on constraint order. That is only
+  sound while the two sides agree, and instrumenting the arm across the suite fired
+  zero times — the case is unreached rather than merely benign. A `debug_assert!` in
+  the arm catches a disagreement already present when the edge is drawn; a pin that
+  lands on one side afterwards is outside what it can see.
 
 - **Σ is the missing type, and it is missing at two sites.** Because a domain join
   can be forced from a `Fun`/`Fun` edge as well as at coalesce, the Σ work has to
@@ -1639,7 +1597,7 @@ Consult these definitions as needed; each term is introduced in context in §1�
 | **Refinement** | Both | A `Type::Refinement(T, r)` carries a refinement `r` (an immutable predicate `Rc<TypedExpr>`) — a refinement in its role as a black box to the subtyping lattice. A type holds a *set* of refinements, width-subtyped like records (more refinements ⇒ subtype; `{T\|p,q} <: {T\|p}`). Refinements compare by type-blind structural predicate equality (`Refinement`'s `PartialEq`; pointer-equal predicates short-circuit) — not implication. A refinement is *required* — `constrain_subtype` is strict (`T ⊀ {T\|p}`); acquiring one is an explicit runtime `Restrict` at the collection-iteration boundary, not subsumption. |
 | **Let Binding Resolution** | Cambra-Specific | Ensuring a `Let` binding's fully resolved type overwrites the type of any `Var` references to it within the let body. |
 | **`InferArena`** | Cambra-Specific | The single owner of every inference variable minted during one `infer()` run. Captures each mint through a thread-local sink and, on `Drop`, clears all variables' bounds to break the `Rc` cycles that mutual subtyping constraints form — the end-of-inference cleanup that reference counting alone cannot do. See §3.2. |
-| **Pi type** | Both | A `Type::Fun` with `name: Some(𝑥)` — the dependent function type `(𝑥: domain) ⇒ codomain`, with `𝑥` bound in `codomain` and referenceable by nested refinement predicates. `name: None` is the ordinary arrow. See §4.5. |
+| **Pi type** | Both | A `Type::Fun` with `name: Some(𝑥)` — the dependent function type `(𝑥: domain) ⇒ codomain`, with `𝑥` bound in `codomain` and referenceable by nested refinement predicates. `name: None` is the ordinary function type. See §4.5. |
 | **`Subst` / discharge / rename** | Cambra-Specific | A context morphism over *term* binders (`ccl::subst`), riding a constraint edge in a two-sided `Bound { self_subst, ty, ty_subst }` (native direction, never inverted at record time). A **rename** `[𝑘 ↦ 𝑥]` is invertible; a **discharge** `[𝑥 ↦ arg]` (dependent application) is one-way. Composed forward along the closure and the coalesce walk, forced at refinement predicates. See §4.5. |
 | **Correspondence** | Both | The binder alignment `[𝑘 ↦ 𝑥]` *derived* by `constrain_go`'s Fun/Fun arm when relating two Pi codomains, carried on the codomain edge so a dependent refinement renames consistently. See §4.5. |
 

@@ -467,7 +467,7 @@ pub fn make_iterate(predicate: Expr) -> Expr {
         .expect("iterate predicate must have a function type")
         .clone();
     let refined = refine_with(domain, &predicate);
-    // A **data** arrow, by the audit rule *an arrow is data iff it denotes a
+    // A **data** function, by the audit rule *a function is data iff it denotes a
     // collection*: `iterate(p)` is the identity on the extent, so the extent
     // *is* its data. This is what makes the kind decide whether iterating is
     // acceptable at all — every chain led by an iteration source inherits `Data`
@@ -559,7 +559,7 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
 /// that is what the type must say: a data function's domain *is* its data, so the
 /// domain of this morphism is the refined extent, not the full product. Refining
 /// only the codomain would leave the domain claiming rows the join never produces
-/// — readable as a supertype under the contravariant reading of an arrow, but
+/// — readable as a supertype under the contravariant reading of a function, but
 /// wrong for a collection, and it puts every enclosing type at odds with the site.
 ///
 /// The symmetric `{D | p} ⇒ {D | p}` shape is the same one [`make_iterate`] gives
@@ -614,7 +614,7 @@ pub fn set_codomain(morphism: Expr, new_codomain: Type) -> Expr {
 /// type down the combinator's function spine. See [`set_codomain`], which fixes
 /// the domain, and [`refine_extent`], which refines both.
 pub fn set_extent(mut morphism: Expr, domain: Type, new_codomain: Type) -> Expr {
-    // `fun_like`: a codomain-only rewrite must not flip the arrow's kind or drop
+    // `fun_like`: a codomain-only rewrite must not flip the kind or drop
     // its Pi binder — restamping an iteration source's codomain leaves it the
     // same collection.
     let new_ty = Type::fun_like(&morphism.ty, domain, new_codomain);
@@ -792,12 +792,16 @@ pub fn bare_predicate_of_fn(base: &Type, predicate: Expr) -> Expr {
 /// Re-point every [`TypedExprNode::Cast`]'s `target` type slot at the cast
 /// node's own `expr.ty`. A cast's recorded type *is* its target type, so the
 /// two are equal by construction — but the `target` carries its **own**
-/// immutable refinement-predicate `Rc`, and a predicate-rewriting pass
-/// (inlining's beta step, lambda elimination, planning's point-free
-/// compilation) rebuilds the predicate on `expr.ty` without touching `target`,
-/// so they drift apart. The post-pass `typecheck` reconstructs a cast from its
-/// `target` ([`cast_target_refinement`]) and compares against the recorded
-/// `expr.ty`; re-syncing after each such pass keeps that match exact.
+/// immutable refinement-predicate `Rc`, and lambda elimination rebuilds the
+/// predicate on `expr.ty` without touching `target`, so they drift apart. The
+/// post-pass `typecheck` reconstructs a cast from its `target`
+/// ([`cast_target_refinement`]) and compares against the recorded `expr.ty`;
+/// re-syncing after that pass keeps the match exact.
+///
+/// Only lambda elimination needs it. Inlining and planning each ran it too, and
+/// removing those calls changes no test — a whole-tree repair after a pass is
+/// weaker than writing both copies at the rewrite, which is what
+/// [`sync_cast_target_kind`] does for the arrow kind.
 pub fn sync_cast_targets(expr: &mut Expr) {
     if matches!(expr.node, TypedExprNode::Cast { .. }) {
         let ty = expr.ty.clone();
@@ -806,6 +810,30 @@ pub fn sync_cast_targets(expr: &mut Expr) {
         }
     }
     expr.walk_children_mut(sync_cast_targets);
+}
+
+/// Carry a re-typed node's [`FunKind`](crate::ccl::ty::FunKind) onto its `target`,
+/// when that node is a [`TypedExprNode::Cast`].
+///
+/// A cast's `target` states the claims the cast asserts, and those are the cast's
+/// own — a rewrite must not overwrite them with a type derived from the
+/// surrounding term. The `FunKind` is different: nothing asserts it
+/// independently, `emit_cast` reads it off `target` to type the node, and so the
+/// two copies have to agree or the node contradicts itself.
+///
+/// The caller is a rewrite that hands a node over to one of its own
+/// sub-expressions (`simplify`'s collapse rules). Such a rewrite writes the
+/// position's type onto the survivor, and where the survivor is a cast that
+/// re-kinds it — `⟨id, const 𝑥⟩ ≫ apply` collapsing to a `𝑥` that is a collection
+/// standing in a morphism position. Only the kind moves; the claims stay the
+/// cast's.
+pub(crate) fn sync_cast_target_kind(expr: &mut Expr) {
+    if matches!(expr.node, TypedExprNode::Cast { .. }) {
+        let ty = expr.ty.clone();
+        if let TypedExprNode::Cast { target, .. } = &mut expr.node {
+            *target = target.with_kind_of(&ty);
+        }
+    }
 }
 
 /// Wrap `base` in a fresh `Type::Refinement` whose bare predicate filters the

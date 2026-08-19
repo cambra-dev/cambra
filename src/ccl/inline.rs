@@ -89,11 +89,7 @@ use crate::ccl::{
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
-    let mut expr = inline_impl(expr);
-    // Beta-reduction rebuilds predicates on `expr.ty` (immutable terms); keep
-    // each `Cast`'s `target` slot in step so the post-pass typecheck matches.
-    crate::ccl::ccl_utils::sync_cast_targets(&mut expr);
-    expr
+    inline_impl(expr)
 }
 
 /// Returns `true` when a `Let` binding of type `bound_ty` should be inlined.
@@ -678,7 +674,7 @@ mod tests {
         assert!(!should_inline(&ty));
     }
 
-    /// The same domain at the **capability** kind is inlined. A `Compute` arrow
+    /// The same domain at the **capability** kind is inlined. A `Compute` function
     /// over `[0, 3)` is a function that happens to accept those inputs, not a
     /// collection of them, and there is nothing behind it to share.
     #[test]
@@ -1221,7 +1217,9 @@ mod tests {
         // leaving `λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ x → x)`.
         let int = Type::Base(BaseType::Int);
         let range = Type::UIntRange(3);
-        let list = fn_ty(range.clone(), int.clone());
+        // The list, and the `λ __iter_record` that denotes it, are **collections**
+        // (`⤇`); the UDF around them is a capability taking one to another.
+        let list = Type::data_fun(range.clone(), int.clone());
         let udf_ty = fn_ty(list.clone(), list.clone());
 
         let inner_lambda_body = TypedExpr::apply(
@@ -1283,7 +1281,7 @@ mod tests {
         // outer-lambda beta-reduction behaviour.
         let int = Type::Base(BaseType::Int);
         let range = Type::UIntRange(3);
-        let list = fn_ty(range.clone(), int.clone());
+        let list = Type::data_fun(range.clone(), int.clone());
         let arg_pair_ty = Type::Tuple(vec![list.clone(), int.clone()]);
         let udf_ty = fn_ty(arg_pair_ty.clone(), list.clone());
 

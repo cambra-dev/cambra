@@ -723,11 +723,15 @@ impl Subst {
 
         // `Compose`'s type is derived from its elements, so rewriting them can
         // concretize it (substituting a `Var` whose type was a placeholder).
+        // Only the *domain and codomain* are derived that way: `fun_like` keeps
+        // the chain's own kind and Pi binder, which its elements do not carry and
+        // a bare function type would drop — rebuilding a collection as a capability
+        // (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions").
         if let TypedExprNode::Compose(elts) = &e.node
             && let (Some(first), Some(last)) = (elts.first(), elts.last())
             && let (Some(d), Some(c)) = (first.ty.domain(), last.ty.codomain())
         {
-            e.ty = Type::fun(d, c);
+            e.ty = Type::fun_like(&e.ty, d, c);
         }
     }
 

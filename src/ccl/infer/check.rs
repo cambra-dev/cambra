@@ -283,7 +283,7 @@ impl Typing for CheckCtx {
             return Ok(((**d).clone(), (**c).clone()));
         }
         // A feed channel reads as its whole stream `domain ⇒ value`, so it
-        // destructures as that arrow.
+        // destructures as that function type.
         if let Some((domain, value)) = peeled.as_feed() {
             return Ok((domain.clone(), value.clone()));
         }
@@ -367,7 +367,7 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
 /// recorded `Type`.
 fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferError> {
     let label = symbolic(expr);
-    // The `Lambda` rule reads the node's own arrow for its kind (see
+    // The `Lambda` rule reads the node's own type for its kind (see
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
     let ty = match &mut expr.node {
@@ -442,7 +442,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // The projection's function type is already recorded; decompose it.
         TypedExprNode::Proj(key) => emit_proj(key, &expr.ty, ctx)?,
 
-        TypedExprNode::List(elts) => emit_list(elts, ctx)?,
+        TypedExprNode::List(elts) => emit_list(elts, &recorded_ty, ctx)?,
 
         TypedExprNode::Case {
             scrutinee,
@@ -456,7 +456,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
-        TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, ctx)?,
+        TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, &recorded_ty, ctx)?,
 
         TypedExprNode::Transact {
             keys,
