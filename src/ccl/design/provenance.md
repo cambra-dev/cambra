@@ -126,10 +126,13 @@ Three primitives, chosen by what the copy denotes.
   ([The collapse](#the-collapse)): an `Unexplained` or a `CopyOfUnknown` means a copy was made with
   no step open, or against an origin the log never recorded, which is a recording gap whose fix is
   to record the copy.
-- **`clone_at`** — the copy's root carries a given id and its interior freshens: substitution. The
-  replacement for a `Var(𝑥)` occurrence denotes what the occurrence denoted, the value of 𝑥 at that
-  position, so the occurrence keeps its own id while the interior becomes a fresh node-set. N reads
-  give N distinct roots. `Subst`'s compound-replacement arm is the engine.
+- **a copy at the occurrence's id** — the root takes an id the tree already holds and the interior
+  freshens: substitution, and the one copy that shares an id. The replacement for a `Var(𝑥)`
+  occurrence denotes what the occurrence denoted, the value of 𝑥 at that position, so attribution
+  there is the occurrence's; N reads give N subtrees under N ids the tree already holds. One site,
+  `Subst`'s compound-replacement arm in `as_expr_preserving`, which carries the alternative it is
+  chosen over: recording the copy against the occurrence instead of sharing its id resolves to the
+  same entry, at a death per occurrence and an ordering constraint on the record.
 
 **Freshen at placement, not at construction.** Most passes build intermediate structures — guard
 vectors, path conjunctions, per-branch environments — whose entries are aliased and then copied into

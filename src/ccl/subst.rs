@@ -172,23 +172,49 @@ impl Mapping {
         out
     }
 
-    /// [`as_expr`](Self::as_expr) at a **preserved** root identity: the
-    /// replacement root takes `node_id` — the occurrence's own id — so it
-    /// inherits the use-site's span and attribution.
+    /// [`as_expr`](Self::as_expr) at the **occurrence's own identity**: the
+    /// replacement's root takes `node_id`, so attribution at that position stays
+    /// the use site's rather than becoming the template's.
     ///
     /// A `Rename` is built directly at `node_id` rather than minted and then
     /// overwritten: a mint fires `on_mint`, and an id no node ends up carrying is
     /// a phantom birth in the lineage log.
     ///
-    /// A `Discharge` copies through [`clone_at`](TypedExpr::clone_at), which
-    /// builds the replacement's root directly at `node_id` and freshens the
-    /// interior. Neither shape mints an id that no node ends up carrying.
+    /// A `Discharge` is the crate's one copy that shares an id; the literal below
+    /// carries why.
     fn as_expr_preserving(&self, node_id: NodeId, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
             // See [`as_expr`]: the rename keeps the occurrence's type.
             Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone()))
                 .with_ty(occurrence_ty.clone()),
-            Mapping::Discharge(t) => t.clone_at(node_id),
+            // The root takes the occurrence's id, the interior freshens
+            // (`node.clone()` reaches each child's own `Clone`): N occurrences give
+            // N subtrees under N ids the tree already holds. The id is what
+            // attribution resolves through, and a lowered parameter use is the case
+            // that shows it — uncurry substitutes a machine-made tuple projection
+            // into every use of `a` in `def add(a, b): a + a + b`, so a freshened
+            // root resolves through that template, whose span is the whole `def`
+            // and whose nature is machinery, and all three uses report the header
+            // instead of their own columns.
+            //
+            // A literal rather than `preserve(node_id, …).with_ty(…)`: the
+            // exhaustive field check is what keeps `user_annotation` from being
+            // silently dropped.
+            //
+            // TODO(subst-lineage): the edge encoding reproduces this entry, span
+            // and nature alike — freshen the root and record the copy against the
+            // occurrence instead of the template. It costs a death per occurrence,
+            // and the record has to land in the enclosing frame, since a nested one
+            // flushes first (guards drop LIFO) and would order these edges ahead of
+            // the copy that introduced the template they read. Revisit when the
+            // pane-level table lands and the two become distinguishable from
+            // outside this function.
+            Mapping::Discharge(t) => TypedExpr {
+                ty: t.ty.clone(),
+                node: t.node.clone(),
+                user_annotation: t.user_annotation.clone(),
+                node_id,
+            },
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out

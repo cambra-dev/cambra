@@ -192,7 +192,7 @@ fn is_mut_written(name: &Name, expr: &Expr) -> bool {
 /// docs), so it *does* encounter `Defer`/`Feed`/`Define` nodes; beta-reduction
 /// routes them through the defer-aware [`crate::ccl::subst::Subst`] engine,
 /// which renames a fed-to handle when a defer-mediating UDF is inlined. The
-/// defer-returning lift itself lives in `channelize::try_lift_defer`.
+/// defer-returning lift itself lives in `channelize::lift_defer`.
 fn inline_impl(expr: Expr) -> Expr {
     // Carry `node_id` through every rebuild: reconstructing a node with
     // inlined children is a Preserve (the same node, same identity), so the
@@ -270,10 +270,10 @@ fn inline_impl(expr: Expr) -> Expr {
         // ANF defer-returning Compose source: when the first element of a Compose
         // (i.e. the for-loop iteration source) is itself a defer-returning
         // expression, wrap it in a fresh `let __for_src_N = source` binding so
-        // that `try_lift_defer` can physically rename its inner defer handle,
+        // that `lift_defer` can physically rename its inner defer handle,
         // preventing two same-named `__result` defers from coexisting in
         // `channelize`. Re-running `inline_impl` on the wrapping `Let`
-        // triggers `try_lift_defer` on the new binding.
+        // triggers the defer lift on the new binding.
         TypedExprNode::Compose(terms) => {
             TypedExprNode::Compose(terms.into_iter().map(inline_impl).collect())
         }

@@ -99,7 +99,7 @@ fn test_polymorphic_udf_calls_differing_only_in_a_literal(
 // Same generator, but its result is *bound* to a variable before use
 // (`y = doubles(...)` then `y`) rather than called inline. `inline` expands
 // the call to `let y = (let __result = defer in … __result) in y`, and
-// `channelize::try_lift_defer` lifts the inner result-defer scope out so the
+// `channelize::lift_defer` lifts the inner result-defer scope out so the
 // feeds land on `y`. The inline form above never reaches that path, so this
 // case is its regression guard.
 #[case(
@@ -111,7 +111,7 @@ fn test_polymorphic_udf_calls_differing_only_in_a_literal(
 // becomes `let y = (let z = <doubles inlined> in z) in y` — the inner
 // bound-expr contains a defer but is not itself `Defer`, so
 // `channelize`'s defer-returning-let *collapse* fires (surfacing the inner
-// defer for a subsequent `try_lift_defer`). Regression guard for that path.
+// defer for a subsequent `lift_defer`). Regression guard for that path.
 #[case(
     "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndef wrap(xs):\n    z = doubles(xs)\n    z\ny = wrap([1, 2, 3])\ny",
     make_int_list(&[2, 4, 6])

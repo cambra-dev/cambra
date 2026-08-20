@@ -188,9 +188,11 @@ pub(crate) type LineageLog = Vec<RewriteStep>;
 /// itself hold). Attached-literal vs resolved-through-state are different
 /// semantics, not two instances of one thing — and thread-local statics cannot
 /// be generic, so a blame-domain generic would erase to the same at the
-/// recorder boundary anyway. There is deliberately no NodeId-blame field:
-/// root-carry eliminated its only prospective user; add one when a site
-/// demands it.
+/// recorder boundary anyway. There is no NodeId-blame field: the one site that
+/// would name an upstream id — a substitution, whose replacement takes the
+/// replaced occurrence's attribution — carries the occurrence's identity instead
+/// (`crate::ccl::subst`'s `as_expr_preserving`), so there is no id left to
+/// resolve. Add one when a site demands it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LoweringStep {
     /// The identity relation this step performs. For lowering: a leaf mint is a
@@ -1842,12 +1844,11 @@ mod tests {
     }
 
     #[test]
-    fn lowering_root_carry_preserve_inherits_its_leaf_attribution() {
-        // Root-carry: the substituted compound root carries the
-        // occurrence's own id (a preserve). In the log that is just the
-        // occurrence's leaf entry — no copy for the root — and its interior
-        // children are copies of the template. The root keeps its own (Source)
-        // attribution; the interior mirrors the template (Machinery).
+    fn lowering_substituted_root_inherits_its_occurrences_leaf_attribution() {
+        // A substituted root carries the occurrence's own id, so the log holds no
+        // step for it — just the occurrence's leaf entry — while its interior
+        // children are copies of the replacement template. The root keeps its own
+        // (Source) attribution; the interior mirrors the template (Machinery).
         let [occurrence, tmpl_child, occ_child] = ids();
         let log = vec![
             // The param-use occurrence, imaged Source at its mint.
@@ -1869,7 +1870,7 @@ mod tests {
         assert_eq!(
             root_attr.rewritten.nature,
             Nature::Source,
-            "the carried root preserves the occurrence's own Source attribution"
+            "the carried root keeps the occurrence's own Source attribution"
         );
         assert_eq!(root_attr.spans, vec![span(10, 11)]);
         assert_eq!(

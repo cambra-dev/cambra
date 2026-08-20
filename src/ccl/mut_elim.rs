@@ -1651,10 +1651,7 @@ fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(rep) = env.get(n)
     {
-        // Root-carry: the replacement denotes what the `Var` denoted — the value
-        // of `n` *here* — so the read site keeps its own id, and with it its
-        // span/attribution. N reads give N distinct roots.
-        return rep.clone_at(e.node_id());
+        return rep.clone();
     }
     e.map_children(|c| subst_env(c, env));
     e

@@ -184,18 +184,18 @@ pub(super) fn uncurry_params(
     let up = "lower.uncurry_proj";
     let body_with_subs = params.iter().enumerate().fold(body_expr, |acc, (i, arg)| {
         // The projection plumbing is manufactured per *occurrence*: the
-        // substitution deep-freshens the template's INTERIOR into every
-        // occurrence of the parameter (root-carry keeps each occurrence's own
-        // id/attribution — see `substitute_param_in_body`), so tag the template's
+        // substitution deep-freshens this template's INTERIOR into every
+        // occurrence of the parameter while each occurrence keeps its own
+        // id/attribution (see `substitute_param_in_body`), so tag the template's
         // three nodes as machinery leaves.
         //
         // The template itself never enters the tree. Its two interior ids reach
         // the tree as the freshened copies the frame below captures, so they are
-        // origins of live nodes; its ROOT does not — root-carry replaces it with
-        // each occurrence's own id — so that one id is tagged and then carried by
-        // nothing. Harmless in the product (the projection is filtered to the
-        // output tree, so the entry drops out), and the reason there is no
-        // produced-side leak class: see `design/provenance.md`, "The collapse".
+        // origins of live nodes; its ROOT does not — each occurrence's own id
+        // replaces it — so that one id is tagged and then carried by nothing.
+        // Harmless in the product (the projection is filtered to the output tree,
+        // so the entry drops out), and the reason there is no produced-side leak
+        // class: see `design/provenance.md`, "The collapse".
         let var = ctx.tag_machinery(Expr::var(&tuple_name), fn_span, up);
         let idx = ctx.tag_machinery(Expr::proj_index(i), fn_span, up);
         let proj = ctx.tag_machinery(Expr::apply(var, idx), fn_span, up);
@@ -408,12 +408,11 @@ in add"
     }
 
     /// Occurrence fidelity: in a multi-param `def` whose params occur more than
-    /// once, uncurry substitutes a fresh tuple-projection template into each
-    /// occurrence — and root-carry (see [`substitute_param_in_body`]) makes each
-    /// projection *root* preserve the occurrence's own id, so it inherits that
-    /// occurrence's own source span instead of the one `def` span shared by every
-    /// copy. The corpus otherwise has no multi-param `def`, so pin the span
-    /// fidelity here.
+    /// once, uncurry substitutes a tuple-projection template into each occurrence,
+    /// and each projection *root* keeps that occurrence's own id (see
+    /// [`substitute_param_in_body`]), so it inherits that occurrence's own source
+    /// span instead of the one `def` span every copy of the template shares. The
+    /// corpus otherwise has no multi-param `def`, so pin the span fidelity here.
     #[test]
     fn uncurry_projection_roots_carry_occurrence_spans() {
         use crate::ccl::TypedExprNode;
@@ -448,8 +447,8 @@ in add"
 
         // Collect the source span each uncurry-projection ROOT carries. A
         // projection node is `Apply { function: Proj(Index(_)) }` — its argument
-        // is the synthetic tuple var. Its own id is the occurrence's, carried by
-        // root-carry, so its projection entry is the occurrence's `Source` image.
+        // is the synthetic tuple var. Its own id is the occurrence's, so its
+        // projection entry is that occurrence's `Source` image.
         fn projection_spans(e: &Expr, proj: &SourceProjection, out: &mut Vec<Span>) {
             if let TypedExprNode::Apply { function, .. } = &e.node
                 && matches!(function.node, TypedExprNode::Proj(_))

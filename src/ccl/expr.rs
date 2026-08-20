@@ -725,7 +725,7 @@ pub struct TypedExpr {
     ///
     /// **`Clone` freshens** (see the [`Clone`] impl below), so reaching a
     /// duplicated id takes writing one deliberately, through
-    /// [`preserve`](Self::preserve) or [`clone_at`](Self::clone_at).
+    /// [`preserve`](Self::preserve).
     ///
     /// # What is forbidden is a mint, not a write
     ///
@@ -763,14 +763,15 @@ pub type Expr = TypedExpr;
 ///
 /// **The named id-sharing paths.** Sharing an id takes writing one through
 /// [`TypedExpr::preserve`] (one node at an id already in hand),
-/// [`TypedExpr::clone_at`] (a copied subtree whose root takes a given id),
 /// [`TypedExpr::clone_preserving_ids`] (a subtree at its source's ids), the
 /// [`preserving_ids`](crate::ccl::lineage::preserving_ids) scope that backs it —
-/// called directly by `PredMemo`'s rebuilds in `crate::ccl::ccl_utils` — or the
+/// called directly by `PredMemo`'s rebuilds in `crate::ccl::ccl_utils` — the
 /// `*_preserving` constructors
 /// ([`expr_stmt_preserving`](TypedExpr::expr_stmt_preserving),
 /// [`let_in_preserving`](TypedExpr::let_in_preserving)), which are `preserve` in
-/// convenience form.
+/// convenience form, or the one literal in [`crate::ccl::subst`]'s
+/// `as_expr_preserving`, where a substituted occurrence's id lands on the
+/// replacement's root.
 ///
 /// The freshen is deep by construction: `node.clone()` clones the children, and
 /// each child is a `TypedExpr` reaching this same impl.
@@ -847,7 +848,7 @@ impl TypedExpr {
     /// These are the only two ways to build a node, and the recorder sees exactly
     /// the difference: `new` mints and records a birth, `preserve` does neither.
     ///
-    /// # Two shapes build a node at an existing id; only one of them is this
+    /// # Three shapes build a node at an existing id; only one of them is this
     ///
     /// **Reaching into another node for its id** — `node_id: src.node_id`, where
     /// `src` is some *other* node — is this constructor's shape, and the one where
@@ -866,6 +867,11 @@ impl TypedExpr {
     /// assertion far away. Roughly three dozen such rebuilds live in
     /// `transact_phase`, `inline`, and `channelize`; converting them would trade a
     /// compile-time guarantee for a runtime one, once per site.
+    ///
+    /// **A copy at an id the tree already holds** — a subtree cloned, its root
+    /// taking a caller-supplied id — is neither, and is one site:
+    /// [`crate::ccl::subst`]'s `as_expr_preserving`, a literal for the same
+    /// field-check reason.
     pub(crate) fn preserve(node_id: NodeId, node: TypedExprNode) -> Self {
         TypedExpr {
             node,
@@ -938,27 +944,6 @@ impl TypedExpr {
     pub(crate) fn clone_preserving_ids(&self) -> Self {
         let _preserving = crate::ccl::lineage::preserve_ids();
         self.clone()
-    }
-
-    /// A copy whose **root carries `node_id`** and whose interior is freshened —
-    /// the root-carry primitive.
-    ///
-    /// The substitution engine's compound-replacement arm is the caller: the
-    /// replacement for a `Var(𝑥)` occurrence denotes what the occurrence denoted
-    /// — the value of 𝑥 *at that position* — so the occurrence keeps its own id,
-    /// inheriting its span and attribution, while the interior becomes a fresh
-    /// node-set. N reads give N distinct roots.
-    ///
-    /// The root is built directly at `node_id`, so nothing is minted for it. The
-    /// interior still freshens, because `node.clone()` reaches each child's own
-    /// [`Clone`] and each child is a sibling of the template's.
-    pub(crate) fn clone_at(&self, node_id: NodeId) -> Self {
-        TypedExpr {
-            ty: self.ty.clone(),
-            node: self.node.clone(),
-            user_annotation: self.user_annotation.clone(),
-            node_id,
-        }
     }
 
     /// Set the inferred type on this expression, consuming and returning it.

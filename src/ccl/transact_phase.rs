@@ -366,11 +366,7 @@ fn proj_pair(p: &Name, pair_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
 fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
     if let TypedExprNode::Var(n) = &e.node {
         if n == name {
-            // Root-carry, as `subst_env` below: `p.1.field` denotes what
-            // `Var(name)` denoted at this position, so the occurrence keeps its
-            // own id and with it its source span — a user-written register read.
-            // Freshening the root instead would move that hover onto machinery.
-            *e = replacement.clone_at(e.node_id());
+            *e = replacement.clone();
         }
         return;
     }
@@ -2344,7 +2340,7 @@ fn subst_env(e: &Expr, env: &HashMap<Name, Expr>) -> Expr {
         // Root-carry: the replacement denotes what the `Var` denoted — the value
         // of `n` *here* — so the read site keeps its own id, and with it its
         // span/attribution. N reads give N distinct roots.
-        return rep.clone_at(e.node_id());
+        return rep.clone();
     }
     let mut out = e.clone();
     out.map_children(|c| subst_env(&c, env));
@@ -3230,7 +3226,6 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::context::assert_unique_node_ids;
     use crate::ccl::{ArithmeticKind, BinOpKind, letrec::check_letrec_causal, symbolic::symbolic};
 
     /// A [`RawSite`] with only the fields [`partition_keys`] reads. The rest are
@@ -3451,45 +3446,5 @@ mod tests {
             Ok(()),
             "the emitted transaction letrec must be guarded"
         );
-    }
-
-    /// `subst_var_with` root-carries, like both `subst_env`s: each occurrence
-    /// keeps its own `NodeId` — it is a user-written register read, and the id is
-    /// what carries its source span — while the replacement's *interior* is
-    /// freshened once per occurrence, so N reads give N distinct trees rather
-    /// than N aliases of one.
-    #[test]
-    fn subst_var_with_root_carries_each_occurrence() {
-        let int = Type::Base(BaseType::Int);
-        let x = Name::fresh("x");
-
-        let lhs = Expr::var(x.clone()).with_ty(int.clone());
-        let rhs = Expr::var(x.clone()).with_ty(int.clone());
-        let (lhs_id, rhs_id) = (lhs.node_id(), rhs.node_id());
-        let mut body =
-            Expr::binop(lhs, BinOpKind::Arithmetic(ArithmeticKind::Add), rhs).with_ty(int.clone());
-
-        // A compound replacement, so there is an interior to freshen.
-        let p = Name::fresh("__zp");
-        let pair_ty = Type::Tuple(vec![int.clone(), int.clone()]);
-        let replacement = proj_pair(&p, &pair_ty, 0, &int);
-
-        subst_var_with(&mut body, &x, &replacement);
-
-        let TypedExprNode::BinOp { left, right, .. } = &body.node else {
-            panic!("substitution rebuilt the binop: {}", symbolic(&body));
-        };
-        assert_eq!(
-            left.node_id(),
-            lhs_id,
-            "the left read keeps its own id, not the replacement's"
-        );
-        assert_eq!(
-            right.node_id(),
-            rhs_id,
-            "the right read keeps its own id, not the replacement's"
-        );
-        // The two replacements' interiors must not alias each other.
-        assert_unique_node_ids(&body, "transact_phase::subst_var_with");
     }
 }
