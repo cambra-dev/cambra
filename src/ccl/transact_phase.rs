@@ -1550,16 +1550,16 @@ pub fn check_no_guarded_induction_write_in_block(
 /// continuation spine here supplies ([`Expr::walk_children`] visits `bound_expr` before `body`
 /// for every spine node) and lowering's right-to-left statement chain is not.
 pub fn check_await_final_linearity(expr: &Expr) -> Result<(), String> {
-    fn used_up(reg: &Name) -> String {
+    fn used_up(var: &Name) -> String {
         format!(
-            "`{reg}` is unreferenceable after `await_final({reg})`: the await consumes the \
+            "`{var}` is unreferenceable after `await_final({var})`: the await consumes the \
              mutable variable, declaring its commit history complete",
-            reg = reg.base()
+            var = var.base()
         )
     }
     fn go(e: &Expr, awaited: &mut HashSet<Name>) -> Result<(), String> {
         match &e.node {
-            TypedExprNode::Var(reg) if awaited.contains(reg) => return Err(used_up(reg)),
+            TypedExprNode::Var(var) if awaited.contains(var) => return Err(used_up(var)),
             TypedExprNode::MutWrite { name, .. } if awaited.contains(name) => {
                 return Err(used_up(name));
             }
@@ -1568,14 +1568,14 @@ pub fn check_await_final_linearity(expr: &Expr) -> Result<(), String> {
             TypedExprNode::Apply { argument, function }
                 if matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal)) =>
             {
-                let TypedExprNode::Var(reg) = &argument.node else {
+                let TypedExprNode::Var(var) = &argument.node else {
                     return Err(
                         "await_final's operand must be a bare mutable variable reference"
                             .to_string(),
                     );
                 };
-                if !awaited.insert(reg.clone()) {
-                    return Err(used_up(reg));
+                if !awaited.insert(var.clone()) {
+                    return Err(used_up(var));
                 }
                 return Ok(());
             }
@@ -1653,9 +1653,9 @@ fn check_store_acyclicity(
         fn direct(e: &Expr, out: &mut Vec<Name>) {
             if let TypedExprNode::Apply { argument, function } = &e.node
                 && matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))
-                && let TypedExprNode::Var(reg) = &argument.node
+                && let TypedExprNode::Var(var) = &argument.node
             {
-                out.push(reg.clone());
+                out.push(var.clone());
             }
             e.walk_children(|c| direct(c, out));
         }
@@ -1767,11 +1767,11 @@ fn resolve_writer_free_awaits(e: &mut Expr, written_keys: &[Name]) {
     fn collect(e: &Expr, written_keys: &[Name], out: &mut Vec<Name>) {
         if let TypedExprNode::Apply { argument, function } = &e.node
             && matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))
-            && let TypedExprNode::Var(reg) = &argument.node
-            && !written_keys.contains(reg)
-            && !out.contains(reg)
+            && let TypedExprNode::Var(var) = &argument.node
+            && !written_keys.contains(var)
+            && !out.contains(var)
         {
-            out.push(reg.clone());
+            out.push(var.clone());
         }
         e.walk_children(|c| collect(c, written_keys, out));
     }
@@ -1784,8 +1784,8 @@ fn resolve_writer_free_awaits(e: &mut Expr, written_keys: &[Name]) {
     fn rewrite(e: &mut Expr, seeds: &HashMap<Name, MutVarDecl>) {
         if let TypedExprNode::Apply { argument, function } = &e.node
             && matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))
-            && let TypedExprNode::Var(reg) = &argument.node
-            && let Some(seed) = seeds.get(reg)
+            && let TypedExprNode::Var(var) = &argument.node
+            && let Some(seed) = seeds.get(var)
         {
             // The marker node is what the seed stands in for, and it is user-written
             // (`await_final(x)` is source text), so the recording names it. The key's
@@ -3346,8 +3346,8 @@ fn resolve_await_finals(
 ) {
     if let TypedExprNode::Apply { argument, function } = &e.node
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal))
-        && let TypedExprNode::Var(reg) = &argument.node
-        && hist.contains_key(reg)
+        && let TypedExprNode::Var(var) = &argument.node
+        && hist.contains_key(var)
     {
         // The marker is user-written source text, and the terminal read is what it
         // becomes, so the recording names the marker node. Its `Var(x)` operand dies with
@@ -3358,7 +3358,7 @@ fn resolve_await_finals(
             "transact.await_final",
             provenance::Nature::Expansion,
         );
-        *e = final_key(reg, hist, key_init);
+        *e = final_key(var, hist, key_init);
         return;
     }
     e.walk_children_mut(|c| resolve_await_finals(c, hist, key_init));
@@ -3378,7 +3378,7 @@ fn final_key(k: &Name, hist: &HashMap<Name, Name>, key_init: &HashMap<Name, MutV
     sampling_read(&hist[k], v, Builtin::FinalRead)
 }
 
-/// `as_of_read(reg_k)` — a key's **as-of read**, awaiting the reading loop
+/// `as_of_read(hist_k)` — a key's **as-of read**, awaiting the reading loop
 /// [`rewrite_as_of_reads`] pairs it with. No seed operand: the sampled position always
 /// has a value, because tick 0 of every store is its keys' seeds.
 fn as_of_read(hist: &Name, value_ty: Type) -> Expr {

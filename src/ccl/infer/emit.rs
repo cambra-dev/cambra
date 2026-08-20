@@ -1357,11 +1357,11 @@ pub(super) fn emit_let<C: Typing>(
         // minting a second variable here would leave the one the binder is bound at
         // unrelated to the one the initializer flowed into.
         //
-        // There is no register arm and no deref-copy case. A mutable variable introduction
-        // is a `MutDecl` (see `emit_mut_decl`), and a mutable-variable-typed initializer was
-        // already deref'd above — so `y: Int = x` off a mutable variable needs no special
-        // handling, and `y: _ = x` completes from the *value* rather than the
-        // history, which is what makes it mean exactly `y = x`.
+        // There is no mutable-variable arm and no deref-copy case. A mutable variable
+        // introduction is a `MutDecl` (see `emit_mut_decl`), and a mutable-variable-typed
+        // initializer was already deref'd above — so `y: Int = x` off a mutable variable
+        // needs no special handling, and `y: _ = x` completes from the *value* rather
+        // than the history, which is what makes it mean exactly `y = x`.
         Some(ann) => {
             let declared = match ann {
                 Type::BoundedHole(_) => ann.clone(),
@@ -1461,17 +1461,17 @@ pub(super) fn emit_letrec<C: Typing>(
 ///
 /// The binder is bound at the history `Mut(V, D)`, so references to `x` carry
 /// `Mut` and a read derefs to `V` at the rule that emits it ([`emit_value_read`], not
-/// the subtyping relation — see `src/ccl/design/mutability.md`, "A mutable variable read is
-/// an explicit operation"). `normalize`
-/// mints the declared type's `Hole` value/domain as fresh variables in Emit — so
-/// `?V` receives the seed and every write — and is the identity in Check.
+/// the subtyping relation — see `src/ccl/design/mutability.md`, "A mutable variable
+/// read is an explicit operation"). `normalize` mints the declared type's `Hole`
+/// value/domain as fresh variables in Emit — so `?V` receives the seed and every
+/// write — and is the identity in Check.
 ///
 /// The seed is one **contribution** to `V`, not its definition, and flows in
 /// verbatim: the join with the mutable variable's writes is what keeps `x := 0` from
-/// pinning the mutable variable to `{Int | __elem == 0}`. A register with *no* writes keeps
-/// its seed's refinement, and that is correct — it really does hold that value at
-/// every position. The constraint is skipped when `V` is still a `Hole` (Check's
-/// identity-normalize), which the already-resolved tree validates on its own.
+/// pinning the mutable variable to `{Int | __elem == 0}`. A mutable variable with *no*
+/// writes keeps its seed's refinement, and that is correct — it really does hold that
+/// value at every position. The constraint is skipped when `V` is still a `Hole`
+/// (Check's identity-normalize), which the already-resolved tree validates on its own.
 ///
 /// The node's own type is its body's: a mutable variable introduction scopes a mutable variable
 /// over `body` and yields whatever `body` yields, exactly as a `let` does.

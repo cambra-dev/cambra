@@ -1117,7 +1117,7 @@ A CHL **program** is its top-level block (§2.1): a sequence of
 statements. Each non-terminal statement either introduces a binding
 visible to the remainder of the block, or performs an effect (a feed
 into a deferred output). The block's *value* is the value of its final
-expression statement; if the program mutable variables any sinks (e.g.
+expression statement; if the program registers any sinks (e.g.
 `http_serve`), the program value is implicitly a record of those sinks
 instead.
 

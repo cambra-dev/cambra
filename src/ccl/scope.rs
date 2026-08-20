@@ -269,7 +269,7 @@ where
         }
 
         // A mutable variable introduction scopes exactly like a `let`: `init` sits outside
-        // the binder — a seed cannot reference the register it seeds — and
+        // the binder — a seed cannot reference the variable it seeds — and
         // `binding` scopes over `body`, which is where its writes and reads live.
         N::MutDecl {
             binding,
@@ -548,14 +548,14 @@ mod tests {
             }),
             TypedExpr::let_bind("l", var("bound"), var("l")),
             TypedExpr::mut_decl(
-                "reg",
+                "md",
                 Type::History {
                     value: Box::new(Type::Hole),
                     domain: Box::new(Type::Hole),
                     kind: crate::ccl::HistoryKind::Overwrite,
                 },
                 var("seed"),
-                var("reg"),
+                var("md"),
             ),
             node(N::List(vec![var("e0"), var("e1")])),
             case_with_two_branches(),

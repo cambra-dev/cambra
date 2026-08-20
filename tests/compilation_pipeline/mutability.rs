@@ -1376,7 +1376,7 @@ fn non_mut_redef_shadows_mut_param_fn_lowers_tupled() {
 /// Regression: a `Mut`-param `def` local to a nested scope (here a function
 /// body) must not leak its curried call shape to a same-named top-level `def`.
 /// Statement blocks lower right-to-left, so the top-level `bump(3, 4)` call is
-/// lowered *after* `outer`'s body mutable variables a nested `Mut`-param `bump`; without
+/// lowered *after* `outer`'s body registers a nested `Mut`-param `bump`; without
 /// block-scoping the leak made that call lower curried against the 2-tuple
 /// top-level `bump`. `r = bump(3,4) = 7`; `outer(100)` bumps `y` once then adds
 /// 100 → 101; total 108.

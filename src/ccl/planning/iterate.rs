@@ -1157,7 +1157,7 @@ mod tests {
         // previous-accumulator read.  The exact body shape doesn't matter for
         // this test — we only check the writer `source` gets iterate-wrapped.
         let body = Expr::var("acc").with_ty(int.clone());
-        let reg_ty = Type::Record(vec![(
+        let hist_ty = Type::Record(vec![(
             "acc".to_string(),
             fun_ty(Type::UIntRange(3), int.clone()),
         )]);
@@ -1174,7 +1174,7 @@ mod tests {
             }],
             domain: Type::UIntRange(3),
         })
-        .with_ty(reg_ty);
+        .with_ty(hist_ty);
 
         insert_iterate_recurse(&mut expr);
 

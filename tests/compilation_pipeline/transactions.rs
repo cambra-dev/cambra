@@ -1564,7 +1564,7 @@ fn mut_vars_read_together_share_a_store() {
     assert_eq!(commit_stores(code), vec!["Txn[a,b]"]);
 }
 
-/// A register a *writing* block reads to decide its commit is read at that commit's
+/// A mutable variable a *writing* block reads to decide its commit is read at that commit's
 /// snapshot, so the read alone pulls it into the store — no write to `limit` is
 /// needed. (`limit` is never written, so it is a read-only key of the store. The key
 /// order is the block's footprint order, which is where the guard reads them, not the
@@ -2256,18 +2256,18 @@ fn induction_write_inside_begin_block_rejected() {
 
 /// A *guarded* induction write in a **mixed** block — one that *does* commit a
 /// transactional mutable variable — is rejected. `check_no_induction_only_transactions`
-/// passes (the block commits `reg`), but the guarded `cnt += 1` is not liftable
+/// passes (the block commits `total`), but the guarded `cnt += 1` is not liftable
 /// by `partition_spine` and would be silently dropped from the decision record.
 /// A dedicated pre-check (`check_no_guarded_induction_write_in_block`) catches it.
 #[test]
 fn guarded_induction_write_in_mixed_block_rejected() {
     check_compile_error(
         indoc! {r#"
-            reg: Mut(Int, Txn) := 0
+            total: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 0
             for x in [1, 2, 3]:
                 with begin():
-                    reg := reg + x
+                    total := total + x
                     if x >= 2:
                         cnt := cnt + 1
             cnt
@@ -2335,17 +2335,17 @@ fn txn_writer_called_inside_block_rejected() {
 /// PR-2 registry leak (same class as PR-1's mutable-registry leak): a
 /// `Mut(_, Txn)` mutable variable declared *inside* a `def` body must not leak into the
 /// transactional registry and falsely gate a like-spelled top-level local. The
-/// def-body scope snapshots and restores *both* mutable variable registries, so `reg`
+/// def-body scope snapshots and restores *both* mutable variable registries, so `v`
 /// outside `f` is an ordinary local (assignable, readable).
 #[test]
 fn txn_mut_var_in_def_body_does_not_leak_to_outer_local() {
     check_scalar(
         indoc! {r#"
             def f(x):
-                reg: Mut(Int, Txn) := 0
+                v: Mut(Int, Txn) := 0
                 x
-            reg = 5
-            reg
+            v = 5
+            v
         "#},
         cambra::interpreter::Value::Int(5),
     );

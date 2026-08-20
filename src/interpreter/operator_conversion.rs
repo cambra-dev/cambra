@@ -288,7 +288,7 @@ pub struct OpConversionContext {
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
     /// Transactional stores in scope, keyed by their `__hist` binder. A
-    /// `let __hist = Transact{…}` builds the shared store once and mutable variables
+    /// `let __hist = Transact{…}` builds the shared store once and registers
     /// it here; each variable read `__hist.k` projects key `k` off the shared
     /// store fan (see [`StoreReadInfo`]). Names are α-unique, so a flat
     /// (unscoped) map suffices.
