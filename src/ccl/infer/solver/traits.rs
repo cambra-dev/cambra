@@ -963,7 +963,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                     codomain,
                     ..
                 } => descend(codomain, &path, Step::Result, &mut frontier),
-                // The value a register or channel carries is a component of it in the
+                // The value a mutable variable or channel carries is a component of it in the
                 // same sense a field is; the domain beside it is an index, not a value
                 // this place holds.
                 Type::History { value, .. } => {

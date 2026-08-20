@@ -1402,7 +1402,7 @@ impl TileProducer for InductionStoreProducer {
                 // the commit gate), so a fired tap always rides an appended change.
                 // Layout invariant (as on the transaction side): `write_keys` =
                 // carry keys ++ tap keys, so the subtraction never underflows —
-                // a break would wrap `n_reg` to a huge value in release and
+                // a break would wrap `n_carry` to a huge value in release and
                 // mis-index `tap_fired`.
                 debug_assert!(
                     self.write_keys.len() >= self.tap_fields.len(),
@@ -1410,14 +1410,14 @@ impl TileProducer for InductionStoreProducer {
                     self.tap_fields.len(),
                     self.write_keys.len()
                 );
-                let n_reg = self.write_keys.len() - self.tap_fields.len();
+                let n_carry = self.write_keys.len() - self.tap_fields.len();
                 Some(
                     self.write_keys
                         .iter()
                         .cloned()
                         .zip(writes)
                         .enumerate()
-                        .filter(|(i, _)| *i < n_reg || tap_fired[*i - n_reg])
+                        .filter(|(i, _)| *i < n_carry || tap_fired[*i - n_carry])
                         .map(|(_, kv)| kv)
                         .collect(),
                 )
@@ -3851,21 +3851,21 @@ impl TileProducer for TransactWriterProducer {
                     // over-fire on a sibling route's commit.
                     // Layout invariant: `write_keys` = carry keys ++ tap keys, so
                     // the subtraction never underflows. Assert it — a break would wrap
-                    // `n_reg` to a huge value in release and mis-index `tap_fired`.
+                    // `n_carry` to a huge value in release and mis-index `tap_fired`.
                     debug_assert!(
                         self.write_keys.len() >= self.tap_fields.len(),
                         "commit operator: tap fields ({}) exceed write keys ({})",
                         self.tap_fields.len(),
                         self.write_keys.len()
                     );
-                    let n_reg = self.write_keys.len() - self.tap_fields.len();
+                    let n_carry = self.write_keys.len() - self.tap_fields.len();
                     let writes: HashMap<Value, Value> = self
                         .write_keys
                         .iter()
                         .cloned()
                         .zip(new)
                         .enumerate()
-                        .filter(|(i, _)| *i < n_reg || tap_fired[*i - n_reg])
+                        .filter(|(i, _)| *i < n_carry || tap_fired[*i - n_carry])
                         .map(|(_, kv)| kv)
                         .collect();
                     // Re-proposing this item at a new frontier supersedes its

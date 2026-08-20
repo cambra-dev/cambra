@@ -162,13 +162,13 @@ pub(super) fn lower_call(
                     "await_final takes a transactional mutable variable by name",
                 ));
             };
-            let reg = id.as_str();
-            if !ctx.is_transactional_mut_var(reg) || ctx.is_shadowed(reg) {
+            let name = id.as_str();
+            if !ctx.is_transactional_mut_var(name) || ctx.is_shadowed(name) {
                 return Err(LoweringError::unsupported(
                     arg.span,
                     format!(
-                        "`{reg}` is not a transactional mutable variable, so it has no commit history to \
-                         await. `await_final` applies to a `{reg}: Mut(V, Txn) := …` mutable variable; an \
+                        "`{name}` is not a transactional mutable variable, so it has no commit history to \
+                         await. `await_final` applies to a `{name}: Mut(V, Txn) := …` mutable variable; an \
                          induction accumulator's final value is read by naming it after its loop"
                     ),
                 ));
@@ -180,22 +180,22 @@ pub(super) fn lower_call(
                 return Err(LoweringError::unsupported(
                     func.span,
                     format!(
-                        "await_final(`{reg}`) inside a `with begin():` block would wait on the \
-                         commit history that block extends; a block reads `{reg}` bare, as a \
+                        "await_final(`{name}`) inside a `with begin():` block would wait on the \
+                         commit history that block extends; a block reads `{name}` bare, as a \
                          snapshot"
                     ),
                 ));
             }
-            // The *linearity* rule — the await consumes the mutable variable, so no later read
-            // or write may name it, and no mutable variable may be awaited twice — is not
-            // checkable here: `lower_stmts_inner` builds its statement chain
-            // right-to-left, so lowering visits the tail before the statements it
-            // follows. It is `transact_phase::check_await_final_linearity`, on the
-            // typed tree whose continuation spine runs in source order and where mutable variable
-            // identity is exact. A later `with begin():` block is only rejected by it
-            // if that block names the awaited mutable variable; blocks over other mutable variables
-            // are ordinary.
-            let mut_var = ctx.tag_image(Expr::var(reg.to_string()), arg.span);
+            // The *linearity* rule — the await consumes the mutable variable, so no
+            // later read or write may name it, and no mutable variable may be awaited
+            // twice — is not checkable here: `lower_stmts_inner` builds its statement
+            // chain right-to-left, so lowering visits the tail before the statements
+            // it follows. It is `transact_phase::check_await_final_linearity`, on the
+            // typed tree whose continuation spine runs in source order and where
+            // mutable variable identity is exact. A later `with begin():` block is
+            // only rejected by it if that block names the awaited mutable variable;
+            // blocks over other mutable variables are ordinary.
+            let mut_var = ctx.tag_image(Expr::var(name.to_string()), arg.span);
             let await_fn = ctx.tag_image(Expr::builtin(Builtin::AwaitFinal), func.span);
             Ok(Expr::apply(mut_var, await_fn))
         }

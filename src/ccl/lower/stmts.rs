@@ -431,7 +431,7 @@ pub(super) fn lower_middle_stmt(
             }
             let (req_name, resp_name) = extract_http_serve_names(target)?;
             let (port, method, path) = extract_http_serve_args(value)?;
-            // Create and mutable variable the source now; the caller drains new_sources
+            // Create and register the source now; the caller drains new_sources
             // via take_new_sources() after lower_stmts returns, before type inference.
             let port_u16: u16 = port.parse().map_err(|_| {
                 LoweringError::unsupported(
@@ -596,7 +596,7 @@ pub(super) fn lower_middle_stmt(
             };
             // Stamp the binding `Mut(V, D)` (so inference binds `x` at `Mut` and
             // its references deref to `V`). `D = Txn` for a transactional mutable variable
-            // (fixed here, never inferred), which also mutable variables `x` so its
+            // (fixed here, never inferred), which also registers `x` so its
             // `with begin():` writes lower to `MutWrite` and its bare reads are
             // gated. An induction accumulator gets `D = Hole` and carries *no* lowering
             // registry — its mutability is this `Mut` type, checked
@@ -1009,7 +1009,7 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
             // A `def` with a pass-by-reference `Mut` parameter is lowered and
             // applied curried. Blocks lower right-to-left, so a call site is
             // lowered *before* the `def` preceding it textually — pre-register
-            // the name here so [`lower_call`] picks the curried shape. Mutable variable
+            // the name here so [`lower_call`] picks the curried shape. Register
             // or unregister per the definition's mut-ness so the last `def` of a
             // name in the block wins (a non-`Mut` redefinition clears an earlier
             // `Mut` one, so its calls lower tupled).

@@ -1416,7 +1416,7 @@ pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// [`TypedExprNode::MutDecl`] (a `:=` introduction) and a pass-by-reference
 /// `Lambda` param — both declarations by construction. Checked rather than argued,
 /// because the failure is silent: a mutable variable reaching a `Let` binder is an alias,
-/// and an alias means a register with an unknown writer set.
+/// and an alias means a mutable variable with an unknown writer set.
 ///
 /// A **feed** handle on a `Let` is legal and common (`let d = Defer in …`), which is
 /// why this keys on `mut_value_type` (`Overwrite` only) and not `is_handle`.
