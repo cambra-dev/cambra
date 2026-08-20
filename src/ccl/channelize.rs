@@ -747,9 +747,8 @@ fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
         erase_chan_domains(bound_expr, map);
         erase_chan_domains(body, map);
         // §6.2 Let-closing on the substitution content (see fn docs).
-        // A type-level discharge. The term keeps its ids because it is a
-        // *template*, cloned again at every read; that read is where the sibling
-        // is minted.
+        // A discharge template is not a tree node: it is cloned again at every
+        // read, and that read is where the sibling is minted.
         let discharge =
             crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone_preserving_ids());
         for dom in map.values_mut() {
@@ -2127,9 +2126,8 @@ fn extract_for_defer_impl(
                     let mut fvs = HashSet::new();
                     collect_free_vars(feed, &mut fvs);
                     if fvs.contains(&binding.name) {
-                        // A `mem::take` slot, overwritten below — mint nothing for
-                        // it (`NodeId::PLACEHOLDER`), or the recorder logs a birth
-                        // for a node that never reaches the tree.
+                        // A `mem::take` slot, overwritten below: minting for it
+                        // would log a birth for a node no tree ever holds.
                         let placeholder = Expr::throwaway(TypedExprNode::Lit(Lit::Unit));
                         let original = std::mem::replace(feed, placeholder);
                         // stamp the wrap at construction —
@@ -2141,10 +2139,6 @@ fn extract_for_defer_impl(
                         let let_ty =
                             crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone())
                                 .apply_type(&original.ty);
-                        // The `Let` this walk is rebuilding keeps the original
-                        // `bound_expr` in the body, and each extracted feed that
-                        // captures the binder gets its own re-binding of the same
-                        // definition, so every wrap is a copy.
                         *feed = Expr::let_bind(binding.name.clone(), bound_expr.clone(), original)
                             .with_ty(let_ty);
                     }
@@ -2230,8 +2224,6 @@ fn extract_for_defer_impl(
                     // (the argument matches `param.ty`). Typed at construction.
                     let v_ty = v.ty.clone();
                     let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
-                    // Each companion channel applies the same source, which also
-                    // stays on the rebuilt `Apply` below, so each gets its own copy.
                     let channel = Expr::apply(new_argument.clone(), channel_lambda).with_ty(v_ty);
                     feeds.push(channel);
                 }
@@ -2390,10 +2382,6 @@ fn extract_for_defer_impl(
                                         .with_ty(Type::Base(BaseType::Bool));
                                     let refinement_struct =
                                         Refinement::born(Rc::new(pred_on_source));
-                                    // One refined source per feeding arm, so
-                                    // each arm's copy must carry its own ids —
-                                    // a bare clone would put one identity at N
-                                    // live positions.
                                     let mut refined_prefix = source_prefix.clone();
                                     refine_source_domain(&mut refined_prefix, refinement_struct);
                                     let channel_lambda =
@@ -2452,10 +2440,7 @@ fn extract_for_defer_impl(
                             // handle's rigid `ChanDom` domain, closed by the
                             // final `erase_chan_domains` substitution.
                             let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
-                            // The prefix stays in `new_elts` for the rebuilt
-                            // compose, so each companion channel takes its own copy.
-                            let mut channel_elts: Vec<Expr> =
-                                new_elts.iter().map(Expr::clone).collect();
+                            let mut channel_elts = new_elts.clone();
                             channel_elts.push(channel_lambda);
                             // A single-element "compose" is just that
                             // element; otherwise build a Compose.

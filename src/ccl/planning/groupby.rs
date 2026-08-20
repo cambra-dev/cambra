@@ -183,19 +183,14 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     // Compile the pointful key function to a point-free morphism V ⇒ K, then
     // build `keys = c ≫ key : I ⇒ K` and `values = c : I ⇒ V`.
     // This lifts a term out of a *type* — the refined domain's predicate — into
-    // the term tree, the crossing `planning::iterate`'s `fn_of_bare_predicate`
-    // has to freshen at: predicate interiors are outside the checked id domain
-    // and legitimately alias main-tree ids (lowering shares a comprehension's
-    // source term between the generator and the guard), so a lift can land ids
-    // that are already live. This site needs no freshen because `lambda_elim::run`
-    // *rebuilds* the term, re-minting every node — the laundering is what makes
-    // the crossing safe, and `groupby_recognition_lifts_the_key_without_aliasing`
-    // pins it, since a future elim that preserved ids would land duplicates here.
+    // the term tree. A predicate interior may already alias a live main-tree id
+    // (lowering shares a comprehension's source term between the generator and
+    // the guard), so a lift can land ids that are already in use. `lambda_elim::run`
+    // rebuilds the term, re-minting every node, which is what makes the crossing
+    // safe; `groupby_recognition_lifts_the_key_without_aliasing` pins the property
+    // rather than the mechanism.
     let key_pf = lambda_elim::run((**key_expr).clone()).ok()?;
     let value_idx_ty = (**idx_ty).clone();
-    // `c` reaches the output on both legs — once under `keys`, once as the value
-    // source below — so the keys leg carries a freshened sibling and the value
-    // leg (the collection the composition already denoted) keeps `c`'s own ids.
     let keys =
         compose((**c).clone(), key_pf).with_ty(Type::fun(value_idx_ty.clone(), (**key_ty).clone()));
     let key_binder = match &head.ty {

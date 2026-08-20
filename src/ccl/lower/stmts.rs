@@ -63,9 +63,7 @@ pub(super) fn lower_stmts_recovering(
     // errors are exceptional.
     //
     // The snapshot preserves ids, and must. It is a *rollback copy*, not a
-    // sibling: at most one of `acc` and `backup` ever reaches the tree, since
-    // the error arm runs only when `lower_middle_stmt` consumed and dropped
-    // `acc`.
+    // sibling: at most one of `acc` and `backup` ever reaches the tree.
     //
     // TODO(rollback-copy): ripe for refactoring — this is quadratic. The
     // continuation grows with every statement and is copied whole for each one,

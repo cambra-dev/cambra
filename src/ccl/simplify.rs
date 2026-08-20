@@ -957,13 +957,7 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             let g_ty = arm_ty(g);
             let h_ty = arm_ty(h);
 
-            // Distribution places `left` on **both** legs of the zip, so only one
-            // placement can keep its ids. The first leg is the survivor — `left`
-            // moves into it — and the second carries a freshened sibling. Two
-            // bare clones would give the two legs one identity, which the
-            // downstream product-beta hides only when it happens to consume one
-            // copy per leg (`⟨.0, .1⟩` arms); arms that read the *same* slot
-            // (`⟨.0, .0⟩`) leave both copies live.
+            // Distribution places `left` on both legs of the zip.
             let h_left = left.clone();
             let g_compose = Expr::compose(vec![left, g.clone()]).with_ty(g_ty);
             let h_compose = Expr::compose(vec![h_left, h.clone()]).with_ty(h_ty);

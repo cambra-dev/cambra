@@ -1004,9 +1004,6 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
         let value_ty = value.ty.clone();
         let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), value);
         lambda.ty = Type::fun(target.ty.clone(), value_ty.clone());
-        // One `Feed` per in-block feed, each mapping the one loop source. Two or
-        // more feeds place that source at that many live positions, so a bare
-        // clone would give them one identity.
         let mut map = Expr::compose(vec![iter.clone(), lambda]);
         map.ty = Type::fun(domain_ty.clone(), value_ty);
         let mut feed = Expr::feed(defer, map);
@@ -1122,11 +1119,10 @@ fn body_has_feed(expr: &Expr) -> bool {
 /// place. The result is the clean generator body (`Case { gᵢ → Feed; true → unit }`
 /// / a bare `Feed`) that `channelize`'s feed fan-out recognizes.
 fn strip_trailing_unit(expr: Expr) -> Expr {
-    // The rebuilt `Case` below is the *same* logical node with stripped branch
-    // bodies, so it carries its original `NodeId` — a pass that minted here would
-    // break the node's link to the source it came from
-    // (`src/ccl/design/provenance.md`, "The two identity primitives
-    // (`src/ccl/provenance.rs`)").
+    // The rebuilt `Case` below is the same logical node with stripped branch
+    // bodies, so it carries its original `NodeId`; a pass that minted here would
+    // break the node's link to the source it came from. See
+    // `src/ccl/design/provenance.md`, "Node identity (`src/ccl/provenance.rs`)".
     let node_id = expr.node_id();
     match expr.node {
         TypedExprNode::ExprStmt { expr: effect, body }
@@ -1272,26 +1268,8 @@ fn transform_chain(
                 // `commit` field must be point-free like `writes`.
                 let pi = subst_env(synthesize_arm_predicate(&br.guard, &priors), env);
                 priors.push(br.guard.clone());
-                // The post-`Case` remainder is walked once per branch, and each
-                // branch's writes and feeds land in the decision, so every branch
-                // gets its own copy of it.
                 let spliced = splice_after_unit(br.body, rest.clone());
-                // Likewise the entering values: a branch that leaves an
-                // accumulator alone carries that value into its write set, so a
-                // bare env clone would stamp one value's ids into every branch.
-                //
-                // This is the one place the discipline is *eager* rather than
-                // at-placement, and it costs: an accumulator the branch goes on to
-                // overwrite has its copy killed by the `env.insert`, so the pass
-                // manufactures a death per (branch × overwritten accumulator) that
-                // a placement-time freshen would not. It is load-bearing anyway —
-                // `transform_chain`'s terminal reads the environment with a bare
-                // clone, so the environment itself has to hold distinct identities
-                // by then. Narrowing this to the accumulators a branch actually
-                // carries wants the branch's write set up front, which is what the
-                // walk below is computing.
-                let mut branch_env: HashMap<Name, Expr> =
-                    env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let mut branch_env = env.clone();
                 // Each branch walks under `path ∧ πᵢ`, collecting its feeds into the
                 // shared `feeds` (unique field names, per-branch fire paths) — so a
                 // feed under a guard becomes a `to_<feed>__fire`-gated tap that fires
@@ -1499,9 +1477,6 @@ fn conditional_decision(
     writes_ty: &Type,
 ) -> Expr {
     let bool_ty = Type::Base(BaseType::Bool);
-    // Each writing branch's guard reaches the output once in the commit
-    // disjunction and once more per accumulator (as a value-`Case` arm guard
-    // below), so every placement is a copy.
     let mut commit_guards: Vec<Expr> = writing.iter().map(|(g, _)| g.clone()).collect();
     // An **unconditional** write (before the `Case`, or after it in `rest`, spliced
     // into every branch) is baked into the `carry` — so `carry ≠ entering` means the
@@ -1526,8 +1501,6 @@ fn conditional_decision(
                 .iter()
                 .map(|(g, w)| Branch {
                     pattern: None,
-                    // One guard, one value-`Case` per accumulator: see
-                    // `commit_guards` above.
                     guard: g.clone(),
                     body: w[i].clone(),
                 })
@@ -1615,7 +1588,7 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
             let ty = new_body.ty.clone();
             // The same logical `Let` with its feed fields attached, so it keeps its
             // own id rather than minting a replacement.
-            let mut e = Expr::let_in(binding, *bound_expr, new_body).re_root(node_id);
+            let mut e = Expr::let_in_preserving(node_id, binding, *bound_expr, new_body);
             e.ty = ty;
             e
         }
@@ -1638,8 +1611,6 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
             // to the shared decision builder (the one place the `__fire` encoding
             // lives — see `ccl_utils::writer_decision_record`).
             let commit = crate::ccl::ccl_utils::disjoin(
-                // Each fire path lands in the record twice — here, widening the
-                // commit gate, and again as the tap's `__fire` field below.
                 std::iter::once(commit_base).chain(feeds.iter().map(|f| f.fire.clone())),
                 false,
                 &bool_ty,
@@ -1680,16 +1651,10 @@ fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(rep) = env.get(n)
     {
-        // Root-carry. One environment value, N reads of the name: each read is
-        // inlined into the decision, so every occurrence needs its own identity.
-        // The replacement denotes the same thing the `Var` did — the value of
-        // `n` *here* — so the read site keeps its own id (and with it its
-        // span/attribution) and only the interior is freshened. N reads still
-        // give N distinct roots, so uniqueness holds.
-        // `Clone` freshens, so the interior arrives already distinct. The root id
-        // it mints is discarded by the `re_root` below; that stranded id folds as
-        // a death, not a defect.
-        return rep.clone().re_root(e.node_id());
+        // Root-carry: the replacement denotes what the `Var` denoted — the value
+        // of `n` *here* — so the read site keeps its own id, and with it its
+        // span/attribution. N reads give N distinct roots.
+        return rep.clone_at(e.node_id());
     }
     e.map_children(|c| subst_env(c, env));
     e

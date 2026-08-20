@@ -362,10 +362,8 @@ fn build_value_case_cform(
     let mut arm_domains: Vec<Type> = Vec::new();
     let mut default_body: Option<Expr> = None;
 
-    // `final_or_default`'s default is the *last* branch's body, which is the one
-    // branch whose body reaches the output twice; the rest move whole into their
-    // arms. Naming the index says that, and keeps the earlier branches from
-    // cloning a body that is dropped on the next iteration.
+    // `final_or_default`'s default is the *last* branch's body, the one branch
+    // whose body reaches the output twice; the rest move whole into their arms.
     let last = branches.len().saturating_sub(1);
     for (i, b) in branches.into_iter().enumerate() {
         let guard = elim_lambdas(ctx, b.guard)?;
@@ -400,15 +398,8 @@ fn build_value_case_cform(
     // A one-branch value `Case` denotes just that branch's value.
     let default_body = default_body.expect("value-selecting Case has at least one branch");
     if arms.len() == 1 {
-        // The single arm is discarded, so this body reaches the output once and
-        // keeps the branch's own ids.
         return Ok(default_body);
     }
-    // Past here the last branch's body reaches the output *twice*: as its own
-    // gated arm, and as `final_or_default`'s default. The arm is the copy that
-    // actually fires, so it keeps the source ids and the unreachable type anchor
-    // is the freshened sibling.
-    let default_body = default_body.clone();
 
     // Union domain = Variant({Index(i): {UIntRange(1)|π̂ᵢ}}) — the same tagged
     // union `emit_copair` produces, so op-conversion's `UnionOperator`
@@ -576,8 +567,6 @@ fn build_scrutinee_case_cform(
         .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
         // eᵢ as a point-free morphism `Pᵢ ⇒ Vᵢ`, reading the projected payload.
         let arm_fn = elim_lambda(ctx, &pat.binding.name, &payload_ty, br.body)?;
-        // `scrut_stream` is built once and composed into every arm, and all arms
-        // stay live in the union below, so each placement needs its own identity.
         arms.push(arm_compose(
             vec![scrut_stream.clone(), vp, arm_fn],
             driver_dom.clone(),
@@ -1397,12 +1386,6 @@ fn elim_lambda_impl(
                     let arm_fn = elim_lambda(ctx, &payload_name, &payload_ty, br.body)?;
                     let mut chain: Vec<Expr> = Vec::with_capacity(3);
                     if !scrut_is_id {
-                        // `scrut_pf` is built once before the loop and prepended to
-                        // every arm, and all arms stay live in the fan-out, so each
-                        // placement needs its own identity. No boundary catches a
-                        // bare clone here: the catch-all arm re-mints every
-                        // pass-through node, which launders the duplicate before any
-                        // boundary walk reaches it.
                         chain.push(scrut_pf.clone());
                     }
                     chain.push(vp);
@@ -1433,7 +1416,6 @@ fn elim_lambda_impl(
                     let payload_pf = if scrut_is_id {
                         vp
                     } else {
-                        // Per-arm placement, as above.
                         typed_compose(vec![scrut_pf.clone(), vp])
                     };
                     // Outer morphism `param_ty ⇒ param_ty` — the full element; the

@@ -582,7 +582,7 @@ impl CompiledProgram {
 ///
 /// Deliberately wider than `assert_unique_node_ids`, which walks children only.
 /// Explanation and uniqueness are two questions with two answers; see
-/// `design/provenance.md`, "The id domain".
+/// `design/provenance.md`, "Walking the ids".
 pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId> {
     use crate::ccl::TypedExprNode;
     use crate::ccl::ty::Type;
@@ -813,14 +813,10 @@ pub fn compile_program(
     // still-hole-typed tree. Its ids resolve against the `lowering_projection`
     // (the pre-mono originals). See `CompiledProgram::pre_inference_ir`.
     // A pane snapshot: the same nodes as the live tree, observed at a point in
-    // time, so it preserves ids. That is the whole content of a pane — a
-    // freshening clone here would hand the boundary a structurally identical
-    // program sharing no identity with the one it is meant to be a snapshot of.
-    // `pre_inference_ir`'s ids in particular must resolve against the
-    // `lowering_projection`, which is keyed by the originals.
-    //
-    // Nothing at this commit fails if this is wrong: the pane boundaries and the
-    // `NodeId`-keyed table arrive with `02-lineage-table`. Verified there.
+    // time, so it preserves ids. A freshening clone would hand the boundary a
+    // structurally identical program sharing no identity with the one it is meant
+    // to snapshot, and these ids must resolve against the `lowering_projection`,
+    // which is keyed by the originals.
     let pre_inference_ir = expr.clone_preserving_ids();
 
     // Register every source (pre-registered + discovered during lowering) with

@@ -463,11 +463,15 @@ pub(super) fn lower_compare(
     }
 
     // Build one BinOp per (op, adjacent-operand-pair). Each middle operand is
-    // shared by two pairs; a bare clone would put the same NodeIds in the tree
-    // twice. Keep-first: an operand's first tree use keeps its original ids
-    // (operand i+1 first appears as pair i's RIGHT side), and its second use
-    // (as pair i+1's LEFT side) is a deep-freshened copy whose folded
-    // attributions mirror the original's.
+    // placed in two pairs, and no placement is privileged, so every placement is a
+    // freshened copy taken inside a lowering copy-frame: each re-minted node lands
+    // as a `Copy` step mirroring the original operand's (Source) image, which is
+    // the attribution wanted for a duplicated operand.
+    let operand = |i: usize| {
+        use crate::ccl::lineage::copy_frame;
+        let _frame = copy_frame("lower.compare_operand");
+        operands[i].clone()
+    };
     let mut comparisons: Vec<Expr> = Vec::with_capacity(ops.len());
     for (i, op) in ops.iter().enumerate() {
         let kind = match op {
@@ -478,24 +482,8 @@ pub(super) fn lower_compare(
             CmpOp::Gt => CompareKind::Greater,
             CmpOp::GtE => CompareKind::GreaterOrEq,
         };
-        let lhs = if i == 0 {
-            // Operand 0's only use — a move out of a borrowed `Vec`, so it keeps
-            // its ids: nothing is duplicated and the operand's own attribution
-            // is what this position should carry.
-            operands[0].clone_preserving_ids()
-        } else {
-            // Operand i's second use (its first was pair i-1's right side). A
-            // bare clone would share NodeIds; freshen a copy inside a lowering
-            // copy-frame so each re-minted node lands as a `Copy` LoweringStep
-            // mirroring the original operand's (Source) image — exactly the
-            // attribution wanted for the duplicated operand.
-            use crate::ccl::lineage::copy_frame;
-            let _frame = copy_frame("lower.compare_operand");
-            operands[i].clone()
-        };
-        // Operand i+1's *first* use (its second, if any, is pair i+1's left
-        // side and is freshened there). A move out of a borrowed `Vec` again.
-        let rhs = operands[i + 1].clone_preserving_ids();
+        let lhs = operand(i);
+        let rhs = operand(i + 1);
         // Each pair comparison images its `<op>` in the chain, spanning its two
         // operands. It is *not* `Nature::Source` — a chained comparison is one of
         // the cost cases of the structural rule (see `tag_source`): only the

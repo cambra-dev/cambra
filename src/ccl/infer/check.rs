@@ -238,9 +238,8 @@ impl Typing for CheckCtx {
         // predicates — then return the (owned) body type unchanged rather than
         // cloning `bound_expr` for a no-op discharge.
         if crate::ccl::subst::type_free_vars(&body_ty).contains(name) {
-            // A type-level discharge. The template keeps its ids because a
-            // template is not a tree node — it is cloned again at every read, and
-            // that read is where the sibling is minted.
+            // A discharge template is not a tree node: it is cloned again at
+            // every read, and that read is where the sibling is minted.
             crate::ccl::subst::Subst::discharge(name, bound_expr.clone_preserving_ids())
                 .apply_type(&body_ty)
         } else {
@@ -343,7 +342,7 @@ impl Typing for CheckCtx {
             Type::Fun { name: Some(b), .. }
                 if crate::ccl::subst::type_free_vars(&codomain).contains(b) =>
             {
-                // Type-level discharge; see the `Let` rule above.
+                // A discharge template; see the `Let` rule above.
                 crate::ccl::subst::Subst::discharge(b, argument.clone_preserving_ids())
                     .apply_type(&codomain)
             }
@@ -529,9 +528,8 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 ///
 /// The scratch copy **preserves ids**: it is never installed anywhere, so
 /// nothing can observe two nodes at one identity, and the blame ids the rules
-/// record then name the caller's real nodes rather than scratch ones nobody can
-/// resolve. Freshening it would mint a whole tree per call — and the hot caller
-/// mints one per *fired rewrite rule*.
+/// record name the caller's real nodes rather than scratch ones nobody can
+/// resolve.
 ///
 /// Cost note: the full-tree clone makes each call O(tree). The hot caller is
 /// `simplify`'s `debug_typecheck` (one call per *fired* rewrite rule), which

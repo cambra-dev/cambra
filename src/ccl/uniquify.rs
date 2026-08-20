@@ -344,9 +344,9 @@ impl Uniquifier {
 /// result order-independent so the before/after comparison checks set identity
 /// with 1:1 multiplicity, not traversal order.
 ///
-/// This domain is **broader than the uniqueness domain** (the `walk_children`
-/// node-set — see `design/provenance.md`, "The id domain"): the
-/// property checked here is not uniqueness but *preservation*, and predicate
+/// This domain is **broader than the uniqueness walk**'s `walk_children` node-set
+/// (see `design/provenance.md`, "Walking the ids"): the
+/// property checked here is not uniqueness but preservation, and predicate
 /// interiors are in scope precisely because uniquify rebuilds those terms through
 /// a [`PredMemo`], which is where a rebuild could drop or re-mint an id. Do not
 /// narrow it to match the freshen walks — they are checking different things.
@@ -608,10 +608,7 @@ mod tests {
     #[test]
     fn idempotent_on_minted_trees() {
         let expr = pipeline_front("k = 1\n[x for x in [1, 2, 3] if x > k]\n");
-        // An id-preserving copy: `Clone` freshens, and a freshened tree is not
-        // the tree this test means to run `uniquify` over a second time.
-        // `PartialEq` excludes `node_id`, so the comparison is structural either
-        // way — but the *input* to the second run must be the same nodes.
+        // The second run must see the same nodes, not a freshened copy of them.
         let again = run(expr.clone_preserving_ids());
         assert_eq!(expr, again, "uniquify must be idempotent");
     }

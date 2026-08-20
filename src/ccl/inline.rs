@@ -326,10 +326,6 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
     if let TypedExprNode::Var(ref n) = expr.node
         && n == name
     {
-        // A UDF named at N occurrences puts N copies of the *same* lambda into
-        // the output tree, so a bare clone would give every copy the binding
-        // site's ids. The `Let` that bound the lambda is dropped once inlining
-        // completes, so no copy is the "original" — freshen every one.
         return lambda.clone();
     }
 

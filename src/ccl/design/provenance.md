@@ -6,6 +6,11 @@ at lowering, monomorphization cloning subtrees, inline fanning UDF bodies out,
 channelize rewriting defers, lambda-elim synthesizing combinators, planning
 fusing clauses).
 
+A **pane** is a snapshot of the AST at one point in compilation. `CompiledProgram` retains three —
+`pre_inference_ir`, `post_inference_ir`, `post_desugar_ir` — and the inspector renders each in one
+UI pane, which is where the name comes from. **Below** a pane means later in the pipeline, on a more
+lowered tree; it is not tree depth and not a layering.
+
 **Status markers.** The substrate — the identity primitives, the lineage model,
 the recorder, and the always-on lowering projection — is in tree. Everything a
 **Planned** marker introduces is designed but not yet built: the passes' adoption
@@ -18,155 +23,138 @@ prose describes code you can go read.
 > and the adoption sequencing — is the `lineage-design` note under
 > projects/program-inspector in the internal vault.
 
-## The two identity primitives (`src/ccl/provenance.rs`)
+## Node identity (`src/ccl/provenance.rs`)
 
-- **`NodeId`** — a `Copy` newtype giving each IR expression node a stable,
-  never-reused identity (its own atomic counter, distinct from `Uid`). It rides
-  inline on `TypedExpr`, whose hand-written `PartialEq` **skips it**: provenance
-  is metadata, not part of a node's value, so two structurally-equal nodes stay
-  equal even with distinct ids — which the passes' structural-equality checks
-  depend on. (Nodes are never hashed by value: `TypedExpr` has no `Hash` impl.
-  `NodeId` itself is `Hash`/`Ord`, as a map key.) `NodeId::PLACEHOLDER` is the reserved sentinel for
-  `Default`/`mem::take` throwaways (ignored by the recorder; `assert_unique_node_ids`
-  backstops that it never persists into a checked tree).
-- **`Pass`** — the compiler stage that produced/rewrote a node (`Lower`,
-  `Uniquify`, `Inline`, `Desugar`, `Transact`, `Letrec`, `Mono`, `LambdaElim`,
-  `Planning`). It lives in the lineage *data* (each step's `via`), never in a
-  type.
+**`NodeId`** is a `Copy` newtype giving each IR expression node an identity: stable, never reused,
+and off its own atomic counter. It rides inline on `TypedExpr`. Lineage and source attribution are
+both keyed by it, which is what lets an inference error on a node minted three passes ago resolve to
+the source span the user wrote. It is distinct from `Uid` because `Uid` identifies binders and a
+`NodeId` identifies expression nodes.
 
-### The id domain
+A node is **live** when it is reachable from the expression tree a pass hands on — the node set
+`walk_children` enumerates, called the **main tree** throughout this doc. A refinement predicate is
+a term hanging off a *type* slot, so its nodes are reachable from the tree without being in it; the
+distinction is what the two walks below split on.
 
-**Two questions, two domains.** Keep them apart, because the answers differ:
+Four properties define a `NodeId`.
 
-- **Explanation** — *which ids must the fold account for?* The main tree **and its
-  refinement predicates**. `collect_tree_ids` enumerates both (children, plus the
-  predicate reachable through a type slot, a `user_annotation`, or a `Cast`
-  target) and is the operative definition: the fold's leak classes and every
-  `SourceProjection` enumerate from it, so a node it returns is a node the fold
-  must explain or report as a leak.
-- **Uniqueness** — *may two live nodes share an id?* The main tree, and nothing
-  else. `assert_unique_node_ids` walks children only, and deliberately: a
-  predicate interior may legitimately alias a main-tree id at inline's blind
-  spot, so a predicate-inclusive uniqueness walk would false-fire. **Predicate
-  uniqueness is not asserted at all.**
+- **It is not part of a node's value.** `TypedExpr`'s hand-written `PartialEq` skips `node_id`, so
+  two structurally-equal nodes compare equal with distinct ids, which the passes'
+  structural-equality checks depend on. Nodes are never hashed by value: `TypedExpr` has no `Hash`
+  impl. `NodeId` itself is `Hash`/`Ord`, as a map key.
+- **Two live nodes never share one.** This is what makes an id an identity rather than a label. Two
+  nodes at one id collapse to a single entry in every `NodeId`-keyed walk, and give the
+  `SourceProjection` — the `NodeId → SourceAttribution` map the lineage fold produces
+  ([The collapse](#the-collapse)) — one attribution for two nodes.
+- **Construction and copying both mint.** `Expr::new` mints, and `Clone` mints for every node it
+  copies. A call site duplicating a subtree gets distinct identities without asking for them, so no
+  site has to work out which of its copies is the survivor — reaching a shared id takes writing one
+  through a named primitive ([Duplication](#duplication)).
+- **Uniqueness is asserted on the main tree only.** `assert_unique_node_ids` walks children and
+  stops there, so predicate interiors are outside the uniqueness walk.
 
-A refinement predicate is program text the user wrote — `[x for x in xs if x > k]`
-puts `x > k` in one — so it earns the same attribution as any other node. That is
-why it is in the explanation domain, and why a guard error now resolves to a
-caret: lowering sweeps the finished predicate through
-`LoweringContext::tag_predicate`, so its ids reach the lowering projection.
+`NodeId::PLACEHOLDER` is the reserved sentinel for `Default`/`mem::take` throwaways. The recorder —
+the ambient session that logs every mint and copy ([The recorder](#the-recorder)) — ignores it, and
+`assert_unique_node_ids` backstops that it never persists into a checked tree.
 
-That is the **entry** crossing, and it is the only one recorded here. A predicate
-being *rewritten* (uniquify and inference rebuild them through a `PredMemo`) and a
-predicate being *raised* back into the main tree (planning) both still mint under
-no recording. Their nodes are minted below the last pane, so no boundary reads
-them yet.
+### Maintaining uniqueness
 
-`Rc` sharing stays load-bearing and constrains how recording may be done. One
-predicate term rides many type slots as a shared `Rc`, and planning's compile memo
-is `Rc`-keyed, so splitting the sharing compiles one predicate once per
-occurrence. Recording must therefore be idempotent **per id**, not per slot the id
-is reached through: `lowering_predicate_leaf` skips an id already recorded, which
-also stops a sweep replacing precise attribution with a coarse label. For the same
-reason a duplication path may share a predicate `Rc` with its source rather than
-rebuild one (see `design/type-inference.md`, "Sharing is an invariant, not an
-optimization detail").
+`Clone` freshens: it mints a new `NodeId` for every node it copies and reports each `(origin,
+fresh)` pair through `on_copy`, the recorder's copy hook. The alternative is a call site that
+decides — keep the id here, freshen there — and a site that decides wrong puts two nodes on one id,
+which surfaces at a boundary assert far from the site, if at all. Freshening removes the decision
+rather than answering it.
 
-`uniquify::collect_node_ids` is a third walk for a third question: a debug
-tripwire asserting **multiset preservation** across uniquify's own `PredMemo`
-rebuilds, which is where ids could be dropped or re-minted. It is neither
-explanation nor uniqueness, and it does not dedup by `PredicateId`.
+`assert_unique_node_ids` enforces uniqueness at every pass boundary in `compile_program`:
+post-lowering, -inline, -transact, -letrec-run, -desugar, -as-of-read, -lambda-elim, -planning,
+gated on `cfg!(any(debug_assertions, test))`. The walk is `O(nodes)` per boundary and compiles out
+of a release build, along with the leak checks (`assert_leaks_clean` is gated the same way, so
+nothing enforces either property in release). The lineage fold that produces the release-critical
+projection — [The collapse](#the-collapse) — stays always-on. A boundary check states a property of
+the tree rather than of the pass that produced it, so reordering the passes leaves the checks where
+they are and still bounds every pass between two of them. A clean run is therefore evidence about
+the boundaries, not about any individual pass.
 
-**Open, and worth doing:** assert uniqueness *across distinct predicate terms* —
-dedup by `PredicateId` first, then require the ids of the deduped set to be
-unique. That is the uniqueness property predicates can satisfy: one term riding N
-slots is one term and shares its ids with itself legitimately, while two
-*different* predicate terms sharing an id is a defect nothing catches.
+### Walking the ids
 
-### Duplication discipline
+Three walks answer three questions.
 
-**Every pass yields unique `NodeId`s.** `Clone` is hand-written and **freshens**:
-it mints a new `NodeId` for every node it copies and reports each
-`(origin, fresh)` pair through `on_copy`. Two live nodes therefore cannot share an
-identity by accident, and sharing one is something a site has to ask for.
+| Walk | Question | Domain |
+|---|---|---|
+| `assert_unique_node_ids` | may two live nodes share an id? | children |
+| `collect_tree_ids` | which ids must the lineage fold account for? | children, plus refinement predicates |
+| `uniquify::collect_node_ids` | did a `PredMemo` rebuild drop or re-mint an id? | the same, as a multiset |
 
-Uniqueness is what makes an id an *identity* rather than a label. Two live nodes
-at one id collapse to one entry in every `NodeId`-keyed walk, give the
-`SourceProjection` one attribution for two nodes, and make a
-`NodeId → OperatorId` map non-functional. Keeping that property is no longer the
-call site's job: a copy freshens unless the site asks otherwise.
+`collect_tree_ids` reaches a predicate through a type slot, a `user_annotation`, or a `Cast` target.
+It is the operative definition of what the fold must explain: the leak classes and every
+`SourceProjection` enumerate from it, so a node it returns is a node the fold explains or reports as
+a leak. A refinement predicate is program text the user wrote — `[x for x in xs if x > k]` puts `x >
+k` in one — so it earns the same attribution as any other node. Lowering sweeps a finished predicate
+through `LoweringContext::tag_predicate`, which is what makes a guard error resolve to a caret.
 
-`assert_unique_node_ids` enforces it at every pass boundary in `compile_program`
-— post-lowering, -inline, -transact, -letrec-run, -desugar, -as-of-read,
--lambda-elim, -planning — gated on `cfg!(any(debug_assertions, test))`. The walk
-is `O(nodes)` per boundary and buys nothing in a release compile, where the fold's
-leak classes cover the same ground. A boundary check is a tree invariant and
-encodes no pass order, so a reordered pass carries its check with it. It also
-means a pass is implicated only at a boundary that looks at it: a clean run is
-evidence about the gates, not about the passes between them.
+That sweep is the predicate domain's **entry** crossing, and the only crossing that is recorded. A
+predicate being rewritten (uniquify and inference rebuild them through a `PredMemo`) and a predicate
+being raised back into the main tree (planning) both still mint under no recording. No boundary
+check reads the ids they mint: the uniqueness walk stops at children, and the leak checks run only
+at the lowering boundary, upstream of both crossings.
 
-Three shapes, and the choice between them is about what the copy *denotes*:
+`uniquify::collect_node_ids` checks multiset preservation across uniquify's own `PredMemo` rebuilds,
+which is where ids could be dropped or re-minted.
 
-- **`clone`** — duplication, and the default. The copy is a *sibling*: same value,
-  distinct identity, `annot(p) = annot(o)`. Every re-minted node fires `on_copy`,
-  so a freshen is captured as `Op::Copy` the moment a session is installed and is
-  a no-op before that; no call site needs to know which.
-- **`clone_preserving_ids`** — the copy *is the same node*, so it keeps its ids.
-  Sound because the copy is never reachable from a tree beside its source, and
-  narrow: a `Subst` discharge template, which is not a tree node and is copied
-  again at every read; a retained snapshot or rollback copy, which replaces or
-  shadows its source; and a test comparing trees across a pass.
+`Rc` sharing is load-bearing and constrains how recording may be done. One predicate term rides many
+type slots as a shared `Rc`, and planning's compile memo is `Rc`-keyed, so splitting the sharing
+compiles one predicate once per occurrence. Recording is therefore idempotent per id rather than per
+slot the id is reached through: `lowering_predicate_leaf` skips an id already recorded, which also
+stops a sweep replacing precise attribution with a coarse label. For the same reason a duplication
+path may share a predicate `Rc` with its source rather than rebuild one (see
+`design/type-inference.md`, "Sharing is an invariant, not an optimization detail").
 
-  **Not a way to silence a leak.** An `Unexplained` or a `CopyOfUnknown` means a
-  copy was made with no step open, or against an origin the log never recorded.
-  That is a *recording* gap, and its fix is to record the copy.
-- **Root-carry** (`clone().re_root(id)`) — substitution. The replacement for a
-  `Var(𝑥)` occurrence denotes what the occurrence denoted — the value of 𝑥 *at
-  that position* — so the occurrence keeps its own id while the interior becomes a
-  fresh node-set. N reads give N distinct roots, so uniqueness holds without
-  deleting the read sites from the output. `Subst`'s compound-replacement arm is
-  the engine.
+### Duplication
 
-  Re-rooting costs one spent id per substituted occurrence: the clone mints a root
-  before `re_root` overwrites it, so `on_copy` fires for an id that ends up on no
-  node. A constructor that built the root *at* the carried id would cost nothing,
-  and is worth having.
+Three primitives, chosen by what the copy denotes.
 
-**Freshen every copy, not all-but-one-by-position.** Which copy retains the
-original id is a *fate* question, and keep-first guesses it wrong exactly when
-position 0 is the copy that later dies. Freshening needs no knowledge of
-downstream fates: the original either survives in place and keeps its id, or dies
-and is consumed by the rewrite that dropped it. (Lowering's `fan_out_copy` is
-keep-first on purpose — it is the pass that *mints* the originals, so position 0
-is the source image by construction.)
+- **`clone`** — the copy is a *sibling*: same value, distinct identity, `annot(p) = annot(o)`. The
+  default. Every re-minted node fires `on_copy`, so a freshen is captured as `Op::Copy`, the
+  lineage step whose outputs mirror an origin's history
+  ([The lineage model](#the-lineage-model-srcccllineagers)). Capture is live the moment a session is
+  installed and a no-op before that; no call site needs to know which.
+- **`clone_preserving_ids`** — the copy *is the same node*, so it keeps its ids. Sound because the
+  copy is never reachable from a tree beside its source, and narrow: a `Subst` discharge template,
+  which is not a tree node and is copied again at every read; a throwaway the normal path discards,
+  such as a rollback copy or a scratch tree; and a test comparing trees across a pass. Not a way to
+  silence a **leak**, the fold's report of a node whose history it cannot account for
+  ([The collapse](#the-collapse)): an `Unexplained` or a `CopyOfUnknown` means a copy was made with
+  no step open, or against an origin the log never recorded, which is a recording gap whose fix is
+  to record the copy.
+- **`clone_at`** — the copy's root carries a given id and its interior freshens: substitution. The
+  replacement for a `Var(𝑥)` occurrence denotes what the occurrence denoted, the value of 𝑥 at that
+  position, so the occurrence keeps its own id while the interior becomes a fresh node-set. N reads
+  give N distinct roots. `Subst`'s compound-replacement arm is the engine.
 
-**Freshen at placement, not at construction.** Most passes build intermediate
-structures — guard vectors, path conjunctions, per-branch environments — whose
-entries are aliased and then copied into the output. Placement is where a copy's
-multiplicity is known; freshening earlier assumes an answer, and the three
-outcomes carry different costs.
+**Freshen at placement, not at construction.** Most passes build intermediate structures — guard
+vectors, path conjunctions, per-branch environments — whose entries are aliased and then copied into
+the output. Placement is where a copy's multiplicity is known; freshening earlier assumes an answer,
+and the three outcomes carry different costs.
 
-- **Moved** into the output: no cost. The output node holds the fresh id, and its
-  parent is the original.
-- **Copied again** into the output: a defect the gate catches. The intermediate
-  generation is stranded, so the placed copy's `Copy` names an origin no node
-  holds, a `parents` walk for a span dead-ends, and the fold reports
-  `CopyOfUnknown`. Freshening the substitution engine's `Subst`-resident
-  templates produces this, and the boundary gate fails.
-- **Dropped**: one spent id and one row no query reaches. No check reports it —
-  both leak checks enumerate from the tree, there is no produced-side check
-  (below), and a node absent from the tree is outside `assert_unique_node_ids`.
-  Construction is the only constraint: `new` mints and records, `preserve`
-  carries.
+- **Moved** into the output: no cost. The output node holds the fresh id, and its parent is the
+  original.
+- **Copied again** into the output: a defect the *lineage* fold catches, not the uniqueness walk.
+  The intermediate copy is stranded, so the placed copy's `Op::Copy` names an origin no node holds,
+  walking `parents` for a span dead-ends, and the fold reports `Leak::CopyOfUnknown`. Freshening the
+  substitution engine's `Subst`-resident templates produces exactly this.
+- **Dropped**: one spent id and one row no query reaches. No check reports it — both leak checks
+  enumerate from the tree, there is no produced-side check (below), and a node absent from the tree
+  is outside `assert_unique_node_ids`. Construction is the only constraint: `new` mints and records,
+  `preserve` carries.
 
-**A term crossing out of the predicate domain must not land aliased ids.**
-Predicate interiors are outside the *uniqueness* domain (above) and may already
-alias main-tree ids, so a pass that lifts one into the term tree owes a freshen at
-the point of entry — `planning::iterate`'s `fn_of_bare_predicate` lift does
-exactly that. A lift that *rebuilds* the term is already safe:
-`planning::groupby`'s key extraction goes through `lambda_elim::run`, which
-re-mints every node. That is the mechanism, not the requirement; the requirement
-is that nothing aliased arrives, and each site pins it with a test.
+**A term crossing out of the predicate domain must not land aliased ids.** The uniqueness walk does
+not reach predicate interiors, so a pass lifting one into the main tree owes a freshen at the point
+of entry — `planning::iterate`'s `fn_of_bare_predicate` lift does exactly that. A lift that
+*rebuilds* the term is already safe: `planning::groupby`'s key extraction goes through
+`lambda_elim::run`, which re-mints every node. The requirement is that nothing aliased arrives;
+rebuilding is one mechanism that satisfies it. `groupby_recognition_lifts_the_key_without_aliasing`
+pins the property at the group-by site, so an elim that started preserving ids fails there rather
+than at a boundary. The `iterate` lift has no such test.
 
 ## The lineage model (`src/ccl/lineage.rs`)
 
@@ -177,6 +165,10 @@ a pass runs it appends `RewriteStep`s to a `LineageLog`:
   `produced` = discard; an id in `consumed ∩ produced` survives while absorbing).
 - `Op::Copy { origin, produced }` — outputs mirror `origin`'s lineage (freshened
   duplicates); silent on the origin's own fate.
+
+**`Pass`** names the compiler stage that produced or rewrote a node (`Lower`, `Uniquify`, `Inline`,
+`Desugar`, `Transact`, `Letrec`, `Mono`, `LambdaElim`, `Planning`). It lives in the lineage data, as
+each step's `via`, and never in a type.
 
 Each step *separately* carries a `blame` set (the upstream ids the outputs
 attribute to — **not** the same as `consumed`), a `nature` (the trinary fidelity
@@ -251,7 +243,7 @@ cannot see. Saying it explicitly means emitting the discard the model already
 has, `Transform { consumed: [id], produced: [] }`, which neither site does today.
 
 Construction closes the gap the check would have watched: a node is built either
-by `TypedExpr::new` (mint, recorded) or `TypedExpr::preserve` (carry an existing
+by `Expr::new` (mint, recorded) or `Expr::preserve` (carry an existing
 id, nothing recorded), so an id cannot be minted and then discarded.
 
 The fold is in tree; **planned** is its use at the inspector's two pane

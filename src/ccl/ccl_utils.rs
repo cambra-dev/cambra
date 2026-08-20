@@ -1289,24 +1289,19 @@ impl<C: PartialEq + Clone> PredMemo<C> {
                     let keepalive = Rc::clone(&refinement.predicate);
                     // Copy-on-write, not duplication: the rebuilt term is
                     // installed *in place of* the original, so it is the same
-                    // logical node at a new allocation and keeps its ids. A
-                    // freshening clone here would re-mint the whole predicate
-                    // domain on every rewriting pass, and trips `uniquify`'s
-                    // id-stability tripwire on the first one.
+                    // logical node at a new allocation and keeps its ids.
                     let copy = refinement.predicate.clone_preserving_ids();
                     let rev = store.revision;
                     (copy, keepalive, rev)
                 }
             }
         };
-        // The whole rebuild runs id-preserving. Nothing records a predicate
-        // rewrite: lowering anchors a predicate's nodes as it builds one, but no
-        // step covers this rebuild, so an id minted here is one no record
-        // explains and a `Copy` rowed against a predicate-interior origin folds
-        // as `CopyOfUnknown`. Preserving is honest because the rebuilt term
-        // *replaces* the original everywhere this walk reaches. This covers the
-        // rewrite too, not just the copy-on-write above: a substitution firing
-        // inside a predicate materializes its template here.
+        // The rebuild runs id-preserving, covering the rewrite as well as the
+        // copy-on-write above (a substitution firing inside a predicate
+        // materializes its template here). Nothing records a predicate rewrite,
+        // so an id minted here is one no record explains; preserving is honest
+        // because the rebuilt term *replaces* the original everywhere this walk
+        // reaches.
         let reported = crate::ccl::lineage::preserving_ids(|| f(&mut pred));
         let mut store = self.0.borrow_mut();
         let changed = reported || store.revision != before;

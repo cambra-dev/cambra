@@ -1158,7 +1158,7 @@ pub(crate) fn preserve_ids() -> PreservingIds {
 /// everywhere the walk reaches — which holds only because `uniquify` walks the
 /// whole tree. It is a **scope cut**, not a design: the predicate domain needs
 /// recording, and this function should go when that lands. See the vault's
-/// `predicate-lineage-report` and `design/provenance.md`, "The id domain".
+/// `predicate-lineage-report` and `design/provenance.md`, "Walking the ids".
 ///
 /// [`PredMemo`]: crate::ccl::ccl_utils::PredMemo
 /// [`TypedExpr::clone_preserving_ids`]: crate::ccl::expr::TypedExpr::clone_preserving_ids

@@ -420,15 +420,11 @@ fn freshen_watches(
 /// exception, scoped and unfixed: generic instantiation", for the numbers and
 /// the decision.
 ///
-/// The clone below freshens the whole interior: `TypedExpr`'s `Clone` re-mints
-/// every [`NodeId`](crate::ccl::provenance::NodeId) it reaches, so the copy shares
-/// no id with the origin term. Predicate interiors are in the domain the lineage
-/// fold must explain — `collect_tree_ids` descends a `Type::Refinement`'s
-/// predicate (`ccl/design/provenance.md`, "The id domain") — so a sharing fix here
-/// has to keep one id-set per term: reusing one rebuilt `Rc` across the slots that
-/// shared an `Rc` going in is one term riding many slots, and returning the origin
-/// `Rc` when the freshen is vacuous is the same. Producing two distinct terms with
-/// equal ids is what nothing may do, and nothing yet checks.
+/// A sharing fix here has to keep one id-set per term: reusing one rebuilt `Rc`
+/// across the slots that shared an `Rc` going in is one term riding many slots,
+/// and returning the origin `Rc` when the freshen is vacuous is the same.
+/// Producing two *distinct* terms with equal ids is what nothing may do, and
+/// nothing yet checks.
 fn freshen_refinement_predicate(
     lim: Level,
     r: &Refinement,
