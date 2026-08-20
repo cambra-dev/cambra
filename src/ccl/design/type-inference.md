@@ -1310,16 +1310,21 @@ coalesce as alternatives and are reported there
 redundant, and Σ has to satisfy both.
 
 **Mechanics.** The decision is split across two phases, and the split is forced. At
-the compact merge, a positive `Data ⊔ Data` accumulates its domain **alternatives**
-(`CompactFun::domains`, unioned and deduplicated by `union_domains` — never met).
-It cannot decide there whether the alternatives are really two domains: a compact
-domain still carries inference-variable identity that `simplify_type` may merge
-afterwards, so two structurally identical domains can arrive as two alternatives.
-Coalesce materializes each alternative to a `Type` and deduplicates *again*, and
-that second comparison is the one that decides — one survivor is a plain data
-function, two or more is the rejection. A `Data ⊔ Compute` collision is a third
-outcome, `KindMerge::Conflict`, reported as `DomainJoinConflict` when it would drop
-≥ 2 alternatives and as `KindConflict` when a single slot's kind resolved
+the compact merge, a positive join accumulates its domain **alternatives**
+(`CompactFun::domains`, unioned and deduplicated by `union_domains` — never met)
+whatever the slot's kind, because two questions are open there. Whether the
+alternatives are really two domains is open: a compact domain still carries
+inference-variable identity that `simplify_type` may merge afterwards, so two
+structurally identical domains can arrive as two alternatives. What two
+alternatives *mean* is open as well, because that reads the slot's kind and a bound
+still to arrive can change it — a `Data` reading needs one survivor, a `Compute`
+reading meets them contravariantly. Coalesce answers both. A `Compute` slot, and
+one whose kind variable nothing pinned, meets its alternatives before materializing
+them; a `Data` slot materializes each and deduplicates *again*, and that second
+comparison is the one that decides — one survivor is a plain data function, two or
+more is the rejection. A `Data ⊔ Compute` collision is a third outcome,
+`KindMerge::Conflict`, reported as `DomainJoinConflict` when it would drop ≥ 2
+alternatives and as `KindConflict` when a single slot's kind resolved
 contradictorily.
 
 Refinements ride *inside* each alternative domain, so differently-filtered arms of
