@@ -1653,9 +1653,20 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
         } => {
             let new_body = attach_feed_fields(*body, feeds);
             let ty = new_body.ty.clone();
-            // The same logical `Let` with its feed fields attached, so it keeps its
-            // own id rather than minting a replacement.
-            let mut e = Expr::let_in_preserving(node_id, binding, *bound_expr, new_body);
+            // The same logical `Let` with its feed fields attached, so it keeps
+            // its own id rather than minting a replacement. `preserve` builds it
+            // at that id directly; `Expr::let_in(..).re_root(id)` used to mint one
+            // and overwrite it, which fires `on_mint` for an id no node ends up
+            // carrying — the phantom birth `preserve` exists to make
+            // unrepresentable.
+            let mut e = Expr::preserve(
+                node_id,
+                TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body: Box::new(new_body),
+                },
+            );
             e.ty = ty;
             e
         }

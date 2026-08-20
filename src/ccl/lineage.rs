@@ -1784,35 +1784,30 @@ pub(crate) fn preserve_ids() -> PreservingIds {
 }
 
 /// Run `f` with id-preserving clones — a scope over a whole *rewrite region*,
-/// not over a copy.
+/// not over a single copy.
 ///
-/// # TODO(predicate-domain): this is slated for removal. Do not add callers.
+/// # TODO(predicate-domain): do not add callers without reading this.
 ///
-/// **There is exactly one legitimate user: [`PredMemo`]'s predicate rebuild**
-/// (two call sites). Everything else that needs a preserving copy has one —
-/// [`TypedExpr::clone_preserving_ids`] — and should use it. A new caller here is
-/// almost certainly reaching for the wrong tool: this scope silences the
-/// freshening for *every* clone on the thread until `f` returns, including
-/// genuine duplications a callee performs, so it can manufacture duplicate ids
-/// in a way the per-copy method cannot.
+/// **One legitimate user: [`PredMemo`] in *replacing* mode**, which is to say
+/// [`uniquify`](crate::ccl::uniquify) and nothing else. Anything that needs a
+/// preserving *copy* has one — [`TypedExpr::clone_preserving_ids`] — and should
+/// use it. This scope silences the freshening for **every** clone on the thread
+/// until `f` returns, including genuine duplications a callee performs, so unlike
+/// the per-copy method it can manufacture duplicate ids.
 ///
-/// It exists because what must not re-identify a predicate is not a copy but an
-/// arbitrary caller-supplied *rewrite*: `f` does not clone the predicate, it
-/// mints and copies *into* it (a substitution materializing a template, a rule
-/// building a conjunction). The rewritten term **replaces** the original in its
-/// `Refinement`, so it is the same logical node and keeps its ids;
-/// `clone_preserving_ids` can say that about one copy but not about a whole
-/// region, and only a scope can.
+/// It exists because what must keep its identity is not a copy but an arbitrary
+/// caller-supplied *rewrite*: `f` mints and copies *into* the term (a
+/// substitution materializing a template, a rule building a conjunction), and
+/// those products are part of the same replacement.
 ///
-/// Note this is no longer justified by predicates being *outside* the id domain —
-/// they are in it, and the fold explains them (`design/provenance.md`, "Walking
-/// the ids"). It is justified by the rewrite being a replacement.
-///
-/// Preserving is honest here because the rebuilt term *replaces* the original
-/// everywhere the walk reaches — which holds only because `uniquify` walks the
-/// whole tree. It is a **scope cut**, not a design: the predicate domain needs
-/// recording, and this function should go when that lands. See the vault's
-/// `predicate-lineage-report` and `design/provenance.md`, "Walking the ids".
+/// The justification is **replacement, not domain**. Predicate interiors are in
+/// the id domain and the fold explains them (`design/provenance.md`, "Walking
+/// the ids"). What makes preserving honest here is that the rebuilt term stands in
+/// for the original *everywhere* — which is true only because `uniquify` walks
+/// the whole tree, and which `uniquify` asserts on every compile as a 1:1
+/// correspondence over distinct predicate terms. A rebuild whose walk misses an
+/// occurrence leaves the original alive beside its replacement, and then this
+/// scope puts one id-set on two live terms.
 ///
 /// [`PredMemo`]: crate::ccl::ccl_utils::PredMemo
 /// [`TypedExpr::clone_preserving_ids`]: crate::ccl::expr::TypedExpr::clone_preserving_ids

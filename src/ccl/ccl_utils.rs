@@ -1255,7 +1255,38 @@ impl<C> Default for PredMemo<C> {
         PredMemo(Rc::new(RefCell::new(MemoStore {
             entries: HashMap::new(),
             revision: 0,
+            replacing: false,
         })))
+    }
+}
+
+impl<C> PredMemo<C> {
+    /// A memo whose rebuilds **replace** the terms they are handed, so the
+    /// rebuilt term keeps the original's `NodeId`s.
+    ///
+    /// Only sound when the owning walk reaches **every** occurrence of every
+    /// predicate it rebuilds. A predicate is an `Rc` shared across many type
+    /// slots and a rebuild cannot mutate through it, so it builds a new `Rc` and
+    /// repoints the refinement it was given. If some other type still holds the
+    /// original, the two coexist — and preserving ids then puts one id-set on two
+    /// live terms, which nothing catches because predicate uniqueness is not
+    /// asserted.
+    ///
+    /// [`uniquify`](crate::ccl::uniquify) is the one caller entitled to this: it
+    /// walks the whole tree, and asserts the resulting 1:1 correspondence
+    /// (N distinct terms in, N out, same ids) on every compile.
+    ///
+    /// Every other caller rebuilds within a single type while the original may
+    /// survive elsewhere. Those are *derivations*, and [`Default`] gives them the
+    /// recording behaviour they need.
+    pub fn replacing() -> Self {
+        let m = Self::default();
+        m.0.borrow_mut().replacing = true;
+        m
+    }
+
+    fn is_replacing(&self) -> bool {
+        self.0.borrow().replacing
     }
 }
 
@@ -1289,6 +1320,9 @@ struct MemoStore<C> {
     /// own recursion, which the callback cannot report: a nested reuse mutates the
     /// callback's copy without the callback doing anything.
     revision: u64,
+    /// See [`PredMemo::replacing`]: the owning walk reaches every occurrence, so
+    /// a rebuild is a replacement and keeps the original's ids.
+    replacing: bool,
 }
 
 struct Entry<C> {
@@ -1342,7 +1376,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
         context: &C,
         f: impl FnOnce(&mut Expr) -> bool,
     ) -> bool {
-        let (mut pred, keepalive, before) = {
+        let (keepalive, before) = {
             let mut store = self.0.borrow_mut();
             let hit = store
                 .entries
@@ -1356,30 +1390,39 @@ impl<C: PartialEq + Clone> PredMemo<C> {
                 }
                 None => {
                     let keepalive = Rc::clone(&refinement.predicate);
-                    // Copy-on-write, not duplication: the rebuilt term is
-                    // installed *in place of* the original, so it is the same
-                    // logical node at a new allocation and keeps its ids.
-                    let copy = refinement.predicate.clone_preserving_ids();
                     let rev = store.revision;
-                    (copy, keepalive, rev)
+                    (keepalive, rev)
                 }
             }
         };
-        // The whole rebuild runs id-preserving, and the reason is that a rebuild
-        // is a **replacement**: the term this produces is installed in place of
-        // the original, so it is the same logical predicate and keeps its ids.
-        // `uniquify`'s multiset tripwire asserts exactly that for its own
-        // rebuilds.
+        // The copy and the rewrite run together under the memo's declared intent
+        // — `f` mints and copies *into* the term, so its products belong to
+        // whichever the rebuild is.
         //
-        // The scope covers the rewrite, not just the copy-on-write above,
-        // because `f` mints and copies *into* the term (a substitution
-        // materializing a template, a rule building a conjunction) and those
-        // products are part of the same replacement.
+        // **Replacing** (see [`PredMemo::replacing`]): the rebuilt term stands in
+        // for the original everywhere, so it is the same logical predicate at a
+        // new allocation and keeps its ids.
         //
-        // Not justified by predicates being outside the id domain — they are in
-        // it, and the fold explains them (`design/provenance.md`, "Walking the
-        // ids").
-        let reported = crate::ccl::lineage::preserving_ids(|| f(&mut pred));
+        // **Deriving** (the default): the original may survive on a type this
+        // walk never reaches, so the rebuilt term is a genuinely new one. It
+        // freshens, bracketed on the source predicate's own root, which records
+        // it as derived from the term it was rebuilt from.
+        let (pred, reported) = if self.is_replacing() {
+            crate::ccl::lineage::preserving_ids(|| {
+                let mut pred = (*keepalive).clone();
+                let reported = f(&mut pred);
+                (pred, reported)
+            })
+        } else {
+            let _g = crate::ccl::lineage::enter(
+                keepalive.node_id(),
+                "predicate.rebuild",
+                crate::ccl::lineage::Nature::Machinery,
+            );
+            let mut pred = (*keepalive).clone();
+            let reported = f(&mut pred);
+            (pred, reported)
+        };
         let mut store = self.0.borrow_mut();
         let changed = reported || store.revision != before;
         let installed = if changed {
@@ -1415,10 +1458,23 @@ impl TermMemo {
     /// caller) still leaves the occurrence rebuilt and recorded.
     pub fn rebuild_always(&self, refinement: &mut Refinement, f: impl FnOnce(&mut Expr)) {
         let keepalive = Rc::clone(&refinement.predicate);
-        // Copy-on-write; see `rebuild`.
-        let mut pred = refinement.predicate.clone_preserving_ids();
-        // Id-preserving; see `rebuild`.
-        crate::ccl::lineage::preserving_ids(|| f(&mut pred));
+        // Copy and rewrite under the memo's declared intent; see `rebuild`.
+        let pred = if self.0.is_replacing() {
+            crate::ccl::lineage::preserving_ids(|| {
+                let mut pred = (*keepalive).clone();
+                f(&mut pred);
+                pred
+            })
+        } else {
+            let _g = crate::ccl::lineage::enter(
+                keepalive.node_id(),
+                "predicate.rebuild",
+                crate::ccl::lineage::Nature::Machinery,
+            );
+            let mut pred = (*keepalive).clone();
+            f(&mut pred);
+            pred
+        };
         let mut store = self.0.0.borrow_mut();
         let shared = store
             .entries

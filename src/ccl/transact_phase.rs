@@ -2465,16 +2465,27 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
         && keys.contains(&binding.name)
         && !out.contains_key(&binding.name)
     {
-        // A stash, not a duplication: this records *the* init term so a later
-        // stage can place it, and the `let` that held it is dropped rather than
-        // kept alongside. Preserving its ids is what makes the two later
-        // placements copies **of the original** — freshen here and they row on
-        // an id nothing ever recorded.
+        // Stash the register's init so a later stage can place it: `rebind_letrec`
+        // drops this whole `MutDecl` for a register key, so the original is gone
+        // by then. The copy freshens and is **recorded** against the `MutDecl`
+        // it is taken from — the same node the stash already carries as `decl`,
+        // and the one the register's later scaffolding is attributed to.
+        //
+        // Preserving instead would also be sound (only one of the two is ever
+        // live), but it saved 20 ids over the whole pipeline suite — subtrees of
+        // 1 to 3 nodes — which does not pay for an opt-out. What matters is only
+        // that the copy is not an *unrecorded* mint; a bracket gets that as well
+        // as preserving does.
+        let _g = lineage::enter(
+            expr.node_id(),
+            "transact.key_init_stash",
+            lineage::Nature::Machinery,
+        );
         out.insert(
             binding.name.clone(),
             MutVarDecl {
                 decl: expr.node_id(),
-                init: init.clone_preserving_ids(),
+                init: (**init).clone(),
             },
         );
     }

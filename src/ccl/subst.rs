@@ -82,12 +82,16 @@ pub enum Mapping {
     /// `binder ↦ term` — plug a term in for the binder. No inverse.
     /// (Boxed: a term is much larger than a binder name.)
     ///
-    /// **Considered and deferred: `Rc<TypedExpr>`.** The payload is a template,
-    /// never a tree node and cloned afresh at every read ([`Mapping::as_expr`]),
-    /// so sharing it is sound. The solver copies substitutions constantly
-    /// (`Bound::render_subst`, [`Subst::then`], `compact`, `constrain`): with a
-    /// `Box` each of those ~28 sites deep-copies the payload tree, with an `Rc`
-    /// they are refcount bumps.
+    /// **Considered and deferred: `Rc<TypedExpr>`.** The payload is a
+    /// *template* — never a tree node, cloned afresh at every read
+    /// ([`Mapping::as_expr`]) — so sharing it is sound, and the solver copies
+    /// substitutions constantly (`Bound::render_subst`, [`Subst::then`],
+    /// `compact`, `constrain`). With a `Box`, every one of those ~28 sites deep-
+    /// copies the payload tree; with an `Rc` they are refcount bumps. That cost
+    /// is **pre-existing** — the derived `Clone` paid it too — so it is an
+    /// improvement over both arms rather than anything the freshening `Clone`
+    /// introduced, and it wants its own before/after rather than riding along
+    /// here.
     ///
     /// One trap if it is ever done: [`Subst::for_each_discharge_term_mut`] would
     /// become `Rc::make_mut`, which copies out through `TypedExpr`'s freshening
@@ -109,12 +113,12 @@ pub enum Mapping {
 /// So copying the map itself must mint nothing: the template is never in a tree,
 /// and no two nodes can end up sharing an id because of it.
 ///
-/// Without this, every `Subst` copy inherits the freshening and re-mints its
-/// payloads. That is not merely wasteful. The solver copies
+/// Without this, the derived `Clone` inherits the freshening and every `Subst`
+/// copy re-mints its payloads. That is not merely wasteful. The solver copies
 /// substitutions constantly — `Bound::render_subst`, [`Subst::then`],
 /// `compact`, `constrain` — and a bound edge's payloads are **type-domain**
-/// terms whose ids no rewrite ever produced, so each such copy rows against an
-/// origin the table never saw and the pane fold reports it as
+/// terms whose ids are outside the recorded id domain, so each such copy records
+/// a `Copy` against an origin the table never saw and the pane fold reports it as
 /// [`Leak::ParentUnknown`](crate::ccl::lineage::Leak::ParentUnknown). Measured on
 /// `generator_pipeline`: 200 of them at the first pane boundary.
 ///
@@ -183,41 +187,15 @@ impl Mapping {
     /// overwritten: a mint fires `on_mint`, and an id no node ends up carrying is
     /// a phantom birth in the lineage log.
     ///
-    /// A `Discharge` is the crate's one copy that shares an id; the literal below
-    /// carries why.
+    /// A `Discharge` copies through [`clone_at`](TypedExpr::clone_at), which
+    /// builds the replacement's root directly at `node_id` and freshens the
+    /// interior. Neither shape mints an id that no node ends up carrying.
     fn as_expr_preserving(&self, node_id: NodeId, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
             // See [`as_expr`]: the rename keeps the occurrence's type.
             Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone()))
                 .with_ty(occurrence_ty.clone()),
-            // The root takes the occurrence's id, the interior freshens
-            // (`node.clone()` reaches each child's own `Clone`): N occurrences give
-            // N subtrees under N ids the tree already holds. The id is what
-            // attribution resolves through, and a lowered parameter use is the case
-            // that shows it — uncurry substitutes a machine-made tuple projection
-            // into every use of `a` in `def add(a, b): a + a + b`, so a freshened
-            // root resolves through that template, whose span is the whole `def`
-            // and whose nature is machinery, and all three uses report the header
-            // instead of their own columns.
-            //
-            // A literal rather than `preserve(node_id, …).with_ty(…)`: the
-            // exhaustive field check is what keeps `user_annotation` from being
-            // silently dropped.
-            //
-            // TODO(subst-lineage): the edge encoding reproduces this entry, span
-            // and nature alike — freshen the root and record the copy against the
-            // occurrence instead of the template. It costs a death per occurrence,
-            // and the record has to land in the enclosing frame, since a nested one
-            // flushes first (guards drop LIFO) and would order these edges ahead of
-            // the copy that introduced the template they read. Revisit when the
-            // pane-level table lands and the two become distinguishable from
-            // outside this function.
-            Mapping::Discharge(t) => TypedExpr {
-                ty: t.ty.clone(),
-                node: t.node.clone(),
-                user_annotation: t.user_annotation.clone(),
-                node_id,
-            },
+            Mapping::Discharge(t) => t.clone_at(node_id),
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out
@@ -485,13 +463,22 @@ impl Subst {
     /// catch. (That check accordingly demotes to a debug assert — see
     /// `check_scope_valid`.)
     pub fn apply_expr(&self, e: &TypedExpr) -> TypedExpr {
-        // Both early returns hand back `e` itself, so they keep its ids. A
-        // freshening clone mints a whole tree whose only purpose is to *be* `e`,
-        // and the fold then has to explain products describing a rewrite that did
-        // not happen — measured at 50 `ParentUnknown` on `inner_join` when these
-        // freshen.
+        // Both early returns build a term the caller owns while `e` stays live in
+        // whatever tree holds it, so the result is a genuinely new node even
+        // though the substitution changed nothing. It freshens and is **recorded**
+        // as a copy of `e`, rather than keeping `e`'s ids: preserving would put
+        // one id-set on two live terms, which is the defect predicate rebuilding
+        // just had to be fixed for.
+        //
+        // Recording rather than simply freshening is the load-bearing half —
+        // unbracketed, these produced 50 `ParentUnknown` on `inner_join`.
         if self.is_id() {
-            return e.clone_preserving_ids();
+            let _g = crate::ccl::lineage::enter(
+                e.node_id(),
+                "subst.vacuous",
+                crate::ccl::lineage::Nature::Machinery,
+            );
+            return e.clone();
         }
         // No-op short-circuit: if none of the substituted binders occur free
         // in `e` — value or type slots — the substitution does nothing here.
@@ -500,7 +487,12 @@ impl Subst {
         // path, which is what keeps vacuous transport from copying terms or
         // rebuilding predicate terms into fresh `Rc`s.
         if !self.0.keys().any(|k| is_free(k, e)) {
-            return e.clone_preserving_ids();
+            let _g = crate::ccl::lineage::enter(
+                e.node_id(),
+                "subst.vacuous",
+                crate::ccl::lineage::Nature::Machinery,
+            );
+            return e.clone();
         }
         self.apply_expr_inner(e)
     }
@@ -793,6 +785,21 @@ impl Subst {
             // construction.
             let occurrence_ty = e.ty.clone();
             *e = repl.as_expr_preserving(e.node_id, &occurrence_ty);
+            if !matches!(e.node, TypedExprNode::Var(_)) {
+                // Compound replacement. `Clone` freshens, so the replacement's
+                // interior arrives already distinct from the template — what the
+                // old `freshen_interior_node_ids()` call did explicitly. Type
+                // slots are out of the id domain, so the predicate `Rc`s the
+                // clone shares with its source stay shared.
+                //
+                // The root is the one place this costs anything: the clone mints
+                // an id for it and the carry above immediately discards that id
+                // in favour of the occurrence's. So the occurrence stays in the
+                // live set (the carry precedes nothing that could displace it),
+                // and what is stranded is a single minted id that folds as a
+                // death rather than a defect — one row and one id per
+                // substituted occurrence, no extra hop.
+            }
             return;
         }
         // *Every* type slot the node carries, not just `ty` and the annotation: a
