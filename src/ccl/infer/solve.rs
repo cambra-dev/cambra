@@ -869,8 +869,9 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
 /// **well-formed in the lexical scope at that node** — every free term-variable
 /// of its refinement predicates is bound by an enclosing Pi binder (subtracted
 /// by [`crate::ccl::subst::type_free_vars`]) or an enclosing AST binder
-/// (lambda / `let` / loop / case), or is a program source (seeded into the root
-/// `scope`).
+/// (lambda / `let` / loop / case). The root `scope` is empty: a program source
+/// is referenced by a [`TypedExprNode::Source`] node rather than by a variable,
+/// so no source name reaches `type_free_vars`.
 ///
 /// A violation means a refinement reached a position where its predicate's free
 /// variables are out of scope — e.g. a dependent-application discharge that

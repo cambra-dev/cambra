@@ -998,10 +998,18 @@ dangling index could land on a recorded bound, and either re-derivation opens un
 because it reconciles two passes' spellings of one type. `CAMBRA_TELESCOPE_LOG` enables the
 observation log.
 
-Sources stay name-referenced and outside the telescope. A source name is a unique global identifier
-with no binding structure, the same standing `check_scope_valid` gives it. A source has no binding
-site, so it is never uniquified, while after uniquification every binder reference is `Unique` or
-`Synthetic`; a `Name::Raw` gap is therefore a source reference and passes.
+A program source needs no standing in the telescope, because it is never a reference the check sees.
+A source is referenced by a `TypedExprNode::Source` node, not by a variable: lowering emits that node
+for every source reference, `emit_node`'s `Source` arm types it from the source registry, and the
+`Var` arm resolves against the scope stack alone and rejects any name not in it. A source name
+therefore never reaches `subst::type_free_vars`, so every gap the check finds is a reference that
+should have been rewritten and is not excused.
+
+A parameter annotation's predicate referencing a sibling parameter is such a reference. Uncurrying
+rewrites the output annotation's references to tuple projections and leaves a parameter annotation's
+alone, so the refinement keeps the source name while the lambda binds `__arg_tuple_0`
+(`tests/type_check.rs`, `a_param_claim_may_reference_a_sibling_param`, ignored pending the lowering
+fix).
 
 #### The coordinate is locally nameless
 

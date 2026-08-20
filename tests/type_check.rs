@@ -3260,3 +3260,133 @@ fn joining_a_capability_with_a_collection_is_a_kind_conflict() {
         "expected a kind conflict, got {errs:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// User-written refinements: a refinement's reference to an enclosing binder
+// ---------------------------------------------------------------------------
+
+/// A user-written refinement that references an enclosing binder reaches the solver
+/// with that reference intact, and the binder it names is one the tree holds.
+/// These are the surface-syntax counterparts of the hand-built acceptance tests
+/// in `compact.rs` and `spec_key.rs`: `{T where p}` puts a refinement on a variable
+/// whose telescope has to carry the binder `p` names, the same traveler class
+/// group-by's lowering produces.
+///
+/// The observable is the diagnostic. Nothing discharges a user-written
+/// predicate — a refined parameter admits an argument only when the argument's
+/// own refinement set already carries the predicate — so every case here is rejected
+/// at the subsumption step, and what the assertion reads is the refinement the
+/// solver arrived at.
+#[rstest]
+// A `let` binder is a telescope entry, and a refinement may reference one while it
+// is in scope.
+#[case::let_bound(
+    indoc! {r#"
+        n = 5
+        def f(x: {Int where _ > n}):
+            x
+
+        f(7)
+    "#},
+    "{Int | __elem > n}"
+)]
+// A predicate that projects out of the refined element keeps the projection.
+#[case::projection(
+    indoc! {r#"
+        def f(r: { {x: Int, y: Int} where _.y != 0}):
+            r.x
+
+        f((x=1, y=2))
+    "#},
+    "{{x: Int, y: Int} | __elem.y != 0}"
+)]
+// An output annotation referencing a parameter is rewritten to the tuple
+// projection when uncurrying tuples the parameter list, so the refinement names the
+// binder the lambda actually binds.
+#[case::uncurried_output(
+    indoc! {r#"
+        def f(a: Int, b: Int) => {Int where _ >= a}:
+            a + b
+
+        f(1, 2)
+    "#},
+    "{Int | __elem >= __arg_tuple_0.0}"
+)]
+fn a_user_written_refinement_keeps_its_binder_reference(
+    #[case] code: &str,
+    #[case] refinement: &str,
+) {
+    let errs = infer_program_err(code);
+    assert!(
+        errs.iter()
+            .map(|e| format!("{e:?}"))
+            .any(|msg| msg.contains(refinement)),
+        "expected a diagnostic naming the refinement `{refinement}`, got {errs:?}"
+    );
+}
+
+/// A refinement referencing no binder types through as itself, at both
+/// polarities of the parameter it annotates. This is the control for the cases
+/// above: the refinement travels the same route and closes trivially, so a failure
+/// here is about refinements rather than about scope.
+#[test]
+fn a_refinement_referencing_no_binder_types_through() {
+    let ty = infer_program(indoc! {r#"
+        def f(c: {Int where _ >= 0}):
+            c
+
+        f
+    "#});
+    assert_eq!(
+        format!("{ty}"),
+        "({Int | __elem >= 0} ⇒ {Int | __elem >= 0})",
+        "a closed refinement rides both the domain and the codomain unchanged"
+    );
+}
+
+/// **Known gap: a parameter's refinement cannot reference a sibling
+/// parameter.** `uncurry_params` rewrites an output annotation's references to
+/// tuple projections and leaves a parameter annotation's alone, so the refinement
+/// keeps the source name while the lambda binds `__arg_tuple_0` — the refinement
+/// references a binder nothing binds. The record-time closure check reports it
+/// (`observe_bound_scope`), which is what this program trips today.
+///
+/// Two same-shaped definitions joined at one position are the same defect one
+/// step on: the merge unions both refinement sets at a position that binds neither
+/// name, which is the order-dependent dangling type the index coordinate
+/// retires for arrows.
+///
+/// Fixing it belongs in lowering: uncurrying rewrites parameter-annotation
+/// predicates the way it already rewrites the output annotation's, after which
+/// the refinement names `__arg_tuple_0` and the telescope carries it.
+#[test]
+#[ignore = "uncurrying does not rewrite a param annotation's predicate references; \
+            the refinement references a binder nothing binds"]
+fn a_param_claim_may_reference_a_sibling_param() {
+    let ty = infer_program(indoc! {r#"
+        def f(a: Int, c: {Int where _ >= a}):
+            c
+
+        f
+    "#});
+    assert!(
+        format!("{ty}").contains("__arg_tuple_0.0"),
+        "the sibling reference resolves to the tuple projection, got {ty}"
+    );
+
+    let joined = infer_program(indoc! {r#"
+        def f(a: Int, c: {Int where _ >= a}):
+            c
+
+        def h(b: Int, d: {Int where _ >= b}):
+            d
+
+        [f, h]
+    "#});
+    let rendered = format!("{joined}");
+    assert!(
+        !rendered.contains(" >= a") && !rendered.contains(" >= b"),
+        "two α-variant refinements joined at one position must not leave a source \
+         binder name behind, got {rendered}"
+    );
+}
