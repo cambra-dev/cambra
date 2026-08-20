@@ -344,6 +344,9 @@ pub(super) fn lower_list_comp(
 /// sibling, including the first: a fan-out places the same subtree under several
 /// arms and no arm is privileged. The copy-frame records each copy as a `Copy` of
 /// the origin, so every arm's attribution mirrors the original's.
+///
+/// Keeping the first arm's ids was measured at 30 ids saved over the whole
+/// pipeline suite, max subtree 5 — which does not pay for a second code path.
 fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
     use crate::ccl::lineage::copy_frame;
     let _frame = copy_frame(label);
@@ -434,6 +437,8 @@ fn fan_out_element_case(
     // `true → Case{…}`) into one flat partition, so each arm is a plain value.
     let branches = flatten_trailing_value_case(branches);
     let mut prior_guards: Vec<Expr> = Vec::new();
+    // The source subtree is placed once per arm in the element map and once more in
+    // that arm's gate, so every use after the first must be a freshened copy.
     let arms: Vec<Expr> = branches
         .into_iter()
         .map(|b| {

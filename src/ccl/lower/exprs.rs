@@ -482,6 +482,10 @@ pub(super) fn lower_compare(
             CmpOp::Gt => CompareKind::Greater,
             CmpOp::GtE => CompareKind::GreaterOrEq,
         };
+        // Operand `i` is this pair's left side and, for `i > 0`, was pair `i-1`'s
+        // right side; operand `i+1` is this pair's right side and may be the next
+        // pair's left. Every placement freshens and is recorded, so which use
+        // comes first does not matter here.
         let lhs = operand(i);
         let rhs = operand(i + 1);
         // Each pair comparison images its `<op>` in the chain, spanning its two

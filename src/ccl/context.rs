@@ -2121,23 +2121,26 @@ mod tests {
     /// end), so the fixture is one that drives three of the five: the
     /// transaction, which `transact_phase` disassembles, `mut_elim` rebuilds as
     /// a `LetRec`, and `channelize` desugars.
-    /// **No predicate term shares an id with the main tree**, and the count of
-    /// ids shared between two *distinct* predicate terms is pinned.
+    /// **Distinct predicate terms never share a `NodeId`** — with each other, or
+    /// with the main tree.
     ///
-    /// Predicate ids are in the explanation domain but uniqueness is not asserted
-    /// for them (`design/provenance.md`, "Walking the ids"), so this is the only
-    /// thing watching. Dedup is by `Rc` pointer first: one term riding many type
-    /// slots is one term and shares ids with itself legitimately.
+    /// Predicate ids are in the explanation domain but `assert_unique_node_ids`
+    /// walks the main tree only (`design/provenance.md`, "Walking the ids"), so this
+    /// is the only thing asserting uniqueness for them. Dedup is by `Rc` pointer
+    /// first: one term riding many type slots is one term and shares ids with
+    /// itself legitimately.
     ///
-    /// The residual is `PredMemo::rebuild`, which keeps the source's ids because
-    /// `uniquify`'s multiset tripwire requires it — so one predicate rebuilt
-    /// under two contexts yields two live terms with identical ids. It goes to
-    /// zero when that rebuild records instead of preserving, which is gated on
-    /// narrowing the tripwire to the main tree. Pinned rather than asserted-zero
-    /// so the number cannot drift upward unnoticed in the meantime.
+    /// What this catches is a rebuild that **preserves ids when it should not**. A
+    /// predicate cannot be mutated through its `Rc`, so every rewrite builds a new
+    /// `Rc` and repoints the refinement it was handed. That is a *replacement*
+    /// only if the walk reaches every occurrence; otherwise the original survives
+    /// on some type the walk missed, and preserving ids puts one id-set on two
+    /// live terms. `PredMemo::replacing` is the opt-in for walks that do reach
+    /// everything, and `uniquify` — the only one — asserts its own 1:1
+    /// correspondence separately.
     #[test]
-    fn predicate_terms_do_not_collide_with_the_main_tree() {
-        let mut residual: Vec<(String, usize)> = Vec::new();
+    fn distinct_predicate_terms_never_share_a_node_id() {
+        let mut found: Vec<(String, usize, &'static str)> = Vec::new();
         for (name, code) in corpus() {
             let program = compile_ok(&code);
             for (pane, tree) in [
@@ -2145,31 +2148,15 @@ mod tests {
                 ("post-inference", &program.post_inference_ir),
                 ("post-desugar", &program.post_desugar_ir),
             ] {
-                let collisions = predicate_id_collisions(tree);
-                let with_main: Vec<_> = collisions
-                    .iter()
-                    .filter(|(_, kind)| *kind == "predicate-vs-main-tree")
-                    .collect();
-                assert!(
-                    with_main.is_empty(),
-                    "{name} / {pane}: predicate terms must not share ids with the \
-                     main tree, found {}: {with_main:?}",
-                    with_main.len(),
-                );
-                let between = collisions.len() - with_main.len();
-                if between > 0 {
-                    residual.push((format!("{name} / {pane}"), between));
+                for (_, kind) in predicate_id_collisions(tree) {
+                    found.push((format!("{name} / {pane}"), 1, kind));
                 }
             }
         }
-        residual.sort();
-        assert_eq!(
-            residual,
-            vec![
-                ("inner_join / post-desugar".to_string(), 33),
-                ("inner_join / post-inference".to_string(), 33),
-            ],
-            "ids shared between distinct predicate terms — see this test's docs",
+        assert!(
+            found.is_empty(),
+            "{} predicate id collisions: {found:?}",
+            found.len(),
         );
     }
 
