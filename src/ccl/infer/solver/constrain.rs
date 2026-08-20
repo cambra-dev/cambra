@@ -21,7 +21,9 @@ use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::FunKind;
-use crate::ccl::{BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
+use crate::ccl::{
+    BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, Type,
+};
 
 use super::traits::{Trait, link_watches, notify_lower};
 use super::type_level;
@@ -588,7 +590,7 @@ fn constrain_go_impl(
             // ([`Derivation`]) answers both this and the record sites'
             // question, so the two read one field rather than two flags.
             // The pre-scan keeps the common index-free codomain untouched.
-            let open = |n: &Option<crate::ccl::Name>, c: &Type, other: &Type| -> Option<Type> {
+            let open = |n: &Option<Name>, c: &Type, other: &Type| -> Option<Type> {
                 match n {
                     Some(b)
                         if crate::ccl::subst::contains_pi_bound(c)

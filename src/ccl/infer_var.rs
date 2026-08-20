@@ -357,9 +357,10 @@ impl fmt::Debug for Telescope {
 /// the suspension is the application that closes them).
 ///
 /// The gap set of the record-time closure check
-/// (`src/ccl/design/type-inference.md`, "The invariant"). Source references
-/// are not excluded here: they are identifiable by name form, and
-/// [`observe_bound_scope`] is where that exemption is applied.
+/// (`src/ccl/design/type-inference.md`, "The invariant"), and every member is
+/// an error. A program source is never one: a source reference is a
+/// [`crate::ccl::TypedExprNode::Source`] node, so it is not a term variable and
+/// [`subst::type_free_vars`] does not report it.
 #[cfg(any(debug_assertions, test))]
 pub(crate) fn bound_scope_gaps(
     telescope: &Telescope,
@@ -401,12 +402,12 @@ pub(crate) fn observe_bound_scope(
             return;
         }
         // The record-time closure invariant, as an internal error on the live
-        // solve (see `src/ccl/design/type-inference.md`, "The invariant"). A
-        // `Name::Raw` gap is a *source* reference and legal: a source has no
-        // binding site, so it is never uniquified — while after uniquification
-        // every binder reference is `Unique`/`Synthetic` — and its standing is
-        // the same one `check_scope_valid` gives it.
-        if enforce && let Some(open) = gaps.iter().find(|n| !n.is_raw()) {
+        // solve (see `src/ccl/design/type-inference.md`, "The invariant"). Every
+        // gap is an error: a bound's free term variables are the telescope's
+        // entries and the edge substitutions' domains, and a program source is
+        // not among them because a source reference is a
+        // [`crate::ccl::TypedExprNode::Source`] node rather than a variable.
+        if enforce && let Some(open) = gaps.iter().next() {
             panic!(
                 "open bound recorded on ?{}: `{open:?}` is free in the {side} bound \
                  `{}` but is neither in the holder's telescope {:?} nor discharged by \
@@ -704,16 +705,20 @@ mod tests {
         observe_bound_scope(&holder, "lower", &Bound::conc(dep), true);
     }
 
-    /// A `Name::Raw` gap is a source reference, which has no binding site and
-    /// is legal free — enforcement lets it through.
+    /// A [`Name::Raw`] gap is an internal error like any other. The form does
+    /// not excuse it: a source reference is a
+    /// [`crate::ccl::TypedExprNode::Source`] node rather than a variable, so a
+    /// raw gap is a reference some pass failed to rewrite — the dangling refinement
+    /// this check exists to catch.
     #[test]
     #[cfg(debug_assertions)]
-    fn a_raw_name_gap_is_a_source_reference_and_allowed() {
+    #[should_panic(expected = "open bound recorded")]
+    fn a_raw_gap_is_an_internal_error() {
         use crate::ccl::{Name, Refinement, TypedExpr};
         use std::rc::Rc as StdRc;
         let dep = Type::Refinement(
             Box::new(Type::Base(BaseType::Int)),
-            Refinement::born(StdRc::new(TypedExpr::var(Name::raw("users")))),
+            Refinement::born(StdRc::new(TypedExpr::var(Name::raw("a")))),
         );
         let holder = InferVar::fresh(0);
         observe_bound_scope(&holder, "lower", &Bound::conc(dep), true);
