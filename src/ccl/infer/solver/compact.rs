@@ -101,7 +101,7 @@ pub enum KindMerge {
     /// accumulated meet contravariantly when coalesce reads them.
     Compute,
     /// A collection: its domain *is* the data, so the alternatives never meet —
-    /// exactly one must survive (`union_domains`).
+    /// exactly one must survive ([`DomainSet`]).
     Data,
     /// A data/compute or multi-domain collision; deferred to coalesce.
     Conflict,
@@ -151,7 +151,7 @@ impl KindMerge {
 
 /// A merged function shape. `domains` holds the alternatives a positive join
 /// accumulated — one entry unless two distinct domains met — and coalesce
-/// applies the resolved [`KindMerge`]'s rule to them (see `union_domains` and
+/// applies the resolved [`KindMerge`]'s rule to them (see [`DomainSet`] and
 /// [`CompactFun::merge`]). A negative merge takes the contravariant meet
 /// directly, since that rule does not read the kind.
 #[derive(Debug, Clone, PartialEq)]
@@ -161,32 +161,96 @@ pub struct CompactFun {
     /// The merged kind.
     pub kind: KindMerge,
     /// Domain alternatives — `len == 1` unless a positive join accumulated more.
-    pub domains: Vec<CompactType>,
+    pub domains: DomainSet,
     /// The codomain (covariant).
     pub codomain: Box<CompactType>,
 }
 
-/// The join of two domain-alternative lists: the union of the alternatives,
-/// deduplicated by structural [`CompactType`] equality. Never a meet — a `Data`
-/// domain *is* the data, so narrowing it drops rows, and whether the slot will
-/// read as data is not yet known ([`CompactFun::merge`]).
+/// The domain alternatives a positive join accumulated: a **set**, deduplicated
+/// by [`CompactType`] equality.
 ///
-/// Both alternatives are kept because neither question this defers can be
-/// answered here. Whether they are really two domains cannot: at compact time a
-/// domain still carries unresolved variable identity, so two structurally
-/// identical domains can compare unequal. What two surviving domains *mean*
-/// cannot either: it depends on the slot's kind, which the bounds still arriving
-/// can change. Coalesce answers both — it re-runs the comparison on the
-/// materialized [`Type`]s, and under a `Compute` reading it meets the
-/// alternatives instead, so a `Data` slot with more than one survivor is the one
-/// case with no lossless answer.
-fn union_domains(mut a: Vec<CompactType>, b: Vec<CompactType>) -> Vec<CompactType> {
-    for d in b {
-        if !a.contains(&d) {
-            a.push(d);
-        }
+/// Order-insensitive, which is what keeps a merged slot's *identity* independent
+/// of bound arrival order. Appending into a bare `Vec` did not: `CompactFun`
+/// derives `PartialEq`, which compares a `Vec` positionally, so two data-function
+/// bounds over distinct domains merged to `[d₁, d₂]` or `[d₂, d₁]` and the two
+/// results compared unequal. Structural equality is load-bearing where types are
+/// identities, which is the same reason refinements are a
+/// [`RefinementSet`](crate::ccl::RefinementSet) rather than a `Vec`.
+///
+/// Deduplicating here does not make coalesce's second dedup redundant: at compact
+/// time a domain still carries inference-variable identity that `simplify_type`
+/// may merge afterwards, so two alternatives that are unequal here can still
+/// materialize to one `Type`.
+#[derive(Debug, Clone, Default)]
+pub struct DomainSet(Vec<CompactType>);
+
+impl PartialEq for DomainSet {
+    /// Set equality. Sound as stated because both sides are deduplicated, so
+    /// equal cardinality plus one-way containment is mutual containment — the
+    /// same argument `RefinementSet`'s equality rests on.
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().all(|d| other.0.contains(d))
     }
-    a
+}
+
+impl DomainSet {
+    /// The one alternative an ordinary function slot carries.
+    pub(super) fn one(d: CompactType) -> Self {
+        Self(vec![d])
+    }
+
+    /// The union of two alternative sets. Never a meet — a `Data` domain *is* the
+    /// data, so narrowing it drops rows, and whether the slot reads as data is not
+    /// known here ([`CompactFun::merge`]).
+    pub(super) fn union(mut self, other: Self) -> Self {
+        for d in other.0 {
+            if !self.0.contains(&d) {
+                self.0.push(d);
+            }
+        }
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, CompactType> {
+        self.0.iter()
+    }
+
+    /// The alternatives as a slice, for a reader that only materializes them —
+    /// the same accessor `RefinementSet` offers for the same reason.
+    pub fn as_slice(&self) -> &[CompactType] {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a DomainSet {
+    type Item = &'a CompactType;
+    type IntoIter = std::slice::Iter<'a, CompactType>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl IntoIterator for DomainSet {
+    type Item = CompactType;
+    type IntoIter = std::vec::IntoIter<CompactType>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl FromIterator<CompactType> for DomainSet {
+    fn from_iter<I: IntoIterator<Item = CompactType>>(iter: I) -> Self {
+        iter.into_iter()
+            .fold(Self::default(), |acc, d| acc.union(Self::one(d)))
+    }
 }
 
 impl CompactFun {
@@ -196,21 +260,9 @@ impl CompactFun {
         use KindMerge::*;
         let name = a.name.clone().or_else(|| b.name.clone());
         let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
-        // The contravariant domain meet, defined only when both sides carry a
-        // single domain (a multi-domain collection has no single domain to meet).
-        let meet = |x: Vec<CompactType>, y: Vec<CompactType>| -> Vec<CompactType> {
-            debug_assert!(x.len() == 1 && y.len() == 1, "meet of a multi-domain");
-            vec![CompactType::merge(
-                !pol,
-                x.into_iter().next().unwrap(),
-                y.into_iter().next().unwrap(),
-            )]
-        };
         // On any prior conflict, stay conflicted (keep the wider domain list
         // so coalesce can render diagnostics).
-        let widest = |x: Vec<CompactType>, y: Vec<CompactType>| {
-            if x.len() >= y.len() { x } else { y }
-        };
+        let widest = |x: DomainSet, y: DomainSet| if x.len() >= y.len() { x } else { y };
         // The kinds join in the flat semilattice `Unknown < {Data, Compute} <
         // Conflict`, the same operation at both polarities: `Unknown` is the
         // identity (nothing required a kind on that side, so the other side's
@@ -234,12 +286,24 @@ impl CompactFun {
             // has merged, so a choice made here is made from an answer that does not
             // exist yet, and a later bound cannot undo it. `coalesce_compact_go`
             // applies the resolved kind's rule once, at the same place
-            // [`union_domains`]' dedup is re-decided.
-            (kind, union_domains(a.domains, b.domains))
+            // [`DomainSet`]'s dedup is re-decided.
+            (kind, a.domains.union(b.domains))
         } else if a.domains.len() == 1 && b.domains.len() == 1 {
-            // A negative position's rule does not read the kind, so taking it here
-            // decides nothing early.
-            (kind, meet(a.domains, b.domains))
+            // The contravariant meet. A negative position's rule does not read the
+            // kind, so taking it here decides nothing early. The meet is defined
+            // only where both sides carry a *single* domain — a multi-domain
+            // requirement has no one domain to meet — which is what the guard
+            // establishes, and `sole` states rather than restating it as an
+            // assertion beside a fallback answer no caller can reach.
+            let sole = |d: DomainSet| {
+                d.into_iter()
+                    .next()
+                    .expect("a one-element DomainSet yields its element")
+            };
+            (
+                kind,
+                DomainSet::one(CompactType::merge(!pol, sole(a.domains), sole(b.domains))),
+            )
         } else {
             // Two multi-domain requirements meeting at a negative position — no current
             // program produces this; flag it loudly at coalesce.
@@ -290,7 +354,7 @@ pub struct CompactType {
     pub var: Option<CompactVariant>,
     /// Function shape, if any: see [`CompactFun`]. Carries the Pi binder, the
     /// merged [`KindMerge`], the domain alternatives (one, unless a positive
-    /// `Data ⊔ Data` join accumulated alternatives via [`union_domains`]), and the
+    /// positive join accumulated alternatives via [`DomainSet::union`]), and the
     /// codomain. Recursively merged with polarity flip on the domain.
     pub fun: Option<CompactFun>,
     /// Refinement contributions at this position — the same
@@ -855,7 +919,7 @@ fn compact_go(
                 fun: Some(CompactFun {
                     name: name.clone(),
                     kind: KindMerge::of(kind),
-                    domains: vec![dom],
+                    domains: DomainSet::one(dom),
                     codomain: Box::new(cod),
                 }),
                 ..CompactType::value()
@@ -1294,10 +1358,12 @@ mod tests {
             fun: Some(CompactFun {
                 name: None,
                 kind,
-                domains: vec![CompactType {
+                domains: [CompactType {
                     rec: Some(rec),
                     ..CompactType::value()
-                }],
+                }]
+                .into_iter()
+                .collect(),
                 codomain: Box::new(int()),
             }),
             ..CompactType::value()
@@ -1377,6 +1443,37 @@ mod tests {
                 ("b".to_string(), Type::Base(BaseType::Int)),
             ])),
             "the met domain is the union of the two records' fields"
+        );
+    }
+
+    /// The merge is commutative under `CompactType`'s own equality, including once
+    /// a positive join has accumulated two domain alternatives. Appending them into
+    /// a `Vec` broke this: `CompactFun`'s derived `PartialEq` compares positionally,
+    /// so the two arrival orders produced unequal slots — and structural equality is
+    /// load-bearing where types are identities.
+    #[test]
+    fn a_positive_join_of_two_domains_is_order_insensitive() {
+        let fun = |dom: BaseType| CompactType {
+            fun: Some(CompactFun {
+                name: None,
+                kind: KindMerge::Data,
+                domains: DomainSet::one(CompactType::from_atom(AtomKey::Prim(dom))),
+                codomain: Box::new(CompactType::from_atom(AtomKey::Prim(BaseType::Int))),
+            }),
+            ..CompactType::value()
+        };
+        let a = fun(BaseType::Int);
+        let b = fun(BaseType::String);
+        let ab = CompactType::merge(true, a.clone(), b.clone());
+        let ba = CompactType::merge(true, b, a);
+        assert_eq!(
+            ab.fun.as_ref().map(|f| f.domains.len()),
+            Some(2),
+            "the alternatives accumulate"
+        );
+        assert_eq!(
+            ab, ba,
+            "and the merged slot does not depend on which arrived first"
         );
     }
 
