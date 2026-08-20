@@ -154,7 +154,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         // domain *is* the data, so its alternatives never meet — they are
         // materialized and deduplicated at the `Type` level, which is where the
         // "same domain or not?" question is actually decided: the compact-time
-        // `CompactType ==` dedup in `union_domains` cannot settle it, because a
+        // `CompactType ==` dedup in `DomainSet` cannot settle it, because a
         // compact domain still carries variable identity that `simplify_type` may
         // merge afterwards, so two identical domains can arrive as two
         // alternatives. A conflicted slot keeps every alternative for its
@@ -304,7 +304,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             // needs strict scalar consumers (binops, …) to impose concrete
             // bounds so the union is rejected at *their* site; that is deferred
             // past the conditional-collection foundation. Collection arms still join losslessly — that happens in
-            // the `fun` slot above (`union_domains`), not through atoms.
+            // the `fun` slot above (`DomainSet::union`), not through atoms.
             let pretty = all
                 .iter()
                 .map(|t| format!("{t}"))
@@ -366,7 +366,7 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
                 name: None,
                 // A feed's read view is a collection stream: a data function.
                 kind: super::compact::KindMerge::Data,
-                domains: vec![*domain],
+                domains: super::compact::DomainSet::one(*domain),
                 codomain: value,
             }),
             ..Default::default()
@@ -520,10 +520,12 @@ mod tests {
                 fun: Some(CompactFun {
                     name: None,
                     kind: KindMerge::Data,
-                    domains: vec![
+                    domains: [
                         compact_type(&Type::UIntRange(2)).term,
                         compact_type(&Type::UIntRange(3)).term,
-                    ],
+                    ]
+                    .into_iter()
+                    .collect(),
                     codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
@@ -546,7 +548,9 @@ mod tests {
                 fun: Some(CompactFun {
                     name: None,
                     kind: KindMerge::Data,
-                    domains: vec![compact_type(&Type::UIntRange(2)).term],
+                    domains: [compact_type(&Type::UIntRange(2)).term]
+                        .into_iter()
+                        .collect(),
                     codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
@@ -574,10 +578,12 @@ mod tests {
                 fun: Some(CompactFun {
                     name: None,
                     kind: KindMerge::Data,
-                    domains: vec![
+                    domains: [
                         compact_type(&Type::UIntRange(2)).term,
                         compact_type(&Type::UIntRange(2)).term,
-                    ],
+                    ]
+                    .into_iter()
+                    .collect(),
                     codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
@@ -605,10 +611,12 @@ mod tests {
                 fun: Some(CompactFun {
                     name: None,
                     kind: KindMerge::Conflict,
-                    domains: vec![
+                    domains: [
                         compact_type(&Type::UIntRange(2)).term,
                         compact_type(&Type::UIntRange(3)).term,
-                    ],
+                    ]
+                    .into_iter()
+                    .collect(),
                     codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
@@ -633,7 +641,9 @@ mod tests {
                 fun: Some(CompactFun {
                     name: None,
                     kind: KindMerge::Conflict,
-                    domains: vec![compact_type(&prim(BaseType::Int)).term],
+                    domains: [compact_type(&prim(BaseType::Int)).term]
+                        .into_iter()
+                        .collect(),
                     codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
                 }),
                 ..Default::default()
