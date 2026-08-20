@@ -1179,8 +1179,8 @@ fn constrain_go_impl(
         // needs from the sum is its candidate **domains** and the element types carried
         // at them, and [`collection_candidates`] / [`collection_codomains`] answer that
         // for the factored `Σ 𝐷 ∈ {𝐷ᵢ}. 𝐷 ⤇ 𝑉` and the unfactored `Σ σ ∈ {𝐷ᵢ ⤇ 𝑉ᵢ}. σ`
-        // alike. Nothing downstream of that point can tell which arrived, which is why
-        // there is no longer a split here.
+        // alike. Nothing downstream of that point can tell which arrived, so one path
+        // serves both.
         //
         // The domains do not become an edge. They become a **range demand** on the
         // consumer's domain — see [`demand_domain_range`] — and the element types flow
@@ -2021,9 +2021,9 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             //    two-way proxy under both keys — reuse it wholesale.
             //  * A prior *polar* extrusion (`extrude` above) minted a proxy
             //    under a single key with only *one* bound link. Reusing that
-            //    proxy naively — as this branch used to — would hand the
-            //    invariant position a one-way proxy, silently dropping the
-            //    other bound direction across the level boundary. Instead,
+            //    proxy naively would hand the invariant position a one-way
+            //    proxy, silently dropping the other bound direction across the
+            //    level boundary. Instead,
             //    reuse the proxy (it is the same original variable) but add the
             //    link the polar extrusion omitted, upgrading it to two-way.
             let cached_pos = cache.get(&(tv.uid, true)).cloned();
@@ -2896,13 +2896,11 @@ mod tests {
         }
     }
 
-    // The deref arm these two tests covered is gone: a mutable variable mention that denotes
-    // its value is dereffed by the rule that emits it (`emit::emit_value_read`), so
-    // `Mut(V) <: V` is no longer a subtyping fact and there is nothing to assert here.
-    // The property they protected — `cnt + 1` yields `Int` rather than leaving a `Mut`
-    // on an inference variable — is now pinned where it is decided:
-    // `a_mut_var_read_yields_its_value_in_a_value_position` in `tests/type_check.rs`,
-    // and the `mutability` integration suite end to end.
+    // There is no deref arm to test: a mutable variable mention that denotes its value is
+    // dereffed by the rule that emits it (`emit::emit_value_read`), so `Mut(V) <: V` is not
+    // a subtyping fact. That `cnt + 1` yields `Int` rather than leaving a `Mut` on an
+    // inference variable is pinned where it is decided,
+    // `a_mut_var_read_yields_its_value_in_a_value_position` in `tests/type_check.rs`.
 
     #[test]
     fn mut_meets_mut_invariantly() {

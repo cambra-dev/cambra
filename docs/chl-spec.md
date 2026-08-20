@@ -653,34 +653,6 @@ never takes it (a mutable variable is the sequence its writes produce, so no one
 value describes it). Unit is the exception with nothing to say: it has one
 inhabitant, so pinning it would add nothing to the base.
 
-A construct that *selects* or *collects* values rather than computing one keeps
-what **every** value it could yield establishes: `1 if c else 2` is an `Int`
-because the branches disagree, while `5 if c else 5` is still `5`, and a list is
-`[5, 5] : 5`-elemented but `[5, 6] : Int`-elemented. The same rule covers every
-such position — a conditional's branches, a collection's elements, a register's
-writes, a channel's contributions — since none of them is one value.
-
-Where the values establish **nothing** in common there is no such type, and the
-program is asked rather than guessed at. Collections are the usual case:
-`xs if c else ys` over two different lists is rejected, because the honest
-answers disagree — one keeps *both* possibilities and remembers which occurred,
-the other forgets which list it is and with it the length. Neither is a default,
-so the choice is written. `box` asks for the first:
-
-```
-box(xs) if c else box(ys)
-```
-
-is a value that carries **which branch it was**, and anything that works for
-both lists works on it. Annotating the result `List(T)` asks for the second.
-The same applies to scalars with nothing in common: `1 if c else "x"` is
-rejected, while `box(1) if c else box("x")` is accepted and is consumable by
-anything defined on both. `box` is [Planned] (§7.5).
-
-The point of carrying it is proof: `arr[0]` is only a *proven* lookup if `0`'s
-type says it is `0` and so lies inside `arr`'s index range (§3.9). Nothing else
-in the language observes it.
-
 > **Direction [Decided] — `true`/`false`.** The boolean literals are spelled
 > `True`/`False` today, the one exception to the capitalization rule above. They
 > are renamed to `true`/`false`, which is not yet implemented: a boolean literal
@@ -778,6 +750,9 @@ look up a missing key, etc. — see *Partiality*, §3) without making
 the ternary itself ill-defined. If the non-taken branch contains a feed
 or yield, that effect does not occur.
 
+The ternary's type is the join of its two branches — see
+[Joining the types of several values](#joining-the-types-of-several-values) (§6).
+
 Right-associative: `x if a else y if b else z` parses as
 `x if a else (y if b else z)`.
 
@@ -800,8 +775,9 @@ compile-time error.
 Feeds against a given target are visible to anything that consumes
 that target: a downstream comprehension iterating the stream, a sink
 that dispatches the stream to an HTTP response, etc. The stream's
-element type is the type of `value` (or the union of all feed-value
-types if multiple feeds target the same defer).
+element type is the type of `value`, or where several feeds target one
+defer, the join of their value types
+([Joining the types of several values](#joining-the-types-of-several-values)).
 
 The deferred collection a target accumulates is, like any CHL
 collection, **unordered** (§3): multiple `<<` statements — across
@@ -906,30 +882,29 @@ at `t.0`. Conversely `.` does not index a collection. The distinction
 is by *spelling*, not by whether the index happens to be a literal, so
 the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 
-> **Direction [Planned] — two lookup operators.** Under the collections model
-> (§6.3) subscript splits into two operators, distinguished by whether the type
-> system can *prove* the index is in range:
+> **Direction [Planned] — two lookup operators.** Subscript splits into two
+> operators, distinguished by whether the type system can prove the index is
+> present:
 >
-> - `c[k]` — **proven**, result `T`/`V`. The index must carry a refinement that
->   discharges membership: `{i | i < n}` for a range (an `Array`, a comprehension
->   index), `{k | k ∈ E}` for a keyed collection (a key drawn from iterating the
->   collection, or refined by an `in` guard — `if k in m: m[k]`). If presence
->   cannot be proven it is a **compile-time type error** pointing at `c[k]?` —
->   never a runtime failure.
-> - `c[k]?` — **optional**, result `Option(T)` (matched with `` `some(v) `` /
->   `` `none ``, §6.5, as in the north-star `txn_kv`). No prerequisite; always
+> - `c[k]` — the proven lookup, result `T`/`V`. The index's type has to say it is
+>   present: `{i | i < n}` for an `Array` or a comprehension index, membership in
+>   the collection's keys for a `Map` or `Set` — a key drawn from iterating the
+>   collection, or one refined by an `in` guard (`if k in m: m[k]`). Where presence
+>   cannot be proven this is a compile-time type error pointing at `c[k]?`, never a
+>   runtime failure.
+> - `c[k]?` — the optional lookup, result `Option(T)` (matched with `` `some(v) ``
+>   / `` `none ``, §6.5, as in the north-star `txn_kv`). No prerequisite; always
 >   well-defined.
 >
-> So `arr[i] : T` (static bound discharged) and `lst[i]? : Option(T)` (length
-> unknown) are the *same* operator pair on different proof outcomes; likewise
-> `m[k] : V` when `k ∈ E` is known versus `m[k]? : Option(V)` otherwise. A `Set`
-> has no subscript — its content is the domain; test it with `k in s` (below).
-> This eliminates the not-defined lookup cases above (see *Partiality*, §3). A
-> `FullMap` (§6.3) discharges every key by construction: its domain *is* the key
-> type, so `m[k]: V` needs no membership refinement. The discharge mechanic is
+> So `arr[i]: T` and `lst[i]?: Option(T)` are one operator pair on two proof
+> outcomes, as are `m[k]: V` for a key known present and `m[k]?: Option(V)`
+> otherwise. A `Set` has no subscript — its keys are its content, so test it with
+> `k in s` (below). A `FullMap` (§6.3) discharges every key by construction, so
+> `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
+> *Partiality*, §3). **Not yet implemented** — `c[k]` lowers as the lookup `c(k)`
+> today, but nothing discharges the index's membership, so a collection subscript is a
+> type error whatever the index. The discharge mechanic is
 > [collections.md, "Lookup: membership discharge"](../src/ccl/design/collections.md#lookup-membership-discharge).
-> **Not yet implemented** — today
-> subscript is integer-literal tuple projection only.
 
 ### 3.10 Lambda
 
@@ -1033,9 +1008,7 @@ is the unit type, written `{}` (§6.6). `[]` is the empty list.
 > §6.3 applied to inline literals); a *mutable* or *fed* map resolves
 > repeats by its merge law instead. `K` must be a key type (equatable);
 > that obligation is discharged through the same contextual-parameter
-> mechanism as `Ord` (§8). The lowering realizes a re-keying as a
-> group-by on the key projection (§7.2), so map/set literals reuse the
-> `groupby` machinery.
+> mechanism as `Ord` (§8).
 
 ### 3.12 Comprehensions
 
@@ -1093,8 +1066,8 @@ elements as inputs arrive.
 > binder: `for k -> v in m` (≡ `for (k, v) in m`), and likewise
 > `for k -> g in groupby(c, key)` — so the group-by rollup composes as
 > `[k -> agg(g) for k -> g in groupby(c, key)]` (the north-star
-> `storefront` `/stats`). The bare-group iteration `for g in
-> groupby(c, key)` (no key) remains valid.
+> `storefront` `/stats`). A single binder takes the whole entry rather than the
+> group (§4.6), so iterating the groups alone is `values(groupby(c, key))`.
 
 ### 3.13 `yield`
 
@@ -1185,16 +1158,17 @@ y: Option(Int) = `some(1)
 z: {`ok{Int} | `err{String}} = `err("nope")
 ```
 
-> **Direction [Tentative].** A variant type can be *written* but not yet
-> *named*: tags have no declaration site, so a misspelled tag is caught only
-> where it fails to meet its counterpart, and a constructor's payload arity is
-> not checked at the constructor. The planned refinement is the structural type
-> alias of §6.1 — `` Option(T) = {`some{T} | `none} ``,
-> `` Result(T) = {`ok{T} | `err{String}} `` — which gives a tag a resolution
-> site and checks the payload there. It would also replace the
-> built-in `Option(T)` above with a prelude definition. An alias is still
-> structural: it names a shape, so two aliases with the same tags are the same
-> type. Nominality is the separate `type` declaration direction (§6.1).
+**Variants are structural, so a constructor synthesizes its own type.** `` `sme(1) ``
+is the type ``{`sme{Int@1}}``, whatever the writer meant, and the payload type is
+whatever term sits in the parens. A tag mismatch is therefore reported where the
+constructor meets a counterpart that lacks the tag — an annotation, a `match` arm's
+expected type, a join — rather than at the constructor.
+
+> **Direction [Tentative].** The structural type alias of §6.7 —
+> `` Option(T) = {`some{T} | `none} ``, `` Result(T) = {`ok{T} | `err{String}} `` —
+> gives the arms a name to write, and would replace the built-in `Option(T)` above
+> with a prelude definition. An alias names a shape, so two aliases with the same
+> arms are the same type.
 
 ---
 
@@ -1883,7 +1857,8 @@ marked one carries its status per "How to read this document".)
   argument (§3.8): an n-parameter function's domain is the
   corresponding tuple type, and a keyword-argument function's domain
   is a record type — `{x: T, y: U} ⇒ V`. Surface syntax uses the `=>`
-  arrow.
+  arrow. Whether the function is a collection or a callable capability
+  is inferred, never written (§6.3).
 
 CHL also supports **refinement types**: a value of the refined type is
 a value of the base type for which a predicate holds. Refinements are
@@ -2122,133 +2097,110 @@ For ergonomics, an initialising `:=` alone marks a variable mutable
 (`total := 0`); a `Mut(_)` annotation is mandatory only where there is no
 initialiser — e.g. a `Mut` parameter (§4.3, §8.1).
 
-### 6.3 Direction: collections as functions [Decided]
+### Joining the types of several values
 
-The **organizing idea** (2026-06-29 §2), already showing through in
-§3.9: a collection is *represented* by a data function `Domain ⤇ Value`
-— a function whose domain is the data (an *extent*), distinguished in the
-checker from a capability function `Domain ⇒ Value` by its *kind*. That
-data function is the shared **representation**; `List`, `Array`, `Set`,
-`Map`, and `Collection` are **distinct kinds** over it, each with its own
-operations (`for`-in, `[]`, `in`, ordering). They are *not* interchangeable
-by shape — `Array(n,T)` and `List(T)` share the range representation,
-`Set(K)` and `Map(K,V)` the keyed representation, but each kind iterates
-and indexes differently, so the kind is a declared property that operations
-dispatch on (a future **trait** layer; §8) rather than something read back
-from the domain/codomain shape. *How* a kind is carried in the checker is
-**not yet decided** — today it is not carried at all, which is why the
-per-kind operations below are [Planned] and `for`-in currently binds the
-value for every kind. The design of record is
-[src/ccl/design/collections.md](../src/ccl/design/collections.md); the
-summary:
+Several constructs yield one of several values without saying which. Each is typed by
+the **join** of the values it could yield: the type that holds of all of them and says
+nothing more.
 
-- `Array(n, T)` — `[0, n) ⤇ T`: domain a static index range; ordered;
-  lookup `arr[i]: T` is total, the bound `{i | i < n}` statically
-  discharged.
-- `List(T)` — `Σ n. [0, n) ⤇ T`: a range whose length `n` is a runtime
-  witness; ordered; `lst[i]: Option(T)` (the bound is not statically
-  dischargeable).
-- `Set(K)` — `E ⤇ None`: a *keyed* extent `E` with trivial codomain —
-  the domain is the payload; membership `e in s` (§3.4).
-- `Map(K, V)` — `E ⤇ V`: a keyed extent; keys typed `{k: K | k ∈ E}`;
-  lookup `m[k]: Option(V)` in general and `: V` where `k ∈ E` discharges
-  (e.g. a key drawn from iterating the map's own entries), membership
-  `k in m`. `Dict(K, V)` is the surface spelling of this type.
-- `FullMap(K, V)` — `K ⤇ V`: the **total** map, which is `Map` whose
-  extent is all of `K`, so every key is present. Lookup is `m[k]: V` —
-  there is no missing case, so nothing to match (§3.9). A total map is
-  typically *earned* by refining the key type down to keys known to
-  exist, rather than by promising totality over an open type:
-  `FullMap({String where _ in ks}, Int)` is total because its domain
-  says which strings it holds (§6.4). That shifts "the lookup hits"
-  from a runtime invariant to an obligation on whatever constructs the
-  map. **[Open]**: precise semantics and limitations — starting with
-  what that construction-site obligation is (a literal must cover the
-  domain; a domain that grows must extend the map).
-- `Collection(T)` — `Σ D. D ⤇ T`: the whole domain is the Σ witness — the
-  domain type rides along in the value (retained, not sealed; a dependent sum,
-  not an existential). A domain-generic consumer holds it abstract.
+| Construct | The values joined |
+|---|---|
+| ternary `a if c else b` (§3.6) | the two branches |
+| `if`/`elif`/`else` used for a value (§4.5) | every branch, `else` included |
+| `match` (§4.10) | every arm's result |
+| a collection literal or comprehension (§3.11, §3.12) | the elements |
+| a mutable variable (§8.1) | every value written to it |
+| a feed (§3.7) | every contribution |
 
-The keyed extent of `Set`/`Map` and the runtime witness of `List` are
-the same new type-level idea — a **referenceable opaque extent**, the
-activation of the type checker's dormant Σ *witness*
-([type-inference §4.6](../src/ccl/design/type-inference.md)): an
-opaque, binder-named extent referenced by
-refinement predicates on its elements. `Σ` is the sum-of-witnesses case
-(control-flow joins); a single collection is the single-witness case.
-The earlier record encodings (`List(T) = {len: Nat, data: …}`, `Map(K,V)
-= {is_key, data}`) are **superseded** — they modeled as record data what
-the domain now expresses.
+The join keeps what every value establishes and drops the rest, so a refinement
+survives only where all of them carry it: `1 if c else 2` is `Int`, `5 if c else 5` is
+`Int@5` (§3.1), and `[5, 5]` has element type `Int@5` where `[5, 6]` has `Int`.
+
+**Where the values establish nothing in common there is no join, and the construct is
+a compile-time error.** `1 if c else "x"` is rejected rather than given some
+`Int`-or-`String` type, and the same holds for a `match` whose arms disagree or a
+mutable variable written at two unrelated types. Cambra has no anonymous union type to
+fall back on; to carry values of several types in one place, say which by tagging them
+— a variant (§6.5) if the tags are meaningful to the program, `box` (§7.5) if they
+are not.
+
+> **Direction [Planned] — joining two collections.** Two collections that are not the
+> same collection — `xs if c else ys` over lists of different length — establish
+> nothing in common either, because a collection's elements are indexed and the two
+> disagree about which indices exist. The two answers a program might want differ: one
+> keeps both possibilities and which occurred, the other forgets which collection it is
+> and with it the length. Neither is the default, so the program says which. `box` asks
+> for the first (§7.5); a `List(T)` or `Collection(T)` annotation asks for the second
+> (§6.3).
+
+### 6.3 Direction: collection types [Decided]
+
+CHL has five collection types, and they are distinct types rather than one type
+in different clothes: each has its own lookup, its own iteration element
+(§4.6), and its own answer to whether it is ordered. How they are represented,
+and how the checker carries the distinction, is
+[src/ccl/design/collections.md](../src/ccl/design/collections.md).
+
+- `Array(n, T)` — `n` values in order, `n` known at compile time. Lookup
+  `arr[i]: T` is total, because `i`'s type carries the bound `{i | i < n}`
+  (§3.9).
+- `List(T)` — values in order, count known only at runtime. `lst[i]?:
+  Option(T)`, since nothing bounds `i`.
+- `Set(K)` — distinct keys and no values. Membership is `k in s` (§3.4); there
+  is no subscript, because the keys are the content.
+- `Map(K, V)` — one value per key. `m[k]: V` where `k` is proven present,
+  `m[k]?: Option(V)` otherwise (§3.9); membership `k in m`. `Dict(K, V)` is a
+  second spelling of the same type.
+- `Collection(T)` — some collection of `T`, saying nothing about which. Every
+  other collection type widens to it.
+
+`FullMap(K, V)` is a `Map` that holds a value for every `K`, so `m[k]: V` needs
+no proof of presence. Totality is earned by refining the key type down to keys
+known to exist rather than by promising it over an open type:
+`FullMap({String where _ in ks}, Int)` is total because its domain says which
+strings it holds (§6.4). That makes "the lookup hits" an obligation on whatever
+builds the map. **[Open]**: what that obligation is — a literal must cover the
+domain, and a domain that grows must extend the map.
 
 Decided consequences:
 
-- **Two independent axes.** *Structure* — which collection is usable where
-  another is expected — is subtyping over the domain/codomain shape (a `List`
-  is-a `Collection`; details in [collections.md,
-  "Subtyping"](../src/ccl/design/collections.md#subtyping)). *Operations* — `for`-in
-  (§4.6), subscript `[]`/`[]?` (§3.9), membership `in`, ordering — are a separate
-  layer, chosen per collection kind (a future **trait** layer; built-in for now).
-  The two do not coincide: a `Set(K) = E ⤇ unit` is structurally a collection of
-  `unit`, but *iterates* its keys `K` — structure reads the codomain, operations
-  are their own layer.
-- **`Set` and `Map` are nominal types [Tentative].** All five collection kinds are
-  distinct types, but only this pair needs *naming* to be so: `Array`, `List` and
-  `Collection` differ in the shape of their domain, while `Set(K)` and `Map(K, unit)`
-  have the same structure (a function from a key domain, whose values are `unit` for one)
-  and differ only in which side of the arrow is the payload. So they are declared with
-  the **nominal** strength of a type declaration (§6.1) — distinct from every other type
-  of the same shape — which lands with nominal types.
-  Naming them changes nothing above them: both remain subtypes of `Collection`, since
-  widening to a collection forgets which kind it was. What it settles is only whether a
-  `Set(K)` may be used where a `Map(K, unit)` is expected, and vice versa — a question
-  their shared shape would otherwise answer by accident. Until then the two are
-  indistinguishable and `for`-in binds the codomain for every kind ([Interim]); see
-  [collections.md, "Two axes: representation vs kind [Decided direction; representation tentative]"](../src/ccl/design/collections.md#two-axes-representation-vs-kind-decided-direction-representation-tentative).
-- **Membership `in` [Planned].** `k in c` follows Python: for `Set`/`Map` it tests
-  **keys**, for `List`/`Array`/`Collection` it tests **values**. A key-membership
-  guard refines the key (`if k in m:` gives `k : {K | k ∈ E}`), which is the proof
-  the proven lookup `m[k] : V` needs (§3.9). Value/entry membership on a map is
-  `v in values(m)` / `(k -> v) in items(m)`.
-- **Keyed collections project to collections explicitly [Planned].** `keys(m) :
-  Collection(K)`, `values(m) : Collection(V)`, `items(m) : Collection((K, V))` —
-  there is no implicit "a map *is* a collection of its values"; `sum(values(m))`,
-  not `sum(m)`. What rejects `sum(m)` is the **iteration element**: a map iterates
-  `(K, V)` entries, and entries cannot be summed. A `Map <: Collection(V)` subtyping
-  edge does hold — `Collection` is the top of the collection lattice for every kind —
-  so the annotated form `sum(m : Collection(V))` is the way to ask for the values
-  without naming `values`. See [collections.md,
-  "Subtyping"](../src/ccl/design/collections.md#subtyping).
-- **Abstract collection types are entered explicitly [Planned].** `List(T)` and
-  `Collection(T)` mean "some collection of `T`" without saying which, so reaching one
-  *forgets* the specific domain — an array's length, a map's keys — and with it any
-  proven lookup (§3.9). That forgetting is written, not implicit: a literal or a
-  comprehension result is `box`ed (§7.5) to reach a `List(T)` or `Collection(T)`
-  annotation, while values that are already abstract — `List`, `Map`, `Set` — widen to
-  `Collection(T)` on their own. The reason to require it is the reason a conditional
-  over two different collections asks rather than guesses (§3.1): an implicit widening
-  would quietly turn every such conditional into a length-free collection, with
-  nothing in the program recording that a proof was given up.
-- **Ordering is derived from the domain, not stored.** `Array` and
-  `List` are *ordered* because their domain is a range (a sequencing
-  domain, totally ordered by construction); `Set`, `Map`, and
-  `Collection` are unordered, and an order-dependent operation over them
-  takes an ordering explicitly as a **given** instance (§8) rather than
-  fabricating one. `for`-in is unordered/parallel by default (§4.6); a
-  loop-carried accumulator forces sequential order, and a non-commutative fold
-  over an unordered source needs an `Ord` given.
-- Arrays, lists, and sets share literal syntax; the type comes from
-  annotation or usage, with `list([…])` / `set([…])` constructors for
-  explicitness (the north-star `reachability` uses `set(…)`).
-- Out-of-line definition of immutable collections: element-wise
-  dereference-definition `c[i] = v` — with the compiler checking that
-  multiple out-of-line definitions of the same collection don't
-  overlap — and append via the feed operator `c << v` (a *keyed feed*
-  when the target is a map/set; see §3.7 and the collections design);
-  `c[i] := v` for mutable collections.
-- Immutable collections as the encouraged default; mutable collections
-  are the keyed generalization of a `Mut(…)` register whose value type
-  is a collection (`store[k] := v`), and get the standard mutation
-  operations.
+- **Ordering follows from the type and is not stored.** `Array` and `List` are
+  ordered; `Set`, `Map`, and `Collection` are not. An order-dependent operation
+  over an unordered collection takes its ordering explicitly as a `given`
+  instance (§8) rather than inheriting whatever order the runtime happened to
+  store. `for`-in is unordered and parallel by default (§4.6); a loop-carried
+  accumulator forces sequential order, and a non-commutative fold over an
+  unordered collection needs an `Ord` given.
+- **Membership `in` follows Python [Planned].** `k in c` tests keys for `Set`
+  and `Map`, values for `List`, `Array`, and `Collection`. A key-membership
+  guard refines the key, which is what makes `if k in m: m[k]` a proven lookup
+  (§3.9). A map's values and entries are tested through `values(m)` and
+  `items(m)`.
+- **A map's keys, values, and entries are named, not implied [Planned].**
+  `keys(m): Collection(K)`, `values(m): Collection(V)`, `items(m):
+  Collection((K, V))`. `sum(m)` is an error, because a map iterates entries
+  (§4.6) and entries cannot be summed; `sum(values(m))` is how to say it.
+- **`Set(K)` and `Map(K, unit)` are distinct types [Tentative].** The two carry
+  the same information and differ only in which side of the pair is the payload,
+  so the distinction is declared rather than read off the shape, and it lands
+  with nominal types (§6.1). Both widen to `Collection`.
+- **Widening to `List(T)` or `Collection(T)` is written.** Those types say nothing
+  about the domain, so reaching one forgets what the collection knew — an array's
+  length, a map's keys — and with it any proven lookup (§3.9). A literal or a
+  comprehension result is therefore `box`ed (§7.5) to reach such an annotation,
+  while a `List`, `Map`, or `Set` widens to `Collection(T)` on its own.
+- **Literal syntax is shared.** Arrays, lists, and sets are written with the
+  same literal (§3.11) and the type comes from annotation or usage, with
+  `list([…])` / `set([…])` / `map([…])` constructors for explicitness (the
+  north-star `reachability` uses `set(…)`).
+- **Out-of-line definition.** An immutable collection can be defined
+  element-wise, `c[i] = v`, with the compiler checking that multiple
+  definitions of one collection do not overlap; append is the feed operator
+  `c << v` (§3.7). A mutable collection is written `c[i] := v`.
+- **A mutable collection is a keyed register.** It is the keyed generalization
+  of a `Mut(…)` register whose value is a collection (§8.1) — `store[k] := v`
+  writes one key — and it gets the standard mutation operations. Immutable
+  collections remain the encouraged default.
 
 ### 6.4 Refinement syntax
 
@@ -2538,8 +2490,9 @@ what `groupby` is primarily designed to support.
 > [key -> sum([o.price for o in g]) for key -> g in groupby(paid, \o -> o.sku)]
 > ```
 >
-> (the north-star `storefront` `/stats` rollup). The bare-group form
-> `for g in groupby(…)` (no key) remains valid.
+> (the north-star `storefront` `/stats` rollup). A single binder takes the whole
+> entry rather than the group (§4.6), so `for g in values(groupby(…))` is how to
+> iterate the groups alone — which is what the unkeyed form above does today.
 
 ### 7.3 `defer`
 
@@ -2643,58 +2596,58 @@ unique across the program.
 
 ---
 
-### 7.5 `box` [Planned]
+### 7.5 `box`
 
 ```
 box(x)
 ```
 
-Makes a value carry **which of several possibilities it is**. `box(x)` on its
-own says nothing new and can be used exactly as `x` can; its purpose is what
-happens when two boxed values meet, which is where a plain value would have no
-type at all (§3.1):
+Pairs `x` with **which type it is**, giving a value that carries its own type alongside
+it. A consumer defined on every alternative unboxes implicitly, so `box(x)` is usable
+wherever `x` is; what the pair buys is the join, which keeps both types as alternatives
+instead of looking for one type that covers both
+([Joining the types of several values](#joining-the-types-of-several-values)).
 
 ```python
 counts = box([1, 2, 3]) if detailed else box([10])
 sum(counts)                     # fine — works for either list
 ```
 
-The result remembers both possibilities *and* which one occurred, so nothing is
-lost and no length is invented. Consuming it requires an operation defined on
-every possibility — `sum` is, so the example works; an operation valid for only
-one of them is a compile-time error rather than a runtime one.
+`counts` holds one of the two lists and which one it is, so no length is invented and
+nothing is dropped. `sum` is defined on both alternatives, so it consumes `counts`
+directly; an operation valid for only one is a compile-time error rather than a runtime
+one. Where the alternatives are the same type there is one alternative, and
+`box(xs) if c else box(xs)` is `xs`.
 
-Boxing is only ever needed where the possibilities genuinely differ. Where they
-agree, `box` changes nothing: `box(xs) if c else box(xs)` is just `xs`.
+`box` is **idempotent** — `box(box(x))` is `box(x)` — because the pair already records
+which type the value is, so pairing it again records the same thing. A program may
+therefore box freely without tracking whether a value arrived boxed.
 
-`box` is **idempotent**: `box(box(x))` is `box(x)`. A boxed value already carries
-which possibility it is, and boxing it again asks the same question of one
-answer, so a program may box freely without tracking whether a value came to it
-boxed.
+The alternatives are anonymous: the pair records the types themselves, not names chosen
+by the program. Where the choice is meaningful to the reader, a variant (§6.5) names its
+arms and `match` dispatches on them; `box` is for the case where the alternatives need
+no names.
 
-**Box the value that meets, not one inside it.** Branches meet at the
-conditional, so that is where the `box` belongs:
+**Box each branch's result, not something inside it.**
 
 ```python
 box([y for y in xs if y > 1]) if c else box(ys)              # ✅
 [y for y in box(xs) if y > 1] if c else [z for z in box(ys)]  # ❌
 ```
 
-Both spellings box something, and only the first boxes the values that meet.
-Filtering a collection gives a collection over a **narrower domain**, so the
-second spelling's branches are a filtered collection and an unfiltered one —
-still two different domains, which is the thing `box` is needed for and which
-boxing further in does not address. The error names the domains.
+Both spellings box something, and both branches of the second are boxed values — a
+comprehension over a boxed collection is boxed in turn, over the same alternatives. What
+separates them is where the **filter** sits. Boxed inside, the filter is part of the
+alternative that branch records, and the two branches join. Boxed outside, the filter
+applies to whichever alternative was taken and so is not part of any of them, and two
+such values do not join. Dropping the filter makes the second spelling type-check, which
+is what identifies it as the cause.
 
-Two boxed collections meet when the only difference between them is which domain
-each is over. That is why boxing each branch's *result* works: the filter is
-then part of the domain that branch remembers, and remembering the domain is
-what `box` does.
-
-Writing an abstract collection type is the other way to make branches meet — a
-value must be boxed to reach a `List(T)` or `Collection(T)` annotation (§6.3),
-which keeps the elements but forgets which collection it was, and with it any
-proven lookup (§3.9).
+**An abstract collection type needs `box` too.** `List(T)` and `Collection(T)` say
+nothing about which collection they are, so a value reaches one only by being boxed:
+`x: List(Int) = box([1, 2, 3])` binds, and `x: List(Int) = [1, 2, 3]` is an error. That
+is the same requirement as above rather than an alternative to it — the annotation keeps
+the elements and forgets which collection it was, and with it any proven lookup (§3.9).
 
 ## 8. Mutability, transactions, and feeds
 
@@ -3151,12 +3104,6 @@ with parser-level support that lowering rejects:
   predicate. Function contracts are written either as those annotations or as
   `assert`s lifted to refinements (**[Decided]**, §6) — `assert` is likewise not
   yet a statement.
-- **Named variant types** — a tag has no declaration site, so a misspelled tag
-  is caught only where it fails to meet its counterpart, and a constructor's
-  payload arity is not checked at the constructor. The structural type alias
-  (`` Option(T) = {`some{T} | `none} ``) is the planned resolution site, and
-  would replace the built-in `Option(T)` with a prelude definition
-  (**[Tentative]**, §3.15, §6.1).
 - **Pattern matching** beyond a `match` arm's single tag — `match` / `case`
   tag dispatch over a variant is implemented (§4.10), but patterns are
   shallow: no nesting, no literal patterns, and no per-arm guard. `match` is a

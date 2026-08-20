@@ -743,24 +743,6 @@ pub fn refined_data_fun(base_domain: Type, predicate: Expr, codomain: Type) -> T
     )
 }
 
-/// Peel the outer [`Type::Refinement`] wrappers off `ty`, exposing its head
-/// constructor and leaving everything nested inside untouched.
-///
-/// This is the peel to reach for when *dispatching* on a type's shape — asking
-/// "is this a function? a sum?" of a type that may be wrapped in refinements.
-/// [`strip_refinements`] is the wrong tool there and the difference is not
-/// cosmetic: it erases refinements at every depth, including a Σ's candidate
-/// domains, and a candidate's refinement is the program's filter. Reading a
-/// domain out of a deep-stripped copy silently drops that filter, and with it
-/// the `Restrict` it would have compiled to.
-pub(crate) fn peel_refinements(ty: &Type) -> &Type {
-    let mut t = ty;
-    while let Type::Refinement(inner, _) = t {
-        t = inner;
-    }
-    t
-}
-
 /// A structural copy of `ty` with every [`Type::Refinement`] layer removed,
 /// at any depth (inside tuples / records / function types).  Used to compare
 /// domains up to refinements (which are transparent to structural shape) —
@@ -1665,16 +1647,5 @@ mod tests {
             "a collection composed with an element map is still a collection, got {}",
             composed.ty
         );
-    }
-
-    /// The dispatch peel reaches the head and stops. Anything nested — a candidate's
-    /// filter above all — is what the caller is about to read, so it must survive.
-    #[test]
-    fn peel_refinements_stops_at_the_head() {
-        let inner = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
-            refined(Type::UIntRange(3), "p"),
-        ]))));
-        let wrapped = refined(refined(inner.clone(), "q"), "r");
-        assert_eq!(peel_refinements(&wrapped), &inner);
     }
 }

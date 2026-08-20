@@ -44,8 +44,7 @@ use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
     apply_primitive, cast_target_refinement, flatten_trailing_value_case, is_free,
-    is_free_in_value, peel_refinements, refine_with, strip_refinements, synthesize_arm_predicate,
-    typed_compose,
+    is_free_in_value, refine_with, strip_refinements, synthesize_arm_predicate, typed_compose,
 };
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
@@ -318,7 +317,7 @@ fn extract_filter_case(body: Expr) -> (Expr, Expr) {
 /// whose arms are collections takes the data-typed gate fan-out; a `Case`
 /// returning a scalar / compute value takes the C-form below.
 fn is_collection_result(ty: &Type) -> bool {
-    matches!(peel_refinements(ty), Type::Fun { .. } | Type::Sigma(_))
+    matches!(ty.peel_refinements(), Type::Fun { .. } | Type::Sigma(_))
 }
 
 /// Compile a guard-based **value-selecting** `Case` (a ternary or `if`/`elif`/

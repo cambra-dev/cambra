@@ -17,14 +17,16 @@
 //! (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
 //!
 //! Only a **listing** witness kind can be realized here: the legs are the candidates, so
-//! there have to be finitely many, named. A described kind (`Collection(𝑇)`, `List(𝑇)`)
-//! reaches op-conversion still a Σ, and fails there — which is the correct signal, since
-//! that is the case needing a runtime witness rather than a static realization
-//! (`src/ccl/design/collections.md`, "Future work").
+//! there have to be finitely many, named. A described kind (`Collection(𝑇)`, `List(𝑇)`) is
+//! left alone, and ordinary code over one still compiles because inlining and
+//! monomorphization resolve its domain from the concrete producer before op-conversion. A
+//! described Σ that reaches op-conversion with no concrete domain fails there, which is the
+//! correct signal: that is the case needing a runtime witness rather than a static
+//! realization (`src/ccl/design/collections.md`, "Future work").
 
 use crate::ccl::ccl_utils::{
-    PredMemo, apply_primitive, flatten_trailing_value_case, make_cast, peel_refinements,
-    refine_with, synthesize_arm_predicate, walk_refined_predicates, walk_refined_predicates_mut,
+    PredMemo, apply_primitive, flatten_trailing_value_case, make_cast, refine_with,
+    synthesize_arm_predicate, walk_refined_predicates, walk_refined_predicates_mut,
 };
 use crate::ccl::{
     BaseType, BinOpKind, Builtin, Expr, FieldKey, LogicKind, Type, TypedExprNode, lambda_elim,
@@ -50,7 +52,7 @@ pub(super) fn realize_conditional_collections(
     // witness stands for a domain that is *known* — and applied to exactly the binders it
     // erased. That last part is what keeps a **realized** sum out of it: realization
     // consumes its arms' boxes without recording them, because the union it built has a
-    // `Variant` domain and `Realize` asserts the sum over it deliberately. A same-domain
+    // `Variant` domain, and `Realize` asserts the sum over it. A same-domain
     // conditional is the case that proves the distinction is needed — one candidate, two
     // legs — and instantiating its assertion breaks it.
     if !erased.is_empty() {
@@ -405,7 +407,7 @@ fn mentions_witness(ty: &Type, binder: crate::ccl::infer_var::WitnessBinderId) -
 }
 
 fn restriction_on_a_witness(ty: &Type) -> Option<(crate::ccl::infer_var::WitnessBinderId, Owed)> {
-    let Type::Sigma(sum) = peel_refinements(ty) else {
+    let Type::Sigma(sum) = ty.peel_refinements() else {
         return None;
     };
     let Type::Refinement(base, restriction) = sum.body.domain()? else {
@@ -436,9 +438,9 @@ fn restriction_on_a_witness(ty: &Type) -> Option<(crate::ccl::infer_var::Witness
 /// the binder off only the `Σ` silently skips the discharge on the composed shape and
 /// leaves the site's filter uncompiled.
 fn witness_named_by(ty: &Type) -> Option<crate::ccl::infer_var::WitnessBinderId> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::Sigma(sum) => Some(sum.binder()),
-        other => match peel_refinements(&other.domain()?) {
+        other => match (other.domain()?).peel_refinements() {
             Type::WitnessRef(w) => Some(*w),
             _ => None,
         },
@@ -499,7 +501,7 @@ fn read_the_arm_instead(
     // sum itself, or — once lambda elimination has opened it — the **arrow view** `𝑤 ⤇ 𝑉`,
     // which is a `Fun` whose domain is the witness. Matching only the constructor misses
     // the case that actually occurs.
-    let names_this_sum = match peel_refinements(&predicate.ty) {
+    let names_this_sum = match predicate.ty.peel_refinements() {
         // **By candidate list, not by binder.** The predicate holds its *own copy* of the
         // source, and that copy carries a **different** witness binder than the site's sum
         // — measured. The two print identically (`σ` names no binder) and compare unequal,
@@ -517,12 +519,12 @@ fn read_the_arm_instead(
         // `𝑤 ⤇ 𝑉` — a `Fun` on the witness, with no candidate list left to compare, so the
         // binder is all there is.
         other => matches!(
-            other.domain().map(|d| peel_refinements(&d).clone()),
+            other.domain().map(|d| d.peel_refinements().clone()),
             Some(Type::WitnessRef(w)) if w == binder
         ),
     };
     if names_this_sum {
-        if let Type::Sigma(s) = peel_refinements(&predicate.ty) {
+        if let Type::Sigma(s) = predicate.ty.peel_refinements() {
             copies.insert(s.binder());
         }
         return arm.clone();
@@ -546,41 +548,28 @@ fn is_value_case(expr: &Expr) -> bool {
 
 /// Realize the conditional collections a site chooses between, as its gated union.
 ///
-/// **Where the union goes.** It is an iteration *source*: each leg carries a refined domain
-/// that [`super::iterate::wrap_with_iterate`] turns into `iterate ▷ (π̂ᵢ ▷ restrict) ≫ armᵢ`.
-/// So it has to sit where a source belongs — at the head of the pipeline consuming it. That
-/// is the node whose type carries the choice, which is the outermost `Σ` binding the witness:
-/// rewriting the `Case` in place puts the union at the head only when the conditional is the
-/// sole generator, and with a second the head moves above it to the product iterate, where a
-/// source stranded mid-chain is what op-conversion rejects (`zip requires an input operator`).
-/// The chain between site and `Case` is copied into every leg — under leg `i` the conditional
-/// *is* `armᵢ` and the witness *is* that arm's domain, so a leg is that substitution made
-/// everywhere at once, including in the filter predicates that hold their own read of the
-/// source. That is also what discharges a consuming site's restriction: inside the leg the
-/// fact is *sayable*, a predicate being allowed to hold a plain arm but not a gated union.
+/// The design is `src/ccl/design/collections.md`, "Realizing a conditional collection".
+/// What this function decides:
 ///
-/// **All of the site's witnesses at once.** Two conditional generators nest two sums over one
-/// product domain — `Σ σ₄ ∈ 𝐾₄. Σ σ₇ ∈ 𝐾₇. ((σ₄, σ₇) ⤇ 𝑉)` — and that is one site with two
-/// choices on it, not a site inside a site. Realizing them one at a time nests the unions, and
-/// a nested union is wrong in the *term*, not just in the type it records: an outer leg's gate
-/// is carried as a refinement on its domain, and the term-level `restrict` is emitted only
-/// where that domain heads an iteration. Wrapping the inner union — which is not an iteration
-/// site — silently drops the outer gate, leaving two legs live at once where exactly one may
-/// be. So the legs are the **combinations**: one per tuple of arms, gated by the conjunction of
-/// their path conditions, indexed by the product of their arms' domains. That is the same
-/// finite-Σ ≡ gated-union isomorphism, stated for a product of witnesses rather than for one —
-/// and it is flat, which is what the term already is, since [`Expr::collection_union`] flattens.
+/// - **Where the union goes.** It is an iteration *source*, so it belongs at the head of
+///   the pipeline consuming it — the outermost `Σ` binding the witness, not the `Case`.
+///   Rewriting the `Case` in place puts it at the head only for a sole generator; with a
+///   second the head is the product iterate above it, and a source stranded mid-chain is
+///   what op-conversion rejects (`zip requires an input operator`). The chain between site
+///   and `Case` is copied into every leg, filter predicates included, since they hold
+///   their own read of the source.
+/// - **Every witness of the site at once**, so the legs are the tuples of arms, gated by
+///   the conjunction of their path conditions and indexed by the product of their domains.
+///   One at a time would nest the unions, and the term-level `restrict` is emitted only
+///   where a domain heads an iteration, so an inner union drops the outer gate.
+/// - **A witness-free conditional is realized at the `Case` itself**, the degenerate case:
+///   one choice, and substituting the arm for the conditional leaves the arm. Nothing above
+///   changes, so no [`TypedExprNode::Realize`] asserts anything.
 ///
-/// **A conditional with no witness is realized at itself**, and can be nowhere else: arms over
-/// one domain type as a plain collection, so no enclosing type mentions the choice and there is
-/// no binder to find it by. It is the degenerate case rather than a second algorithm — one
-/// choice, the site *is* the `Case`, and substituting the arm for the conditional leaves the
-/// arm. Nothing above changes, so no [`TypedExprNode::Realize`] asserts anything.
-///
-/// Returns whether this node was realized — load-bearing, not bookkeeping: a `Case` inside a
-/// **refinement predicate** is rewritten through [`PredMemo::rebuild`], which *discards* the
-/// rewrite when the caller reports no change. A realization that forgot to report would be
-/// silently undone, leaving an unrealized `Case` in a predicate for op-conversion to reject.
+/// Returns whether this node was realized, which is load-bearing rather than bookkeeping: a
+/// `Case` inside a **refinement predicate** is rewritten through [`PredMemo::rebuild`],
+/// which *discards* the rewrite when the caller reports no change. A realization that
+/// forgot to report would be silently undone.
 fn realize(
     expr: &mut Expr,
     discharged: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
@@ -704,7 +693,7 @@ fn realize(
     // Every witness of the site is instantiated in its legs, so the union is a plain data
     // function over the flat `Variant` of their domains — no binder is left for it to carry.
     debug_assert!(
-        !matches!(peel_refinements(&legs[0].ty), Type::Sigma(_)),
+        !matches!(legs[0].ty.peel_refinements(), Type::Sigma(_)),
         "a realized leg quantifies a witness the site did not name"
     );
     // **Which union, decided by whether the site names a witness.** A site that does is a
@@ -868,8 +857,8 @@ fn witnesses_named_by(
     crate::ccl::ty::TypeKind,
 )> {
     let mut out = Vec::new();
-    let mut cursor = peel_refinements(ty).clone();
-    while let Type::Sigma(sum) = peel_refinements(&cursor).clone() {
+    let mut cursor = ty.peel_refinements().clone();
+    while let Type::Sigma(sum) = cursor.peel_refinements().clone() {
         out.push((sum.binder(), sum.kind().clone()));
         cursor = (*sum.body).clone();
     }
@@ -927,7 +916,7 @@ fn replace_the_conditional(
 /// The shared element type of a collection-valued `Case`, or `None` when the `Case` is
 /// not collection-valued (a scalar one, which `lambda_elim`'s C-form already handled).
 fn collection_value_ty(ty: &Type) -> Option<Type> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::Fun { codomain, .. } => Some(codomain.as_ref().clone()),
         Type::Sigma(s) => match &*s.body {
             // A sum inside a sum — two conditional sources — carries its element type under
@@ -969,9 +958,9 @@ fn collection_value_ty(ty: &Type) -> Option<Type> {
 /// the head — never [`strip_refinements`](crate::ccl::ccl_utils), which erases at depth
 /// and so reaches inside the sum's candidates — is what keeps them.
 fn arm_domain(ty: &Type) -> Option<Type> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::Sigma(s) => match s.kind().listed() {
-            Some([sole]) => peel_refinements(&s.instantiate_body(sole)).domain(),
+            Some([sole]) => (s.instantiate_body(sole)).peel_refinements().domain(),
             _ => None,
         },
         other => other.domain(),
@@ -1006,7 +995,7 @@ fn unbox(
     // and its argument carry the same type and no witness is being erased — nothing is
     // recorded, and `instantiate_erased_witnesses` must not touch a binder that is still
     // live in the argument.
-    if matches!(peel_refinements(&argument.ty), Type::Sigma(_)) {
+    if matches!(argument.ty.peel_refinements(), Type::Sigma(_)) {
         return ((**argument).clone(), true);
     }
     // **The introduction's stated type, because only a binding position carries the kind.**
@@ -1019,7 +1008,7 @@ fn unbox(
     match stated.witness_kind() {
         Some(kind) if matches!(kind.listed(), Some([_])) => {
             if let Some(erased) = erased
-                && let Type::Sigma(s) = peel_refinements(&stated)
+                && let Type::Sigma(s) = stated.peel_refinements()
             {
                 erased.insert(s.binder());
             }
@@ -1048,7 +1037,7 @@ mod tests {
     /// load-bearing: erasing without reporting leaves the original predicate in place, and
     /// a `box` reaches op-conversion, which has no arm for it.
     ///
-    /// A `Case` in the same position is deliberately *not* realized — the gated union it
+    /// A `Case` in the same position is *not* realized — the gated union it
     /// would become needs `iterate`/`restrict`, which a predicate may not carry
     /// (`debug_assert_no_iteration_markers_in_type`). The per-leg discharge replaces it with
     /// a plain arm instead. Both halves are asserted here, since they are one decision.

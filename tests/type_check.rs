@@ -1624,7 +1624,7 @@ fn test_source_list_comp_element_type() {
 /// *computed* (a comprehension), its domain is an inference variable at emit time and
 /// has no shape to read, so the requirement is recorded as a **kinding constraint** on
 /// that variable and discharged when its position resolves. See
-/// `src/ccl/design/collections.md`, "Injecting a domain that has no shape yet".
+/// `src/ccl/design/collections.md`, "Entering a collection type whose domain has no shape yet".
 #[test]
 fn test_comprehension_enters_a_list_annotation() {
     // The comprehension's domain resolves to `[0, 3)` — a range — which realizes
@@ -4438,7 +4438,7 @@ sum([x + y for x in a for y in b])",
 /// is, so the only thing it may quantify is a collection. A witness reference, or a record
 /// of them — the index a two-generator comprehension is applied at — is a position *inside*
 /// that collection's scope, and closing one fabricates `Σ 𝐷 ∈ 𝐾. 𝐷`: a type standing in for
-/// what is a variable (`src/ccl/design/type-inference.md`, "Why a name, and not a type").
+/// what is a variable (`src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness").
 ///
 /// The two-generator index is the shape that exposes it, because the rule that keeps an
 /// index open recognised a *bare* witness and an index record is not one. The damage is

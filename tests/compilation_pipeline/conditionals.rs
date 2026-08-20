@@ -672,7 +672,7 @@ fn a_conditional_source_compiles_however_it_reaches_the_generator(
 ///
 /// Realization can. Inside leg `i` the conditional *is* `armᵢ`, so the leg is gated twice —
 /// by its first-match path condition and by `𝑝` rewritten to read that arm
-/// (`src/ccl/design/collections.md`, "Realization notes"). The determined case is the
+/// (`src/ccl/design/collections.md`, "Realizing a conditional collection"). The determined case is the
 /// conditional-free one, where `unbox` erases the witness instead and the ordinary
 /// iterate-then-restricts chain compiles the filter (`sums.rs`,
 /// `a_filter_over_a_boxed_source_is_applied`).

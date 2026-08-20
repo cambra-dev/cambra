@@ -128,10 +128,10 @@ pub enum KindMerge {
     ///
     /// Separate from [`Conflict`](Self::Conflict) because they are different facts and
     /// want different diagnostics — one says "box these arms", the other "this is a
-    /// function, not a collection". Coalesce used to tell them apart by asking whether the
-    /// merged kind named more than one domain, which reads the *shape* of the answer
-    /// rather than the reason for it, and mis-reported the moment a second producer
-    /// existed whose candidates could deduplicate to one.
+    /// function, not a collection". Telling them apart by asking whether the merged kind
+    /// names more than one domain reads the *shape* of the answer rather than the reason
+    /// for it, and mis-reports as soon as a second producer's candidates deduplicate to
+    /// one.
     DomainConflict,
 }
 
@@ -326,7 +326,7 @@ pub struct CompactSigma {
 }
 
 impl CompactSigma {
-    /// No `fresh` counterpart, deliberately: **no sum is born at the compact level.**
+    /// No `fresh` counterpart: **no sum is born at the compact level.**
     /// Every one either enters the carrier from a [`crate::ccl::Type`] (this constructor),
     /// or is derived from one already here — [`rebuild`](Self::rebuild),
     /// [`alpha_convert`](Self::alpha_convert). Origination is a `Type`-level act

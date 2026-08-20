@@ -131,7 +131,7 @@ pub fn clear_witness_ctx() {
 /// being it: an index (`𝜎`), a record of indices (`(𝜎₁, 𝜎₂)`, what two generators build),
 /// a compute morphism between them (a projection, a zip). Closing one of those fabricates
 /// `Σ 𝐷 ∈ 𝐾. 𝐷` where a domain belongs — a type standing in for what is a variable, which
-/// this design rejects (`src/ccl/design/type-inference.md`, "Why a name, and not a type").
+/// this design rejects (`src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness").
 /// They stay references to the binder their enclosing collection introduces, exactly as a
 /// Pi binder's occurrences refer to the lambda that bound them.
 ///

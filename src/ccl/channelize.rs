@@ -114,7 +114,7 @@ use crate::ccl::ccl_utils::make_cast;
 use crate::ccl::{
     BaseType, Branch, Expr, HistoryKind, Lit, Name, Pattern, Refinement, Type, TypedBinding,
     TypedExpr, TypedExprNode,
-    ccl_utils::{count_free, peel_refinements, synthesize_arm_predicate, typed_compose},
+    ccl_utils::{count_free, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
 };
 
@@ -603,12 +603,12 @@ pub fn run(expr: Expr) -> Result<Expr, DeferError> {
 /// per-instantiation, freshened at `specialize_use`), so channel recording
 /// and lift-alias entries key on it, never on the term name.
 fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::History {
             domain,
             kind: HistoryKind::Append,
             ..
-        } => match peel_refinements(domain) {
+        } => match domain.peel_refinements() {
             Type::ChanDom(n, l) => Some((n.clone(), *l)),
             _ => None,
         },
@@ -621,7 +621,7 @@ fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
 /// is itself a defer read (`x <<= y` leaves `Var(y) : feed(…)`), the read's
 /// handle domain (a `ChanDom` closed later by [`close_chan_domains`]).
 fn channel_domain_of(ty: &Type) -> Option<Type> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
         Type::History {
             domain,
@@ -783,7 +783,7 @@ fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
 /// a read prefix (a nested generator's inner channel block) types at
 /// construction instead of leaving a `Hole` for a re-derivation pass.
 fn fun_codomain(ty: &Type) -> Option<Type> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::Fun { codomain, .. } => Some((**codomain).clone()),
         Type::History {
             value,
@@ -797,7 +797,7 @@ fn fun_codomain(ty: &Type) -> Option<Type> {
 /// The domain of `ty` viewed as a function, peeling outer refinements.
 /// See [`fun_codomain`] for the feed-history stream view.
 fn fun_domain(ty: &Type) -> Option<Type> {
-    match peel_refinements(ty) {
+    match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
         Type::History {
             domain,
@@ -1883,7 +1883,7 @@ fn copair_type(feeds: &[Expr]) -> Type {
     let mut tags: Vec<(crate::ccl::FieldKey, Type)> = Vec::with_capacity(feeds.len());
     let mut cod: Option<Type> = None;
     for (i, f) in feeds.iter().enumerate() {
-        match peel_refinements(&f.ty) {
+        match f.ty.peel_refinements() {
             Type::Fun {
                 domain, codomain, ..
             } => {
