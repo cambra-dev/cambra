@@ -2624,21 +2624,21 @@ correct.
   the arm catches a disagreement already present when the edge is drawn; a pin that
   lands on one side afterwards is outside what it can see.
 
-- **A comprehension over *two* conditional collections does not compile**, though it types
-  and keeps the witnesses apart (`two_conditional_sources_keep_their_witnesses_apart`).
-  Pinned by the ignored `two_conditional_sources_compile`.
+- **A comprehension over two conditional collections compiles when the conditionals are
+  written *inline*, and not when they are `let`-bound.** Inline is pinned by
+  `two_conditional_sources_compile`, across all four `(c, d)` assignments; the witnesses stay
+  apart either way (`two_conditional_sources_keep_their_witnesses_apart`).
 
-  The blocker today, measured: a candidate domain meets a **bound** witness at a subtyping
-  edge (`[0, 1] <: 𝜎`), where `constrain_go` has `unreachable!` — relating a candidate to a
-  witness is the `𝑒 = 𝑑` reading of Σ-width rather than the rule. Two witnesses in scope at
-  once is what produces the edge, since a pairing search tries one source's candidate
-  against the other's witness, and what the rule should say there is not settled.
+  The `let`-bound blocker today, measured: op-conversion reports `zip requires an input
+  operator`. Realization builds the union around the outermost node binding the witness and
+  copies the intervening chain into each leg, and a binding is what puts the product iterate
+  outside the copied region, so the legs reach `zip` with no source at their head.
 
-  This entry previously said the blocker was realization emitting a copair where it meant a
-  disjoint join. That was a fourth wrong diagnosis of the same test: it was derived from the
-  model rather than from a run, and it did not survive the witness-identity work — the
-  failure has since moved through a sum in a domain position reaching `extent_of`, a free witness on the
-  index, and an unresolved variable. Per the method note above, re-measure before replacing
+  The blocker has been misdiagnosed five times, each diagnosis derived from the model rather
+  than from a run: a copair emitted where a disjoint join was meant, a sum in a domain
+  position reaching `extent_of`, a free witness on the index, an unresolved variable, and a
+  candidate meeting a bound witness at `[0, 1] <: 𝜎`. The fifth outlived the inline case it
+  described, which by then compiled. Per the method note above, re-measure before replacing
   the sentence above with a new one.
 
   Realizing a conditional collection also changes a subterm's type, and *chasing every

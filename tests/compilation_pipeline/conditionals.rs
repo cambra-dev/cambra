@@ -661,29 +661,26 @@ fn a_conditional_source_compiles_however_it_reaches_the_generator(
     check_scalar(code, expected);
 }
 
-/// **A comprehension filter over a conditional source is not emitted yet.**
+/// **A comprehension filter over a conditional source, discharged per leg.**
 ///
-/// The conditional-free half of this now works (`sums.rs`,
-/// `a_filter_over_a_boxed_source_is_applied`): a **determined** witness — one candidate — is
-/// erased by `unbox` in the term and instantiated in the types, so the consuming site is left
-/// with an ordinary refined domain and the existing iterate-then-restricts chain compiles it.
+/// The witness here is *not* determined, so nothing erases it: the sum has two or more
+/// candidates (or one candidate over two realized legs — the same-domain pair below), and the
+/// site's domain stays `{𝜎 | 𝑝}` with 𝜎 a real witness. The comprehension types as
+/// `Σ 𝜎 ∈ {[0, 1], [0, 2]}. ({𝜎 | 𝑝} ⤇ Int)`, the restriction riding the witness exactly as
+/// `src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness" says — a fact
+/// about whichever domain the witness turns out to name, which the site can do nothing with.
 ///
-/// These are the cases where the witness is *not* determined, so nothing erases it. The sum
-/// has two or more candidates (or one candidate over two realized legs — the same-domain
-/// pair below), and the site's domain stays `{𝜎 | 𝑝}` with 𝜎 a real witness. Inference is
-/// right throughout; the comprehension types as
-/// `Σ 𝜎 ∈ {[0, 1], [0, 2]}. ({𝜎 | 𝑝} ⤇ Int)`,
-/// the restriction on the witness exactly as
-/// `src/ccl/design/type-inference.md`, "Consuming a sum: naming the witness" says.
+/// Realization can. Inside leg `i` the conditional *is* `armᵢ`, so the leg is gated twice —
+/// by its first-match path condition and by `𝑝` rewritten to read that arm
+/// (`src/ccl/design/collections.md`, "Realization notes"). The determined case is the
+/// conditional-free one, where `unbox` erases the witness instead and the ordinary
+/// iterate-then-restricts chain compiles the filter (`sums.rs`,
+/// `a_filter_over_a_boxed_source_is_applied`).
 ///
-/// **What is owed is an extent for that witness**, and it is right there: realization has
-/// already materialized this sum as the gated union below the site, whose extent *is* the
-/// selected domain because the unselected legs are empty. Planning does not consult it — it
-/// reads the domain off the type, finds a witness, and refuses.
-///
-/// Planning refuses rather than dropping, so these fail to compile instead of computing the
-/// unfiltered answer. That distinction matters here: two of the cases below have filters that
-/// are no-ops on the arm they select, so a dropped filter would leave them *passing*.
+/// Two of the cases below have filters that are **no-ops on the arm they select**, so they
+/// discriminate a discharge that reads the wrong leg's arm from one that reads the right one:
+/// a filter applied to the other candidate would leave them passing on the answer and wrong
+/// on the reason.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 // Both arms of the two-candidate sum. Only the `else` arm was pinned before, which cannot
