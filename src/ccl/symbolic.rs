@@ -90,10 +90,56 @@ impl Precedence {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// The Pi binders a rendering is inside of, innermost first — what gives a
+/// [`Name::PiBound`](crate::ccl::Name::PiBound) reference a name to print.
+///
+/// A stored type spells a reference to one of its own arrows as a de Bruijn
+/// index, and the arrow that binds it carries the source spelling in its name
+/// slot. Rendering descends through the arrow, so it holds the spelling by the
+/// time it reaches the reference: the index is a display coordinate only, and
+/// a type reads with the same names it read with before the index coordinate
+/// existed.
+///
+/// A borrowed cons list, so descending costs no allocation and no clone. An
+/// unnamed arrow is an entry with no name: it counts as a crossing, because
+/// the index counts crossings.
+pub(crate) struct PiBinderEnv<'a> {
+    binder: Option<&'a crate::ccl::Name>,
+    outer: Option<&'a PiBinderEnv<'a>>,
+}
+
+impl<'a> PiBinderEnv<'a> {
+    /// This environment with `binder`'s arrow crossed — the innermost entry of
+    /// the result.
+    pub(crate) fn crossing(
+        outer: Option<&'a PiBinderEnv<'a>>,
+        binder: Option<&'a crate::ccl::Name>,
+    ) -> Self {
+        PiBinderEnv { binder, outer }
+    }
+
+    /// The name of the binder `index` crossings out, if the environment reaches
+    /// that far and that arrow names its binder. `None` leaves the reference to
+    /// render as the bare index: the type is being shown detached from the
+    /// arrow that binds it, and no spelling is available.
+    fn lookup(env: Option<&Self>, index: u32) -> Option<&crate::ccl::Name> {
+        let mut cur = env?;
+        for _ in 0..index {
+            cur = cur.outer?;
+        }
+        cur.binder
+    }
+}
+
 /// Options for configuring the output of `symbolic`
 #[derive(Default)]
-struct SymbolicOpts {
+struct SymbolicOpts<'a> {
     show_types: bool,
+    /// The Pi binders the enclosing type rendering is inside of. Set only when
+    /// [`Display for Type`](crate::ccl::Type) reaches a refinement predicate
+    /// through one or more arrows; empty at every other entry point, where a
+    /// predicate is being shown on its own.
+    pi_binders: Option<&'a PiBinderEnv<'a>>,
 }
 
 /// Render a CCL expression as a symbolic string.
@@ -103,12 +149,40 @@ pub fn symbolic(expr: &Expr) -> String {
 
 /// Render a CCL expression as a symbolic string.
 pub fn symbolic_typed(expr: &Expr) -> String {
-    fmt(expr, Precedence::Lowest, &SymbolicOpts { show_types: true })
+    fmt(
+        expr,
+        Precedence::Lowest,
+        &SymbolicOpts {
+            show_types: true,
+            ..SymbolicOpts::default()
+        },
+    )
+}
+
+/// [`symbolic`] for a refinement predicate reached through `binders` arrows, so
+/// a reference to one of them prints as that arrow's binder name rather than as
+/// its index. Called by `Display for Type`.
+pub(crate) fn symbolic_under(expr: &Expr, binders: Option<&PiBinderEnv<'_>>) -> String {
+    fmt(
+        expr,
+        Precedence::Lowest,
+        &SymbolicOpts {
+            show_types: false,
+            pi_binders: binders,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Core recursive renderer
 // ---------------------------------------------------------------------------
+
+/// A type slot inside a term, rendered in the term's binder environment. The
+/// slot may itself carry a reference to an arrow the enclosing type rendering
+/// descended through, so it takes the same environment the predicate does.
+fn ty_at<'a>(ty: &'a Type, opts: &'a SymbolicOpts<'a>) -> crate::ccl::ty::TypeUnder<'a, 'a> {
+    crate::ccl::ty::TypeUnder(ty, opts.pi_binders)
+}
 
 /// Render one transaction writer: `[reads]⇒[writes] over <source> do <body>` —
 /// its read-set / write-set footprint and the per-position decision body.
@@ -143,7 +217,17 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
     let res = match &expr.node {
         TypedExprNode::Lit(lit) => (Precedence::Atom, fmt_lit(lit)),
 
-        TypedExprNode::Var(name) => (Precedence::Atom, name.to_string()),
+        // A `PiBound` reference prints as the name of the arrow that binds it
+        // when the rendering descended through that arrow (see
+        // [`PiBinderEnv`]), and as the bare index when it did not.
+        TypedExprNode::Var(name) => {
+            let spelling = match name.pi_bound_index() {
+                Some(k) => PiBinderEnv::lookup(opts.pi_binders, k)
+                    .map_or_else(|| name.to_string(), |b| b.to_string()),
+                None => name.to_string(),
+            };
+            (Precedence::Atom, spelling)
+        }
 
         TypedExprNode::Builtin(Builtin::VariantProject(tag)) => {
             (Precedence::Atom, format!("variant_project(`{tag})"))
@@ -214,7 +298,9 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         TypedExprNode::Cast { value, target } => {
             let rendered_arg = fmt(value, Precedence::Lowest, opts);
             let text = match &expr.ty {
-                Type::Hole | Type::Infer(_) => format!("cast({target}, {rendered_arg})"),
+                Type::Hole | Type::Infer(_) => {
+                    format!("cast({}, {rendered_arg})", ty_at(target, opts))
+                }
                 _ => format!("cast({rendered_arg})"),
             };
             (Precedence::Atom, text)
@@ -225,7 +311,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             // of `param.ty` (a `Type::Refinement`) via `Display for Type`.
             let header = match &param.ty {
                 Type::Hole | Type::Infer(_) => format!("λ {}", param.name),
-                ty => format!("λ {} : {ty}", param.name),
+                ty => format!("λ {} : {}", param.name, ty_at(ty, opts)),
             };
             let body_str = fmt(body, Precedence::Lowest, opts);
             (Precedence::Lowest, format!("{header} → {body_str}"))
@@ -244,7 +330,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             body,
         } => {
             let ty_str = if !matches!(binding.ty, Type::Hole | Type::Infer(_)) {
-                format!(" : {}", binding.ty)
+                format!(" : {}", ty_at(&binding.ty, opts))
             } else {
                 String::new()
             };
@@ -262,7 +348,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             body,
         } => {
             let ty_str = if !matches!(binding.ty, Type::Hole | Type::Infer(_)) {
-                format!(" : {}", binding.ty)
+                format!(" : {}", ty_at(&binding.ty, opts))
             } else {
                 String::new()
             };
@@ -395,7 +481,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
                 .iter()
                 .map(|(b, def)| {
                     let ty_str = if !matches!(b.ty, Type::Hole | Type::Infer(_)) {
-                        format!(" : {}", b.ty)
+                        format!(" : {}", ty_at(&b.ty, opts))
                     } else {
                         String::new()
                     };
@@ -523,7 +609,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         TypedExprNode::Error => (Precedence::Atom, "<error>".to_string()),
     };
     if opts.show_types {
-        (res.0, format!("{}:<{}>", res.1, expr.ty))
+        (res.0, format!("{}:<{}>", res.1, ty_at(&expr.ty, opts)))
     } else {
         res
     }

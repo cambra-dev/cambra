@@ -153,7 +153,7 @@ pub struct ConstrainCache {
 /// draws an edge, which is what the coordinate questions are answered against.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Derivation {
-    /// Emission and its specialization pins — where a recorded fragment becomes
+    /// Emission and its specialization pins — where a recorded bound becomes
     /// solved output.
     LiveSolve,
     /// A pass-boundary re-derivation over a whole tree: it reconciles types two
@@ -164,19 +164,19 @@ pub enum Derivation {
     /// per-operation check, its one caller. Its refinements reference binders the
     /// absent context holds, which no walk of the sub-tree can see, so the
     /// closure invariant is not a record-time error here. Planning's in-place
-    /// checks of a morphism it has just built do *not* need the excuse — a
-    /// morphism carries its own binder — and take [`PostPass`](Self::PostPass),
-    /// which enforces.
-    Fragment,
+    /// checks of a morphism it has just built do not need the excuse: a
+    /// morphism carries its own binder, so they take
+    /// [`PostPass`](Self::PostPass), which enforces.
+    SubTree,
 }
 
 impl Derivation {
     /// Whether bounds recorded through this derivation must close against the
     /// holder's telescope (`src/ccl/design/type-inference.md`, "The invariant").
-    /// Every derivation over a self-contained tree does; only a fragment probe
-    /// is excused, and only because its context is what carries the binders.
+    /// Every derivation over a self-contained tree does. Only a sub-tree probe
+    /// is excused, because its absent context is what carries the binders.
     fn enforces_closure(self) -> bool {
-        self != Derivation::Fragment
+        self != Derivation::SubTree
     }
 
     /// Whether a closed `Fun`/`Fun` codomain opens unconditionally rather than
@@ -568,13 +568,13 @@ fn constrain_go_impl(
             // Descent opens (`src/ccl/design/type-inference.md`, "Where the
             // conversions run"): a *closed* codomain — one whose claims
             // reference this arrow's binder as indices — opens at its own
-            // binder name before the edge decomposes it, so fragments
+            // binder name before the edge decomposes it, so the bounds
             // recorded on inner variables are name-referenced against their
             // telescopes and the correspondence above applies to them.
             //
             // On the live solve, opening is gated on the **opposite** side
             // carrying inference variables: only a live side records
-            // fragments, so only there would a dangling index land. A ground
+            // bounds, so only there would a dangling index land. A ground
             // closed-closed pair compares index-to-index instead — opening it
             // at display names would let an unrelated *free* reference that
             // happens to share the binder's spelling capture the reopened
@@ -1374,17 +1374,54 @@ mod tests {
         )
     }
 
+    /// The `Fun`/`Fun` opening does not fire between two ground sides, so a free
+    /// reference sharing a binder's display spelling cannot capture the reopened
+    /// index.
+    ///
+    /// `(x: Int) ⇒ {Int | __elem == #0}` and `Int ⇒ {Int | __elem == x}` state
+    /// different claims: one is about the arrow's own argument, the other about
+    /// whatever binds `x` outside the type. Opening the closed side at its
+    /// display name spells both `__elem == x` and reads them as one. Uniquified
+    /// binders make the collision need the same uid, which is the same binder,
+    /// and the ground relation must not depend on that convention.
+    #[test]
+    fn a_ground_pair_does_not_open_at_a_shared_spelling() {
+        let x = Name::raw("x");
+        let refinement = |referenced: &Name| {
+            Type::Refinement(
+                Box::new(Type::Base(BaseType::Int)),
+                Refinement::born(Rc::new(TypedExpr::binop(
+                    TypedExpr::var(Name::elem()),
+                    BinOpKind::Compare(CompareKind::Equals),
+                    TypedExpr::var(referenced.clone()),
+                ))),
+            )
+        };
+        // Construction closes the reference into `#0`.
+        let closed = Type::pi(x.clone(), Type::Base(BaseType::Int), refinement(&x));
+        // The same spelling, free: no arrow in this type binds it.
+        let free = Type::fun(Type::Base(BaseType::Int), refinement(&x));
+        assert!(
+            crate::ccl::subst::type_free_vars(&free).contains(&x),
+            "the right side's reference must be free for this to be the capture case"
+        );
+        assert!(
+            constrain_subtype(&closed, &free, &mut ConstrainCache::new()).is_err(),
+            "a closed refinement about the arrow's own binder does not satisfy a refinement \
+             about a free name that shares its spelling"
+        );
+    }
+
     /// A whole-tree re-derivation enforces the closure invariant, exactly as the
     /// live solve does: the tree it walks holds every binder its refinements name, so
     /// a reference to one it does not is the escape the invariant catches.
     ///
-    /// This is what a `Derivation::Fragment` cache is excused from, and the two
-    /// tests together are the reason that excuse is narrow: a probe over a
-    /// sub-tree has no context to hold the binder, a walk over the whole tree
-    /// does.
+    /// This is what a `Derivation::SubTree` cache is excused from. The two
+    /// tests together are why that excuse is narrow: a probe over a sub-tree
+    /// has no context to hold the binder, and a walk over the whole tree does.
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "open fragment recorded")]
+    #[should_panic(expected = "open bound recorded")]
     fn a_whole_tree_re_derivation_enforces_the_closure_invariant() {
         let escaped = escaped_claim();
         let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
@@ -1392,17 +1429,17 @@ mod tests {
         let _ = constrain_subtype(&escaped, &v, &mut cache);
     }
 
-    /// A fragment probe records the same bound without complaint: its refinements
+    /// A sub-tree probe records the same bound without complaint: its refinements
     /// reference binders the context it was cut from holds, and no walk of the
     /// sub-tree can enter them.
     #[test]
     #[cfg(debug_assertions)]
-    fn a_fragment_probe_admits_a_reference_its_context_binds() {
+    fn a_sub_tree_probe_admits_a_reference_its_context_binds() {
         let escaped = escaped_claim();
-        let mut cache = ConstrainCache::for_derivation(Derivation::Fragment);
+        let mut cache = ConstrainCache::for_derivation(Derivation::SubTree);
         let v = fresh_var(0);
         constrain_subtype(&escaped, &v, &mut cache)
-            .expect("a fragment's free reference is admitted");
+            .expect("a sub-tree's free reference is admitted");
     }
 
     /// The tripwire is armed for the one place the record/variant arms and the

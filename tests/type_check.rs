@@ -1712,6 +1712,51 @@ apply0(groups)
     );
 }
 
+/// An undischarged group-by partition stores the key reference as a de Bruijn
+/// index and renders it as the key binder's name. The two spellings are the
+/// coordinate's contract end to end: identity is decided on the index, and the
+/// reader sees the name (`src/ccl/design/type-inference.md`, "The coordinate is
+/// locally nameless" and "Rendering opens what it descended through").
+#[test]
+fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
+    let ty = infer_program("groupby([1, 2, 3], \\x -> x)");
+    let Type::Fun {
+        name: Some(key_binder),
+        codomain,
+        ..
+    } = &ty
+    else {
+        panic!("a group-by is a dependent function from key to partition, got {ty}");
+    };
+    let Type::Fun { domain: dom, .. } = &**codomain else {
+        panic!("expected the partition function inside the key arrow, got {ty}");
+    };
+    let Type::Refinement(_, r) = &**dom else {
+        panic!("expected a refined partition domain, got {ty}");
+    };
+    // Stored: the reference is the index, and no free name for the binder is
+    // left anywhere in the type.
+    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
+    assert!(
+        pred.contains("#0"),
+        "the stored refinement must reference the key binder as an index: {pred}"
+    );
+    assert!(
+        !pred.contains(key_binder.base()),
+        "no free name for the key binder may survive in the stored refinement: {pred}"
+    );
+    // Read: rendering the whole type resolves the index to the binder's name.
+    let rendered = ty.to_string();
+    assert!(
+        rendered.contains(&format!("== {key_binder}")),
+        "the rendered type must spell the reference as the binder: {rendered}"
+    );
+    assert!(
+        !rendered.contains("#0"),
+        "no index may survive into a rendered whole type: {rendered}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Case / if expression tests
 // ---------------------------------------------------------------------------

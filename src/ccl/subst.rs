@@ -1394,6 +1394,20 @@ pub fn well_formed(ty: &Type, ctx: &BTreeSet<Binder>) -> bool {
 /// closing does not touch keeps its original `Rc` (pointer-equal), exactly
 /// as [`Subst::force_refinement`] transports a vacuous substitution.
 pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
+    // A codomain with no free occurrence of the binder has nothing to close,
+    // and every construction site runs this — including the rebuild helpers
+    // (`Type::fun_like`, `emit_cast`) whose codomains come out of arrows that
+    // closed already. Answering from a borrowing scan keeps those off the
+    // clone-and-walk path. The scan covers what the walk covers: predicates,
+    // their interior type slots, and interior term binders' shadowing.
+    debug_assert!(
+        !binder.is_elem(),
+        "a Pi binder is never the refinement element binder, which \
+         `is_free_in_type` reports as never free",
+    );
+    if !crate::ccl::ccl_utils::is_free_in_type(binder, ty) {
+        return ty.clone();
+    }
     let frames = [Some(binder.clone())];
     let mut out = ty.clone();
     PiWalk::new(PiMode::Close(&frames)).ty(&mut out, 0);
@@ -1432,7 +1446,15 @@ pub fn open_codomain(morphism: &Type, codomain: &Type) -> Type {
         Type::Fun { name: Some(b), .. } if references_outermost_frame(codomain) => {
             open_pi_binder(&Mapping::Rename(b.clone()), codomain)
         }
-        _ => codomain.clone(),
+        _ => {
+            debug_assert!(
+                !matches!(morphism.peel_refinements(), Type::Fun { name: None, .. })
+                    || !references_outermost_frame(codomain),
+                "an unnamed arrow's codomain references the arrow: the index has no \
+                 binder to open at, so nothing downstream can resolve it",
+            );
+            codomain.clone()
+        }
     }
 }
 
@@ -1461,7 +1483,15 @@ struct PiWalk<'a> {
     /// Predicate terms already rewritten at a given depth, so occurrences
     /// that entered sharing one `Rc` leave sharing one `Rc`. Keyed by depth
     /// too: one term reachable at two depths is two different rewrites.
+    /// Consulted only while [`shadowed`](Self::shadowed) is empty, since a
+    /// shadow changes what the same term at the same depth converts to.
     memo: HashMap<(PredicateId, u32), Rc<TypedExpr>>,
+    /// Term binders a predicate's interior introduces, innermost last. A
+    /// reference to one of these is bound by the predicate's own lambda, not
+    /// by an enclosing arrow, so closing leaves it alone
+    /// (`src/ccl/design/type-inference.md`, "Interior term binders stay
+    /// named").
+    shadowed: Vec<Name>,
 }
 
 impl<'a> PiWalk<'a> {
@@ -1470,6 +1500,7 @@ impl<'a> PiWalk<'a> {
             mode,
             changed: 0,
             memo: HashMap::new(),
+            shadowed: Vec::new(),
         }
     }
 
@@ -1510,8 +1541,12 @@ impl<'a> PiWalk<'a> {
     }
 
     fn refinement(&mut self, r: &mut crate::ccl::Refinement, depth: u32) {
+        // A shadow makes the conversion depend on more than the term and the
+        // depth, so the memo is bypassed under one. It costs a re-walk of a
+        // predicate a shadowing lambda encloses and keeps the key two fields.
         let key = (r.predicate_id(), depth);
-        if let Some(done) = self.memo.get(&key) {
+        let memoizable = self.shadowed.is_empty();
+        if memoizable && let Some(done) = self.memo.get(&key) {
             if !Rc::ptr_eq(done, &r.predicate) {
                 *r = crate::ccl::Refinement::sharing(done);
             }
@@ -1546,13 +1581,16 @@ impl<'a> PiWalk<'a> {
         } else {
             Rc::clone(&r.predicate)
         };
-        self.memo.insert(key, done);
+        if memoizable {
+            self.memo.insert(key, done);
+        }
     }
 
     fn expr(&mut self, e: &mut TypedExpr, depth: u32) {
         match &self.mode {
             PiMode::Close(frames) => {
                 if let TypedExprNode::Var(n) = &e.node
+                    && !self.shadowed.contains(n)
                     && let Some(dist) = frames.iter().rev().position(|f| f.as_ref() == Some(n))
                 {
                     e.node = TypedExprNode::Var(Name::PiBound(dist as u32 + depth));
@@ -1565,17 +1603,38 @@ impl<'a> PiWalk<'a> {
                 if let TypedExprNode::Var(Name::PiBound(k)) = &e.node
                     && *k == depth
                 {
-                    *e = target.as_expr_preserving(e.node_id, &e.ty);
+                    let occurrence_ty = e.ty.clone();
+                    *e = target.as_expr_preserving(e.node_id, &occurrence_ty);
                     self.changed += 1;
-                    // The replacement is foreign content: it carries no
-                    // reference to the frame being opened, so there is
-                    // nothing left to convert beneath it.
+                    // A `Discharge` replaces the occurrence with a foreign
+                    // term, whose own indices are relative to wherever it was
+                    // written and must not be read against this depth. A
+                    // `Rename` keeps the occurrence's type slot, which is
+                    // still in the pre-opening coordinate, so that slot is
+                    // converted and the term below it is a bare `Var`.
+                    if matches!(target, Mapping::Rename(_)) {
+                        self.ty(&mut e.ty, depth);
+                    }
                     return;
                 }
             }
         }
         e.walk_type_slots_mut(|t| self.ty(t, depth));
-        e.walk_children_mut(|c| self.expr(c, depth));
+        // Children under the binders that scope over them: a term binder a
+        // predicate introduces shadows a frame that shares its name, and its
+        // references are its own.
+        let base = self.shadowed.len();
+        for_each_scoped_item_mut(e, &mut |item| match item {
+            ScopedItemMut::Scope(binders) => {
+                self.shadowed.truncate(base);
+                self.shadowed.extend(binders.iter().cloned());
+            }
+            ScopedItemMut::Child(child) => self.expr(child, depth),
+            // A handle node's write target names a mutable variable, and a
+            // key names a record field. Neither is a Pi binder reference.
+            ScopedItemMut::VarRef(_) | ScopedItemMut::KeyRef(_) => {}
+        });
+        self.shadowed.truncate(base);
     }
 }
 
@@ -1584,6 +1643,10 @@ impl<'a> PiWalk<'a> {
 /// borrowing pre-scan so the opening sites (the Fun/Fun codomain edge) touch
 /// only the types that actually need conversion; the overwhelmingly common
 /// codomain carries none.
+///
+/// The question is depth-free — any index at any depth answers it — so the
+/// once-per-predicate guard needs no depth, unlike
+/// [`references_outermost_frame`]'s.
 pub fn contains_pi_bound(ty: &Type) -> bool {
     fn ty_scan(ty: &Type, visited: &mut BTreeSet<PredicateId>) -> bool {
         match ty {
@@ -1632,7 +1695,7 @@ pub fn contains_pi_bound(ty: &Type) -> bool {
 /// coalesce keeps a Pi binder's name slot, and an application has a
 /// discharge to perform, exactly when this holds.
 pub fn references_outermost_frame(ty: &Type) -> bool {
-    fn ty_scan(ty: &Type, depth: u32, visited: &mut BTreeSet<PredicateId>) -> bool {
+    fn ty_scan(ty: &Type, depth: u32, visited: &mut BTreeSet<(PredicateId, u32)>) -> bool {
         match ty {
             Type::Base(_)
             | Type::UIntRange(_)
@@ -1646,8 +1709,14 @@ pub fn references_outermost_frame(ty: &Type) -> bool {
             Type::Fun {
                 domain, codomain, ..
             } => ty_scan(domain, depth, visited) || ty_scan(codomain, depth + 1, visited),
+            // Keyed by depth as well as by predicate: the answer depends on
+            // the crossings walked to reach the refinement, so one shared predicate
+            // reached at two depths is two questions. Keying on identity alone
+            // answers the second from the first and reports a dependent
+            // codomain as independent — the index would then lose its binder.
             Type::Refinement(base, r) => {
-                (visited.insert(r.predicate_id()) && expr_scan(&r.predicate, depth, visited))
+                (visited.insert((r.predicate_id(), depth))
+                    && expr_scan(&r.predicate, depth, visited))
                     || ty_scan(base, depth, visited)
             }
             Type::Tuple(ts) => ts.iter().any(|t| ty_scan(t, depth, visited)),
@@ -1658,7 +1727,7 @@ pub fn references_outermost_frame(ty: &Type) -> bool {
             }
         }
     }
-    fn expr_scan(e: &TypedExpr, depth: u32, visited: &mut BTreeSet<PredicateId>) -> bool {
+    fn expr_scan(e: &TypedExpr, depth: u32, visited: &mut BTreeSet<(PredicateId, u32)>) -> bool {
         if matches!(&e.node, TypedExprNode::Var(Name::PiBound(k)) if *k == depth) {
             return true;
         }
@@ -2424,7 +2493,7 @@ mod pi_coordinate_tests {
     }
 
     /// The worked example from `type-inference.md`, "Freshening and
-    /// `SpecKey`, worked": closing the outer binder of
+    /// `SpecKey`": closing the outer binder of
     /// `(i: {Int | k}) ⇒ {Int | k}` assigns `#0` in the inner arrow's domain
     /// (only the outer frame is in scope there) and `#1` in its codomain
     /// (the inner frame is crossed).
@@ -2566,5 +2635,49 @@ mod pi_coordinate_tests {
             Rc::ptr_eq(&pred_rc(&ts[2]), &untouched),
             "an untouched predicate keeps its original Rc",
         );
+    }
+
+    /// A term binder inside a predicate shadows the arrow being closed: the
+    /// references it binds stay names, because they are its and not the
+    /// arrow's. Uniquification keeps the two spellings apart in a compiled
+    /// program, so this is what makes closing correct without depending on
+    /// that convention (`src/ccl/design/type-inference.md`, "Interior term
+    /// binders stay named").
+    #[test]
+    fn closing_stops_at_a_shadowing_term_binder() {
+        let k = Name::fresh("k");
+        // {Int | (λ k → k) …} — the body's `k` is the lambda's parameter.
+        let shadowing = refined(TypedExpr::lambda(
+            k.clone(),
+            int(),
+            TypedExpr::var(k.clone()),
+        ));
+        assert_eq!(close_pi_binder(&k, &shadowing), shadowing);
+        // The arrow's own reference beside it still closes, so the shadow is
+        // scoped to the lambda rather than disabling the walk.
+        let both = Type::Tuple(vec![shadowing, refined(TypedExpr::var(k.clone()))]);
+        let Type::Tuple(ts) = close_pi_binder(&k, &both) else {
+            panic!("closing preserves the tuple");
+        };
+        assert!(is_pi_bound(predicate_of(&ts[1]), 0));
+    }
+
+    /// The dependence test answers per position, not per predicate: one shared
+    /// predicate reached at two depths is two questions, and the deeper
+    /// position's answer must not settle the shallower one's. Reaching the
+    /// non-referencing position first is what exposes a predicate-keyed guard.
+    #[test]
+    fn the_dependence_test_is_per_position_not_per_predicate() {
+        let shared = Rc::new(TypedExpr::var(Name::PiBound(0)));
+        let slot = || Type::Refinement(Box::new(int()), Refinement::sharing(&shared));
+        // Under an arrow the index is one crossing short of the outermost
+        // frame, so that position does not reference it; beside the arrow it
+        // does.
+        let under = Type::fun(int(), slot());
+        assert!(!references_outermost_frame(&under));
+        assert!(references_outermost_frame(&Type::Tuple(vec![
+            under,
+            slot()
+        ])));
     }
 }

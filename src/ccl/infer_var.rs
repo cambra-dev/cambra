@@ -291,7 +291,7 @@ impl InferBounds {
 /// The binders in lexical scope at an inference variable's creation,
 /// innermost first — the context a bound recorded on the variable must close
 /// against. See `src/ccl/design/type-inference.md`, "Scoped inference
-/// variables: stored fragments close against a telescope".
+/// variables: a stored bound closes against a telescope".
 ///
 /// A persistent cons list: extending shares the tail, so every variable
 /// minted under one scope holds the same nodes and entering a binder costs
@@ -356,10 +356,10 @@ impl fmt::Debug for Telescope {
 /// edge substitution's domain (a discharge's binders are bound by the edge —
 /// the suspension is the application that closes them).
 ///
-/// This is the record-time closure check of the scoped-inference-variables
-/// design, in its milestone-1 **observation** form: source references are not
-/// excluded (identifiable in the log by name; enforcement threads the source
-/// set), and the caller logs instead of failing.
+/// The gap set of the record-time closure check
+/// (`src/ccl/design/type-inference.md`, "The invariant"). Source references
+/// are not excluded here: they are identifiable by name form, and
+/// [`observe_bound_scope`] is where that exemption is applied.
 #[cfg(any(debug_assertions, test))]
 pub(crate) fn bound_scope_gaps(
     telescope: &Telescope,
@@ -376,9 +376,9 @@ pub(crate) fn bound_scope_gaps(
 
 /// Log a recorded bound's closure gaps to the file `CAMBRA_TELESCOPE_LOG`
 /// names. Debug builds only, and inert unless the variable is set; one line
-/// per open name, so the file enumerates every fragment the run stored open.
+/// per open name, so the file enumerates every open bound the run stored.
 ///
-/// A line the enforcement excused reads `OPEN(fragment)`: the derivation was a
+/// A line the enforcement excused reads `OPEN(sub-tree)`: the derivation was a
 /// probe over a sub-tree, whose free references its absent context binds. The
 /// tag is what keeps the log a measurement of escapes rather than a count of
 /// sub-tree checks.
@@ -408,7 +408,10 @@ pub(crate) fn observe_bound_scope(
         // the same one `check_scope_valid` gives it.
         if enforce && let Some(open) = gaps.iter().find(|n| !n.is_raw()) {
             panic!(
-                "open fragment recorded on ?{}: `{open:?}` is free in the {side} bound                  `{}` but is neither in the holder's telescope {:?} nor discharged by                  the edge's substitutions — the fragment left its binder's scope                  without a mediating discharge (see type-inference.md, \"The invariant\")",
+                "open bound recorded on ?{}: `{open:?}` is free in the {side} bound \
+                 `{}` but is neither in the holder's telescope {:?} nor discharged by \
+                 the edge's substitutions — the bound left its binder's scope \
+                 without a mediating discharge (see type-inference.md, \"The invariant\")",
                 holder.uid, bound.ty, holder.telescope,
             );
         }
@@ -420,7 +423,7 @@ pub(crate) fn observe_bound_scope(
         for n in &gaps {
             out.push_str(&format!(
                 "OPEN{} ?{} {side} free={n} telescope={:?} ty={}\n",
-                if enforce { "" } else { "(fragment)" },
+                if enforce { "" } else { "(sub-tree)" },
                 holder.uid,
                 holder.telescope,
                 bound.ty
@@ -648,8 +651,8 @@ mod tests {
 
     /// The record-time closure check: a bound's free reference is covered by
     /// the holder's telescope or by an edge substitution's domain, and
-    /// anything else is a gap. The gap set is what milestone 1 logs and
-    /// milestone 3 rejects.
+    /// anything else is a gap. [`observe_bound_scope`] logs the gap set and,
+    /// on a derivation that enforces, rejects it.
     #[test]
     fn bound_scope_gaps_sees_telescope_and_edge_domains() {
         use crate::ccl::{Lit, Name, Refinement, TypedExpr, subst::Subst};
@@ -674,7 +677,7 @@ mod tests {
             Subst::discharge(Name::raw("x"), TypedExpr::lit(Lit::Int(7))),
         );
         assert!(bound_scope_gaps(&scope, &discharged).is_empty());
-        // Covered by neither: the open fragment the design retires.
+        // Covered by neither: the open bound the design retires.
         let gaps = bound_scope_gaps(&scope, &Bound::conc(dep("y")));
         assert_eq!(
             gaps.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
@@ -689,8 +692,8 @@ mod tests {
     /// `check_scope_valid`.
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "open fragment recorded")]
-    fn recording_an_open_fragment_is_an_internal_error() {
+    #[should_panic(expected = "open bound recorded")]
+    fn recording_an_open_bound_is_an_internal_error() {
         use crate::ccl::{Name, Refinement, TypedExpr};
         use std::rc::Rc as StdRc;
         let dep = Type::Refinement(

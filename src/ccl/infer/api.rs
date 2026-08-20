@@ -1317,8 +1317,8 @@ pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// the sub-tree can enter them, so recording such a bound is expected here and a
 /// record-time internal error over a whole tree
 /// (`src/ccl/design/type-inference.md`, "The invariant").
-pub fn check_pre_channelize_fragment(expr: &Expr) -> Result<(), Vec<InferError>> {
-    check_pre_channelize_as(expr, Derivation::Fragment)
+pub fn check_pre_channelize_sub_tree(expr: &Expr) -> Result<(), Vec<InferError>> {
+    check_pre_channelize_as(expr, Derivation::SubTree)
 }
 
 fn check_pre_channelize_as(expr: &Expr, derivation: Derivation) -> Result<(), Vec<InferError>> {
@@ -1724,7 +1724,7 @@ fn check_mut_write_targets_go(
 pub fn debug_typecheck(expr: &Expr) {
     #[cfg(feature = "deep-typecheck")]
     assert_eq!(
-        check_pre_channelize_fragment(expr),
+        check_pre_channelize_sub_tree(expr),
         Ok(()),
         "Failed post-transform typecheck: {}",
         crate::ccl::symbolic::symbolic_typed(expr)

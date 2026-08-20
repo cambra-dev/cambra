@@ -80,8 +80,7 @@ impl PolyScheme {
     /// record. A *let*-generalized scheme keeps plain
     /// [`instantiate`](Self::instantiate): its clone stands where the
     /// definition stood, and the definition-site telescopes are the contract
-    /// (see `src/ccl/design/type-inference.md`, "Freshening and `SpecKey`,
-    /// worked").
+    /// (see `src/ccl/design/type-inference.md`, "Freshening and `SpecKey`").
     pub fn instantiate_in(
         &self,
         current_level: Level,
