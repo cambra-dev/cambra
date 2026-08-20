@@ -1748,7 +1748,15 @@ Each upper bound is resolved **as its own position**, by a walk entered at that 
 
 The choice is recorded on the *variable*, not in the binder slot, so every occurrence of it agrees — the slot, the scrutinee's expected variant, and hence an enclosing lambda's parameter type. That is also why the pin precedes the scrutinee's own walk and not merely the branches': the scrutinee's type is the variant these payload variables sit inside, so a pin placed after it leaves that reading stale. Unreachable arms are **kept**, not pruned: an arm for a tag the scrutinee cannot carry projects an empty restriction and contributes nothing, while pruning would narrow the arm set relative to the enclosing lambda's declared domain. `pin_unobservable_arm_payload` in `src/ccl/infer/solve.rs` holds the mechanism, including the ordering constraints that place it inside the coalesce walk.
 
-A refined pin is what makes the compaction identity below load-bearing: a bare variable bound contributes an empty refinement set, and an empty set is absorbing under the positive intersection, so `Int@1` arriving from the pin would be erased by the scrutinee's own per-tag variable. `CompactType::imposes_nothing` names the contribution that says nothing at all and makes it the merge identity, which is what every *shape* component already gets from its `None`.
+A refined pin is what makes the compaction identity below load-bearing: an empty
+refinement set is absorbing under the positive intersection, so `Int@1` arriving
+from the pin would be erased by the scrutinee's own per-tag variable if that
+variable's contribution read as an empty set. It does not.
+`CompactType::refinements` is an `Option`, the same sentinel every *shape*
+component carries: `None` is "no refinement contribution here" and merges as the
+identity, and only a *value* carries a set — an empty one included, because a
+value that guarantees nothing is a fact about it. A bare variable and a hole are
+not values.
 
 ### Record literals and field access
 
