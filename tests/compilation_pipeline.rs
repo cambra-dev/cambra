@@ -46,5 +46,7 @@ mod scalars_collections;
 mod sources_incremental;
 #[path = "compilation_pipeline/transactions.rs"]
 mod transactions;
+#[path = "compilation_pipeline/type_annotations.rs"]
+mod type_annotations;
 #[path = "compilation_pipeline/variants.rs"]
 mod variants;

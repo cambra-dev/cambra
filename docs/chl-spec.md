@@ -179,7 +179,7 @@ surface level.
 ### 1.8 Operators and punctuation
 
 ```
-+  -  *  //  ++  ->
++  -  *  //  ++  ->  =>
 &  |  ^
 == != <  <= >  >=
 =  += -= *= //=
@@ -203,6 +203,11 @@ parsing-then-erroring.
 
 `\` introduces a lambda binder and `->` separates it from the body —
 `\x -> body` (§3.10).
+
+`=>` is the function-type arrow. It separates a `def`'s parameter list
+from its return-type annotation — `def f(x: Int) => Int:` (§4.1), which
+type inference checks against the body's value. Its use as a general
+type operator inside an expression is **[Planned]**.
 
 > **Direction.** `->` additionally becomes the pair / map-entry arrow
 > (`a -> b` for a two-tuple, `[k -> v, …]` for a map literal — §2.4,
@@ -289,7 +294,7 @@ for_stmt        ::= "for" assign_target "in" expression ":" block
 
 with_stmt       ::= "with" [ ident "=" ] expression ":" block
 
-def_stmt        ::= "def" ident "(" [ param ( "," param )* [ "," ] ] ")" ":" block
+def_stmt        ::= "def" ident "(" [ param ( "," param )* [ "," ] ] ")" [ "=>" expression ] ":" block
 param           ::= ident [ ":" expression ]
 
 block           ::= NEWLINE INDENT statement+ DEDENT
@@ -1148,12 +1153,19 @@ def f(x: Int, y):
     return x + y
 ```
 
-Annotation types are arbitrary expressions evaluated in the surrounding
-scope. `p: T` fixes the parameter's type at `T`; `p <: T` leaves it
-inferred and bounded above by `T` (see
-[Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
-The two forms may be mixed across a parameter list. Annotations on the
-function's *return type* are not yet supported.
+Annotation types are arbitrary expressions evaluated in the
+surrounding scope. `p: T` fixes the parameter's type at `T`; `p <: T`
+leaves it inferred and bounded above by `T` (see [Two annotation
+forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
+The two forms may be mixed across a parameter list. A return-type
+annotation, introduced by `=>`, specifies a fixed output type for the
+function. The inferred type of the function body must be a subtype of
+the annotated output type.
+
+```python
+def f(x: Int, y: Int) => Int:
+    return x + y
+```
 
 A function whose body contains a `yield` expression anywhere is a
 **generator function** — see §4.2 for its semantics. The rules in the
@@ -1183,11 +1195,12 @@ function must be definable without referring to its own name.
 > `store: Mut(Map(…), Txn)`. Either way the capability is visible in the
 > types at the binder, not smuggled in.
 
-> **Direction [Tentative].** Return-type annotations:
-> `def f(t: T) => U:` — `=>` is the function-type arrow, so the same
-> signature can be written as a binding, `f: (T => U) = \t -> …`.
-> Recommended style annotates both parameters and the return type on
-> top-level `def`s; the north-star programs follow it.
+> **Direction [Planned].** `=>` is the function-type arrow, so a `def`'s
+> signature can equivalently be written as a binding,
+> `f: (T => U) = \t -> …`. Using `=>` as a *type* operator inside an
+> expression is not yet parsed; only its `def`-return-annotation position
+> (implemented above) is. Recommended style annotates both parameters and
+> the return type on top-level `def`s; the north-star programs follow it.
 
 ### 4.2 `def` — generator function
 
@@ -1745,8 +1758,7 @@ marked one carries its status per "How to read this document".)
 - ``{ `tag₀{…} | `tag₁{…} | … }`` — variant type (§6.5). Two variants are the
   same type iff they have the same tags with the same payload types; the arms
   are a set, so their written order does not matter.
-- `{T where p(_)}` — refinement type (**[Decided]**, §6.4). Not writable
-  yet.
+- `{T where p(_)}` — refinement type (§6.4), where `_` refers to the value being refined.
 - `Mut(V)` / `Mut(V, Txn)` — mutable-variable / transactional-variable
   type (§6.2, §8).
 - `Map(K, V)` — finite-map type. **[Planned]** — the map literal
@@ -1766,8 +1778,8 @@ marked one carries its status per "How to read this document".)
 
 CHL also supports **refinement types**: a value of the refined type is
 a value of the base type for which a predicate holds. Refinements are
-inferred internally by built-ins like `groupby` (§7.2); the decided
-surface form is `{T where p(_)}` (§6.4), not writable yet.
+inferred internally by built-ins like `groupby` (§7.2); the surface
+form `{T where p(_)}` (§6.4) is writable in annotation position.
 
 > **Direction [Decided] — function contracts.** A contract can be written two
 > ways, and which one to reach for is a matter of the case at hand. As a
@@ -2052,9 +2064,6 @@ Sketched at the same **[Tentative]** level:
 
 ### 6.4 Refinement syntax
 
-**[Decided]** — not implemented. `where` is lexed and reserved (§1.6); the brace
-form is not parsed.
-
 A refinement is written `{ 𝑇 where 𝑝 }` — the base type, the keyword
 `where`, and a predicate over the value being refined:
 
@@ -2064,8 +2073,7 @@ A refinement is written `{ 𝑇 where 𝑝 }` — the base type, the keyword
 {{a: Int} where _.a > 0}                # ... a single-field record; no comma
 ```
 
-Three pieces. The form is not parsed today, though `where` is already lexed and
-reserved (§1.6):
+Refinement syntax has three pieces:
 
 - **`{ … }`** because a refinement *is* a structural type (§2.4). The base
   type sits inside the braces in its own spelling, so refining a structural
