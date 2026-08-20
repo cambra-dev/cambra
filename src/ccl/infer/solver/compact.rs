@@ -623,10 +623,57 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         scope: RefinementScope::default(),
     };
     let term = compact_go(ty, true, &Subst::id(), None, &mut st);
+    debug_assert!(
+        refinement_slot_present(&term) && st.rec_vars.values().all(refinement_slot_present),
+        "a position carrying content must carry a refinement slot: only a hole and a \
+         bare variable leave it absent"
+    );
     CompactGraph {
         term,
         rec_vars: st.rec_vars,
     }
+}
+
+/// Whether every position in `ct` that carries content also carries a refinement
+/// slot — the post-condition of the walk above.
+///
+/// The slot's `None` belongs to exactly the two contributions that are not
+/// values, a hole ([`CompactType::empty`]) and a bare variable
+/// ([`CompactType::from_var`]), and neither carries content. Nothing in the type
+/// system says so: every value-shaped arm has to be built from
+/// [`CompactType::value`], across a dozen construction sites. A position that
+/// carried content with the slot absent would read as the merge identity and so
+/// *absorb* a sibling bound's refinements instead of intersecting with none of its
+/// own, which is the collapse [`CompactType::refinements`] documents — `Int`
+/// joined with `{Int | p}` would keep `p`.
+///
+/// Variable contributions are not content: a bare variable's whole content is
+/// its identity, so `vars` is the one populated field the slot may accompany as
+/// `None`.
+fn refinement_slot_present(ct: &CompactType) -> bool {
+    let carries_content = !ct.atoms.is_empty()
+        || ct.rec.is_some()
+        || ct.var.is_some()
+        || ct.fun.is_some()
+        || ct.history_slot.is_some();
+    if carries_content && ct.refinements.is_none() {
+        return false;
+    }
+    ct.rec
+        .iter()
+        .flat_map(|m| m.values())
+        .all(refinement_slot_present)
+        && ct
+            .var
+            .iter()
+            .flat_map(|v| v.tags.values())
+            .all(refinement_slot_present)
+        && ct.fun.iter().all(|f| {
+            f.domains.iter().all(refinement_slot_present) && refinement_slot_present(&f.codomain)
+        })
+        && ct.history_slot.iter().all(|(value, domain, _)| {
+            refinement_slot_present(value) && refinement_slot_present(domain)
+        })
 }
 
 /// The variables whose bounds the current path is walking, as a chain of stack
@@ -1372,5 +1419,51 @@ mod refinement_closing_tests {
             "closing against the walk's enclosing binders must not conflate the inner and \
              outer Pi binders"
         );
+    }
+}
+
+#[cfg(test)]
+mod refinement_slot_tests {
+    use super::*;
+
+    /// The two contributions that are not values carry no refinement slot, and the
+    /// checker accepts them: a hole imposes nothing and a bare variable's whole
+    /// content is its identity.
+    #[test]
+    fn a_hole_and_a_bare_variable_need_no_refinement_slot() {
+        assert!(refinement_slot_present(&CompactType::empty()));
+        assert!(refinement_slot_present(&CompactType::from_var(InferVarId(
+            0
+        ))));
+    }
+
+    /// The violation the post-condition exists for, which no test program
+    /// reaches and nothing in the type system forbids: content with the slot
+    /// absent, which merges as the identity and absorbs a sibling's refinements.
+    #[test]
+    fn content_without_a_refinement_slot_is_rejected() {
+        let bad = CompactType {
+            refinements: None,
+            ..CompactType::from_atom(AtomKey::Prim(BaseType::Int))
+        };
+        assert!(!refinement_slot_present(&bad));
+        assert!(refinement_slot_present(&CompactType::from_atom(
+            AtomKey::Prim(BaseType::Int)
+        )));
+    }
+
+    /// Nested, so a violation below the root is caught: the walk builds every
+    /// payload from the same arms.
+    #[test]
+    fn a_violation_below_the_root_is_rejected() {
+        let bad = CompactType {
+            refinements: None,
+            ..CompactType::from_atom(AtomKey::Prim(BaseType::Int))
+        };
+        let outer = CompactType {
+            rec: Some([(FieldKey::Index(0), bad)].into_iter().collect()),
+            ..CompactType::value()
+        };
+        assert!(!refinement_slot_present(&outer));
     }
 }
