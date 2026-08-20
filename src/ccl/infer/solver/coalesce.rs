@@ -292,7 +292,12 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     };
 
     // Re-attach the refinements carried at this position.
-    Ok(Type::refined(inner, ct.refinements.clone()))
+    // A position with no refinement contribution materializes as the bare type: `None`
+    // and an empty set both mean "no refinements hold here".
+    Ok(Type::refined(
+        inner,
+        ct.refinements.clone().unwrap_or_default(),
+    ))
 }
 
 /// Dissolve a position's feed `history_slot` into its other contributions when
@@ -322,6 +327,12 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
         // The channel is the `domain ⇒ value` function; reconstruct it as a
         // `fun`-slot CompactType (exactly what the old single-payload slot held)
         // and merge it into the read view.
+        //
+        // Not [`CompactType::value`]: this re-expresses content already at this
+        // position rather than arriving as a second bound, so it imposes no refinement
+        // of its own and leaves `refinements` at the merge identity. Building it
+        // as a value would intersect the position's own refinements away at a positive
+        // polarity (see `CompactType::refinements`).
         let chan = CompactType {
             fun: Some(super::compact::CompactFun {
                 name: None,
