@@ -165,11 +165,17 @@ fn drop_dead_as_of_reads(e: &mut Expr) {
         binding,
         bound_expr,
         body,
-    } = &e.node
+    } = &mut e.node
         && as_of_read_source(bound_expr).is_some()
         && !is_free_in_value(&binding.name, body)
     {
-        *e = (**body).clone();
+        // The body takes the dropped `let`'s position, so this is a move, not a
+        // duplication — take it out rather than copying it. A `clone()` here
+        // would *freshen* the whole continuation (see `Clone` on `TypedExpr`),
+        // re-minting a subtree that nothing recorded and stranding every id in
+        // it; a preserving clone would be correct but still copy the tree.
+        let body = std::mem::take(&mut **body);
+        *e = body;
         drop_dead_as_of_reads(e);
         return;
     }
