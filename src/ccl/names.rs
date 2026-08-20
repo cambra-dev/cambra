@@ -324,23 +324,33 @@ impl Name {
         }
     }
 
-    /// A globally-distinct string key for this name, suitable as a **mutable variable
-    /// record field label** for a [`crate::ccl::TypedExprNode::Transact`] key.
-    /// Unlike [`base`](Self::base) it folds the `uid` in, so two distinct
-    /// binders sharing a spelling (e.g. accumulators in sibling loops) get
-    /// distinct keys. A variable read of a mutable variable key projects this field of
-    /// the history record (`__hist.field_key`).
+    /// This name as a **mutable variable record field label** for a
+    /// [`crate::ccl::TypedExprNode::Transact`] key. A variable read of a
+    /// mutable variable key projects this field of the history record
+    /// (`__hist.field_key`).
+    ///
+    /// It is the plain [`base`](Self::base) spelling, and deliberately carries
+    /// no `uid`. The label has to be distinct only among the keys of *one*
+    /// history record — every consumer resolves it against a `keys_map`
+    /// built per [`Transact`](crate::ccl::TypedExprNode::Transact) node, so
+    /// accumulators in sibling loops live in different records and cannot
+    /// collide. Folding the `uid` in would buy global distinctness nothing
+    /// needs, at the cost of rendering a run-varying identity into a `String`:
+    /// once a name is a record label, uid-robust comparison is impossible, and
+    /// two compilations of one source disagree. That made program diffing at
+    /// and below loop planning unusable — see `src/ccl/design/diffing.md`.
+    ///
+    /// The per-record uniqueness this relies on holds by construction: a key
+    /// spelling is either the user's own variable name, distinct within its
+    /// block, or a label planning mints indexed by position (`acc0`, `acc1`).
     pub fn field_key(&self) -> String {
         match self {
-            Name::Raw(s) => s.clone(),
-            Name::Unique { base, uid } => format!("{base}#{}", uid.0),
-            Name::Synthetic { kind, uid } => format!("{}#{}", kind.stem(), uid.0),
-            Name::Reserved(r) => r.spelling().to_string(),
             // Not a binder, so no mutable variable is ever declared at one and
             // no record field is ever labeled by one.
             Name::PiBound(_) => {
                 unreachable!("a PiBound is a reference, not a binder; it labels no field")
             }
+            _ => self.base().to_string(),
         }
     }
 

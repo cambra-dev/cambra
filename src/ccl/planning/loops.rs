@@ -602,13 +602,18 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         })
         .collect();
 
-    // One mutable variable key per accumulator. Names are fresh labels: every read is
-    // positional (`__hist ≫ .writes ≫ .i`), so only field order is
-    // load-bearing.
+    // One mutable variable key per accumulator. Every read is positional
+    // (`__hist ≫ .writes ≫ .i`), so these names carry no meaning beyond
+    // labelling the mutable variable record — but the label still has to be
+    // distinct *within* that record, and `field_key` is the plain spelling. So
+    // index by position: a shared `"acc"` base would collapse two accumulators
+    // onto one field, and position is the one distinguisher that is also stable
+    // across compilations, which uid-free labels require.
     let keys: Vec<TransactKey> = inits
         .into_iter()
-        .map(|init| TransactKey {
-            name: Name::fresh("acc"),
+        .enumerate()
+        .map(|(i, init)| TransactKey {
+            name: Name::fresh(format!("acc{i}")),
             init,
         })
         .collect();
