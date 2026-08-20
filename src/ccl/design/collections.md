@@ -1272,8 +1272,11 @@ planning surfaces.
 
 ## Implementation roadmap
 
-[Status](#status) records what is built. This section is the order to build the
-rest in, and why that order. Each step is independently landable and pins a test.
+[Status](#status) records what is built. This section is the **order** to build the rest
+in, and why that order — nothing else. A step names what it unblocks and what it depends
+on; it does not restate a capability's status, name the tests a branch turns off, or carry
+design a section above already holds. Each of those is what rotted this section before,
+and each has a home: the table, the branch, and the section respectively.
 
 > **Two step-0 obligations.** Both are cheap now and unrecoverable later, so they
 > gate the steps rather than sitting inside one.
@@ -1282,9 +1285,8 @@ rest in, and why that order. Each step is independently landable and pins a test
 >   is minted at creation](#witness-identity-is-minted-at-creation-load-bearing). A
 >   shared anonymous key domain would let one map's membership proof discharge
 >   against another's, and identity cannot be retrofitted onto values already
->   conflated. **Discharged** by the `Builtin::KeyDom` token, whose `KeyDomId` is
->   minted per creation site (`key_domains_are_per_creation_site`) — landing with
->   `groupby-keyed-collection` per [Status](#status).
+>   conflated. Discharged by giving each creation site its own key domain, so two maps
+>   built separately never share one.
 > - **Decide how a collection kind is represented** — **tentatively decided**: the
 >   witness kind carries four of the five, and `Set`/`Map` — the pair it cannot
 >   discriminate — become **nominal type heads**, landing with nominal types
@@ -1294,75 +1296,25 @@ rest in, and why that order. Each step is independently landable and pins a test
 >   layer, take the uniform-entry-iteration interim named there rather than encoding the
 >   distinction somewhere it will have to be removed from.
 
-1. **Finish the Σ-as-kinds rework.** Every witness becomes a *type* classified by a
-   **kind**, and Σ subtyping is kind containment plus the body edge — the general union
-   rule, with its `∃` discharged as a search over ground candidates
-   ([type-inference.md, Where the pairing search
-   runs](type-inference.md#where-the-pairing-search-runs)). Landed so
-   far: that rule, `box` as the only way into a sum (no `𝑇 <: Σ` edge at all — see
-   [Subtyping](#subtyping)), `Any` as two containment rows, and `List` as the
-   `UIntRanges` kind — which removed
-   the `{𝑖 | 𝑖 < 𝑛}` refinement, its built-typed-predicate construction, and the
-   filtered-range hole (a `Refinement` is not a `UIntRange`, so a filtered collection
-   can no longer hand `List` a length witness for a domain with holes).
+1. **Finish the Σ-as-kinds rework.** Every witness is a *type* classified by a **kind**,
+   so Σ subtyping is kind containment plus the body edge — the general union rule, with its
+   `∃` discharged as a search over ground candidates ([type-inference.md, Where the pairing
+   search runs](type-inference.md#where-the-pairing-search-runs)). What remains is the
+   **keyed** kind, which makes the keyed discharge plain kind containment rather than a rule
+   of its own, so it precedes every step below that dispatches on a key. The representation
+   it uses is [Representation: the key domain is
+   opaque](#representation-the-key-domain-is-opaque-decided).
 
-   The rest of the step is the **keyed** kind `TypeKind::Keyed` — every witness is a type
-   classified by a kind, so the keyed discharge is plain kind containment — landing with
-   `groupby-keyed-collection` per [Status](#status).
+2. **Restore direct group-by key application; then lookup discharge + `Option`.** Two
+   halves of one mechanic, and the first is a *regression fix*: `groupby`'s honest keyed type
+   makes `g(k)` at a bare key a type error, and it must, since an arbitrary key is not known
+   to be present — the whole content of [Lookup](#lookup-membership-discharge). A test
+   asserting a bare key succeeding is therefore **restated** against the checked operator,
+   never re-enabled. The prerequisite is [making the membership proof survive being
+   consumed](#prerequisite-the-proof-has-to-survive-being-consumed); the surface pair `𝑐[𝑘]` /
+   `𝑐[𝑘]?` and `Option` over the existing `Variant` nodes (shared with `txn_kv`) sit directly on
+   top.
 
-   It carries the concrete keyed domain `{𝐾 | __elem ▷ keydom#id}` and a `Builtin::KeyDom`
-   token, which retires `Builtin::Member` (and with it the `bool_or` /
-   characteristic-predicate options and the ∃ problem). The representation choice was
-   traced, not guessed:
-   - A nominal domain *atom* cannot work: `AtomKey` is a **discrete** set — only
-     reflexive arms exist for the nominal leaves, atoms merge by set union, and
-     coalesce rejects ≥ 2 shapes at a position. So `KeyDom(id, Int) <: Int` would need
-     polarity-aware atom subsumption that does not exist, and it would break at the
-     first `k + 1`.
-   - A refinement works for free: `Type::Refinement(inner, r)` compacts by recursing
-     into `inner`, so the **base's** atom lands in `atoms` while `r` rides a separate
-     width-subtyped list (positive intersects, negative unions). So `{𝐾 | tok}` and `𝐾`
-     both contribute the base atom — no collision — and join to `𝐾`, which is exactly
-     `{𝐾 | tok} <: 𝐾`. The token sits in the **function** position of the ordinary
-     `__elem ▷ p` shape, so `fn_of_bare_predicate` fast-paths it and predicate
-     compilation round-trips with no special case.
-   - And the membership *term* it replaced was decorative: the compiled tile is
-     **unchanged** (only the type annotation on it shrinks, from a point-free-compiled
-     key-image graph to `{Int | __elem ▷ keydom}`). Nothing in planning, `Converse`
-     recognition, op-conversion, or the runtime read it.
-
-   The id is deliberately **not rendered**, so type goldens stay independent of minting
-   order. `debug_assert_no_unexecutable_atoms` is *kept*, retargeted to the token: the
-   invariant it names (a key-domain atom never reaches op-conversion as a term) is real
-   whether the atom is `∈` or a token.
-
-   > **What unblocks it**, measured on `groupby-keyed-collection`. A first attempt at this
-   > swap was reverted, because
-   > `Member`'s shared-variable scheme `∀κ. (κ, Collection(κ)) → Bool` had been doing
-   > double duty: it was also what **pinned the key type**, linking `κ` between `__elem`
-   > and the inlined key-image's element. An opaque token links nothing, and nothing
-   > *inside* an opaque refinement can pin it — by construction — so the key type has to
-   > arrive from outside. [`Type::SharedHole`] is that outside: `lower_call`'s `groupby`
-   > arm mints one linkage id and writes it into both the key binder's domain and
-   > `key_fn`'s codomain annotation, stating "these two positions are the same type"
-   > directly instead of smuggling it through a term. The whole suite passes with
-   > `Member`'s `κ` deliberately de-linked, which is how the pin was confirmed to have
-   > moved rather than merely been duplicated.
-
-2. **Restore direct group-by key application; then lookup discharge + `Option`.**
-   Two halves of one mechanic, and the first half is a *regression fix*, not a new
-   capability. `groupby`'s honest keyed type makes `g(k)` a type error — the bare key
-   cannot prove `𝑘 ∈ 𝐸` — which turns off nine tests green today on the imprecise total
-   type: six end-to-end value cases (`test_dependent_groupby_lookup` in
-   `tests/compilation_pipeline/misc.rs`) and three dependent-application type tests
-   (`test_groupby_aggregate`, `test_groupby_dependent_application_discharges_key`,
-   `test_higher_order_dependent_application_discharges_key` in `tests/type_check.rs`).
-   The branch that lands the keyed type `#[ignore]`s them naming this step, and
-   **un-ignoring all nine is the acceptance criterion.** The prerequisite is [making the
-   membership proof
-   survive being consumed](#prerequisite-the-proof-has-to-survive-being-consumed);
-   the surface pair `𝑐[𝑘]` / `𝑐[𝑘]?` and `Option` over the landed `Variant` nodes
-   (shared with `txn_kv`) sit directly on top.
 3. **The operation layer.** The per-kind iteration element (`Set` → key, `Map` →
    `(𝐾, 𝑉)` entry), membership `in`, the `keys` / `values` / `items` views, and the
    `Ord[𝐾]` given that an ordered operation over an unordered domain requires — all
@@ -1404,7 +1356,7 @@ rest in, and why that order. Each step is independently landable and pins a test
       `join_witness_kinds`' missing `Described ⊔ Described`, and retires the `(Keyed, Any)`
       row to the iteration-element layer (step 3).
    2. **The pairing search** — `∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁`, with the codomain edge emitted once
-      and the domain edge per pairing. **Landed.** The precondition is ground candidates,
+      and the domain edge per pairing. The precondition is ground candidates,
       not a particular time: a ground comparison records no bounds, so a failed attempt
       leaves no trace and the choice is confluent. That holds at emission today, so the
       search runs inline and needs no deferral channel; it moves late only when formation
@@ -1418,7 +1370,7 @@ rest in, and why that order. Each step is independently landable and pins a test
       Σ-width is one-directional with a contravariant domain edge. See
       [type-inference.md, Where the pairing search
       runs](type-inference.md#where-the-pairing-search-runs).
-   3. **Consuming a sum at a domain-preserving consumer.** **Landed.** A conditional
+   3. **Consuming a sum at a domain-preserving consumer.** A conditional
       collection survives a comprehension by every route — inline, `let`-bound, and through
       a UDF parameter — all yielding `Σ 𝐷 ∈ {[0, 1], [0, 2]}. 𝐷 ⤇ Int`, and a filtered one
       restricts the **witness**, `Σ 𝜎 ∈ {[0, 1], [0, 2]}. ({𝜎 | 𝑝} ⤇ Int)`, which
@@ -1457,7 +1409,7 @@ rest in, and why that order. Each step is independently landable and pins a test
       candidates are alternatives.
 
       The *other* half of what this step used to claim — the join destroying candidates —
-      is landed too: alternatives accumulate at either polarity while demands still narrow.
+      holds as well: alternatives accumulate at either polarity while demands still narrow.
 6. **The rest of the constructor surface.** Map/dict literals `[k -> v]`, `list()`,
    `map()` with the [`sole` aggregate](#sole-is-an-option-accumulator-aggregate),
    general `𝑚[𝑘]` subscript lowering, and the [keyed entry of an inferred-domain
