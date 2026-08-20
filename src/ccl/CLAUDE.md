@@ -16,7 +16,7 @@ If you find yourself adding a new `TypedExprNode` variant that "does something" 
 ## General Instructions
 
 ### Workflow
-When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes the CCL design docs in `design/` (`ir.md`, `type-inference.md`, `lowering.md`, `optimization.md`, `mutability.md`, `provenance.md`) and other `*/design-*.md` files close to source files that were changed.
+When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes the CCL design docs in `design/` (`ir.md`, `type-inference.md`, `lowering.md`, `optimization.md`, `mutability.md`, `provenance.md`, `diffing.md`) and other `*/design-*.md` files close to source files that were changed.
 
 ### Node identity and lineage
 Every pass rebuilds IR nodes, and every rebuild must carry the node's `NodeId` (or record the mint/copy it performs). This is not incidental bookkeeping: the always-on lowering projection is what turns an inference error into a source span, so a pass that mints where it should preserve degrades release diagnostics. Read `design/provenance.md` before changing how a pass constructs, clones, or discards nodes.
