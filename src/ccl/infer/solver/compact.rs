@@ -88,16 +88,20 @@ impl AtomKey {
 /// neither directly, so [`coalesce_compact`](super::coalesce::coalesce_compact)
 /// picks a single concrete type from these bag-of-types contributions and
 /// errors on conflict.
-/// The kind of a merged function slot. Three-state so [`CompactType::merge`]
-/// stays infallible: a `Data ⊔ Compute` collision that would collapse a
-/// data function's domain alternatives becomes `Conflict` and is reported loudly at coalesce
-/// ([`super::coalesce::CoalesceError::DomainJoinConflict`]), never a mid-merge
-/// panic.
+/// The kind of a merged function slot. The four values form the flat semilattice
+/// `Unknown < {Data, Compute} < Conflict`, joined the same way at both
+/// polarities: `Unknown` is the identity and `Conflict` absorbing, so
+/// [`CompactType::merge`] stays infallible and a `Data`/`Compute` collision is
+/// reported loudly at coalesce
+/// ([`super::coalesce::CoalesceError::DomainJoinConflict`]) rather than as a
+/// mid-merge panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum KindMerge {
-    /// domain — the ordinary contravariant meet.
+    /// A capability: its domain is a requirement, so the alternatives a join
+    /// accumulated meet contravariantly when coalesce reads them.
     Compute,
-    /// domain — joins are lossless (`union_domains`).
+    /// A collection: its domain *is* the data, so the alternatives never meet —
+    /// exactly one must survive (`union_domains`).
     Data,
     /// A data/compute or multi-domain collision; deferred to coalesce.
     Conflict,
@@ -145,32 +149,37 @@ impl KindMerge {
     }
 }
 
-/// A merged function shape. `domains` holds one entry for an ordinary function
-/// (the meet of the merged domains); a positive `Data ⊔ Data` join accumulates
-/// ≥ 2 deduplicated alternatives, which coalesce reconciles (see `union_domains`).
-/// `Compute` slots always carry exactly one.
+/// A merged function shape. `domains` holds the alternatives a positive join
+/// accumulated — one entry unless two distinct domains met — and coalesce
+/// applies the resolved [`KindMerge`]'s rule to them (see `union_domains` and
+/// [`CompactFun::merge`]). A negative merge takes the contravariant meet
+/// directly, since that rule does not read the kind.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactFun {
     /// The Pi (element) binder, `na.or(nb)` on merge.
     pub name: Option<Name>,
     /// The merged kind.
     pub kind: KindMerge,
-    /// Domain alternatives — `len == 1` unless a `Data ⊔ Data` join accumulated more.
+    /// Domain alternatives — `len == 1` unless a positive join accumulated more.
     pub domains: Vec<CompactType>,
     /// The codomain (covariant).
     pub codomain: Box<CompactType>,
 }
 
-/// The join of two data-function domain-alternative lists: the union of the
-/// alternatives, deduplicated by structural [`CompactType`] equality. Never a
-/// meet — a `Data` domain *is* the data, so narrowing it drops rows.
+/// The join of two domain-alternative lists: the union of the alternatives,
+/// deduplicated by structural [`CompactType`] equality. Never a meet — a `Data`
+/// domain *is* the data, so narrowing it drops rows, and whether the slot will
+/// read as data is not yet known ([`CompactFun::merge`]).
 ///
-/// Both alternatives are kept because whether they are really two domains cannot
-/// be decided here: at compact time a domain still carries unresolved variable
-/// identity, so two structurally identical domains can compare unequal. Coalesce
-/// re-runs the comparison on the materialized [`Type`]s and decides there — one
-/// surviving domain is a plain data function, and more than one is a join with no
-/// lossless single-domain answer.
+/// Both alternatives are kept because neither question this defers can be
+/// answered here. Whether they are really two domains cannot: at compact time a
+/// domain still carries unresolved variable identity, so two structurally
+/// identical domains can compare unequal. What two surviving domains *mean*
+/// cannot either: it depends on the slot's kind, which the bounds still arriving
+/// can change. Coalesce answers both — it re-runs the comparison on the
+/// materialized [`Type`]s, and under a `Compute` reading it meets the
+/// alternatives instead, so a `Data` slot with more than one survivor is the one
+/// case with no lossless answer.
 fn union_domains(mut a: Vec<CompactType>, b: Vec<CompactType>) -> Vec<CompactType> {
     for d in b {
         if !a.contains(&d) {
@@ -202,44 +211,39 @@ impl CompactFun {
         let widest = |x: Vec<CompactType>, y: Vec<CompactType>| {
             if x.len() >= y.len() { x } else { y }
         };
-        let (kind, domains) = if a.kind == Conflict || b.kind == Conflict {
+        // The kinds join in the flat semilattice `Unknown < {Data, Compute} <
+        // Conflict`, the same operation at both polarities: `Unknown` is the
+        // identity (nothing required a kind on that side, so the other side's
+        // answer stands), a kind meeting itself is itself, and the two concrete
+        // kinds are incomparable — neither reading stands in for the other, so
+        // `Data` meeting `Compute` has no answer at either polarity.
+        let kind = match (a.kind, b.kind) {
+            (Conflict, _) | (_, Conflict) => Conflict,
+            (Unknown, k) | (k, Unknown) => k,
+            (x, y) if x == y => x,
+            _ => Conflict,
+        };
+        let (kind, domains) = if kind == Conflict {
+            // Keep the wider list so coalesce can render diagnostics.
             (Conflict, widest(a.domains, b.domains))
-        } else if a.kind == Unknown || b.kind == Unknown {
-            // Nothing required a kind on one side, so the other side's answer
-            // stands — at either polarity, and with the domains combined the way
-            // that answer calls for.
-            let kind = if a.kind == Unknown { b.kind } else { a.kind };
-            let domains = if pol && kind == Data {
-                union_domains(a.domains, b.domains)
-            } else if a.domains.len() == 1 && b.domains.len() == 1 {
-                meet(a.domains, b.domains)
-            } else {
-                widest(a.domains, b.domains)
-            };
-            (kind, domains)
         } else if pol {
-            // Positive (join).
-            match (a.kind, b.kind) {
-                (Data, Data) => (Data, union_domains(a.domains, b.domains)),
-                (Compute, Compute) => (Compute, meet(a.domains, b.domains)),
-                // `Data ⊔ Compute` has no answer. The kinds are incomparable, so
-                // neither arm stands in for the other, and the contravariant meet
-                // the compute reading would take is row loss on the data one.
-                _ => (Conflict, widest(a.domains, b.domains)),
-            }
-        } else if a.kind != b.kind {
-            // Negative (meet): `Data ⊓ Compute` has no answer either — one
-            // position cannot require both readings of a function.
-            (Conflict, widest(a.domains, b.domains))
+            // A join accumulates the alternatives whatever the kind. Which
+            // combination the alternatives want *is* a function of the kind — a
+            // `Data` join needs one surviving domain, a `Compute` join needs their
+            // contravariant meet — and the kind is not settled until the last bound
+            // has merged, so a choice made here is made from an answer that does not
+            // exist yet, and a later bound cannot undo it. `coalesce_compact_go`
+            // applies the resolved kind's rule once, at the same place
+            // [`union_domains`]' dedup is re-decided.
+            (kind, union_domains(a.domains, b.domains))
+        } else if a.domains.len() == 1 && b.domains.len() == 1 {
+            // A negative position's rule does not read the kind, so taking it here
+            // decides nothing early.
+            (kind, meet(a.domains, b.domains))
         } else {
-            let k = a.kind;
-            if a.domains.len() == 1 && b.domains.len() == 1 {
-                (k, meet(a.domains, b.domains))
-            } else {
-                // Two multi-domain requirements meeting at a negative position — no current
-                // program produces this; flag it loudly at coalesce.
-                (Conflict, widest(a.domains, b.domains))
-            }
+            // Two multi-domain requirements meeting at a negative position — no current
+            // program produces this; flag it loudly at coalesce.
+            (Conflict, widest(a.domains, b.domains))
         };
         CompactFun {
             name,
@@ -1101,6 +1105,7 @@ fn compact_go(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::infer::solver::{CoalesceError, coalesce_compact};
 
     /// Compact merge at positive polarity unions tags.
     #[test]
@@ -1275,6 +1280,103 @@ mod tests {
         assert!(
             rec.is_empty(),
             "positive payload merge intersects fields; got {rec:?}"
+        );
+    }
+
+    /// A function slot of `kind` over one record domain with `fields`.
+    fn fun_over(kind: KindMerge, fields: &[&str]) -> CompactType {
+        let int = || CompactType::from_atom(AtomKey::Prim(BaseType::Int));
+        let mut rec = BTreeMap::new();
+        for f in fields {
+            rec.insert(FieldKey::Name(SmolStr::from(*f)), int());
+        }
+        CompactType {
+            fun: Some(CompactFun {
+                name: None,
+                kind,
+                domains: vec![CompactType {
+                    rec: Some(rec),
+                    ..CompactType::value()
+                }],
+                codomain: Box::new(int()),
+            }),
+            ..CompactType::value()
+        }
+    }
+
+    fn as_graph(term: CompactType) -> CompactGraph {
+        CompactGraph {
+            term,
+            rec_vars: BTreeMap::new(),
+        }
+    }
+
+    /// A `Data` bound and two undetermined-kind bounds over distinct domains at
+    /// one position: the kinds join to `Data`, so all three domains *are* the
+    /// data and no single one of them holds it — every association rejects.
+    ///
+    /// Reading the kind to pick the domain rule made the association decide
+    /// that. An undetermined pair took the contravariant meet, `{a} ⊓ {b}` is
+    /// `{a, b}`, and that deduplicated against the data bound's own `{a, b}` —
+    /// so one association accepted a collection over `{a, b}` for a join of
+    /// three collections over `{a, b}`, `{a}`, and `{b}`.
+    #[test]
+    fn undetermined_kinds_join_without_deciding_the_domain_rule() {
+        let data = fun_over(KindMerge::Data, &["a", "b"]);
+        let u1 = fun_over(KindMerge::Unknown, &["a"]);
+        let u2 = fun_over(KindMerge::Unknown, &["b"]);
+        for (x, y, z) in [
+            (data.clone(), u1.clone(), u2.clone()),
+            (u1.clone(), data.clone(), u2.clone()),
+            (u1.clone(), u2.clone(), data.clone()),
+        ] {
+            let associations = [
+                CompactType::merge(
+                    true,
+                    CompactType::merge(true, x.clone(), y.clone()),
+                    z.clone(),
+                ),
+                CompactType::merge(true, x, CompactType::merge(true, y, z)),
+            ];
+            for merged in associations {
+                let err = coalesce_compact(&as_graph(merged))
+                    .expect_err("three distinct data domains have no single join");
+                assert!(
+                    matches!(err, CoalesceError::DomainJoinConflict { .. }),
+                    "expected a domain-join conflict; got {err:?}"
+                );
+            }
+        }
+    }
+
+    /// Two undetermined-kind bounds over distinct domains still join: the
+    /// alternatives accumulate at the merge, and the resolved kind's rule — here
+    /// the capability default nothing pinned away from — applies once at
+    /// coalesce, meeting the domains contravariantly.
+    #[test]
+    fn two_undetermined_kinds_join_to_a_capability_over_the_met_domain() {
+        let merged = CompactType::merge(
+            true,
+            fun_over(KindMerge::Unknown, &["a"]),
+            fun_over(KindMerge::Unknown, &["b"]),
+        );
+        assert_eq!(
+            merged.fun.as_ref().map(|f| (f.kind, f.domains.len())),
+            Some((KindMerge::Unknown, 2)),
+            "the merge accumulates the alternatives rather than combining them"
+        );
+        let ty = coalesce_compact(&as_graph(merged)).expect("the domains meet");
+        let Type::Fun { kind, domain, .. } = &ty else {
+            panic!("expected a function; got {ty}");
+        };
+        assert_eq!(*kind, crate::ccl::ty::FunKind::Compute);
+        assert_eq!(
+            *domain,
+            Box::new(Type::Record(vec![
+                ("a".to_string(), Type::Base(BaseType::Int)),
+                ("b".to_string(), Type::Base(BaseType::Int)),
+            ])),
+            "the met domain is the union of the two records' fields"
         );
     }
 
