@@ -666,8 +666,8 @@ mod tests {
     use crate::ccl::infer::typing::Typing;
     use crate::ccl::provenance::NodeId;
 
-    /// A variable minted inside `scoped` carries the binder in its telescope;
-    /// one minted outside does not — the milestone-1 threading, end to end
+    /// A variable minted inside `scoped` carries the binder in its telescope,
+    /// and one minted outside does not. This is the threading end to end
     /// through the emission context.
     #[test]
     fn fresh_variables_carry_the_live_telescope() {
@@ -685,6 +685,44 @@ mod tests {
         assert!(
             !ov.telescope.contains(&k),
             "scoped restores the telescope on exit"
+        );
+    }
+
+    /// An unnamed annotation arrow over a named inferred arrow adopts the
+    /// inferred binder, and the variables normalization mints in the
+    /// annotation's codomain carry it. Without the adoption those variables
+    /// have no telescope entry for the binder, so a dependent refinement flowing
+    /// into the codomain slot is an open bound at the moment it is recorded —
+    /// the group-by lowering's `data_fun(key_ty, Hole)` annotation over
+    /// `λ __gb_k → …` is the exercising case.
+    #[test]
+    fn an_unnamed_annotation_adopts_the_inferred_pi_binder() {
+        let mut ctx = InferCtx::new(HashMap::new(), NodeId::fresh());
+        let k = Name::raw("__gb_k");
+        let inferred = Type::pi_kinded(
+            k.clone(),
+            Type::Base(crate::ccl::BaseType::Int),
+            Type::infer(),
+            crate::ccl::FunKind::Data,
+        );
+        let ann = Type::data_fun(Type::Base(crate::ccl::BaseType::Int), Type::Hole);
+        let bound = ctx
+            .bind_annotation(&inferred, &ann)
+            .expect("the annotation relates to the inferred arrow");
+        let Type::Fun { name, codomain, .. } = &bound else {
+            panic!("expected an arrow, got {bound}");
+        };
+        assert_eq!(
+            name.as_ref(),
+            Some(&k),
+            "the annotation adopts the inferred binder"
+        );
+        let Type::Infer(cod) = &**codomain else {
+            panic!("a `Hole` codomain normalizes to a variable, got {codomain}");
+        };
+        assert!(
+            cod.telescope.contains(&k),
+            "a variable minted in the adopted arrow's codomain carries the binder"
         );
     }
 }

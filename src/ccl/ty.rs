@@ -826,37 +826,84 @@ impl serde::Serialize for Type {
     }
 }
 
+/// Renders through [`fmt_type`] with no enclosing arrow: a self-contained type
+/// carries every arrow its references name, so the spelling is complete. A type
+/// shown detached from an arrow that binds one of its references renders that
+/// reference as its bare index — see [`symbolic::PiBinderEnv`].
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+        fmt_type(f, self, None)
+    }
+}
+
+/// `ty` rendered inside `binders` — the [`Display`](fmt::Display) form of
+/// [`fmt_type`], for a caller that holds an environment and needs a type
+/// string. The symbolic printer takes this for the type slots it renders
+/// inside a refinement predicate, so a reference to an enclosing arrow prints
+/// as that arrow's binder name there too.
+pub(crate) struct TypeUnder<'a, 'b>(
+    pub(crate) &'a Type,
+    pub(crate) Option<&'a symbolic::PiBinderEnv<'b>>,
+);
+
+impl fmt::Display for TypeUnder<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_type(f, self.0, self.1)
+    }
+}
+
+/// Render `ty` inside `binders`, the arrows the rendering has descended
+/// through. Threading them is what lets a refinement predicate print a
+/// reference to one of those arrows by the arrow's own binder name rather than
+/// as a de Bruijn index (`src/ccl/design/type-inference.md`, "Rendering opens
+/// what it descended through").
+fn fmt_type(
+    f: &mut fmt::Formatter<'_>,
+    ty: &Type,
+    binders: Option<&symbolic::PiBinderEnv<'_>>,
+) -> fmt::Result {
+    /// `ty` as a string in the same environment, for the arms that join parts.
+    fn render(ty: &Type, binders: Option<&symbolic::PiBinderEnv<'_>>) -> String {
+        TypeUnder(ty, binders).to_string()
+    }
+    {
+        match ty {
             Type::Base(b) => write!(f, "{}", b.keyword()),
             // `n == 0` means an empty range (e.g. the domain of `[]`); render
             // it as `∅` instead of computing `n - 1` and underflowing.
-            Type::BoundedHole(t) => write!(f, "<:{t}"),
+            Type::BoundedHole(t) => write!(f, "<:{}", render(t, binders)),
             Type::UIntRange(0) => write!(f, "∅"),
             Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
             // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
             // capability (and an unresolved kind var), `⤇` for a data collection
             // (see `FunKind::arrow`), making the collection/capability distinction
             // legible in every type string.
+            //
+            // The codomain renders one arrow deeper, named or not: the index
+            // counts crossings, so an unnamed arrow occupies an entry too.
             Type::Fun {
-                name: Some(x),
+                name,
                 kind,
                 domain,
                 codomain,
-            } => write!(f, "(({x}: {domain}) {} {codomain})", kind.arrow()),
-            Type::Fun {
-                name: None,
-                kind,
-                domain,
-                codomain,
-            } => write!(f, "({domain} {} {codomain})", kind.arrow()),
+            } => {
+                let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
+                let cod = render(codomain, Some(&inner));
+                let dom = render(domain, binders);
+                match name {
+                    Some(x) => write!(f, "(({x}: {dom}) {} {cod})", kind.arrow()),
+                    None => write!(f, "({dom} {} {cod})", kind.arrow()),
+                }
+            }
             Type::Tuple(ts) => {
-                let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
+                let parts: Vec<_> = ts.iter().map(|t| render(t, binders)).collect();
                 write!(f, "({})", parts.join(", "))
             }
             Type::Record(fields) => {
-                let parts: Vec<_> = fields.iter().map(|(n, t)| format!("{n}: {t}")).collect();
+                let parts: Vec<_> = fields
+                    .iter()
+                    .map(|(n, t)| format!("{n}: {}", render(t, binders)))
+                    .collect();
                 write!(f, "{{{}}}", parts.join(", "))
             }
             Type::Variant(tags, openness) => {
@@ -876,7 +923,7 @@ impl fmt::Display for Type {
                 // `a ++ b ++ c` prints as `A | B | C` rather than
                 // `[._0: [._0: A | ._1: B] | ._1: C]`.
                 if let Some(payloads) = synthetic_payloads(tags) {
-                    let parts: Vec<_> = payloads.iter().map(|t| t.to_string()).collect();
+                    let parts: Vec<_> = payloads.iter().map(|t| render(t, binders)).collect();
                     write!(f, "{}{ellipsis}", parts.join(" | "))
                 } else {
                     // CHL's surface spelling — see `fmt_variant_arms`. A `Unit`
@@ -886,7 +933,7 @@ impl fmt::Display for Type {
                         tags.iter().map(|(n, t)| {
                             let payload = match t {
                                 Type::Base(BaseType::Unit) => None,
-                                _ => Some(t.to_string()),
+                                _ => Some(render(t, binders)),
                             };
                             (n.to_string(), payload)
                         }),
@@ -898,9 +945,17 @@ impl fmt::Display for Type {
             // __elem == 5}` is `Int@5`. The predicate is the type's whole content,
             // and spelling it out puts one in front of the reader at every literal.
             // Every other refinement prints in the general form.
-            Type::Refinement(t, r) => match singleton_value(self) {
-                Some(lit) => write!(f, "{t}@{}", symbolic::symbolic(lit)),
-                None => write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate)),
+            //
+            // The predicate renders inside `binders`, so a reference to an
+            // enclosing arrow prints as that arrow's binder name.
+            Type::Refinement(t, r) => match singleton_value(ty) {
+                Some(lit) => write!(f, "{}@{}", render(t, binders), symbolic::symbolic(lit)),
+                None => write!(
+                    f,
+                    "{{{} | {}}}",
+                    render(t, binders),
+                    symbolic::symbolic_under(&r.predicate, binders)
+                ),
             },
             Type::Hole => write!(f, "_"),
             // A hole with an identity renders as one: `_#0` and `_#1` are distinct
@@ -915,6 +970,7 @@ impl fmt::Display for Type {
                 domain,
                 kind,
             } => {
+                let (value, domain) = (render(value, binders), render(domain, binders));
                 if *kind == HistoryKind::Overwrite {
                     write!(f, "Mut({value}, {domain})")
                 } else {
@@ -1054,7 +1110,7 @@ impl Type {
     ///
     /// Closes its codomain exactly as [`Type::pi`] does — the kind is the only
     /// difference, and reaching for a bare [`Type::Fun`] literal to get it is what
-    /// leaves a free binder name in a stored fragment.
+    /// leaves a free binder name in a stored type.
     pub fn pi_kinded(
         name: impl Into<crate::ccl::Name>,
         domain: Self,
@@ -2114,5 +2170,49 @@ mod tests {
         let l = TagMap::from_arms(vec![(name("a"), 1), (name("b"), 2)]);
         let r = TagMap::from_arms(vec![(name("a"), 10)]);
         let _ = l.zip_same_tags(&r, "test", |x, y| x + y);
+    }
+
+    /// A dependent arrow renders its refinement's binder reference as the binder's
+    /// own name: the arrow is in the rendering, so the spelling is available.
+    /// The index is the stored form and the name is the read form.
+    #[test]
+    fn a_dependent_arrow_renders_its_binder_by_name() {
+        let k = crate::ccl::Name::raw("k");
+        let refinement = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(Rc::new(TypedExpr::binop(
+                TypedExpr::var(crate::ccl::Name::elem()),
+                BinOpKind::Compare(CompareKind::Equals),
+                TypedExpr::var(k.clone()),
+            ))),
+        );
+        let ty = Type::pi(k.clone(), Type::Base(BaseType::Int), refinement);
+        assert_eq!(ty.to_string(), "((k: Int) ⇒ {Int | __elem == k})");
+
+        // Rendered detached from the arrow, the same claim has no spelling to
+        // reach and reads as the bare index.
+        let Type::Fun { codomain, .. } = &ty else {
+            panic!("expected an arrow");
+        };
+        assert_eq!(codomain.to_string(), "{Int | __elem == #0}");
+    }
+
+    /// The index counts arrow crossings, so an unnamed arrow between the
+    /// reference and its binder occupies an environment entry: dropping it
+    /// would resolve the reference to the wrong binder.
+    #[test]
+    fn an_unnamed_crossing_still_counts_when_rendering() {
+        let refinement = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(Rc::new(TypedExpr::var(crate::ccl::Name::PiBound(1)))),
+        );
+        // (k: Int) ⇒ (Int ⇒ {Int | #1}) — one unnamed crossing in between.
+        let ty = Type::Fun {
+            name: Some(crate::ccl::Name::raw("k")),
+            kind: FunKind::Compute,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::fun(Type::Base(BaseType::Int), refinement)),
+        };
+        assert_eq!(ty.to_string(), "((k: Int) ⇒ (Int ⇒ {Int | k}))");
     }
 }

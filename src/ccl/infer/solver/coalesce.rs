@@ -165,6 +165,11 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         // kept name slot is what lets descent and application open the frame
         // later, so dropping it on an index-referencing codomain would leave
         // the indices unreachable.
+        debug_assert!(
+            cf.name.is_some() || !crate::ccl::subst::references_outermost_frame(&c),
+            "an index is only ever assigned pointing at a *named* frame, so an \
+             unnamed arrow's codomain cannot reference it",
+        );
         let kept_name = cf.name.clone().filter(|b| {
             crate::ccl::subst::references_outermost_frame(&c)
                 || crate::ccl::subst::type_free_vars(&c).contains(b)
