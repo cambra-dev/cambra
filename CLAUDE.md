@@ -202,7 +202,7 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 Types (from `Display for Type` in `src/ccl/mod.rs`):
 
 - **Function**: `(T ⇒ U)` for a compute function; `(T ⤇ U)` (plain-text `|=>`) for a data function (the domain is the data map, joins must be lossless). Lowering picks the kind from the CHL construct (see `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions"); only a function parameter or a freshened scheme carries a `FunKind::Var`, pinned by the value that reaches it. `Display` renders it live: a data collection shows `⤇`, a capability (and an unpinned kind var) `⇒`. A comprehension over a **let-bound** collection source resolves to `⤇` just like one over a literal source (`let x = [1,2,3] in [y + 10 for y in x]` is `⤇`) — its domain is a data collection.
-- **Sigma**: a value whose type is a dependent sum. `Display for Type` writes the binder — `Σ σ ∈ K. body` — and so should you; see the Σ entry under *Symbolic notation for types and terms* below. A bound witness reference renders `σ`, one left free by a consumed sum `σ#n`.
+- **Sigma**: a value whose type is a dependent sum. `Display for Type` writes the binder — `Σ σ ∈ K. body` — and so should you; see the Σ entry under *Symbolic notation for types and terms* below. A witness reference renders `σ`, bound or free alike; binder ids are off by default and `CCL_SHOW_BINDERS=1` turns them on (`σ@n`, `Σ σ@n ∈ K. body`) for the case that is about identity.
 - **Refinement**: `{T | predicate}` — predicate is rendered via `symbolic`. A **singleton** (a base refined by exactly `__elem == <lit>`) renders `T@lit`: `{Int | __elem == 7}` is `Int@7`.
 - **UIntRange**: `[0, N]`, or `∅` when empty.
 - **Hole**: `_`.

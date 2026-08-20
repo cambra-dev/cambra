@@ -694,9 +694,13 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// TODO remove this constraint once we get rid of the special-casing correlated
 /// refinement code in lambda_elim.
 pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
+    // Through [`Type::domain`], not by matching `Type::Fun` here: a collection indexed by a
+    // witness spells the arrow inside a `Σ` binder, and `Type::fun_like` — which is what
+    // builds these targets — re-closes that binder. Matching the outer constructor rejects
+    // the shape the paired constructor just produced.
     assert!(
-        matches!(&target_ty, Type::Fun { domain: d, .. } if matches!(d.as_ref(), Type::Refinement(..))),
-        "make_cast target_ty must be Fun(Refinement(_, _), _), got {target_ty}"
+        matches!(target_ty.domain(), Some(Type::Refinement(..))),
+        "make_cast target_ty must denote an arrow with a refined domain, got {target_ty}"
     );
     Expr::cast(value, target_ty)
 }
@@ -711,13 +715,14 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
 /// refinement.) The returned `Refinement` shares the predicate's `Rc<Expr>` with
 /// `target`.
 pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
-    let Type::Fun { domain, .. } = target else {
+    // [`Type::domain`] for the same reason [`make_cast`] uses it: the target may be a
+    // witness-indexed collection, whose arrow sits under a `Σ` binder. This has to agree
+    // with `make_cast` on which targets carry a refinement, since one asserts what the
+    // other reads.
+    let Type::Refinement(_, refinement) = target.domain()? else {
         return None;
     };
-    let Type::Refinement(_, refinement) = domain.as_ref() else {
-        return None;
-    };
-    Some(refinement.clone())
+    Some(refinement)
 }
 
 /// Build a function type whose domain is `base_domain` wrapped in a fresh

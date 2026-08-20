@@ -39,6 +39,13 @@ f(box([1, 2, 3]))",
 )]
 // A mapping body, which composes onto the source rather than collapsing to it.
 #[case("x = box([1, 2, 3])\nsum([y * 10 for y in x])", Value::Int(60))]
+// The same mapping body over an **inline** box. Both halves are needed and neither
+// implies the other: the body is what puts the `box` inside a point-free chain, and
+// being inline is what leaves it there as an interior morphism — where `lambda_elim`
+// re-types it as the sum's body, so the erasure has to read the type the introduction
+// states rather than the one the node ended up with.
+#[case("sum([y * 10 for y in box([1, 2, 3])])", Value::Int(60))]
+#[case("sum([y * 10 for y in box([z for z in [1, 2, 3]])])", Value::Int(60))]
 fn a_boxed_collection_is_consumed_like_the_collection_it_wraps(
     #[case] code: &str,
     #[case] expected: Value,
@@ -158,4 +165,46 @@ fn a_filter_over_a_box_that_already_carries_one() {
         "x = box([z for z in [1, 2, 3] if z > 1])\nsum([y for y in x if y < 3])",
         Value::Int(2),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Boxing a sum is the identity
+// ---------------------------------------------------------------------------
+
+/// **`box` is idempotent.** `Σ σ ∈ {𝑆}. σ` is `𝑆` when `𝑆` is itself a sum
+/// ([`cambra::ccl::ty::SigmaType::into_type`]), so a second `box` introduces no
+/// second witness: one value made one choice, and the outer sum's candidate list
+/// contributes its own candidates rather than nesting inside it. That is the
+/// one-candidate instance of the flattening a join already performs.
+///
+/// The law is about the *outer* sum, so the inner one's shape does not matter, and
+/// the cases below are the three it can have: a kind listing one candidate, one
+/// listing several, and one that describes them. Each answers what the singly-boxed
+/// program answers.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// One candidate: the plain re-box, inline and through a binding.
+#[case("sum([y for y in box(box([1, 2, 3]))])", Value::Int(6))]
+#[case("x = box([1, 2, 3])\ny = box(x)\nsum([z for z in y])", Value::Int(6))]
+// Idempotent rather than merely collapsing once: a third `box` adds nothing either.
+#[case("sum([y for y in box(box(box([1, 2, 3])))])", Value::Int(6))]
+// The re-boxed sum is still consumable — a filter over it lands.
+#[case(
+    "x = box([1, 2, 3])\ny = box(x)\nsum([z for z in y if z > 1])",
+    Value::Int(5)
+)]
+// Several candidates: boxing a conditional collection, whose witness is undetermined.
+// A second witness here would be a second choice for the one the conditional made.
+#[case(
+    "c: Bool = True\nzs = box([1, 2]) if c else box([1, 2, 3])\nws = box(zs)\nsum([y for y in ws])",
+    Value::Int(3)
+)]
+// A described kind: `List(Int)` names one domain per length, so there is no candidate
+// list to splice and the outer sum has to adopt the inner sum whole.
+#[case(
+    "xs: List(Int) = box([1, 2, 3])\nys = box(xs)\nsum([z for z in ys])",
+    Value::Int(6)
+)]
+fn boxing_a_sum_is_the_identity(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }

@@ -647,8 +647,8 @@ fn is_bare_witness(ct: &CompactType) -> bool {
 /// Split a position into the **content** that a cross-slot Σ law pushes into a sum's
 /// body and the **names** that stay where they were written.
 ///
-/// This is the [Naming a position is not filling
-/// it](`src/ccl/design/type-inference.md`) split, applied: variables and kinding
+/// The split of `src/ccl/design/type-inference.md`, "Naming a position is not filling
+/// it", applied: variables and kinding
 /// constraints name a position rather than contributing to one. By the time this runs,
 /// compaction has folded a variable's bounds into the concrete slots, so moving the name
 /// inward would relocate it without moving any information, and simplification reads
@@ -1013,8 +1013,19 @@ impl CompactFun {
         // above them either — entering one is a term. The merge above has put both domains
         // in one position; several *denoted* domains there is exactly that conflict, and it
         // is what `[1] if c else [2, 3]` must report instead of quietly acquiring a sum.
+        // **A data domain's refinements are part of it**, and the guard below cannot see
+        // them, because it reads the position *after* the merge: a contravariant meet unions
+        // refinements, so `{𝑑 | 𝑝}` and `𝑑` arrive as two domains and leave as one. Distinct
+        // *shapes* survive the meet and are counted; a distinct refinement is resolved by it,
+        // and the join then denotes a collection filtered by a predicate only one side owed.
+        //
+        // Compared on the inputs for that reason. Their refinement lists are compared rather
+        // than the whole positions, which would demand representational identity the meet
+        // exists to smooth over — variable ids and slot order among them.
+        let refinements_differ = a.domain.refinements != b.domain.refinements;
         let several = matches!(kind_of(&a.kind, &b.kind), Data)
-            && denoted_domains(&domain).is_some_and(|ds| denotes_several_domains_ty(&ds));
+            && (refinements_differ
+                || denoted_domains(&domain).is_some_and(|ds| denotes_several_domains_ty(&ds)));
         let kind = if conflicted(&a.kind) || conflicted(&b.kind) {
             // A conflict already recorded keeps its *reason* — the two are different facts
             // and want different diagnostics.
@@ -2334,6 +2345,71 @@ mod tests {
             Some(Name::from("__gb_k")),
             "the factored body must declare the candidate's binder"
         );
+    }
+
+    /// **A refinement is part of a data domain, so a join may not acquire one.** The
+    /// contravariant meet a `fun` slot's domain takes *unions* refinements, so a domain
+    /// carrying a filter and one carrying none merge to the filtered domain — and the joined
+    /// collection then denotes rows filtered by a predicate only one side owed. That is the
+    /// wrong-answer half of the losslessness `FunKind::Data` exists to enforce.
+    ///
+    /// Reported as a domain conflict rather than by dropping the refinement, which is the
+    /// other wrong answer: it loses a filter the program wrote.
+    ///
+    /// A distinct domain *shape* needs no test here — it survives the meet as two denoted
+    /// domains and the guard already counts it. A refinement is the case the meet *resolves*,
+    /// which is why it has to be compared before merging.
+    #[test]
+    fn a_data_join_does_not_acquire_one_sides_domain_refinement() {
+        let filtered_domain = CompactType {
+            refinements: vec![Refinement {
+                predicate: Rc::new(crate::ccl::TypedExpr::lit(crate::ccl::Lit::Bool(true))),
+            }],
+            ..CompactType::from_atom(AtomKey::UIntRange(2))
+        };
+        let data_fun = |domain: CompactType| CompactType {
+            fun: Some(CompactFun {
+                name: None,
+                kind: KindMerge::Data,
+                domain: Box::new(domain),
+                codomain: Box::new(CompactType::from_atom(AtomKey::Prim(BaseType::Int))),
+            }),
+            ..Default::default()
+        };
+        // Positive polarity: the join a conditional's two arms build.
+        let merged = CompactType::merge(
+            true,
+            data_fun(filtered_domain),
+            data_fun(CompactType::from_atom(AtomKey::UIntRange(2))),
+        );
+        assert_eq!(
+            merged.fun.expect("fun slot present").kind,
+            KindMerge::DomainConflict,
+            "a data join must not acquire a refinement only one side carried"
+        );
+    }
+
+    /// The control: two data functions over the *same* refined domain join without
+    /// conflict. The rule is about a refinement one side lacks, not about refinements.
+    #[test]
+    fn a_data_join_over_one_refined_domain_is_fine() {
+        let refined = || CompactType {
+            refinements: vec![Refinement {
+                predicate: Rc::new(crate::ccl::TypedExpr::lit(crate::ccl::Lit::Bool(true))),
+            }],
+            ..CompactType::from_atom(AtomKey::UIntRange(2))
+        };
+        let data_fun = |domain: CompactType| CompactType {
+            fun: Some(CompactFun {
+                name: None,
+                kind: KindMerge::Data,
+                domain: Box::new(domain),
+                codomain: Box::new(CompactType::from_atom(AtomKey::Prim(BaseType::Int))),
+            }),
+            ..Default::default()
+        };
+        let merged = CompactType::merge(true, data_fun(refined()), data_fun(refined()));
+        assert_eq!(merged.fun.expect("fun slot present").kind, KindMerge::Data);
     }
 
     /// Compact merge at positive polarity unions tags.

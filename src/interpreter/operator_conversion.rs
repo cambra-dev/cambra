@@ -452,6 +452,18 @@ impl OpConversionContext {
             // source's. `transact_phase` emits `Mut(V, Txn)` stores, so this is a
             // live path — a transactional store's history domain converts here.
             Type::Txn => Ok(Extent::Base(BaseType::UInt)),
+            // An **unrealized sum**, rejected by name rather than through the catch-all
+            // below. Realization erases the sums whose witness is statically enumerable
+            // (`src/ccl/planning/conditionals.rs`), so one reaching here ranges over
+            // domains no fan-out could list — a described witness kind, `List(T)` or
+            // `Collection(T)` — and what it needs is the runtime witness
+            // (`src/ccl/design/collections.md`, "Future work"). That is an unimplemented
+            // capability, so it must not be reported as a compiler bug; `planning::iterate`
+            // and `planning::conditionals` both leave such a type standing for this arm.
+            Type::Sigma(_) | Type::WitnessRef(_) => Err(ConversionError::Unsupported(format!(
+                "a collection whose domain is not statically known ({ty}) has no extent: \
+                 the runtime witness is not implemented"
+            ))),
             other => Err(ConversionError::TypeError(format!(
                 "Cannot convert CCL type {other:?} to an interpreter extent; \
                  this is a compiler bug — type inference should have resolved \

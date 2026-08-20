@@ -2667,6 +2667,30 @@ one of them is a compile-time error rather than a runtime one.
 Boxing is only ever needed where the possibilities genuinely differ. Where they
 agree, `box` changes nothing: `box(xs) if c else box(xs)` is just `xs`.
 
+`box` is **idempotent**: `box(box(x))` is `box(x)`. A boxed value already carries
+which possibility it is, and boxing it again asks the same question of one
+answer, so a program may box freely without tracking whether a value came to it
+boxed.
+
+**Box the value that meets, not one inside it.** Branches meet at the
+conditional, so that is where the `box` belongs:
+
+```python
+box([y for y in xs if y > 1]) if c else box(ys)              # ✅
+[y for y in box(xs) if y > 1] if c else [z for z in box(ys)]  # ❌
+```
+
+Both spellings box something, and only the first boxes the values that meet.
+Filtering a collection gives a collection over a **narrower domain**, so the
+second spelling's branches are a filtered collection and an unfiltered one —
+still two different domains, which is the thing `box` is needed for and which
+boxing further in does not address. The error names the domains.
+
+Two boxed collections meet when the only difference between them is which domain
+each is over. That is why boxing each branch's *result* works: the filter is
+then part of the domain that branch remembers, and remembering the domain is
+what `box` does.
+
 Writing an abstract collection type is the other way to make branches meet — a
 value must be boxed to reach a `List(T)` or `Collection(T)` annotation (§6.3),
 which keeps the elements but forgets which collection it was, and with it any

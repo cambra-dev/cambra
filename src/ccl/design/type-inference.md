@@ -1423,11 +1423,15 @@ rules rather than a stipulation:
   conversely, so a one-candidate box sits strictly *below* its content and is usable
   wherever the content is. That is what makes boxing free where the arms agree, with
   no collapse convention to state anywhere.
-- **Nesting flattens at construction** — `Σ 𝑇 ∈ {Σ 𝑈 ∈ {𝑇ᵢ}. 𝑈}. 𝑇 ≡ Σ 𝑇 ∈ {𝑇ᵢ}. 𝑇`, a well-formedness
-  condition on the constructor rather than a subtyping law, and the same
+- **Nesting flattens**, so `box` is idempotent — `Σ 𝑇 ∈ {Σ 𝑈 ∈ {𝑇ᵢ}. 𝑈}. 𝑇 ≡ Σ 𝑇 ∈ {𝑇ᵢ}. 𝑇`,
+  a well-formedness condition on the type rather than a subtyping law, and the same
   candidates-taken-whole rule that gives the width rule its associativity. Compare
-  [Union flattening (construction-time)](#union-flattening-construction-time). The
-  listing is non-empty by construction, which [`SigmaType::over`] already asserts.
+  [Union flattening (construction-time)](#union-flattening-construction-time). It applies
+  at **materialization** ([`SigmaType::into_type`]) rather than where the sum is
+  constructed: `box`'s scheme writes `Σ 𝑇 ∈ {𝑎}. 𝑇` with `𝑎` a variable, so the candidate
+  has a shape only once the solver resolves it. The outer binder is the one that survives,
+  since occurrences elsewhere in the tree already name it. The listing is non-empty by
+  construction, which [`SigmaType::over`] already asserts.
 
 **`box` is not a no-op.** A sum is a pair, so introducing one *pairs the value with its
 witness*, and that is real content — unlike [`Cast`](ir.md#cast--explicit-refinement-acquisition),
@@ -1835,7 +1839,7 @@ conditions matter, and keeping them separate resolves what would otherwise look 
 imminent counterexample.
 
 `Set(𝐾)` versus `Map(𝐾, unit)` is a genuine failure of (1) — with the kind unrepresented
-they are *the same type* ([`Type::set_of`] delegates to [`Type::map_of`]), and no
+they are *the same type* — a set constructor delegates to the map one — and no
 inspection of the shared domain `{𝐾 | tok}` distinguishes them. Three answers are
 possible, and the criterion ranks them:
 

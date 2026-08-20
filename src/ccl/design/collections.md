@@ -41,10 +41,10 @@ function `𝐷 ⤇ 𝑉`. The surface kinds `List`, `Array`, `Set`, `Map`, and
 `Collection` are *meant* to be distinct, each with its own operations, and that
 is the decided direction ([Two axes](#two-axes-representation-vs-kind-decided-direction-representation-tentative)).
 How a kind is represented is *tentatively* settled — the witness kind for four of them, a
-**nominal head** for the ambiguous pair — and today it is not represented at all: `Array(𝑛, 𝑇)` and `List(𝑇)` share the range representation
-`[0,𝑛) ⤇ 𝑇`, `Set(𝐾)` and `Map(𝐾, 𝑉)` share the `Keyed(𝐾)` witness kind, and
-`Set(𝐾)` is *literally* `Map(𝐾, unit)` ([`Type::set_of`] delegates to
-[`Type::map_of`]). So the operation layer has nothing to dispatch on yet.
+**nominal head** for the ambiguous pair — and today it is not represented at all:
+`Array(𝑛, 𝑇)` and `List(𝑇)` share the range representation `[0,𝑛) ⤇ 𝑇`, `Set(𝐾)` and
+`Map(𝐾, 𝑉)` will share the `Keyed(𝐾)` witness kind, with `Set(𝐾)` *literally*
+`Map(𝐾, unit)`. So the operation layer has nothing to dispatch on yet.
 
 ### Two axes: representation vs kind [Decided direction; representation tentative]
 
@@ -728,8 +728,8 @@ most already implemented.
   [Views](#operations-how-the-trait-layer-is-realized-planned) and
   [chl-spec §6.3](../../../docs/chl-spec.md#63-direction-collections-as-functions-decided)).
 - **`Set(𝐾)` vs `Map(𝐾, unit)`** — no subtyping arm relates them, because with the
-  kind unrepresented they are the *same type* ([`Type::set_of`] delegates to
-  [`Type::map_of`]). Under the [tentative
+  kind unrepresented they are the *same type* — a set constructor delegates to the map
+  one. Under the [tentative
   direction](#two-axes-representation-vs-kind-decided-direction-representation-tentative)
   they become distinct **nominal heads**, and the relation between them (if any) is then
   a deliberate declaration rather than a structural accident. That is the *only* edge
@@ -1282,8 +1282,9 @@ rest in, and why that order. Each step is independently landable and pins a test
 >   is minted at creation](#witness-identity-is-minted-at-creation-load-bearing). A
 >   shared anonymous key domain would let one map's membership proof discharge
 >   against another's, and identity cannot be retrofitted onto values already
->   conflated. **Discharged** by the [`Builtin::KeyDom`] token, whose [`KeyDomId`] is
->   minted per creation site (`key_domains_are_per_creation_site`).
+>   conflated. **Discharged** by the `Builtin::KeyDom` token, whose `KeyDomId` is
+>   minted per creation site (`key_domains_are_per_creation_site`) — landing with
+>   `groupby-keyed-collection` per [Status](#status).
 > - **Decide how a collection kind is represented** — **tentatively decided**: the
 >   witness kind carries four of the five, and `Set`/`Map` — the pair it cannot
 >   discriminate — become **nominal type heads**, landing with nominal types
@@ -1303,14 +1304,16 @@ rest in, and why that order. Each step is independently landable and pins a test
    `UIntRanges` kind — which removed
    the `{𝑖 | 𝑖 < 𝑛}` refinement, its built-typed-predicate construction, and the
    filtered-range hole (a `Refinement` is not a `UIntRange`, so a filtered collection
-   can no longer hand `List` a length witness for a domain with holes). Also landed:
-   the **keyed** kind [`TypeKind::Keyed`] — every witness is a type classified by a
-   kind, so the keyed discharge is plain kind containment.
+   can no longer hand `List` a length witness for a domain with holes).
 
-   Also landed: the concrete keyed domain `{𝐾 | __elem ▷ keydom#id}` and the
-   [`Builtin::KeyDom`] token, which deleted `Builtin::Member` (and with it the
-   `bool_or` / characteristic-predicate options and the ∃ problem). The
-   representation choice was traced, not guessed:
+   The rest of the step is the **keyed** kind `TypeKind::Keyed` — every witness is a type
+   classified by a kind, so the keyed discharge is plain kind containment — landing with
+   `groupby-keyed-collection` per [Status](#status).
+
+   It carries the concrete keyed domain `{𝐾 | __elem ▷ keydom#id}` and a `Builtin::KeyDom`
+   token, which retires `Builtin::Member` (and with it the `bool_or` /
+   characteristic-predicate options and the ∃ problem). The representation choice was
+   traced, not guessed:
    - A nominal domain *atom* cannot work: `AtomKey` is a **discrete** set — only
      reflexive arms exist for the nominal leaves, atoms merge by set union, and
      coalesce rejects ≥ 2 shapes at a position. So `KeyDom(id, Int) <: Int` would need
@@ -1333,7 +1336,8 @@ rest in, and why that order. Each step is independently landable and pins a test
    invariant it names (a key-domain atom never reaches op-conversion as a term) is real
    whether the atom is `∈` or a token.
 
-   > **What unblocked it.** A first attempt at this swap was reverted, because
+   > **What unblocks it**, measured on `groupby-keyed-collection`. A first attempt at this
+   > swap was reverted, because
    > `Member`'s shared-variable scheme `∀κ. (κ, Collection(κ)) → Bool` had been doing
    > double duty: it was also what **pinned the key type**, linking `κ` between `__elem`
    > and the inlined key-image's element. An opaque token links nothing, and nothing
@@ -1348,13 +1352,14 @@ rest in, and why that order. Each step is independently landable and pins a test
 2. **Restore direct group-by key application; then lookup discharge + `Option`.**
    Two halves of one mechanic, and the first half is a *regression fix*, not a new
    capability. `groupby`'s honest keyed type makes `g(k)` a type error — the bare key
-   cannot prove `𝑘 ∈ 𝐸` — which turned off nine previously-green tests: six
-   end-to-end value cases (`test_dependent_groupby_lookup` in
+   cannot prove `𝑘 ∈ 𝐸` — which turns off nine tests green today on the imprecise total
+   type: six end-to-end value cases (`test_dependent_groupby_lookup` in
    `tests/compilation_pipeline/misc.rs`) and three dependent-application type tests
    (`test_groupby_aggregate`, `test_groupby_dependent_application_discharges_key`,
-   `test_higher_order_dependent_application_discharges_key` in
-   `tests/type_check.rs`), each `#[ignore]`d naming this step. **Un-ignoring all nine
-   is the acceptance criterion.** The prerequisite is [making the membership proof
+   `test_higher_order_dependent_application_discharges_key` in `tests/type_check.rs`).
+   The branch that lands the keyed type `#[ignore]`s them naming this step, and
+   **un-ignoring all nine is the acceptance criterion.** The prerequisite is [making the
+   membership proof
    survive being consumed](#prerequisite-the-proof-has-to-survive-being-consumed);
    the surface pair `𝑐[𝑘]` / `𝑐[𝑘]?` and `Option` over the landed `Variant` nodes
    (shared with `txn_kv`) sit directly on top.

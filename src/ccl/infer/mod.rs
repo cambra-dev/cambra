@@ -363,7 +363,8 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             "collection domain conflict at {}: {} \
              (two constraints on this collection's domain have no common answer, and \
              narrowing to one would drop rows. If these are the arms of a conditional, \
-             wrap each in `box` to keep both domains)",
+             wrap each *arm* in `box` to keep both domains — boxing a collection inside an \
+             arm and then filtering it leaves the arms over different domains still)",
             ctx_label, details
         )),
         CoalesceError::KindConflict { details } => InferError::Unsupported(format!(

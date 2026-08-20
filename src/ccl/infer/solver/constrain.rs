@@ -465,18 +465,6 @@ fn closed_sum(ty: &Type) -> Option<Type> {
     ))))
 }
 
-/// The range of the free witness a domain position **is** — written there, or demanded of
-/// a variable standing there.
-///
-/// Elimination names the consumed sum's witness against whatever domain the consumer
-/// declared, and a consumer mints a fresh one, so the position usually reads `?d` with the
-/// witness on its upper bounds. Following the bound is the move [`candidate_shape`] makes,
-/// in the direction this fact travels: a candidate is determined by what flows *into* it,
-/// a consumed domain by what is demanded *of* it.
-///
-/// The depth bound is a cycle guard, not a search budget — `?a <: ?b`, `?b <: ?a` is a
-/// recursive type the solver rejects later, and this must not hang first. Any real chain
-/// is one hop.
 /// The one domain `binder` can be, when its range leaves it no choice.
 ///
 /// A range naming exactly one domain *determines* the witness, so it **is** that domain and
@@ -537,22 +525,6 @@ fn unify_sum_witnesses(lv: &Rc<InferVar>, lows: Rc<Vec<Bound>>) -> Rc<Vec<Bound>
     Rc::new(renamed)
 }
 
-/// The **domain** half of consuming a sum: name the witness, and publish what it ranges
-/// over.
-///
-/// The consumer's domain is told *which* witness it ranges over — a reference to the
-/// sum's binder. A reference is a leaf and not a [`Type::Infer`], so nothing can unify it
-/// away, which is what stops a conditional collection being narrowed to one arm by a
-/// demand. Every sum
-/// describing one value has already been brought under one binder
-/// ([`crate::ccl::infer_var::InferVar::witness_binder`]), so the arms of a conditional
-/// reaching this consumer separately emit the *same* edge, and the ordinary pointwise
-/// closure needs no join assembled ahead of it.
-///
-/// The witness is **not bound here**: the consumer's result is an unresolved variable at
-/// this point, so the reference stays free in the graph until materialization binds it
-/// (in `src/ccl/infer/solver/compact.rs`). None may survive coalesce still free — that is
-/// the escape check.
 /// Bring the sum's witnesses under the **names the context already gave them**, position by
 /// position. Answers whether every witness in `body_domain` was named, in which case there is
 /// no edge left to draw.
@@ -581,6 +553,21 @@ fn adopt_the_contexts_names(consumer: &Type, body_domain: &Type, range: &TypeKin
     }
 }
 
+/// The **domain** half of consuming a sum: name the witness, and publish what it ranges
+/// over.
+///
+/// The consumer's domain is told *which* witness it ranges over — a reference to the
+/// sum's binder. A reference is a leaf and not a [`Type::Infer`], so nothing can unify it
+/// away, which is what stops a conditional collection being narrowed to one arm by a
+/// demand. Every sum describing one value has already been brought under one binder
+/// ([`crate::ccl::infer_var::InferVar::witness_binder`]), so the arms of a conditional
+/// reaching this consumer separately emit the *same* edge, and the ordinary pointwise
+/// closure needs no join assembled ahead of it.
+///
+/// The witness is **not bound here**: the consumer's result is an unresolved variable at
+/// this point, so the reference stays free in the graph until materialization binds it
+/// (in `src/ccl/infer/solver/compact.rs`). None may survive coalesce still free — that is
+/// the escape check.
 fn demand_domain_range(
     domain: &Type,
     body_domain: &Type,
@@ -616,6 +603,18 @@ fn demand_domain_range(
     constrain_go(domain, body_domain, sr, sl, cache)
 }
 
+/// The free witness a domain position **is** — written there, or demanded of a variable
+/// standing there.
+///
+/// Elimination names the consumed sum's witness against whatever domain the consumer
+/// declared, and a consumer mints a fresh one, so the position usually reads `?d` with the
+/// witness on its upper bounds. Following the bound is the move [`candidate_shape`] makes,
+/// in the direction this fact travels: a candidate is determined by what flows *into* it,
+/// a consumed domain by what is demanded *of* it.
+///
+/// The depth bound is a cycle guard, not a search budget — `?a <: ?b`, `?b <: ?a` is a
+/// recursive type the solver rejects later, and this must not hang first. Any real chain
+/// is one hop.
 fn free_witness_of(domain: &Type) -> Option<crate::ccl::infer_var::WitnessBinderId> {
     fn go(ty: &Type, depth: usize) -> Option<crate::ccl::infer_var::WitnessBinderId> {
         match ty {
@@ -820,7 +819,6 @@ fn constrain_sigma_width(
             v.bounds.borrow_mut().kinds.push(k);
         }
         if let Some((subs, sups)) = obligations.pairing {
-            let (subs, sups) = (subs, sups);
             discharge_pairing(&subs, &sups, sl, sr, lhs, rhs)?;
         }
         for (_, elem) in fibers {
@@ -917,7 +915,6 @@ fn discharge_pairing(
 /// would record a constraint for a correspondence that may then be rejected — and no
 /// cache can undo that. Groundness is therefore the actual precondition, and a non-ground
 /// pair gets only the `𝑒 = 𝑑` instance, which needs no search at all.
-///
 fn probe_edge(sub: &Type, sup: &Type, ssub: &Subst, ssup: &Subst) -> bool {
     if sub == sup {
         return true;

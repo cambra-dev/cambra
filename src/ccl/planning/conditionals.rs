@@ -717,9 +717,7 @@ fn realize(
     // which every consumer's `𝐷`-shaped demand would then have to undo
     // (`src/ccl/design/ir.md`, "`Copair` and `DisjointJoin` — two collection-combining
     // operations, not one").
-    let mentions_witness = !witnesses.is_empty()
-        || matches!(peel_refinements(&original), Type::Sigma(_))
-        || crate::ccl::ty::has_free_witness_ref(&original, &[]);
+    let mentions_witness = !witnesses.is_empty() || original.is_witness_indexed();
     // One leg denotes just that arm's collection — no union, and no witness to discriminate
     // on. It keeps its gate, which rides its domain either way.
     let realized = if legs.len() == 1 {
@@ -781,11 +779,49 @@ fn arm_choices(
         arms.push(ArmChoice {
             witness: witness.clone(),
             gate,
-            arm: unbox(b.body, None).0,
+            arm: discharge_determined_witnesses(b.body),
             dom,
         });
     }
     Some(arms)
+}
+
+/// An arm with every **determined** witness discharged — the term *and* the types.
+///
+/// [`unbox`] alone is the term half, and only where the arm *is* the introduction. A `box`
+/// interior to the arm — anything with a mapping body, where the introduction becomes a
+/// morphism inside a point-free chain — leaves the resulting sum standing on the arm's type,
+/// and the leg then carries it into the union, where the assertion that a leg is a plain
+/// collection rightly fails.
+///
+/// Both halves, in the order [`realize_conditional_collections`] runs them tree-wide: the
+/// term first, so no `box` is left whose function type the type half would rewrite (that type
+/// is what [`unbox`] reads to know the witness is determined), then the types, per occurrence
+/// via [`instantiate_erased_witnesses`] — a binder is named by both spellings of its sum, and
+/// one global substitution would put a domain where the unfactored spelling wants an arrow.
+///
+/// The erased set is **local** to the arm, which is what keeps realization's own witness out
+/// of it: an arm-level `box` names the arm's binder, never the site's, so the sum
+/// [`TypedExprNode::Realize`] asserts over the union is untouched.
+fn discharge_determined_witnesses(arm: Expr) -> Expr {
+    fn go(
+        expr: &mut Expr,
+        erased: &mut std::collections::HashSet<crate::ccl::infer_var::WitnessBinderId>,
+    ) {
+        expr.walk_children_mut(|child| go(child, erased));
+        let (unboxed, _) = unbox(
+            std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)),
+            Some(erased),
+        );
+        *expr = unboxed;
+    }
+    let mut arm = arm;
+    let mut erased = std::collections::HashSet::new();
+    go(&mut arm, &mut erased);
+    if !erased.is_empty() {
+        instantiate_erased_witnesses(&mut arm, &erased, &PredMemo::new());
+    }
+    arm
 }
 
 /// One witness taking one arm: what a leg is a tuple of.
@@ -965,10 +1001,26 @@ fn unbox(
     if !matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) {
         return (e, false);
     }
+    // **A box over a sum introduced nothing**, so it goes whatever its candidates are.
+    // Boxing a sum is the identity ([`crate::ccl::ty::SigmaType::into_type`]), so this node
+    // and its argument carry the same type and no witness is being erased — nothing is
+    // recorded, and `instantiate_erased_witnesses` must not touch a binder that is still
+    // live in the argument.
+    if matches!(peel_refinements(&argument.ty), Type::Sigma(_)) {
+        return ((**argument).clone(), true);
+    }
+    // **The introduction's stated type, because only a binding position carries the kind.**
+    // Determinedness is a fact about the witness's range, and a range belongs to its binder
+    // ([`Type::witness_kind`]) — so an interior `box`, whose node type is the sum's body with
+    // the witness free, cannot answer. `box`'s function type states the sum it introduces and
+    // no rewrite retypes it.
+    let stated = function.ty.codomain().unwrap_or_else(|| e.ty.clone());
     // Only a determined witness — one candidate — is erasable.
-    match peel_refinements(&e.ty) {
-        Type::Sigma(s) if matches!(s.kind().listed(), Some([_])) => {
-            if let Some(erased) = erased {
+    match stated.witness_kind() {
+        Some(kind) if matches!(kind.listed(), Some([_])) => {
+            if let Some(erased) = erased
+                && let Type::Sigma(s) = peel_refinements(&stated)
+            {
                 erased.insert(s.binder());
             }
             // Reported rather than inferred from the recorded set: the *same* binder can be

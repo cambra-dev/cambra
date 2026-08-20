@@ -539,6 +539,74 @@ fn test_comprehension_over_conditional(#[case] code: &str, #[case] expected: Val
     check_scalar(code, expected);
 }
 
+/// **The arm is itself a witness-indexed collection**, which the cases above never build:
+/// there the `box` is the arm and the mapping body sits over the whole conditional, so the
+/// arm's own type is a plain collection. Move the body *inside* each arm and the `box`
+/// becomes a morphism interior to that arm's point-free chain, so the arm carries the
+/// resulting sum on its type — a determined witness the arm still quantifies when it
+/// becomes a leg.
+///
+/// Realizing it needs both halves of the erasure, not just the term half `unbox` performs
+/// on an arm: with only the term erased the leg stays a sum, and a leg is asserted to be a
+/// plain collection over the union's `Variant` of domains.
+///
+/// Every case discriminates the *selected* arm rather than only compiling: the two branch
+/// values differ, so a leg chosen by the wrong gate is a wrong answer and not a crash.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Distinct domains, each arm mapping its own elements.
+#[case(
+    r"
+c: Bool = True
+xs = [y * 10 for y in box([1, 2])] if c else [z * 100 for z in box([1, 2, 3])]
+sum([w for w in xs])",
+    Value::Int(30)
+)]
+#[case(
+    r"
+c: Bool = False
+xs = [y * 10 for y in box([1, 2])] if c else [z * 100 for z in box([1, 2, 3])]
+sum([w for w in xs])",
+    Value::Int(600)
+)]
+// Same-domain arms: no witness to discriminate on, so the union is a `DisjointJoin` — the
+// arm's own witness still has to go.
+#[case(
+    r"
+c: Bool = True
+xs = [y * 10 for y in box([1, 2])] if c else [z * 100 for z in box([3, 4])]
+sum([w for w in xs])",
+    Value::Int(30)
+)]
+// Three arms, mapping bodies throughout.
+#[case(
+    r"
+n: Int = 2
+xs = [y * 10 for y in box([1])] if n == 1 else [z * 100 for z in box([2, 2])] if n == 2 else [w for w in box([3, 3, 3])]
+sum([v for v in xs])",
+    Value::Int(400)
+)]
+// A consumer filter on top: the restriction rides the witness and is gated per leg, over
+// arms that each carry a witness of their own.
+#[case(
+    r"
+c: Bool = True
+xs = [y * 10 for y in box([1, 2])] if c else [z * 100 for z in box([1, 2, 3])]
+sum([w for w in xs if w > 10])",
+    Value::Int(20)
+)]
+// Two consumers of the one binding, one filtered — each gets its own legs.
+#[case(
+    r"
+c: Bool = True
+xs = [y * 10 for y in box([1, 2])] if c else [z * 100 for z in box([1, 2, 3])]
+sum([w for w in xs]) + sum([v for v in xs if v > 10])",
+    Value::Int(50)
+)]
+fn an_arm_that_is_itself_witness_indexed_is_realized(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// **The source need not be a literal `Case`.** Consuming a conditional collection goes
 /// through one rule, so what matters is the *type* at the generator, not the syntax that
 /// put it there — a binding, a parameter, or a filter in between are all the same rule.

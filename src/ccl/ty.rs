@@ -370,9 +370,9 @@ impl Openness {
 /// solver resolves it, like a type variable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FunKind {
-    /// domain (`⇒`): lossy meet at a join is fine.
+    /// A compute function / capability (`⇒`): lossy meet at a join is fine.
     Compute,
-    /// domain (`⤇`): the domain is data; joins must be lossless.
+    /// A data function / collection (`⤇`): the domain is data; joins must be lossless.
     Data,
     /// An unresolved kind, pinned down by the solver at coalesce. Identity is by
     /// the variable's `uid`, so `FunKind` (and `Type`) keep deriving
@@ -1390,8 +1390,9 @@ impl SigmaType {
             &Type::WitnessRef(witness.binder()),
         );
         if renamed == *self.body {
-            // Vacuous in its own witness: nothing to rename, and `bound` would rightly
-            // reject the result.
+            // Vacuous in its own witness: nothing names the binder, so nothing to rename,
+            // and the fresh binder minted above would only be a second name for a witness
+            // no occurrence mentions.
             return self.clone();
         }
         SigmaType::bound(witness, renamed)
@@ -1459,6 +1460,31 @@ impl SigmaType {
     /// of naming it. [`has_sum_in_domain_position`] is the check that keeps the two apart.
     pub fn body_is_witness(&self) -> bool {
         matches!(&*self.body, Type::WitnessRef(w) if *w == self.binder())
+    }
+
+    /// This sum as a type, **flattening a sum reached as its sole candidate**:
+    /// `Σ 𝜎 ∈ {𝑆}. 𝜎` is `𝑆`.
+    ///
+    /// The nesting rule of `src/ccl/design/type-inference.md`, "Only a term builds a sum",
+    /// which makes [`Builtin::Box`](crate::ccl::Builtin) idempotent. The doc states it on
+    /// the constructor; it is applied *here* because a candidate is a variable when the
+    /// scheme is instantiated and has a shape only once the solver resolves it, so
+    /// materialization is the first place the question can be answered.
+    ///
+    /// The inner kind's shape does not matter — the rule is about the outer sum — so one
+    /// listed candidate (`box(box(xs))`), several (`box` of a conditional collection), and
+    /// a described kind (`box` of a `List(𝑉)`) all go through without an arm each.
+    ///
+    /// The **outer** binder survives and the inner is renamed onto it. Answering the inner
+    /// sum unchanged would strip a binder that occurrences elsewhere in the tree already
+    /// name; renaming keeps them pointing at the witness they were typed against.
+    pub fn into_type(self) -> Type {
+        if self.body_is_witness()
+            && let Some([Type::Sigma(inner)]) = self.kind().listed()
+        {
+            return inner.rename_binder(self.binder()).into_type();
+        }
+        Type::Sigma(Box::new(self))
     }
 
     /// The **factored view** of a witness-bodied collection sum: `Σ 𝜎 ∈ {𝐷ᵢ ⤇ 𝑉}. 𝜎` read
@@ -2267,6 +2293,52 @@ impl Type {
         match self {
             Type::Fun { codomain, .. } => Some(codomain.as_ref().clone()),
             Type::Sigma(s) => s.body.codomain(),
+            _ => None,
+        }
+    }
+
+    /// Whether the arrow this type denotes is indexed by a **witness** rather than by a
+    /// written domain — the closed and open spellings of one collection, answered together.
+    ///
+    /// After `lambda_elim` a collection has two spellings, and which one a reader meets is
+    /// a fact about position, not about the collection: the `Σ` sits at the position that
+    /// binds the witness, and every interior position carries the sum's *body* with the
+    /// witness free (a `Compose` chain composes on codomains, and a `Σ` has none — so
+    /// exactly one position per chain can hold the binder). Both spell the same collection,
+    /// so a reader asking "is this indexed by a witness" must accept either, and a reader
+    /// that tests only `Type::Sigma` silently answers `false` at every interior position.
+    ///
+    /// Refinements are peeled: a consumer's filter rides the witness (`{𝑤 | 𝑝}`), so a
+    /// restricted collection is witness-indexed like an unrestricted one.
+    pub fn is_witness_indexed(&self) -> bool {
+        let head = {
+            let mut t = self;
+            while let Type::Refinement(inner, _) = t {
+                t = inner;
+            }
+            t
+        };
+        matches!(head, Type::Sigma(_)) || has_free_witness_ref(head, &[])
+    }
+
+    /// The kind the witness indexing this collection ranges over — **only where the binder
+    /// is**.
+    ///
+    /// `None` says one of two things, and the difference is what a caller has to think
+    /// about: either no witness indexes this collection, or the binder is at an enclosing
+    /// position and this is its body ([`is_witness_indexed`](Self::is_witness_indexed)
+    /// separates the two). A range belongs to a binder, so the body genuinely cannot answer
+    /// — the index that could ([`witness_ctx`]) is scoped to the inference run and is gone
+    /// by planning.
+    ///
+    /// So a caller needing the kind after inference must read it off a position that binds:
+    /// a `box`'s own function type states the sum it introduces, and no rewrite retypes it.
+    /// Asking the *node* instead is how a determined witness goes unrecognized wherever the
+    /// introduction is interior to a chain.
+    pub fn witness_kind(&self) -> Option<&TypeKind> {
+        match self {
+            Type::Refinement(inner, _) => inner.witness_kind(),
+            Type::Sigma(s) => Some(s.kind()),
             _ => None,
         }
     }
@@ -3889,6 +3961,68 @@ mod witness_subst_tests {
             s.instantiate_body(&range(2)),
             Type::data_fun(range(2), Type::Base(BaseType::Int))
         );
+    }
+
+    /// **Both spellings of one collection answer the same.** After `lambda_elim` the `Σ`
+    /// sits at the position that binds the witness and every interior position carries the
+    /// body with the witness free, so a reader testing only `Type::Sigma` answers `false`
+    /// at every interior position — which is how a witness-indexed collection gets treated
+    /// as a written domain.
+    #[test]
+    fn both_spellings_are_witness_indexed() {
+        let int = Type::Base(BaseType::Int);
+        let closed = Type::Sigma(Box::new(sum(TypeKind::UIntRanges, |w| {
+            Type::data_fun(Type::WitnessRef(w), int.clone())
+        })));
+        let Type::Sigma(s) = &closed else {
+            unreachable!("built a sum")
+        };
+        let open = (*s.body).clone();
+        assert!(closed.is_witness_indexed(), "the closed spelling: {closed}");
+        assert!(open.is_witness_indexed(), "the open spelling: {open}");
+        // A written domain is neither.
+        assert!(!Type::data_fun(range(2), int).is_witness_indexed());
+    }
+
+    /// A consumer's filter rides the witness, so a restricted collection is
+    /// witness-indexed like an unrestricted one.
+    #[test]
+    fn a_restriction_does_not_hide_the_witness() {
+        let inner = Type::Sigma(Box::new(sum(TypeKind::UIntRanges, |w| {
+            Type::data_fun(Type::WitnessRef(w), Type::Base(BaseType::Int))
+        })));
+        let refined = Type::Refinement(
+            Box::new(inner),
+            Refinement::born(Rc::new(
+                TypedExpr::new(TypedExprNode::Lit(Lit::Bool(true)))
+                    .with_ty(Type::Base(BaseType::Bool)),
+            )),
+        );
+        assert!(refined.is_witness_indexed());
+        assert!(refined.witness_kind().is_some());
+    }
+
+    /// **Only a binding position carries the kind.** A range belongs to its binder, so the
+    /// body cannot report one — and the `None` it answers is not "no witness", which is
+    /// why the two questions are separate accessors. A caller needing the kind after
+    /// inference has to read it off a position that binds.
+    #[test]
+    fn only_the_binding_position_reports_the_witness_kind() {
+        let int = Type::Base(BaseType::Int);
+        let closed = Type::Sigma(Box::new(sum(TypeKind::Enumerated(vec![range(2)]), |w| {
+            Type::data_fun(Type::WitnessRef(w), int.clone())
+        })));
+        let Type::Sigma(s) = &closed else {
+            unreachable!("built a sum")
+        };
+        let open = (*s.body).clone();
+        assert_eq!(
+            closed.witness_kind(),
+            Some(&TypeKind::Enumerated(vec![range(2)]))
+        );
+        assert_eq!(open.witness_kind(), None, "the body has no binder: {open}");
+        // ...and it is witness-indexed all the same, which is the distinction.
+        assert!(open.is_witness_indexed());
     }
 
     /// A nested sum's body names the **inner** binder, so substituting the outer one

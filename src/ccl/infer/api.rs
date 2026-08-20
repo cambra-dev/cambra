@@ -1103,12 +1103,6 @@ pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
             symbolic(e)
         );
     }
-    if std::env::var("DBG_TREE").is_ok() {
-        eprintln!(
-            "TREE {stage}:\n{}",
-            crate::ccl::symbolic::symbolic_typed(expr)
-        );
-    }
     fn go(e: &Expr, stage: &str, scope: &mut Vec<crate::ccl::infer_var::WitnessBinderId>) {
         check(&e.ty, scope, e, stage);
         if let Some(a) = &e.user_annotation {

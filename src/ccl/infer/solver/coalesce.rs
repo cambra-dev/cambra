@@ -232,9 +232,9 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     // **A lone witness materializes as a reference, not as a sum.** The position is a
     // consumed collection's domain and nothing else claimed it, so the answer is "whichever
     // domain the witness picked" — and that is said by *naming* the witness, exactly as the
-    // open said it. Closing it into `Σ 𝐷 ∈ 𝐾. 𝐷` here would put a sum standing where a domain belongs where a
-    // domain belongs, which is the one position [`crate::ccl::ty::has_sum_in_domain_position`]
-    // forbids; the binder is bound by the enclosing collection instead.
+    // open said it. Closing it into `Σ 𝐷 ∈ 𝐾. 𝐷` here would put a sum where a domain
+    // belongs, the one position [`crate::ccl::ty::has_sum_in_domain_position`] forbids;
+    // the binder is bound by the enclosing collection instead.
     //
     // A witness alongside a *function* does not reach here — that is the ordinary close,
     // which re-pairs `𝑤 ⤇ 𝑉` into the sum during compaction.
@@ -288,10 +288,12 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             &coalesce_compact_go(&sg.body, polarity)?,
             binder,
         );
-        shapes.push(Type::Sigma(Box::new(crate::ccl::ty::SigmaType::bound(
-            crate::ccl::ty::Witness::bound_to(binder, kind),
-            body,
-        ))));
+        // `into_type` rather than `Type::Sigma`: this is where a sum that was *boxed* comes
+        // back, so it is where the introduction's idempotence applies.
+        shapes.push(
+            crate::ccl::ty::SigmaType::bound(crate::ccl::ty::Witness::bound_to(binder, kind), body)
+                .into_type(),
+        );
     }
     if let Some(cf) = &ct.fun {
         use super::compact::KindMerge;
@@ -393,11 +395,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                     !kind.needs_witness(),
                     "a data function's domain kind lists several candidates: {kind}"
                 );
-                let __t = kind.into_data_fun(kept_name, c);
-                if let Type::Sigma(sg) = &__t {
-                    eprintln!("BUILD factored binder={:?}", sg.binder());
-                }
-                shapes.push(__t);
+                shapes.push(kind.into_data_fun(kept_name, c));
             }
         }
     }
