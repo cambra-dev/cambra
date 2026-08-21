@@ -3,7 +3,7 @@
 // builtins
 // ---------------------------------------------------------------------------
 
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 use crate::chl_parser;
 use crate::chl_parser::parser::ParseError;
@@ -25,7 +25,8 @@ use crate::{
         transact_phase, uniquify,
     },
     interpreter::{
-        Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        http_server::SharedHttpServer,
         operator_conversion::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
             convert_to_operators,
@@ -350,6 +351,60 @@ impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
     }
 }
 
+/// The external endpoints a program holds open: its data sources, the sinks its
+/// replies dispatch through, and the HTTP listeners behind them.
+///
+/// Program state rather than compilation state. A listener's socket, its
+/// routing-table entry, and the requests buffered behind it outlive the version
+/// of the program that opened them, so they are the part of a running program a
+/// replacement version inherits. Compiling a replacement seeds a fresh
+/// [`LoweringContext`] from this registry with
+/// [`endpoints_frozen`](crate::ccl::lower::LoweringContext) set: an
+/// `http_serve` call binds a route the registry already holds and is rejected
+/// if it names one the registry does not.
+///
+/// Freezing the registry is what makes "only the logic between sources and
+/// sinks may change" a precondition the compiler checks rather than a
+/// convention. See [`GlobalContext::seed_lowering`].
+#[derive(Default)]
+pub struct EndpointRegistry {
+    /// Every open source, by the name `Source(name)` resolves against.
+    sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    /// The reply sink of each open `http_serve` route, by the route's source
+    /// name. Keyed by route rather than by response-binding name, which a new
+    /// version may spell differently.
+    http_route_sinks: HashMap<String, Arc<dyn DataSink>>,
+    /// One listener per bound TCP port.
+    shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
+}
+
+impl EndpointRegistry {
+    /// The names of every open source — the endpoint set a replacement version
+    /// must not step outside.
+    pub fn source_names(&self) -> impl Iterator<Item = &str> {
+        self.sources.keys().map(String::as_str)
+    }
+
+    /// Fold everything a completed lowering pass opened back into the registry.
+    ///
+    /// A no-op for a frozen pass by construction: a frozen pass opens nothing,
+    /// so every entry it carries came from here.
+    fn absorb(&mut self, lowering: &LoweringContext) {
+        self.sources.extend(
+            lowering
+                .registered_sources()
+                .map(|(n, s)| (n.to_string(), s.clone())),
+        );
+        self.http_route_sinks.extend(
+            lowering
+                .registered_route_sinks()
+                .map(|(n, s)| (n.to_string(), s.clone())),
+        );
+        self.shared_servers
+            .extend(lowering.registered_servers().map(|(p, s)| (*p, s.clone())));
+    }
+}
+
 /// Bundles the per-stage registries needed to thread externally-managed data
 /// sources through the full CCL pipeline (lowering → type inference → compilation).
 pub struct GlobalContext {
@@ -361,6 +416,8 @@ pub struct GlobalContext {
     conversion: OpConversionContext,
     /// Scheduler for triggering notifications.
     scheduler: Scheduler,
+    /// The open endpoint set, which outlives any one version of the program.
+    endpoints: EndpointRegistry,
 }
 
 impl GlobalContext {
@@ -375,10 +432,66 @@ impl GlobalContext {
             inference: TypeInferenceContext::new(),
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
+            endpoints: EndpointRegistry::default(),
         };
         let stdin = Rc::new(RefCell::new(StdinDataSource::new()));
         result.register_source(stdin);
         result
+    }
+
+    /// The open endpoint set — the sources and sinks a replacement version of
+    /// this program must bind against rather than reopen.
+    pub fn endpoints(&self) -> &EndpointRegistry {
+        &self.endpoints
+    }
+
+    /// Retire the running version's conversion context and carry its operators
+    /// forward to the version replacing it.
+    ///
+    /// Call once the running operator graph has been dropped. Each operator a
+    /// `Let` binding produced is offered to the next compilation by the identity
+    /// of the term it computes, and the replaced version's subscriptions to it
+    /// are neutralized ([`OpConversionContext::into_inheritance`]). The source
+    /// consumers the scheduler holds go the same way: a source handle outlives a
+    /// version, the subscriptions against it do not.
+    ///
+    /// Scheduler registrations need no attention here: they are weak and owned
+    /// by the producers that made them, so dropping the graph prunes exactly the
+    /// ones whose producer went with it (see [`Scheduler::add_source_handle`]).
+    pub fn retire_version(&mut self) {
+        let previous = std::mem::replace(&mut self.conversion, OpConversionContext::new());
+        self.conversion.inherit(previous.into_inheritance());
+    }
+
+    /// Install a fresh [`LoweringContext`] seeded from the endpoint registry,
+    /// discarding the previous compilation's lowering state.
+    ///
+    /// `frozen` decides whether the new version may open endpoints of its own.
+    /// The first compilation of a program runs unfrozen — it is the one that
+    /// opens them; every replacement runs frozen.
+    ///
+    /// A fresh context rather than a reused one because everything else
+    /// `LoweringContext` accumulates (synthetic-name counter, transactional
+    /// variables, mutable-parameter functions) is per-pass, and carrying it into
+    /// a second pass would let one version's declarations leak into the next.
+    fn seed_lowering(&mut self, frozen: bool) {
+        let mut lowering = LoweringContext::default();
+        lowering.adopt_endpoints(
+            self.endpoints
+                .sources
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone())),
+            self.endpoints
+                .http_route_sinks
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone())),
+            self.endpoints
+                .shared_servers
+                .iter()
+                .map(|(p, s)| (*p, s.clone())),
+        );
+        lowering.endpoints_frozen = frozen;
+        self.lowering = lowering;
     }
 
     /// Returns the context for lowering
@@ -389,6 +502,12 @@ impl GlobalContext {
     /// Returns the context for type inference
     pub fn inference_ctx(&mut self) -> &mut TypeInferenceContext {
         &mut self.inference
+    }
+
+    /// How many `Let` bindings the last compilation reused from the version it
+    /// replaced, against how many it bound.
+    pub fn reuse_tally(&self) -> (usize, usize) {
+        self.conversion.reuse_tally()
     }
 
     /// Returns the context for operator conversion
@@ -408,7 +527,8 @@ impl GlobalContext {
     /// (pre-registered and discovered) is registered in one uniform pass.
     pub fn register_source(&mut self, source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {
         let name = source.borrow().get_id().to_string();
-        self.lowering.register_source(name, source);
+        self.lowering.register_source(name.clone(), source.clone());
+        self.endpoints.sources.insert(name, source);
     }
 }
 
@@ -753,7 +873,48 @@ pub enum CompileStage {
 ///
 /// [`Channelized`]: CompileStage::Channelized
 pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileError>> {
-    let mut ctx = GlobalContext::new();
+    compile_to_in(GlobalContext::new().lowering, code, stage)
+}
+
+/// Compile `code` to `stage` against an already-open endpoint set, without
+/// touching the running program.
+///
+/// The scratch lowering and inference contexts this builds are discarded on
+/// return, and the seeded registry is frozen, so nothing here binds a port,
+/// registers a route, or mutates the live compilation contexts. That is what
+/// makes it safe to answer a diff query about a *running* program: the naive
+/// alternative — [`compile_to`]'s fresh [`GlobalContext`] — would try to bind a
+/// port the running program already holds and fail.
+pub fn compile_to_inherited(
+    endpoints: &EndpointRegistry,
+    code: &str,
+    stage: CompileStage,
+) -> Result<Expr, Vec<CompileError>> {
+    let mut lowering = LoweringContext::default();
+    lowering.adopt_endpoints(
+        endpoints
+            .sources
+            .iter()
+            .map(|(n, s)| (n.clone(), s.clone())),
+        endpoints
+            .http_route_sinks
+            .iter()
+            .map(|(n, s)| (n.clone(), s.clone())),
+        endpoints
+            .shared_servers
+            .iter()
+            .map(|(p, s)| (*p, s.clone())),
+    );
+    lowering.endpoints_frozen = true;
+    compile_to_in(lowering, code, stage)
+}
+
+fn compile_to_in(
+    mut lowering: LoweringContext,
+    code: &str,
+    stage: CompileStage,
+) -> Result<Expr, Vec<CompileError>> {
+    let mut inference = TypeInferenceContext::new();
     let mut errors: Vec<CompileError> = Vec::new();
 
     let parse_result = chl_parser::parse_module(code);
@@ -769,7 +930,7 @@ pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileEr
         return Err(errors);
     }
 
-    let lower_result = lower_stmts(&module.body, ctx.lowering_ctx());
+    let lower_result = lower_stmts(&module.body, &mut lowering);
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
@@ -784,18 +945,18 @@ pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileEr
     }
 
     expr = uniquify::run(expr);
-    for (_name, source) in ctx.lowering_ctx().take_sources() {
+    for (_name, source) in lowering.take_sources() {
         let name = source.borrow().get_id().to_string();
         let output_type = source.borrow().output_type();
         // The source's data-function type is constructed inside
         // `register_source_type` from the element type — the `Data` kind is
         // intrinsic, not stamped here.
-        ctx.inference_ctx().register_source_type(&name, output_type);
+        inference.register_source_type(&name, output_type);
     }
     // No lowering projection is threaded here — this entry point exists to hand a
     // tree to the differ, not to render diagnostics — so an inference error keeps
     // its blame node but degrades to a span-less `CompileError`.
-    if let Err(errors) = infer(&mut expr, ctx.inference_ctx()) {
+    if let Err(errors) = infer(&mut expr, &mut inference) {
         return Err(errors
             .into_iter()
             .map(|located| CompileError::Infer {
@@ -866,6 +1027,32 @@ pub fn compile_program(
     code: &str,
     main_consumer: Box<dyn Consumer>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
+    compile_version(ctx, code, main_consumer, Endpoints::Open)
+}
+
+/// Whether a compilation may open the program's external endpoints or must
+/// inherit the ones already open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoints {
+    /// The first compilation of a program: `http_serve` binds its port and
+    /// registers its route.
+    Open,
+    /// A replacement version: every source and sink comes from the running
+    /// program's [`EndpointRegistry`], and naming one it does not hold is a
+    /// compile error. This is the precondition that confines an update to the
+    /// logic *between* sources and sinks.
+    Inherited,
+}
+
+/// [`compile_program`], parameterized by whether the version being compiled
+/// opens its endpoints or inherits them.
+pub fn compile_version(
+    ctx: &mut GlobalContext,
+    code: &str,
+    main_consumer: Box<dyn Consumer>,
+    endpoints: Endpoints,
+) -> Result<CompiledProgram, Vec<CompileError>> {
+    ctx.seed_lowering(endpoints == Endpoints::Inherited);
     // ---- User-facing failure points ----
     //
     // The pipeline now accumulates errors across the *parse* and *lower*
@@ -917,6 +1104,11 @@ pub fn compile_program(
     if !errors.is_empty() {
         return Err(errors);
     }
+
+    // Fold anything this pass opened into the endpoint registry before the
+    // per-compilation registries are drained, so the next version inherits it.
+    // A no-op for an `Inherited` pass, which opens nothing.
+    ctx.endpoints.absorb(&ctx.lowering);
 
     // Drain sink bindings discovered during lowering before taking sources.
     let sink_bindings_registry = ctx.lowering_ctx().take_sink_bindings();

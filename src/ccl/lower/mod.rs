@@ -277,6 +277,39 @@ pub struct LoweringContext {
     /// and reuse the per-port server.
     pub(super) shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
 
+    /// The [`DataSink`] each open `http_serve` route dispatches replies through,
+    /// keyed by the route's source name.
+    ///
+    /// Keyed by *route* rather than by binding name, unlike
+    /// [`sink_bindings`](Self::sink_bindings): the response binding is a name the
+    /// program chooses and a new version may spell differently, whereas the route
+    /// is the endpoint's identity. This is what lets a re-lowered `http_serve`
+    /// recover the sink of a route it inherited — `sink()` is inherent on
+    /// `HttpServerDataSource`, so it cannot be read back off the erased
+    /// `dyn DataSourceDomainExtentImpl` in [`sources`](Self::sources).
+    pub(super) http_route_sinks: HashMap<String, Arc<dyn DataSink>>,
+
+    /// Every `http_serve` route already lowered *in this pass*, by source name.
+    ///
+    /// Separate from [`sources`](Self::sources) because that map is seeded with
+    /// the endpoints a previous version of the program opened
+    /// ([`EndpointRegistry`](crate::ccl::context::EndpointRegistry)), so a name
+    /// being present there means "already open", not "already lowered". Two
+    /// `http_serve` calls on one route within a single program remain an error;
+    /// re-lowering the same route in a later version is the reuse path.
+    pub(super) http_routes_this_pass: HashSet<String>,
+
+    /// Whether the external endpoint set is **frozen**: an `http_serve` call may
+    /// bind a route [`sources`](Self::sources) already holds, but may not open a
+    /// new one.
+    ///
+    /// Set when lowering a *replacement* version of a running program, where the
+    /// open sockets and their buffered data are state the new version inherits
+    /// rather than creates. Opening a port during such a lowering would bind a
+    /// second listener and register a duplicate route on the running server, so
+    /// it is rejected instead. See `GlobalContext::compile_replacement`.
+    pub(super) endpoints_frozen: bool,
+
     /// Monotonic counter for minting unique synthetic names during lowering.
     /// Globally unique across nested scopes so inner binders cannot capture
     /// a reference inserted by an outer substitution.
@@ -354,6 +387,43 @@ impl LoweringContext {
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
     ) {
         self.sources.insert(name.into(), source);
+    }
+
+    /// Every source registered in this context, for folding into the
+    /// [`EndpointRegistry`](crate::ccl::context::EndpointRegistry) that outlives
+    /// the compilation. Unlike [`take_sources`](Self::take_sources) this leaves
+    /// the map in place, so it may be called before the drain.
+    pub fn registered_sources(
+        &self,
+    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> {
+        self.sources.iter().map(|(n, s)| (n.as_str(), s))
+    }
+
+    /// Every open `http_serve` route's reply sink, by route source name.
+    pub fn registered_route_sinks(&self) -> impl Iterator<Item = (&str, &Arc<dyn DataSink>)> {
+        self.http_route_sinks.iter().map(|(n, s)| (n.as_str(), s))
+    }
+
+    /// Every bound TCP port's listener.
+    pub fn registered_servers(&self) -> impl Iterator<Item = (&u16, &Arc<SharedHttpServer>)> {
+        self.shared_servers.iter()
+    }
+
+    /// Seed this context with an already-open endpoint set.
+    ///
+    /// Whether the pass may open endpoints beyond these is
+    /// [`endpoints_frozen`](Self::endpoints_frozen), set separately: seeding and
+    /// freezing are independent (the first compilation of a program seeds an
+    /// empty registry unfrozen).
+    pub fn adopt_endpoints(
+        &mut self,
+        sources: impl IntoIterator<Item = (String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>)>,
+        route_sinks: impl IntoIterator<Item = (String, Arc<dyn DataSink>)>,
+        servers: impl IntoIterator<Item = (u16, Arc<SharedHttpServer>)>,
+    ) {
+        self.sources.extend(sources);
+        self.http_route_sinks.extend(route_sinks);
+        self.shared_servers.extend(servers);
     }
 
     /// Drain all sources accumulated for this compilation.

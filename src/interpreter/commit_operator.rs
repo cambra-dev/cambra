@@ -132,6 +132,25 @@ impl CommitEngine {
         }
     }
 
+    /// Create an engine whose initial state is `init` at tick `at`, for a
+    /// position-driven store whose first iteration position is not `0`.
+    ///
+    /// A store built to replace one in a running program enrols with its source
+    /// at the source's current frontier, so its first position is wherever the
+    /// replaced version had reached. The drive maps iteration position `p` to
+    /// tick `p + 1` and reads the previous accumulator as of tick `p`, so the
+    /// seed has to sit at the tick the first position reads rather than at `0`.
+    /// Re-basing the ticks instead would break the correspondence the dense read
+    /// relies on.
+    pub fn seeded_at(at: CommitTs, init: HashMap<Value, Value>) -> Self {
+        let latest_write = init.keys().map(|k| (k.clone(), at)).collect();
+        Self {
+            committed: BTreeMap::from([(at, init)]),
+            latest_write,
+            next_ts: at + 1,
+        }
+    }
+
     /// An empty engine for a **position-driven induction store**: no tick-0 init
     /// seed (the accumulator's init is the reader's fold default, supplied by
     /// `get_prev_seq`), driven by [`step`](Self::step) rather than
@@ -1187,6 +1206,16 @@ fn source_value_at(codomain: &Tile, i: usize) -> Value {
 /// A plain (unconditional) `mut` loop is the degenerate `` `commit ``-everywhere
 /// case (a dense changelog); a conditional write is sparse in position space
 /// (`` `abort `` positions append nothing) while the frontier still tracks the whole extent.
+/// The current value of each of a store's carried keys, kept up to date by the
+/// store's producer.
+///
+/// A store is where a program's mutable variables live, so this is the state a
+/// replacement version inherits. It is a shared cell rather than something read
+/// out of the producer because the producer is owned deep inside the operator
+/// graph the replacement is about to drop, and its type is not recoverable from
+/// the `dyn TileProducer` that holds it.
+pub type StoreState = Rc<RefCell<HashMap<Value, Value>>>;
+
 pub struct InductionStore {
     /// Per accumulator key, its runtime key and the acyclic operator producing
     /// its tick-0 fold default (the accumulator's init; read once at subscribe,
@@ -1209,6 +1238,9 @@ pub struct InductionStore {
     /// [`body_decision_at`]). Empty for a store with no feed.
     tap_fields: Vec<String>,
     output_tiling: Tiling,
+    /// The carried keys' current values, for a replacement version to resume
+    /// from. See [`StoreState`].
+    state: StoreState,
 }
 
 impl InductionStore {
@@ -1237,7 +1269,13 @@ impl InductionStore {
             write_keys,
             tap_fields,
             output_tiling,
+            state: StoreState::default(),
         }
+    }
+
+    /// The carried keys' current values, tracking this store as it runs.
+    pub fn state(&self) -> StoreState {
+        self.state.clone()
     }
 }
 
@@ -1297,7 +1335,9 @@ impl TileOperator for InductionStore {
             // the first *iteration* change (a leading carry) without an external
             // default. Iterations therefore occupy ticks 1.., a `+ 1` offset the
             // drive loop and the dense read both apply.
-            engine: CommitEngine::new(inits),
+            engine: CommitEngine::new(inits.clone()),
+            inits,
+            state: self.state.clone(),
             body_producer,
             source_producer,
             buffer: self.buffer.clone(),
@@ -1305,7 +1345,7 @@ impl TileOperator for InductionStore {
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
             output_tiling: self.output_tiling.clone(),
-            processed: 0,
+            processed: None,
             source_complete: false,
             released_through: None,
             source_fully_released: false,
@@ -1316,6 +1356,13 @@ impl TileOperator for InductionStore {
 struct InductionStoreProducer {
     base: ProducerBase,
     engine: CommitEngine,
+    /// The accumulators' seed values, retained so the engine can be re-seeded at
+    /// the first iteration position once it is known. See
+    /// [`processed`](Self::processed).
+    inits: HashMap<Value, Value>,
+    /// The shared cell this producer keeps current, for a replacement version to
+    /// resume from. See [`StoreState`].
+    state: StoreState,
     body_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
     buffer: BodyInputBuffer,
@@ -1327,7 +1374,15 @@ struct InductionStoreProducer {
     output_tiling: Tiling,
     /// Iteration positions already fed to the body and stepped into the engine.
     /// Monotonic; the drive resumes here each pull as the source grows.
-    processed: usize,
+    ///
+    /// `None` until the first pull that carries a position, then the base of the
+    /// arrived run. It is not fixed at `0` because the source a store iterates
+    /// need not begin there: a store built to replace one in a running program
+    /// enrols with the source at its current frontier, so the first window it
+    /// sees starts wherever the replaced version had reached. Starting at `0`
+    /// against such a window finds no position to drive and the store emits
+    /// nothing.
+    processed: Option<usize>,
     /// Whether the iteration source is complete (its most recent pull was terminal). A
     /// batch source (a list — the usual loop extent) is complete on the first pull.
     source_complete: bool,
@@ -1419,8 +1474,28 @@ impl TileProducer for InductionStoreProducer {
         // value inherits from tick 0 / the latest earlier change). Stop at the first
         // gap (position `processed` not yet arrived): the recurrence is sequential,
         // so a later position cannot be decided before its predecessor.
-        while let Some(item) = by_pos.get(&self.processed) {
-            let pos = self.processed;
+        // The base of the arrived run on the first pull that has one; afterwards
+        // the drive's own monotonic cursor.
+        let mut next = match self.processed {
+            Some(next) => next,
+            None => match by_pos.keys().copied().min() {
+                // The seed belongs at the tick this first position reads, not at
+                // tick 0. See [`CommitEngine::seeded_at`].
+                Some(base) => {
+                    if base > 0 {
+                        self.engine = CommitEngine::seeded_at(base, self.inits.clone());
+                    }
+                    base
+                }
+                // Nothing has arrived. Fall through with the cursor unset so the
+                // terminality check below still runs: an empty source is complete
+                // on its first pull, and returning early here leaves a loop over
+                // one waiting for a notification that never comes.
+                None => 0,
+            },
+        };
+        while let Some(item) = by_pos.get(&next) {
+            let pos = next;
             let snap_in: Vec<Value> = self
                 .read_keys
                 .iter()
@@ -1490,7 +1565,8 @@ impl TileProducer for InductionStoreProducer {
                 None // the accumulator holds from tick 0 / the latest change
             };
             self.engine.step(pos + 1, write_set);
-            self.processed = pos + 1;
+            next = pos + 1;
+            self.processed = Some(next);
         }
         // Incrementally reclaim the processed prefix of the source. The drive only
         // ever pulls position `processed` forward and never re-reads a position
@@ -1499,16 +1575,29 @@ impl TileProducer for InductionStoreProducer {
         // dense `Recurse` path). The source drops a row only once every producer
         // releases it (cross-producer intersection), so a co-iterated reader still
         // folding earlier positions keeps them live.
-        let unused = self.processed == 0
-            || self
-                .released_through
-                .is_some_and(|r| r + 1 >= self.processed);
+        let unused = self
+            .processed
+            .is_none_or(|p| p == 0 || self.released_through.is_some_and(|r| r + 1 >= p));
         if !unused {
+            let through = next - 1;
             self.source_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(self.processed - 1)),
+                    Predicate::LessThanEq(Value::UInt(through)),
                 )));
-            self.released_through = Some(self.processed - 1);
+            self.released_through = Some(through);
+        }
+        // Publish the accumulators' current values for a replacement version to
+        // resume from. `read_keys` is exactly the carried accumulators — a reply
+        // tap is a per-position event with nothing to carry — and the watermark
+        // is the latest decided tick, so this is each variable's value now.
+        if self.processed.is_some() {
+            let watermark = self.engine.watermark();
+            let mut state = self.state.borrow_mut();
+            for key in &self.read_keys {
+                if let Some(value) = self.engine.read_as_of(watermark, key) {
+                    state.insert(key.clone(), value);
+                }
+            }
         }
         // Signal terminality once the source is complete and every arrived position
         // has been decided: the accumulator is final, so the frontier *closes*
@@ -1520,7 +1609,7 @@ impl TileProducer for InductionStoreProducer {
         // position (`by_pos` no longer holds `processed`) means the whole extent is
         // decided — robust to the incremental prefix release above shrinking
         // `by_pos`.
-        let done = self.source_complete && !by_pos.contains_key(&self.processed);
+        let done = self.source_complete && !by_pos.contains_key(&next);
         // Final reclamation: once terminal, release the *whole* source (`True`) so a
         // finite loop reaches the `get_released_predicate() == True` end-state (the
         // incremental prefix release above stops one short of a `True` predicate).

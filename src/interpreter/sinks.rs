@@ -99,6 +99,20 @@ impl SinkConsumer {
         )
     }
 
+    /// Stop dispatching and release the producer chain behind this consumer.
+    ///
+    /// A [`DataSink`] outlives any one version of a program; the subscription
+    /// that feeds it does not. Detaching is what ends a replaced version's
+    /// dispatch, and it is not achieved by dropping the consumer alone: an
+    /// operator carried across the replacement still holds the notification
+    /// closure that reaches this consumer, so the replaced version would keep
+    /// being woken and keep writing to a sink its successor now owns. Clearing
+    /// the producer slot also drops the operators behind it, which is what lets
+    /// the fan-outs they subscribed to see those subscriptions end.
+    pub fn detach(&mut self) {
+        *self.producer.borrow_mut() = None;
+    }
+
     /// Call `f` with the sink's current producer, if it has been set.
     pub fn with_producer<F: FnOnce(&dyn TileProducer)>(&self, f: F) {
         if let Some(ref prod) = *self.producer.borrow() {

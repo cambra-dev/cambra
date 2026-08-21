@@ -25,6 +25,7 @@ mod http_counter;
 mod http_greeter;
 mod inner_join;
 mod ledger_balance;
+mod live_update;
 mod nonneg_inventory;
 mod prefix_lines;
 mod reachability;

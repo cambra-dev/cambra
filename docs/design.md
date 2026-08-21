@@ -203,6 +203,7 @@ The connections between the layers above and the capabilities Cambra claims:
 - **Incremental views by construction.** Monotone tilings mean live aggregates are maintained, not recomputed. The materializable time-pinned view is the decided form of this — the history substrate is implemented, the transaction-handle read it needs is not yet (the ledger's `txn_kv` pins it).
 - **Verification [Sketched].** A small referentially-transparent core plus a refinement-typed checker means a semantic predicate established at one point composes across the whole program. The machinery exists today; whole-application contracts on top of it are the driving direction.
 - **Validation and program branching [Open].** Referential transparency makes program versions *syntactically comparable with well-defined semantics*, and temporal functional mutation makes state a value over time domains — *branchable and pinnable by construction*. Together they are the substrate for branching a running application — logic and state — exercising the branch under a realistic workload, and diffing behaviour.
+- **Live update [Partial].** A running program can be replaced by a new version of its source over the control port (`--control`): `/diff` reports how the two versions differ at any pipeline stage, and `/update` swaps the program. The new version inherits the running one's sources and sinks — naming one it does not hold is a compile error, which confines an update to the logic between them — and inherits the operator behind every `Let` binding whose computation is unchanged, so state the edit did not touch survives it. See [live-update.md](/src/ccl/design/live-update.md). Running two versions at once is not implemented.
 - **Observability.** The compilation pipeline preserves a legible chain from source to running state; the web inspector (`--inspect`) serves the CHL AST, the lowered CCL, the operator graph, and live per-producer runtime state for any running program.
 
 ## Feature status at a glance
@@ -221,6 +222,7 @@ The connections between the layers above and the capabilities Cambra claims:
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | Organizing idea decided; encodings **[Sketched]** |
 | `match` / `case` | Tag dispatch implemented; deeper patterns **[Tentative]** |
+| Live update of a running program (`--control`) | Implemented for logic between existing sources and sinks; endpoint changes and concurrent versions **[Open]** |
 | `while`, floats, imports, classes, exceptions | Absent (see the spec) |
 
 The [spec](chl-spec.md) carries the authoritative per-construct markers; [demo-programs.md](demo-programs.md) maps them to runnable programs and their blockers.
