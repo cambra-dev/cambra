@@ -340,11 +340,6 @@ pub(super) fn lower_list_comp(
     }
 }
 
-/// Float a value-`Case` *source* out of a single-generator comprehension:
-/// `[e for x in Case{gᵢ→srcᵢ}]` ⟹ `Case{gᵢ → [e for x in srcᵢ]}`. Sound because
-/// the guards do not reference the comprehension variable `x`. Recurses so a
-/// nested conditional source flattens per arm; a concrete (non-`Case`) source
-/// builds the ordinary map chain `λ __idx → __idx ▷ src ▷ (λ x → body)`.
 /// Hand out a tree copy of `origin` for one arm of a fan-out. Every arm is a
 /// sibling, including the first: a fan-out places the same subtree under several
 /// arms and no arm is privileged. The copy-frame records each copy as a `Copy` of
@@ -355,6 +350,11 @@ fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
     origin.clone()
 }
 
+/// Float a value-`Case` *source* out of a single-generator comprehension:
+/// `[e for x in Case{gᵢ→srcᵢ}]` ⟹ `Case{gᵢ → [e for x in srcᵢ]}`. Sound because
+/// the guards do not reference the comprehension variable `x`. Recurses so a
+/// nested conditional source flattens per arm; a concrete (non-`Case`) source
+/// builds the ordinary map chain `λ __idx → __idx ▷ src ▷ (λ x → body)`.
 fn float_comp_source_case(
     source: Expr,
     iter_var: &str,

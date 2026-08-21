@@ -1902,9 +1902,9 @@ mod tests {
 
     // ---- the recorder ------------------------------------------------------
     //
-    // These exercise the construction hooks through *real* `Expr` construction
-    // (`Expr::new`/`Expr::lit`/`Expr::tuple` + `freshen_node_ids_deep`), not
-    // hand-built steps, so the hook wiring in `expr.rs` is under test too.
+    // These exercise the hooks through *real* `Expr` construction (`Expr::lit`,
+    // `Expr::tuple`) and the freshening `Clone`, not hand-built steps, so the hook
+    // wiring in `expr.rs` is under test too.
 
     use crate::ccl::Lit;
     use crate::ccl::expr::Expr;
