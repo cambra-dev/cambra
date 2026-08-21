@@ -348,7 +348,7 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
     changed
 }
 
-/// Run one rewrite rule under a recording ([`lineage::enter`](crate::ccl::lineage::enter))
+/// Run one rewrite rule under a recording ([`provenance::enter`](crate::ccl::provenance::enter))
 /// keyed on the node the rule is about to rewrite.
 ///
 /// This is the whole of simplify's provenance instrumentation: **one combinator,
@@ -362,7 +362,7 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
 ///   rule fired, which is why the `bool` return is not consulted.
 /// * A rule that mutates in place without minting (`try_string_add_to_concat`'s
 ///   `*op = BinOpKind::Concat`) is likewise a preserve — the node keeps its
-///   identity, so its lineage is the self-edge it already had.
+///   identity, so its provenance is the self-edge it already had.
 /// * A rule that replaces the slot wholesale (`*expr = Expr::compose(flat)`)
 ///   mints, and those mints record `expr`'s pre-rule id as their parent.
 /// * A rule that promotes an existing child into the slot
@@ -373,14 +373,14 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
 ///
 /// `Nature::Machinery`: an algebraic simplification has no source counterpart.
 fn ruled(
-    label: crate::ccl::lineage::RewriteLabel,
+    label: crate::ccl::provenance::RewriteLabel,
     expr: &mut Expr,
     rule: impl FnOnce(&mut Expr) -> bool,
 ) -> bool {
-    let _g = crate::ccl::lineage::enter(
+    let _g = crate::ccl::provenance::enter(
         expr.node_id(),
         label,
-        crate::ccl::lineage::Nature::Machinery,
+        crate::ccl::provenance::Nature::Machinery,
     );
     rule(expr)
 }

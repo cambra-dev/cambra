@@ -77,10 +77,10 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // The literal's own node is the slot, which is the edge
             // `predicate-lineage-report` records as missing: nothing used to link
             // a singleton refinement back to the literal the user wrote.
-            let _g = crate::ccl::lineage::enter(
+            let _g = crate::ccl::provenance::enter(
                 node_id,
                 "infer.lit_singleton",
-                crate::ccl::lineage::Nature::Machinery,
+                crate::ccl::provenance::Nature::Machinery,
             );
             ctx.lit_singleton(lit)
         }

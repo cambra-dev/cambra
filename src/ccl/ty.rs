@@ -1260,7 +1260,7 @@ impl Type {
     /// call sites (lambda elimination's type-preservation asserts) is exactly
     /// `Some` vs `None`: both compared types descend from one derivation, so
     /// when both carry a binder it is the *same* [`crate::ccl::Name`] (uids are preserved
-    /// by every copy along the lineage). What elimination does not preserve is
+    /// by every copy in the chain). What elimination does not preserve is
     /// the binder's presence — rebuilt combinator types (`fun_ty_or_hole`,
     /// [`Type::fun`]) are constructed with `name: None`. If those sites ever
     /// preserve binders on rebuilt types, this helper can retire.

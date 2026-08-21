@@ -32,8 +32,9 @@
 //! carries a predicate leaves structurally-equal `Rc`s behind:
 //! `f = \xs -> [x for x in xs if x > 1]` measures 4 surplus of 9 distinct at one
 //! call site, 29 of 38 at two. Adding such a program here **fails today** — do it
-//! as the regression test when the split is fixed, not before. Tracked in the
-//! lineage-redesign doc, §12.4(9); rationale in `ccl/design/type-inference.md`.
+//! as the regression test when the split is fixed, not before. Tracked as an
+//! open decision in the `lineage-design` note under projects/program-inspector in
+//! the internal vault; rationale in `ccl/design/type-inference.md`.
 
 use cambra::ccl::ccl_utils::{distinct_predicate_rcs, reachable_refinements};
 use cambra::ccl::infer::{TypeInferenceContext, infer};

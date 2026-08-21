@@ -1751,7 +1751,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             // property rather than as a mechanism. Settling mint-vs-preserve for
             // the catch-all arm wants its own change.
             //
-            // Neither choice writes a lineage row: this file opens no recording,
+            // Neither choice writes a provenance row: this file opens no recording,
             // and `compile_program` runs `lambda_elim::run` outside every pass
             // scope it opens.
             let mut expr = Expr::new(node).with_ty(ty);

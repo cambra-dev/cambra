@@ -79,8 +79,8 @@ use crate::ccl::{
     BaseType, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey,
     HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::{free_names_in_value, is_free_in_value, synthesize_arm_predicate},
-    lineage,
     mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
+    provenance,
     provenance::NodeId,
     subst::Subst,
 };
@@ -163,13 +163,13 @@ fn rewrite_as_of_reads_go(expr: &mut Expr) {
     //
     // These rows reach no table in a normal compile: `compile_program` calls
     // `rewrite_as_of_reads` outside every pass scope it opens, so they land only
-    // under an audit window (`CAMBRA_LINEAGE_AUDIT=full`, which ends at
+    // under an audit window (`CAMBRA_PROVENANCE_AUDIT=full`, which ends at
     // `post-as-of-read`).
     {
-        let _g = lineage::enter(
+        let _g = provenance::enter(
             expr.node_id(),
             "transact.as_of_read",
-            lineage::Nature::Expansion,
+            provenance::Nature::Expansion,
         );
         if let Some(rewritten) = as_of_join(expr) {
             *expr = rewritten;
@@ -572,7 +572,7 @@ fn mut_var_value_ty(ty: &Type) -> Type {
 /// A stripped `with begin():` writer site, before its decision body is built.
 struct RawSite {
     /// The statement node the `with begin():` block was stripped from — the
-    /// lineage slot every node built for this site parents on. Carried on the
+    /// recording slot every node built for this site parents on. Carried on the
     /// site rather than re-derived because the block is *disassembled* on the way
     /// to a writer: by [`build_writer`] the `Begin` and its `ExprStmt` are gone,
     /// and the decision body is the only surviving piece.
@@ -630,7 +630,7 @@ struct FeedSite {
 /// them before the store is planned.
 ///
 /// Each writer travels with the [`NodeId`] of the `with begin():` statement its
-/// block was stripped from — the site's lineage slot, which rides beside
+/// block was stripped from — the site's recording slot, which rides beside
 /// [`WriterSite`] rather than on it because that type is shared IR that planning
 /// rebuilds from a `Transact` carrier. `site_feeds[j]` holds site `j`'s feeds, so
 /// the two vectors stay index-parallel.
@@ -801,7 +801,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     // Each writer travels with the statement node its block was stripped from, so
     // `plan_store` can parent that site's commit record on it. The slot rides
     // beside `WriterSite` rather than on it: `WriterSite` is shared IR that
-    // planning rebuilds from a `Transact` carrier, and a lineage slot is not a
+    // planning rebuilds from a `Transact` carrier, and a recording slot is not a
     // fact about the carrier.
     let mut per_store: Vec<StoreWriters> = (0..groups.len())
         .map(|_| (Vec::new(), Vec::new()))
@@ -809,7 +809,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     for s in sites {
         let store = store_of(&s);
         let slot = s.slot;
-        let g = lineage::enter(slot, "transact.writer", lineage::Nature::Expansion);
+        let g = provenance::enter(slot, "transact.writer", provenance::Nature::Expansion);
         let (writer, feeds) = build_writer(s, &key_init, &mut feed_counter, &cross.acc_views);
         drop(g);
         per_store[store].0.push((slot, writer));
@@ -923,7 +923,7 @@ fn partition_keys(
 struct CrossDomain {
     bindings: Vec<(TypedBinding, Expr)>,
     /// The `ExprStmt` each `bindings` entry was folded out of, index-parallel
-    /// with it — the lineage slot for the letrec [`wrap_cross_domain`] builds
+    /// with it — the recording slot for the letrec [`wrap_cross_domain`] builds
     /// around that binding. It rides beside `bindings` rather than inside for
     /// the same reason a writer's slot rides beside its `WriterSite`: the
     /// binding is IR that recognition rebuilds, and a slot is not a fact about
@@ -994,10 +994,10 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         // resolve to the loop keyword's span rather than the statement's. Both
         // choices mirror `mut_elim`'s `letrec.loop`, which records the *same*
         // `fold_induction_loop` call for a loop that stays in that pass.
-        let g = lineage::enter(
+        let g = provenance::enter(
             stmt_id,
             "transact.cross_domain_fold",
-            lineage::Nature::Expansion,
+            provenance::Nature::Expansion,
         );
         g.blame(&[effect_id]);
         // The loop body and the continuation between them carry every reference to
@@ -1156,7 +1156,7 @@ fn strip(
                 // writes, and whatever `partition_block` rebuilds. The block
                 // itself is *not* consumed here — it travels on the site and is
                 // disassembled by `build_writer` under this same slot.
-                let g = lineage::enter(stmt_id, "transact.strip", lineage::Nature::Expansion);
+                let g = provenance::enter(stmt_id, "transact.strip", provenance::Nature::Expansion);
                 g.blame(&[begin_id]);
                 let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
                 let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
@@ -1191,7 +1191,11 @@ fn strip(
             // captures nothing and writes nothing. It is here because the arm is a
             // rewrite: if a re-typed rebuild ever starts minting, the node lands
             // on the statement it belongs to instead of becoming a leak.
-            let g = lineage::enter(stmt_id, "transact.unwrap_block", lineage::Nature::Machinery);
+            let g = provenance::enter(
+                stmt_id,
+                "transact.unwrap_block",
+                provenance::Nature::Machinery,
+            );
             g.blame(&[begin_id]);
             splice_block(*block, *rest)
         };
@@ -1785,10 +1789,10 @@ fn resolve_writer_free_awaits(e: &mut Expr, written_keys: &[Name]) {
             // (`await_final(x)` is source text), so it is the slot. The key's
             // `MutDecl` stays on the spine here — this is the writer-free case — so
             // the seed's original is still live and the copy must freshen.
-            let _g = lineage::enter(
+            let _g = provenance::enter(
                 e.node_id(),
                 "transact.await_final_seed",
-                lineage::Nature::Expansion,
+                provenance::Nature::Expansion,
             );
             *e = seed.init.clone();
             return;
@@ -2443,7 +2447,7 @@ fn and_path(path: &Expr, guard: &Expr) -> Expr {
 struct MutVarDecl {
     /// The `let` node that declared the register. [`walk_spine`] **drops** it —
     /// the key's history binding is what stands in its place — so it is the
-    /// lineage slot for everything built for this key.
+    /// recording slot for everything built for this key.
     decl: NodeId,
     /// The tick-0 initial value, which carries the key's value type (its `.ty`).
     /// It reaches the output **once**, as the `get_prev_txn` default: the
@@ -2470,10 +2474,10 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
         // Preserving instead would also be sound (only one of the two is ever
         // live), but it saved 20 ids over the whole pipeline suite — subtrees of
         // 1 to 3 nodes — which does not pay for an opt-out.
-        let _g = lineage::enter(
+        let _g = provenance::enter(
             expr.node_id(),
             "transact.key_init_stash",
-            lineage::Nature::Machinery,
+            provenance::Nature::Machinery,
         );
         out.insert(
             binding.name.clone(),
@@ -2726,7 +2730,11 @@ fn plan_store(
         // scaffolding around the writer body all belong to the `with begin():`
         // statement they were built for. The writer `body` passes through
         // verbatim and keeps its own ids.
-        let _g = lineage::enter(slot, "transact.commit_record", lineage::Nature::Expansion);
+        let _g = provenance::enter(
+            slot,
+            "transact.commit_record",
+            provenance::Nature::Expansion,
+        );
         let WriterSite {
             read_keys,
             write_keys,
@@ -2855,10 +2863,10 @@ fn plan_store(
         // `walk_spine` drops — so that `let` is the slot, and the merged per-key
         // commit view, the `get_prev_txn` application and the wrapping lambda all
         // parent on it.
-        let _g = lineage::enter(
+        let _g = provenance::enter(
             key_init[k].decl,
             "transact.history",
-            lineage::Nature::Expansion,
+            provenance::Nature::Expansion,
         );
         let v = value_ty(k);
         let reg_k = hist[k].clone();
@@ -3020,10 +3028,10 @@ impl StorePlan {
                 // The as-of read is the key's *second* stand-in for the declaration
                 // this phase drops (the history binding was the first), so it
                 // parents on that same `let`.
-                let _g = lineage::enter(
+                let _g = provenance::enter(
                     key_init[k].decl,
                     "transact.key_rebind",
-                    lineage::Nature::Expansion,
+                    provenance::Nature::Expansion,
                 );
                 let v = mut_var_value_ty(&key_init[k].init.ty);
                 (binding(k.clone(), v.clone()), as_of_read(&self.hist[k], v))
@@ -3186,10 +3194,10 @@ fn walk_spine(
                     .iter()
                     .map(|(b, e)| (b.clone(), e.clone_preserving_ids()))
                     .collect();
-                let _g = lineage::enter(
+                let _g = provenance::enter(
                     store.carrier_slot(key_init, &inner),
                     "transact.carrier",
-                    lineage::Nature::Expansion,
+                    provenance::Nature::Expansion,
                 );
                 inner = close_recurrence_group(bindings, reads, store.feed_views(), inner);
             }
@@ -3343,10 +3351,10 @@ fn resolve_await_finals(
         // becomes, so the marker node is the slot. Its `Var(x)` operand dies with
         // it — the read names the history binding, not the key — which the boundary
         // difference reports without anything having to declare it.
-        let _g = lineage::enter(
+        let _g = provenance::enter(
             e.node_id(),
             "transact.await_final",
-            lineage::Nature::Expansion,
+            provenance::Nature::Expansion,
         );
         *e = final_key(reg, hist, key_init);
         return;
@@ -3420,10 +3428,10 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
         // a real node this phase removed, and it is the first of the statements
         // this group collectively replaced.
         let outermost = slots.first().copied().unwrap_or_else(|| inner.node_id());
-        let _g = lineage::enter(
+        let _g = provenance::enter(
             outermost,
             "transact.cross_domain_body",
-            lineage::Nature::Machinery,
+            provenance::Nature::Machinery,
         );
         for (b, def) in reads.into_iter().rev() {
             inner = let_typed(b.name, b.ty, def, inner);
@@ -3434,10 +3442,10 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
     // that loop was folded out of — the same slot `transact.cross_domain_fold`
     // recorded its binding against, so the carrier and its contents agree.
     for ((b, def), slot) in bindings.into_iter().zip(slots).rev() {
-        let _g = lineage::enter(
+        let _g = provenance::enter(
             slot,
             "transact.cross_domain_group",
-            lineage::Nature::Expansion,
+            provenance::Nature::Expansion,
         );
         let ty = inner.ty.clone();
         inner = Expr::new(TypedExprNode::LetRec {

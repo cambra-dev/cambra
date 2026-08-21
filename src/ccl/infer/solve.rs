@@ -1800,10 +1800,10 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // Sink for the clone's `on_copy` pairs, which each keep their own origin
     // rather than inheriting the slot. The use site is the slot: it is the node
     // this rewrite is performed for, and already what a failed pin blames.
-    let _spec = crate::ccl::lineage::enter(
+    let _spec = crate::ccl::provenance::enter(
         use_expr.node_id(),
         "mono.specialize",
-        crate::ccl::lineage::Nature::Expansion,
+        crate::ccl::provenance::Nature::Expansion,
     );
     // The clone must come *after* the recording opens. `Clone` re-mints every
     // `NodeId` in the copy, so N specializations cannot collide on one id, and
@@ -1967,10 +1967,10 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     //
     // The generalized `let` is the slot: the chain of K specialized layers
     // replaces it, one origin and K products.
-    let _chain = crate::ccl::lineage::enter(
+    let _chain = crate::ccl::provenance::enter(
         expr.node_id(),
         "mono.coalesce_let",
-        crate::ccl::lineage::Nature::Expansion,
+        crate::ccl::provenance::Nature::Expansion,
     );
     let mut result = body;
     for spec in frame.specs.into_iter().rev().filter(|s| s.referenced) {

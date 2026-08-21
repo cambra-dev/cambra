@@ -1,17 +1,17 @@
-# Provenance & lineage — node identity and source attribution
+# Provenance — node identity and source attribution
 
 This doc is the reference for how Cambra keeps an IR node's connection to the
-source the user wrote, through a pipeline that otherwise loses it (spans dropped
-at lowering, monomorphization cloning subtrees, inline fanning UDF bodies out,
-channelize rewriting defers, lambda-elim synthesizing combinators, planning
-fusing clauses).
+source the user wrote.
 
-**Status markers.** The substrate — the identity primitives, the lineage model,
-the recorder, the passes' adoption of it, the always-on lowering projection, the
-`NodeId`-keyed table that is the sink
-([The node table](#the-node-table-srcccllineagers)), and the fold over it — is in
-tree. Everything a **Planned** marker introduces is designed but not yet built:
-the inspector's consumption of the panes. A reader can tell the two apart by the
+`src/ccl/provenance.rs` holds all of it — the node id, the pass tag, the
+recorder, the table, and the folds. `src/ccl/context.rs` is where the pipeline
+opens the sessions and materializes the panes
+([The seam](#the-seam-srccclcontextrs)).
+
+**Status markers.** The the provenance model,
+the recorder, some passes' adoption of it, the lowering projection, the ([`NodeId`-keyed table](#the-node-table)), and the fold over 
+it — is in tree. **Planned** markers introduce designed but not yet built-features:
+the inspector's consumption of the panes, adoption in further passes. A reader can tell the two apart by the
 marker alone; unmarked prose describes code you can go read.
 
 Adoption is complete across the five passes the two pane relations span — `Mono`,
@@ -47,7 +47,7 @@ those passes, labelling every edge and reporting the ids it could not explain.
 Two things fold. A **pane** is a retained snapshot the inspector displays,
 materialized after a set of passes; the fold over the passes between two adjacent
 panes is the **pane relation**, and the leak classes are asserted empty there on
-every compile. A `LineageAudit` folds between two chosen points against the live
+every compile. A `ProvenanceAudit` folds between two chosen points against the live
 tree rather than a snapshot, and measures instead of gating: it is how a pass's
 recording is checked before any pane spans it, and how a suspected gap is located
 without waiting for the gate to be extended.
@@ -62,8 +62,8 @@ by walking `parents` back into that projection.
 |---|---|
 | **pane** | A retained AST snapshot the inspector displays, materialized after a set of passes. Each one costs a retained full-tree clone. |
 | **pane relation** | What folding the passes between two adjacent panes produces: an id-to-id relation with labelled edges. The **durable, gated** artifact — the leak classes are asserted here. |
-| **recording** | The scope `lineage::enter` opens over one rewrite, held as a `FrameGuard`. Every node minted while it is the innermost open one takes the node it names as a parent. Prose here says "a recording" for the scope, "the recording site" for the code location, and "records against X"; the guard is the RAII value that closes it. |
-| **slot** | The node a recording names — `lineage::enter(slot_id, …)` — read off the tree *before* the rewrite runs. Normally a main-tree node. A predicate interior *may* be one, but work **on** a predicate is usually recorded against the predicate's own root, and work that *produces* one against the main-tree node whose type will carry it. |
+| **recording** | The scope `provenance::enter` opens over one rewrite, held as a `FrameGuard`. Every node minted while it is the innermost open one takes the node it names as a parent. Prose here says "a recording" for the scope, "the recording site" for the code location, and "records against X"; the guard is the RAII value that closes it. |
+| **slot** | The node a recording names — `provenance::enter(slot_id, …)` — read off the tree *before* the rewrite runs. Normally a main-tree node. A predicate interior *may* be one, but work **on** a predicate is usually recorded against the predicate's own root, and work that *produces* one against the main-tree node whose type will carry it. |
 | **predicate interior** | A `NodeId` on a `TypedExpr` inside a `Type::Refinement`'s predicate. Ordinary ids from the same counter, and inside the id domain a fold must explain: `collect_tree_ids` enumerates them. They are the one place explanation and uniqueness come apart — `assert_unique_node_ids` walks the main tree only, because a predicate interior may legitimately carry a main-tree id. See "Walking the ids". |
 
 An audit's endpoint is **chosen**, because a span running past the last
@@ -73,7 +73,7 @@ audit read as a broken gate rather than a measurement. The `full` span therefore
 ends at the last instrumented pane, `post-inference..post-as-of-read`, stopping in
 front of `lambda_elim`.
 
-**The same discipline governs the gate.** `CAMBRA_LINEAGE_GATE=1` makes *every*
+**The same discipline governs the gate.** `CAMBRA_PROVENANCE_GATE=1` makes *every*
 compile fold its pane relations and gate the leak classes, so the gate's corpus
 becomes whatever the caller compiles — point it at the test suite and it covers
 every program there instead of the handful `context.rs`'s `corpus()` lists. That
@@ -101,7 +101,7 @@ it ahead reintroduces the unreachable zero.
 > and the adoption sequencing — is the `lineage-design` note under
 > projects/program-inspector in the internal vault.
 
-## Node identity (`src/ccl/provenance.rs`)
+## Node identity
 
 - **`NodeId`** — a `Copy` newtype giving each IR expression node a stable,
   never-reused identity (its own atomic counter, distinct from `Uid`). It rides
@@ -114,7 +114,7 @@ it ahead reintroduces the unreachable zero.
   backstops that it never persists into a checked tree).
 - **`Pass`** — the compiler stage that produced/rewrote a node (`Lower`,
   `Uniquify`, `Inline`, `Channelize`, `Transact`, `Letrec`, `Mono`, `LambdaElim`,
-  `Planning`). It lives in the lineage *data* (each row's `via`), never in a
+  `Planning`). It lives in the provenance *data* (each row's `via`), never in a
   type.
 
 ### Walking the ids
@@ -268,10 +268,10 @@ exactly that. A lift that *rebuilds* the term is already safe:
 re-mints every node. That is the mechanism, not the requirement; the requirement
 is that nothing aliased arrives, and each site pins it with a test.
 
-## The lineage model (`src/ccl/lineage.rs`)
+## The provenance model
 
 Recording is a **byproduct of performing a rewrite**, never a post-pass diff. As
-a pass runs, every node it *produces* gets a row in the `LineageTable`:
+a pass runs, every node it *produces* gets a row in the `ProvenanceTable`:
 
 | column | what it holds |
 |---|---|
@@ -303,7 +303,7 @@ Attribution resolves through **`parents` ∪ `blame`** — parentage first, then
 blame's distinct additions, so the span order is deterministic and blame is never
 dropped when it names a node the parents do not. Blame is named at a handful of
 sites, all in the mutability phases, so for almost every node this is simply the
-spans of what it was made from, which is why walking the lineage recovers a
+spans of what it was made from, which is why walking the parent edges recovers a
 source location at all.
 
 **Two labels on one relation, which is why they stay separate columns.** Both
@@ -326,7 +326,7 @@ lowering**; the fold's attributing helper carries a debug guard that no pass row
 ever carries it.
 
 Three invariants are properties of the *write*, and are asserted at
-`LineageTable::record`, at the site that would violate one, rather than in a
+`ProvenanceTable::record`, at the site that would violate one, rather than in a
 fold that only runs when a pane is materialized: **one row per id** (attribution
 has no join, so a second claimant has no answer), **every row anchored through
 some channel** (consumption or blame — a row with neither cannot explain where
@@ -364,7 +364,7 @@ sink, mirroring `infer_var::ACTIVE_ARENA`:
 **A site declares nothing.** It names the node it is *about to rewrite*:
 
 ```rust
-let _g = lineage::enter(slot_id, "inline.beta", Nature::Machinery);
+let _g = provenance::enter(slot_id, "inline.beta", Nature::Machinery);
 ```
 
 `slot_id` is read off the node before the rewrite runs; every id minted while the
@@ -381,7 +381,7 @@ a loud failure rather than a silent misattribution):
 - `also_consumes(id)` — genuine fusion (many:1), the only thing that puts a
   second parent on a row and the only place any id is named at record time.
 - `blame(ids)` — nodes this rewrite is **related to but did not consume to
-  produce** its outputs. Attribution unions them with the parents; the lineage
+  produce** its outputs. Attribution unions them with the parents; the pane
   relation carries them as *blame* edges. Blame is named at a handful of sites,
   all in the mutability phases, so `parents` alone is what recovers a source
   location for almost every node.
@@ -412,9 +412,9 @@ rows:
 rule-body edits), `planning/iterate`, and `transact_phase`'s as-of-read rewrite.
 `compile_program` opens no `PassScope` around any of them, so their recordings
 are inert in a normal build and land only under an audit a caller opens.
-`CAMBRA_LINEAGE_AUDIT=full` (`post-inference..post-as-of-read`) covers the
+`CAMBRA_PROVENANCE_AUDIT=full` (`post-inference..post-as-of-read`) covers the
 as-of-read rewrite; reaching `simplify` and `planning/iterate` needs
-`CAMBRA_LINEAGE_AUDIT=planning` (`recognized..join-planned`), which is what the
+`CAMBRA_PROVENANCE_AUDIT=planning` (`recognized..join-planned`), which is what the
 coverage figures below were measured with. `lambda_elim` records nothing, which
 is what an audit's endpoint stops in front of.
 
@@ -430,7 +430,7 @@ thirteen rule invocations, with **no rule body edited at all**:
 
 ```rust
 fn ruled(label: RewriteLabel, expr: &mut Expr, rule: impl FnOnce(&mut Expr) -> bool) -> bool {
-    let _g = lineage::enter(expr.node_id(), label, Nature::Machinery);
+    let _g = provenance::enter(expr.node_id(), label, Nature::Machinery);
     rule(expr)
 }
 ```
@@ -469,12 +469,12 @@ attribution *is* the product; the number will not tell you when they are wrong.
 `compile_program` opens one `PassScope` per pass — `Mono`, then `Inline`,
 `Transact`, `Letrec`, `Channelize` — inside the single `TableSession` that spans the
 whole compile, and retains the drained table as
-`CompiledProgram::lineage_table`. A pass that rewrites nothing on a given program
+`CompiledProgram::provenance_table`. A pass that rewrites nothing on a given program
 writes no rows, which is the preserve case and not a gap.
 
-### The node table (`src/ccl/lineage.rs`)
+### The node table
 
-The recording, keyed by the node it describes. `LineageTable` is
+The recording, keyed by the node it describes. `ProvenanceTable` is
 `NodeId → {parents, blame, rule}`: one row per **produced** node, written by
 `OpenStep::flush_into_table` as each guard drops. `parents` are the ids the
 rewrite consumed (the node the recording named; a fusion's whole consumed set),
@@ -530,7 +530,7 @@ raising a predicate back into the main tree; see
 `collapse(table, passes, input_ids, output_ids, upstream_attr)` folds the rows
 those passes wrote into:
 
-- a `LineageMap<NodeId, NodeId>` — a dense bidirectional node↔node relation
+- a `ProvenanceMap<NodeId, NodeId>` — a dense bidirectional node↔node relation
   (self-edge for every survivor), each edge carrying the **label set** described
   in [The edge labels](#the-edge-labels), and
 - the output pane's `SourceProjection` (`NodeId → SourceAttribution`, where an
@@ -544,7 +544,7 @@ those passes wrote into:
 
 Transients (born + consumed within the phase) compose away. A two-sided leak
 audit (`Leak`) reports both sides of the live-set difference: an output with no
-lineage (`Unexplained` — a capture defect) and an input absent from the output
+provenance (`Unexplained` — a capture defect) and an input absent from the output
 pane (`Died` — the death report, data rather than a defect, since under driver
 capture nothing declares a fate).
 
@@ -611,8 +611,8 @@ condition, and telling them apart would mean recording the rewrite's shape.
 
 The classes that are properties of a *record* rather than of a fold live at
 the write instead: one row per id, and every row anchored through consumption or
-blame, are asserted in `LineageTable::record` (see
-[The lineage model](#the-lineage-model-srcccllineagers)). "Two rewrites claimed
+blame, are asserted in `ProvenanceTable::record` (see
+[The provenance model](#the-provenance-model)). "Two rewrites claimed
 one id's death" has no class at all — a fate claim is not something a row makes,
 and an id appearing in two rows' `parents` is an ordinary shared ancestor.
 
@@ -621,7 +621,7 @@ leaf entries are appended at construction rather than when a guard drops, so its
 log
 genuinely is chronology, and its last-tag-wins re-imaging (`lower_expr` re-tagging
 an arm's already-tagged root) is real semantics rather than an artifact. It also
-has no lineage to compose — lowering mints from scratch, so what would be a set
+has no ancestry to compose — lowering mints from scratch, so what would be a set
 of input-pane roots per id degenerates to a plain live set.
 
 Both checks enumerate from the **tree**. There is deliberately no third check on
@@ -701,11 +701,11 @@ inspector's consumption of what it produces.
   refinement-predicate interiors included). This is the degenerate lowering case
   of `collapse`,
   and the one fold that stays sequential: no input pane (leaves are pure
-  insertions attributed from their literal anchor), no `LineageMap` output, no
+  insertions attributed from their literal anchor), no `ProvenanceMap` output, no
   upstream attr (a copy mirrors its origin's already-folded entry), and no
   one-record-per-id requirement (a re-image is a second entry for one id and the
   later tag deliberately wins). `Pass::Lower` is lowering-projection vocabulary
-  only — it never tags a `LineageTable` row, and the inter-pane relation stays a
+  only — it never tags a `ProvenanceTable` row, and the inter-pane relation stays a
   homogeneous `NodeId → NodeId` (the lowering projection constrains the
   **product**, not the producer).
   Release `InferError` diagnostics read the projection one-hop (no fold, before
@@ -721,17 +721,17 @@ inspector's consumption of what it produces.
   structurally impossible — the projection is *produced by* the fold, never
   mutated incrementally.
 - **Materialization (cold, inspector-only).** `CompiledProgram::materialize_panes`
-  folds `lineage_table` across the two pane relations, restricting it by pass:
+  folds `provenance_table` across the two pane relations, restricting it by pass:
   `MONO_PASSES` bridges pre → post-inference; `CHANNELIZE_PASSES` (Inline, Transact,
   Letrec, Channelize) bridges post-inference → post-channelize. It returns the three per-pane
-  `SourceProjection`s, the two pane-pair `LineageMap`s, and each relation's leak
+  `SourceProjection`s, the two pane-pair `ProvenanceMap`s, and each relation's leak
   vector. There is no catch-all bridge: a node is explained by a recorded row or
   it is not explained at all, and the gate is what says which. Materialization
   cannot assert its own gate — with `Died` as a payload the leak vector is a
   *product*, not an error channel — so it returns the leaks and callers gate.
 - **The pane leak gate.** `gate_leaks` gates the lowering handoff and both
   **pane relations** on the *defect* classes: `Unexplained` (an output node no
-  capture explains) and `ParentUnknown` (a lineage edge to an id the fold has
+  capture explains) and `ParentUnknown` (an ancestry edge to an id the fold has
   never heard of). The split lives on `Leak::is_defect`. `Died` is excluded by
   construction — it is the death report, and gating on it would be unsatisfiable
   now that no pass declares what it consumes.
@@ -741,7 +741,7 @@ inspector's consumption of what it produces.
   `pane_relations_fold_with_no_structural_leaks` asserts, as a property rather
   than a pinned residue count. Capture is total over the adopted span: every
   output-pane node has an origin. The whole-suite gate
-  (`CAMBRA_LINEAGE_GATE=1`) is the wider corpus and the narrower relation — it
+  (`CAMBRA_PROVENANCE_GATE=1`) is the wider corpus and the narrower relation — it
   holds at zero over every program the caller compiles, at the second relation
   only.
 
@@ -771,7 +771,7 @@ that exist:
   Measured at `post-inference..join-planned`, when that was `full`'s span: over
   the 11-program corpus the residue was 1184 `ParentUnknown` edges and nothing
   else, every unknown parent a predicate-interior id of the input tree, and
-  widening the audit's live set (`CAMBRA_LINEAGE_PREDICATES=1`) took every gated
+  widening the audit's live set (`CAMBRA_PROVENANCE_PREDICATES=1`) took every gated
   class to zero. (The count is from before the endpoint moved and has not been
   re-taken.) That says the recording is total for the span and the narrow live
   set is what makes the crossing read as a leak. It says nothing about the two
@@ -792,7 +792,7 @@ pane folds; the release compiler reads the lowering projection and nothing else.
   `Nature::is_source`, and both validators guard that a `"source"` nature never
   actually ships. The wire carries no flat `Source`/`Derived`/`Synthetic` label
   string; the frontend formats the tag itself.
-- `paneLinks` ship each pane-pair `LineageMap` **dense** — self-edges included,
+- `paneLinks` ship each pane-pair `ProvenanceMap` **dense** — self-edges included,
   no identity-edge filter — via `stage::dense_edges`; the frontend only follows
   edges, never reconstructing them, and reads each edge's label set to decide
   whether to render the blame or prune it. Both validators check that every

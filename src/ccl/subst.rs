@@ -119,7 +119,7 @@ pub enum Mapping {
 /// `compact`, `constrain` — and a bound edge's payloads are **type-domain**
 /// terms whose ids are outside the recorded id domain, so each such copy records
 /// a `Copy` against an origin the table never saw and the pane fold reports it as
-/// [`Leak::ParentUnknown`](crate::ccl::lineage::Leak::ParentUnknown). Measured on
+/// [`Leak::ParentUnknown`](crate::ccl::provenance::Leak::ParentUnknown). Measured on
 /// `generator_pipeline`: 200 of them across the first pane relation.
 ///
 /// [`as_expr_preserving`]: Mapping::as_expr_preserving
@@ -185,7 +185,7 @@ impl Mapping {
     ///
     /// A `Rename` is built directly at `node_id` rather than minted and then
     /// overwritten: a mint fires `on_mint`, and an id no node ends up carrying is
-    /// a phantom birth in the lineage log.
+    /// a phantom birth in the provenance record.
     ///
     /// A `Discharge` copies through [`clone_at`](TypedExpr::clone_at), which
     /// builds the replacement's root directly at `node_id` and freshens the
@@ -473,10 +473,10 @@ impl Subst {
         // Recording rather than simply freshening is the load-bearing half —
         // unbracketed, these produced 50 `ParentUnknown` on `inner_join`.
         if self.is_id() {
-            let _g = crate::ccl::lineage::enter(
+            let _g = crate::ccl::provenance::enter(
                 e.node_id(),
                 "subst.vacuous",
-                crate::ccl::lineage::Nature::Machinery,
+                crate::ccl::provenance::Nature::Machinery,
             );
             return e.clone();
         }
@@ -487,10 +487,10 @@ impl Subst {
         // path, which is what keeps vacuous transport from copying terms or
         // rebuilding predicate terms into fresh `Rc`s.
         if !self.0.keys().any(|k| is_free(k, e)) {
-            let _g = crate::ccl::lineage::enter(
+            let _g = crate::ccl::provenance::enter(
                 e.node_id(),
                 "subst.vacuous",
-                crate::ccl::lineage::Nature::Machinery,
+                crate::ccl::provenance::Nature::Machinery,
             );
             return e.clone();
         }
@@ -505,10 +505,10 @@ impl Subst {
         // nodes below are genuinely new and want **recording**, not id-preserving
         // — and the node they are derived from is `e`. The recording opens at
         // function entry because the `Var` arm returns early.
-        let _g = crate::ccl::lineage::enter(
+        let _g = crate::ccl::provenance::enter(
             e.node_id(),
             "subst.transport",
-            crate::ccl::lineage::Nature::Machinery,
+            crate::ccl::provenance::Nature::Machinery,
         );
         let node = match &e.node {
             Var(n) => match self.0.get(n) {
@@ -1054,10 +1054,10 @@ impl Subst {
         // The slot is the source predicate's own root, so the rewritten term rows
         // as derived from the term it was substituted out of.
         let new_pred = {
-            let _g = crate::ccl::lineage::enter(
+            let _g = crate::ccl::provenance::enter(
                 r.predicate.node_id(),
                 "subst.force_refinement",
-                crate::ccl::lineage::Nature::Machinery,
+                crate::ccl::provenance::Nature::Machinery,
             );
             strip_iterate_markers(&restricted.apply_expr(&r.predicate))
         };

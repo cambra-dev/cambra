@@ -290,7 +290,7 @@ pub(super) fn lower_lambda(
 /// ([`LoweringContext::fresh_tuple_arg`]), so the engine's no-capture assert
 /// cannot fire.
 fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
-    use crate::ccl::lineage::copy_frame;
+    use crate::ccl::provenance::copy_frame;
     let mut expr = expr;
     // A lowering copy sink: the discharge's interior freshens fire `on_copy` into
     // this recording, which writes them as `Copy` LoweringSteps (mirroring the
@@ -443,8 +443,10 @@ in add"
     #[test]
     fn uncurry_projection_roots_carry_occurrence_spans() {
         use crate::ccl::TypedExprNode;
-        use crate::ccl::lineage::{LoweringSession, Nature, SourceProjection, collapse_lowering};
         use crate::ccl::provenance::NodeId;
+        use crate::ccl::provenance::{
+            LoweringSession, Nature, SourceProjection, collapse_lowering,
+        };
         use crate::chl_parser::ast::Span;
         use std::collections::HashSet;
 

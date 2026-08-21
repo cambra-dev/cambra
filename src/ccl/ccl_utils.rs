@@ -1408,16 +1408,16 @@ impl<C: PartialEq + Clone> PredMemo<C> {
         // freshens, recorded against the source predicate's own root, which records
         // it as derived from the term it was rebuilt from.
         let (pred, reported) = if self.is_replacing() {
-            crate::ccl::lineage::preserving_ids(|| {
+            crate::ccl::provenance::preserving_ids(|| {
                 let mut pred = (*keepalive).clone();
                 let reported = f(&mut pred);
                 (pred, reported)
             })
         } else {
-            let _g = crate::ccl::lineage::enter(
+            let _g = crate::ccl::provenance::enter(
                 keepalive.node_id(),
                 "predicate.rebuild",
-                crate::ccl::lineage::Nature::Machinery,
+                crate::ccl::provenance::Nature::Machinery,
             );
             let mut pred = (*keepalive).clone();
             let reported = f(&mut pred);
@@ -1460,16 +1460,16 @@ impl TermMemo {
         let keepalive = Rc::clone(&refinement.predicate);
         // Copy and rewrite under the memo's declared intent; see `rebuild`.
         let pred = if self.0.is_replacing() {
-            crate::ccl::lineage::preserving_ids(|| {
+            crate::ccl::provenance::preserving_ids(|| {
                 let mut pred = (*keepalive).clone();
                 f(&mut pred);
                 pred
             })
         } else {
-            let _g = crate::ccl::lineage::enter(
+            let _g = crate::ccl::provenance::enter(
                 keepalive.node_id(),
                 "predicate.rebuild",
-                crate::ccl::lineage::Nature::Machinery,
+                crate::ccl::provenance::Nature::Machinery,
             );
             let mut pred = (*keepalive).clone();
             f(&mut pred);

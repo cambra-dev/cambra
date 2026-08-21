@@ -725,7 +725,7 @@ pub struct TypedExpr {
     ///
     /// **`Clone` freshens.** A clone is a *sibling*, not the same node, so the
     /// hand-written [`Clone`] impl below mints a new id for every node it
-    /// copies and reports each `(origin, fresh)` pair to the lineage recorder.
+    /// copies and reports each `(origin, fresh)` pair to the provenance recorder.
     /// There is no decision to make at a clone site and no "copy then freshen"
     /// step to forget: the only way to reach a duplicated id is to write one
     /// deliberately, through [`preserve`](Self::preserve),
@@ -758,8 +758,8 @@ pub type Expr = TypedExpr;
 
 /// Hand-written so that **a clone is a sibling, not the same node**: every node
 /// it copies gets a freshly-minted [`NodeId`], and every `(origin, fresh)` pair
-/// is reported to the ambient lineage recorder via
-/// [`on_copy`](crate::ccl::lineage::on_copy).
+/// is reported to the ambient provenance recorder via
+/// [`on_copy`](crate::ccl::provenance::on_copy).
 ///
 /// A derived `Clone` copied `node_id`, which made *every* duplication site a
 /// decision: reach for `clone` when the copy replaces its source, or for a
@@ -791,7 +791,7 @@ pub type Expr = TypedExpr;
 /// is the sentinel. Nothing is recorded and nothing reaches a checked tree.
 impl Clone for TypedExpr {
     fn clone(&self) -> Self {
-        let node_id = crate::ccl::lineage::copy_id(self.node_id);
+        let node_id = crate::ccl::provenance::copy_id(self.node_id);
         TypedExpr {
             ty: self.ty.clone(),
             node: self.node.clone(),
@@ -823,7 +823,7 @@ impl TypedExpr {
     /// registered [`Type::Infer`] variable before type-checking begins.
     pub fn new(node: TypedExprNode) -> Self {
         let node_id = NodeId::fresh();
-        crate::ccl::lineage::on_mint(node_id);
+        crate::ccl::provenance::on_mint(node_id);
         TypedExpr {
             node,
             ty: Type::Hole,
@@ -837,9 +837,9 @@ impl TypedExpr {
     ///
     /// A pass that rebuilds a node — reparenting it, renaming a slot, moving it
     /// along a spine — is producing the same logical node at a new position, so
-    /// its `NodeId` must carry over for its span and lineage to survive as a
+    /// its `NodeId` must carry over for its span and provenance to survive as a
     /// self-edge. Minting and then overwriting the id cannot express that: the
-    /// mint fires [`on_mint`](crate::ccl::lineage::on_mint), so the log records a
+    /// mint fires [`on_mint`](crate::ccl::provenance::on_mint), so the log records a
     /// birth for an id that ends up on no node — a claim the fold cannot check,
     /// because its leak classes enumerate from the tree (see
     /// `design/provenance.md`, "The collapse"). Entering the id at construction
@@ -889,7 +889,7 @@ impl TypedExpr {
     ///
     /// It carries [`NodeId::PLACEHOLDER`], the reserved throwaway identity, so it
     /// consumes no id and records no birth: a diagnostic must not perturb the
-    /// lineage log it may be reporting on. `assert_unique_node_ids` backstops that
+    /// provenance record it may be reporting on. `assert_unique_node_ids` backstops that
     /// a placeholder never reaches a checked tree.
     pub(crate) fn throwaway(node: TypedExprNode) -> Self {
         Self::preserve(NodeId::PLACEHOLDER, node)
@@ -966,7 +966,7 @@ impl TypedExpr {
     /// (the naive arm ran *faster* than baseline at 2-3x the ids), so the honest
     /// fix is to record the copy. See the vault's `freshening-clone-report`.
     pub(crate) fn clone_preserving_ids(&self) -> Self {
-        let _preserving = crate::ccl::lineage::preserve_ids();
+        let _preserving = crate::ccl::provenance::preserve_ids();
         self.clone()
     }
 
@@ -1954,7 +1954,7 @@ impl TypedExpr {
 impl Default for TypedExpr {
     fn default() -> Self {
         // Built *literally*, not via `Self::new`: a `mem::take` throwaway must
-        // not fire `on_mint` and pollute an open lineage step. It carries the
+        // not fire `on_mint` and pollute an open recording. It carries the
         // reserved `PLACEHOLDER` id (never minted, ignored by `on_mint`) and is
         // always immediately overwritten, so it never reaches a checked tree.
         // Every default node shares this id, so two defaults compare equal (as

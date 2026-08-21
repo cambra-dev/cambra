@@ -50,7 +50,7 @@ use crate::ccl::{
     TypedExprNode,
     ccl_utils::{COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
-    lineage,
+    provenance,
     subst::Subst,
     symbolic::symbolic,
 };
@@ -213,7 +213,7 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
     match writer_body.node {
         // 1:1 reparents — carry the input node's id (a preserve, not a mint): the
         // statement/binding survives at a new spine position, so its source span
-        // and lineage carry over as a self-edge rather than a fresh untracked node.
+        // and provenance carry over as a self-edge rather than a fresh untracked node.
         TypedExprNode::ExprStmt {
             expr: effect,
             body: cont,
@@ -377,10 +377,10 @@ fn flatten_spine(mut e: Expr) -> Expr {
         // The recursion is outside the recording, so a nested hoist attributes to its
         // own `Let`.
         let hoisted = {
-            let _g = lineage::enter(
+            let _g = provenance::enter(
                 let_id,
                 "letrec.hoist_writer_body",
-                lineage::Nature::Machinery,
+                provenance::Nature::Machinery,
             );
             hoist_writer_body(binding, *bound_expr, *body)
         };
@@ -394,10 +394,10 @@ fn flatten_spine(mut e: Expr) -> Expr {
         // position. So the write is the slot.
         let write_id = e.node_id();
         let terminalized = {
-            let _g = lineage::enter(
+            let _g = provenance::enter(
                 write_id,
                 "letrec.terminalize_write",
-                lineage::Nature::Machinery,
+                provenance::Nature::Machinery,
             );
             Expr::expr_stmt(e, unit_expr())
         };
@@ -439,7 +439,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             //
             // `blame` names the `For` rather than the `ExprStmt` so the products
             // resolve to the loop keyword's span, not the statement's.
-            let g = lineage::enter(stmt_id, "letrec.loop", lineage::Nature::Expansion);
+            let g = provenance::enter(stmt_id, "letrec.loop", provenance::Nature::Expansion);
             g.blame(&[effect_id]);
             return transform_loop(target, *iter, *loop_body, *body);
         }
@@ -452,7 +452,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             // node it replaces. The `MutWrite` marker and the `ExprStmt` wrapper
             // both vanish, but neither is named: both are absent from the output
             // tree, so the boundary difference reports them.
-            let g = lineage::enter(stmt_id, "letrec.bare_write", lineage::Nature::Machinery);
+            let g = provenance::enter(stmt_id, "letrec.bare_write", provenance::Nature::Machinery);
             g.blame(&[effect_id]);
             return normalize_bare_write(name, *value, *body);
         }
@@ -1176,7 +1176,7 @@ fn strip_trailing_unit(expr: Expr) -> Expr {
     // The rebuilt `Case` below is the same logical node with stripped branch
     // bodies, so it carries its original `NodeId`; a pass that minted here would
     // break the node's link to the source it came from. See
-    // `src/ccl/design/provenance.md`, "Node identity (`src/ccl/provenance.rs`)".
+    // `src/ccl/design/provenance.md`, "Node identity".
     let node_id = expr.node_id();
     match expr.node {
         TypedExprNode::ExprStmt { expr: effect, body }
@@ -1694,10 +1694,7 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
         }
         other => panic!(
             "letrec phase: a writer decision is `let* in {{commit, writes}}`, got {}",
-            symbolic(
-                &Expr::preserve(crate::ccl::provenance::NodeId::PLACEHOLDER, other)
-                    .with_ty(decision.ty)
-            )
+            symbolic(&Expr::preserve(provenance::NodeId::PLACEHOLDER, other).with_ty(decision.ty))
         ),
     }
 }

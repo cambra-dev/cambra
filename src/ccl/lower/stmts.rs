@@ -1937,8 +1937,8 @@ x";
     #[test]
     fn lowering_tags_nodes_with_source_spans() {
         use crate::ccl::TypedExprNode;
-        use crate::ccl::lineage::{LoweringSession, Nature, collapse_lowering};
         use crate::ccl::provenance::NodeId;
+        use crate::ccl::provenance::{LoweringSession, Nature, collapse_lowering};
         use crate::chl_parser::ast::Span;
         use std::collections::HashSet;
 

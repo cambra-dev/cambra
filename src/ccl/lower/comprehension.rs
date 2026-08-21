@@ -348,7 +348,7 @@ pub(super) fn lower_list_comp(
 /// Keeping the first arm's ids was measured at 30 ids saved over the whole
 /// pipeline suite, max subtree 5 — which does not pay for a second code path.
 fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
-    use crate::ccl::lineage::copy_frame;
+    use crate::ccl::provenance::copy_frame;
     let _frame = copy_frame(label);
     origin.clone()
 }

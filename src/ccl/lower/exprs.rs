@@ -468,7 +468,7 @@ pub(super) fn lower_compare(
     // as a `Copy` step mirroring the original operand's (Source) image, which is
     // the attribution wanted for a duplicated operand.
     let operand = |i: usize| {
-        use crate::ccl::lineage::copy_frame;
+        use crate::ccl::provenance::copy_frame;
         let _frame = copy_frame("lower.compare_operand");
         operands[i].clone()
     };
@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn chained_compare_freshens_shared_operands() {
         use crate::ccl::context::{assert_unique_node_ids, collect_tree_ids};
-        use crate::ccl::lineage::{LoweringSession, collapse_lowering};
+        use crate::ccl::provenance::{LoweringSession, collapse_lowering};
 
         let expr = parse_expr("1 < x < 3");
         let mut ctx = LoweringContext::default();

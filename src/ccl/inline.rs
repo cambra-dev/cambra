@@ -69,7 +69,7 @@ use crate::ccl::{
     Expr, Lit, Name, Refinement, Type, TypedExprNode,
     ccl_utils::{PredMemo, is_free, walk_refined_predicates_mut},
     lambda_elim::substitute,
-    lineage,
+    provenance,
 };
 
 // ---------------------------------------------------------------------------
@@ -235,7 +235,7 @@ fn inline_impl(expr: Expr) -> Expr {
                 // Alias collapse: the `Let` and its `Var` bound-expr die, the
                 // body is promoted. Nothing is minted, so the recording exists
                 // only to own the substitution's copies.
-                let _g = lineage::enter(node_id, "inline.alias", lineage::Nature::Machinery);
+                let _g = provenance::enter(node_id, "inline.alias", provenance::Nature::Machinery);
                 return substitute(body, &binding.name, &bound_expr);
             }
 
@@ -252,7 +252,7 @@ fn inline_impl(expr: Expr) -> Expr {
                 // Let bindings (e.g. `let y = (let x = Defer in …) in …` after
                 // expanding a defer-returning UDF) are eligible for the alias
                 // and lift rewrites on the second pass.
-                let _g = lineage::enter(node_id, "inline.udf", lineage::Nature::Expansion);
+                let _g = provenance::enter(node_id, "inline.udf", provenance::Nature::Expansion);
                 return inline_impl(inline_and_beta_reduce(
                     body,
                     &binding.name,
@@ -402,7 +402,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                 // promoted `body` keeps its own id and is its own self-edge, and
                 // the substituted argument's copies arrive through `on_copy` as
                 // copies of the argument's own interior, which is what they are.
-                let _g = lineage::enter(node_id, "inline.beta", lineage::Nature::Expansion);
+                let _g = provenance::enter(node_id, "inline.beta", provenance::Nature::Expansion);
                 return substitute(*body, &param.name, &argument);
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather

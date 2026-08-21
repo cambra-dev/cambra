@@ -116,7 +116,7 @@ use crate::ccl::{
     TypedExpr, TypedExprNode,
     ccl_utils::{count_free, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
-    lineage,
+    provenance,
 };
 
 /// `true` when `ty` carries channelization-erasable residue — a `Hole` stamped
@@ -1220,7 +1220,8 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
             // product replaces it. A cluster's inner defers are consumed too but
             // are not named, because naming them would assert they die, and a
             // defer whose handle survives in a type does not.
-            let _g = lineage::enter(node_id, "channelize.cluster", lineage::Nature::Expansion);
+            let _g =
+                provenance::enter(node_id, "channelize.cluster", provenance::Nature::Expansion);
             channelize_cluster(&defer_names, &chan_names, body_rewritten, ctx)
         }
         TypedExprNode::Let {
@@ -1253,10 +1254,10 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
                 // The recursion below runs outside the recording, so a nested lift
                 // attributes to its own `let`.
                 let lift = {
-                    let _g = lineage::enter(
+                    let _g = provenance::enter(
                         node_id,
                         "channelize.defer_lift",
-                        lineage::Nature::Machinery,
+                        provenance::Nature::Machinery,
                     );
                     lift_defer(&binding.name, *bound_expr, &body)
                 };
@@ -1299,10 +1300,10 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
                 // borrowed tree and splices the outer body into its tail, so the
                 // collapsed `let` and both copies are new nodes standing in for
                 // this `let`. Same slot and same reason as the lift above.
-                let _g = lineage::enter(
+                let _g = provenance::enter(
                     node_id,
                     "channelize.defer_collapse",
-                    lineage::Nature::Machinery,
+                    provenance::Nature::Machinery,
                 );
                 let inner_name = inner_binding.name.clone();
                 let inner_be = (**inner_be).clone();

@@ -82,7 +82,7 @@ use std::{
 use crate::{
     ccl::{
         Branch, Expr, Lit, Type, TypedExprNode,
-        lineage::{Nature, RewriteLabel},
+        provenance::{Nature, RewriteLabel},
     },
     chl_parser::ast::{
         Expr as ChlExpr, RecordField, Span, Spanned, Stmt as ChlStmt,
@@ -412,7 +412,7 @@ impl LoweringContext {
     }
 
     /// Record `expr` as a source construct's image — a single-node leaf
-    /// [`LoweringStep`](crate::ccl::lineage::LoweringStep) (`"lower.image"`,
+    /// [`LoweringStep`](crate::ccl::provenance::LoweringStep) (`"lower.image"`,
     /// anchored at `span`) appended to the always-on lowering log — and return it,
     /// for chaining at construction sites.
     ///
@@ -448,7 +448,7 @@ impl LoweringContext {
     /// A no-op when no lowering session is installed (the `lower` submodules' unit
     /// tests, which only inspect the tree shape).
     pub(super) fn tag_source(&mut self, expr: Expr, span: Span) -> Expr {
-        crate::ccl::lineage::lowering_leaf(expr.node_id(), span, Nature::Source, "lower.image");
+        crate::ccl::provenance::lowering_leaf(expr.node_id(), span, Nature::Source, "lower.image");
         expr
     }
 
@@ -484,12 +484,17 @@ impl LoweringContext {
     /// once real consumption tells us what distinction is actually load-bearing.
     /// Do not build on the current shape.
     pub(super) fn tag_image(&mut self, expr: Expr, span: Span) -> Expr {
-        crate::ccl::lineage::lowering_leaf(expr.node_id(), span, Nature::Machinery, "lower.image");
+        crate::ccl::provenance::lowering_leaf(
+            expr.node_id(),
+            span,
+            Nature::Machinery,
+            "lower.image",
+        );
         expr
     }
 
     /// Record `expr` as **manufactured by lowering** — a single-node leaf
-    /// [`LoweringStep`](crate::ccl::lineage::LoweringStep) (`Nature::Machinery`,
+    /// [`LoweringStep`](crate::ccl::provenance::LoweringStep) (`Nature::Machinery`,
     /// `label`, anchored at `span`) appended to the always-on lowering log — and
     /// return it, for chaining at construction sites. The dual of
     /// [`tag_image`](Self::tag_image): a node lowering *manufactured* — encoding
@@ -509,7 +514,7 @@ impl LoweringContext {
     /// [`tag_source`](Self::tag_source) for the rule). The `label` is what
     /// distinguishes them — `"lower.image"` versus a `lower.<rule>` name.
     pub(super) fn tag_machinery(&mut self, expr: Expr, span: Span, label: RewriteLabel) -> Expr {
-        crate::ccl::lineage::lowering_leaf(expr.node_id(), span, Nature::Machinery, label);
+        crate::ccl::provenance::lowering_leaf(expr.node_id(), span, Nature::Machinery, label);
         expr
     }
 
@@ -527,10 +532,10 @@ impl LoweringContext {
     /// predicate is born. Nodes already recorded keep their own precise
     /// attribution — see [`lowering_predicate_leaf`].
     ///
-    /// [`lowering_predicate_leaf`]: crate::ccl::lineage::lowering_predicate_leaf
+    /// [`lowering_predicate_leaf`]: crate::ccl::provenance::lowering_predicate_leaf
     pub(super) fn tag_predicate(&mut self, pred: &Expr, span: Span, label: RewriteLabel) {
         fn go(e: &Expr, span: Span, label: RewriteLabel) {
-            crate::ccl::lineage::lowering_predicate_leaf(
+            crate::ccl::provenance::lowering_predicate_leaf(
                 e.node_id(),
                 span,
                 Nature::Machinery,
@@ -714,7 +719,7 @@ pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String
 /// [`LoweringContext::tag_machinery`] for manufactured plumbing. **That choice is
 /// per-rule judgment, not a rule** — `tag_image`'s docs state what it does and
 /// does not guarantee. Whichever of them lands at the root is re-tagged here.
-/// [`collapse_lowering`](crate::ccl::lineage::collapse_lowering)'s leak taxonomy
+/// [`collapse_lowering`](crate::ccl::provenance::collapse_lowering)'s leak taxonomy
 /// enforces full coverage of the lowered tree either way.
 pub fn lower_expr(
     expr: &Spanned<ChlExpr>,

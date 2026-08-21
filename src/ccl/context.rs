@@ -17,12 +17,12 @@ use crate::{
             check_pre_channelize, infer, typecheck,
         },
         inline, lambda_elim,
-        lineage::{
-            Leak, LineageMap, LineageTable, LoweringSession, PassScope, SourceProjection,
-            TableSession, collapse, collapse_lowering,
-        },
         lower::{LoweringContext, LoweringError, lower_stmts},
         mut_elim, planning,
+        provenance::{
+            Leak, LoweringSession, PassScope, ProvenanceMap, ProvenanceTable, SourceProjection,
+            TableSession, collapse, collapse_lowering,
+        },
         provenance::{NodeId, Pass},
         symbolic::{symbolic, symbolic_typed},
         transact_phase, uniquify,
@@ -471,8 +471,8 @@ pub struct CompiledProgram {
     pub done: std::sync::mpsc::Receiver<()>,
     /// The always-on **lowering projection**: **every** lowered node's
     /// [`NodeId`](crate::ccl::provenance::NodeId) mapped to the
-    /// [`SourceAttribution`](crate::ccl::lineage::SourceAttribution) folded from
-    /// lowering's [`LoweringLog`](crate::ccl::lineage::LoweringLog). Every entry
+    /// [`SourceAttribution`](crate::ccl::provenance::SourceAttribution) folded from
+    /// lowering's [`LoweringLog`](crate::ccl::provenance::LoweringLog). Every entry
     /// is `via: Lower`; the tag is one of **three** shapes, not two:
     ///
     /// - `Nature::Source` + `"lower.image"` — the root of a lowered
@@ -489,7 +489,7 @@ pub struct CompiledProgram {
     /// Coverage, by contrast, is guaranteed: the whole `walk_children` domain is
     /// present, since an unrecorded mint surfaces as `Leak::Unexplained` at the
     /// fold. Produced by
-    /// [`collapse_lowering`](crate::ccl::lineage::collapse_lowering) at the
+    /// [`collapse_lowering`](crate::ccl::provenance::collapse_lowering) at the
     /// lowering boundary, never mutated incrementally. It is always-on and the
     /// release `InferError` diagnostics read it one-hop (spans of the blame node).
     pub lowering_projection: SourceProjection,
@@ -535,9 +535,9 @@ pub struct CompiledProgram {
     /// Every id preserved through inline/transact/letrec/channelize is shared with
     /// [`post_inference_ir`](Self::post_inference_ir).
     pub post_channelize_ir: Expr,
-    /// The compile's lineage record: `NodeId → { parents, blame, rule }`, one
+    /// The compile's provenance record: `NodeId → { parents, blame, rule }`, one
     /// row per node a pass produced, written by the recorder as those passes run
-    /// ([`crate::ccl::lineage`]).
+    /// ([`crate::ccl::provenance`]).
     ///
     /// One table covers the whole compile, because a row's key is a
     /// process-unique `NodeId` and needs no pass set to disambiguate it; a row's
@@ -557,14 +557,14 @@ pub struct CompiledProgram {
     /// prerequisites for panes past `post-channelize`".
     ///
     /// Empty when capture is switched off — no pass scope is opened then, so
-    /// every flush is a no-op — see [`lineage_capture_enabled`]. This is the
-    /// authoritative lineage surface:
+    /// every flush is a no-op — see [`provenance_capture_enabled`]. This is the
+    /// authoritative provenance surface:
     /// [`materialize_panes`](Self::materialize_panes) folds it for each pane
     /// relation.
     // Consumed by `materialize_panes` and the inspector model; the compiler
     // itself never reads it.
     #[allow(dead_code)]
-    pub(crate) lineage_table: LineageTable,
+    pub(crate) provenance_table: ProvenanceTable,
     /// The parsed CHL surface AST — the source-of-truth for source-level
     /// (lexical) inspector queries.
     ///
@@ -608,8 +608,8 @@ impl CompiledProgram {
         self.outputs.iter().filter(|o| !o.is_main())
     }
 
-    /// Fold [`lineage_table`](Self::lineage_table) across the two pane relations into
-    /// the per-pane [`SourceProjection`]s, the pane-pair [`LineageMap`]s, and
+    /// Fold [`provenance_table`](Self::provenance_table) across the two pane relations into
+    /// the per-pane [`SourceProjection`]s, the pane-pair [`ProvenanceMap`]s, and
     /// each relation's [`Leak`]s. Cold path (snapshot-serve only), never called
     /// by [`compile_program`]:
     ///
@@ -632,14 +632,14 @@ impl CompiledProgram {
         let post_des_ids = collect_tree_ids(&self.post_channelize_ir);
 
         let (mono_map, post_inference, mono_leaks) = collapse(
-            &self.lineage_table,
+            &self.provenance_table,
             MONO_PASSES,
             &pre_ids,
             &post_inf_ids,
             &self.lowering_projection,
         );
         let (channelize_map, post_channelize, channelize_leaks) = collapse(
-            &self.lineage_table,
+            &self.provenance_table,
             CHANNELIZE_PASSES,
             &post_inf_ids,
             &post_des_ids,
@@ -672,8 +672,8 @@ pub(crate) const MONO_PASSES: &[Pass] = &[Pass::Mono];
 pub(crate) const CHANNELIZE_PASSES: &[Pass] =
     &[Pass::Inline, Pass::Transact, Pass::Letrec, Pass::Channelize];
 
-/// The per-pane projections, pane-pair lineage maps, and per-relation leaks
-/// materialized from [`CompiledProgram::lineage_table`] — see
+/// The per-pane projections, pane-pair provenance maps, and per-relation leaks
+/// materialized from [`CompiledProgram::provenance_table`] — see
 /// [`CompiledProgram::materialize_panes`].
 // Consumed by the inspector model; unused within the compiler itself.
 #[allow(dead_code)]
@@ -684,11 +684,11 @@ pub(crate) struct MaterializedPanes {
     pub(crate) post_inference: SourceProjection,
     /// post-channelize pane projection.
     pub(crate) post_channelize: SourceProjection,
-    /// pre-inference → post-inference lineage map (the `Mono` fan-out). Dense:
+    /// pre-inference → post-inference provenance map (the `Mono` fan-out). Dense:
     /// an id that survived is its own self-edge.
-    pub(crate) mono_map: LineageMap<NodeId, NodeId>,
-    /// post-inference → post-channelize lineage map.
-    pub(crate) channelize_map: LineageMap<NodeId, NodeId>,
+    pub(crate) mono_map: ProvenanceMap<NodeId, NodeId>,
+    /// post-inference → post-channelize provenance map.
+    pub(crate) channelize_map: ProvenanceMap<NodeId, NodeId>,
     /// Leaks at the pre-inference → post-inference pane relation.
     pub(crate) mono_leaks: Vec<Leak>,
     /// Leaks at the post-inference → post-channelize pane relation.
@@ -790,7 +790,7 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
 ///
 /// The counterpart to [`collect_tree_ids`], which is predicate-*inclusive* and is
 /// the id domain the fold must explain. This narrow walk exists so the two can be
-/// measured against the same logs (see [`LineageAudit::live_ids`]): with the
+/// measured against the same logs (see [`ProvenanceAudit::live_ids`]): with the
 /// narrow live set, planning's *main-tree* output is essentially fully explained
 /// and the residue is entirely inside refinement predicates, which is the
 /// measurement that says where the remaining work is.
@@ -806,7 +806,7 @@ pub(crate) fn collect_main_tree_ids(expr: &Expr) -> std::collections::HashSet<No
 
 /// Every node id reachable in `expr`: the `walk_children` node set plus the
 /// interiors of every refinement predicate riding a type slot — the id domain the
-/// lineage steps and the pane projections must explain.
+/// recordings and the pane projections must explain.
 ///
 /// Deliberately wider than `assert_unique_node_ids`, which walks children only.
 /// Explanation and uniqueness are two questions with two answers; see
@@ -846,7 +846,7 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId>
 ///
 /// `Unexplained` is the capture gate — an output-pane node with no origin means
 /// the driver missed a mint. `ParentUnknown` is the record-integrity gate — a
-/// node's lineage stopping at an id the fold has never heard of.
+/// node's ancestry stopping at an id the fold has never heard of.
 ///
 /// [`Leak::Died`] is deliberately **not** gated. Nothing declares a fate under
 /// driver capture, so `Died` fires for every node that dies across the fold — it
@@ -861,7 +861,7 @@ fn gate_leaks(leaks: &[Leak], relation: &str) {
     let defects: Vec<&Leak> = leaks.iter().filter(|l| l.is_defect()).collect();
     assert!(
         defects.is_empty(),
-        "lineage capture defect across the {relation} pane relation \
+        "provenance capture defect across the {relation} pane relation \
          ({} of {} leaks; `Died` is the death report and is not gated): {defects:?}",
         defects.len(),
         leaks.len(),
@@ -893,7 +893,7 @@ fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
 /// Pipeline-wide id-uniqueness tripwire: panic if `expr` carries a duplicated
 /// [`NodeId`], naming the `boundary` and the offending id(s) + node kinds.
 ///
-/// Uniqueness within a tree is what makes a `NodeId` an *identity*: the lineage
+/// Uniqueness within a tree is what makes a `NodeId` an *identity*: the provenance
 /// map is keyed by id, so two live nodes sharing one id make their attributions
 /// and edges indistinguishable. The failure mode this catches is a clone that
 /// forgot to freshen, or a rewrite that preserved an id where it minted.
@@ -944,7 +944,7 @@ pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Lineage measurement switches
+// Provenance measurement switches
 //
 // Four environment variables steer what the recorder does. Each is named once
 // and read through exactly one accessor, because two of them interact: pane
@@ -956,19 +956,19 @@ pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
 
 /// Turns pane capture off (`=0`), so the cost of capture can be measured
 /// against the same binary compiling the same programs.
-const LINEAGE_ENV: &str = "CAMBRA_LINEAGE";
+const PROVENANCE_ENV: &str = "CAMBRA_PROVENANCE";
 
-/// Names the [`LineageAudit`] span to open, e.g. `full`.
-const LINEAGE_AUDIT_ENV: &str = "CAMBRA_LINEAGE_AUDIT";
+/// Names the [`ProvenanceAudit`] span to open, e.g. `full`.
+const PROVENANCE_AUDIT_ENV: &str = "CAMBRA_PROVENANCE_AUDIT";
 
 /// Gates the pane-relation leak classes on **every** compile (`=1`), making the
 /// gate's corpus whatever the caller compiles.
-const LINEAGE_GATE_ENV: &str = "CAMBRA_LINEAGE_GATE";
+const PROVENANCE_GATE_ENV: &str = "CAMBRA_PROVENANCE_GATE";
 
 /// Narrows an audit's live set to the main tree, excluding refinement-predicate
 /// interiors (`=0`). Predicate-inclusive otherwise — see
-/// [`lineage_predicates_live`].
-const LINEAGE_PREDICATES_ENV: &str = "CAMBRA_LINEAGE_PREDICATES";
+/// [`provenance_predicates_live`].
+const PROVENANCE_PREDICATES_ENV: &str = "CAMBRA_PROVENANCE_PREDICATES";
 
 /// Repetition count for the ignored perf driver. Test-only — the driver is a
 /// `#[test]`, so the name is dead in a lib build; it lives here rather than
@@ -976,10 +976,10 @@ const LINEAGE_PREDICATES_ENV: &str = "CAMBRA_LINEAGE_PREDICATES";
 #[cfg(test)]
 const PERF_REPS_ENV: &str = "CAMBRA_PERF_REPS";
 
-/// The audit span named by [`LINEAGE_AUDIT_ENV`], if any. **Sole reader** of
+/// The audit span named by [`PROVENANCE_AUDIT_ENV`], if any. **Sole reader** of
 /// that variable — see the section note above.
-fn lineage_audit_span() -> Option<String> {
-    std::env::var(LINEAGE_AUDIT_ENV).ok()
+fn provenance_audit_span() -> Option<String> {
+    std::env::var(PROVENANCE_AUDIT_ENV).ok()
 }
 
 /// Whether an audit's live set admits refinement-predicate interiors. **On by
@@ -993,23 +993,23 @@ fn lineage_audit_span() -> Option<String> {
 /// interiors, which the narrow set omits from the input side, so those edges
 /// dangle as [`Leak::ParentUnknown`] with nothing actually unrecorded. Defaulting
 /// to the narrow set made the plain invocation report ~166 folds of noise on
-/// the pipeline corpus and buried real defects in it.
+/// the pipeline orpus and buried real defects in it.
 ///
 /// [`materialize_panes`]: CompiledProgram::materialize_panes
-fn lineage_predicates_live() -> bool {
-    !std::env::var(LINEAGE_PREDICATES_ENV).is_ok_and(|v| v == "0")
+fn provenance_predicates_live() -> bool {
+    !std::env::var(PROVENANCE_PREDICATES_ENV).is_ok_and(|v| v == "0")
 }
 
 /// Whether [`compile_program`] opens the per-pass recorder scopes that fill
-/// [`CompiledProgram::lineage_table`]. On by default.
+/// [`CompiledProgram::provenance_table`]. On by default.
 ///
 /// The switch changes only whether a scope is opened; every recording hook is
 /// already a no-op outside one (`STEP_STACK` empty / no ambient pass).
 ///
-/// A [`LineageAudit`] span opens its own scope, so naming one turns pane
+/// A [`ProvenanceAudit`] span opens its own scope, so naming one turns pane
 /// capture off.
-pub(crate) fn lineage_capture_enabled() -> bool {
-    !std::env::var(LINEAGE_ENV).is_ok_and(|v| v == "0") && lineage_audit_span().is_none()
+pub(crate) fn provenance_capture_enabled() -> bool {
+    !std::env::var(PROVENANCE_ENV).is_ok_and(|v| v == "0") && provenance_audit_span().is_none()
 }
 
 /// Whether every compile folds its pane relations and gates the leak classes,
@@ -1030,12 +1030,12 @@ pub(crate) fn lineage_capture_enabled() -> bool {
 /// **not** a substitute for the sampled gate, which stays always-on so a plain
 /// `cargo test` still fails on the common shapes.
 ///
-/// Requires capture: with `CAMBRA_LINEAGE=0`, or under an audit span (which
+/// Requires capture: with `CAMBRA_PROVENANCE=0`, or under an audit span (which
 /// takes the pass scopes for itself), the table is empty and every output node
 /// would read as unexplained. Both are honoured rather than asserted, so a run
 /// can name one without also having to unset this.
-fn lineage_gate_every_compile() -> bool {
-    std::env::var(LINEAGE_GATE_ENV).is_ok_and(|v| v != "0") && lineage_capture_enabled()
+fn provenance_gate_every_compile() -> bool {
+    std::env::var(PROVENANCE_GATE_ENV).is_ok_and(|v| v != "0") && provenance_capture_enabled()
 }
 
 /// Run `f` with `pass` installed as the recorder's ambient pass, so every row a
@@ -1057,19 +1057,19 @@ fn recorded<R>(capture: bool, pass: Pass, f: impl FnOnce() -> R) -> R {
 /// A driver-capture audit over one span of the pipeline: install a pass recorder at
 /// the input pane, fold at the output pane, and print what the capture explains.
 ///
-/// Opt-in via `CAMBRA_LINEAGE_AUDIT=1` so the whole test suite can run either
+/// Opt-in via `CAMBRA_PROVENANCE_AUDIT=1` so the whole test suite can run either
 /// way. It is a **measurement**, not a gate: the point of driver capture is that
 /// nothing declares a fate, so the fold's `retired` set is empty by construction
 /// and every genuinely-dead input id surfaces as [`Leak::Died`]. That class is
 /// therefore the *death report*, not an error, and the audit counts it
 /// separately from the classes that really are recording bugs
 /// ([`Leak::Unexplained`] — an output node no recording accounted for).
-struct LineageAudit {
+struct ProvenanceAudit {
     span: &'static str,
     state: Option<(PassScope, std::collections::HashSet<NodeId>)>,
 }
 
-impl LineageAudit {
+impl ProvenanceAudit {
     /// The `via` an audit's rows carry. A span covers several passes under one
     /// scope, so no single pass is the truthful answer; the tag is nominal, and
     /// naming it once keeps the scope's tag and the passes the fold restricts by
@@ -1077,7 +1077,7 @@ impl LineageAudit {
     const AUDIT_VIA: Pass = Pass::Planning;
 
     /// The audit's live set: [`collect_main_tree_ids`]'s `walk_children` domain,
-    /// or — when [`lineage_predicates_live`] says so — [`collect_tree_ids`]'s
+    /// or — when [`provenance_predicates_live`] says so — [`collect_tree_ids`]'s
     /// predicate-inclusive domain.
     ///
     /// Both arms are real and differ: the narrow one is *not* the id domain any
@@ -1086,20 +1086,20 @@ impl LineageAudit {
     /// comment false. Keeping a named narrow walk is what makes the comparison
     /// measurable rather than a no-op.
     fn live_ids(expr: &Expr) -> std::collections::HashSet<NodeId> {
-        if lineage_predicates_live() {
+        if provenance_predicates_live() {
             collect_tree_ids(expr)
         } else {
             collect_main_tree_ids(expr)
         }
     }
 
-    /// Open the audit if [`lineage_audit_span`] names this `span`. Spans are
+    /// Open the audit if [`provenance_audit_span`] names this `span`. Spans are
     /// mutually exclusive because a pass scope is per-thread and non-reentrant;
     /// naming them lets a run narrow the measurement to the passes under study
     /// instead of the whole tail of the pipeline.
     fn start(span: &str, name: &'static str, input: &Expr) -> Self {
-        let on = lineage_audit_span().is_some_and(|w| w == span);
-        LineageAudit {
+        let on = provenance_audit_span().is_some_and(|w| w == span);
+        ProvenanceAudit {
             span: name,
             state: on.then(|| (PassScope::enter(Self::AUDIT_VIA), Self::live_ids(input))),
         }
@@ -1114,7 +1114,7 @@ impl LineageAudit {
         // so the measurement reads them in place rather than draining anything.
         drop(scope);
         let output_ids = Self::live_ids(output);
-        let Some((rows, projection, leaks)) = crate::ccl::lineage::with_active_table(|table| {
+        let Some((rows, projection, leaks)) = crate::ccl::provenance::with_active_table(|table| {
             let (_map, projection, leaks) = collapse(
                 table,
                 &[Self::AUDIT_VIA],
@@ -1137,7 +1137,7 @@ impl LineageAudit {
                 .or_default() += 1;
         }
         eprintln!(
-            "[lineage-audit {}] rows={rows} input={} output={} attributed={} leaks={counts:?}",
+            "[provenance-audit {}] rows={rows} input={} output={} attributed={} leaks={counts:?}",
             self.span,
             input_ids.len(),
             output_ids.len(),
@@ -1277,7 +1277,7 @@ pub fn compile_program(
     // Pass recording for the rows the two pane relations fold. One scope per
     // pass, opened and closed in place: a pass scope is per-thread and
     // non-reentrant, so the scopes are sequential, never nested.
-    let capture_lineage = lineage_capture_enabled();
+    let capture_lineage = provenance_capture_enabled();
 
     // Register every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
@@ -1396,7 +1396,7 @@ pub fn compile_program(
     // that instruments it** — to `post-lambda-elim` when the elim pass records,
     // and to `join-planned` when planning does. Leaving it behind understates
     // coverage; moving it ahead reintroduces the unreachable-zero problem.
-    let audit = LineageAudit::start(
+    let audit = ProvenanceAudit::start(
         "full",
         "post-inference..post-as-of-read",
         &post_inference_ir,
@@ -1404,7 +1404,7 @@ pub fn compile_program(
     // A narrower pane pair over just the mutability phases (inline, transact,
     // mut_elim), which is where the fate-prediction question lives.
     let audit_letrec =
-        LineageAudit::start("letrec", "post-inference..post-letrec", &post_inference_ir);
+        ProvenanceAudit::start("letrec", "post-inference..post-letrec", &post_inference_ir);
 
     expr = recorded(capture_lineage, Pass::Inline, || {
         inline::inline_capability_lambdas(expr)
@@ -1479,7 +1479,7 @@ pub fn compile_program(
     // pre-channelize check.
     // Isolated pane pair over `mut_elim` alone — the pass whose fate prediction
     // driver capture is meant to delete.
-    let audit_mutelim = LineageAudit::start("mutelim", "post-transact..post-letrec", &expr);
+    let audit_mutelim = ProvenanceAudit::start("mutelim", "post-transact..post-letrec", &expr);
     let phase_out = recorded(capture_lineage, Pass::Letrec, || mut_elim::run(expr));
     audit_mutelim.finish(&phase_out);
     assert_unique_node_ids(&phase_out, "post-letrec-run");
@@ -1523,7 +1523,7 @@ pub fn compile_program(
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     assert_unique_node_ids(&channelized, "post-as-of-read");
     typecheck(&channelized).expect("as-of-read rewrite produced an ill-typed tree");
-    // The last instrumented pane: see the span's own note at `LineageAudit::start`.
+    // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
     audit.finish(&channelized);
 
     let lambda_elim = lambda_elim::run(channelized).errs()?;
@@ -1549,7 +1549,8 @@ pub fn compile_program(
 
     // Isolated pane pair over `planning::run` — the passes containing
     // `simplify`'s 13 rules and `wrap_with_iterate`.
-    let audit_planning = LineageAudit::start("planning", "recognized..join-planned", &recognized);
+    let audit_planning =
+        ProvenanceAudit::start("planning", "recognized..join-planned", &recognized);
     let join_planned = planning::run(recognized);
     audit_planning.finish(&join_planned);
     assert_unique_node_ids(&join_planned, "post-planning");
@@ -1653,7 +1654,7 @@ pub fn compile_program(
         }
     }
 
-    let lineage_table = table_session.into_table();
+    let provenance_table = table_session.into_table();
 
     let program = CompiledProgram {
         ast: join_planned,
@@ -1663,14 +1664,14 @@ pub fn compile_program(
         pre_inference_ir,
         post_inference_ir,
         post_channelize_ir,
-        lineage_table,
+        provenance_table,
         source_ast: module,
         source: code.to_string(),
     };
 
-    // Every compile its own gate — see `lineage_gate_every_compile` for why this
+    // Every compile its own gate — see `provenance_gate_every_compile` for why this
     // is opt-in and what it covers that the sampled gate does not.
-    if lineage_gate_every_compile() {
+    if provenance_gate_every_compile() {
         for (relation, leaks) in program.materialize_panes().gated_pane_relations() {
             gate_leaks(leaks, relation);
         }
@@ -1690,7 +1691,7 @@ mod tests {
     /// nested comprehension).
     ///
     /// The gallery's remaining programs are excluded for reasons unrelated to
-    /// lineage: most are deliberate *failure* fixtures (`while`, record-term
+    /// provenance: most are deliberate *failure* fixtures (`while`, record-term
     /// syntax, `Feed(_)` types) that pin errors and so have no panes to fold,
     /// and the three HTTP demos bind a real listening socket during lowering,
     /// which collides with itself under a parallel test runner.
@@ -1804,7 +1805,7 @@ mod tests {
     /// the structural classes are zero everywhere.
     ///
     /// The two invariants fail differently and are worth reading apart.
-    /// `structural == 0` says no node's lineage stops at an id the relation
+    /// `structural == 0` says no node's ancestry stops at an id the relation
     /// never heard of. `Unexplained == 0` says no rewrite went
     /// *unrecorded* — it is the gate the whole driver-capture design exists to
     /// pass, and the number a newly-added rewrite site breaks first.
@@ -1854,7 +1855,7 @@ mod tests {
     fn every_recorded_pass_belongs_to_exactly_one_pane_relation() {
         for (name, code) in corpus() {
             let program = compile_ok(&code);
-            for p in program.lineage_table.recorded_passes() {
+            for p in program.provenance_table.recorded_passes() {
                 assert!(
                     MONO_PASSES.contains(&p) != CHANNELIZE_PASSES.contains(&p),
                     "{name}: {p:?} is in neither pane relation, or in both",
@@ -1914,7 +1915,7 @@ mod tests {
             let post_inf = collect_tree_ids(&program.post_inference_ir);
             let post_des = collect_tree_ids(&program.post_channelize_ir);
 
-            let relations: [(&str, &LineageMap<NodeId, NodeId>, _, _); 2] = [
+            let relations: [(&str, &ProvenanceMap<NodeId, NodeId>, _, _); 2] = [
                 (
                     "pre-inference → post-inference",
                     &panes.mono_map,
@@ -1993,7 +1994,7 @@ mod tests {
     ///
     /// A blame edge is *only* blame here: no corpus rewrite both
     /// consumes a node and blames it, so nothing in the corpus pins the
-    /// both-labels case — the fold tests in `lineage.rs` do.
+    /// both-labels case — the fold tests in `provenance.rs` do.
     #[test]
     fn blame_reaches_the_pane_relation_labelled() {
         let mut relating: Vec<String> = Vec::new();
@@ -2173,7 +2174,7 @@ mod tests {
             .find(|(name, _)| *name == "transaction")
             .expect("the transaction fixture");
         let program = compile_ok(&code);
-        let mut recorded = program.lineage_table.recorded_passes();
+        let mut recorded = program.provenance_table.recorded_passes();
         recorded.sort_by_key(|p| format!("{p:?}"));
         assert_eq!(
             recorded,
@@ -2194,7 +2195,7 @@ mod tests {
     /// drives `channelize`.
     ///
     /// Sizes are deliberately small. Compile time here is **superlinear in
-    /// program size** for reasons that predate lineage (a UDF-heavy 63-line
+    /// program size** for reasons that predate provenance capture (a UDF-heavy 63-line
     /// program compiles in tens of seconds), so a corpus large enough to be a
     /// benchmark would be too slow to run; this is a sanity check on the
     /// *ratio* between capture on and capture off, not a benchmark.
@@ -2208,7 +2209,7 @@ mod tests {
                 // Independent comprehensions summed, rather than a chain: a
                 // chained comprehension trips an unrelated substitution bug
                 // ("discharged binder still free after substitution into
-                // predicate") that has nothing to do with lineage.
+                // predicate") that has nothing to do with provenance.
                 let parts: Vec<String> = (0..n)
                     .map(|i| format!("sum([y + {i} for y in xs if y > 0])"))
                     .collect();
@@ -2276,8 +2277,8 @@ mod tests {
     ///
     /// ```text
     /// for i in 1 2 3; do
-    ///   CAMBRA_LINEAGE=1 cargo test --release --lib lineage_pane_perf -- --ignored --nocapture
-    ///   CAMBRA_LINEAGE=0 cargo test --release --lib lineage_pane_perf -- --ignored --nocapture
+    ///   CAMBRA_PROVENANCE=1 cargo test --release --lib provenance_pane_perf -- --ignored --nocapture
+    ///   CAMBRA_PROVENANCE=0 cargo test --release --lib provenance_pane_perf -- --ignored --nocapture
     /// done
     /// ```
     ///
@@ -2285,8 +2286,8 @@ mod tests {
     /// the cost the design actually incurs.
     #[test]
     #[ignore = "measurement, not an assertion; see the doc comment for the driver"]
-    fn lineage_pane_perf() {
-        let capture = lineage_capture_enabled();
+    fn provenance_pane_perf() {
+        let capture = provenance_capture_enabled();
         let reps: usize = std::env::var(PERF_REPS_ENV)
             .ok()
             .and_then(|v| v.parse().ok())
@@ -2307,8 +2308,8 @@ mod tests {
                 let t0 = std::time::Instant::now();
                 let program = compile_ok(&code);
                 best_compile = best_compile.min(t0.elapsed());
-                rows = program.lineage_table.len();
-                rules = program.lineage_table.rule_count();
+                rows = program.provenance_table.len();
+                rules = program.provenance_table.rule_count();
                 panes_nodes = collect_tree_ids(&program.pre_inference_ir).len()
                     + collect_tree_ids(&program.post_inference_ir).len()
                     + collect_tree_ids(&program.post_channelize_ir).len();

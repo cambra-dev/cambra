@@ -9,7 +9,7 @@ use std::mem::take;
 
 use super::join::try_hash_join_rewrite;
 use crate::ccl::ccl_utils::PredMemo;
-use crate::ccl::lineage;
+use crate::ccl::provenance;
 
 use super::predicates::{compile_refinement_predicates, fn_of_bare_predicate};
 use super::*;
@@ -399,11 +399,11 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     //
     // These rows reach no table in a normal compile: `compile_program` calls
     // `planning::run` outside every pass scope it opens, so they land only under
-    // `CAMBRA_LINEAGE_AUDIT=planning` (`recognized..join-planned`).
-    let _g = lineage::enter(
+    // `CAMBRA_PROVENANCE_AUDIT=planning` (`recognized..join-planned`).
+    let _g = provenance::enter(
         expr.node_id(),
         "planning.iterate",
-        lineage::Nature::Machinery,
+        provenance::Nature::Machinery,
     );
     // Walk every nested `Type::Refinement` layer (innermost ⊇ outermost,
     // each layer's predicate must hold), collecting the predicates
