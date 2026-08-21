@@ -778,14 +778,19 @@ fn elim_lambda_impl(
     let body_ty = body.ty.clone();
     let result_ty = match fun_ty_or_hole(param_ty, &body_ty) {
         // `fun_ty_or_hole` builds a bare combinator type, so both the Pi binder
-        // and the kind are re-attached here: the binder when `param` survives in
-        // the codomain's refinement, the kind always, since the caller is the one
-        // that knows whether this morphism denotes a collection. Attaching the
+        // and the kind are re-attached here: the binder when the codomain
+        // depends on `param`, the kind always, since the caller is the one that
+        // knows whether this morphism denotes a collection. Attaching the
         // binder closes the codomain (`Type::pi_kinded`), which is what keeps this
         // arrow in the same coordinate as the recorded type it replaces.
+        //
+        // The dependence test admits either coordinate
+        // (`subst::codomain_depends_on`), like coalesce's: a `body_ty` whose
+        // claim landed closed references `param` as an index, and a name-only
+        // test would drop the binder and strand it.
         Type::Fun {
             domain, codomain, ..
-        } if crate::ccl::subst::type_free_vars(&body_ty).contains(param) => {
+        } if crate::ccl::subst::codomain_depends_on(param, &body_ty) => {
             Type::pi_kinded(param, *domain, *codomain, fun_kind.clone())
         }
         Type::Fun {

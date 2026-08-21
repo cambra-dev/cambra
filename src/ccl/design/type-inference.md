@@ -951,25 +951,9 @@ Every inference variable records the binders in scope where it was created. A bo
 variable must close against that record, and a reference to anything else is a record-time internal
 error. References that a bound's own arrows introduce are stored as de Bruijn indices assigned when
 the arrow is constructed, so two α-variant closed types are structurally identical everywhere the
-solver decides identity.
-
-#### The defect this removes
-
-A refinement predicate may reference an enclosing binder, and the bound holding it travels away from
-that binder during inference. Group-by's lowering puts the dependent refinement in a cast target while
-`emit_lambda` mints the arrow that binds `__gb_k` separately (`src/ccl/lower/exprs.rs` pins the
-lowered shape). The refinement reaches the solver as a bound on a variable whose position has no
-enclosing arrow, and the suspended discharge riding the edge is all that relates the reference to
-its binder. Nothing checks the reference in that window: `check_scope_valid` runs on coalesced node
-types after inference ends, never on bounds.
-
-Four sites decide identity by comparing bounds structurally — `RefinementSet` dedup,
-`CompactType::merge`, the constraint cache, `SpecKey` — and structural comparison of an open term is
-α-sensitive. At the merge the consequence is worse than a split. `CompactFun::merge` keeps the first
-arrival's binder (`a.name.or_else(|| b.name)`) and unions the refinement sets, so
-`(𝑥: 𝐷) ⤇ {Int | __elem == 𝑥}` and its `𝑦`-twin meeting at one variable coalesce to a type that
-binds one name and refinements under both. Which type results depends on constraint arrival order, and
-the losing claim references a binder the type no longer binds.
+solver decides identity: `RefinementSet` dedup, `CompactType::merge`, the constraint cache, and
+`SpecKey` each compare stored types structurally, and `CompactFun::merge` keeps one arrival's binder
+while unioning both refinement sets.
 
 #### The invariant
 
@@ -978,9 +962,9 @@ binders and `let` binders, interleaved in scope order. Emission already holds th
 `fresh()` — `InferCtx::scopes` tracks in-scope bindings for `Var` typing — and discards it.
 
 A bound recorded on a variable **closes against the holder's telescope**: every free term variable
-of the bound's type is in the telescope, in the edge's substitution domain, or a source. The check
-runs when the bound is recorded, which is a lookup, since uniquify gives every binding site one uid.
-A violation names the variable and the reference and fails.
+of the bound's type is in the telescope or in the edge's substitution domain. The check runs when the
+bound is recorded, which is a lookup, since uniquify gives every binding site one uid. A violation
+names the variable and the reference and fails.
 
 Enforcement covers every derivation over a self-contained tree: the live solve, meaning emission and
 its specialization pins, and the pass-boundary re-derivations that check what a pass produced. A
@@ -1006,11 +990,13 @@ for every source reference, `emit_node`'s `Source` arm types it from the source 
 therefore never reaches `subst::type_free_vars`, so every gap the check finds is a reference that
 should have been rewritten and is not excused.
 
-A parameter annotation's predicate referencing a sibling parameter is such a reference. Uncurrying
-rewrites the output annotation's references to tuple projections and leaves a parameter annotation's
-alone, so the refinement keeps the source name while the lambda binds `__arg_tuple_0`
-(`tests/type_check.rs`, `a_param_claim_may_reference_a_sibling_param`, ignored pending the lowering
-fix).
+A parameter annotation's predicate referencing a parameter would be such a reference, and lowering
+rejects it (`lower::functions`'s `reject_annotation_references`). The annotation asks for a
+telescope — `(a: Int, c: {Int where _ >= a})` is `(a: Int) ⇒ ((c: {Int | _ >= a}) ⇒ …)` — and
+neither shape reaching that check carries one: a tupled parameter list binds one tuple, whose
+`Type::Tuple` binds no component for the predicate to name, and a single parameter can only be
+naming itself. A curried parameter list does carry the telescope, which is why a nested `def`'s
+annotation may name the enclosing `def`'s parameter.
 
 #### The coordinate is locally nameless
 
@@ -1048,8 +1034,12 @@ spellings apart in a compiled program, so the shadow is what makes closing corre
 on that convention, as the `Fun`/`Fun` opening gate does not depend on it either.
 
 Two α-variant predicates whose interior lambdas carry different uids compare unequal, and the
-identity sites split them. What that costs is a duplicate specialization, so the failure abstraction
-would remove here is wasted clones rather than a wrong type.
+identity sites split them. That split is what bounds this section's reach: every refinement a program
+produces routes its element through a function, so it carries an interior lambda, and two refinements
+that would otherwise coalesce differ in that lambda's uid. A `Data` domain admits no join across the
+split, so the program is rejected —
+`tests/type_check.rs`, `two_alpha_variant_dependent_refinements_share_a_position` is the case. Closing an
+interior binder needs no telescope, since it is bound inside the term being compared.
 
 #### `let` binders and scope exit
 
@@ -1062,27 +1052,20 @@ definiens, and lifting past one abstracts instead of discharging.
 
 #### Discharge is application
 
-The two-sided edge storage already holds the pieces. A `Bound { self_subst, ty, ty_subst }` whose
-substitution discharges a binder is a closed family applied at an argument — `(λ𝑥. ty) arg` —
-written as a type with a free variable plus a map that promises to remove it. Reading the form that
-way makes the substitution's domain binders count as the type's own in the record-time check, fires
-β at coalesce against the telescope, and replaces `bridge_holder_gap`'s intensional judgment of
-substitutions-as-maps when two application spines meet at one variable. This is the `γ[σ]` form the
-vault issue `type-checker-first-class-dependent-functions` names as what the two-sided
-representation was chosen to graduate into. The representation itself stays in that issue:
-suspensions on uses, under which the O1/O4 corner becomes two points of one family and
-`Subst::licensed_correspondence_view` has nothing left to license.
+A `Bound { self_subst, ty, ty_subst }` whose substitution discharges a binder is a closed family
+applied at an argument — `(λ𝑥. ty) arg`, written as a type with a free variable plus a map that
+promises to remove it. The substitution's domain binders therefore count as the type's own in the
+record-time check, and β fires at coalesce against the telescope.
 
-The `Fun`/`Fun` `extended_rename` and `licensed_correspondence_view` therefore stay. They carry the
-name coordinate's transport rather than refinement identity, and they retire with that coordinate rather
-than with this one's arrival. With the index coordinate fully landed, disabling the licensed view
-still trips the closure bridge's O1/O4 tripwire on two shapes: extrusion across levels under a
-generalized `let`, and per-occurrence group-by keys through a polymorphic definition.
-
-`Type::Fun`'s binder slot carries no refinement identity either. A refinement's binding is its index, so the
-slot never participates in an identity comparison. It remains the frame's opening address, which
-descent and application open the frame at, so coalesce keeps it exactly on the arrows whose
-codomains reference their frame (`references_outermost_frame`) and strips it elsewhere.
+`Type::Fun`'s binder slot carries no refinement identity. A refinement's binding is its index, so the slot
+never participates in an identity comparison. It remains the frame's opening address, which descent
+and application open the frame at, so coalesce keeps it exactly on the arrows whose codomains
+reference their frame (`subst::codomain_depends_on`) and strips it elsewhere. The `Fun`/`Fun`
+`extended_rename` and `Subst::licensed_correspondence_view` carry the name coordinate's transport
+rather than refinement identity, so they retire with that coordinate: with the index coordinate landed,
+disabling the licensed view still trips the closure bridge's O1/O4 tripwire on extrusion across
+levels under a generalized `let` and on per-occurrence group-by keys through a polymorphic
+definition.
 
 #### Where the conversions run
 
@@ -1152,18 +1135,20 @@ with the spellings it had before the index coordinate existed:
 
     ((__gb_k: Int) ⤇ ({[0, 2] | __elem ▷ [1, 2, 3] ▷ (λ x : Int → x) == __gb_k} ⤇ Int))
 
-The stored form does not convert back after inference. Construction closes at every phase — planning
-builds arrows through `Type::pi_kinded` — so a one-shot conversion would be undone by the next
-rebuild.
+A rendering that does not hold the arrow reads the spelling off the reference instead. A
+`Name::PiBound` carries a `PiRef`: the index, plus the binder's spelling where the closing happened.
+Identity reads the index alone, so the spelling decides nothing and two equal references may print
+differently.
 
-A type shown detached from the arrow that binds one of its references has no spelling to reach, and
-renders the bare index (`{Int | __elem == #0}`). An `InferError` renders its types through the same
-`Display`, so a mismatch blamed on a codomain would carry that spelling to the reader. What keeps it
-from arising is the conversions above rather than the rendering: a refinement deficit at a
-`Fun`/`Fun` codomain edge blames the two codomains, and a codomain reaches that comparison closed
-only when both sides are ground, since a live side opens at its binder and the post-inference check
-opens unconditionally. Every diagnostic the pipeline produces therefore blames a codomain in the
-name coordinate.
+A diagnostic is the rendering that does not hold the arrow. It blames a fragment rather than a whole
+type — `coalesce_compact_go`'s domain-join conflict reports the domains of the arrow it is half-way
+through assembling, and the arrow binding their references is a frame further out in the walk, so
+there is nothing to descend through. Without the spelling on the reference that domain reads
+`{[0, 2] | __elem ▷ [1, 2, 3] ▷ (λ x : Int → x) == #0}`.
+
+The stored form never converts back. Construction closes at every phase — planning builds arrows
+through `Type::pi_kinded` — so a one-shot conversion after inference would be undone by the next
+rebuild.
 
 #### Freshening and `SpecKey`
 
@@ -1198,28 +1183,6 @@ with refinements behind variables). The pin's `Fun`/`Fun` edges open the closed 
 binder names as bounds cross, after which every bound landing on a clone variable is name-referenced
 against that variable's telescope. No index is re-based: an index converts to a name at a binder
 crossing or to a term at an application, and otherwise travels untouched.
-
-#### Coordinates that do not work
-
-- *Source names plus the Barendregt convention* — the status quo, whose measured failure is the
-  arrival-order merge above.
-- *Canonicalizing binders as types flatten* — correct, and an unmerged branch does it, but the
-  conversion runs in three walks that must agree and the birth-to-flatten window stays unchecked.
-- *Indices for telescope references*, with or without carried telescopes — an index into the
-  holder's context collides across holders, so a cross-use key comparison identifies refinements about
-  different binders. Names collide never; uniquify already paid for that.
-- *Names for a type's own arrows, compared α-aware* — well-defined once types are closed, and
-  rejected on placement. Identity sites use types as **keys**: the constraint cache is a `HashMap`
-  on `(Type, Type)`, `SpecKey`'s views are `BTreeMap`s, and claim dedup is containment through
-  `PartialEq`, all via `Eq`/ `Ord`/ `Hash`, which take no environment. A quotient-respecting version
-  must compute the nameless view inside every call while names remain the stored form, which is two
-  views of one structure that must agree at every impl. The merge must still pick a surviving
-  spelling, so coalesced output stays arrival-order-dependent even where every judgment is
-  α-correct. Assigning the index once at abstraction is the same computation run once, after which
-  the derived operations are correct as derived — the trade `Refinement` already made for `__elem`.
-- *α-invariant equality and hashing at claim granularity* — the compared refinements do not contain their
-  binders, since the refinement set sits beside `CompactFun`'s name slot one frame below, so there is no
-  correspondence to thread.
 
 ## 4.6 Data vs compute functions
 

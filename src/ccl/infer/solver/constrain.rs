@@ -589,11 +589,13 @@ fn constrain_go_impl(
             // discharged one). Which derivation this is
             // ([`Derivation`]) answers both this and the record sites'
             // question, so the two read one field rather than two flags.
-            // The pre-scan keeps the common index-free codomain untouched.
+            // The pre-scan keeps the common codomain that does not reference
+            // this frame untouched — the same dependence test descent and
+            // application ask everywhere else.
             let open = |n: &Option<Name>, c: &Type, other: &Type| -> Option<Type> {
                 match n {
                     Some(b)
-                        if crate::ccl::subst::contains_pi_bound(c)
+                        if crate::ccl::subst::references_outermost_frame(c)
                             && (cache.derivation.opens_unconditionally()
                                 || crate::ccl::subst::type_contains_infer(other)) =>
                     {

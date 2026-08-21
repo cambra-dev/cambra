@@ -1593,15 +1593,18 @@ impl<'a> PiWalk<'a> {
                     && !self.shadowed.contains(n)
                     && let Some(dist) = frames.iter().rev().position(|f| f.as_ref() == Some(n))
                 {
-                    e.node = TypedExprNode::Var(Name::PiBound(dist as u32 + depth));
+                    // The spelling rides along as the reference's display
+                    // hint: a diagnostic that blames this claim detached from
+                    // its arrow has no arrow to read a name off.
+                    e.node = TypedExprNode::Var(Name::pi_bound(dist as u32 + depth, n));
                     self.changed += 1;
                     // Fall through: the occurrence's type slot may itself
                     // carry references to convert.
                 }
             }
             PiMode::Open(target) => {
-                if let TypedExprNode::Var(Name::PiBound(k)) = &e.node
-                    && *k == depth
+                if let TypedExprNode::Var(n) = &e.node
+                    && n.pi_bound_index() == Some(depth)
                 {
                     let occurrence_ty = e.ty.clone();
                     *e = target.as_expr_preserving(e.node_id, &occurrence_ty);
@@ -1638,62 +1641,12 @@ impl<'a> PiWalk<'a> {
     }
 }
 
-/// Does `ty` carry a [`Name::PiBound`] reference anywhere — in a refinement
-/// predicate, a predicate's interior type slots, or their nesting? A cheap
-/// borrowing pre-scan so the opening sites (the Fun/Fun codomain edge) touch
-/// only the types that actually need conversion; the overwhelmingly common
-/// codomain carries none.
-///
-/// The question is depth-free — any index at any depth answers it — so the
-/// once-per-predicate guard needs no depth, unlike
-/// [`references_outermost_frame`]'s.
-pub fn contains_pi_bound(ty: &Type) -> bool {
-    fn ty_scan(ty: &Type, visited: &mut BTreeSet<PredicateId>) -> bool {
-        match ty {
-            Type::Base(_)
-            | Type::UIntRange(_)
-            | Type::DataSource(_)
-            | Type::ChanDom(..)
-            | Type::Txn
-            | Type::Hole
-            | Type::SharedHole(_)
-            | Type::Infer(_) => false,
-            Type::BoundedHole(t) => ty_scan(t, visited),
-            Type::Fun {
-                domain, codomain, ..
-            } => ty_scan(domain, visited) || ty_scan(codomain, visited),
-            Type::Refinement(base, r) => {
-                (visited.insert(r.predicate_id()) && expr_scan(&r.predicate, visited))
-                    || ty_scan(base, visited)
-            }
-            Type::Tuple(ts) => ts.iter().any(|t| ty_scan(t, visited)),
-            Type::Record(fs) => fs.iter().any(|(_, t)| ty_scan(t, visited)),
-            Type::Variant(tags, _) => tags.iter().any(|(_, t)| ty_scan(t, visited)),
-            Type::History { value, domain, .. } => {
-                ty_scan(value, visited) || ty_scan(domain, visited)
-            }
-        }
-    }
-    fn expr_scan(e: &TypedExpr, visited: &mut BTreeSet<PredicateId>) -> bool {
-        if matches!(&e.node, TypedExprNode::Var(Name::PiBound(_))) {
-            return true;
-        }
-        let mut found = false;
-        e.walk_type_slots(|t| found = found || ty_scan(t, visited));
-        if found {
-            return true;
-        }
-        e.fold_children(false, |acc, c| acc || expr_scan(c, visited))
-    }
-    ty_scan(ty, &mut BTreeSet::new())
-}
-
 /// Does `ty` reference the arrow frame it was just extracted from — a
 /// [`Name::PiBound`] whose index equals the codomain crossings to reach it?
-/// This is the dependence test for a codomain in the index coordinate,
-/// answering what a free-name lookup answers in the name coordinate:
-/// coalesce keeps a Pi binder's name slot, and an application has a
-/// discharge to perform, exactly when this holds.
+/// This is the dependence test that drives **opening**: descent and
+/// application convert exactly the references this finds. A site deciding
+/// whether to *keep* an arrow's binder wants [`codomain_depends_on`], which
+/// also admits a codomain still in the name coordinate.
 pub fn references_outermost_frame(ty: &Type) -> bool {
     fn ty_scan(ty: &Type, depth: u32, visited: &mut BTreeSet<(PredicateId, u32)>) -> bool {
         match ty {
@@ -1728,7 +1681,7 @@ pub fn references_outermost_frame(ty: &Type) -> bool {
         }
     }
     fn expr_scan(e: &TypedExpr, depth: u32, visited: &mut BTreeSet<(PredicateId, u32)>) -> bool {
-        if matches!(&e.node, TypedExprNode::Var(Name::PiBound(k)) if *k == depth) {
+        if matches!(&e.node, TypedExprNode::Var(n) if n.pi_bound_index() == Some(depth)) {
             return true;
         }
         let mut found = false;
@@ -1739,6 +1692,20 @@ pub fn references_outermost_frame(ty: &Type) -> bool {
         e.fold_children(false, |acc, c| acc || expr_scan(c, depth, visited))
     }
     ty_scan(ty, 0, &mut BTreeSet::new())
+}
+
+/// Does `codomain`, just extracted from an arrow binding `binder`, depend on
+/// that arrow — in either coordinate? A closed codomain references the frame by
+/// index ([`references_outermost_frame`]) and one still in the name coordinate
+/// references `binder` by name; a site that keeps or drops the arrow's binder
+/// slot has to admit both, because the slot is what a later descent or
+/// application opens the frame at and dropping it strands the reference.
+///
+/// The two callers are the two places an arrow is rebuilt around a codomain
+/// computed elsewhere: `coalesce_compact_go` assembling a `Fun` from a compact
+/// view, and `lambda_elim` re-attaching an eliminated lambda's Pi.
+pub fn codomain_depends_on(binder: &Name, codomain: &Type) -> bool {
+    references_outermost_frame(codomain) || type_free_vars(codomain).contains(binder)
 }
 
 /// Closes refinements as they land in a compact/key view (see
@@ -2028,7 +1995,7 @@ mod tests {
         };
         assert_eq!(
             *r2.predicate,
-            gt(var("i"), TypedExpr::var(Name::PiBound(0)))
+            gt(var("i"), TypedExpr::var(Name::pi_bound_bare(0)))
         );
 
         // Name-based: the same shape built field-wise keeps `k` a name, and
@@ -2489,7 +2456,7 @@ mod pi_coordinate_tests {
         &r.predicate
     }
     fn is_pi_bound(e: &TypedExpr, k: u32) -> bool {
-        matches!(&e.node, TypedExprNode::Var(Name::PiBound(i)) if *i == k)
+        matches!(&e.node, TypedExprNode::Var(n) if n.pi_bound_index() == Some(k))
     }
 
     /// The worked example from `type-inference.md`, "Freshening and
@@ -2668,7 +2635,7 @@ mod pi_coordinate_tests {
     /// non-referencing position first is what exposes a predicate-keyed guard.
     #[test]
     fn the_dependence_test_is_per_position_not_per_predicate() {
-        let shared = Rc::new(TypedExpr::var(Name::PiBound(0)));
+        let shared = Rc::new(TypedExpr::var(Name::pi_bound_bare(0)));
         let slot = || Type::Refinement(Box::new(int()), Refinement::sharing(&shared));
         // Under an arrow the index is one crossing short of the outermost
         // frame, so that position does not reference it; beside the arrow it

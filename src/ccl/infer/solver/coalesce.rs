@@ -157,23 +157,21 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                 doms.push(dt);
             }
         }
-        // Strip the Pi binder unless the codomain actually references it
+        // Strip the Pi binder unless the codomain actually depends on it
         // (design §3.2 / O10): keeps ordinary functions `name: None` while a
-        // genuinely dependent codomain keeps its binder. The reference is an
-        // index when the refinement landed closed (the usual case —
-        // `references_outermost_frame`) and a free name when it did not; the
-        // kept name slot is what lets descent and application open the frame
-        // later, so dropping it on an index-referencing codomain would leave
-        // the indices unreachable.
+        // genuinely dependent codomain keeps its binder. Either coordinate
+        // counts (`subst::codomain_depends_on`) — the kept name slot is what
+        // lets descent and application open the frame later, so dropping it on
+        // a codomain that references the frame strands the reference.
         debug_assert!(
             cf.name.is_some() || !crate::ccl::subst::references_outermost_frame(&c),
             "an index is only ever assigned pointing at a *named* frame, so an \
              unnamed arrow's codomain cannot reference it",
         );
-        let kept_name = cf.name.clone().filter(|b| {
-            crate::ccl::subst::references_outermost_frame(&c)
-                || crate::ccl::subst::type_free_vars(&c).contains(b)
-        });
+        let kept_name = cf
+            .name
+            .clone()
+            .filter(|b| crate::ccl::subst::codomain_depends_on(b, &c));
         match cf.kind {
             KindMerge::Conflict => {
                 let doms_s = doms
