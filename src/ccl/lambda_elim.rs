@@ -362,7 +362,10 @@ fn build_value_case_cform(
     let mut arm_domains: Vec<Type> = Vec::new();
     let mut default_body: Option<Expr> = None;
 
-    for b in branches {
+    // `final_or_default`'s default is the *last* branch's body, the one branch
+    // whose body reaches the output twice; the rest move whole into their arms.
+    let last = branches.len().saturating_sub(1);
+    for (i, b) in branches.into_iter().enumerate() {
         let guard = elim_lambdas(ctx, b.guard)?;
         let body = elim_lambdas(ctx, b.body)?;
         // First-match gate π̂ᵢ, lifted to a constant-in-element predicate
@@ -380,14 +383,16 @@ fn build_value_case_cform(
         // gate (a leading `if True`) leaves the driver unrefined (always fires).
         let refined_dom = refine_with(driver_dom.clone(), &gate_fn);
         arm_domains.push(refined_dom.clone());
+        if i == last {
+            default_body = Some(body.clone());
+        }
         // const(eᵢ) : {UIntRange(1) | π̂ᵢ} ⤇ V — lift the value over the gated driver.
         let arm = apply_primitive(
-            body.clone(),
+            body,
             Builtin::Const,
             Type::data_fun(refined_dom, result_ty.clone()),
         );
         arms.push(arm);
-        default_body = Some(body);
     }
 
     // A one-branch value `Case` denotes just that branch's value.

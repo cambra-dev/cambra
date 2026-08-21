@@ -576,16 +576,40 @@ impl CompiledProgram {
     }
 }
 
-/// Every main-tree node id reachable in `expr` (the `walk_children` node set,
-/// refinement-predicate interiors excluded — the domain the lineage steps and
-/// the pane projections reason about).
+/// Every node id reachable in `expr`: the `walk_children` node set plus the
+/// interiors of every refinement predicate riding a type slot — the id domain the
+/// lineage steps and the pane projections must explain.
+///
+/// Deliberately wider than `assert_unique_node_ids`, which walks children only.
+/// Explanation and uniqueness are two questions with two answers; see
+/// `design/provenance.md`, "Walking the ids".
 pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId> {
-    fn go(e: &Expr, acc: &mut std::collections::HashSet<NodeId>) {
-        acc.insert(e.node_id());
-        e.walk_children(|c| go(c, acc));
+    use crate::ccl::TypedExprNode;
+    use crate::ccl::ty::Type;
+
+    fn from_ty(t: &Type, acc: &mut std::collections::HashSet<NodeId>) {
+        if let Type::Refinement(_, r) = t {
+            from_expr(&r.predicate, acc);
+        }
+        t.walk_children(|c| from_ty(c, acc));
     }
+
+    fn from_expr(e: &Expr, acc: &mut std::collections::HashSet<NodeId>) {
+        acc.insert(e.node_id());
+        from_ty(&e.ty, acc);
+        if let Some(ann) = &e.user_annotation {
+            from_ty(ann, acc);
+        }
+        // A `Cast`'s target is a type slot `walk_children` skips, and it is where
+        // lowering parks the predicate it just built.
+        if let TypedExprNode::Cast { target, .. } = &e.node {
+            from_ty(target, acc);
+        }
+        e.walk_children(|c| from_expr(c, acc));
+    }
+
     let mut acc = std::collections::HashSet::new();
-    go(expr, &mut acc);
+    from_expr(expr, &mut acc);
     acc
 }
 
@@ -788,7 +812,12 @@ pub fn compile_program(
     // `infer` mutates `expr` in place. This is the source-shaped, pre-mono,
     // still-hole-typed tree. Its ids resolve against the `lowering_projection`
     // (the pre-mono originals). See `CompiledProgram::pre_inference_ir`.
-    let pre_inference_ir = expr.clone();
+    // A pane snapshot: the same nodes as the live tree, observed at a point in
+    // time, so it preserves ids. A freshening clone would hand the boundary a
+    // structurally identical program sharing no identity with the one it is meant
+    // to snapshot, and these ids must resolve against the `lowering_projection`,
+    // which is keyed by the originals.
+    let pre_inference_ir = expr.clone_preserving_ids();
 
     // Register every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
@@ -883,9 +912,11 @@ pub fn compile_program(
     // not run). `ast` (`join_planned`) is the *wrong* tree for a source
     // view — `lambda_elim`/`planning` re-mint ids and produce execution shape.
     // See `CompiledProgram::post_inference_ir`.
-    let post_inference_ir = expr.clone();
+    // A pane snapshot; see `pre_inference_ir`.
+    let post_inference_ir = expr.clone_preserving_ids();
 
     expr = inline::inline_capability_lambdas(expr);
+    assert_unique_node_ids(&expr, "post-inline");
     debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).map_err(|errs| {
         if errs
@@ -939,6 +970,7 @@ pub fn compile_program(
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     expr = transact_phase::run(expr, &txn_mut_vars)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    assert_unique_node_ids(&expr, "post-transact");
     debug!("Transact phase CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).expect("transact phase produced an inconsistent tree");
 
@@ -951,6 +983,7 @@ pub fn compile_program(
     // The tree still carries Defer/Feed here, so the walls are the relaxed
     // pre-desugar check.
     let phase_out = mut_elim::run(expr);
+    assert_unique_node_ids(&phase_out, "post-letrec-run");
     debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));
     check_pre_desugar(&phase_out).expect("letrec phase produced an inconsistent tree");
 
@@ -965,6 +998,7 @@ pub fn compile_program(
     // channel domains by substitution; the strict `typecheck` below is the
     // release-visible enforcement.
     let mut desugared = channelize::run(phase_out).errs()?;
+    assert_unique_node_ids(&desugared, "post-desugar");
     debug!("Channelized:\n{}", symbolic(&desugared));
     typecheck(&desugared).expect("channelize produced an ill-typed tree");
 
@@ -972,7 +1006,8 @@ pub fn compile_program(
     // post-inference desugar order this snapshot is *downstream* of
     // `post_inference_ir` (post-inline/transact/letrec/channelize); see the doc
     // comment on `post_desugar_ir`.
-    let post_desugar_ir = desugared.clone();
+    // A pane snapshot; see `pre_inference_ir`.
+    let post_desugar_ir = desugared.clone_preserving_ids();
 
     // Fed-out mutable variable reads: rewrite a read-only reply that reads a mutable variable out of
     // its block into an outer-indexed as-of join (an as-of read at the reading
@@ -983,9 +1018,11 @@ pub fn compile_program(
     // `transact_phase::rewrite_as_of_reads`.
     transact_phase::rewrite_as_of_reads(&mut desugared)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    assert_unique_node_ids(&desugared, "post-as-of-read");
     typecheck(&desugared).expect("as-of-read rewrite produced an ill-typed tree");
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;
+    assert_unique_node_ids(&lambda_elim, "post-lambda-elim");
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
     debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
 
@@ -1006,6 +1043,7 @@ pub fn compile_program(
     typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
 
     let join_planned = planning::run(recognized);
+    assert_unique_node_ids(&join_planned, "post-planning");
     debug!(
         "Join-planned CCL:\n{} : {}",
         symbolic(&join_planned),

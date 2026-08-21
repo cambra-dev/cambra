@@ -705,7 +705,7 @@ impl TypedExprNode {
 /// deliberately ignores `node_id`. Provenance is metadata, not part of a node's
 /// value, so two structurally-equal nodes must compare equal even with distinct
 /// ids.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TypedExpr {
     /// The inferred type of this expression.
     ///
@@ -723,10 +723,9 @@ pub struct TypedExpr {
     /// (see [`crate::ccl::provenance`]). Excluded from [`PartialEq`] because
     /// provenance is metadata, not part of the node's value.
     ///
-    /// `Clone` copies `node_id`, so a cloned node *shares* its source's id;
-    /// freshening a clone's id is a deliberate later step, done where it
-    /// matters (monomorphization calls [`freshen_node_id`](Self::freshen_node_id)
-    /// or [`freshen_node_ids_deep`](Self::freshen_node_ids_deep) explicitly).
+    /// **`Clone` freshens** (see the [`Clone`] impl below), so reaching a
+    /// duplicated id takes writing one deliberately, through
+    /// [`preserve`](Self::preserve).
     ///
     /// # What is forbidden is a mint, not a write
     ///
@@ -752,6 +751,56 @@ pub struct TypedExpr {
 /// Type alias for backward compatibility. `Expr` is now [`TypedExpr`].
 pub type Expr = TypedExpr;
 
+/// Hand-written so that **a clone is a sibling, not the same node**: every node
+/// it copies gets a freshly-minted [`NodeId`], and every `(origin, fresh)` pair
+/// is reported to the ambient lineage recorder via
+/// [`on_copy`](crate::ccl::lineage::on_copy).
+///
+/// A derived `Clone` would copy `node_id`, making every duplication site decide
+/// whether to keep the id or freshen it. Freshening here removes the decision;
+/// `src/ccl/design/provenance.md`, "Node identity (`src/ccl/provenance.rs`)" has
+/// what a wrong decision costs.
+///
+/// **The named id-sharing paths.** Sharing an id takes writing one through
+/// [`TypedExpr::preserve`] (one node at an id already in hand),
+/// [`TypedExpr::clone_preserving_ids`] (a subtree at its source's ids), the
+/// [`preserving_ids`](crate::ccl::lineage::preserving_ids) scope that backs it —
+/// called directly by `PredMemo`'s rebuilds in `crate::ccl::ccl_utils` — the
+/// `*_preserving` constructors
+/// ([`expr_stmt_preserving`](TypedExpr::expr_stmt_preserving),
+/// [`let_in_preserving`](TypedExpr::let_in_preserving)), which are `preserve` in
+/// convenience form, or the one literal in [`crate::ccl::subst`]'s
+/// `as_expr_preserving`, where a substituted occurrence's id lands on the
+/// replacement's root.
+///
+/// The freshen is deep by construction: `node.clone()` clones the children, and
+/// each child is a `TypedExpr` reaching this same impl.
+///
+/// **Type slots are not freshened, and that is the rule, not an omission.** A
+/// [`Type`] carries no identity: the only [`NodeId`]s reachable through one are
+/// the `TypedExpr`s inside a `Refinement.predicate`, which is an
+/// `Rc<TypedExpr>` — so `ty.clone()` bumps a refcount and reaches this impl not
+/// at all. That is load-bearing twice over: predicate interiors are outside the
+/// *uniqueness* domain (`assert_unique_node_ids` walks children only), and
+/// planning's compile memo is keyed on `Rc` identity, so splitting the sharing
+/// would compile one predicate once per copy.
+///
+/// **`NodeId::PLACEHOLDER` is not preserved.** A [`throwaway`](TypedExpr::throwaway)
+/// node is built to be rendered into a panic message, never cloned into a tree;
+/// cloning one mints a real id, and `on_copy` drops the pair because its origin
+/// is the sentinel. Nothing is recorded and nothing reaches a checked tree.
+impl Clone for TypedExpr {
+    fn clone(&self) -> Self {
+        let node_id = crate::ccl::lineage::copy_id(self.node_id);
+        TypedExpr {
+            ty: self.ty.clone(),
+            node: self.node.clone(),
+            user_annotation: self.user_annotation.clone(),
+            node_id,
+        }
+    }
+}
+
 /// Hand-written to **exclude `node_id`** from equality.
 ///
 /// `node_id` is provenance metadata, not part of a node's value: two nodes that
@@ -765,26 +814,6 @@ impl PartialEq for TypedExpr {
             && self.node == other.node
             && self.user_annotation == other.user_annotation
     }
-}
-
-/// Shared deep-freshen walk over an expression's node-set: re-mints this node's
-/// id (which fires the ambient `on_copy` recorder hook) then descends into its
-/// children. Backs [`TypedExpr::freshen_node_ids_deep`]; the interior variant
-/// calls it per child, skipping the root's own re-mint.
-///
-/// **Type slots are not walked, and that is the rule, not an omission.** A
-/// [`Type`] carries no identity: the only [`NodeId`]s reachable through one are
-/// the [`TypedExpr`]s inside a `Refinement.predicate`, and those are outside the
-/// id domain — `assert_unique_node_ids` excludes predicates deliberately, and the
-/// lineage fold's leak classes and `SourceProjection` both enumerate from
-/// `collect_tree_ids` (the `walk_children` domain), so a predicate-interior id is
-/// carried but never checked. Freshening them was write-only work whose only
-/// observable effect was splitting predicate `Rc` sharing — planning's compile
-/// memo is keyed on `Rc` identity, so each split predicate is compiled once per
-/// copy. See `design/provenance.md`, "The id domain".
-fn freshen_from_expr(e: &mut TypedExpr) {
-    e.freshen_node_id();
-    e.walk_children_mut(freshen_from_expr);
 }
 
 impl TypedExpr {
@@ -819,7 +848,7 @@ impl TypedExpr {
     /// These are the only two ways to build a node, and the recorder sees exactly
     /// the difference: `new` mints and records a birth, `preserve` does neither.
     ///
-    /// # Two shapes build a node at an existing id; only one of them is this
+    /// # Three shapes build a node at an existing id; only one of them is this
     ///
     /// **Reaching into another node for its id** — `node_id: src.node_id`, where
     /// `src` is some *other* node — is this constructor's shape, and the one where
@@ -838,6 +867,11 @@ impl TypedExpr {
     /// assertion far away. Roughly three dozen such rebuilds live in
     /// `transact_phase`, `inline`, and `channelize`; converting them would trade a
     /// compile-time guarantee for a runtime one, once per site.
+    ///
+    /// **A copy at an id the tree already holds** — a subtree cloned, its root
+    /// taking a caller-supplied id — is neither, and is one site:
+    /// [`crate::ccl::subst`]'s `as_expr_preserving`, a literal for the same
+    /// field-check reason.
     pub(crate) fn preserve(node_id: NodeId, node: TypedExprNode) -> Self {
         TypedExpr {
             node,
@@ -863,72 +897,53 @@ impl TypedExpr {
         self.node_id
     }
 
-    /// Move an **already-cloned** node onto `node_id`, consuming and returning it
-    /// — the root-carry step of a compound substitution.
+    /// A deep copy at the **same identities** — the opt-out from the freshening
+    /// [`Clone`], and the subtree analogue of [`preserve`](Self::preserve).
     ///
-    /// This is the one legitimate write to `node_id` outside a constructor, and it
-    /// is named so it reads as deliberate rather than as a stray assignment. It is
-    /// sound for the same reason a preserving struct literal is: a clone mints
-    /// nothing, so overwriting its root id records no birth and strands none. The
-    /// id it drops is the clone's copied one, which no recorded step ever claimed.
+    /// Discouraged, and narrow: three shapes call it. Anywhere else a copy that
+    /// duplicates ids is a bug an id-uniqueness assert will find later, and the fix
+    /// is to **record** the freshened copy rather than to suppress the freshen —
+    /// including when the symptom is a `Leak::Unexplained` or a
+    /// `Leak::CopyOfUnknown`, which mean a copy was made with no step open or
+    /// against an unrecorded origin. Freshening everywhere and recording it costs
+    /// no compile time and no meaningful memory, so the fix is at the copy site.
+    /// See the vault's `freshening-clone-report`.
     ///
-    /// Not a way to *set* an arbitrary id on a freshly-minted node — that is the
-    /// phantom [`preserve`](Self::preserve) exists to prevent. The caller must
-    /// already hold a clone, and `node_id` must be an id some occurrence carries.
-    pub(crate) fn re_root(mut self, node_id: NodeId) -> Self {
-        self.node_id = node_id;
-        self
-    }
-
-    /// Re-mint this node's [`NodeId`], returning `(old, new)`. A cloned subtree
-    /// shares the original's ids; freshening makes them unique again.
+    /// # 1. A `Subst` discharge template
     ///
-    /// Deliberately fresh-only — there is no `set_node_id(arbitrary)`. Ids are
-    /// minted at construction; the one legitimate later mutation is re-minting
-    /// a clone's copied id.
-    pub(crate) fn freshen_node_id(&mut self) -> (NodeId, NodeId) {
-        let old = self.node_id;
-        let new = NodeId::fresh();
-        self.node_id = new;
-        // Every duplication path funnels through here — the direct callers and
-        // `freshen_node_ids_deep`'s per-node walk alike — so a single `on_copy`
-        // hook reports the (old, new) pair to any open lineage step.
-        crate::ccl::lineage::on_copy(old, new);
-        (old, new)
-    }
-
-    /// Deep-freshen every [`NodeId`] in this expression's node-set — the
-    /// `walk_children` domain, which is the whole id domain (type slots carry no
-    /// identity; see [`freshen_from_expr`]). Each re-minted node fires the ambient
-    /// `on_copy` recorder hook (via
-    /// [`freshen_node_id`](Self::freshen_node_id)), so an open lineage step
-    /// captures the copies.
+    /// A [`Subst`](crate::ccl::subst::Subst) discharge payload is never a tree
+    /// node. `Mapping::as_expr` clones it afresh at every read, and that read is
+    /// where each sibling is minted, so copying the template itself must mint
+    /// nothing. Every site of this shape is either the argument to
+    /// `Subst::discharge` or `Mapping`'s own `Clone` propagating one.
     ///
-    /// This is the single deep-freshen walk shared by monomorphization's clone
-    /// freshening and the transact/letrec phases' `subst_env` copies. Do not
-    /// hand-roll a second walk over this node-set.
+    /// # 2. A throwaway copy
     ///
-    /// Not to be confused with [`crate::ccl::uniquify`]'s `collect_node_ids`,
-    /// which *is* predicate-inclusive: it is a debug tripwire asserting uniquify
-    /// preserves every id as a **multiset** across its own predicate rebuilds, a
-    /// different property over a deliberately different domain.
-    pub(crate) fn freshen_node_ids_deep(&mut self) {
-        freshen_from_expr(self);
-    }
-
-    /// Deep-freshen the **interior** of this node — every descendant — while
-    /// leaving the node's *own* [`NodeId`] untouched.
+    /// A copy the normal path *discards*, kept only so a failure or a later
+    /// comparison has something to look at: lowering's per-statement rollback copy
+    /// of the accumulated continuation (`lower_stmts_recovering`) and the
+    /// post-inference type check's scratch tree (`infer::check::check`).
+    /// Freshening them would mint whole trees for values nothing reads —
+    /// quadratic in both cases; each site carries a `TODO` saying so, and the fix
+    /// at both is to stop needing the copy at all.
     ///
-    /// This is the root-carry primitive: the
-    /// substitution engine's compound-replacement arm carries the occurrence's
-    /// id onto the replacement *root* (a preserve inheriting the occurrence's
-    /// span/attribution) and freshens only the interior, which lands as ambient
-    /// `Copy`s mirroring the template. Every re-minted interior node fires the
-    /// `on_copy` hook (via [`freshen_node_id`](Self::freshen_node_id)), so an
-    /// open lineage step captures them.
-    pub(crate) fn freshen_interior_node_ids(&mut self) {
-        // The root's own id is preserved; only its children are freshened.
-        self.walk_children_mut(freshen_from_expr);
+    /// A copy that *reaches the output* is not this shape, even when the source is
+    /// dropped on the way: the output copy is a sibling and freshens.
+    ///
+    /// # 3. A test comparing trees across a pass
+    ///
+    /// A test that runs a pass over a copy and compares against the original
+    /// needs the two to be the same nodes, or it is not testing the pass. See
+    /// `uniquify`'s idempotence and id-stability tests.
+    ///
+    /// # Why this is sound
+    ///
+    /// In no shape are the source and the copy both reachable from one tree, so
+    /// nothing ever observes two live nodes at one identity. A template is not a
+    /// tree node; a throwaway sits outside the tree the pipeline goes on rewriting.
+    pub(crate) fn clone_preserving_ids(&self) -> Self {
+        let _preserving = crate::ccl::lineage::preserve_ids();
+        self.clone()
     }
 
     /// Set the inferred type on this expression, consuming and returning it.

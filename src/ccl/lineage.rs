@@ -188,9 +188,11 @@ pub(crate) type LineageLog = Vec<RewriteStep>;
 /// itself hold). Attached-literal vs resolved-through-state are different
 /// semantics, not two instances of one thing — and thread-local statics cannot
 /// be generic, so a blame-domain generic would erase to the same at the
-/// recorder boundary anyway. There is deliberately no NodeId-blame field:
-/// root-carry eliminated its only prospective user; add one when a site
-/// demands it.
+/// recorder boundary anyway. There is no NodeId-blame field: the one site that
+/// would name an upstream id — a substitution, whose replacement takes the
+/// replaced occurrence's attribution — carries the occurrence's identity instead
+/// (`crate::ccl::subst`'s `as_expr_preserving`), so there is no id left to
+/// resolve. Add one when a site demands it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LoweringStep {
     /// The identity relation this step performs. For lowering: a leaf mint is a
@@ -808,11 +810,25 @@ thread_local! {
 /// `on_mint`/`on_copy` push NodeIds regardless (they are
 /// blame-domain-agnostic); a frame's flush matches this to emit the right step
 /// type, and the always-on lowering leaves ([`lowering_leaf`]) append here too.
+/// The lowering log, plus the set of [`NodeId`]s it has already explained.
+///
+/// The set exists for one caller: [`lowering_predicate_leaf`], which sweeps a
+/// finished refinement predicate and must **not** re-record a node that already
+/// carries precise attribution from its own lowering. The fold is
+/// last-write-wins (`attr.insert(p, out_attr)`), so a blanket sweep would
+/// silently replace a node's real span and label with the coarse predicate one —
+/// a loss no leak class can see, because the node stays explained either way.
+#[derive(Default)]
+struct LoweringRecord {
+    log: LoweringLog,
+    recorded: HashSet<NodeId>,
+}
+
 enum ActiveLog {
     /// A pass boundary's log (inspector-only sessions).
     Pass(LineageLog),
     /// Lowering's log (the always-on session, all builds).
-    Lowering(LoweringLog),
+    Lowering(LoweringRecord),
 }
 
 /// An in-flight step accumulating the ids born and copied within its dynamic
@@ -887,7 +903,7 @@ impl OpenStep {
     /// [`lowering_leaf`], so a lowering frame carries no consumed ids and no
     /// births — only the captured per-origin copies flush here, as `Copy`
     /// [`LoweringStep`]s mirroring their origins' folded entries (empty anchor).
-    fn flush_into_lowering(self, log: &mut LoweringLog) {
+    fn flush_into_lowering(self, rec: &mut LoweringRecord) {
         let OpenStep {
             label,
             nature,
@@ -901,7 +917,8 @@ impl OpenStep {
              append via lowering_leaf, frames capture only copies",
         );
         for (origin, produced) in group_copies(&copies) {
-            log.push(LoweringStep {
+            rec.recorded.extend(produced.iter().copied());
+            rec.log.push(LoweringStep {
                 op: Op::Copy { origin, produced },
                 anchor: Vec::new(),
                 nature,
@@ -917,10 +934,47 @@ impl OpenStep {
 /// route through. A no-op when no lowering session is installed (the lower
 /// submodules' unit tests, which only inspect the tree shape) or when a pass
 /// session is active (defensive: lowering leaves belong only to a lowering log).
+/// Record one node of a **refinement predicate**, unless it is already
+/// explained.
+///
+/// Lowering builds a predicate out of ordinary sub-expressions that were lowered
+/// — and therefore recorded — in the main tree, then mints and copies extra
+/// nodes to assemble them (`ccl_utils::refined_data_fun` is where the result is
+/// sealed into a `Refinement`). Those assembly nodes live only in a type slot,
+/// outside the `walk_children` domain, so nothing recorded them.
+///
+/// The skip is the whole point. A node the main-tree walk already explained has
+/// a precise span and label; re-recording it here would replace both with this
+/// sweep's coarse ones, because the fold is last-write-wins. Measured on the
+/// pipeline corpus: 318 nodes would be clobbered without it, and no leak class
+/// would report anything, since a clobbered node is still explained.
+pub(crate) fn lowering_predicate_leaf(id: NodeId, span: Span, nature: Nature, label: RewriteLabel) {
+    if id == NodeId::PLACEHOLDER {
+        return;
+    }
+    ACTIVE_LOG.with(|slot| {
+        if let Some(ActiveLog::Lowering(rec)) = slot.borrow_mut().as_mut() {
+            if !rec.recorded.insert(id) {
+                return;
+            }
+            rec.log.push(LoweringStep {
+                op: Op::Transform {
+                    consumed: Vec::new(),
+                    produced: vec![id],
+                },
+                anchor: vec![span],
+                nature,
+                label,
+            });
+        }
+    });
+}
+
 pub(crate) fn lowering_leaf(id: NodeId, span: Span, nature: Nature, label: RewriteLabel) {
     ACTIVE_LOG.with(|slot| {
-        if let Some(ActiveLog::Lowering(log)) = slot.borrow_mut().as_mut() {
-            log.push(LoweringStep {
+        if let Some(ActiveLog::Lowering(rec)) = slot.borrow_mut().as_mut() {
+            rec.recorded.insert(id);
+            rec.log.push(LoweringStep {
                 op: Op::Transform {
                     consumed: Vec::new(),
                     produced: vec![id],
@@ -1025,7 +1079,7 @@ impl Drop for StepGuard {
         // The log kind routes the flush to the matching step type.
         ACTIVE_LOG.with(|slot| match slot.borrow_mut().as_mut() {
             Some(ActiveLog::Pass(log)) => frame.flush_into(log),
-            Some(ActiveLog::Lowering(log)) => frame.flush_into_lowering(log),
+            Some(ActiveLog::Lowering(rec)) => frame.flush_into_lowering(rec),
             None => {}
         });
     }
@@ -1046,6 +1100,87 @@ pub(crate) fn on_mint(id: NodeId) {
             top.births.push(id);
         }
     });
+}
+
+thread_local! {
+    /// Depth counter for [`preserve_ids`]: non-zero means a clone in progress is
+    /// a **re-allocation of the same node**, not a duplication, so it must carry
+    /// the origin's id rather than mint one.
+    ///
+    /// A counter rather than a flag because the scopes nest — a preserving copy
+    /// of a tree recurses through `Clone` for every child.
+    static PRESERVING_IDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard returned by [`preserve_ids`]. Dropping it re-enables freshening.
+pub(crate) struct PreservingIds;
+
+impl Drop for PreservingIds {
+    fn drop(&mut self) {
+        PRESERVING_IDS.with(|c| c.set(c.get() - 1));
+    }
+}
+
+/// Open a scope in which [`TypedExpr`](crate::ccl::expr::TypedExpr)'s `Clone`
+/// **preserves** ids instead of freshening them.
+///
+/// Reach for this through
+/// [`TypedExpr::clone_preserving_ids`](crate::ccl::expr::TypedExpr::clone_preserving_ids),
+/// never directly: the scope must cover the clone and nothing else, and a
+/// genuine duplication performed inside one would silently produce a
+/// duplicate id.
+#[must_use]
+pub(crate) fn preserve_ids() -> PreservingIds {
+    PRESERVING_IDS.with(|c| c.set(c.get() + 1));
+    PreservingIds
+}
+
+/// Run `f` with id-preserving clones — a scope over a whole *rewrite region*,
+/// not over a copy.
+///
+/// # TODO(predicate-domain): this is slated for removal. Do not add callers.
+///
+/// **There is exactly one legitimate user: [`PredMemo`]'s predicate rebuild**
+/// (two call sites). Everything else that needs a preserving copy has one —
+/// [`TypedExpr::clone_preserving_ids`] — and should use it. A new caller here is
+/// almost certainly reaching for the wrong tool: this scope silences the
+/// freshening for *every* clone on the thread until `f` returns, including
+/// genuine duplications a callee performs, so it can manufacture duplicate ids
+/// in a way the per-copy method cannot.
+///
+/// It exists because what must not mint inside a predicate rebuild is not a copy
+/// but an arbitrary caller-supplied rewrite: `f` does not clone the predicate, it
+/// mints *into* it (a substitution materializing a template, a rule building a
+/// conjunction). Nothing records a predicate rewrite, so a node minted there is
+/// one no record explains, and a `Copy` rowed against it folds as
+/// [`Leak::CopyOfUnknown`]. `clone_preserving_ids` covers one copy;
+/// only a scope covers a region.
+///
+/// Preserving is honest here because the rebuilt term *replaces* the original
+/// everywhere the walk reaches — which holds only because `uniquify` walks the
+/// whole tree. It is a **scope cut**, not a design: the predicate domain needs
+/// recording, and this function should go when that lands. See the vault's
+/// `predicate-lineage-report` and `design/provenance.md`, "Walking the ids".
+///
+/// [`PredMemo`]: crate::ccl::ccl_utils::PredMemo
+/// [`TypedExpr::clone_preserving_ids`]: crate::ccl::expr::TypedExpr::clone_preserving_ids
+pub(crate) fn preserving_ids<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = preserve_ids();
+    f()
+}
+
+/// The id a clone of `origin` should carry, and the one place that decides.
+///
+/// Freshens by default — a clone is a sibling — reporting the pair through
+/// [`on_copy`]. Inside a [`preserve_ids`] scope it returns `origin` unchanged
+/// and records nothing, because no new node came into being.
+pub(crate) fn copy_id(origin: NodeId) -> NodeId {
+    if PRESERVING_IDS.with(std::cell::Cell::get) > 0 {
+        return origin;
+    }
+    let fresh = NodeId::fresh();
+    on_copy(origin, fresh);
+    fresh
 }
 
 /// A hook called from the freshen helpers for every `(origin, fresh)`
@@ -1096,7 +1231,7 @@ impl RecorderSession {
     /// installed for the whole of lowering in every build. Its leaf entries
     /// ([`lowering_leaf`]) and copy-frame flushes route to a [`LoweringLog`].
     pub(crate) fn lowering() -> Self {
-        Self::install(ActiveLog::Lowering(Vec::new()))
+        Self::install(ActiveLog::Lowering(LoweringRecord::default()))
     }
 
     fn install(log: ActiveLog) -> Self {
@@ -1129,7 +1264,7 @@ impl RecorderSession {
     /// Drain and return the recorded **lowering** log, ending the session.
     pub(crate) fn into_lowering_log(self) -> LoweringLog {
         ACTIVE_LOG.with(|slot| match slot.borrow_mut().take() {
-            Some(ActiveLog::Lowering(log)) => log,
+            Some(ActiveLog::Lowering(rec)) => rec.log,
             other => {
                 debug_assert!(
                     other.is_none(),
@@ -1170,6 +1305,77 @@ mod tests {
 
     fn set(items: impl IntoIterator<Item = NodeId>) -> HashSet<NodeId> {
         items.into_iter().collect()
+    }
+
+    /// The predicate sweep must not overwrite attribution a node already has.
+    ///
+    /// This is the one property of `lowering_predicate_leaf` that **no leak class
+    /// can see**: the fold is last-write-wins, so a node re-recorded by the sweep
+    /// is still perfectly *explained* — it has just silently swapped its real
+    /// span and label for the sweep's coarse ones. Measured on the pipeline
+    /// corpus, a blanket sweep clobbers 318 nodes and every gate stays green.
+    #[test]
+    fn the_predicate_sweep_skips_already_recorded_nodes() {
+        let [recorded, fresh] = ids::<2>();
+        let session = RecorderSession::lowering();
+        // A node lowered in the main tree: precise span, precise label.
+        lowering_leaf(recorded, span(10, 20), Nature::Source, "lower.precise");
+        // The sweep runs over a predicate containing both that node and one
+        // minted while assembling the predicate.
+        lowering_predicate_leaf(recorded, span(0, 99), Nature::Machinery, "lower.sweep");
+        lowering_predicate_leaf(fresh, span(0, 99), Nature::Machinery, "lower.sweep");
+        let log = session.into_lowering_log();
+
+        assert_eq!(log.len(), 2, "the already-recorded node is not re-recorded");
+        let for_recorded: Vec<_> = log
+            .iter()
+            .filter(
+                |s| matches!(&s.op, Op::Transform { produced, .. } if produced == &vec![recorded]),
+            )
+            .collect();
+        assert_eq!(
+            for_recorded.len(),
+            1,
+            "exactly one entry for the lowered node"
+        );
+        assert_eq!(
+            for_recorded[0].label, "lower.precise",
+            "its own label survives"
+        );
+        assert_eq!(
+            for_recorded[0].anchor,
+            vec![span(10, 20)],
+            "its own span survives"
+        );
+
+        let for_fresh: Vec<_> = log
+            .iter()
+            .filter(|s| matches!(&s.op, Op::Transform { produced, .. } if produced == &vec![fresh]))
+            .collect();
+        assert_eq!(
+            for_fresh.len(),
+            1,
+            "the assembly node is explained by the sweep"
+        );
+        assert_eq!(for_fresh[0].label, "lower.sweep");
+    }
+
+    /// A second sweep over the same predicate adds nothing — the skip is keyed on
+    /// the id, not on which sweep recorded it, so overlapping predicates (one
+    /// term riding several type slots) cannot double-record.
+    #[test]
+    fn the_predicate_sweep_is_idempotent() {
+        let [n] = ids::<1>();
+        let session = RecorderSession::lowering();
+        lowering_predicate_leaf(n, span(1, 2), Nature::Machinery, "lower.sweep");
+        lowering_predicate_leaf(n, span(3, 4), Nature::Machinery, "lower.sweep");
+        let log = session.into_lowering_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "one entry per node however many sweeps reach it"
+        );
+        assert_eq!(log[0].anchor, vec![span(1, 2)], "the first sweep wins");
     }
 
     fn transform(consumed: Vec<NodeId>, produced: Vec<NodeId>, blame: Vec<NodeId>) -> RewriteStep {
@@ -1638,12 +1844,11 @@ mod tests {
     }
 
     #[test]
-    fn lowering_root_carry_preserve_inherits_its_leaf_attribution() {
-        // Root-carry: the substituted compound root carries the
-        // occurrence's own id (a preserve). In the log that is just the
-        // occurrence's leaf entry — no copy for the root — and its interior
-        // children are copies of the template. The root keeps its own (Source)
-        // attribution; the interior mirrors the template (Machinery).
+    fn lowering_substituted_root_inherits_its_occurrences_leaf_attribution() {
+        // A substituted root carries the occurrence's own id, so the log holds no
+        // step for it — just the occurrence's leaf entry — while its interior
+        // children are copies of the replacement template. The root keeps its own
+        // (Source) attribution; the interior mirrors the template (Machinery).
         let [occurrence, tmpl_child, occ_child] = ids();
         let log = vec![
             // The param-use occurrence, imaged Source at its mint.
@@ -1665,7 +1870,7 @@ mod tests {
         assert_eq!(
             root_attr.rewritten.nature,
             Nature::Source,
-            "the carried root preserves the occurrence's own Source attribution"
+            "the carried root keeps the occurrence's own Source attribution"
         );
         assert_eq!(root_attr.spans, vec![span(10, 11)]);
         assert_eq!(
@@ -1697,9 +1902,9 @@ mod tests {
 
     // ---- the recorder ------------------------------------------------------
     //
-    // These exercise the construction hooks through *real* `Expr` construction
-    // (`Expr::new`/`Expr::lit`/`Expr::tuple` + `freshen_node_ids_deep`), not
-    // hand-built steps, so the hook wiring in `expr.rs` is under test too.
+    // These exercise the hooks through *real* `Expr` construction (`Expr::lit`,
+    // `Expr::tuple`) and the freshening `Clone`, not hand-built steps, so the hook
+    // wiring in `expr.rs` is under test too.
 
     use crate::ccl::Lit;
     use crate::ccl::expr::Expr;
@@ -1764,25 +1969,32 @@ mod tests {
 
     #[test]
     fn deep_freshen_in_a_step_yields_per_origin_copies() {
-        // Build a 3-node tree (tuple + two lits) OUTSIDE any step, clone it
-        // (Clone shares ids), then deep-freshen the clone inside a copy-only
-        // frame — one that consumes nothing and mints nothing, so its whole
-        // output is the freshen pairs the `on_copy` hook captures.
-        let tree = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
-        let mut clone = tree.clone();
-        let old_root = clone.node_id();
-        // The pre-freshen node ids (the clone still shares the original's) are
-        // the origins each per-node `Copy` should record.
-        let old_ids: HashSet<NodeId> = std::iter::once(old_root)
-            .chain(clone.child_exprs().iter().map(|c| c.node_id()))
+        // Build a 3-node tree (tuple + two lits) OUTSIDE any step, then clone it
+        // inside a copy-only frame — one that consumes nothing and mints nothing
+        // of its own, so its whole output is the freshen pairs `Clone` reports
+        // through the `on_copy` hook.
+        let source = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
+        // The source's node ids are the origins each per-node `Copy` should record.
+        let old_ids: HashSet<NodeId> = std::iter::once(source.node_id())
+            .chain(source.child_exprs().iter().map(|c| c.node_id()))
             .collect();
 
         let session = RecorderSession::new();
-        {
+        let clone = {
             let _g = copy_frame("dup");
-            clone.freshen_node_ids_deep();
-        }
+            source.clone()
+        };
         let log = session.into_log();
+
+        // The clone is a distinct 3-node tree sharing no id with its source.
+        let fresh_ids: HashSet<NodeId> = std::iter::once(clone.node_id())
+            .chain(clone.child_exprs().iter().map(|c| c.node_id()))
+            .collect();
+        assert_eq!(fresh_ids.len(), 3);
+        assert!(
+            fresh_ids.is_disjoint(&old_ids),
+            "a clone shares no id with its source"
+        );
 
         // Three nodes freshened: three per-origin Copy steps, one produced each,
         // one Copy per pre-freshen origin id.
@@ -1808,13 +2020,12 @@ mod tests {
         // A Transform frame opened purely to capture a deep freshen (no consumed
         // ids, no births) emits only its per-origin Copy steps — never an empty
         // `Transform { consumed: [], produced: [] }`.
-        let tree = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
-        let mut clone = tree.clone();
+        let source = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
 
         let session = RecorderSession::new();
         {
             let _g = step("wrap.freshen", vec![], vec![], Nature::Machinery);
-            clone.freshen_node_ids_deep();
+            let _clone = source.clone();
         }
         let log = session.into_log();
         assert_eq!(log.len(), 3, "only the three per-origin Copy steps");
@@ -1827,10 +2038,10 @@ mod tests {
     #[test]
     fn no_step_open_records_nothing() {
         let session = RecorderSession::new();
-        // Construction and freshening with an empty stack capture nowhere.
+        // Construction and cloning with an empty stack capture nowhere.
         let _e = Expr::lit(Lit::Int(1));
-        let mut x = Expr::lit(Lit::Int(2));
-        x.freshen_node_id();
+        let x = Expr::lit(Lit::Int(2));
+        let _copy = x.clone();
         let log = session.into_log();
         assert!(log.is_empty(), "empty stack ⇒ nothing recorded: {log:?}");
     }
@@ -1982,11 +2193,9 @@ mod tests {
             let template = Expr::lit(Lit::Int(0));
             t = template.node_id();
             // Copy it twice — one freshened clone per read site.
-            let mut r1 = template.clone();
-            r1.freshen_node_id();
+            let r1 = template.clone();
             c1 = r1.node_id();
-            let mut r2 = template.clone();
-            r2.freshen_node_id();
+            let r2 = template.clone();
             c2 = r2.node_id();
         }
         let log = session.into_log();

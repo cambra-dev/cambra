@@ -183,7 +183,6 @@ pub(super) fn lower_list_comp(
             source,
             &gen_iter_vars[0],
             &body,
-            &mut false,
             comp.element.span,
             ctx,
         ));
@@ -321,6 +320,7 @@ pub(super) fn lower_list_comp(
             element_span,
             lc,
         );
+        ctx.tag_predicate(&pred_expr, element_span, "lower.comp_filter_pred");
         let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole);
         Ok(ctx.tag_machinery(make_cast(unrefined_lambda, target_ty), element_span, lc))
     } else {
@@ -340,34 +340,25 @@ pub(super) fn lower_list_comp(
     }
 }
 
+/// Hand out a tree copy of `origin` for one arm of a fan-out. Every arm is a
+/// sibling, including the first: a fan-out places the same subtree under several
+/// arms and no arm is privileged. The copy-frame records each copy as a `Copy` of
+/// the origin, so every arm's attribution mirrors the original's.
+fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
+    use crate::ccl::lineage::copy_frame;
+    let _frame = copy_frame(label);
+    origin.clone()
+}
+
 /// Float a value-`Case` *source* out of a single-generator comprehension:
 /// `[e for x in Case{gᵢ→srcᵢ}]` ⟹ `Case{gᵢ → [e for x in srcᵢ]}`. Sound because
 /// the guards do not reference the comprehension variable `x`. Recurses so a
 /// nested conditional source flattens per arm; a concrete (non-`Case`) source
 /// builds the ordinary map chain `λ __idx → __idx ▷ src ▷ (λ x → body)`.
-/// Hand out a tree copy of `origin` for one arm of a fan-out, **keep-first**: the
-/// first copy keeps the original's `NodeId`s and every later one is deep-freshened
-/// inside a lowering copy-frame, so its re-mints land as `Copy` steps mirroring the
-/// original's attribution. A fan-out places the same subtree under several arms and
-/// two main-tree nodes may not share an id — see `src/ccl/design/provenance.md`,
-/// "The id domain". (The same keep-first shape as the chained-comparison operand
-/// freshen in `lower::exprs`.)
-fn fan_out_copy(origin: &Expr, used: &mut bool, label: &'static str) -> Expr {
-    let mut copy = origin.clone();
-    if *used {
-        use crate::ccl::lineage::copy_frame;
-        let _frame = copy_frame(label);
-        copy.freshen_node_ids_deep();
-    }
-    *used = true;
-    copy
-}
-
 fn float_comp_source_case(
     source: Expr,
     iter_var: &str,
     body: &Expr,
-    body_used: &mut bool,
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Expr {
@@ -386,7 +377,7 @@ fn float_comp_source_case(
                 pattern: b.pattern,
                 guard: b.guard,
                 // The arm body *is* this arm's source collection; float into it.
-                body: float_comp_source_case(b.body, iter_var, body, body_used, span, ctx),
+                body: float_comp_source_case(b.body, iter_var, body, span, ctx),
             })
             .collect();
         // The rebuilt `Case` is the floated encoding of the rule, not an image of
@@ -409,7 +400,7 @@ fn float_comp_source_case(
     // a conditional source join as collections rather than colliding as
     // capabilities whose index domains would meet — and saying it on the node
     // lowering mints is what keeps it from being decided by whoever consumes it.
-    let body = fan_out_copy(body, body_used, "lower.comp_source_case_body");
+    let body = fan_out_copy(body, "lower.comp_source_case_body");
     let cs = "lower.comp_source_case";
     let elem_map = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body), span, cs);
     ctx.tag_machinery(
@@ -443,9 +434,6 @@ fn fan_out_element_case(
     // `true → Case{…}`) into one flat partition, so each arm is a plain value.
     let branches = flatten_trailing_value_case(branches);
     let mut prior_guards: Vec<Expr> = Vec::new();
-    // The source subtree is placed once per arm in the element map and once more in
-    // that arm's gate, so every use after the first must be a freshened copy.
-    let mut source_used = false;
     let arms: Vec<Expr> = branches
         .into_iter()
         .map(|b| {
@@ -456,7 +444,7 @@ fn fan_out_element_case(
             // own images, recorded when they were lowered.
             let ec = "lower.comp_elem_case";
             let idx_var = ctx.tag_machinery(Expr::var(Name::raw(outer_var)), span, ec);
-            let arm_src = fan_out_copy(&source, &mut source_used, "lower.comp_elem_case_source");
+            let arm_src = fan_out_copy(&source, "lower.comp_elem_case_source");
             let read = ctx.tag_machinery(Expr::apply(idx_var, arm_src), span, ec);
             let arm_body = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, b.body), span, ec);
             let applied = ctx.tag_machinery(Expr::apply(read, arm_body), span, ec);
@@ -475,13 +463,15 @@ fn fan_out_element_case(
             let gate_on_source = Expr::apply(
                 Expr::apply(
                     Expr::var(Name::elem()),
-                    fan_out_copy(&source, &mut source_used, "lower.comp_elem_case_source"),
+                    fan_out_copy(&source, "lower.comp_elem_case_source"),
                 ),
                 Expr::lambda(iter_var, Type::Hole, gate),
             );
-            // `gate_on_source` rides the cast target's refinement predicate, so its
-            // interior is outside the NodeId domain — carried, never checked — and
-            // needs no tagging (`src/ccl/design/provenance.md`, "The id domain").
+            // `gate_on_source` rides the cast target's refinement predicate, so
+            // its interior is in the domain the fold must explain and nothing in
+            // the main-tree walk reaches it. Sweep it
+            // (`src/ccl/design/provenance.md`, "Walking the ids").
+            ctx.tag_predicate(&gate_on_source, span, "lower.comp_arm_gate_pred");
             let target = refined_data_fun(Type::Hole, gate_on_source, Type::Hole);
             ctx.tag_machinery(make_cast(elem_map, target), span, ec)
         })

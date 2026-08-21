@@ -87,7 +87,13 @@ pub(super) fn lower_call(
             let key_ty = ctx.fresh_shared_hole();
             // `bare_pred` (and the `collection` clone inside it) lives in the
             // cast target's refinement predicate — a type slot outside the
-            // `walk_children` domain — so its nodes are deliberately untagged.
+            // `walk_children` domain. It used to be left deliberately untagged
+            // for exactly that reason; it is now swept by `tag_predicate` below,
+            // because `collect_tree_ids` reaches refinement predicates and the
+            // lowering fold therefore has to explain them. The `collection`
+            // clone is the reason this matters more than it used to: `Clone`
+            // freshens, so that clone no longer aliases an already-tagged
+            // main-tree id.
             let bare_pred = Expr::binop(
                 Expr::apply(
                     Expr::apply(Expr::var(Name::elem()), collection.clone()),
@@ -114,6 +120,7 @@ pub(super) fn lower_call(
                 func.span,
                 gb,
             );
+            ctx.tag_predicate(&bare_pred, func.span, "lower.groupby_key_pred");
             let target_ty = refined_data_fun(Type::Hole, bare_pred, Type::Hole);
             let cast = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
             // A group-by is a **data function** (a keyed collection): stamp its
@@ -456,11 +463,15 @@ pub(super) fn lower_compare(
     }
 
     // Build one BinOp per (op, adjacent-operand-pair). Each middle operand is
-    // shared by two pairs; a bare clone would put the same NodeIds in the tree
-    // twice. Keep-first: an operand's first tree use keeps its original ids
-    // (operand i+1 first appears as pair i's RIGHT side), and its second use
-    // (as pair i+1's LEFT side) is a deep-freshened copy whose folded
-    // attributions mirror the original's.
+    // placed in two pairs, and no placement is privileged, so every placement is a
+    // freshened copy taken inside a lowering copy-frame: each re-minted node lands
+    // as a `Copy` step mirroring the original operand's (Source) image, which is
+    // the attribution wanted for a duplicated operand.
+    let operand = |i: usize| {
+        use crate::ccl::lineage::copy_frame;
+        let _frame = copy_frame("lower.compare_operand");
+        operands[i].clone()
+    };
     let mut comparisons: Vec<Expr> = Vec::with_capacity(ops.len());
     for (i, op) in ops.iter().enumerate() {
         let kind = match op {
@@ -471,22 +482,8 @@ pub(super) fn lower_compare(
             CmpOp::Gt => CompareKind::Greater,
             CmpOp::GtE => CompareKind::GreaterOrEq,
         };
-        let lhs = if i == 0 {
-            // Operand 0's only use.
-            operands[0].clone()
-        } else {
-            // Operand i's second use (its first was pair i-1's right side). A
-            // bare clone would share NodeIds; freshen a copy inside a lowering
-            // copy-frame so each re-minted node lands as a `Copy` LoweringStep
-            // mirroring the original operand's (Source) image — exactly the
-            // attribution wanted for the duplicated operand.
-            use crate::ccl::lineage::copy_frame;
-            let mut copy = operands[i].clone();
-            let _frame = copy_frame("lower.compare_operand");
-            copy.freshen_node_ids_deep();
-            copy
-        };
-        let rhs = operands[i + 1].clone();
+        let lhs = operand(i);
+        let rhs = operand(i + 1);
         // Each pair comparison images its `<op>` in the chain, spanning its two
         // operands. It is *not* `Nature::Source` — a chained comparison is one of
         // the cost cases of the structural rule (see `tag_source`): only the

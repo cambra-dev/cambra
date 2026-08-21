@@ -165,11 +165,13 @@ fn drop_dead_as_of_reads(e: &mut Expr) {
         binding,
         bound_expr,
         body,
-    } = &e.node
+    } = &mut e.node
         && as_of_read_source(bound_expr).is_some()
         && !is_free_in_value(&binding.name, body)
     {
-        *e = (**body).clone();
+        // The body takes the dropped `let`'s position: a move, not a duplication.
+        let body = std::mem::take(&mut **body);
+        *e = body;
         drop_dead_as_of_reads(e);
         return;
     }
@@ -2335,6 +2337,9 @@ fn subst_env(e: &Expr, env: &HashMap<Name, Expr>) -> Expr {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(rep) = env.get(n)
     {
+        // Root-carry: the replacement denotes what the `Var` denoted — the value
+        // of `n` *here* — so the read site keeps its own id, and with it its
+        // span/attribution. N reads give N distinct roots.
         return rep.clone();
     }
     let mut out = e.clone();
@@ -2350,7 +2355,10 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, Expr>) 
         && keys.contains(&binding.name)
         && !out.contains_key(&binding.name)
     {
-        out.insert(binding.name.clone(), (**init).clone());
+        // A stash, not a duplication: the `let` that held this init is dropped
+        // rather than kept alongside, so preserving its ids is what makes the
+        // later placements copies **of the original**.
+        out.insert(binding.name.clone(), init.clone_preserving_ids());
     }
     expr.walk_children(|c| collect_key_inits(c, keys, out));
 }
@@ -2718,7 +2726,7 @@ fn plan_store(
         let v = value_ty(k);
         let reg_k = hist[k].clone();
         let t = Name::fresh("__t");
-        let init = key_init.get(k).cloned().expect("key init present");
+        let init = key_init.get(k).expect("key init present").clone();
         // The `get_prev_txn` history slot — the design's denotation: the
         // `⧺`-merged **per-key commit views** of every site writing this key
         // ("multiple writer sites for one variable merge their commit

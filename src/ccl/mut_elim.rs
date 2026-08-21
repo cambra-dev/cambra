@@ -1119,11 +1119,10 @@ fn body_has_feed(expr: &Expr) -> bool {
 /// place. The result is the clean generator body (`Case { gᵢ → Feed; true → unit }`
 /// / a bare `Feed`) that `channelize`'s feed fan-out recognizes.
 fn strip_trailing_unit(expr: Expr) -> Expr {
-    // The rebuilt `Case` below is the *same* logical node with stripped branch
-    // bodies, so it carries its original `NodeId` — a pass that minted here would
-    // break the node's link to the source it came from
-    // (`src/ccl/design/provenance.md`, "The two identity primitives
-    // (`src/ccl/provenance.rs`)").
+    // The rebuilt `Case` below is the same logical node with stripped branch
+    // bodies, so it carries its original `NodeId`; a pass that minted here would
+    // break the node's link to the source it came from. See
+    // `src/ccl/design/provenance.md`, "Node identity (`src/ccl/provenance.rs`)".
     let node_id = expr.node_id();
     match expr.node {
         TypedExprNode::ExprStmt { expr: effect, body }
@@ -1589,7 +1588,7 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
             let ty = new_body.ty.clone();
             // The same logical `Let` with its feed fields attached, so it keeps its
             // own id rather than minting a replacement.
-            let mut e = Expr::let_in(binding, *bound_expr, new_body).re_root(node_id);
+            let mut e = Expr::let_in_preserving(node_id, binding, *bound_expr, new_body);
             e.ty = ty;
             e
         }

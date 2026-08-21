@@ -408,8 +408,8 @@ fn freshen_watches(
 /// freshen its type slots through `cache`, and install a fresh `Rc`. See
 /// [`freshen_above`]'s `Refinement` arm.
 ///
-/// **This does not preserve predicate `Rc` sharing, and unlike the rebuilding
-/// passes it threads no [`PredMemo`](crate::ccl::ccl_utils::PredMemo).** The
+/// This does not preserve predicate `Rc` sharing, and unlike the rebuilding
+/// passes it threads no [`PredMemo`](crate::ccl::ccl_utils::PredMemo). The
 /// `Rc::new` is unconditional, so N type slots of one clone that shared an `Rc`
 /// going in come out with N distinct `Rc`s, and planning — whose compile memo is
 /// `Rc`-keyed — compiles each separately. Known and not currently fixed: the
@@ -420,10 +420,11 @@ fn freshen_watches(
 /// exception, scoped and unfixed: generic instantiation", for the numbers and
 /// the decision.
 ///
-/// Note the freshened copy's predicate interior carries the *origin's*
-/// [`NodeId`](crate::ccl::provenance::NodeId)s: predicate interiors are outside
-/// the id domain (`ccl/design/provenance.md`), so nothing reads or checks them and
-/// a sharing fix here has no identity consequence.
+/// A sharing fix here has to keep one id-set per term: reusing one rebuilt `Rc`
+/// across the slots that shared an `Rc` going in is one term riding many slots,
+/// and returning the origin `Rc` when the freshen is vacuous is the same.
+/// Producing two *distinct* terms with equal ids is what nothing may do, and
+/// nothing yet checks.
 fn freshen_refinement_predicate(
     lim: Level,
     r: &Refinement,

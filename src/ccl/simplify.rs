@@ -957,8 +957,10 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             let g_ty = arm_ty(g);
             let h_ty = arm_ty(h);
 
-            let g_compose = Expr::compose(vec![left.clone(), g.clone()]).with_ty(g_ty);
-            let h_compose = Expr::compose(vec![left.clone(), h.clone()]).with_ty(h_ty);
+            // Distribution places `left` on both legs of the zip.
+            let h_left = left.clone();
+            let g_compose = Expr::compose(vec![left, g.clone()]).with_ty(g_ty);
+            let h_compose = Expr::compose(vec![h_left, h.clone()]).with_ty(h_ty);
             vec![zip_pair(g_compose, h_compose)]
         },
     )
@@ -1968,6 +1970,56 @@ mod tests {
         // Then product_beta simplifies: ⟨f0 ≫ g, f1 ≫ h⟩
         let expected = zip_pair(typed_compose2(f0.clone(), g), typed_compose2(f1.clone(), h));
         assert_eq!(simplified, expected);
+    }
+
+    /// Zip distribute places the left operand on both legs, so the two
+    /// placements must not share one identity.
+    ///
+    /// Arms reading the *same* slot are what make the duplication observable:
+    /// with `⟨.0, .1⟩` the follow-on product-beta consumes one copy per leg and
+    /// the survivors are disjoint, which is why the pipeline boundaries stayed
+    /// green over a corpus that never produced this shape. `⟨.0, .0⟩` beta-
+    /// reduces to `⟨f0, f0⟩`, leaving both copies of `f0` live.
+    #[test]
+    fn zip_distribute_yields_unique_node_ids_when_both_arms_read_one_slot() {
+        let int_fun = fun_ty(int_ty(), int_ty());
+        let int_pair = Type::Tuple(vec![int_ty(), int_ty()]);
+
+        let f0 = var("f0").with_ty(int_fun.clone());
+        let f1 = var("f1").with_ty(int_fun.clone());
+        let zip1 = zip_pair(f0, f1);
+
+        // ⟨.0, .0⟩ — simplifying (projections), and not both `id`, so the rule
+        // fires; both arms select the *first* component.
+        let p0 = Expr::proj_index(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
+        let p0_again = Expr::proj_index(0).with_ty(fun_ty(int_pair, int_ty()));
+        let zip2 = zip_pair(p0, p0_again);
+
+        let simplified = simplify(typed_compose2(zip1, zip2));
+        crate::ccl::context::assert_unique_node_ids(&simplified, "simplify::zip_distribute");
+    }
+
+    /// The same guarantee on the shape whose beta-reduction *does* split the two
+    /// copies — a regression here would mean the fix moved rather than removed
+    /// the duplication.
+    #[test]
+    fn zip_distribute_yields_unique_node_ids_with_composed_arms() {
+        let int_fun = fun_ty(int_ty(), int_ty());
+        let int_pair = Type::Tuple(vec![int_ty(), int_ty()]);
+
+        let zip1 = zip_pair(
+            var("f0").with_ty(int_fun.clone()),
+            var("f1").with_ty(int_fun.clone()),
+        );
+        let p0 = Expr::proj_index(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
+        let p1 = Expr::proj_index(1).with_ty(fun_ty(int_pair, int_ty()));
+        let zip2 = zip_pair(
+            typed_compose2(p0, var("g").with_ty(int_fun.clone())),
+            typed_compose2(p1, var("h").with_ty(int_fun)),
+        );
+
+        let simplified = simplify(typed_compose2(zip1, zip2));
+        crate::ccl::context::assert_unique_node_ids(&simplified, "simplify::zip_distribute");
     }
 
     /// Zip distribute in n-ary compose: a ≫ ⟨f0, f1⟩ ≫ ⟨.0, .1⟩ ≫ b

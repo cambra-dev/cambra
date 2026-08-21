@@ -61,12 +61,24 @@ pub(super) fn lower_stmts_recovering(
     // we've built so far), so when one fails we need a snapshot to fall back
     // to. Cloning unconditionally is fine — lowering isn't a hot path and
     // errors are exceptional.
+    //
+    // The snapshot preserves ids, and must. It is a *rollback copy*, not a
+    // sibling: at most one of `acc` and `backup` ever reaches the tree.
+    //
+    // TODO(rollback-copy): ripe for refactoring — this is quadratic. The
+    // continuation grows with every statement and is copied whole for each one,
+    // so a clean compile of an n-statement program does O(n^2) node copies for a
+    // value the happy path drops. Preserving ids keeps it off the *id* ledger
+    // (a freshening clone would deep-mint all of it), but the copy itself
+    // remains. The fix is to stop needing a snapshot: have `lower_middle_stmt`
+    // borrow, or return the continuation back on the error path, so recovery
+    // costs nothing when nothing fails.
     let body = rest
         .iter()
         .enumerate()
         .rev()
         .fold(final_expr, |acc, (i, stmt)| {
-            let backup = acc.clone();
+            let backup = acc.clone_preserving_ids();
             match lower_middle_stmt(stmt, &rest[..i], acc, &outer_bindings, ctx, true) {
                 Ok(e) => e,
                 Err(e) => {

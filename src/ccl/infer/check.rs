@@ -238,7 +238,10 @@ impl Typing for CheckCtx {
         // predicates — then return the (owned) body type unchanged rather than
         // cloning `bound_expr` for a no-op discharge.
         if crate::ccl::subst::type_free_vars(&body_ty).contains(name) {
-            crate::ccl::subst::Subst::discharge(name, bound_expr.clone()).apply_type(&body_ty)
+            // A discharge template is not a tree node: it is cloned again at
+            // every read, and that read is where the sibling is minted.
+            crate::ccl::subst::Subst::discharge(name, bound_expr.clone_preserving_ids())
+                .apply_type(&body_ty)
         } else {
             body_ty
         }
@@ -339,7 +342,9 @@ impl Typing for CheckCtx {
             Type::Fun { name: Some(b), .. }
                 if crate::ccl::subst::type_free_vars(&codomain).contains(b) =>
             {
-                crate::ccl::subst::Subst::discharge(b, argument.clone()).apply_type(&codomain)
+                // A discharge template; see the `Let` rule above.
+                crate::ccl::subst::Subst::discharge(b, argument.clone_preserving_ids())
+                    .apply_type(&codomain)
             }
             _ => codomain,
         };
@@ -521,12 +526,25 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 /// Check reads the recorded types and discards the clone, so callers keep their
 /// `&Expr`. Returns every discovered error.
 ///
+/// The scratch copy **preserves ids**: it is never installed anywhere, so
+/// nothing can observe two nodes at one identity, and the blame ids the rules
+/// record name the caller's real nodes rather than scratch ones nobody can
+/// resolve.
+///
 /// Cost note: the full-tree clone makes each call O(tree). The hot caller is
 /// `simplify`'s `debug_typecheck` (one call per *fired* rewrite rule), which
 /// is compiled out of release builds; the remaining callers (`typecheck`,
 /// post-planning validation in `context.rs`) run once per pipeline stage.
+///
+/// **TODO(scratch-copy): ripe for refactoring — this is quadratic.** One tree
+/// copy per fired rule is O(tree x rules) over a debug compile, for a value that
+/// is read and dropped. The clone exists only because the shared per-node rules
+/// take `&mut Expr` for inference's in-place type writes, while Check needs
+/// nothing but reads. Splitting the rules' slot access — a `&mut` writer in
+/// Infer mode, a reader in Check mode — removes the copy entirely rather than
+/// making it cheaper.
 pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
-    let mut cloned = expr.clone();
+    let mut cloned = expr.clone_preserving_ids();
     let mut ctx = CheckCtx::new(cloned.node_id());
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —

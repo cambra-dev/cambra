@@ -182,6 +182,13 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
 
     // Compile the pointful key function to a point-free morphism V ⇒ K, then
     // build `keys = c ≫ key : I ⇒ K` and `values = c : I ⇒ V`.
+    // This lifts a term out of a *type* — the refined domain's predicate — into
+    // the term tree. A predicate interior may already alias a live main-tree id
+    // (lowering shares a comprehension's source term between the generator and
+    // the guard), so a lift can land ids that are already in use. `lambda_elim::run`
+    // rebuilds the term, re-minting every node, which is what makes the crossing
+    // safe; `groupby_recognition_lifts_the_key_without_aliasing` pins the property
+    // rather than the mechanism.
     let key_pf = lambda_elim::run((**key_expr).clone()).ok()?;
     let value_idx_ty = (**idx_ty).clone();
     let keys =
@@ -218,6 +225,7 @@ fn side_extracts_element(e: &Expr) -> bool {
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+    use crate::ccl::context::assert_unique_node_ids;
 
     #[test]
     fn test_recognize_groupby_sites_on_var() {
@@ -225,5 +233,60 @@ mod tests {
         recognize_groupby_sites(&mut expr);
         // Should remain unchanged
         assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v.base() == "x"));
+    }
+
+    /// `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒ V)` composed with a
+    /// tail — the pointful group-by source the recognizer matches, with the key
+    /// morphism deliberately **shared** between the predicate and the tail.
+    ///
+    /// That sharing is not artificial: predicate interiors are outside the
+    /// checked id domain and lowering already aliases them into the main tree
+    /// (`pred_sources = gen_sources.clone()`), so a term lifted out of a
+    /// predicate can collide with a live original.
+    fn groupby_source_sharing_its_key(key: &Expr) -> Expr {
+        let idx = Type::UIntRange(4);
+        let int = int_ty();
+        let c = var("c").with_ty(fun_ty(idx.clone(), int.clone()));
+
+        // pred = (__elem ▷ c ▷ key) == k
+        let elem = Expr::var(Name::elem()).with_ty(idx.clone());
+        let elem_c = Expr::apply(elem, c.clone()).with_ty(int.clone());
+        let extract = Expr::apply(elem_c, key.clone()).with_ty(int.clone());
+        let pred = Expr::binop(
+            extract,
+            BinOpKind::Compare(CompareKind::Equals),
+            var("k").with_ty(int.clone()),
+        )
+        .with_ty(bool_ty());
+
+        let head_ty = fun_ty(
+            int.clone(),
+            fun_ty(refined_ty(idx.clone(), pred), int.clone()),
+        );
+        let cast = Expr::cast(c.clone(), fun_ty(idx, int)).with_ty(c.ty.clone());
+        let head = apply_builtin(cast, Builtin::Const, Type::Hole, head_ty.clone());
+        // The tail stands in for the live main-tree occurrence of the shared key.
+        Expr::compose(vec![head, key.clone()]).with_ty(head_ty)
+    }
+
+    /// Recognition lifts the key extraction out of a *type* and into the term
+    /// tree, and the lifted copy must not carry ids that are still live
+    /// elsewhere. Today `lambda_elim::run` provides that by rebuilding the term;
+    /// this pins the *property* rather than the mechanism, so an elim that
+    /// started preserving ids fails here instead of at a pane boundary.
+    #[test]
+    fn groupby_recognition_lifts_the_key_without_aliasing() {
+        let key = var("key").with_ty(fun_ty(int_ty(), int_ty()));
+        let mut expr = groupby_source_sharing_its_key(&key);
+        recognize_groupby_sites(&mut expr);
+
+        assert!(
+            !matches!(&expr.node, TypedExprNode::Compose(elts)
+                if matches!(&elts[0].node, TypedExprNode::Apply { function, .. }
+                    if is_builtin(function, Builtin::Const))),
+            "the recognizer must have rewritten the source: {}",
+            symbolic(&expr)
+        );
+        assert_unique_node_ids(&expr, "planning::groupby");
     }
 }

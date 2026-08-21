@@ -267,7 +267,38 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
     any_feed.then_some(arms)
 }
 
-/// Attempt to apply the defer-returning lift to a `Let` binding.
+/// The defer-returning lift's output.
+struct DeferLift {
+    /// `let y = Defer in …` — the two defer scopes merged into one.
+    expr: Expr,
+    /// The inner defer binder, which the lift renamed to the outer name.
+    inner_name: Name,
+    /// The channel domain of the inner handle the lift replaced, when its type
+    /// records one.
+    inner_chan_dom: Option<(Name, crate::ccl::ChanLevel)>,
+}
+
+/// Whether `bound_expr` has the defer-returning lift's shape: any `ExprStmt`
+/// prefix, then `let x = Defer in body_x` with `body_x` defer-returning.
+///
+/// [`lift_defer`] consumes its input, so the shape is decided here first. A
+/// matcher that failed partway through would have to rebuild what it had already
+/// taken apart, or work on a copy.
+fn is_lift_shape(bound_expr: &Expr) -> bool {
+    let mut current = bound_expr;
+    while let TypedExprNode::ExprStmt { body, .. } = &current.node {
+        current = body;
+    }
+    matches!(
+        &current.node,
+        TypedExprNode::Let { binding, bound_expr: inner_be, body }
+            if matches!(inner_be.node, TypedExprNode::Defer)
+                && is_defer_returning(body, &binding.name)
+    )
+}
+
+/// Apply the defer-returning lift to a `Let` binding whose `bound_expr` has
+/// passed [`is_lift_shape`].
 ///
 /// Pattern: `let y = (let x = Defer in body_x) in body_y` where
 /// `body_x` is *defer-returning* (ends in `Var(x)` after walking
@@ -282,11 +313,10 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
 /// Also handles an optional `ExprStmt` prefix on `bound_expr`: the
 /// heads of any leading ExprStmts become a prefix that's prepended to
 /// the lifted body, with stale Feed/Define target names renamed to `y`.
-fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option<(Expr, Name)> {
+fn lift_defer(binding_name: &Name, bound_expr: Expr, body: &Expr) -> DeferLift {
     let mut prefix: Vec<Expr> = Vec::new();
-    let mut current = bound_expr.clone();
+    let mut current = bound_expr;
     loop {
-        let cur_id = current.node_id;
         match current.node {
             TypedExprNode::ExprStmt {
                 expr: head,
@@ -295,34 +325,39 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
                 prefix.push(*head);
                 current = *tail;
             }
+            // Put the node back on the expression the match moved it out of; the
+            // spine ends here.
             node => {
-                current = TypedExpr {
-                    node,
-                    ty: current.ty,
-                    user_annotation: current.user_annotation,
-                    // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
-                    node_id: cur_id,
-                };
+                current.node = node;
                 break;
             }
         }
     }
-    let (inner_name, inner_handle_ty, inner_body_x) = match current.node {
-        TypedExprNode::Let {
-            binding: inner_binding,
-            bound_expr: inner_be,
-            body: inner_body,
-        } if matches!(inner_be.node, TypedExprNode::Defer)
-            && is_defer_returning(&inner_body, &inner_binding.name) =>
-        {
-            // Keep the inner defer's recorded handle type (`feed(ChanDom(F) ⇒
-            // V)`) — the lifted binding must carry it so cluster discovery
-            // keys the channel by the domain name consumer types reference,
-            // not by the term name. (`Hole` on an untyped tree, harmlessly.)
-            (inner_binding.name, inner_be.ty, *inner_body)
-        }
-        _ => return None,
+    let TypedExprNode::Let {
+        binding: inner_binding,
+        bound_expr: inner_be,
+        body: inner_body,
+    } = current.node
+    else {
+        unreachable!("`lift_defer` requires the `is_lift_shape` shape")
     };
+    debug_assert!(
+        matches!(inner_be.node, TypedExprNode::Defer)
+            && is_defer_returning(&inner_body, &inner_binding.name),
+        "`lift_defer` requires the spine to end in `let x = Defer in body_x` with a \
+         defer-returning `body_x` — check `is_lift_shape` first"
+    );
+    // Read the inner handle's channel domain off the binding this lift replaces:
+    // the entry the caller records has to key on the domain name consumer types
+    // carry, which for a specialization clone differs from the term binder name.
+    let inner_chan_dom =
+        handle_chan_dom(&inner_binding.ty).or_else(|| handle_chan_dom(&inner_be.ty));
+    // Keep the inner defer's recorded handle type (`feed(ChanDom(F) ⇒ V)`) — the
+    // lifted binding must carry it so cluster discovery keys the channel by the
+    // domain name consumer types reference, not by the term name. (`Hole` on an
+    // untyped tree, harmlessly.)
+    let (inner_name, inner_handle_ty, inner_body_x) =
+        (inner_binding.name, inner_be.ty, *inner_body);
 
     // `body_x[x → y]` — also renames Feed/Define targets named `x` to `y`.
     let inner_subst = desugar_rename(inner_body_x, &inner_name, binding_name);
@@ -370,7 +405,11 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
     defer_node.ty = inner_handle_ty;
     let mut lifted = Expr::let_bind(binding_name, defer_node, spliced);
     lifted.ty = out_ty;
-    Some((lifted, inner_name))
+    DeferLift {
+        expr: lifted,
+        inner_name,
+        inner_chan_dom,
+    }
 }
 
 /// Return `true` if `expr` ends in `Var(name)` after walking through
@@ -577,30 +616,6 @@ fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
     }
 }
 
-/// Locate the `let <term> = Defer` binding inside `expr` and read its handle's
-/// channel-domain name ([`handle_chan_dom`], off the binding slot or the
-/// `Defer` node itself). Used by the defer-returning lift to key its alias
-/// entry by the name consumer types carry.
-fn find_defer_chan_dom(expr: &Expr, term: &Name) -> Option<(Name, crate::ccl::ChanLevel)> {
-    if let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        ..
-    } = &expr.node
-        && binding.name == *term
-        && matches!(bound_expr.node, TypedExprNode::Defer)
-    {
-        return handle_chan_dom(&binding.ty).or_else(|| handle_chan_dom(&bound_expr.ty));
-    }
-    let mut found = None;
-    expr.walk_children(|c| {
-        if found.is_none() {
-            found = find_defer_chan_dom(c, term);
-        }
-    });
-    found
-}
-
 /// the channel domain carried by an assembled channel's
 /// type — the domain of its constructed `Fun`, or, for an alias channel that
 /// is itself a defer read (`x <<= y` leaves `Var(y) : feed(…)`), the read's
@@ -744,7 +759,10 @@ fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
         erase_chan_domains(bound_expr, map);
         erase_chan_domains(body, map);
         // §6.2 Let-closing on the substitution content (see fn docs).
-        let discharge = crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone());
+        // A discharge template is not a tree node: it is cloned again at every
+        // read, and that read is where the sibling is minted.
+        let discharge =
+            crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone_preserving_ids());
         for dom in map.values_mut() {
             *dom = discharge.apply_type(dom);
         }
@@ -1215,7 +1233,11 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // functions: `let y = f(arg)` where f's body is `let x =
             // Defer in x` inlines to `let y = (let x = Defer in x) in
             // body_y`, and the lift collapses the two scopes.
-            if let Some((lifted, inner_name)) = try_lift_defer(&binding.name, &bound_expr, &body) {
+            if is_lift_shape(&bound_expr) {
+                // Read before the lift consumes the binding.
+                let (outer, lvl) = handle_chan_dom(&binding.ty)
+                    .unwrap_or_else(|| (binding.name.clone(), crate::ccl::ChanLevel(0)));
+                let lift = lift_defer(&binding.name, *bound_expr, &body);
                 // The lift renames the inner defer binder to the outer name,
                 // but *consumer types outside the lifted subtree* may carry
                 // the inner handle's rigid `ChanDom`. Record the alias so the
@@ -1226,22 +1248,21 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 // is per-instantiation, freshened at `specialize_use`), and
                 // post-freshening the two scopes usually already share one
                 // name, in which case no entry is needed. Term names are the
-                // fallback for handles the walk cannot locate.
-                let inner_key = find_defer_chan_dom(&bound_expr, &inner_name)
+                // fallback for handles whose type records no domain.
+                let inner_key = lift
+                    .inner_chan_dom
                     .map(|(n, _)| n)
-                    .unwrap_or_else(|| inner_name.clone());
-                let (outer, lvl) = handle_chan_dom(&binding.ty)
-                    .unwrap_or_else(|| (binding.name.clone(), crate::ccl::ChanLevel(0)));
+                    .unwrap_or(lift.inner_name);
                 if inner_key != outer {
                     ctx.resolved_domains
                         .push((inner_key, Type::ChanDom(outer, lvl)));
                 }
-                return desugar(lifted, ctx);
+                return desugar(lift.expr, ctx);
             }
             // Let-of-defer-returning-let collapse: `let y = (let z =
             // E in Var(z)) in body_y` is equivalent to `let z = E in
             // body_y[y → z]`.  Surfaces a deeper `Defer` (inside E)
-            // so the outer try_lift_defer can fire on a subsequent
+            // so the outer defer lift can fire on a subsequent
             // pass.  Triggered by nested UDF inlines whose ANF
             // introduced an intermediate alias.
             if let TypedExprNode::Let {
@@ -1289,7 +1310,7 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // alias handle must never reach here; a survivor would silently
             // mis-route `Feed(y, …)` to the wrong handle. Assert that loudly in
             // debug rather than re-implementing the collapse. (The defer-*returning*
-            // lifts above — `try_lift_defer` / the collapse — survive `inline`
+            // lifts above — `lift_defer` / the collapse — survive `inline`
             // because their bound-expr is a `let`, not a bare `Var`.)
             #[cfg(debug_assertions)]
             {
@@ -2120,7 +2141,9 @@ fn extract_for_defer_impl(
                     let mut fvs = HashSet::new();
                     collect_free_vars(feed, &mut fvs);
                     if fvs.contains(&binding.name) {
-                        let placeholder = Expr::new(TypedExprNode::Lit(Lit::Unit));
+                        // A `mem::take` slot, overwritten below: minting for it
+                        // would log a birth for a node no tree ever holds.
+                        let placeholder = Expr::throwaway(TypedExprNode::Lit(Lit::Unit));
                         let original = std::mem::replace(feed, placeholder);
                         // stamp the wrap at construction —
                         // the let's type is its body's, closed over the binder
@@ -2725,7 +2748,7 @@ mod tests {
 
     /// The lifted-prefix spine is typed, not `Hole`.
     ///
-    /// `try_lift_defer` rebuilds the prefix onto the lifted body with
+    /// [`lift_defer`] rebuilds the prefix onto the lifted body with
     /// `Expr::expr_stmt`, which carries the body's type — an `ExprStmt`'s type
     /// *is* its body's. That constructor used to leave `Type::Hole` here, and
     /// `Hole` is [`has_type_residue`], so an escaping one is exactly what
@@ -2749,9 +2772,9 @@ mod tests {
         let bound_expr = Expr::expr_stmt(Expr::feed("x", lit(1)), inner);
         let body = var("y").with_ty(int.clone());
 
-        let (lifted, inner_name) =
-            try_lift_defer(&Name::raw("y"), &bound_expr, &body).expect("the lift shape matches");
-        assert_eq!(inner_name, Name::raw("x"));
+        assert!(is_lift_shape(&bound_expr), "the fixture has the lift shape");
+        let lift = lift_defer(&Name::raw("y"), bound_expr, &body);
+        assert_eq!(lift.inner_name, Name::raw("x"));
 
         // Every `ExprStmt` on the spine carries a type. Checking for the absence
         // of `Hole` rather than for equality with `int` keeps this honest if the
@@ -2766,7 +2789,7 @@ mod tests {
             }
             e.walk_children(assert_spine_typed);
         }
-        assert_spine_typed(&lifted);
+        assert_spine_typed(&lift.expr);
     }
 
     #[test]

@@ -1287,13 +1287,22 @@ impl<C: PartialEq + Clone> PredMemo<C> {
                 }
                 None => {
                     let keepalive = Rc::clone(&refinement.predicate);
-                    let copy = (*refinement.predicate).clone();
+                    // Copy-on-write, not duplication: the rebuilt term is
+                    // installed *in place of* the original, so it is the same
+                    // logical node at a new allocation and keeps its ids.
+                    let copy = refinement.predicate.clone_preserving_ids();
                     let rev = store.revision;
                     (copy, keepalive, rev)
                 }
             }
         };
-        let reported = f(&mut pred);
+        // The rebuild runs id-preserving, covering the rewrite as well as the
+        // copy-on-write above (a substitution firing inside a predicate
+        // materializes its template here). Nothing records a predicate rewrite,
+        // so an id minted here is one no record explains; preserving is honest
+        // because the rebuilt term *replaces* the original everywhere this walk
+        // reaches.
+        let reported = crate::ccl::lineage::preserving_ids(|| f(&mut pred));
         let mut store = self.0.borrow_mut();
         let changed = reported || store.revision != before;
         let installed = if changed {
@@ -1329,8 +1338,10 @@ impl TermMemo {
     /// caller) still leaves the occurrence rebuilt and recorded.
     pub fn rebuild_always(&self, refinement: &mut Refinement, f: impl FnOnce(&mut Expr)) {
         let keepalive = Rc::clone(&refinement.predicate);
-        let mut pred = (*refinement.predicate).clone();
-        f(&mut pred);
+        // Copy-on-write; see `rebuild`.
+        let mut pred = refinement.predicate.clone_preserving_ids();
+        // Id-preserving; see `rebuild`.
+        crate::ccl::lineage::preserving_ids(|| f(&mut pred));
         let mut store = self.0.0.borrow_mut();
         let shared = store
             .entries
