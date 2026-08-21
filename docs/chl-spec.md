@@ -903,8 +903,7 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 > `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
 > *Partiality*, §3). **Not yet implemented** — `c[k]` lowers as the lookup `c(k)`
 > today, but nothing discharges the index's membership, so a collection subscript is a
-> type error whatever the index. The discharge mechanic is
-> [collections.md, "Lookup: membership discharge"](../src/ccl/design/collections.md#lookup-membership-discharge).
+> type error whatever the index.
 
 ### 3.10 Lambda
 

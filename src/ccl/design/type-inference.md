@@ -1288,8 +1288,8 @@ itself, and `{[0, 𝑘) | 𝑝}` is a `Refinement` rather than a `UIntRange`, so
 rejected. The guard is reached through the ordinary rule rather than restated.
 
 Keyed entry was already explicit for an independent reason (a collection cannot
-acquire a domain refinement by subsumption — `src/ccl/design/collections.md`, "Keyed
-entry needs the key domain written down at lowering"), so it too needs nothing new.
+acquire a domain refinement by subsumption — `src/ccl/design/collections.md`,
+"Subtyping"), so it too needs nothing new.
 
 **`Collection(𝑇)` is therefore not a structural top.** `𝐷 ⤇ 𝑉 <: Collection(𝑉)` was
 the edge that made it one, and it goes with the rest of that story — necessarily,
@@ -2336,7 +2336,7 @@ numbering, so `{[0, 2] | 𝑝} ⤇ Int` coarsened to `[0, 2] ⤇ Int` licenses p
 `1 ∈ [0, 2]` and typing `xs[1] : Int` while the `Filter` may have removed index 1.
 That makes the rule and the lookup design one choice, not two: a domain's *predicate*
 must never be a proof source, membership riding the key against the domain's identity
-(`design/collections.md`, "Lookup: membership discharge").
+(`design/collections.md`, "Subtyping").
 
 ### Deliberately incomplete here
 
