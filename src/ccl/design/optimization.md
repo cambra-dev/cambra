@@ -6,16 +6,20 @@ The passes that turn a fully type-inferred CCL tree into tile-dataflow operators
 
 ## Inlining Pass (`ccl/inline.rs`)
 
-`inline_non_iterable_lambdas` runs **after `infer`** and **before `lambda_elim`**. It performs two structural rewrites on `Let` bindings, in order:
+`inline_compute_lambdas` runs **after `infer`** and **before `lambda_elim`**. It performs two structural rewrites on `Let` bindings, in order:
 
 1. **Alias inlining** — eliminate `let y = x` pure α-renamings.
-2. **UDF inlining** — substitute call sites for functions over non-iterable domains.
+2. **UDF inlining** — substitute call sites for **compute functions** (capabilities).
 
 ### Motivation
 
-**Scalar UDFs** (e.g. `Fun(Int, Int)`): operator conversion compiles `Let`-bound expressions independently with `input = None`. For a function whose domain is scalar, this causes the operator graph to insert an `IterateExtent` for the domain — which panics at runtime ("Attempted to iterate on infinite Extent") because base types have no finite enumerable extent.
+The inlining criterion is the function's **kind** (`FunKind`), a provenance property stamped at construction — not a guess from the domain's shape. A **compute** function (`⇒`) is a *capability* the operator graph has no first-class value to emit, so it must be beta-reduced away at its call sites. A **data** function (`⤇`) is a *collection* (list, comprehension, source, `groupby`, keyed collection) that op-conversion materializes directly and that benefits from sharing, so it is left intact. Three compute cases show why inlining is mandatory:
 
-**List-producing UDFs** (e.g. generator `def`s, `Fun(Fun(UIntRange, Int), Fun(UIntRange, Int))`): these lower to `λ user_arg → λ __iter_record → body`. If that nested-lambda shape reaches `lambda_elim` intact, the rule emits a `curry` combinator — and `operator_conversion.rs` doesn't implement `curry`, so compilation fails with `unsupported Builtin(curry)`.
+**Scalar UDFs** (e.g. `Int ⇒ Int`): operator conversion compiles `Let`-bound expressions independently with `input = None`. For a scalar-domain function this inserts an `IterateExtent` for the domain — which panics at runtime ("Attempted to iterate on infinite Extent") because base types have no finite enumerable extent.
+
+**List-producing UDFs** (e.g. generator `def`s): these lower to `λ user_arg → λ __iter_record → body`. If that nested-lambda shape reaches `lambda_elim` intact, the rule emits a `curry` combinator — and `operator_conversion.rs` doesn't implement `curry`, so compilation fails with `unsupported Builtin(curry)`.
+
+**Collection consumers** (e.g. `def f(c: Collection(int)): sum(c)`): the parameter's abstract collection type (`Σ`) has no concrete domain for op-conversion to iterate. Beta-reducing at a concrete call site monomorphizes `c` to the argument's concrete domain. (Reading the *kind* rather than the domain shape is what makes this case fall out for free — a collection consumer is `Compute`, so it inlines like any other capability.)
 
 Inlining at the CCL level threads the call-site argument as `input`, and beta-reducing the outer lambda strips the user-parameter layer, leaving a single `__iter_record`-wrapping lambda that matches the list-comprehension shape `lambda_elim` already handles.
 
@@ -53,9 +57,9 @@ After beta-reducing a UDF call, `inline_impl` is re-applied to the result so tha
 
 ### Limitations
 
-- **Explicitly curried UDFs used unapplied** (e.g. `let f = λ x → λ y → body in g(f)`): `f` is inlined because its domain is non-iterable, but with no call site to beta-reduce against the outer lambda survives, lambda-elim emits `curry`, and compilation fails with "unsupported Builtin(curry)". Fully-applied curried calls (`f(1)(2)`) are fine — beta-reduction collapses both layers. Wiring `curry` in `operator_conversion.rs` is the follow-up that closes this gap entirely.
-- **Collection UDFs** (domain `UIntRange` or `DataSource`): not inlined; they compile correctly via `Memo + FanOut` and benefit from sharing.
-- **Body duplication**: a UDF called N times has its body duplicated N times in the operator graph. Acceptable for now; only collection-typed UDFs warrant caching.
+- **Explicitly curried UDFs used unapplied** (e.g. `let f = λ x → λ y → body in g(f)`): `f` is a compute capability so it is inlined, but with no call site to beta-reduce against the outer lambda survives, lambda-elim emits `curry`, and compilation fails with "unsupported Builtin(curry)". Fully-applied curried calls (`f(1)(2)`) are fine — beta-reduction collapses both layers. Wiring `curry` in `operator_conversion.rs` is the follow-up that closes this gap entirely.
+- **Data-function bindings** (collections — lists, comprehensions, sources, `groupby`): not inlined; they compile as standalone collections via `Memo + FanOut` and benefit from sharing.
+- **Body duplication**: a compute UDF called N times has its body duplicated N times in the operator graph. Acceptable for now; only data-function bindings warrant caching.
 - **Recursive UDFs**: unsupported (already noted in `operator_conversion.rs`).
 
 ---
@@ -135,6 +139,10 @@ When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the bo
 `planning::run` runs after `lambda_elim` and produces the CCL that operator conversion will see.  The pass does general iteration-site planning — hash-join planning is just one *specialised* strategy folded in at a site, not the whole job (hence `planning`, not `join_plan`).  It performs two CCL-to-CCL rewrites and a final cleanup:
 
 1. **Keyed-aggregate rewrite** (`recognize_groupby_sites` / `convert_groupby_pointful`) — recognises the **pointful** dependent-refinement source `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒ V)` that lambda elimination emits for `[sum(g) for g in groupby(xs, key_fn)]` and folds the partition dispatch through `converse`.
+
+   Nothing marks that source as a group-by; planning **discovers** it, and that is deliberate. A refinement that partitions its domain by a key should plan as a bucketize whoever wrote it — so as refinements come to be authored by users or generated by other passes, the recogniser is meant to cover more, not to be replaced by a lowering hand-off. The module is split along the axis that determines what can grow: `partition_key_of` asks *is this refinement a partition by a key* (a question about a refinement alone — the durable half, reused by any new source), and `match_pointful_site` asks *is this the term shape I can rebuild from* (coupling to what `lambda_elim` currently emits — deliberately narrow, and a new site pattern is a sibling rather than an edit).
+
+   Declining is always safe: the site falls back to the iterate-then-restricts chain below. The hazard is therefore silence rather than unsoundness, so a refinement that partitions at a site that did **not** match is logged as a *near miss* — making spelling drift visible, and making the list of patterns still to add observable rather than inferred.
 2. **Iteration-site materialization** (`insert_iterate_markers`) — a single walk that visits every position where op-conversion would compile with `input=None`.  At each site the pass picks the best implementation strategy:
    - **Hash join** (`try_hash_join_rewrite` → `convert_loop_join` → `plan_loop_join` → `join_plan_to_expr`) when the site's domain is a refined tuple whose predicate decomposes into equality join conditions.  The emitted chain is itself iteration-bearing at its leaves (each `JoinPlan::Loop` emits `Apply(true ▷ const, Iterate)`), so no further marker is added.
    - **Iterate-then-restricts chain** (`wrap_with_iterate`'s fallback) — build the iteration source by *applying* one `restrict(p)` per refinement layer (innermost first) to a chain-head `Apply(true ▷ const, Iterate)`, then compose the value-producing body onto it, when the hash-join recogniser doesn't match.  `restrict` is a function transformer `(𝐷 ⇒ 𝑇) ⇒ ({𝑑: 𝐷 \| 𝑝(𝑑)} ⇒ 𝑇)` — applied, not composed — so each layer narrows the domain while preserving the value `𝑇`, and the chain stays well-typed (its honest second-order type would make a morphism-`Compose` ill-typed; `typecheck` rejects that).

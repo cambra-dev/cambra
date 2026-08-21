@@ -256,9 +256,11 @@ impl CompactWitnessKind {
 /// [`KindMerge::Conflict`], with both domains still in hand for the diagnostic.
 type WitnessKindMerge = Result<CompactWitnessKind, (CompactWitnessKind, CompactWitnessKind)>;
 
-/// The **join** of two domains: what a value drawn from either ranges over. A data
-/// join is lossless, so this is a union — the candidate domains of the conditional
-/// collection coalesce materializes.
+/// The **join** of two domains: what a value drawn from either ranges over.
+///
+/// Within one *listed* set a data join is lossless, so it is a union — the candidate
+/// domains coalesce materializes as a conditional collection. Across kinds it is the
+/// wider of the two ([`order_by_kind`]).
 ///
 /// In practice this is **only** the union: every join measured across the suite is
 /// `Enumerated`/`Enumerated`. A described kind
@@ -858,10 +860,10 @@ fn witness_type_kind(d: &CompactWitnessKind) -> Option<crate::ccl::ty::TypeKind>
 ///
 /// This runs the **same** [`TypeKind::contains`](crate::ccl::ty::TypeKind::contains) as
 /// the Σ-width subtyping rule, so the compact lattice and the subtyping rules cannot
-/// drift: `Array <: List` orders the same way here as there. Deriving the order from
-/// containment rather than computing a fresh kind is also what keeps a domain's
-/// *compacted contents*: the answer is one of the two inputs, not a rebuilt kind that
-/// would drop them.
+/// drift: `Array <: List` and `List <: Collection` order the same way here as there.
+/// Deriving the order from containment rather than computing a fresh kind is also what
+/// keeps a domain's *compacted contents*: the answer is one of the two inputs, not a
+/// rebuilt kind that would drop them.
 ///
 /// It is also where a `List(𝑇)` parameter annotation and a consumer's `𝐷 ⤇ 𝑉` demand
 /// are reconciled. They are two *upper* bounds on one variable, which the constraint
@@ -869,6 +871,12 @@ fn witness_type_kind(d: &CompactWitnessKind) -> Option<crate::ccl::ty::TypeKind>
 /// between them — and, measured across the suite, the only caller that reaches
 /// this at all. A join is always a union of listings ([`join_witness_kinds`]), so the order it
 /// reads is a meet's order.
+///
+/// A merge has no constraint graph to emit obligations into, so it orders by
+/// [`TypeKind::contains_ground`](crate::ccl::ty::TypeKind::contains_ground) — the same
+/// containment under the only discharge available here, where a parameter pair must
+/// already hold as written and a pending kinding constraint cannot hold at all. Anything
+/// else is `Unrelated` rather than accepted on a relation nothing here can discharge.
 fn order_witness_kinds(a: CompactWitnessKind, b: CompactWitnessKind) -> KindOrder {
     let holds = crate::ccl::ty::TypeKind::contains_ground;
     match (witness_type_kind(&a), witness_type_kind(&b)) {
@@ -926,9 +934,12 @@ fn resolve_named(a: &CompactWitnessKind, b: &CompactWitnessKind) -> Option<Compa
     }
 }
 
-/// The contravariant **meet** of two domains — the strongest contract that
-/// satisfies both. `dpol` is the *domain's* own polarity (the flip of the enclosing
-/// function's), under which the two candidates' contents merge.
+/// The contravariant **meet** of two witness kinds — the strongest contract that satisfies
+/// both. `dpol` is the *domain's* own polarity (the flip of the enclosing function's),
+/// under which two single candidates' contents merge.
+///
+/// Within one *listed* set the meet operates on the candidates; across kinds it is the
+/// narrower of the two ([`order_witness_kinds`]).
 fn meet_witness_kinds(
     dpol: bool,
     a: CompactWitnessKind,
@@ -939,9 +950,9 @@ fn meet_witness_kinds(
         return Ok(d);
     }
     match (a, b) {
-        // Two ordinary domains meet by merging their content. Two *listed sets*
-        // would meet by intersection, but no program produces that pairing, so it
-        // conflicts loudly rather than silently dropping candidates.
+        // Two ordinary domains meet by merging their content, so each side's
+        // information reaches the other — an ordering would keep one and drop the
+        // other's bounds.
         (Enumerated(xs), Enumerated(ys)) if xs.len() == 1 && ys.len() == 1 => {
             let x = xs.into_iter().next().expect("len == 1");
             let y = ys.into_iter().next().expect("len == 1");

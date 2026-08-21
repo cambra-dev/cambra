@@ -901,9 +901,10 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 > otherwise. A `Set` has no subscript — its keys are its content, so test it with
 > `k in s` (below). A `FullMap` (§6.3) discharges every key by construction, so
 > `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
-> *Partiality*, §3). **Not yet implemented** — `c[k]` lowers as the lookup `c(k)`
-> today, but nothing discharges the index's membership, so a collection subscript is a
-> type error whatever the index.
+> *Partiality*, §3). **Partly implemented** — `c[k]` lowers as the lookup `c(k)`, so a
+> `FullMap` subscript answers `V` today, its key set being the key type itself. For every
+> other collection nothing discharges the index's membership, so the subscript is a type
+> error whatever the index.
 
 ### 3.10 Lambda
 
@@ -1848,7 +1849,9 @@ marked one carries its status per "How to read this document".)
   unimplemented.
 - `FullMap(K, V)` — *total*-map type (**[Tentative]**, §6.3): every value
   of `K` is a key, so lookup yields `V` rather than `Option(V)` and has
-  no missing case. Not implemented.
+  no missing case. The annotation and its total lookup are implemented;
+  what obligation totality places on whatever builds the map is **[Open]**,
+  so the annotation is a promise the checker propagates rather than checks.
 - `Time` — a position in the commit order, what a transaction handle's
   `current_time()` answers (**[Tentative]**, §8.2). §8.2 calls the handle
   itself a `Txn` value, and the two spellings are not reconciled.

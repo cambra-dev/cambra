@@ -26,19 +26,18 @@
 //! references; those are folded by [`crate::ccl::simplify`]'s
 //! `try_literal_tuple_projection` rule, not here.
 //!
-//! # Why a single pre-lambda-elim pass works for both
+//! # Why a single pre-lambda-elim pass works
 //!
 //! Lambda-elim recurses into `Apply` nodes, so an `Apply(arg, Lambda)` produced
-//! by inlining a scalar UDF before lambda-elim is handled correctly — the
+//! by inlining a compute UDF before lambda-elim is handled correctly — the
 //! `Lambda` inside the `Apply` gets converted to a combinator by lambda-elim as
-//! usual.  Both scalar and list-producing UDFs benefit from the same
-//! per-call-site beta-reduction performed here, making a separate post-elim
-//! pass unnecessary.
+//! usual.  Per-call-site beta-reduction here makes a separate post-elim pass
+//! unnecessary.
 //!
 //! # Limitations
 //!
 //! - **Recursive UDFs** are not supported (already noted in operator conversion).
-//! - **Body duplication**: if a scalar UDF is called N times, its body appears N
+//! - **Body duplication**: if a compute UDF is called N times, its body appears N
 //!   times in the operator graph. Acceptable for now; caching is only needed for
 //!   collections, which are not inlined.
 //!

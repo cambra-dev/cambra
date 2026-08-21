@@ -771,7 +771,26 @@ impl Subst {
             // span/attribution (the use-site), unique per occurrence by
             // construction.
             let occurrence_ty = e.ty.clone();
+            // **The occurrence's annotation is about the position, not the term.** A
+            // node annotation says what flows through *here*, so substituting a term
+            // into the position leaves the claim standing — `groupby`'s key-function
+            // occurrence carries the shared hole that pins the key type, and a
+            // parameter substitution that dropped it would leave the key type
+            // unresolved at every call site.
+            let occurrence_annotation = e.user_annotation.take();
             *e = repl.as_expr_preserving(e.node_id, &occurrence_ty);
+            if let Some(annotation) = occurrence_annotation {
+                debug_assert!(
+                    e.user_annotation.is_none(),
+                    "substituting an annotated term into an annotated occurrence: two \
+                     claims about one position, and `user_annotation` holds one \
+                     ({annotation} over {})",
+                    e.user_annotation
+                        .as_ref()
+                        .expect("guarded by the assertion")
+                );
+                e.user_annotation = Some(annotation);
+            }
             return;
         }
         // *Every* type slot the node carries, not just `ty` and the annotation: a
@@ -1333,9 +1352,10 @@ fn collect_type_fv(
             collect_type_fv(value, bound, visited, out);
             collect_type_fv(domain, bound, visited, out);
         }
-        // A witness binder binds no *term* variable, so the body's free
-        // term vars are collected under the *enclosing* binders, with nothing
-        // subtracted for the Σ itself.
+        // A witness binder binds no *term* variable, so the body's free term vars are
+        // collected under the *enclosing* binders, with nothing subtracted for the Σ
+        // itself. (Its type children — a keyed kind's key type, say — are collected too:
+        // they can carry refinements.)
         Type::Sigma(s) => {
             for t in s.witness.types() {
                 collect_type_fv(t, bound, visited, out);

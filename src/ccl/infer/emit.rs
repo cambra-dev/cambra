@@ -398,8 +398,8 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             for t in s.witness.types_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
-            // A witness is a type, referenced anonymously in the body's domain
-            // position, so it introduces no term binder to scope the body under.
+            // A witness introduces no *term* binder — it is a type, referenced by the
+            // nullary `Type::WitnessRef` leaf — so the body is processed directly.
             emit_annotation_predicates(&mut s.body, ctx)
         }
         Type::Base(_)
@@ -638,7 +638,14 @@ pub(super) fn emit_lambda<C: Typing>(
     // the type lattice (introduced by `cast`), not the lambda node, so the param
     // binds under its bare type here.
     let declared = param.user_annotation.clone().unwrap_or(param.ty.clone());
-    let param_simple = ctx.normalize(&declared);
+    let mut param_simple = ctx.normalize(&declared);
+    // Type any refinement predicate carried on the param type, in the *enclosing*
+    // scope (before the param binds), because its terms may reference outer
+    // bindings — `groupby`'s key binder `{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}` closes over the
+    // collection. Emit-only (Check trusts resolved predicates and would mistype
+    // planning's function predicates): routed through the mode. A no-op for the
+    // ordinary unrefined/fresh-var param.
+    ctx.type_annotation_predicates(&mut param_simple)?;
     param.ty = param_simple.clone();
     // The param is bound in scope under the *unrefined* `param_simple`, so
     // `Var(param)` body references stay bare; restriction refinements decorate only

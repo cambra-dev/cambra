@@ -221,7 +221,7 @@ pub(crate) fn is_builtin(expr: &Expr, b: Builtin) -> bool {
 
 /// Whether `e` is a chain-head **iteration-source marker** `iterate(pred)` —
 /// `Apply(pred, Builtin::Iterate)`. Planning inserts these into the *term tree*
-/// ([`crate::ccl::planning::insert_iterate_markers`]) to mark an extent as an
+/// ([`crate::ccl::planning::insert_iterate_markers`]) to mark a domain as an
 /// iteration site; `iterate ≫ src` denotes exactly `src` (the marker is
 /// denotation-neutral).
 pub(crate) fn is_iterate_marker(e: &Expr) -> bool {
@@ -233,13 +233,14 @@ pub(crate) fn is_iterate_marker(e: &Expr) -> bool {
 ///
 /// Used when a term value is substituted **into a type** (a refinement
 /// predicate — e.g. the §6.2 move-site discharge of a `let`-bound collection
-/// into a refined domain like a join predicate `{d | __elem ▷ (.0 ≫ a) …}`). A
-/// refinement predicate is a *denotational* term; the `iterate` marker is a
-/// term-tree planning artifact with no meaning there, and leaving it in makes
-/// the predicate churn under `simplify` (nested-`Compose` vs `flatten_compose`)
-/// and diverge from inference's (pre-marker) copy at the post-planning
-/// typecheck. Since `iterate` is denotation-neutral, dropping it recovers the
-/// collection's value unchanged.
+/// into a refined domain like a join predicate `{d | __elem ▷ (.0 ≫ a) …}`, or
+/// into a keyed collection's `{k | k ∈ c ≫ key}`). A refinement predicate is a
+/// *denotational* term; the `iterate` marker is a term-tree planning artifact
+/// with no meaning there, and leaving it in makes the predicate churn under
+/// `simplify` (nested-`Compose` vs `flatten_compose`) and diverge from
+/// inference's (pre-marker) copy at the post-planning typecheck. Since
+/// `iterate` is denotation-neutral, dropping it recovers the collection's value
+/// unchanged.
 ///
 /// A `restrict`/`filter_values` marker is deliberately **not** stripped — it is
 /// a real filter and part of the denotation; a filtered source reaching a
@@ -265,7 +266,16 @@ pub(crate) fn strip_iterate_markers(e: &Expr) -> Expr {
         return match flat.len() {
             0 => out,
             1 => flat.into_iter().next().expect("len == 1"),
-            _ => Expr::compose(flat).with_ty(ty),
+            // The rebuilt chain is the same node making the same claim, so it keeps
+            // the annotation as well as the type. A `Compose`'s kind is decided where
+            // it is built and carried on the annotation when the type is still a
+            // `Hole` — the shape a lowered chain in a refinement predicate has — so
+            // dropping it here would silently re-read a collection as a capability.
+            _ => {
+                let mut rebuilt = Expr::compose(flat).with_ty(ty);
+                rebuilt.user_annotation = out.user_annotation.clone();
+                rebuilt
+            }
         };
     }
     out
@@ -340,6 +350,49 @@ pub(crate) fn debug_assert_no_iteration_markers(expr: &Expr) {
         debug_assert_no_iteration_markers_in_type(target);
     }
     expr.walk_children(debug_assert_no_iteration_markers);
+}
+
+/// Whether `bare_predicate` tests the element for membership in a collection's
+/// outputs — `__elem ▷ (𝑚 ▷ collection_contains)`, the refinement a keyed
+/// collection's domain carries.
+///
+/// A key domain names *which keys are present*, which `Converse` establishes by
+/// materializing the partition: every key it emits occurs. So the refinement is
+/// discharged by construction and has no filter to run, which is why
+/// [`debug_assert_no_unexecutable_atoms`] can insist the predicate never reaches a
+/// term. Planning asks this before reifying a domain refinement into a `Restrict`.
+pub(crate) fn is_key_domain_predicate(bare_predicate: &Expr) -> bool {
+    let TypedExprNode::Apply { function, .. } = &bare_predicate.node else {
+        return false;
+    };
+    matches!(
+        &function.node,
+        TypedExprNode::Apply { function: characteristic, .. }
+            if matches!(characteristic.node, TypedExprNode::Builtin(Builtin::CollectionContains))
+    )
+}
+
+/// Debug-only invariant: the **term spine** reaching op-conversion contains no
+/// atom that op-conversion has no lowering for. Today that is
+/// [`Builtin::CollectionContains`]: the membership predicate exists only inside a
+/// keyed collection's *domain refinement*, which `Converse` discharges structurally,
+/// so it must never appear as a term the operator graph is asked to compile. Planning
+/// does compile surviving predicates to point-free form, so it genuinely *can* end up
+/// in a type; what must not happen is a code path lowering one to a `Restrict`. This
+/// walk is what makes that a checked invariant instead of a coincidence — if a
+/// future membership *filter* (`x in s`) needs to run, it arrives here first.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_no_unexecutable_atoms(expr: &Expr) {
+    debug_assert!(
+        !matches!(
+            expr.node,
+            TypedExprNode::Builtin(Builtin::CollectionContains)
+        ),
+        "`collection_contains` reached op-conversion as a term: a key-domain \
+         membership test is a carried refinement discharged by `Converse`, not an \
+         executable operator"
+    );
+    expr.walk_children(debug_assert_no_unexecutable_atoms);
 }
 
 /// Builds an application of a primitive combinator, setting the types based on
@@ -682,26 +735,14 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// Op-conversion treats `cast` as a no-op — see [`TypedExprNode::Cast`] — so
 /// this is purely a type-level coercion with no runtime cost.
 ///
-/// **Temporary shape contract:** `target_ty` must be
-/// `Fun(Refinement(_, _), _)` — a refinement on a function domain.  Inference
-/// no longer *requires* this (any `target` with `value_ty <: target` is a
-/// well-typed upcast), but it is the only shape lowering produces today and
-/// the one [`crate::ccl::lambda_elim`]'s groupby reconstruction reads a refinement
-/// off of, so this asserts the lowering contract: a non-conforming target is
-/// a construction-time bug, not a user error, so it panics rather than
-/// emitting a cast `lambda_elim` would mishandle.  See [`TypedExprNode::Cast`]
-/// for the migration plan toward a general `𝑈 ⇒ 𝑇` cast.
-/// TODO remove this constraint once we get rid of the special-casing correlated
-/// refinement code in lambda_elim.
+/// Any `target_ty` is accepted. One arm downstream *does* need a refined function
+/// domain — [`crate::ccl::lambda_elim`]'s cast-wrapped-**lambda** case, which reads
+/// the correlated binder off the domain refinement — and it asserts that itself, at
+/// the point where the shape is actually required. Asserting it here as well would
+/// be both a duplicate and a bound on what lowering may express: as refinements come
+/// to be produced by more than the group-by/for-filter lowerings, a cast whose target
+/// is not a refined function domain becomes ordinary. See [`TypedExprNode::Cast`].
 pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
-    // Through [`Type::domain`], not by matching `Type::Fun` here: a collection indexed by a
-    // witness spells the arrow inside a `Σ` binder, and `Type::fun_like` — which is what
-    // builds these targets — re-closes that binder. Matching the outer constructor rejects
-    // the shape the paired constructor just produced.
-    assert!(
-        matches!(target_ty.domain(), Some(Type::Refinement(..))),
-        "make_cast target_ty must denote an arrow with a refined domain, got {target_ty}"
-    );
     Expr::cast(value, target_ty)
 }
 
@@ -715,10 +756,10 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
 /// refinement.) The returned `Refinement` shares the predicate's `Rc<Expr>` with
 /// `target`.
 pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
-    // [`Type::domain`] for the same reason [`make_cast`] uses it: the target may be a
-    // witness-indexed collection, whose arrow sits under a `Σ` binder. This has to agree
-    // with `make_cast` on which targets carry a refinement, since one asserts what the
-    // other reads.
+    // Through [`Type::domain`], not by matching `Type::Fun`: a collection indexed by a
+    // witness spells its arrow inside a `Σ` binder, and [`Type::fun_like`] — which builds
+    // these targets — re-closes that binder, so reading the outer constructor finds no
+    // domain and reports a refined target as unrefined.
     let Type::Refinement(_, refinement) = target.domain()? else {
         return None;
     };

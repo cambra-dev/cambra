@@ -177,11 +177,12 @@ impl InferCtx {
 
     /// Normalize a user annotation / source type into a solver-ready
     /// `Type`: every `Hole` becomes a fresh inference variable at the
-    /// current level. Everything else — including existing `Infer` vars,
+    /// current level, and every [`Type::SharedHole`] the *one* variable its id
+    /// stands for. Everything else — including existing `Infer` vars,
     /// the structural variants the solver operates on, and `Refinement`
     /// wrappers (refinements ride the lattice as refinements) — is
     /// kept, recursing to normalize nested holes.
-    pub(super) fn normalize_annotation(&self, ty: &Type) -> Type {
+    pub(super) fn normalize_annotation(&mut self, ty: &Type) -> Type {
         match ty {
             // A `Hole` annotation means "infer this" → fresh variable.
             Type::Hole => fresh_var(self.level),
@@ -368,6 +369,10 @@ impl Typing for InferCtx {
             self.require_sub(operand, position, at)?;
         }
         Ok(wanted.map(|(_, ty)| ty))
+    }
+
+    fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError> {
+        crate::ccl::infer::emit::emit_annotation_predicates(ty, self)
     }
 
     fn require_sub(

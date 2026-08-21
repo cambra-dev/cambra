@@ -456,10 +456,17 @@ pub(super) fn wrap_with_iterate(
     let mut preds: Vec<Expr> = Vec::new();
     let mut current = &domain_ty;
     while let Type::Refinement(base, refinement) = current {
+        // A key-domain layer states which keys the collection holds, which `Converse`
+        // has already established by materializing the partition. It stays on the type
+        // and contributes no `Restrict`
+        // ([`is_key_domain_predicate`](crate::ccl::ccl_utils::is_key_domain_predicate)).
+        //
         // Lifting a predicate out of a *type* and into the term tree: a predicate
         // interior may already alias a live main-tree id, and one predicate `Rc`
         // reached from two iteration sites would land twice.
-        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate).clone());
+        if !ccl_utils::is_key_domain_predicate(&refinement.predicate) {
+            preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate).clone());
+        }
         current = base.as_ref();
     }
     preds.reverse();

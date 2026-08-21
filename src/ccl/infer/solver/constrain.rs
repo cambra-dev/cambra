@@ -815,12 +815,7 @@ fn constrain_sigma_width(
                 rhs: rhs.clone(),
             });
         };
-        for (v, k) in obligations.kinds {
-            v.bounds.borrow_mut().kinds.push(k);
-        }
-        if let Some((subs, sups)) = obligations.pairing {
-            discharge_pairing(&subs, &sups, sl, sr, lhs, rhs)?;
-        }
+        discharge_obligations(obligations, sl, sr, cache, lhs, rhs)?;
         for (_, elem) in fibers {
             constrain_go(&elem, cod_b, sl, sr, cache)?;
         }
@@ -834,22 +829,13 @@ fn constrain_sigma_width(
             rhs: rhs.clone(),
         });
     };
-    // A candidate with no shape yet gets a **kinding constraint** on its variable
-    // rather than an optimistic acceptance: recorded during emission without knowing
-    // what the variable will become, read when it resolves, which is what the solver
-    // already does for every other constraint on a variable.
-    for (v, k) in obligations.kinds {
-        v.bounds.borrow_mut().kinds.push(k);
-    }
+    discharge_obligations(obligations, sl, sr, cache, lhs, rhs)?;
     // The body of every sum is `𝑤 ⤇ 𝑉` ([`SigmaType::over`]), so instantiating a pairing
     // `(𝑑, 𝑒)` gives `𝑑 ⤇ 𝑉₀ <: 𝑒 ⤇ 𝑉₁`, and the `Fun`/`Fun` decomposition of *that* is
     // exactly the two halves below. They are emitted separately rather than by handing
     // instantiated bodies to `constrain_go`, because their dependencies differ: one is
     // per-pairing and one is not, and re-deriving the codomain edge inside a search
     // would emit it once per attempt — including failed attempts.
-    if let Some((subs, sups)) = obligations.pairing {
-        discharge_pairing(&subs, &sups, sl, sr, lhs, rhs)?;
-    }
     // The codomain edge, **once**: `𝑉` does not mention the witness (one codomain is
     // shared across a sum's candidates), so it is the same edge for every pairing. It
     // also *has* to be emitted here rather than deferred — post-coalesce records no
@@ -869,6 +855,44 @@ fn constrain_sigma_width(
         _ => sl.clone(),
     };
     constrain_go(cod_a, cod_b, &cod_sl, sr, cache)
+}
+
+/// Discharge everything a [`KindObligations`] carries.
+///
+/// **One reader.** Both Σ-width paths go through here — the same-form one, and the
+/// cross-form one that reads an unfactored sum through its fibers — because an
+/// obligation is a *set* of things containment could not answer, and a path that
+/// discharges some of them silently accepts the rest. Two copies drift by omission: the
+/// field a later kind adds gets wired into whichever copy the author was looking at, and
+/// the other one keeps accepting.
+fn discharge_obligations(
+    obligations: crate::ccl::ty::KindObligations,
+    sl: &Subst,
+    sr: &Subst,
+    cache: &mut ConstrainCache,
+    lhs: &Type,
+    rhs: &Type,
+) -> Result<(), ConstrainError> {
+    // A candidate with no shape yet gets a **kinding constraint** on its variable rather
+    // than an optimistic acceptance: recorded during emission without knowing what the
+    // variable will become, read when it resolves, which is what the solver already does
+    // for every other constraint on a variable.
+    for (v, k) in obligations.kinds {
+        v.bounds.borrow_mut().kinds.push(k);
+    }
+    // Kind **parameters** are invariant, so each pair goes through `constrain_go` in both
+    // directions — the sub side under `sl` and the sup side under `sr`, swapped for the
+    // reverse edge. Emitted alongside a pending kinding constraint, not instead of it: the
+    // relation requires the pair either way, and withholding it would drop the only edge
+    // that pins an open parameter.
+    for (sub, sup) in &obligations.params {
+        constrain_go(sub, sup, sl, sr, cache)?;
+        constrain_go(sup, sub, sr, sl, cache)?;
+    }
+    if let Some((subs, sups)) = &obligations.pairing {
+        discharge_pairing(subs, sups, sl, sr, lhs, rhs)?;
+    }
+    Ok(())
 }
 
 /// Discharge a [`KindObligations::pairing`] — the `∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁` of Σ-width — by
@@ -3305,6 +3329,42 @@ mod tests {
         }
     }
 
+    /// **Every kind goes through the same rules.** A witness kind decides only
+    /// containment ([`TypeKind::contains`]); consumption and width are written once, so
+    /// a kind that names no domains at all is still consumed and still widens with no
+    /// rule of its own. `Any` is the case that proves it: nothing constructs it from source yet,
+    /// and it needs no solver code.
+    ///
+    /// It also pins where ⊤ *stops*. A sum widens to it, because that is Σ-width with
+    /// `𝐾 ⊆ Any`. A bare `𝐷 ⤇ 𝑉` does **not**: that edge would build a sum by
+    /// subsumption, and a structural top is an upper bound of every pair of data
+    /// functions — precisely the implicit join `box` exists to surface.
+    #[test]
+    fn every_witness_kind_uses_the_same_sigma_rules() {
+        let int = prim(BaseType::Int);
+        let collection = TypeKind::Any.into_data_fun(None, int.clone());
+        let list = Type::list_of(int.clone());
+        let concrete = Type::data_fun(Type::UIntRange(3), int.clone());
+
+        // Width to ⊤: a *sum* reaches it, a bare data function does not.
+        assert!(constrain_subtype(&list, &collection, &mut ConstrainCache::new()).is_ok());
+        assert!(
+            constrain_subtype(&concrete, &collection, &mut ConstrainCache::new()).is_err(),
+            "a bare data function must not enter the top sum by subsumption"
+        );
+        // Width, and the codomain still flows.
+        assert!(constrain_subtype(&collection, &collection, &mut ConstrainCache::new()).is_ok());
+        let collection_bool = TypeKind::Any.into_data_fun(None, prim(BaseType::Bool));
+        assert!(
+            constrain_subtype(&collection, &collection_bool, &mut ConstrainCache::new()).is_err()
+        );
+        // The universe is not a *sub*-kind of a narrower description.
+        assert!(constrain_subtype(&collection, &list, &mut ConstrainCache::new()).is_err());
+        // Consumed: a consumer's fresh domain variable absorbs the named witness.
+        let consumer = fun(fresh_var(0), int);
+        assert!(constrain_subtype(&collection, &consumer, &mut ConstrainCache::new()).is_ok());
+    }
+
     /// `into_data_fun` is the single materialization, so what it builds is decided by
     /// one test: a **merged domain kind** listing exactly one domain determines that
     /// domain and needs no witness; every other kind carries one. Says nothing about a
@@ -3346,6 +3406,216 @@ mod tests {
             constrain_subtype(&boxed, &list, &mut ConstrainCache::new()).is_ok(),
             "box(xs) must reach List(V) by width"
         );
+    }
+
+    /// The key type is related through the **cross-form** width edge too. A `box`ed keyed
+    /// collection is an *unfactored* sum, so it reaches `Map(𝐾, 𝑉)` by the fibered
+    /// reading rather than by the same-form one — a different path to the same
+    /// obligation, and one that must not answer fewer of them.
+    #[test]
+    fn a_boxed_keyed_collection_still_checks_its_key_type() {
+        let int_ = prim(BaseType::Int);
+        let concrete = keyed_concrete("m", int_.clone(), int_.clone());
+        let boxed = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            concrete,
+        ]))));
+        assert!(
+            constrain_subtype(
+                &boxed,
+                &Type::map_of(int_.clone(), int_.clone()),
+                &mut ConstrainCache::new()
+            )
+            .is_ok(),
+            "the matching key type still relates through a box"
+        );
+        assert!(
+            constrain_subtype(
+                &boxed,
+                &Type::map_of(prim(BaseType::String), int_),
+                &mut ConstrainCache::new()
+            )
+            .is_err(),
+            "an Int-keyed collection must not satisfy Map(String, _) through a box"
+        );
+    }
+
+    /// A keyed kind's key type is a **parameter**, not a candidate: comparing two
+    /// keyed kinds *relates* the two key types invariantly rather than testing them
+    /// for equality. So a wrong key type is rejected in both directions, and an
+    /// **open** one is pinned by the kind it is compared against — the thing a
+    /// predicate-only containment cannot do.
+    #[test]
+    fn keyed_kind_relates_its_key_type_invariantly() {
+        let str_ = prim(BaseType::String);
+        let int_map = Type::map_of(prim(BaseType::Int), str_.clone());
+        let string_map = Type::map_of(prim(BaseType::String), str_.clone());
+
+        for (sub, sup) in [(&int_map, &string_map), (&string_map, &int_map)] {
+            assert!(
+                constrain_subtype(sub, sup, &mut ConstrainCache::new()).is_err(),
+                "Map(Int, _) and Map(String, _) must not relate in either direction"
+            );
+        }
+
+        // An open key type is *pinned*, not merely matched: the edge succeeds and
+        // leaves the variable bounded by the demanded key type.
+        let open = Type::infer();
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&Type::map_of(open.clone(), str_), &int_map, &mut cache)
+            .expect("an open key type is pinned by the kind it is compared against");
+        let Type::Infer(v) = &open else {
+            unreachable!("Type::infer() is a variable")
+        };
+        let bounds = v.bounds.borrow();
+        let is_int = |b: &Bound| b.ty == prim(BaseType::Int);
+        assert!(
+            bounds.upper().iter().any(is_int) && bounds.lower().iter().any(is_int),
+            "invariance should bound the key variable above *and* below by Int, got \
+             lower={:?} upper={:?}",
+            bounds.lower(),
+            bounds.upper()
+        );
+    }
+
+    // --- Keyed Sigma rules (Map/Set): entering one, consuming one, width ---
+
+    /// A concrete keyed collection `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ value`
+    /// — the shape a `Map`/`Set` value realizes (`groupby`, an explicit map literal).
+    /// `morphism` stands for the key morphism `c ≫ key`, whose outputs are the keys;
+    /// two collections have the same key domain exactly when they name the same one.
+    fn keyed_concrete(morphism: &str, key: Type, value: Type) -> Type {
+        let characteristic = TypedExpr::apply(
+            TypedExpr::var(morphism),
+            TypedExpr::builtin(crate::ccl::Builtin::CollectionContains),
+        );
+        let pred = TypedExpr::apply(TypedExpr::var(Name::elem()), characteristic);
+        Type::data_fun(
+            Type::Refinement(
+                Box::new(key),
+                Refinement {
+                    predicate: Rc::new(pred),
+                },
+            ),
+            value,
+        )
+    }
+
+    #[test]
+    fn keyed_collection_entry_consumption_and_width() {
+        let concrete = keyed_concrete("m", prim(BaseType::Int), prim(BaseType::Int));
+        let map = Type::map_of(prim(BaseType::Int), prim(BaseType::Int));
+        // Entering a sum is a term, so the *bare* concrete collection does not reach the
+        // annotation — the same rule that keeps a bare list literal out of `List(Int)`.
+        assert!(
+            constrain_subtype(&concrete, &map, &mut ConstrainCache::new()).is_err(),
+            "a bare keyed collection must not enter Map(Int, Int) by subsumption"
+        );
+        // `box`ed, it does, and by ordinary Σ-width: the one-candidate kind is contained
+        // in `Keyed(Int)` because the concrete key domain is one of those it ranges over,
+        // and the key types relate as its parameter.
+        let boxed = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            concrete.clone(),
+        ]))));
+        assert!(constrain_subtype(&boxed, &map, &mut ConstrainCache::new()).is_ok());
+        // Elimination: consumed by a fresh-domain consumer (`sum` / comprehension).
+        let consumer = fun(fresh_var(0), prim(BaseType::Int));
+        assert!(constrain_subtype(&map, &consumer, &mut ConstrainCache::new()).is_ok());
+        // Width: `Map(Int, Int) <: Map(Int, Int)`; the codomain still flows, so
+        // `Map(Int, Int) ⊀ Map(Int, Bool)`.
+        assert!(constrain_subtype(&map, &map, &mut ConstrainCache::new()).is_ok());
+        let map_bool = Type::map_of(prim(BaseType::Int), prim(BaseType::Bool));
+        assert!(constrain_subtype(&map, &map_bool, &mut ConstrainCache::new()).is_err());
+    }
+
+    /// The keyed discharge is tied to the membership *predicate*, not merely to a
+    /// `Collection` witness: a length-refined (list-shaped) concrete domain must
+    /// not inject into a `Map`, and a keyed concrete must not inject into a `List`.
+    #[test]
+    fn entering_a_keyed_sum_requires_the_membership_refinement() {
+        let map = Type::map_of(prim(BaseType::Int), prim(BaseType::Int));
+        // A concrete list `[0, 3) ⤇ Int` carries no key token, so it must not inject
+        // into a `Map`.
+        let list_concrete = Type::data_fun(Type::UIntRange(3), prim(BaseType::Int));
+        assert!(
+            constrain_subtype(&list_concrete, &map, &mut ConstrainCache::new()).is_err(),
+            "a UIntRange domain must not realize a Map"
+        );
+        // Nor does a domain that merely *happens* to be refined: a filtered range is a
+        // `Refinement`, but its predicate is not a key token.
+        let filtered = Type::data_fun(
+            Type::Refinement(
+                Box::new(Type::UIntRange(3)),
+                Refinement {
+                    predicate: Rc::new(TypedExpr::binop(
+                        TypedExpr::var(Name::elem()),
+                        BinOpKind::Compare(CompareKind::Less),
+                        TypedExpr::lit(Lit::Int(2)),
+                    )),
+                },
+            ),
+            prim(BaseType::Int),
+        );
+        assert!(
+            constrain_subtype(&filtered, &map, &mut ConstrainCache::new()).is_err(),
+            "an ordinary refined domain is not a key domain"
+        );
+        // A keyed concrete must not inject into a `List`: the `UIntRanges` kind is
+        // membership in "is a dense prefix range", which a refinement is not.
+        let keyed = keyed_concrete("m", prim(BaseType::Int), prim(BaseType::Int));
+        let list = Type::list_of(prim(BaseType::Int));
+        assert!(
+            constrain_subtype(&keyed, &list, &mut ConstrainCache::new()).is_err(),
+            "a key domain must not realize a List"
+        );
+    }
+
+    /// **Key-domain identity is the key morphism.** Two keyed collections re-keying
+    /// *different* sources have different key domains, so one's key-membership proof
+    /// cannot discharge against the other's — the property that makes a later
+    /// membership-discharged lookup sound, and one that cannot be retrofitted onto
+    /// values already conflated.
+    ///
+    /// Identity is structural on the morphism rather than on a creation site, which is
+    /// what gives membership an introduction form at all: a key produced by `𝑚` is a
+    /// key of the collection `𝑚` keys. The consequence pinned by
+    /// [`one_morphism_is_one_key_domain`] is that two re-keyings of one source by one
+    /// key function share a domain.
+    #[test]
+    fn key_domains_follow_the_key_morphism() {
+        let (int_, mut cache) = (prim(BaseType::Int), ConstrainCache::new());
+        let one = keyed_concrete("orders_by_customer", int_.clone(), int_.clone());
+        let other = keyed_concrete("shipments_by_customer", int_.clone(), int_.clone());
+
+        // Both reach the *abstract* map once boxed — the kind ranges over every key
+        // domain, so either one-candidate sum is contained in it.
+        let map = Type::map_of(int_.clone(), int_);
+        for c in [&one, &other] {
+            let boxed = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+                c.clone(),
+            ]))));
+            constrain_subtype(&boxed, &map, &mut cache).expect("a key domain realizes Map(K, V)");
+        }
+        // But they are not each other: same key type, same codomain, different
+        // morphism.
+        assert_ne!(one, other, "two key morphisms must not share a key domain");
+        assert!(
+            constrain_subtype(&one, &other, &mut ConstrainCache::new()).is_err(),
+            "one collection's key domain must not satisfy another's"
+        );
+    }
+
+    /// The converse of [`key_domains_follow_the_key_morphism`], and the behavior an
+    /// opaque per-site token could not have: re-keying one source by one key function
+    /// twice yields *one* key domain. Two such collections have the same keys, so a
+    /// membership proof drawn from either discharges against the other.
+    #[test]
+    fn one_morphism_is_one_key_domain() {
+        let int_ = prim(BaseType::Int);
+        let one = keyed_concrete("orders_by_customer", int_.clone(), int_.clone());
+        let same = keyed_concrete("orders_by_customer", int_.clone(), int_);
+        assert_eq!(one, same, "one key morphism is one key domain");
+        constrain_subtype(&one, &same, &mut ConstrainCache::new())
+            .expect("a key domain satisfies itself");
     }
 
     // ----- FunKind edge (the `Compute <: Data` rejection) -----------

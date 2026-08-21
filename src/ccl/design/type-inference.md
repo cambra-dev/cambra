@@ -941,7 +941,7 @@ The expected binder is **always globally fresh** (proposal §5.2 verbatim; the �
 * **O2 (polymorphic case)** — `freshen_above` copy-and-freshens a refined value's predicate type slots through the shared cache (its `Refinement` arm), so a specialization's predicate is a proper freshen instance rather than a shared `Rc`. Immutable predicate terms are acyclic, so no refinement-cycle guard is needed.
 * **O4** — two *different* discharges of one refinement (`g(0)` vs `g(1)`) are distinguished once forced — `force_refinement` rewrites the predicate term and refinement equality is structural (§4) — and the constraint cache is σ-aware, so the two discharges record distinct edges rather than conflating. The residual domain-join corner is two *distinct non-invertible* morphisms meeting at one variable (O1/O4), guarded loudly by `bridge_holder_gap`'s panic tripwire rather than silently dropped.
 
-The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) and the nested filtered-source group-by both run end-to-end with correct values.
+The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. The nested filtered-source group-by runs end-to-end with correct values. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) **did too, and no longer type-check**: once `groupby` infers its honest keyed type ([4.6 Data vs compute functions](#46-data-vs-compute-functions)), a bare key cannot prove it lies in that collection's key domain, so the application is rejected and the bare-key tests are `#[ignore]`d against the restore. Restoring them needs the discharge in `src/ccl/design/collections.md`, "Lookup: membership discharge" — the dependent-application machinery here is unchanged and still correct; what is missing is a membership proof for the argument.
 
 ## 4.6 Data vs compute functions
 
@@ -1107,6 +1107,15 @@ appear anywhere in it — twice, in a codomain, under another constructor — be
 instantiates both sides before any edge is emitted, so no edge depends on an unfixed
 correspondence. Body subtyping recurses through the ordinary arms, which is also what
 relates the two bodies' Pi binders.
+
+**A kind *parameter* is related, not inspected.** A kind may carry a type (`Keyed(𝐾)`),
+and a parameter is not something a membership predicate can settle: relating two types is
+subtyping's job. So containment hands the pair back as an *obligation* and the Σ-width arm
+discharges it through the ordinary solver, invariantly in both directions — a
+`Map(Int, 𝑉)` is not a `Map(String, 𝑉)` either way. Shape is checked; parameters are
+related. Emitting rather than testing is also what lets an **open** parameter be pinned by
+the kind it is compared against instead of merely failing to match it, which is what makes
+an annotation `Map(_, 𝑉)` inferable.
 
 Witness-kind subtyping `K₀ <: K₁` is a *sufficient* condition for the rule rather than a
 premise of it, and the one the implementation uses. See
@@ -1483,7 +1492,7 @@ kinding check does it for a resolved type.
 about current usage, not a restriction on the notion, and a second kind-carrying position
 would need no change to the kind level.
 
-Alongside subtyping, each **described** kind carries one further thing: a **membership
+Alongside subtyping, a **described** kind may carry one further thing: a **membership
 predicate** on a type — is this type a dense prefix range (`UIntRanges`), anything at all
 (`Any`), and whatever a later kind adds. Membership and kind subtyping are different
 questions and want different signatures. Membership takes a *type* and answers about one
@@ -1491,8 +1500,16 @@ kind; subtyping takes two *kinds*. A listed kind is contained in a described one
 when every one of its candidates satisfies that kind's membership predicate — which is how
 the two compose, and the only place they meet.
 
-Keeping them apart is what makes a new kind cheap: a variant, a membership predicate, and
-a row in the kind order. Nothing in `constrain.rs` changes.
+A **parameterized** kind has no such predicate, and that is the interesting case rather
+than an exception. A member of `Keyed(𝐾)` is `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`,
+so deciding membership means *relating* a candidate's key to 𝐾 — an obligation, not a
+`bool`. Those rows therefore live in subtyping, which has somewhere to put an obligation,
+and
+[`TypeKind::admits`] never sees them.
+
+Keeping them apart is what makes a new kind cheap: a variant, a membership predicate or a
+parameter relation, and a row in the kind order. Nothing in `constrain.rs` changes, which
+is what `every_witness_kind_uses_the_same_sigma_rules` pins.
 
 **Away from listed-vs-listed, the order is what the lattice reads rather than a computed
 kind.** `order_witness_kinds` runs `contains` in both directions and reports which side is narrower;
@@ -1572,9 +1589,16 @@ later, because no annotation is left on the tree by then: monomorphization rebui
 
 `TypeKind::Any` is two containment rows: everything is contained in the universe, and the
 universe in nothing narrower, which is what rejects consuming a `Collection` where a
-concrete domain is demanded. The **keyed** witness is the one still to be wired, as its own
-kind over a `Refinement(𝐾, ⟨opaque key token⟩)` domain — a new kind, not a new witness
-flavour.
+concrete domain is demanded. `TypeKind::Keyed(𝐾)` is the kind of every key domain over 𝐾,
+which is what a `Map`/`Set` is: `Map(𝐾, 𝑉) = Σ (𝐷: Keyed(𝐾)). 𝐷 ⤇ 𝑉` — the last
+collection shape to join the kind system, and a new kind rather than a new witness flavour.
+
+`Keyed` is the first **parameterized** kind. An `Enumerated` kind lists its candidates, so
+containment asks a decidable question about one kind — is this domain in that set — and
+equality answers it. A parameter is a type to be related, which is [the width rule's
+obligation](#the-width-rule) rather than a predicate's answer. What still has no producer
+is the *concrete* side, the keyed domain a collection mints, so nothing yet satisfies
+`Enumerated <: Keyed`.
 
 ### What the kind level needs from the solver
 
@@ -2514,8 +2538,9 @@ from](#where-the-conditional-collection-σ-comes-from)).
   so the two do not meet today; they would the moment the fan-out is reconciled against a
   sum with two or more candidates. A Σ formed at the join fixes the order by construction.
 
-- **Witness-dependent kinds are unbuilt.** No kind carries a reference to an *enclosing*
-  witness — the `Σ (𝑤₁: 𝐾₁). Σ (𝑤₂: 𝐾₂[𝑤₁]). 𝐵` shape. Nothing forecloses it: it is kind
+- **Witness-dependent kinds are unbuilt.** A kind may carry a type parameter
+  (`Keyed(𝐾)`), but nothing carries a reference to an *enclosing* witness — the
+  `Σ (𝑤₁: 𝐾₁). Σ (𝑤₂: 𝐾₂[𝑤₁]). 𝐵` shape. Nothing forecloses it: it is kind
   subtyping under a substitution, an extension of the kind level rather than of the Σ
   rules. Listed because it is the honest edge of "general dependent sums", not because
   anything needs it.

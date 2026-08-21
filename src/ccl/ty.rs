@@ -767,9 +767,9 @@ pub enum Type {
     /// lossless join of data functions at a control-flow merge) is the finite
     /// instance — the witness is a type ranging over the branches' candidate
     /// domains ([`TypeKind::Enumerated`]) and the body is `WitnessRef ⤇ V`. The other
-    /// instances differ only in their witness *kind*: [`TypeKind::UIntRanges`] for a
-    /// `List` (every index range) and [`TypeKind::Any`] for `Collection[T]` (the
-    /// whole universe).
+    /// instances differ only in their witness *kind*: [`TypeKind::UIntRanges`]
+    /// (`List`), [`TypeKind::Keyed`] (`Map`/`Set`), and [`TypeKind::Any`]
+    /// (`Collection`, the universe).
     ///
     /// **Entered** only by a term — [`Builtin::Box`](crate::ccl::Builtin) or a keyed
     /// entry builtin — never by a demand: there is no `𝑇 <: Σ` subtyping arm, so
@@ -835,12 +835,13 @@ pub struct SigmaType {
 ///
 /// Both halves in one value. The **kind** describes the domains it ranges
 /// over — a finite candidate set ([`TypeKind::Enumerated`]), every index range
-/// ([`TypeKind::UIntRanges`]), or the whole universe ([`TypeKind::Any`]) — which is what
-/// keeps Σ subtyping to a single rule (kind containment plus body subtyping) with no
-/// per-witness-flavour cases. The **binder** is its identity, and it lives here rather
-/// than on the sum because a kind travelling without one is how a witness acquires a
-/// second name: a site holding only a kind must invent a binder to build a sum, and
-/// inventing is right only when the witness is new.
+/// ([`TypeKind::UIntRanges`]), every keyed domain over a key type ([`TypeKind::Keyed`]),
+/// or the whole universe ([`TypeKind::Any`]) — which is what keeps Σ subtyping to a single
+/// rule (kind containment plus body subtyping) with no per-witness-flavour cases. The
+/// **binder** is its identity, and it lives here rather than on the sum because a kind
+/// travelling without one is how a witness acquires a second name: a site holding only a
+/// kind must invent a binder to build a sum, and inventing is right only when the witness
+/// is new.
 ///
 /// So the operations are named for the question a caller has to answer. Deriving —
 /// [`map_types`](Self::map_types), [`with_kind`](Self::with_kind) — carries the binder;
@@ -881,8 +882,7 @@ pub struct Witness {
 pub enum TypeKind {
     /// A finite, explicitly **enumerated** set of candidate domains, in
     /// branch/contribution order (a tested contract). Statically enumerable →
-    /// the value-`Case` fan-out. The conditional-collection case, the only one
-    /// wired today.
+    /// the value-`Case` fan-out. The conditional-collection case.
     Enumerated(Vec<Type>),
     /// Every **`UIntRange`** — the kind that classifies a `List`'s domain. Not a finite
     /// candidate set (there is one range per length), and not a down-set of any
@@ -892,9 +892,29 @@ pub enum TypeKind {
     /// *filtered* range `{[0, k) | p}` (a `Refinement`, not a `UIntRange`) passing
     /// as a `List`, which would supply a length witness for a domain that has holes.
     UIntRanges,
-    /// **Any** domain — the universe `*` (`Collection(T)`; not enumerable →
-    /// an opaque domain). Type reserved; machinery lands with the collections
-    /// work.
+    /// Every **keyed** domain over the given key type — the kind of a `Map`/`Set`
+    /// domain. A member is `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`: the key type
+    /// refined by membership in what the key morphism `𝑚` produces
+    /// ([`Builtin::CollectionContains`](crate::ccl::Builtin::CollectionContains)). Two
+    /// things follow from it being a refinement rather than a nominal domain atom:
+    /// `{𝐾 | 𝑚} <: 𝐾` comes free by refinement drop (so a key is usable as a `𝐾`,
+    /// which an atom could not be — `AtomKey` is a discrete set), and the predicate
+    /// occupies the ordinary `__elem ▷ p` position, so every existing predicate
+    /// mechanism applies unchanged.
+    ///
+    /// The kind is what an *annotation* `Map(𝐾, 𝑉)` ranges over; a *concrete* keyed
+    /// collection's domain names one specific morphism. See
+    /// `src/ccl/design/collections.md`, "The five collection types".
+    Keyed(Box<Type>),
+    /// **Any** domain — the universe `*` (`Collection(T)` — see
+    /// [`Type::collection_of`]; not enumerable → opaque domain). Wired: any data
+    /// function injects, the sum itself is what elimination presents as the consumed
+    /// domain, and it rides the compact/coalesce carrier as a `Described` domain.
+    ///
+    /// The **⊤ of the kind order and nothing more.** It is not what makes a keyed
+    /// collection keyed — that is [`Keyed`](Self::Keyed) — so no `Map`/`Set` is a sum
+    /// over `Any`, and widening one to `Collection` is the ordinary absorption every
+    /// kind gets.
     Any,
 }
 
@@ -908,6 +928,7 @@ impl fmt::Display for TypeKind {
                 write!(f, "{{{}}}", cs.join(", "))
             }
             TypeKind::UIntRanges => write!(f, "[..]"),
+            TypeKind::Keyed(k) => write!(f, "{{{k}?}}"),
             TypeKind::Any => write!(f, "*"),
         }
     }
@@ -916,18 +937,32 @@ impl fmt::Display for TypeKind {
 /// What is left to discharge for a kind containment to hold — the residue of
 /// [`TypeKind::contains`], which reports the edge itself by returning `Some`.
 ///
-/// Containment is not always self-contained: a candidate that is still a bare
-/// inference **variable** has no shape for a membership predicate to read, and
-/// "whatever this resolves to must inhabit 𝐾" is not expressible as a subtyping bound
-/// — no type 𝑇 has `α <: 𝑇` iff `α` is a range. So it is recorded *as a kinding
-/// constraint on the variable*, beside its bounds, and discharged when the variable
-/// resolves.
+/// Containment is not always self-contained, and the two ways it isn't are different.
 ///
-/// Obligations are conjunctive: every entry must hold. None is polar — a kinding
-/// constraint asserts something about a variable's eventual resolution, which is the
-/// same fact at either position.
+/// A kind can be *parameterized* — [`TypeKind::Keyed`] carries the key type — and a
+/// parameter is a type to be **related**, not a domain to be matched. Relating two types
+/// is subtyping's job, so containment cannot settle it as a predicate: it records the
+/// pair and lets the caller discharge it with whatever context it has. That is what
+/// distinguishes a *parameter* from an [`Enumerated`](TypeKind::Enumerated) domain,
+/// which is matched by equality — membership in a listed set is a decidable question
+/// about one kind, not a relation between two. Emitting the pair rather than testing it
+/// is also what lets an open key type be **pinned** by the kind it is compared against,
+/// instead of merely failing to match it.
+///
+/// A candidate that is still a bare inference **variable** is the other way. It has no
+/// shape for a membership predicate to read, and "whatever this resolves to must inhabit
+/// 𝐾" is not expressible as a subtyping bound — no type 𝑇 has `α <: 𝑇` iff `α` is a
+/// range. So it is recorded *as a kinding constraint on the variable*, beside its
+/// bounds, and discharged when the variable resolves.
+///
+/// Obligations are conjunctive: every entry must hold. Neither kind is polar — a
+/// parameter relation is invariant, and a kinding constraint asserts something about a
+/// variable's eventual resolution, which is the same fact at either position.
 #[derive(Debug, Clone, Default)]
 pub struct KindObligations {
+    /// Kind **parameters** to relate *invariantly* — a `Map(Int, 𝑉)` is not a
+    /// `Map(String, 𝑉)` in either direction.
+    pub params: Vec<(Type, Type)>,
     /// **Kinding** constraints `?𝑣 :: 𝐾` — a listed candidate that is still a bare
     /// variable, together with the described kind it must inhabit.
     pub kinds: Vec<(Rc<InferVar>, TypeKind)>,
@@ -945,18 +980,21 @@ pub struct KindObligations {
 impl KindObligations {
     /// Whether every obligation already holds **as written**.
     ///
-    /// This is the discharge available where there is no constraint graph to emit
-    /// into: the compact-domain lattice, and the post-coalesce kinding check. A
-    /// pending kinding constraint can never be discharged that way — a variable with
-    /// no shape at either point is one that never resolved.
+    /// This is the discharge available where there is no constraint graph to emit into:
+    /// the compact-domain lattice, and the post-coalesce kinding check. Both run on
+    /// resolved types, where the invariance a parameter relation demands *is* equality —
+    /// so this is the ground case of the relation the Σ-width rule emits, not a weaker
+    /// substitute for it. A pending kinding constraint can never be discharged this way:
+    /// a variable with no shape at either point is one that never resolved.
     ///
     /// A pairing is discharged by its **identity** instance — every sub candidate
-    /// appearing verbatim among the sups. That is *sound* rather than complete: equality
-    /// implies the body edge, so this can reject an edge the solver-side search would
-    /// allow. Conservative is the right direction where there is no solver to search
-    /// with.
+    /// appearing verbatim among the sups. That one is *sound* rather than complete:
+    /// equality implies the body edge, so this can reject an edge the solver-side search
+    /// would allow. Conservative is the right direction where there is no solver to
+    /// search with.
     pub fn holds_structurally(&self) -> bool {
-        self.kinds.is_empty()
+        self.params.iter().all(|(a, b)| a == b)
+            && self.kinds.is_empty()
             && self
                 .pairing
                 .as_ref()
@@ -973,7 +1011,9 @@ impl TypeKind {
     pub fn listed(&self) -> Option<&[Type]> {
         match self {
             TypeKind::Enumerated(domains) => Some(domains),
-            TypeKind::UIntRanges | TypeKind::Any => None,
+            // A keyed kind *describes* its domains — a member is a present-key domain
+            // refined over `𝐾`, not the key type itself — so there is no list.
+            TypeKind::Keyed(_) | TypeKind::UIntRanges | TypeKind::Any => None,
         }
     }
 
@@ -983,14 +1023,17 @@ impl TypeKind {
     /// A *superset* of [`listed`](Self::listed), and the distinction is not
     /// cosmetic. Listed domains are the kind's *members*, compared by value and
     /// placed in the domain lattice. A described kind lists no members but may still
-    /// be **parameterized** by a type that is not one of its domains: a parameter is a
-    /// child to be traversed and never a domain to be matched, and conflating the two
-    /// silently drops such a type from every traversal. No variant here is parameterized
-    /// yet, so the two coincide today; the method exists so that adding one cannot quietly
-    /// skip substitution, freshening, extrusion and structural comparison.
+    /// be **parameterized** by a type that is not one of its domains — the key type of
+    /// [`Keyed`](Self::Keyed) is the standing example: its members are present-key domains
+    /// refined over `𝐾`, not `𝐾` itself, so `𝐾` is a child to be traversed and never a
+    /// domain to be matched. Conflating the two silently drops such a type from every
+    /// traversal.
     pub fn children(&self) -> &[Type] {
         match self {
             TypeKind::Enumerated(domains) => domains,
+            // The key type is a genuine child even though it is not a domain: it is
+            // what the kind is *parameterized* by, and traversals must reach it.
+            TypeKind::Keyed(key) => std::slice::from_ref(key),
             TypeKind::UIntRanges | TypeKind::Any => &[],
         }
     }
@@ -999,6 +1042,7 @@ impl TypeKind {
     pub fn children_mut(&mut self) -> &mut [Type] {
         match self {
             TypeKind::Enumerated(domains) => domains,
+            TypeKind::Keyed(key) => std::slice::from_mut(key),
             TypeKind::UIntRanges | TypeKind::Any => &mut [],
         }
     }
@@ -1011,6 +1055,7 @@ impl TypeKind {
             TypeKind::Enumerated(domains) => {
                 TypeKind::Enumerated(domains.iter().map(&mut f).collect())
             }
+            TypeKind::Keyed(key) => TypeKind::Keyed(Box::new(f(key))),
             TypeKind::UIntRanges | TypeKind::Any => self.clone(),
         }
     }
@@ -1052,6 +1097,19 @@ impl TypeKind {
             // a length witness for a domain with holes.
             TypeKind::UIntRanges => matches!(ty, Type::UIntRange(_)),
             TypeKind::Enumerated(domains) => domains.contains(ty),
+            // A keyed kind has **no membership predicate**, and that is a fact about the
+            // notion rather than a gap here: a member is `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}` over
+            // the key **parameter**, so deciding membership means *relating* the
+            // candidate's key to `𝐾` — a subtyping obligation, which no `bool` can carry.
+            // A parameterized kind is the first kind for which membership and containment
+            // come apart this way, and where they do, containment is what owns the
+            // question: [`contains`](Self::contains)'s keyed arms emit the pair and never
+            // consult this predicate. So this arm is unreachable, and stating that is
+            // better than returning a `false` a caller might read as "not a member".
+            TypeKind::Keyed(_) => unreachable!(
+                "a keyed kind's membership is a key-parameter relation, not a predicate: \
+                 TypeKind::contains owns it and never reaches TypeKind::admits"
+            ),
         }
     }
 
@@ -1061,18 +1119,38 @@ impl TypeKind {
     /// non-subtype.
     ///
     /// Ordinary subtyping one level up — a relation between two *classifiers* of types,
-    /// not between two types.
+    /// not between two types — so `Σ 𝑤 ∈ 𝐾₀. 𝐵₀ <: Σ 𝑤 ∈ 𝐾₁. 𝐵₁` decomposes into this
+    /// plus *body* subtyping.
     /// A **singleton** listed kind is contained like any other; it is not a back door
     /// for entering a sum. Nothing views a plain data function as a one-candidate sum —
     /// that would build a sum by subsumption, and only a term builds one
     /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
     ///
+    /// A relation between two kinds rather than a predicate on one, so it is not simply
+    /// [`admits`](Self::admits) lifted. Three cases are settled before membership is
+    /// consulted at all: `Any` absorbs on the right, a listing against a listing is a
+    /// *disjunction* that cannot wait, and a keyed kind relates through its key
+    /// **parameter**. What remains is exactly "the description admits every candidate".
+    ///
     /// Obligations ride the return value rather than an out-parameter so a rejected
     /// edge cannot leave a caller holding the ones gathered before it was rejected.
     pub fn contains(&self, sup: &TypeKind) -> Option<KindObligations> {
-        // ⊤ absorbs, structurally rather than by a row per kind.
+        // ⊤ absorbs, structurally rather than by a row per kind. This one check *is*
+        // `Fun(Data) <: Collection` (any data function injects) and `Σ <: Collection`
+        // width-to-top at once, so neither needs an arm of its own.
         if matches!(sup, TypeKind::Any) {
             return Some(KindObligations::default());
+        }
+        // Two keyed kinds relate iff their key types do, *invariantly* — a `Map(Int, V)`
+        // is not a `Map(String, V)` in either direction. The key type is a kind
+        // **parameter** rather than one of the kind's domains, so relating it is the
+        // caller's obligation and not a verdict here; that is also why this is a relation
+        // between kinds and not a membership question `admits` could answer.
+        if let (TypeKind::Keyed(sub_key), TypeKind::Keyed(sup_key)) = (self, sup) {
+            return Some(KindObligations {
+                params: vec![((**sub_key).clone(), (**sup_key).clone())],
+                ..KindObligations::default()
+            });
         }
         match (self.listed(), sup) {
             // Both list: the `∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁` of the Σ-width rule, handed back as a
@@ -1094,6 +1172,35 @@ impl TypeKind {
                     pairing: Some((subs.to_vec(), sups.to_vec())),
                     ..KindObligations::default()
                 })
+            }
+            // A listed kind against the *keyed* description is the **entry** edge,
+            // and membership is not what decides it: a member is the key type refined by
+            // a *characteristic predicate over the element*, so admitting one means
+            // *relating* the candidate's key to the kind's parameter. `groupby` writes
+            // that refinement onto its key binder at lowering, so the **shape** is
+            // concrete here even when the key type itself is not — the shape decides
+            // containment and the key type rides out as an obligation, which is what pins
+            // an open key type from the annotation (without it `Set(String)` accepts an
+            // `Int`-keyed collection).
+            (Some(domains), keyed @ TypeKind::Keyed(key)) => {
+                let mut obligations = KindObligations::default();
+                for d in domains {
+                    match keyed_domain_key(d) {
+                        Some(base) => obligations.params.push((base.clone(), (**key).clone())),
+                        // No keyed shape. A bare variable has no shape *yet*, so the kind
+                        // becomes a constraint on it and its resolution decides — exactly
+                        // as for a `UIntRanges` candidate. Any other head is already
+                        // readable: a refinement whose predicate is not a key token does
+                        // not become one by resolving a type inside it.
+                        None => {
+                            let Type::Infer(v) = d else {
+                                return None;
+                            };
+                            obligations.kinds.push((Rc::clone(v), keyed.clone()));
+                        }
+                    }
+                }
+                Some(obligations)
             }
             // A listed kind is contained in a *description* iff the description
             // [`admits`](Self::admits) every candidate — the one place membership and
@@ -1121,7 +1228,10 @@ impl TypeKind {
             }
             // Two described kinds relate only by being the same description: neither
             // lists domains to compare, and no description here is a sub-description of
-            // another (⊤ is already handled above).
+            // another (⊤ on the right and keyed-to-keyed are both handled above). `Any`
+            // on the *sub* side lands here and so is contained in nothing narrower — a
+            // `Collection` is not known to have any particular domain, which is what
+            // rejects consuming one where a concrete domain is demanded.
             (None, sup) => (self == sup).then(KindObligations::default),
         }
     }
@@ -1274,6 +1384,45 @@ pub mod witness_ctx {
     pub fn clear() {
         RANGES.with(|m| m.borrow_mut().clear());
     }
+}
+
+/// The **key type** of a concrete keyed domain — the base of `{𝐾 | __elem ▷ p}` — or
+/// `None` if `domain` is not keyed-shaped.
+///
+/// The concrete counterpart of [`TypeKind::Keyed`]: the kind is what an *annotation*
+/// ranges over, and this is what a *specific* keyed collection's domain looks like. The
+/// predicate's identity is what distinguishes two maps.
+///
+/// Returning the base rather than a yes/no is what lets the kind's key **parameter** be
+/// related to it ([`KindObligations`]): the shape decides containment, and the key type
+/// rides out as an obligation, so a still-open key type is pinned rather than silently
+/// ignored.
+fn keyed_domain_key(domain: &Type) -> Option<&Type> {
+    let Type::Refinement(base, r) = domain else {
+        return None;
+    };
+    // The ordinary bare-predicate shape `__elem ▷ p`, with `p` the characteristic
+    // predicate of some morphism's outputs — `𝑚 ▷ collection_contains`. Note how narrow
+    // this is: only that predicate counts, so an ordinary refined domain
+    // (`{Int | __elem > 0}` — a filtered collection) is not mistaken for a keyed one.
+    let TypedExprNode::Apply { argument, function } = &r.predicate.node else {
+        return None;
+    };
+    if !matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem()) {
+        return None;
+    }
+    let TypedExprNode::Apply {
+        function: characteristic,
+        ..
+    } = &function.node
+    else {
+        return None;
+    };
+    matches!(
+        &characteristic.node,
+        TypedExprNode::Builtin(crate::ccl::Builtin::CollectionContains)
+    )
+    .then_some(base.as_ref())
 }
 
 impl SigmaType {
@@ -2228,6 +2377,60 @@ impl Type {
     /// the non-enumerable, opaque-domain sibling.
     pub fn collection_of(elem: Type) -> Self {
         TypeKind::Any.into_data_fun(None, elem)
+    }
+
+    /// The type of a **full map**: the dependent data function `(𝑘: 𝐾) ⤇ 𝑉` — a map
+    /// holding a value for every key of `𝐾`, so a lookup needs no proof of presence.
+    ///
+    /// Not a sum. Totality is earned by `𝐾` being refined down to keys known to exist, so
+    /// the key set is readable from the type rather than standing behind a witness, which
+    /// is what a [`Map`](Self::map_of) gives up. Crossing from here to a `Map` is therefore
+    /// [`Builtin::Box`](crate::ccl::Builtin), and that `box` is where the key type stops
+    /// being available to reason with.
+    ///
+    /// This is the type `groupby` returns: its domain is the present-key domain
+    /// `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}` and its codomain names the key
+    /// binder. This constructor names that shape rather than building a new one. No
+    /// nominal head exists yet, so every dependent data function satisfies a `FullMap`
+    /// annotation, and nothing may come to rely on it: the name exists so a head has one
+    /// place to attach (`src/ccl/design/collections.md`, "`FullMap` is the unboxed map").
+    pub fn full_map_of(key: Type, value: Type) -> Self {
+        Type::data_fun(key, value)
+    }
+
+    /// The type of a **map**: the dependent sum `Σ 𝐷 ∈ Keyed(𝐾). 𝐷 ⤇ 𝑉` — the exact
+    /// analog of a [`list`](Self::list_of)'s `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ 𝑇`, with
+    /// [`TypeKind::Keyed`] in place of [`TypeKind::UIntRanges`]. The annotation is the
+    /// *abstract* map: it ranges over every key domain over `𝐾` without naming one.
+    ///
+    /// The domain content therefore lives in the **kind**, not in a refinement on this
+    /// type — there is no key-set value to witness and no `{𝑘 | 𝑘 ∈ 𝐸}` to discharge.
+    /// A *concrete* map's domain names one specific key domain,
+    /// `{𝑘: 𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`
+    /// ([`Builtin::CollectionContains`](crate::ccl::Builtin::CollectionContains)) —
+    /// which is what the kind ranges over, so injecting it here is plain kind
+    /// containment. See
+    /// `src/ccl/design/collections.md`.
+    pub fn map_of(key: Type, value: Type) -> Self {
+        Self::keyed_collection(key, value)
+    }
+
+    /// The type of a **set**: `Map(𝐾, unit)` — a keyed collection whose codomain
+    /// is `unit`, so the key domain *is* the payload (see [`map_of`](Self::map_of)).
+    pub fn set_of(key: Type) -> Self {
+        Self::keyed_collection(key, Type::Base(BaseType::Unit))
+    }
+
+    /// Shared builder for the keyed sum `Σ 𝐷 ∈ Keyed(𝐾). 𝐷 ⤇ value` behind
+    /// [`map_of`](Self::map_of) / [`set_of`](Self::set_of).
+    ///
+    /// The keyed-ness lives in the witness **kind** ([`TypeKind::Keyed`]), not in a
+    /// predicate on this type: an annotation is the *abstract* map, ranging over
+    /// every key domain over `𝐾`, so it must not name one. A concrete keyed
+    /// collection's domain — `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}` — is what the kind ranges
+    /// over, and it is minted where that collection is created.
+    fn keyed_collection(key: Type, value: Type) -> Self {
+        TypeKind::Keyed(Box::new(key)).into_data_fun(None, value)
     }
 
     /// The domain of the arrow this type denotes, seeing through a sum's binder.

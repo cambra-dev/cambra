@@ -467,7 +467,7 @@ pub(crate) fn run(
 ) -> Result<Type, Vec<LocatedInferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
-        let pre = InferCtx::new(HashMap::new(), expr.node_id());
+        let mut pre = InferCtx::new(HashMap::new(), expr.node_id());
         let translated: HashMap<String, Type> = sources
             .iter()
             .map(|(k, v)| (k.clone(), pre.normalize_annotation(v)))
