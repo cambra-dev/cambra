@@ -428,24 +428,17 @@ fn rewrite(mut expr: Expr) -> Expr {
             body: loop_body,
         } = effect.node
         {
-            // The loop → causal `LetRec` rewrite, recorded against the statement node
-            // it rewrites. Everything the transform mints — the carrier `LetRec`,
-            // its histories, guards and decision scaffolding — attaches to
-            // `stmt_id` as its parent; everything it carries through (the
-            // iteration source, each value expression) keeps its id and is its
-            // own self-edge. Nothing here says what dies.
+            // The statement is the slot: the causal `LetRec` replaces it.
             //
-            // In particular there is no drop-path test. Whether the whole loop
+            // There is deliberately no drop-path test. Whether the whole loop
             // vanishes — no accumulator, no feed, e.g. a transaction-emptied
-            // `For` — is a fact about which ids are absent from the tree
-            // afterwards, and the boundary's live-set difference reads it off
-            // directly. The pass does not have to predict it, which is the point:
-            // that prediction had to re-run `collect_writes` and `body_has_feed`
-            // here to guess what `transform_loop` would decide ~140 lines away.
+            // `For` — is read off the live-set difference, so this site does not
+            // predict it. Predicting it meant re-running `collect_writes` and
+            // `body_has_feed` here to guess what `transform_loop` would decide
+            // ~140 lines away.
             //
             // `blame` names the `For` rather than the `ExprStmt` so the products
-            // resolve to the loop keyword's span, not the statement's; blame ⊥
-            // consumption, so this asserts nothing about the `For`'s fate either.
+            // resolve to the loop keyword's span, not the statement's.
             let g = lineage::enter(stmt_id, "letrec.loop", lineage::Nature::Expansion);
             g.blame(&[effect_id]);
             return transform_loop(target, *iter, *loop_body, *body);

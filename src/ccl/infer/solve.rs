@@ -1797,13 +1797,9 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // predicates are proper freshen instances sharing no live inference state
     // with the definition — and no mutable state to keep in sync with it.
     //
-    // Sink for the clone's `on_copy` pairs. The hook needs somewhere to write to:
-    // an installed table alone captures nothing, only an open recording does.
-    // Naming the use site here supplies that, plus the label and nature a row
-    // needs. Each captured pair keeps its own origin, because copies are written
-    // as per-origin steps rather than inheriting the named node. The use site is
-    // already the node this rewrite is performed for, and is already what a failed
-    // pin blames.
+    // Sink for the clone's `on_copy` pairs, which each keep their own origin
+    // rather than inheriting the slot. The use site is the slot: it is the node
+    // this rewrite is performed for, and already what a failed pin blames.
     let _spec = crate::ccl::lineage::enter(
         use_expr.node_id(),
         "mono.specialize",
@@ -1969,13 +1965,8 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // "Typechecking a never-called definition", for why that dangling reference is
     // unobservable today and what fixes it.
     //
-    // The chain replaces the generalized `let`, whose id does not survive: each
-    // layer is a fresh node, so with no recording open every one of them is an
-    // output node with no origin. The node the chain stands for is the
-    // generalized `let` itself, so that is what the layers copy from — one
-    // origin, K products, matching what the body demanded of the binding. The
-    // recording opens here rather than around the body walk above, because one
-    // there would adopt every node the body's own rewrites mint.
+    // The generalized `let` is the slot: the chain of K specialized layers
+    // replaces it, one origin and K products.
     let _chain = crate::ccl::lineage::enter(
         expr.node_id(),
         "mono.coalesce_let",

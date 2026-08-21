@@ -1216,18 +1216,10 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // non-clustered defers (inner `let d = Defer in ...`
             // separated from this cluster by other lets).
             let body_rewritten = desugar(current_body, ctx)?;
-            // The cluster's whole product — each assembled channel, the
-            // `Feed`-kind `LetRec` binding them, and the union machinery
-            // `combine_feed_values` mints — is recorded against the **outermost**
-            // `let d = Defer` node it replaces. The inner defers of a cluster are
-            // consumed by the same rewrite but are not named: they are absent
-            // from the output tree, so the boundary difference reports them, and
-            // naming them here would be a fate assertion this pass is in no
-            // position to make (a defer whose handle survives in a type is not
-            // dead).
-            //
-            // Opened *after* the body recursion so a nested cluster's products
-            // attach to their own `let`, not to this one.
+            // The **outermost** `let d = Defer` is the slot: the cluster's whole
+            // product replaces it. A cluster's inner defers are consumed too but
+            // are not named, because naming them would assert they die, and a
+            // defer whose handle survives in a type does not.
             let _g = lineage::enter(node_id, "channelize.cluster", lineage::Nature::Expansion);
             channelize_cluster(&defer_names, &chan_names, body_rewritten, ctx)
         }

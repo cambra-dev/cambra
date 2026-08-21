@@ -74,12 +74,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // predicate is a pure function of the literal value, memoized per
             // pass, so it is born the first time each distinct value is seen.
             //
-            // Record against the literal's own node. Two things follow. The
-            // mints land inside an open recording, so the widened
-            // `collect_tree_ids` (which now reaches refinement predicates) can
-            // explain them instead of reporting `Unexplained`. And the resulting edge is the one
-            // `predicate-lineage-report` records as missing: nothing used to
-            // link a singleton refinement back to the literal the user wrote.
+            // The literal's own node is the slot, which is the edge
+            // `predicate-lineage-report` records as missing: nothing used to link
+            // a singleton refinement back to the literal the user wrote.
             let _g = crate::ccl::lineage::enter(
                 node_id,
                 "infer.lit_singleton",
