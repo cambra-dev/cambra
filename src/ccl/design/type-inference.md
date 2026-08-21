@@ -741,7 +741,6 @@ Singletons are *not* erased after inference. They are ordinary refinements and r
 
 A **refined type** `{T | p}` carries a *set* of [`Refinement`]s, and the lattice treats each as a black box: it accumulates them and matches them by identity, never reasoning about what they imply (the predicate's logical content is real and used by the runtime, just opaque *here*). It is a fourth structural dimension on `CompactType`, width-subtyped exactly like records: **`{b₁ | S₁} <: {b₂ | S₂}` iff `b₁ <: b₂` and `S₂ ⊆ S₁ ∪ refinements(b₁)`** — more refinements ⇒ subtype. So `{T | p, q} <: {T | p}` and `{T | p} <: T`, but `{T | q} ⊀ {T | p}`. Refinements match by **type-blind structural equality of their predicate terms** (`Refinement`'s `PartialEq` / `eq_refinement_predicate`) — *not* by predicate implication (`{T | x > 0} ⊀ {T | x > -1}`). Structural matching makes refinement identity agnostic to *where* a predicate was constructed (join planning re-mints `{D | p}` at every marker it emits — `make_iterate` / `make_restrict` / `refine_with` — and must match the structurally-identical contract recorded elsewhere on the tree) and to in-place type resolution (copies of one predicate along a monomorphization descent line differ only in their inferred-type slots); a pointer-equal predicate `Rc` short-circuits as the fast path, since a refinement that merely flows around shares its `Rc`. The refinement set merges with the *same polarity rule as `rec`* (positive ⇒ intersect, negative ⇒ union) and is carried verbatim through simplification (refinements are positional, never folded into a variable's identity, so co-occurrence merging can't move or drop them).
 
-
 **A refinement never changes a type's shape.** It is a claim about the value at a position, not part of the structure carrying it, so `{(𝐷 ⇒ 𝑉) | 𝑝}` *is* a function and `{Mut(𝑉, 𝐷) | 𝑝}` *is* a mutable variable. Every rule that dispatches on or destructures a shape therefore looks *through* the outer layers first — `Type::peel_refinements`, and the handle accessors `Type::mut_value_type` / `as_feed` / `is_handle` built on it, which are what the typing rules and the second-class `Mut` discipline both ask "is this a mutable variable?" with. It is the same claim-versus-structure distinction a trait obligation draws when it reads a base off an operand ([Refinements are transparent](#refinements-are-transparent)): what narrowing consumes is the structure, and the refinement rides along untouched.
 
 A refinement is **required**, so `constrain_subtype` is strict for *concrete* bases: an unrefined concrete value does **not** flow into a refined position (`T ⊀ {T | p}`), and `{T | q} ⊀ {T | p}`. The one subtlety is the `S₂ ⊆ S₁ ∪ refinements(b₁)` clause: when the subtype side's base `b₁` is an **inference variable**, it can still acquire the deficit `S₂ \ S₁`, so the solver flows `b₁ <: {b₂ | S₂ \ S₁}` onto the variable rather than rejecting (the refinement analog of how the record/function arms thread structure through a variable base; it fails later iff the variable resolves to a concrete base lacking those refinements). This is what lets a value that is *already* refined be cast to acquire a further refinement — `{D | p} ⇒ V <: {?a | q} ⇒ V` records `?a <: {D | p}`, stacking `q` over `p` (nested list-comprehension filters). Acquiring a refinement on a *concrete* value is still an *explicit* operation, not subsumption: the explicit `Cast` node from [PR #218](https://github.com/cambra-dev/Cambra/pull/218) (an upcast — `value <: target` — written `cast({D | r} ⇒ V, value)`) makes refinement-acquisition explicit, and the interpreter compiles a refinement on a **collection domain** to a runtime `Restrict`/`Filter` at the iteration boundary (the `Iterate`/`Restrict` arms of `operator_conversion`, where `extent_of` strips the domain refinement into a `Restrict`). The predicate `Expr` of each refinement is inferred/coalesced like any other sub-tree (annotation-borne predicates via `emit_annotation_predicates` / `coalesce_type_predicates`).
@@ -1004,32 +1003,78 @@ Tracking the kind is what makes any of this statable. Without it both arrows are
 functions, the compute lattice's meet applies, and the join silently narrows — correct for
 capabilities, row-destroying for collections.
 
-#### Join is the least upper bound under `<:`, and nothing else
+[collections.md](collections.md) is the collection design built on the sum.
 
-There is no separate join law. A law about what joins may form would be a second place for
-the answer to live, free to disagree with subtyping. So the entire content of "a sum is not
-formed implicitly" is one absence: `<:` has no
-[introduction rule](#only-a-term-builds-a-sum). Two collections over distinct domains then
-have no upper bound at all, and their join is a `JoinTypeError` — a lattice fact rather
-than a rejection anyone wrote down.
+#### The codomain join
 
-What the program can ask for instead:
+**The Σ is lossless on the domain and lossy on the codomain.** The shared body's element
+type is the ordinary covariant lattice join `τ₀ ⊔ τ₁` of the arms' codomains
+(`CompactFun::merge` merges the codomain at `pol`, the domains at `!pol`), forgetting which
+domain pairs with which element type. Where the LUB is a **structured coarsening** it does
+not error — record codomains intersect to their common fields, refinements drop to the
+shared base, both at any positive position. Where it is a **scalar union** it is
+unrepresentable, and that is the deferred piece: a function returning
+`[1, 2, 3] if flag else ["a", "b"]` would type as `Σ (𝑤 ∈ {[0,2], [0,1]}). 𝑤 ⤇ (Int|String)`,
+no longer recording "length 3 ⟹ all Int", and that codomain errors at coalesce with the
+same `IncompatibleBounds` rejection as `1 + true`. It is a positive atom-join,
+indistinguishable there from a binop-operand clash, which must stay a hard error — so the
+sound union waits on strict scalar consumers imposing concrete bounds.
 
-| written | type | what it keeps |
-|---|---|---|
-| `xs if c else ys` | `JoinTypeError` | — no upper bound exists |
-| `box(xs) if c else box(ys)` | `Σ 𝑇 ∈ {𝑇ₓ, 𝑇ᵧ}. 𝑇` | both domains, and the discriminant; compiles to the value-`Case` fan-out |
-| `list(xs) if c else list(ys)` | `List(𝑉)` | the rows, not which range — so a lookup is optional rather than proven |
+The asymmetry tracks whether loss is observable. Dropping an index drops a row and leaves
+no trace, so domains join into the candidate set and never meet. A coarsened codomain sits
+in the type and a consumer that needs `Int` fails at its own constraint site, so the
+shared-codomain Σ is a sound widening — a supertype of the correlated form, into which each
+arm injects. Preserving correlation by default would instead make every conditional
+collection a variant that every downstream consumer destructures, with nested conditionals
+multiplying the arms through the whole consumer graph.
 
-Two of those three lose something, and which loss to take is a decision about the program.
-That is why the type system declines to pick.
+The correlated form is a tagged variant carrying each arm's own codomain,
+`Variant([(Index(0), α ⤇ τ₀), (Index(1), β ⤇ τ₁)])`. A program that needs a branch-aware
+consumer introduces the choice explicitly (`.Ints(xs) if flag else .Strs(ys)`) and
+`match`es it, so the case-split cost is paid by the code that benefits from it. Reaching it
+depends on tagged-variant **surface syntax** (`.Foo(x)` constructors plus `match`, the open
+part of [[type-checker-tagged-variants]]); until that ships the join is a forced loss with
+no recovery path rather than a chosen one.
 
-The rest follows without further rules. Boxing where the arms agree costs nothing
-([Only a term builds a sum](#only-a-term-builds-a-sum) — a singleton sum does not collapse
-but is usable as its content). Nested conditionals flatten, because the width rule takes a
-candidate listing whole. `box(xs) if c else xs` is `𝑇ₓ`: a bare `𝑇` is an upper bound of
-`Σ 𝑈 ∈ {𝑇}. 𝑈` when the sum is consumed, and no sum is an upper bound of a bare `𝑇`, so the
-box is discarded rather than spreading.
+An unfactored `Σ 𝑇 ∈ {𝑇ᵢ}. 𝑇` has no shared codomain to join, so `box(1) if c else box("x")`
+is `Σ 𝑇 ∈ {Int, String}. 𝑇` with nothing coarsened. What is missing there is a rule for
+*consuming* one, not a representation
+([Deliberately incomplete here](#deliberately-incomplete-here)).
+
+**Flow-sensitive typing is declined.** An occurrence-typing language could keep the arms
+correlated through the path condition `flag` itself with no tag; Cambra does not narrow on
+an opaque `Bool`, and the tagged variant is the substitute.
+
+The codomain loss is orthogonal to the axis the witness recovers. The witness here is a
+*type*-witness (`TypeKind::Enumerated` — which branch domain was taken), so the Σ keeps the
+exact domain set. A Σ whose witness kind *describes* its domains recovers a different
+correlation — a conditionally-sized collection is `Σ (𝐷: UIntRanges). 𝐷 ⤇ 𝑇`, one shape for
+every length. Same `Type::Sigma` machinery either way; only the witness kind differs.
+
+### Subtyping for sums
+
+Three rules, and the third one is an absence.
+
+- **No introduction.** `<:` has no rule putting a value into a sum, so a demand never forms
+  one and two collections over distinct domains have no upper bound at all. Every sum is
+  formed by a term ([Only a term builds a sum](#only-a-term-builds-a-sum)).
+- **Width** — `Σ <: Σ` ([The width rule](#the-width-rule)): every member of the left sum
+  lies below some member of the right.
+- **On the left** — `Σ <: 𝑇` ([A sum on the
+  left](#a-sum-on-the-left-forget-the-witness-or-name-it)): a consumer valid at every
+  candidate forgets the witness, and one whose result still mentions it names it instead.
+
+Three premises live elsewhere. Kind containment is the sufficient condition the
+implementation uses for width's `∃` ([Witness kinds form a
+lattice](#witness-kinds-form-a-lattice)); the search discharging that `∃` runs on ground
+candidates ([Where the pairing search runs](#where-the-pairing-search-runs)); and a body
+edge over `𝑤 ⤇ 𝑉` decomposes into the ordinary data-function arms, whose domain half is
+invariant ([Data domains are invariant](#data-domains-are-invariant)).
+
+Everything else the lattice does with sums is derived from these three, the merge laws
+([The merge laws are derived, not chosen](#the-merge-laws-are-derived-not-chosen)) and the
+equivalence of the two spellings ([A collection sum has two
+forms](#a-collection-sum-has-two-forms-and-they-are-equivalent)) included.
 
 #### The width rule
 
@@ -1106,114 +1151,32 @@ And the gates' exclusivity and exhaustiveness is a `lambda_elim` construction in
 asserted at the fan-out boundary, not re-proven in the solver: a non-exhaustive
 value-`Case` would realize an empty collection on the uncovered path.
 
-#### The wired witness kinds
+#### Join is the least upper bound under `<:`, and nothing else
 
-`TypeKind::Enumerated` is the finite listing [`box`](#only-a-term-builds-a-sum) builds.
-`TypeKind::UIntRanges` is the kind of every index range, which is what a `List` is:
-`List(𝑇) = Σ (𝐷: UIntRanges). 𝐷 ⤇ 𝑇`. They divide the grammar — **`Enumerated`
-classifies whole types and its Σ's body is the bare witness; a described kind classifies
-domains and its Σ's body is an arrow over the witness** — which is what tells the two
-shapes apart from the witness alone, with no flag to carry.
+There is no separate join law. A law about what joins may form would be a second place for
+the answer to live, free to disagree with subtyping. So the entire content of "a sum is not
+formed implicitly" is one absence: `<:` has no
+[introduction rule](#only-a-term-builds-a-sum). Two collections over distinct domains then
+have no upper bound at all, and their join is a `JoinTypeError` — a lattice fact rather
+than a rejection anyone wrote down.
 
-Making `List` a *kind* rather than a scalar value-witness collapses its rules into the
-general one. `list([1, 2, 3])` checks `{[0, 3)} ⊆ UIntRanges`, the same containment
-Σ-width runs, reached from the entry term rather than from a subtyping edge. There is no
-`{𝑖 | 𝑖 < 𝑛}` domain refinement to discharge, because the kind already says "a dense prefix
-range" — which closes a hole the refinement had: a gate that strips refinements before
-testing for a range admits a *filtered* collection `{[0, 𝑘) | 𝑝} ⤇ 𝑇` into `List(𝑇)` and
-hands it the length witness `𝑘` for a domain with holes. A `Refinement` is not a
-`UIntRange`, so kind membership rejects it.
+What the program can ask for instead:
 
-Consuming either kind [names the witness](#consuming-a-sum-naming-the-witness) the same
-way. A described kind has no candidate list to present, so a rule that handed the sum over
-as the consumed domain would have nothing to hand over but the sum itself — which is why
-naming, and not presenting, is what makes the two kinds share one rule.
+| written | type | what it keeps |
+|---|---|---|
+| `xs if c else ys` | `JoinTypeError` | — no upper bound exists |
+| `box(xs) if c else box(ys)` | `Σ 𝑇 ∈ {𝑇ₓ, 𝑇ᵧ}. 𝑇` | both domains, and the discriminant; compiles to the value-`Case` fan-out |
+| `list(xs) if c else list(ys)` | `List(𝑉)` | the rows, not which range — so a lookup is optional rather than proven |
 
-A **bounded** `List(𝑇)` parameter annotation (`a <: List(𝑇)`) and a consumer's `𝐷 ⤇ 𝑉`
-demand are two upper bounds on one variable, and the solver never relates two upper bounds
-to each other — so `meet_witness_kinds` decides between a described kind and an enumerated
-candidate set by `TypeKind::contains`: containment means the listed side is the narrower,
-and an `Array(2, 𝑉)` demanded of a `List(𝑉)` parameter meets at the `Array`. Anything
-unordered conflicts loudly. The **exact** form has no such meet, because it leaves no
-variable for the two bounds to land on: `a: List(𝑇)` binds the parameter at `List(𝑇)`
-itself ([Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded)). Under
-the exact form a collection parameter is domain-abstract however concrete the argument is,
-so a comprehension over it gives back `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ 𝑇` rather than the caller's
-`[0, 2]`.
+Two of those three lose something, and which loss to take is a decision about the program.
+That is why the type system declines to pick.
 
-Membership in a described kind tests a domain's shape, so a computed collection —
-whose domain is still a variable at emit — records a kinding constraint instead
-([What the kind level needs from the solver](#what-the-kind-level-needs-from-the-solver)).
-
-`TypeKind::Any` is two containment rows: everything is contained in the universe, and the
-universe in nothing narrower, which is what rejects consuming a `Collection` where a
-concrete domain is demanded. The **keyed** witness is the one still to be wired, as its own
-kind over a `Refinement(𝐾, ⟨opaque key token⟩)` domain — a new kind, not a new witness
-flavour.
-
-#### `Case` arms join by the lattice
-
-`emit_case` constrains every arm into a fresh result variable (`require_sub`) rather than
-requiring equality. Homogeneous arms recover the old behavior; data-collection arms with
-distinct domains form the conditional-collection Σ. There is no `Mut`/`History` exception:
-a mutable read derefs into the join like any other, so a `Case` over two registers types as
-their value, and the second-class discipline still rejects a selected register reaching a
-write position because rule 1 reads the argument *node* rather than its type (see the
-merge-law bullets under [Refinements on the lattice](#refinements-on-the-lattice)).
-
-Consuming a conditional collection through a comprehension
-(`[f(x) for x in (box(xs) if c else box(ys))]`) compiles: `lower::comprehension` floats the
-source `Case` out of the map so it never becomes a Σ applied to an index, each arm is built
-as a data-kinded `Compose`, and the boxed arms then join into one Σ.
-
-#### The codomain join
-
-**The Σ is lossless on the domain and lossy on the codomain.** The shared body's element
-type is the ordinary covariant lattice join `τ₀ ⊔ τ₁` of the arms' codomains
-(`CompactFun::merge` merges the codomain at `pol`, the domains at `!pol`), forgetting which
-domain pairs with which element type. Where the LUB is a **structured coarsening** it does
-not error — record codomains intersect to their common fields, refinements drop to the
-shared base, both at any positive position. Where it is a **scalar union** it is
-unrepresentable, and that is the deferred piece: a function returning
-`[1, 2, 3] if flag else ["a", "b"]` would type as `Σ (𝑤 ∈ {[0,2], [0,1]}). 𝑤 ⤇ (Int|String)`,
-no longer recording "length 3 ⟹ all Int", and that codomain errors at coalesce with the
-same `IncompatibleBounds` rejection as `1 + true`. It is a positive atom-join,
-indistinguishable there from a binop-operand clash, which must stay a hard error — so the
-sound union waits on strict scalar consumers imposing concrete bounds.
-
-The asymmetry tracks whether loss is observable. Dropping an index drops a row and leaves
-no trace, so domains join into the candidate set and never meet. A coarsened codomain sits
-in the type and a consumer that needs `Int` fails at its own constraint site, so the
-shared-codomain Σ is a sound widening — a supertype of the correlated form, into which each
-arm injects. Preserving correlation by default would instead make every conditional
-collection a variant that every downstream consumer destructures, with nested conditionals
-multiplying the arms through the whole consumer graph.
-
-The correlated form is a tagged variant carrying each arm's own codomain,
-`Variant([(Index(0), α ⤇ τ₀), (Index(1), β ⤇ τ₁)])`. A program that needs a branch-aware
-consumer introduces the choice explicitly (`.Ints(xs) if flag else .Strs(ys)`) and
-`match`es it, so the case-split cost is paid by the code that benefits from it. Reaching it
-depends on tagged-variant **surface syntax** (`.Foo(x)` constructors plus `match`, the open
-part of [[type-checker-tagged-variants]]); until that ships the join is a forced loss with
-no recovery path rather than a chosen one.
-
-An unfactored `Σ 𝑇 ∈ {𝑇ᵢ}. 𝑇` has no shared codomain to join, so `box(1) if c else box("x")`
-is `Σ 𝑇 ∈ {Int, String}. 𝑇` with nothing coarsened. What is missing there is a rule for
-*consuming* one, not a representation
-([Deliberately incomplete here](#deliberately-incomplete-here)).
-
-**Flow-sensitive typing is declined.** An occurrence-typing language could keep the arms
-correlated through the path condition `flag` itself with no tag; Cambra does not narrow on
-an opaque `Bool`, and the tagged variant is the substitute.
-
-The codomain loss is orthogonal to the axis the witness recovers. The witness here is a
-*type*-witness (`TypeKind::Enumerated` — which branch domain was taken), so the Σ keeps the
-exact domain set. A Σ whose witness kind *describes* its domains recovers a different
-correlation — a conditionally-sized collection is `Σ (𝐷: UIntRanges). 𝐷 ⤇ 𝑇`, one shape for
-every length. Same `Type::Sigma` machinery either way; only the witness kind differs.
-
-The collection design built on this section is [collections.md](collections.md).
-
+The rest follows without further rules. Boxing where the arms agree costs nothing
+([Only a term builds a sum](#only-a-term-builds-a-sum) — a singleton sum does not collapse
+but is usable as its content). Nested conditionals flatten, because the width rule takes a
+candidate listing whole. `box(xs) if c else xs` is `𝑇ₓ`: a bare `𝑇` is an upper bound of
+`Σ 𝑈 ∈ {𝑇}. 𝑈` when the sum is consumed, and no sum is an upper bound of a bare `𝑇`, so the
+box is discarded rather than spreading.
 ### Only a term builds a sum
 
 `<:` has no rule that puts a value into a sum. Every sum is **first formed** by a term, and
@@ -1340,6 +1303,26 @@ that merge — `?d` against the witness — that resolves `?d` to `σ`. A residu
 to put it. Holding the whole body is what makes every Σ law an ordinary recursive merge
 instead of a destructure.
 
+#### One carrier per constructor
+
+Every sum reaches the graph through the `sigma` slot, and nothing else does.
+[`CompactFun::domain`] is one ordinary [`CompactType`] — a single domain — and a
+candidate *set* lives only on the witness a Σ binds ([`CompactSigma::kind`], a
+[`CompactWitnessKind`]).
+
+That separation is what makes the two constructors independent rather than two readings
+of one slot. It rests on two facts, and both are properties of the model rather than of
+the carrier: a join forms no sum (only `box` does), so two data functions over distinct
+domains never union their domains in place; and a consumed sum *names* its witness rather than
+putting one where a domain belongs. Coalesce asserts what is left — a data function's
+domain names exactly one domain — so the invariant fails loudly rather than by silently
+materializing a candidate set in a `fun` slot.
+
+The witness lives in that **slot** and not in the atom set. The atom set is a `BTreeSet` of
+nominal leaves that either match or do not, with no field-level subtyping, and a witness
+carrying a kind has exactly the field-level structure that excludes — as well as needing to
+be read back at materialization, which an `Ord`-constrained key could not carry the kind
+for.
 #### The merge laws are derived, not chosen
 
 Each is the least upper or greatest lower bound under `<:`, so each is derived rather than
@@ -1489,27 +1472,6 @@ and `box(box(xs) if p else box(ys)) if q else box(zs)` forms one flat
 `Σ 𝑤 ∈ {xs, ys, zs}. 𝑤 ⤇ 𝑉` rather than a nested Σ. A candidate domain is therefore always
 a ground data-function domain, never itself a Σ.
 
-#### One carrier per constructor
-
-Every sum reaches the graph through the `sigma` slot, and nothing else does.
-[`CompactFun::domain`] is one ordinary [`CompactType`] — a single domain — and a
-candidate *set* lives only on the witness a Σ binds ([`CompactSigma::kind`], a
-[`CompactWitnessKind`]).
-
-That separation is what makes the two constructors independent rather than two readings
-of one slot. It rests on two facts, and both are properties of the model rather than of
-the carrier: a join forms no sum (only `box` does), so two data functions over distinct
-domains never union their domains in place; and a consumed sum *names* its witness rather than
-putting one where a domain belongs. Coalesce asserts what is left — a data function's
-domain names exactly one domain — so the invariant fails loudly rather than by silently
-materializing a candidate set in a `fun` slot.
-
-The witness lives in that **slot** and not in the atom set. The atom set is a `BTreeSet` of
-nominal leaves that either match or do not, with no field-level subtyping, and a witness
-carrying a kind has exactly the field-level structure that excludes — as well as needing to
-be read back at materialization, which an `Ord`-constrained key could not carry the kind
-for.
-
 ### Witness kinds form a lattice
 
 A kind **classifies types**. [`TypeKind`] is therefore a level above [`Type`], with the
@@ -1579,6 +1541,51 @@ emit into, `contains_ground` requires the residue to be empty; sharing that one 
 between the compact lattice and the post-coalesce check is what keeps them from drifting
 from the Σ-width rule they must agree with. See [What the kind level needs from the
 solver](#what-the-kind-level-needs-from-the-solver).
+
+#### The wired witness kinds
+
+`TypeKind::Enumerated` is the finite listing [`box`](#only-a-term-builds-a-sum) builds.
+`TypeKind::UIntRanges` is the kind of every index range, which is what a `List` is:
+`List(𝑇) = Σ (𝐷: UIntRanges). 𝐷 ⤇ 𝑇`. They divide the grammar — **`Enumerated`
+classifies whole types and its Σ's body is the bare witness; a described kind classifies
+domains and its Σ's body is an arrow over the witness** — which is what tells the two
+shapes apart from the witness alone, with no flag to carry.
+
+Making `List` a *kind* rather than a scalar value-witness collapses its rules into the
+general one. `list([1, 2, 3])` checks `{[0, 3)} ⊆ UIntRanges`, the same containment
+Σ-width runs, reached from the entry term rather than from a subtyping edge. There is no
+`{𝑖 | 𝑖 < 𝑛}` domain refinement to discharge, because the kind already says "a dense prefix
+range" — which closes a hole the refinement had: a gate that strips refinements before
+testing for a range admits a *filtered* collection `{[0, 𝑘) | 𝑝} ⤇ 𝑇` into `List(𝑇)` and
+hands it the length witness `𝑘` for a domain with holes. A `Refinement` is not a
+`UIntRange`, so kind membership rejects it.
+
+Consuming either kind [names the witness](#consuming-a-sum-naming-the-witness) the same
+way. A described kind has no candidate list to present, so a rule that handed the sum over
+as the consumed domain would have nothing to hand over but the sum itself — which is why
+naming, and not presenting, is what makes the two kinds share one rule.
+
+A **bounded** `List(𝑇)` parameter annotation (`a <: List(𝑇)`) and a consumer's `𝐷 ⤇ 𝑉`
+demand are two upper bounds on one variable, and the solver never relates two upper bounds
+to each other — so `meet_witness_kinds` decides between a described kind and an enumerated
+candidate set by `TypeKind::contains`: containment means the listed side is the narrower,
+and an `Array(2, 𝑉)` demanded of a `List(𝑉)` parameter meets at the `Array`. Anything
+unordered conflicts loudly. The **exact** form has no such meet, because it leaves no
+variable for the two bounds to land on: `a: List(𝑇)` binds the parameter at `List(𝑇)`
+itself ([Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded)). Under
+the exact form a collection parameter is domain-abstract however concrete the argument is,
+so a comprehension over it gives back `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ 𝑇` rather than the caller's
+`[0, 2]`.
+
+Membership in a described kind tests a domain's shape, so a computed collection —
+whose domain is still a variable at emit — records a kinding constraint instead
+([What the kind level needs from the solver](#what-the-kind-level-needs-from-the-solver)).
+
+`TypeKind::Any` is two containment rows: everything is contained in the universe, and the
+universe in nothing narrower, which is what rejects consuming a `Collection` where a
+concrete domain is demanded. The **keyed** witness is the one still to be wired, as its own
+kind over a `Refinement(𝐾, ⟨opaque key token⟩)` domain — a new kind, not a new witness
+flavour.
 
 ### What the kind level needs from the solver
 
@@ -1848,6 +1855,21 @@ survives only as the reading of positions that predate this rule; a merged bag o
 alternatives is no longer produced on the join path, so the association between a candidate
 and its refinement is kept rather than guessed back.
 
+#### `Case` arms join by the lattice
+
+`emit_case` constrains every arm into a fresh result variable (`require_sub`) rather than
+requiring equality, so arms meet at their join. Homogeneous arms join to their common type;
+data-collection arms with distinct domains form the conditional-collection Σ. There is no `Mut`/`History` exception:
+a mutable read derefs into the join like any other, so a `Case` over two registers types as
+their value, and the second-class discipline still rejects a selected register reaching a
+write position because rule 1 reads the argument *node* rather than its type (see the
+merge-law bullets under [Refinements on the lattice](#refinements-on-the-lattice)).
+
+Consuming a conditional collection through a comprehension
+(`[f(x) for x in (box(xs) if c else box(ys))]`) compiles: `lower::comprehension` floats the
+source `Case` out of the map so it never becomes a Σ applied to an index, each arm is built
+as a data-kinded `Compose`, and the boxed arms then join into one Σ.
+
 ### A variable's lower bounds are one value
 
 **Where the pointwise closure looks wrong, and is not.** A variable's lower bounds are
@@ -2087,6 +2109,34 @@ The carrier says the same for the bound form: [`AtomKey::Witness`] is a bound nu
 standing for one candidate without saying which, so it matches only itself. Naming a witness
 reuses that law rather than adding one.
 
+#### The witness carries its range rather than the position carrying a constraint
+
+Recording the range on the free witness rather than as a separate kinding constraint on the
+position makes three otherwise-separate problems one fact:
+
+- **Binding can happen wherever it is needed.** Three places read the kind and only one has
+  the consumed sum in hand: the carrier's re-pairing of `𝑤 ⤇ 𝑉` into the sum, a
+  constraint-time comparison that runs before materialization, and the materialization of a
+  **lone** witness position. That last is a legitimate answer rather than an escape —
+  `Σ 𝑤 ∈ 𝐾. 𝑤`, "whichever domain the witness picked". With the kind recorded separately
+  it has nothing to bind over.
+- **The kind check stops running on a name.** Coalesce checks a kinding constraint by asking
+  whether the minimal kind containing the *resolved* type is contained in it. A position
+  that resolved to a witness fails that immediately — `{𝑤}` is not among a kind's concrete
+  domains — because the check is written for domains and a witness is a name for one.
+  Carrying the kind removes the separate constraint, so there is nothing to check against
+  the name.
+- **`𝑈 <: 𝑤` becomes a legitimate edge.** A consumer handed a sum standing where a domain
+  belongs meets a concrete demand as `𝑈 <: Σ …`, an edge into a sum, which this design does
+  not have. A free witness is a **domain**, so both sides are domains and the question is
+  membership in a kind rather than entry into a sum.
+
+Membership holds only for a **determined** witness — a kind naming exactly one domain. A
+kind naming several leaves the witness free to be any of them, and accepting a concrete
+demand would pin it to one, the silent narrowing
+[Data domains are invariant](#data-domains-are-invariant) rules out. So transparency through
+the range means transparent when the range *determines* the witness, not whenever it admits
+it. Pinned by `conditional_consumed_as_fun`.
 #### Naming a position is not filling it
 
 Both witness forms *name* the position they stand in rather than contributing content to it,
@@ -2187,35 +2237,6 @@ instead cannot work, because coalesce runs bottom-up and at the point a type is 
 nothing knows what binds it from outside. Such a check can only ask about the shape of the
 type in hand, which forces an exception for a bare witness at an *index* position, whose
 binder belongs to the enclosing collection. With a real scope that node is simply in scope.
-
-#### The witness carries its range rather than the position carrying a constraint
-
-Recording the range on the free witness rather than as a separate kinding constraint on the
-position makes three otherwise-separate problems one fact:
-
-- **Binding can happen wherever it is needed.** Three places read the kind and only one has
-  the consumed sum in hand: the carrier's re-pairing of `𝑤 ⤇ 𝑉` into the sum, a
-  constraint-time comparison that runs before materialization, and the materialization of a
-  **lone** witness position. That last is a legitimate answer rather than an escape —
-  `Σ 𝑤 ∈ 𝐾. 𝑤`, "whichever domain the witness picked". With the kind recorded separately
-  it has nothing to bind over.
-- **The kind check stops running on a name.** Coalesce checks a kinding constraint by asking
-  whether the minimal kind containing the *resolved* type is contained in it. A position
-  that resolved to a witness fails that immediately — `{𝑤}` is not among a kind's concrete
-  domains — because the check is written for domains and a witness is a name for one.
-  Carrying the kind removes the separate constraint, so there is nothing to check against
-  the name.
-- **`𝑈 <: 𝑤` becomes a legitimate edge.** A consumer handed a sum standing where a domain
-  belongs meets a concrete demand as `𝑈 <: Σ …`, an edge into a sum, which this design does
-  not have. A free witness is a **domain**, so both sides are domains and the question is
-  membership in a kind rather than entry into a sum.
-
-Membership holds only for a **determined** witness — a kind naming exactly one domain. A
-kind naming several leaves the witness free to be any of them, and accepting a concrete
-demand would pin it to one, the silent narrowing
-[Data domains are invariant](#data-domains-are-invariant) rules out. So transparency through
-the range means transparent when the range *determines* the witness, not whenever it admits
-it. Pinned by `conditional_consumed_as_fun`.
 
 #### Realization asserts rather than rewrites
 
