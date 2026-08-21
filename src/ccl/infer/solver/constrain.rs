@@ -177,7 +177,7 @@ impl Derivation {
     /// holder's telescope (`src/ccl/design/type-inference.md`, "The invariant").
     /// Every derivation over a self-contained tree does. Only a sub-tree probe
     /// is excused, because its absent context is what carries the binders.
-    fn enforces_closure(self) -> bool {
+    pub(crate) fn enforces_closure(self) -> bool {
         self != Derivation::SubTree
     }
 
@@ -780,12 +780,7 @@ fn constrain_go_impl(
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
                 let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone());
-                crate::ccl::infer_var::observe_bound_scope(
-                    lv,
-                    "upper",
-                    &bound,
-                    cache.derivation.enforces_closure(),
-                );
+                crate::ccl::infer_var::observe_bound_scope(lv, "upper", &bound, cache.derivation);
                 let mut s = lv.bounds.borrow_mut();
                 s.upper_mut().push(bound);
                 Rc::clone(s.lower())
@@ -820,12 +815,7 @@ fn constrain_go_impl(
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
                 let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone());
-                crate::ccl::infer_var::observe_bound_scope(
-                    rv,
-                    "lower",
-                    &bound,
-                    cache.derivation.enforces_closure(),
-                );
+                crate::ccl::infer_var::observe_bound_scope(rv, "lower", &bound, cache.derivation);
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);
                 Rc::clone(s.upper())

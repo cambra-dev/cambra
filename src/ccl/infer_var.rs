@@ -383,12 +383,20 @@ pub(crate) fn bound_scope_gaps(
 /// probe over a sub-tree, whose free references its absent context binds. The
 /// tag is what keeps the log a measurement of escapes rather than a count of
 /// sub-tree checks.
+///
+/// Takes the [`Derivation`] rather than a decision about it: which derivations
+/// enforce is one question with one answer
+/// ([`Derivation::enforces_closure`]), and a caller passing a bool would be the
+/// second place it is answered.
+///
+/// [`Derivation::enforces_closure`]: crate::ccl::infer::solver::Derivation
 pub(crate) fn observe_bound_scope(
     holder: &InferVar,
     side: &'static str,
     bound: &Bound,
-    enforce: bool,
+    derivation: crate::ccl::infer::solver::Derivation,
 ) {
+    let enforce = derivation.enforces_closure();
     #[cfg(debug_assertions)]
     {
         use std::sync::OnceLock;
@@ -702,7 +710,12 @@ mod tests {
             Refinement::born(StdRc::new(TypedExpr::var(Name::fresh("escaped")))),
         );
         let holder = InferVar::fresh(0);
-        observe_bound_scope(&holder, "lower", &Bound::conc(dep), true);
+        observe_bound_scope(
+            &holder,
+            "lower",
+            &Bound::conc(dep),
+            crate::ccl::infer::solver::Derivation::LiveSolve,
+        );
     }
 
     /// A [`Name::Raw`] gap is an internal error like any other. The form does
@@ -721,7 +734,12 @@ mod tests {
             Refinement::born(StdRc::new(TypedExpr::var(Name::raw("a")))),
         );
         let holder = InferVar::fresh(0);
-        observe_bound_scope(&holder, "lower", &Bound::conc(dep), true);
+        observe_bound_scope(
+            &holder,
+            "lower",
+            &Bound::conc(dep),
+            crate::ccl::infer::solver::Derivation::LiveSolve,
+        );
     }
 
     /// A fresh variable's lists are the shared empty one, so minting costs no

@@ -7,6 +7,7 @@ use crate::ccl::infer::solver::{
     ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
+use crate::ccl::infer_var::Telescope;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{BaseType, Expr, Level, Name, Type, TypedExprNode};
@@ -72,7 +73,7 @@ pub(super) struct CheckCtx {
     /// it mints sit at lexical positions like Emit's, so they carry the live
     /// telescope and the record-time closure observation stays meaningful in
     /// both modes.
-    telescope: crate::ccl::infer_var::Telescope,
+    telescope: Telescope,
     /// Whether this walk has the whole tree or a sub-tree cut from its context
     /// — the two answer the closure invariant differently. See [`Derivation`].
     derivation: Derivation,
@@ -89,7 +90,7 @@ impl CheckCtx {
             errors: Vec::new(),
             pred_memo: Default::default(),
             current_node: root,
-            telescope: crate::ccl::infer_var::Telescope::empty(),
+            telescope: Telescope::empty(),
             derivation,
         }
     }
