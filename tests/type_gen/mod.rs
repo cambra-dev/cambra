@@ -1,0 +1,209 @@
+//! Seeded generation of variable-free `Type`s, shared by the integration tests that
+//! fuzz the solver. Deterministic and dependency-free, so a failing case
+//! replays from its seed.
+//!
+//! A test binary uses only part of this, so each item is `allow(dead_code)`:
+//! `mod type_gen;` compiles the whole module into every including binary, and
+//! `tests/constraint_order_fuzz.rs` does not generate the leaves and predicates
+//! directly the way an edit-driven harness does.
+#![allow(dead_code)]
+
+use std::rc::Rc;
+
+use smol_str::SmolStr;
+
+use cambra::ccl::{
+    BaseType, BinOpKind, CompareKind, FieldKey, FunKind, FunKindVar, Lit, Name, Openness,
+    Refinement, Type, TypedExpr,
+};
+
+/// A seed or case count from the environment, or `default`. Every harness here
+/// is replayable from its seed, which means every harness reads the same two
+/// knobs; one reader keeps them spelled once.
+pub fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// xorshift64* — deterministic, dependency-free.
+pub struct Rng(pub u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Rng(seed | 1)
+    }
+    pub fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    pub fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    pub fn chance(&mut self, num: u64, den: u64) -> bool {
+        self.below(den) < num
+    }
+}
+
+/// A predicate from the model's `Pred` vocabulary: `__elem`, literals, a
+/// binder reference, or `__elem == <binder>` (the dependent-refinement
+/// shape). Structural equality is all subtyping observes, so a small closed
+/// set that can collide and differ is enough.
+pub fn gen_pred(rng: &mut Rng) -> Rc<TypedExpr> {
+    match rng.below(6) {
+        0 => Rc::new(TypedExpr::var(Name::elem())),
+        1 => Rc::new(TypedExpr::lit(Lit::Bool(true))),
+        2 => Rc::new(TypedExpr::lit(Lit::Int(rng.below(3) as i64))),
+        _ => {
+            let x = if rng.chance(1, 2) { "x" } else { "y" };
+            Rc::new(TypedExpr::binop(
+                TypedExpr::var(Name::elem()),
+                BinOpKind::Compare(CompareKind::Equals),
+                TypedExpr::var(Name::raw(x)),
+            ))
+        }
+    }
+}
+
+pub fn gen_leaf(rng: &mut Rng) -> Type {
+    match rng.below(6) {
+        0 => Type::Base(BaseType::Int),
+        1 => Type::Base(BaseType::Bool),
+        2 => Type::Base(BaseType::String),
+        3 => Type::UIntRange(2 + rng.below(3) as usize),
+        4 => Type::DataSource(if rng.chance(1, 2) { "s" } else { "t" }.into()),
+        _ => Type::Txn,
+    }
+}
+
+/// The kind variables one generated constraint set draws from.
+///
+/// Sharing is the point. A variable minted per generated type is written by at
+/// most one constraint, which leaves the relation `constrain_kind` records
+/// between two kind variables unobservable: nothing checks whether a pin reaches
+/// the far side, or whether it still does when it arrives after the edge. Drawing
+/// from a pool gives a set a few variables spread across many constraints, so a
+/// pin recorded by one is read through another.
+pub struct KindVarPool(Vec<Rc<FunKindVar>>);
+
+impl Default for KindVarPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KindVarPool {
+    pub fn new() -> Self {
+        KindVarPool(Vec::new())
+    }
+
+    /// One of the variables already handed out, or a fresh one. Biased toward
+    /// reuse, since a set of all-distinct variables is the case that already had
+    /// coverage.
+    fn pick(&mut self, rng: &mut Rng) -> Rc<FunKindVar> {
+        if !self.0.is_empty() && rng.chance(2, 3) {
+            let i = rng.below(self.0.len() as u64) as usize;
+            return Rc::clone(&self.0[i]);
+        }
+        let v = FunKindVar::fresh();
+        self.0.push(Rc::clone(&v));
+        v
+    }
+}
+
+/// Replace a function's concrete kind with a kind *variable* from `pool`
+/// (sometimes, top-level only). Nothing else produces one: [`gen_ty`] stamps a
+/// concrete `FunKind`, so the states only a variable kind reaches —
+/// `KindMerge::Unknown`, and `constrain_kind`'s variable-against-variable arm —
+/// are unreachable without this. A kind variable holds mutable state behind an
+/// `Rc` (its pin, and the variables it is related to), which is why a generator
+/// that replays re-runs rather than cloning.
+pub fn maybe_kind_var_from(rng: &mut Rng, pool: &mut KindVarPool, t: Type) -> Type {
+    match t {
+        Type::Fun {
+            name,
+            kind: _,
+            domain,
+            codomain,
+        } if rng.chance(1, 2) => Type::Fun {
+            name,
+            kind: FunKind::Var(pool.pick(rng)),
+            domain,
+            codomain,
+        },
+        other => other,
+    }
+}
+
+/// [`maybe_kind_var_from`] with a pool of its own, so the variable is fresh — for
+/// a harness whose cases are independent and share nothing.
+pub fn maybe_kind_var(rng: &mut Rng, t: Type) -> Type {
+    maybe_kind_var_from(rng, &mut KindVarPool::new(), t)
+}
+
+pub fn gen_ty(rng: &mut Rng, depth: u32) -> Type {
+    if depth == 0 || rng.chance(1, 3) {
+        return gen_leaf(rng);
+    }
+    match rng.below(5) {
+        0 => {
+            let kind = if rng.chance(1, 2) {
+                FunKind::Data
+            } else {
+                FunKind::Compute
+            };
+            let domain = gen_ty(rng, depth - 1);
+            let name = match rng.below(3) {
+                0 => None,
+                1 => Some(Name::raw("x")),
+                _ => Some(Name::raw("y")),
+            };
+            // With a Pi binder present, bias the codomain toward a dependent
+            // refinement so the binder correspondence actually fires.
+            let codomain = if name.is_some() && rng.chance(1, 2) {
+                Type::refined_one(gen_ty(rng, depth - 1), Refinement::born(gen_pred(rng)))
+            } else {
+                gen_ty(rng, depth - 1)
+            };
+            Type::Fun {
+                name,
+                kind,
+                domain: Box::new(domain),
+                codomain: Box::new(codomain),
+            }
+        }
+        1 => Type::Tuple((0..rng.below(3)).map(|_| gen_ty(rng, depth - 1)).collect()),
+        2 => {
+            let mut fields = Vec::new();
+            for key in ["a", "b", "c"] {
+                if rng.chance(1, 2) {
+                    fields.push((key.to_string(), gen_ty(rng, depth - 1)));
+                }
+            }
+            Type::Record(fields)
+        }
+        3 => {
+            let mut tags = Vec::new();
+            if rng.chance(1, 2) {
+                for key in ["t0", "t1"] {
+                    if rng.chance(2, 3) {
+                        tags.push((FieldKey::Name(SmolStr::from(key)), gen_ty(rng, depth - 1)));
+                    }
+                }
+            } else {
+                for i in 0..rng.below(3) {
+                    tags.push((FieldKey::Index(i as usize), gen_ty(rng, depth - 1)));
+                }
+            }
+            // Closed: an open arm set is only ever *demanded*, never produced, so
+            // a generated type — which stands in for a value's type — is closed.
+            Type::Variant(tags, Openness::Closed)
+        }
+        _ => Type::refined_one(gen_ty(rng, depth - 1), Refinement::born(gen_pred(rng))),
+    }
+}

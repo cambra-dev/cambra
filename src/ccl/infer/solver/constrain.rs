@@ -20,7 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::ty::FunKind;
+use crate::ccl::ty::{FunKind, FunKindVar};
 use crate::ccl::{
     BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, RefinementSet,
     Type,
@@ -185,7 +185,7 @@ impl Derivation {
     /// Whether a closed `Fun`/`Fun` codomain opens unconditionally rather than
     /// only toward a side carrying inference variables. A re-derivation is
     /// reconciling two passes' spellings of one type; the live solve is not, and
-    /// opening a ground pair at display names lets a free reference sharing a
+    /// opening a concrete pair at display names lets a free reference sharing a
     /// binder's spelling capture the reopened index.
     fn opens_unconditionally(self) -> bool {
         self != Derivation::LiveSolve
@@ -278,22 +278,25 @@ fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<bool, ()> {
             v.pin_data();
             Ok(true)
         }
-        // Two variables meeting record nothing. What the pair resolves to is not
-        // known at this edge, and deciding it from pins that arrive later
-        // would make typing depend on constraint order; each is pinned by the
-        // concrete kind that reaches it, if one does. See [`FunKindVar`].
+        // The edge **relates** the two kinds; it does not resolve them. What the
+        // pair resolves to is not known here, so recording the edge and joining
+        // over it at the read ([`FunKindVar::pin`]) is what makes the answer a
+        // function of the whole constraint set rather than of its order. Copying
+        // each side's pin onto the other instead would answer from the pins that
+        // happen to have arrived, and drop every one that arrives later: `a—b`
+        // recorded while both are unpinned, then `a` pinned, would leave `b`
+        // unpinned, while the other order pinned both — the two coalescing to
+        // different arrows. Deferring the join to the read is the same rule the
+        // domain combination follows, and for the same reason: a value the fold is
+        // still accumulating cannot be read pairwise
+        // ([`super::compact::KindMerge`]).
         //
-        // Carrying nothing is only sound while the two sides agree, since a pin
-        // on one side would otherwise be dropped. No program in the suite reaches
-        // this arm at all, so the guard is what would notice one starting to: it
-        // catches a disagreement already present, not one a later pin creates.
+        // Still not a *data* edge (`Ok(false)`): whether the domains must join
+        // losslessly is a question about what the edge demands, and this edge
+        // demands nothing of either kind. Two `Data`-pinned variables therefore
+        // reach the lossless-domain rule through their pins, not through here.
         (Var(a), Var(b)) => {
-            debug_assert_eq!(
-                a.pin(),
-                b.pin(),
-                "a var-var kind edge relates two differently-pinned kinds, so this \
-                 arm would drop one side's pin"
-            );
+            FunKindVar::relate(a, b);
             Ok(false)
         }
     }
@@ -577,13 +580,13 @@ fn constrain_go_impl(
             //
             // On the live solve, opening is gated on the **opposite** side
             // carrying inference variables: only a live side records
-            // bounds, so only there would a dangling index land. A ground
+            // bounds, so only there would a dangling index land. A concrete
             // closed-closed pair compares index-to-index instead — opening it
             // at display names would let an unrelated *free* reference that
             // happens to share the binder's spelling capture the reopened
             // index (found by the differential oracle; with uniquified
             // binders the collision needs the same uid, which *is* the same
-            // binder, but the ground relation must not depend on that
+            // binder, but the concrete relation must not depend on that
             // convention). A post-pass re-derivation opens unconditionally: it
             // reconciles types that different passes spelled in different
             // forms (a closed function's codomain against a rebuilt,
@@ -1358,7 +1361,7 @@ mod tests {
         )
     }
 
-    /// The `Fun`/`Fun` opening does not fire between two ground sides, so a free
+    /// The `Fun`/`Fun` opening does not fire between two concrete sides, so a free
     /// reference sharing a binder's display spelling cannot capture the reopened
     /// index.
     ///
@@ -1367,9 +1370,9 @@ mod tests {
     /// whatever binds `x` outside the type. Opening the closed side at its
     /// display name spells both `__elem == x` and reads them as one. Uniquified
     /// binders make the collision need the same uid, which is the same binder,
-    /// and the ground relation must not depend on that convention.
+    /// and the concrete relation must not depend on that convention.
     #[test]
-    fn a_ground_pair_does_not_open_at_a_shared_spelling() {
+    fn a_concrete_pair_does_not_open_at_a_shared_spelling() {
         let x = Name::raw("x");
         let refinement = |referenced: &Name| {
             Type::Refinement(
@@ -1639,7 +1642,7 @@ mod tests {
         // base variable ?a can acquire the deficit {p}, so the constraint
         // succeeds by flowing `?a <: {Int | p}`. This is what lets a value
         // that is *already* refined be cast to add a further refinement (nested
-        // list-comprehension filters: `{D|p} ⇒ V <: {?a|q} ⇒ V`); a ground
+        // list-comprehension filters: `{D|p} ⇒ V <: {?a|q} ⇒ V`); a concrete
         // `{p} ⊆ {q}` check would reject it.
         let (p, q) = (1, 2);
         let a = fresh_var(0);
@@ -2511,6 +2514,170 @@ mod tests {
             ),
             Err(ConstrainError::KindMismatch { .. })
         ));
+    }
+
+    /// A function over a fixed domain and codomain, so a test varies only the
+    /// kind — which is the only thing `constrain_kind` reads.
+    fn kind_fun(kind: FunKind) -> Type {
+        Type::Fun {
+            name: None,
+            kind,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(prim(BaseType::Int)),
+        }
+    }
+
+    #[test]
+    fn a_var_var_kind_edge_makes_each_side_read_the_other_s_pin() {
+        // The edge relates the two kinds, so a pin either side carries is a pin
+        // both read — whichever side it was recorded on.
+        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        let mut cache = ConstrainCache::new();
+        // Pin `a` to compute, leaving `b` unpinned.
+        constrain_subtype(
+            &kind_fun(FunKind::Var(Rc::clone(&a))),
+            &kind_fun(FunKind::Compute),
+            &mut cache,
+        )
+        .expect("a var meeting Compute records the pin");
+        assert_eq!(a.pin(), KindPin::Compute);
+        assert_eq!(b.pin(), KindPin::Unpinned);
+
+        constrain_subtype(
+            &kind_fun(FunKind::Var(Rc::clone(&b))),
+            &kind_fun(FunKind::Var(Rc::clone(&a))),
+            &mut cache,
+        )
+        .expect("a var-var kind edge is never a rejection");
+        assert_eq!(
+            b.pin(),
+            KindPin::Compute,
+            "the unpinned side reads the other's pin"
+        );
+        assert_eq!(
+            a.pin(),
+            KindPin::Compute,
+            "and the pinned side is unchanged"
+        );
+    }
+
+    /// A pin arriving **after** the edge crosses it, which is what makes the arm
+    /// order-independent: the join is folded at the read, so it sees every pin the
+    /// component ever acquired rather than the ones present when the edge landed.
+    #[test]
+    fn a_pin_arriving_after_a_var_var_kind_edge_still_crosses_it() {
+        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        // The edge first, both sides unpinned — nothing to carry.
+        constrain_subtype(
+            &kind_fun(FunKind::Var(Rc::clone(&a))),
+            &kind_fun(FunKind::Var(Rc::clone(&b))),
+            &mut ConstrainCache::new(),
+        )
+        .expect("a var-var kind edge is never a rejection");
+        assert_eq!(a.pin(), KindPin::Unpinned);
+        assert_eq!(b.pin(), KindPin::Unpinned);
+
+        // Then a concrete kind reaches `a` only.
+        constrain_subtype(
+            &kind_fun(FunKind::Var(Rc::clone(&a))),
+            &kind_fun(FunKind::Data),
+            &mut ConstrainCache::new(),
+        )
+        .expect("a var meeting Data records the pin");
+        assert_eq!(a.pin(), KindPin::Data);
+        assert_eq!(
+            b.pin(),
+            KindPin::Data,
+            "the far side of the edge reads a pin that arrived after it"
+        );
+    }
+
+    /// The relation is transitive at the read, because the join folds the whole
+    /// component and not just one edge's far end.
+    #[test]
+    fn a_pin_crosses_a_chain_of_var_var_kind_edges() {
+        let (a, b, c) = (
+            FunKindVar::fresh(),
+            FunKindVar::fresh(),
+            FunKindVar::fresh(),
+        );
+        for (x, y) in [(&a, &b), (&b, &c)] {
+            constrain_subtype(
+                &kind_fun(FunKind::Var(Rc::clone(x))),
+                &kind_fun(FunKind::Var(Rc::clone(y))),
+                &mut ConstrainCache::new(),
+            )
+            .expect("a var-var kind edge is never a rejection");
+        }
+        constrain_subtype(
+            &kind_fun(FunKind::Var(Rc::clone(&a))),
+            &kind_fun(FunKind::Data),
+            &mut ConstrainCache::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.pin(),
+            KindPin::Data,
+            "two edges away, and still one answer"
+        );
+        assert_eq!(b.pin(), KindPin::Data);
+        assert_eq!(a.pin(), KindPin::Data);
+    }
+
+    /// Pinning either end of a related pair to a different point is the conflict,
+    /// read from every member — the pins are joined, never arbitrated.
+    #[test]
+    fn a_var_var_kind_edge_between_disagreeing_pins_conflicts_from_either_end() {
+        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        constrain_subtype(
+            &kind_fun(FunKind::Var(Rc::clone(&a))),
+            &kind_fun(FunKind::Var(Rc::clone(&b))),
+            &mut ConstrainCache::new(),
+        )
+        .unwrap();
+        constrain_subtype(
+            &kind_fun(FunKind::Var(Rc::clone(&a))),
+            &kind_fun(FunKind::Compute),
+            &mut ConstrainCache::new(),
+        )
+        .unwrap();
+        constrain_subtype(
+            &kind_fun(FunKind::Var(Rc::clone(&b))),
+            &kind_fun(FunKind::Data),
+            &mut ConstrainCache::new(),
+        )
+        .unwrap();
+        assert_eq!(a.pin(), KindPin::Conflict);
+        assert_eq!(b.pin(), KindPin::Conflict);
+    }
+
+    #[test]
+    fn a_var_var_kind_edge_between_disagreeing_pins_is_a_conflict() {
+        // Absorption, not arbitration: holding both points is `Conflict`, exactly
+        // as on a concrete edge, and coalesce reports it.
+        let fun_over = kind_fun;
+        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(
+            &fun_over(FunKind::Var(Rc::clone(&a))),
+            &fun_over(FunKind::Compute),
+            &mut cache,
+        )
+        .unwrap();
+        constrain_subtype(
+            &fun_over(FunKind::Var(Rc::clone(&b))),
+            &fun_over(FunKind::Data),
+            &mut cache,
+        )
+        .unwrap();
+        constrain_subtype(
+            &fun_over(FunKind::Var(Rc::clone(&a))),
+            &fun_over(FunKind::Var(Rc::clone(&b))),
+            &mut cache,
+        )
+        .expect("the edge records the join; the rejection is coalesce's");
+        assert_eq!(a.pin(), KindPin::Conflict);
+        assert_eq!(b.pin(), KindPin::Conflict);
     }
 
     #[test]

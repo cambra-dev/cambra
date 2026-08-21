@@ -1246,9 +1246,9 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
 }
 
 /// Whether `ty`'s structural skeleton contains an unresolved [`Type::Infer`]
-/// leaf. This is the per-type dual of `check_fully_typed`'s whole-program scan:
-/// a cheap "is this type ground" predicate for invariant assertions at pass
-/// boundaries. It walks the type skeleton only — a `Refinement`'s predicate is
+/// leaf — the negation of **concrete** for the one variant that survives
+/// solving ([`Type`]). This is the per-type dual of `check_fully_typed`'s
+/// whole-program scan, for invariant assertions at pass boundaries. It walks the type skeleton only — a `Refinement`'s predicate is
 /// a term, not a type, and is not descended into (an `Infer` embedded in a
 /// predicate cast is out of scope and would need a term walk).
 pub fn type_contains_infer(ty: &Type) -> bool {
