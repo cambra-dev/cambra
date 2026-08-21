@@ -60,7 +60,7 @@ y <<= x
 y"#, make_int_list(&[0, 1]))]
 // Cross-cluster defer reference: `y` and `x` are separated by an
 // intervening non-Defer `let some_var = 5`, and `y` depends on `x`
-// (via define).  The desugar pass must topologically order the defers
+// (via define).  The channelize pass must topologically order the defers
 // across the intervening let so `x` is bound before `y`.
 #[case(
 r#"x = defer()
@@ -412,7 +412,7 @@ fn scalar_define_into_defer_is_rejected() {
 
 /// Type errors in defer programs are reported against the *user's* program
 /// shape: inference now runs before `channelize`, so the rendered
-/// message must not leak desugar artifacts (floated parameters, `to_<defer>`
+/// message must not leak channelize artifacts (floated parameters, `to_<defer>`
 /// record fields, channel unions, scope-out bindings).
 #[rstest]
 #[timeout(Duration::from_secs(1))]
@@ -442,7 +442,7 @@ x"#;
     ] {
         assert!(
             !rendered.contains(artifact),
-            "desugar artifact `{artifact}` leaked into a user-facing type error:\n{rendered}"
+            "channelize artifact `{artifact}` leaked into a user-facing type error:\n{rendered}"
         );
     }
 }

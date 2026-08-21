@@ -581,7 +581,7 @@ impl Typing for InferCtx {
             .lower_mut()
             .push(crate::ccl::Bound::with_subst(
                 result,
-                crate::ccl::subst::Subst::discharge(&x, argument.clone()),
+                crate::ccl::subst::Subst::discharge(&x, argument.clone_preserving_ids()),
             ));
         Ok(applied)
     }

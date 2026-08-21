@@ -200,7 +200,7 @@ pub(super) fn uncurry_params(
         // three nodes as machinery leaves.
         //
         // The template itself never enters the tree. Its two interior ids reach
-        // the tree as the freshened copies the frame below captures, so they are
+        // the tree as the freshened copies the recording below captures, so they are
         // origins of live nodes; its ROOT does not — each occurrence's own id
         // replaces it — so that one id is tagged and then carried by nothing.
         // Harmless in the product (the projection is filtered to the output tree,
@@ -280,7 +280,7 @@ pub(super) fn lower_lambda(
 /// what buys occurrence fidelity here: every `x` in `def f(x, y)`'s body becomes
 /// its own `__arg_tuple.0` whose root still points at that `x`'s span, rather
 /// than every projection mirroring the one shared `def` span. The interior
-/// freshens land as ambient `Copy`s in the open lowering copy-frame below,
+/// freshens land as ambient `Copy`s in the open lowering copy sink below,
 /// mirroring the template's machinery attribution — so every substituted node
 /// stays covered by the lowering fold.
 ///
@@ -292,8 +292,8 @@ pub(super) fn lower_lambda(
 fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
     use crate::ccl::lineage::copy_frame;
     let mut expr = expr;
-    // A lowering copy-frame: the discharge's interior freshens fire `on_copy`
-    // into this frame, which flushes them as `Copy` LoweringSteps (mirroring the
+    // A lowering copy sink: the discharge's interior freshens fire `on_copy` into
+    // this recording, which writes them as `Copy` LoweringSteps (mirroring the
     // template) into the always-on lowering log. A no-op when no session is
     // installed (the lower unit tests).
     let _frame = copy_frame("lower.uncurry_proj");
@@ -443,7 +443,7 @@ in add"
     #[test]
     fn uncurry_projection_roots_carry_occurrence_spans() {
         use crate::ccl::TypedExprNode;
-        use crate::ccl::lineage::{Nature, RecorderSession, SourceProjection, collapse_lowering};
+        use crate::ccl::lineage::{LoweringSession, Nature, SourceProjection, collapse_lowering};
         use crate::ccl::provenance::NodeId;
         use crate::chl_parser::ast::Span;
         use std::collections::HashSet;
@@ -457,11 +457,11 @@ in add"
 
         let stmts = parse_module(src);
         let mut ctx = LoweringContext::default();
-        let session = RecorderSession::lowering();
+        let session = LoweringSession::install();
         let ccl = lower_stmts(&stmts, &mut ctx)
             .into_result()
             .expect("lowering failed");
-        let log = session.into_lowering_log();
+        let log = session.into_log();
 
         let mut ids: HashSet<NodeId> = HashSet::new();
         fn all_ids(e: &Expr, acc: &mut HashSet<NodeId>) {

@@ -1122,8 +1122,8 @@ fn elim_lambda_impl(
             // to the bound expression (design §6.2 move-site rule) — the same
             // substitution inference's let-closing and `emit_let` apply, so
             // the post-elim check's reconstruction reconciles structurally.
-            let let_ty =
-                crate::ccl::subst::Subst::discharge(&v, new_def.clone()).apply_type(&result_ty);
+            let let_ty = crate::ccl::subst::Subst::discharge(&v, new_def.clone_preserving_ids())
+                .apply_type(&result_ty);
             Ok(Expr::let_bind(v, new_def, new_body).with_ty(let_ty))
         }
 
@@ -1737,10 +1737,23 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         // List, ExprStmt, Feed, Define, and the atoms (no children to walk).
         node => {
             // TODO(preserve): a pure structural recursion rebuilds the same
-            // logical node, so this is arguably `Expr::preserve(node_id, node)`
-            // carrying the input's id rather than a mint. Minting here is at
-            // least *recorded* (via `Expr::new`); settling mint-vs-preserve for
+            // logical node, so `Expr::preserve(node_id, node)` carrying the
+            // input's id would serve as well as this mint. It would buy id
+            // correspondence across the pass: a pre-elim id would still name the
+            // same node afterwards.
+            //
+            // `planning/groupby` blocks it. That recognizer lifts a key function
+            // out of a refinement predicate into the term tree, and relies on
+            // `lambda_elim::run` re-minting every node so the lifted copy carries
+            // no id that is still live elsewhere. Preserving ids here lands
+            // duplicates at that lift, which
+            // `groupby_recognition_lifts_the_key_without_aliasing` pins as a
+            // property rather than as a mechanism. Settling mint-vs-preserve for
             // the catch-all arm wants its own change.
+            //
+            // Neither choice writes a lineage row: this file opens no recording,
+            // and `compile_program` runs `lambda_elim::run` outside every pass
+            // scope it opens.
             let mut expr = Expr::new(node).with_ty(ty);
             expr.user_annotation = user_annotation;
             expr.try_map_children(|child| elim_lambdas(ctx, child))?;
@@ -2284,7 +2297,7 @@ mod tests {
     fn elim_and_typecheck(binder: &str, binder_ty: Type, body: Expr) -> String {
         let result = run(Expr::lambda(binder, binder_ty, body)).expect("lambda elimination");
         assert_eq!(
-            crate::ccl::infer::check_pre_desugar(&result),
+            crate::ccl::infer::check_pre_channelize(&result),
             Ok(()),
             "the eliminated form must typecheck: {}",
             crate::ccl::symbolic::symbolic_typed(&result)

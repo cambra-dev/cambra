@@ -18,7 +18,7 @@ use cambra::ccl::{
     FieldKey, HistoryKind, Lit, PredicateId, Type,
     ccl_utils::walk_refined_predicates,
     infer::{
-        InferError, LocatedInferError, TypeInferenceContext, check_pre_desugar, infer,
+        InferError, LocatedInferError, TypeInferenceContext, check_pre_channelize, infer,
         lit_singleton,
     },
     lower::{LoweringContext, lower_stmts},
@@ -1954,7 +1954,7 @@ fn infer_and_check(code: &str) -> Type {
         .into_result()
         .expect("lowering failed");
     let ty = infer(&mut expr, &mut ictx).expect("inference failed");
-    check_pre_desugar(&expr)
+    check_pre_channelize(&expr)
         .expect("post-inference consistency wall must accept the inferred tree");
     ty
 }
@@ -2140,7 +2140,7 @@ fn test_fed_defer_reads_through_aggregate() {
 fn test_defer_chain_flattens_feeds() {
     // `x <<= y` sets x's channel to y's whole stream. A feed reads through as
     // its stream, so x gets y's stream directly (a single feed layer, not
-    // nested); desugar later binds x to y's channel.
+    // nested); channelize later binds x to y's channel.
     let ty = infer_program("x = defer()\ny = defer()\nx <<= y\ny <<= [0, 1]\nx");
     assert_eq!(*feed_value(&ty), int());
 }

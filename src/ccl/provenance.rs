@@ -2,12 +2,16 @@
 //!
 //! # Purpose
 //!
-//! Cambra lowers source through a chain of passes (lowering → uniquify →
-//! infer → inline → lambda-elim → planning). Every IR expression node carries a
-//! stable [`NodeId`] so its identity survives across those passes, and each
-//! rewrite records — through the lineage recorder in [`crate::ccl::lineage`] —
-//! how the node it produced relates to the nodes it consumed. That lineage
-//! folds, at each inspector pane boundary, into a
+//! Cambra lowers source through a chain of passes, and [`Pass`] tags the one
+//! that produced a node. In pipeline order those are `Lower`, `Uniquify`,
+//! `Mono` (inside inference), `Inline`, `Transact`, `Letrec`, `Channelize`,
+//! `LambdaElim`, `Planning` — the order `compile_program` runs them in
+//! (`crate::ccl::context`). Every IR expression node carries a stable
+//! [`NodeId`] so its identity survives across those passes, and each rewrite
+//! records — through the lineage recorder in [`crate::ccl::lineage`] — how the
+//! node it produced relates to the nodes it consumed.
+//! `CompiledProgram::materialize_panes` folds that lineage, at each pane
+//! boundary, into a
 //! [`SourceProjection`](crate::ccl::lineage::SourceProjection) mapping a node
 //! back to the source spans it traces to. This module owns only the two
 //! identity primitives that lineage is parameterized over: the node id and the
@@ -63,16 +67,6 @@ impl NodeId {
     pub fn fresh() -> Self {
         NodeId(FRESH_NODE_ID.fetch_add(1, Ordering::Relaxed))
     }
-
-    /// The id's underlying number, for use as an opaque serialization handle
-    /// (the inspector wire shape carries a `NodeId` as a JSON number). This is
-    /// the *only* place the numeric value
-    /// is observed — internal logic compares ids by equality, never by value —
-    /// so it is exposed solely so a client can round-trip a handle, not to give
-    /// the value any in-compiler meaning.
-    pub fn as_u64(self) -> u64 {
-        self.0
-    }
 }
 
 impl std::fmt::Debug for NodeId {
@@ -83,9 +77,11 @@ impl std::fmt::Debug for NodeId {
 
 // Wire shape (inspector, feature `serde`): a bare JSON number. A `NodeId` is an
 // opaque handle the client round-trips, so it serializes as its underlying
-// `u64` (the one place the numeric value is observed — see [`NodeId::as_u64`]),
-// not as a struct. Hand-written rather than `#[serde(transparent)]` because the
-// inner field is private.
+// `u64`, read off the field directly, not as a struct. Hand-written rather than
+// `#[serde(transparent)]` because the inner field is private. There is no
+// accessor for the number: nothing in the compiler reads it — ids are compared
+// by equality — so the wire impl is its only reader, and an accessor can come
+// back when a caller needs one.
 //
 // TODO(wire-stability): the mint-order value is not stable across compiler
 // changes — anything that shifts upstream mint *counts* renumbers every later id,
@@ -108,6 +104,11 @@ impl serde::Serialize for NodeId {
 /// Minimal on purpose: only the stages that *mint or restructure* expression
 /// nodes (and therefore need to record why a node exists) appear here.
 ///
+/// **Declaration order is not pipeline order**: `Channelize` is declared ahead of
+/// `Transact` and `Letrec`, which run before it. The derived [`Ord`] is for map
+/// keys, and nothing sorts passes by it — the pipeline order is the one in the
+/// module docs.
+///
 /// `Pass` and [`crate::ccl::names::SyntheticKind`] (which tracks *binder*
 /// provenance: `Pair`, `Mono`, `SolverArg`, …) are deliberately separate enums,
 /// neither wrapping the other — one tags `NodeId`s (expression nodes), the
@@ -118,37 +119,41 @@ impl serde::Serialize for NodeId {
 pub enum Pass {
     /// Lowering CHL source into CCL.
     Lower,
-    /// The 1:1 binder rename in [`crate::ccl::uniquify`].
+    /// The 1:1 binder rename in [`crate::ccl::uniquify`]. **Never
+    /// constructed**: `uniquify` preserves every node id, so it has nothing to
+    /// record. The variant exists so the axis covers every pass.
     Uniquify,
     /// UDF inlining + beta-reduction ([`crate::ccl::inline`]): the pass that
-    /// runs between the post-inference and post-desugar snapshots. Mostly
+    /// runs between the post-inference and post-channelize snapshots. Mostly
     /// id-preserving (a rebuilt node carries its input id); its genuine
     /// deviations are the fan-out clones at multi-use call sites (`Copy`s) and
     /// the wrappers/redexes it drops (`Transform` discards).
     Inline,
-    /// Defer desugaring ([`crate::ccl::channelize`]): channelizing
+    /// Channelization ([`crate::ccl::channelize`]): channelizing
     /// `Defer`/`Feed`/`Define` into collection unions and contribution records.
     /// Mostly a 1:1 transform (ids preserved), but its channelization machinery
     /// synthesizes new nodes (channel unions, contribution records, floated
-    /// lambdas, DI wrappers) that are tagged `{via: Desugar, nature: Machinery}`.
-    Desugar,
+    /// lambdas, DI wrappers) that are tagged `{via: Channelize, nature: Machinery}`.
+    Channelize,
     /// The transaction slice of the unified mutability phase
     /// ([`crate::ccl::transact_phase::run`]): stripping `with begin():` writer
     /// sites and assembling the `get_prev_txn`-guarded `LetRec` (histories,
-    /// commit records, taps). Runs between the post-inference and post-desugar
-    /// snapshots (after `Inline`, before `Desugar`).
+    /// commit records, taps). Runs between the post-inference and post-channelize
+    /// snapshots (after `Inline`, before `Channelize`).
     Transact,
     /// The induction slice of the unified mutability phase
     /// ([`crate::ccl::mut_elim::run`]): folding direct-mirror `For`/`MutWrite`
     /// loops into guarded `LetRec` induction histories. Runs between the
-    /// post-inference and post-desugar snapshots (after `Transact`, before
-    /// `Desugar`).
+    /// post-inference and post-channelize snapshots (after `Transact`, before
+    /// `Channelize`).
     Letrec,
     /// Monomorphization: cloning a generalized definition's subtree once per
     /// distinct resolved type (during inference).
     Mono,
     /// Lambda elimination: synthesizing point-free combinators (`Compose`,
-    /// `Zip`, `Id`) from explicit lambdas.
+    /// `Zip`, `Id`) from explicit lambdas. **Never constructed**: `lambda_elim`
+    /// opens no recording, so no row carries this tag. The variant exists so the
+    /// axis covers every pass.
     LambdaElim,
     /// Join/dataflow planning: hash-join and restrict scaffolding, clause
     /// fusion, refinement-predicate compilation.
