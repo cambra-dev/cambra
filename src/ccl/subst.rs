@@ -231,7 +231,7 @@ impl Mapping {
 fn debug_assert_no_pi_bound(binder: &Name) {
     debug_assert!(
         binder.pi_bound_index().is_none(),
-        "a `PiBound` is never a substitution's domain binder: it is bound by an \
+        "a `PiBound` is never a substitution's domain binder: it is bound by a \
          function the type carries, and `open_pi_binder` is what removes it",
     );
 }
@@ -1692,36 +1692,56 @@ pub fn codomain_depends_on(binder: &Name, codomain: &Type) -> bool {
     references_enclosing_function(codomain) || type_free_vars(codomain).contains(binder)
 }
 
-/// Closes refinements as they land in a compact/key view (see
-/// `src/ccl/design/type-inference.md`, "Where the conversions run"): a refinement's
-/// free references to the functions the walk is inside of become indices, one
-/// conversion after the substitution forcing at the same two arms. Memoized on
-/// (predicate identity, enclosing binders) so occurrences that entered a view
-/// sharing one predicate `Rc` leave sharing one `Rc` — the planning-cost
-/// concern of [`crate::ccl::Refinement::predicate`] — and so the common
-/// claim referencing none of them is returned shared without a walk.
+/// The functions a refinement-landing walk is inside of, and the memo that closes
+/// refinements against them (see `src/ccl/design/type-inference.md`, "Where the
+/// conversions run").
+///
+/// One type because two walks must agree. `compact_go` and `key_go` both close a
+/// claim as it lands, and each has to enter and leave the same crossings at the
+/// same arms: a compacted type and the `SpecKey` beside it that disagreed would
+/// spell one refinement two ways, and the key would then split — or share — a
+/// specialization the type does not. Owning the stack and the memo together is what
+/// leaves the two walks nothing to disagree about.
 #[derive(Default)]
-pub(crate) struct ClaimCloser {
+pub(crate) struct ClaimScope {
+    /// The binders of the `Fun`s the walk is inside of, innermost last (`None`
+    /// for an unnamed one — it still counts as a crossing). Pushed entering a
+    /// codomain, never a domain: a binder scopes over its codomain only.
+    enclosing: Vec<Option<Name>>,
+    /// Keyed on (predicate identity, enclosing binders) so occurrences that
+    /// entered a view sharing one predicate `Rc` leave sharing one `Rc` — the
+    /// planning-cost concern of [`crate::ccl::Refinement::predicate`].
     memo: HashMap<(PredicateId, Vec<Option<Name>>), crate::ccl::Refinement>,
 }
 
-impl ClaimCloser {
-    /// Close `r` against `enclosing` (innermost last, unnamed codomain
-    /// crossings as `None`). A refinement referencing none of them keeps its
-    /// predicate `Rc`.
-    pub(crate) fn close(
-        &mut self,
-        enclosing: &[Option<Name>],
-        r: &crate::ccl::Refinement,
-    ) -> crate::ccl::Refinement {
-        if enclosing.iter().all(Option::is_none) {
+impl ClaimScope {
+    /// Enter the codomain of a `Fun` binding `name` — one crossing deeper.
+    pub(crate) fn enter(&mut self, name: Option<Name>) {
+        self.enclosing.push(name);
+    }
+
+    /// Leave the codomain [`enter`](Self::enter) entered.
+    pub(crate) fn exit(&mut self) {
+        self.enclosing.pop();
+    }
+
+    /// The entered binders, for a walk whose own memo is per-position too.
+    pub(crate) fn enclosing(&self) -> &[Option<Name>] {
+        &self.enclosing
+    }
+
+    /// Close `r` against the functions entered so far: its free references to
+    /// them become indices. A refinement referencing none of them keeps its predicate
+    /// `Rc` and costs no walk.
+    pub(crate) fn close(&mut self, r: &crate::ccl::Refinement) -> crate::ccl::Refinement {
+        if self.enclosing.iter().all(Option::is_none) {
             return r.clone();
         }
-        let key = (r.predicate_id(), enclosing.to_vec());
+        let key = (r.predicate_id(), self.enclosing.clone());
         if let Some(done) = self.memo.get(&key) {
             return done.clone();
         }
-        let mut walk = PiWalk::new(PiMode::Close(enclosing));
+        let mut walk = PiWalk::new(PiMode::Close(&self.enclosing));
         let mut out = r.clone();
         walk.refinement(&mut out, 0);
         self.memo.insert(key, out.clone());

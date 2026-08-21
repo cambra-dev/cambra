@@ -156,16 +156,18 @@ pub struct PiRef {
     /// Boxed to keep [`Name`] at the width its `Unique` variant already needs:
     /// an inline `SmolStr` here fits the payload but leaves the enum no niche
     /// for its discriminant, which widens every `Name` in the IR. The
-    /// allocation is per *distinct closed refinement* — [`ClaimCloser`] memoizes on
+    /// allocation is per *distinct closed refinement* — [`ClaimScope`] memoizes on
     /// (predicate, enclosing binders) — not per comparison.
     ///
-    /// [`ClaimCloser`]: crate::ccl::subst::ClaimCloser
+    /// [`ClaimScope`]: crate::ccl::subst::ClaimScope
     pub hint: Option<Box<str>>,
 }
 
 impl PiRef {
-    /// A reference to the function `index` crossings out, with no spelling — for a
-    /// site that has no binder to read one off (tests, and a re-index).
+    /// A reference to the function `index` crossings out, with no spelling. Every
+    /// reference a conversion mints carries the binder it abstracted
+    /// ([`Name::pi_bound`]), so this is for a test naming a reference directly, and
+    /// what it exercises is that the spelling decides nothing.
     pub fn bare(index: u32) -> Self {
         PiRef { index, hint: None }
     }

@@ -862,8 +862,9 @@ fn fmt_type(
     ty: &Type,
     binders: Option<&symbolic::PiBinderEnv<'_>>,
 ) -> fmt::Result {
-    /// `ty` in the same environment, as something `write!` can take directly —
-    /// no intermediate `String` per child.
+    /// `ty` in the same environment, as something `write!` can take directly, so
+    /// a single-child arm formats straight into `f`. The `Tuple`/`Record`/`Variant`
+    /// arms still materialize a `String` per child, because they `join` them.
     fn at<'a, 'b>(
         ty: &'a Type,
         binders: Option<&'a symbolic::PiBinderEnv<'b>>,

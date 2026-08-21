@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fun, type_level};
-use crate::ccl::infer_var::Telescope;
+use crate::ccl::infer_var::{Telescope, TelescopeWalk};
 use std::rc::Rc;
 
 use crate::ccl::infer::{InferError, LocatedInferError};
@@ -334,6 +334,12 @@ impl InferCtx {
     }
 }
 
+impl TelescopeWalk for InferCtx {
+    fn telescope_mut(&mut self) -> &mut Telescope {
+        &mut self.telescope
+    }
+}
+
 impl Typing for InferCtx {
     fn pred_memo(&self) -> TermMemo {
         self.pred_memo.clone()
@@ -423,10 +429,7 @@ impl Typing for InferCtx {
                 scheme: PolyScheme::poly(self.level, ty.clone()),
             },
         );
-        let extended = self.telescope.extended(name.clone());
-        let saved = std::mem::replace(&mut self.telescope, extended);
-        let r = f(self);
-        self.telescope = saved;
+        let r = self.under_binder(name, f);
         self.scopes.pop_scope();
         r
     }
@@ -474,10 +477,7 @@ impl Typing for InferCtx {
         };
         self.scopes.push_scope();
         self.scopes.bind(name, Binding { scheme });
-        let extended = self.telescope.extended(name.clone());
-        let saved = std::mem::replace(&mut self.telescope, extended);
-        let r = f(self);
-        self.telescope = saved;
+        let r = self.under_binder(name, f);
         self.scopes.pop_scope();
         r
     }
@@ -522,19 +522,31 @@ impl Typing for InferCtx {
         // is the exercising case). The adopted name is a spelling and an
         // opening address; the annotation states no claim of its own about the
         // binder.
+        //
+        // One layer: the outermost function only, so an annotation nested two
+        // dependent functions deep adopts the outer binder and not the inner. No
+        // shape reaching here carries two — a nested group-by resolves to
+        // `(Int ⤇ (Int ⤇ Int))`, with the key binders discharged — and the
+        // recursion would need the annotation and the inferred type to agree on
+        // depth, which nothing establishes at this edge.
         let adopted;
         let ann_to_normalize = match (inferred.peel_refinements(), ann.peel_refinements()) {
             (Type::Fun { name: Some(b), .. }, Type::Fun { name: None, .. }) => {
                 let mut named = ann.clone();
-                // Name the (single) unrefined function layer; refinement wrappers
-                // stay outside it.
+                // Name the unrefined function layer `peel_refinements` matched;
+                // refinement wrappers stay outside it. The walk peels exactly what
+                // that match peeled, so it lands on that same function.
                 let mut cur: &mut Type = &mut named;
                 while let Type::Refinement(inner, _) = cur {
                     cur = inner;
                 }
-                if let Type::Fun { name, .. } = cur {
-                    *name = Some(b.clone());
-                }
+                let Type::Fun { name, .. } = cur else {
+                    unreachable!(
+                        "`peel_refinements` matched a `Fun` on this annotation, and \
+                         this walk peels the same `Refinement` layers, so it lands on it"
+                    )
+                };
+                *name = Some(b.clone());
                 adopted = named;
                 &adopted
             }

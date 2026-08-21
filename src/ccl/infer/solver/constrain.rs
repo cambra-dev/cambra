@@ -593,6 +593,20 @@ fn constrain_go_impl(
             // this function untouched — the same dependence test descent and
             // application ask everywhere else.
             let open = |n: &Option<Name>, c: &Type, other: &Type| -> Option<Type> {
+                // An unnamed function whose codomain references it by index has no
+                // binder to open at, so the reference reaches the codomain edge and
+                // compares against the other side's name — a mismatch reported as a
+                // type error rather than as the malformed input it is. The same
+                // tripwire guards `subst::open_codomain`, the rebuild passes' entry
+                // to this conversion; a binder dropped off a closed function
+                // (`Type::without_pi_names`, or a pass rebuilding a `Fun` and
+                // filtering the name slot) is what arms it.
+                debug_assert!(
+                    n.is_some() || !crate::ccl::subst::references_enclosing_function(c),
+                    "an unnamed function's codomain references it: the index has no \
+                     binder to open at, so the codomain edge compares an index \
+                     against a name",
+                );
                 match n {
                     Some(b)
                         if crate::ccl::subst::references_enclosing_function(c)
