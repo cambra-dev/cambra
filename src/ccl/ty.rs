@@ -826,9 +826,9 @@ impl serde::Serialize for Type {
     }
 }
 
-/// Renders through [`fmt_type`] with no enclosing arrow: a self-contained type
-/// carries every arrow its references name, so the spelling is complete. A type
-/// shown detached from an arrow that binds one of its references renders that
+/// Renders through [`fmt_type`] with no enclosing function: a self-contained
+/// type carries every function its references name, so the spelling is
+/// complete. A type shown detached from a function that binds one of its references renders that
 /// reference as its bare index — see [`symbolic::PiBinderEnv`].
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -839,8 +839,8 @@ impl fmt::Display for Type {
 /// `ty` rendered inside `binders` — the [`Display`](fmt::Display) form of
 /// [`fmt_type`], for a caller that holds an environment and needs a type
 /// string. The symbolic printer takes this for the type slots it renders
-/// inside a refinement predicate, so a reference to an enclosing arrow prints
-/// as that arrow's binder name there too.
+/// inside a refinement predicate, so a reference to an enclosing function
+/// prints as that function's binder name there too.
 pub(crate) struct TypeUnder<'a, 'b>(
     pub(crate) &'a Type,
     pub(crate) Option<&'a symbolic::PiBinderEnv<'b>>,
@@ -852,9 +852,9 @@ impl fmt::Display for TypeUnder<'_, '_> {
     }
 }
 
-/// Render `ty` inside `binders`, the arrows the rendering has descended
+/// Render `ty` inside `binders`, the functions the rendering has descended
 /// through. Threading them is what lets a refinement predicate print a
-/// reference to one of those arrows by the arrow's own binder name rather than
+/// reference to one of them by that function's own binder name rather than
 /// as a de Bruijn index (`src/ccl/design/type-inference.md`, "Rendering opens
 /// what it descended through").
 fn fmt_type(
@@ -882,8 +882,8 @@ fn fmt_type(
         // (see `FunKind::arrow`), making the collection/capability distinction
         // legible in every type string.
         //
-        // The codomain renders one arrow deeper, named or not: the index
-        // counts crossings, so an unnamed arrow occupies an entry too.
+        // The codomain renders one function deeper, named or not: the index
+        // counts crossings, so an unnamed one occupies an entry too.
         Type::Fun {
             name,
             kind,
@@ -953,7 +953,7 @@ fn fmt_type(
         // Every other refinement prints in the general form.
         //
         // The predicate renders inside `binders`, so a reference to an
-        // enclosing arrow prints as that arrow's binder name.
+        // enclosing function prints as that function's binder name.
         Type::Refinement(t, r) => match singleton_value(ty) {
             Some(lit) => write!(f, "{}@{}", at(t, binders), symbolic::symbolic(lit)),
             None => write!(
@@ -1102,14 +1102,14 @@ impl Type {
     ///
     /// Construction closes: free references to `name` in `codomain` become
     /// de Bruijn indices ([`crate::ccl::subst::close_pi_binder`]), so the
-    /// constructed arrow never carries a free name for its own binder and two
-    /// α-variant arrows are structurally identical. See
+    /// constructed function never carries a free name for its own binder and
+    /// two α-variant function types are structurally identical. See
     /// `src/ccl/design/type-inference.md`, "Where the conversions run".
     pub fn pi(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
         Type::pi_kinded(name, domain, codomain, FunKind::Compute)
     }
 
-    /// [`Type::pi`] at an explicit kind, for a rebuild that carries the arrow kind
+    /// [`Type::pi`] at an explicit kind, for a rebuild that carries the `FunKind`
     /// it is replacing: a group-by partition function is a dependent *collection*,
     /// so its Pi stays `⤇` instead of flattening to the capability arrow.
     ///
@@ -1230,7 +1230,7 @@ impl Type {
                 // Construction closes (see [`Type::pi`]): a rebuild computes
                 // its codomain from node types, which reference the binder by
                 // name. Idempotent on a codomain extracted from a closed
-                // arrow — its references are already indices.
+                // function — its references are already indices.
                 let codomain = match name {
                     Some(b) => crate::ccl::subst::close_pi_binder(b, &codomain),
                     None => codomain,
@@ -1348,7 +1348,7 @@ impl Type {
     ///
     /// Binder **presence** is all this canonicalizes. It does not reconcile the
     /// two binder-reference coordinates: a refinement spelled as an index and its
-    /// name-coordinate twin stay unequal here, so the comparisons below hold
+    /// name-spelled twin stay unequal here, so the comparisons below hold
     /// only between two types on the same side of a construction boundary. That
     /// is the invariant they are checking, not an assumption they make — a pass
     /// that dropped a binder and left the index behind fails them.
@@ -2449,9 +2449,9 @@ mod tests {
         let _ = l.zip_same_tags(&r, "test", |x, y| x + y);
     }
 
-    /// A dependent arrow's claim *stores* an index and *reads* as the binder's
-    /// name, detached from the arrow or not. Two spellings, two mechanisms: a
-    /// rendering that holds the arrow reads its name slot, and one that does
+    /// A dependent function's claim *stores* an index and *reads* as the
+    /// binder's name, detached from the function or not. Two spellings, two
+    /// mechanisms: a rendering that holds the function reads its name slot, and one that does
     /// not falls back to the reference's own hint. Identity is the index in
     /// both cases, which is what the assertion on the term checks.
     #[test]
@@ -2468,12 +2468,12 @@ mod tests {
         let ty = Type::pi(k.clone(), Type::Base(BaseType::Int), refinement);
         assert_eq!(ty.to_string(), "((k: Int) ⇒ {Int | __elem == k})");
 
-        // Detached from the arrow, the reference still reads as the binder —
-        // now off its own hint rather than off the arrow's name slot. A bare
+        // Detached from the function, the reference still reads as the binder —
+        // now off its own hint rather than off the function's name slot. A bare
         // `#0` in a diagnostic tells a reader nothing, and a fragment plucked
-        // out of a half-assembled arrow is exactly what a diagnostic blames.
+        // out of a half-assembled function is exactly what a diagnostic blames.
         let Type::Fun { codomain, .. } = &ty else {
-            panic!("expected an arrow");
+            panic!("expected a function");
         };
         assert_eq!(codomain.to_string(), "{Int | __elem == k}");
 
@@ -2496,7 +2496,7 @@ mod tests {
         );
     }
 
-    /// The index counts arrow crossings, so an unnamed arrow between the
+    /// The index counts function crossings, so an unnamed function between the
     /// reference and its binder occupies an environment entry: dropping it
     /// would resolve the reference to the wrong binder.
     #[test]

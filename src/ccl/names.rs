@@ -33,13 +33,13 @@
 //!   refinement implicitly binds the *same* one (see [`crate::ccl::Refinement`]),
 //!   which is what makes refinement equality plain structural equality of bare
 //!   predicates. Uniquification never mints it; substitution shadows it.
-//! * [`Name::PiBound`] — a **bound reference to an enclosing arrow's Pi
+//! * [`Name::PiBound`] — a **bound reference to an enclosing function's Pi
 //!   binder**, as a de Bruijn index ([`PiRef`]). Not a binder: nothing
-//!   introduces one; a reference becomes one when arrow construction closes
+//!   introduces one; a reference becomes one when function construction closes
 //!   its codomain ([`crate::ccl::subst::close_pi_binder`]) and becomes a name
-//!   or a term again when descent or application opens the arrow
+//!   or a term again when descent or application opens the function
 //!   ([`crate::ccl::subst::open_pi_binder`]). Identity is the index, so two
-//!   α-variant closed arrows are structurally identical — what the solver's
+//!   α-variant closed function types are structurally identical — what the solver's
 //!   identity sites key on — and the binder's source spelling rides alongside
 //!   it as display metadata.
 //!
@@ -128,27 +128,28 @@ impl SyntheticKind {
     }
 }
 
-/// A reference to an enclosing arrow's Pi binder: a de Bruijn `index` plus the
+/// A reference to an enclosing function's Pi binder: a de Bruijn `index` plus the
 /// binder's source spelling.
 ///
 /// **`index` is the identity.** `PartialEq`/`Ord`/`Hash` read it alone, so two
 /// α-variant closed types compare equal wherever the solver decides identity,
-/// which is the whole point of the coordinate
-/// (`src/ccl/design/type-inference.md`, "The coordinate is locally nameless").
+/// which is the whole point of the locally-nameless representation
+/// (`src/ccl/design/type-inference.md`, "A binder reference is stored in one of
+/// two forms").
 ///
 /// **`hint` is display metadata**, stamped by the closing walk from the binder
-/// it just abstracted. Its job is a type rendered *detached* from the arrow
+/// it just abstracted. Its job is a type rendered *detached* from the function
 /// that binds it: a diagnostic that blames a domain plucked out of a
-/// half-assembled arrow has no arrow to read a spelling off, and a bare `#0`
+/// half-assembled function has none to read a spelling off, and a bare `#0`
 /// reaching a user says nothing. Two equal `PiRef`s may therefore carry
 /// different hints and print differently — the hint never decides anything.
 ///
-/// A rendering that *does* hold the arrow prefers the arrow's own name slot
+/// A rendering that *does* hold the function prefers its own name slot
 /// (see [`crate::ccl::symbolic::PiBinderEnv`]): a later pass may rename the
 /// binder, which leaves the hint stale and the name slot right.
 #[derive(Clone, Debug)]
 pub struct PiRef {
-    /// Codomain crossings between the reference and the arrow binding it.
+    /// Codomain crossings between the reference and the function binding it.
     pub index: u32,
     /// The binder's spelling where the closing happened. Display only.
     ///
@@ -156,14 +157,14 @@ pub struct PiRef {
     /// an inline `SmolStr` here fits the payload but leaves the enum no niche
     /// for its discriminant, which widens every `Name` in the IR. The
     /// allocation is per *distinct closed refinement* — [`ClaimCloser`] memoizes on
-    /// (predicate, frames) — not per comparison.
+    /// (predicate, enclosing binders) — not per comparison.
     ///
     /// [`ClaimCloser`]: crate::ccl::subst::ClaimCloser
     pub hint: Option<Box<str>>,
 }
 
 impl PiRef {
-    /// A reference to the arrow `index` crossings out, with no spelling — for a
+    /// A reference to the function `index` crossings out, with no spelling — for a
     /// site that has no binder to read one off (tests, and a re-index).
     pub fn bare(index: u32) -> Self {
         PiRef { index, hint: None }
@@ -217,18 +218,18 @@ pub enum Name {
     Synthetic { kind: SyntheticKind, uid: Uid },
     /// A name with custom semantics (currently only `__elem`).
     Reserved(ReservedName),
-    /// A bound reference to an enclosing arrow's Pi binder ([`PiRef`]): the
-    /// number of `Fun` codomains crossed between the reference and the arrow
-    /// that binds it, named and unnamed frames alike (so the coordinate
+    /// A bound reference to an enclosing function's Pi binder ([`PiRef`]): the
+    /// number of `Fun` codomains crossed between the reference and the function
+    /// that binds it, named and unnamed alike (so the index
     /// survives `Type::without_pi_names`), plus the binder's spelling as
     /// display metadata. Assigned at abstraction by
     /// [`crate::ccl::subst::close_pi_binder`]; converted back to a name or a
     /// term by [`crate::ccl::subst::open_pi_binder`] when descent or
-    /// application opens the arrow. Never a binder — no binding site
+    /// application opens the function. Never a binder — no binding site
     /// introduces one, uniquification never mints one, and a substitution
     /// never maps one (a [`crate::ccl::subst::Subst`] domain is free names).
-    /// See `src/ccl/design/type-inference.md`, "The coordinate is locally
-    /// nameless".
+    /// See `src/ccl/design/type-inference.md`, "A binder reference is stored
+    /// in one of two forms".
     PiBound(PiRef),
 }
 
@@ -339,7 +340,7 @@ impl Name {
         matches!(self, Name::Reserved(ReservedName::Elem))
     }
 
-    /// A reference to the enclosing arrow `index` crossings out, spelled by
+    /// A reference to the enclosing function `index` crossings out, spelled by
     /// `binder` — what [`crate::ccl::subst::close_pi_binder`] mints when it
     /// abstracts `binder`.
     pub fn pi_bound(index: u32, binder: &Name) -> Self {

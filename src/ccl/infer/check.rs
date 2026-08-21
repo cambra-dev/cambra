@@ -367,15 +367,15 @@ impl Typing for CheckCtx {
         // Re-run the discharge on the resolved codomain so the reconstructed
         // type matches the recorded (discharged) one. A named Pi discharges its
         // binder to the argument; an ordinary function's codomain is unchanged.
-        // The binder's references are indices when the arrow is closed (the
-        // usual case — application opens the frame at the argument, β) and
-        // free names when a name-coordinate form survived; both discharge to
+        // The binder's references are indices when the function is closed (the
+        // usual case — application opens the function at the argument, β) and
+        // free names when a name-spelled form survived; both discharge to
         // the same argument term.
         let result = match fn_ty.peel_refinements() {
             Type::Fun { name: Some(b), .. } => {
                 // Both clones are discharge *templates*; see the `Let` rule
                 // above for why they preserve ids.
-                let codomain = if crate::ccl::subst::references_outermost_frame(&codomain) {
+                let codomain = if crate::ccl::subst::references_enclosing_function(&codomain) {
                     crate::ccl::subst::open_pi_binder(
                         &crate::ccl::subst::Mapping::Discharge(Box::new(
                             argument.clone_preserving_ids(),

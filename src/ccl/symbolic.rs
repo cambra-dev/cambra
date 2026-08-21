@@ -93,15 +93,14 @@ impl Precedence {
 /// The Pi binders a rendering is inside of, innermost first — what gives a
 /// [`Name::PiBound`](crate::ccl::Name::PiBound) reference a name to print.
 ///
-/// A stored type spells a reference to one of its own arrows as a de Bruijn
-/// index, and the arrow that binds it carries the source spelling in its name
-/// slot. Rendering descends through the arrow, so it holds the spelling by the
-/// time it reaches the reference: the index is a display coordinate only, and
-/// a type reads with the same names it read with before the index coordinate
-/// existed.
+/// A stored type spells a reference to one of its own functions as a de Bruijn
+/// index, and the function that binds it carries the source spelling in its
+/// name slot. Rendering descends through that function, so it holds the
+/// spelling by the time it reaches the reference: a type reads with the same
+/// names it read with before indices existed.
 ///
 /// A borrowed cons list, so descending costs no allocation and no clone. An
-/// unnamed arrow is an entry with no name: it counts as a crossing, because
+/// unnamed function is an entry with no name: it counts as a crossing, because
 /// the index counts crossings.
 pub(crate) struct PiBinderEnv<'a> {
     binder: Option<&'a crate::ccl::Name>,
@@ -109,7 +108,7 @@ pub(crate) struct PiBinderEnv<'a> {
 }
 
 impl<'a> PiBinderEnv<'a> {
-    /// This environment with `binder`'s arrow crossed — the innermost entry of
+    /// This environment with `binder`'s function crossed — the innermost entry of
     /// the result.
     pub(crate) fn crossing(
         outer: Option<&'a PiBinderEnv<'a>>,
@@ -119,9 +118,9 @@ impl<'a> PiBinderEnv<'a> {
     }
 
     /// The name of the binder `index` crossings out, if the environment reaches
-    /// that far and that arrow names its binder. `None` leaves the reference to
+    /// that far and that function names its binder. `None` leaves the reference to
     /// render as the bare index: the type is being shown detached from the
-    /// arrow that binds it, and no spelling is available.
+    /// function that binds it, and no spelling is available.
     fn lookup(env: Option<&Self>, index: u32) -> Option<&crate::ccl::Name> {
         let mut cur = env?;
         for _ in 0..index {
@@ -137,7 +136,7 @@ struct SymbolicOpts<'a> {
     show_types: bool,
     /// The Pi binders the enclosing type rendering is inside of. Set only when
     /// [`Display for Type`](crate::ccl::Type) reaches a refinement predicate
-    /// through one or more arrows; empty at every other entry point, where a
+    /// through one or more functions; empty at every other entry point, where a
     /// predicate is being shown on its own.
     pi_binders: Option<&'a PiBinderEnv<'a>>,
 }
@@ -159,8 +158,8 @@ pub fn symbolic_typed(expr: &Expr) -> String {
     )
 }
 
-/// [`symbolic`] for a refinement predicate reached through `binders` arrows, so
-/// a reference to one of them prints as that arrow's binder name rather than as
+/// [`symbolic`] for a refinement predicate reached through `binders` functions,
+/// so a reference to one of them prints as that function's binder name rather than as
 /// its index. Called by `Display for Type`.
 pub(crate) fn symbolic_under(expr: &Expr, binders: Option<&PiBinderEnv<'_>>) -> String {
     fmt(
@@ -178,7 +177,7 @@ pub(crate) fn symbolic_under(expr: &Expr, binders: Option<&PiBinderEnv<'_>>) -> 
 // ---------------------------------------------------------------------------
 
 /// A type slot inside a term, rendered in the term's binder environment. The
-/// slot may itself carry a reference to an arrow the enclosing type rendering
+/// slot may itself carry a reference to a function the enclosing type rendering
 /// descended through, so it takes the same environment the predicate does.
 fn ty_at<'a>(ty: &'a Type, opts: &'a SymbolicOpts<'a>) -> crate::ccl::ty::TypeUnder<'a, 'a> {
     crate::ccl::ty::TypeUnder(ty, opts.pi_binders)
@@ -217,8 +216,8 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
     let res = match &expr.node {
         TypedExprNode::Lit(lit) => (Precedence::Atom, fmt_lit(lit)),
 
-        // A `PiBound` reference prints as the name of the arrow that binds it
-        // when the rendering descended through that arrow (see
+        // A `PiBound` reference prints as the name of the function that binds
+        // it when the rendering descended through that function (see
         // [`PiBinderEnv`]), and as the bare index when it did not.
         TypedExprNode::Var(name) => {
             let spelling = match name.pi_bound_index() {

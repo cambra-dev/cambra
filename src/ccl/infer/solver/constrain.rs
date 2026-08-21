@@ -145,14 +145,14 @@ pub enum ConstrainError {
 /// composites grow along lexical nesting depth, not around cycles).
 pub struct ConstrainCache {
     edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
-    /// Which derivation this cache serves. The coordinate poses two questions
+    /// Which derivation this cache serves. The representation poses two questions
     /// and they do not have the same answer in all three
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run").
     derivation: Derivation,
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
-/// draws an edge, which is what the coordinate questions are answered against.
+/// draws an edge, which is what those questions are answered against.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Derivation {
     /// Emission and its specialization pins — where a recorded bound becomes
@@ -569,9 +569,9 @@ fn constrain_go_impl(
             };
             // Descent opens (`src/ccl/design/type-inference.md`, "Where the
             // conversions run"): a *closed* codomain — one whose claims
-            // reference this arrow's binder as indices — opens at its own
+            // reference this function's binder as indices — opens at its own
             // binder name before the edge decomposes it, so the bounds
-            // recorded on inner variables are name-referenced against their
+            // recorded on inner variables are name-spelled against their
             // telescopes and the correspondence above applies to them.
             //
             // On the live solve, opening is gated on the **opposite** side
@@ -585,17 +585,17 @@ fn constrain_go_impl(
             // binder, but the ground relation must not depend on that
             // convention). A post-pass re-derivation opens unconditionally: it
             // reconciles types that different passes spelled in different
-            // coordinates (a closed arrow's codomain against a rebuilt,
+            // forms (a closed function's codomain against a rebuilt,
             // discharged one). Which derivation this is
             // ([`Derivation`]) answers both this and the record sites'
             // question, so the two read one field rather than two flags.
             // The pre-scan keeps the common codomain that does not reference
-            // this frame untouched — the same dependence test descent and
+            // this function untouched — the same dependence test descent and
             // application ask everywhere else.
             let open = |n: &Option<Name>, c: &Type, other: &Type| -> Option<Type> {
                 match n {
                     Some(b)
-                        if crate::ccl::subst::references_outermost_frame(c)
+                        if crate::ccl::subst::references_enclosing_function(c)
                             && (cache.derivation.opens_unconditionally()
                                 || crate::ccl::subst::type_contains_infer(other)) =>
                     {
@@ -1373,7 +1373,7 @@ mod tests {
     /// index.
     ///
     /// `(x: Int) ⇒ {Int | __elem == #0}` and `Int ⇒ {Int | __elem == x}` state
-    /// different claims: one is about the arrow's own argument, the other about
+    /// different claims: one is about the function's own argument, the other about
     /// whatever binds `x` outside the type. Opening the closed side at its
     /// display name spells both `__elem == x` and reads them as one. Uniquified
     /// binders make the collision need the same uid, which is the same binder,
@@ -1393,7 +1393,7 @@ mod tests {
         };
         // Construction closes the reference into `#0`.
         let closed = Type::pi(x.clone(), Type::Base(BaseType::Int), refinement(&x));
-        // The same spelling, free: no arrow in this type binds it.
+        // The same spelling, free: no function in this type binds it.
         let free = Type::fun(Type::Base(BaseType::Int), refinement(&x));
         assert!(
             crate::ccl::subst::type_free_vars(&free).contains(&x),
@@ -1401,7 +1401,7 @@ mod tests {
         );
         assert!(
             constrain_subtype(&closed, &free, &mut ConstrainCache::new()).is_err(),
-            "a closed refinement about the arrow's own binder does not satisfy a refinement \
+            "a closed refinement about the function's own binder does not satisfy a refinement \
              about a free name that shares its spelling"
         );
     }

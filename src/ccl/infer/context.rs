@@ -191,7 +191,7 @@ impl InferCtx {
     }
 
     /// [`normalize_annotation`](Self::normalize_annotation)'s recursion, with
-    /// the telescope threaded as a value: descending into a named arrow's
+    /// the telescope threaded as a value: descending into a named function's
     /// codomain extends it with the Pi binder, so a variable minted inside a
     /// dependent annotation carries the binder in scope — the annotation's
     /// refinements reference it, and the bounds recording them close against the
@@ -258,8 +258,8 @@ impl InferCtx {
                 r.clone(),
             ),
             // Structural types are already solver-ready; recurse to
-            // normalize any nested holes/refinements. A named arrow's binder
-            // is in scope in its codomain — the annotation's own Pi frame
+            // normalize any nested holes/refinements. A named function's binder
+            // is in scope in its codomain — the annotation's own Pi
             // extends the telescope for the variables minted there.
             Type::Fun {
                 name,
@@ -511,7 +511,7 @@ impl Typing for InferCtx {
         // annotation's refinement of an inferred variable, and the refinement rule
         // flows that deficit onto it rather than rejecting. What changes is *when* a
         // genuine conflict surfaces: at coalesce rather than immediately.
-        // An unnamed annotation arrow over a *named* inferred arrow adopts the
+        // An unnamed annotation function over a *named* inferred one adopts the
         // inferred Pi binder before normalizing — the same preservation
         // `emit_cast` performs on a cast value's binder, for the same reason: a
         // dependent codomain flowing into the annotation's codomain slot
@@ -519,13 +519,14 @@ impl Typing for InferCtx {
         // its correspondence and puts the binder in the telescope of the
         // variables normalization mints inside the codomain (the group-by
         // lowering's `data_fun(key_ty, Hole)` annotation over `λ __gb_k → …`
-        // is the exercising case). Adoption is display-and-address only: the
-        // annotation states no claim of its own about the binder.
+        // is the exercising case). The adopted name is a spelling and an
+        // opening address; the annotation states no claim of its own about the
+        // binder.
         let adopted;
         let ann_to_normalize = match (inferred.peel_refinements(), ann.peel_refinements()) {
             (Type::Fun { name: Some(b), .. }, Type::Fun { name: None, .. }) => {
                 let mut named = ann.clone();
-                // Name the (single) unrefined arrow layer; refinement wrappers
+                // Name the (single) unrefined function layer; refinement wrappers
                 // stay outside it.
                 let mut cur: &mut Type = &mut named;
                 while let Type::Refinement(inner, _) = cur {
@@ -690,7 +691,7 @@ mod tests {
         );
     }
 
-    /// An unnamed annotation arrow over a named inferred arrow adopts the
+    /// An unnamed annotation function over a named inferred one adopts the
     /// inferred binder, and the variables normalization mints in the
     /// annotation's codomain carry it. Without the adoption those variables
     /// have no telescope entry for the binder, so a dependent refinement flowing
@@ -710,9 +711,9 @@ mod tests {
         let ann = Type::data_fun(Type::Base(crate::ccl::BaseType::Int), Type::Hole);
         let bound = ctx
             .bind_annotation(&inferred, &ann)
-            .expect("the annotation relates to the inferred arrow");
+            .expect("the annotation relates to the inferred function");
         let Type::Fun { name, codomain, .. } = &bound else {
-            panic!("expected an arrow, got {bound}");
+            panic!("expected a function, got {bound}");
         };
         assert_eq!(
             name.as_ref(),
@@ -724,7 +725,7 @@ mod tests {
         };
         assert!(
             cod.telescope.contains(&k),
-            "a variable minted in the adopted arrow's codomain carries the binder"
+            "a variable minted in the adopted function's codomain carries the binder"
         );
     }
 }

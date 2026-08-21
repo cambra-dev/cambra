@@ -52,8 +52,8 @@ fn emit_groupby(
     // wrong for a collection. The binder must ride the function type as a Pi for the
     // predicate's `k` to stay bound.
     // Construction closes (`Type::pi_kinded`): the group's predicate references
-    // the key binder, and a stored arrow spells that reference as an index, so
-    // building the arrow with a bare literal would leave the name free and the
+    // the key binder, and a stored function spells that reference as an index,
+    // so building it with a bare literal would leave the name free and the
     // checker's rebuilt (closed) type would no longer match the recorded one.
     let partition = |codomain: Type| match &key_binder {
         Some(k) => Type::pi_kinded(k.clone(), key_ty.clone(), codomain, FunKind::Data),
