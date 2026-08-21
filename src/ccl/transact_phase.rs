@@ -80,6 +80,7 @@ use crate::ccl::{
     HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::{free_names_in_value, is_free_in_value, synthesize_arm_predicate},
     mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
+    subst::Subst,
 };
 
 /// Recognize a **fed-out mutable variable read** and rewrite it to an as-of join, *before*
@@ -336,19 +337,24 @@ fn build_zip_read(
 
     // reply: λ p:(req, snap) → e[param ↦ p.0, reads ↦ p.1 (bare) / p.1.field].
     let p = Name::fresh("__zp");
-    let mut body = lam_body.clone();
-    subst_var_with(&mut body, &param.name, &proj_pair(&p, &pair_ty, 0, &req_ty));
+    // The request binder and every register read are discharged *simultaneously*:
+    // they are independent reads of the one new pair binder, and one traversal
+    // is both cheaper and the honest reading (a sequential fold would re-enter
+    // each replacement it had already installed).
     let snap_expr = proj_pair(&p, &pair_ty, 1, &snap_ty);
+    let mut reads: HashMap<Name, Expr> =
+        HashMap::from([(param.name.clone(), proj_pair(&p, &pair_ty, 0, &req_ty))]);
     if used.len() == 1 {
-        subst_var_with(&mut body, &used[0].name, &snap_expr);
+        reads.insert(used[0].name.clone(), snap_expr);
     } else {
         for r in used {
             let field = Expr::new(TypedExprNode::Proj(ProjKey::Field(r.field.clone())))
                 .with_ty(Type::fun(snap_ty.clone(), r.value_ty.clone()));
             let field_read = Expr::apply(snap_expr.clone(), field).with_ty(r.value_ty.clone());
-            subst_var_with(&mut body, &r.name, &field_read);
+            reads.insert(r.name.clone(), field_read);
         }
     }
+    let body = Subst::discharge_env_in_place(lam_body.clone(), &reads);
     let reply = Expr::lambda(p, pair_ty, body);
     Some(Expr::compose(vec![zip, reply]).with_ty(out_ty))
 }
@@ -359,18 +365,6 @@ fn proj_pair(p: &Name, pair_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
     let proj = Expr::new(TypedExprNode::Proj(ProjKey::Index(i)))
         .with_ty(Type::fun(pair_ty.clone(), elt_ty.clone()));
     Expr::apply(pvar, proj).with_ty(elt_ty.clone())
-}
-
-/// Replace each free `Var(name)` in `e` with `replacement` (α-unique names, so no
-/// capture; an as-of read's reply body contains no shadowing binder for these).
-fn subst_var_with(e: &mut Expr, name: &Name, replacement: &Expr) {
-    if let TypedExprNode::Var(n) = &e.node {
-        if n == name {
-            *e = replacement.clone();
-        }
-        return;
-    }
-    e.walk_children_mut(|c| subst_var_with(c, name, replacement));
 }
 
 /// Match `as_of_read(⟨hist⟩)` over a **commit-log** history — a bare reference to a
@@ -2104,7 +2098,7 @@ fn walk_block(
             bound_expr,
             body,
         } => {
-            let bound = subst_env(bound_expr, env);
+            let bound = Subst::discharge_env_in_place((**bound_expr).clone(), env);
             env.insert(binding.name.clone(), bound);
             walk_block(
                 body,
@@ -2144,7 +2138,7 @@ fn walk_block(
                          block is not a recorded transactional write key — its write \
                          would be silently dropped from the decision record"
                     );
-                    let val = subst_env(value, env);
+                    let val = Subst::discharge_env_in_place(value.as_ref().clone(), env);
                     env.insert(name.clone(), val);
                     // This write commits on the current path (a spine write's path
                     // is `true`); the disjunction over all writes is the commit.
@@ -2182,7 +2176,7 @@ fn walk_block(
                 // assembler emits a per-tap `__fire` field (this path) the engine
                 // checks, unless the path *is* the commit (then it always fires).
                 TypedExprNode::Feed { name, value } => {
-                    let val = subst_env(value, env);
+                    let val = Subst::discharge_env_in_place(value.as_ref().clone(), env);
                     let field = format!("to_{}_{}", name.base(), *feed_counter);
                     *feed_counter += 1;
                     feeds.push((name.clone(), field, val, path.clone()));
@@ -2244,7 +2238,7 @@ fn walk_case(
     let mut arm_results: Vec<(Expr, HashMap<Name, Expr>)> = Vec::with_capacity(branches.len());
     let mut priors: Vec<Expr> = Vec::new();
     for br in branches {
-        let guard = subst_env(&br.guard, &snapshot);
+        let guard = Subst::discharge_env_in_place(br.guard.clone(), &snapshot);
         let pi = synthesize_arm_predicate(&guard, &priors);
         priors.push(guard.clone());
         let arm_path = and_path(path, &pi);
@@ -2329,22 +2323,6 @@ fn and_path(path: &Expr, guard: &Expr) -> Expr {
     );
     e.ty = Type::Base(BaseType::Bool);
     e
-}
-
-/// Replace every free `Var(n)` with `n`'s current environment value. Names are
-/// α-unique, so no capture is possible; blocks contain no lambdas.
-fn subst_env(e: &Expr, env: &HashMap<Name, Expr>) -> Expr {
-    if let TypedExprNode::Var(n) = &e.node
-        && let Some(rep) = env.get(n)
-    {
-        // Root-carry: the replacement denotes what the `Var` denoted — the value
-        // of `n` *here* — so the read site keeps its own id, and with it its
-        // span/attribution. N reads give N distinct roots.
-        return rep.clone();
-    }
-    let mut out = e.clone();
-    out.map_children(|c| subst_env(&c, env));
-    out
 }
 
 /// Locate each mutable variable key's `let` binding and record its tick-0 `init` (keeping

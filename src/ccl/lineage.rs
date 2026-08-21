@@ -2171,7 +2171,7 @@ mod tests {
     fn born_copied_discarded_template_composes_without_leaks() {
         // The `fold_induction_loop`/`build_writer` template shape (transact/letrec
         // instrumentation hazard): a single frame births a template `T`, copies
-        // it per read site (`subst_env` freshens a clone at each), and discards
+        // it per read site (via `Subst::discharge_env_in_place`), and discards
         // `T` (it never reaches the output tree). Per `OpenStep::flush_into`'s
         // refinement the frame's `Transform` (which produces `T`) flushes BEFORE
         // the captured `Copy` steps, so `T` is live when the copies are processed —
