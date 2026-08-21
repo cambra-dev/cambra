@@ -1288,16 +1288,14 @@ incomplete here](#deliberately-incomplete-here)).
 
 #### The compact body holds the witness
 
-The body slot holds the body **whole**, with `Type::WitnessRef` compacted to a witness
-*atom*. The atom is nullary and **anonymous** even though the type-level reference names
-its binder: within one sum's body every occurrence names the same binder, so the compact
-side needs no id to tell them apart, and `AtomKey` must be `Ord` anyway. Materialization
-re-binds them ([`bind_unbound_witnesses`]). That makes the atom set where it belongs, and it merges by the law atoms already have: it matches
-only itself, and meeting a concrete type is the collision `Int` meeting `String` is.
+The body slot holds the body **whole**, with `Type::WitnessRef` compacted to a nullary
+witness *atom* — anonymous, because within one sum's body every occurrence names the same
+binder, so materialization re-binds them together. The witness then merges by the law atoms
+already have: it matches only itself, and meeting a concrete type is the collision `Int`
+meeting `String` is.
 
-Storing instead the witness-**in**dependent residue (a shared codomain, or nothing when
-the body *is* the witness) is smaller and reads like the type-level
-`SigmaType::body_residue`, but it cannot express `𝐵 ⊓ 𝑇`. A consumer's `?d ⤇ 𝑉` meeting a
+Storing the witness-**in**dependent residue instead — a shared codomain, or nothing when
+the body *is* the witness — is smaller and cannot express `𝐵 ⊓ 𝑇`. A consumer's `?d ⤇ 𝑉` meeting a
 collection's `σ ⤇ 𝑉` is exactly a demand landing **on the witness position**, and it is
 that merge — `?d` against the witness — that resolves `?d` to `σ`. A residue has nowhere
 to put it. Holding the whole body is what makes every Σ law an ordinary recursive merge
@@ -1305,10 +1303,9 @@ instead of a destructure.
 
 #### One carrier per constructor
 
-Every sum reaches the graph through the `sigma` slot, and nothing else does.
-[`CompactFun::domain`] is one ordinary [`CompactType`] — a single domain — and a
-candidate *set* lives only on the witness a Σ binds ([`CompactSigma::kind`], a
-[`CompactWitnessKind`]).
+Every sum reaches the graph through the `sigma` slot and nothing else does, so a data
+function's domain slot holds one domain and a candidate *set* lives only on the witness a
+Σ binds ([`CompactSigma`]).
 
 That separation is what makes the two constructors independent rather than two readings
 of one slot. It rests on two facts, and both are properties of the model rather than of
@@ -1317,12 +1314,6 @@ domains never union their domains in place; and a consumed sum *names* its witne
 putting one where a domain belongs. Coalesce asserts what is left — a data function's
 domain names exactly one domain — so the invariant fails loudly rather than by silently
 materializing a candidate set in a `fun` slot.
-
-The witness lives in that **slot** and not in the atom set. The atom set is a `BTreeSet` of
-nominal leaves that either match or do not, with no field-level subtyping, and a witness
-carrying a kind has exactly the field-level structure that excludes — as well as needing to
-be read back at materialization, which an `Ord`-constrained key could not carry the kind
-for.
 #### The merge laws are derived, not chosen
 
 Each is the least upper or greatest lower bound under `<:`, so each is derived rather than
@@ -1359,10 +1350,10 @@ which is the next section.
 `Σ ⊓ 𝑇` and `Σ ⊔ 𝑇` relate slots that are *different constructors*, so neither can be
 decided slot-against-slot the way `Σ ⋈ Σ` is. Every case is the same instance of the
 rules — `𝐵[𝑑]` against `𝑇` for whichever `𝑑` the pairing determines — and what varies is
-only whether the answer can be written down in a carrier that stores **one** body for
-the whole sum. Four arms, in order:
+only whether the answer fits in a carrier that stores **one** body for the whole sum. Four
+cases, by where the pairing lands:
 
-1. **`Σ ⊔ 𝑇`, listing kind — the sum dissolves.** The join is `𝑇 ⊔ ⨆_𝑑 𝐵[𝑑]`, the only
+1. **`Σ ⊔ 𝑇` against a listing kind — the sum dissolves.** The join is `𝑇 ⊔ ⨆_𝑑 𝐵[𝑑]`, the only
    arm needing the candidates *named*. This is `box(xs) if c else xs` collapsing to
    `xs`'s type.
 2. **`𝑇` names a domain the kind admits — the sum dissolves.** `𝑇` picks the candidate
@@ -1378,13 +1369,13 @@ the whole sum. Four arms, in order:
    sum keeps `𝐾`. Nothing is enumerated — which is why a described kind needs no
    discharge of its own here.
 
-The split is **not** listing-versus-described, by analogy with the rest of this layer. Case
-4 is what a described kind reaches, but it reaches it because a consumer's fresh domain
-variable names no candidate (case 2 declines), not because the kind describes. A listing
-kind whose demand also names nothing lands there too.
+The split is **not** listing-versus-described. Case 4 is what a described kind reaches, but
+it reaches it because a consumer's fresh domain variable names no candidate (case 2
+declines), not because the kind describes; a listing kind whose demand names nothing lands
+there too.
 
-Case 2 is the one arm that needs `𝑇` to be a candidate outright. It is sound only because a `𝑇`
-inhabiting the kind already lies below the sum; delete that edge and the arm becomes a
+Case 2 is the one case needing `𝑇` to inhabit the kind outright, and it is sound only
+because such a `𝑇` already lies below the sum. Delete that edge and it becomes a
 mismatch — which is exactly the change that makes entering an abstract collection type
 require `box`.
 
@@ -1435,23 +1426,18 @@ difference:
   share no element type at all, so there is no arrow to read and the destructuring fails
   by name.
 
-#### Body instantiation is a real operation
+#### Instantiating the body
 
-Every rule is written in terms of `𝐵[𝑑]`, and both levels now have it: `instantiate_body`
-on `SigmaType`, `CompactSigma::instantiate` on the compact graph. Both are witness
-substitution, with the same scoping asymmetry — a nested sum's **body** is not descended
-into (its witness belongs to that binder, and substituting would capture), its **kind**
-is (candidates are written in the outer scope). So the rules transcribe directly:
+Every rule is written in terms of `𝐵[𝑑]`, and both levels have it
+([`SigmaType::instantiate_body`]). Instantiation is witness substitution with one scoping
+asymmetry: a nested sum's **body** is not descended into (its witness belongs to that
+binder, and substituting would capture), its **kind** is (candidates are written in the
+outer scope). So the rules transcribe directly:
 
 ```
 width:  ∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁. 𝐵₀[𝑑] <: 𝐵₁[𝑒]
 elim:   ∀ 𝑑 ∈ 𝐾.  𝐵[𝑑] <: 𝑈
 ```
-
-The **residue split** survives alongside it: `SigmaType::body_residue` keeps
-witness-independent edges out of the pairing search, which matters because the search
-discards failed attempts and only ground comparisons leave no trace. It is an
-optimization of the width rule, not the representation of a body.
 
 #### Materialization
 
@@ -2143,13 +2129,10 @@ it. Pinned by `conditional_consumed_as_fun`.
 #### Naming a position is not filling it
 
 Both witness forms *name* the position they stand in rather than contributing content to it,
-and every rule that reads a position has to know the difference. This is the reading
-[`KindOrder::Resolves`] takes of a bare inference variable, and it generalizes:
-
-- a domain listing whose candidates are all names resolves to the side with content
-  (`names_position`)
-- `Σ ⋈ 𝑤` is the sum — there is nothing to distribute over (`is_bare_witness`)
-- a candidate cannot be *picked* by a name (`admitted_domain` declines one)
+and every rule that reads a position has to know the difference: a listing whose candidates
+are all names resolves to the side with content, `Σ ⋈ 𝑤` is the sum with nothing to
+distribute over, and a name cannot pick a candidate out. This is the reading
+[`KindOrder::Resolves`] takes of a bare inference variable, generalized.
 
 Getting this wrong produces no type error at the point of the mistake. It produces a witness
 sitting in an atom set beside a concrete domain, read later as two alternatives, and
@@ -2252,17 +2235,14 @@ chain still does not terminate because the last stale mention is not a sum at al
 So realization asserts instead. [`TypedExprNode::Realize`] re-views the gated union at the
 type the `Case` had, and nothing above it changes.
 
-It is deliberately **not** a [`TypedExprNode::Cast`]. A cast is an upcast — its whole
-typing rule is the subtype obligation `value_ty <: target`, discharged by the ordinary
-rules. What realization asserts is an isomorphism the rules *cannot* see: the sum picks one
-branch, the tagged union has rows from every leg, and only the gates reconcile them. Routing
-it through `Cast` would mean claiming an obligation that does not hold, and would quietly
-turn a checked edge into a trusted one for every other cast in the language.
-
-`Realize` carries no target field — the type it asserts is the node's own `ty`. A second
-copy would be a second thing to keep in sync, and planning normalizes refinement predicates
-in `ty`; a `Cast`'s `target` has to be threaded through exactly that walk, and this
-sidesteps it by not having one.
+It is **not** a [`TypedExprNode::Cast`], because a cast is an upcast: its whole typing rule
+is the subtype obligation `value_ty <: target`, discharged by the ordinary rules. What
+realization asserts is an isomorphism the rules *cannot* see — the sum picks one branch, the
+tagged union has rows from every leg, and only the gates reconcile them, which no typing
+rule can check. Routing it through `Cast` would claim an obligation that does not hold, and
+would turn a checked edge into a trusted one for every other cast in the language. What the
+node carries, what it does not cover, and why it needs no target field are on
+[`TypedExprNode::Realize`] itself.
 
 ### Data domains are invariant
 
