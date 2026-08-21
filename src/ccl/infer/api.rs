@@ -512,7 +512,7 @@ pub enum InferError {
     /// first (`k = x`) does not help, because discharging `[k ↦ x]` puts the mutable variable's
     /// name straight back into the predicate. Reported here so the program is rejected
     /// with its source position instead of tripping the debug-only scope net (and, in
-    /// release, surviving to panic at the pre-desugar wall).
+    /// release, surviving to panic at the pre-channelize wall).
     MutableInRefinedType {
         /// The mutable variable's name.
         name: String,
@@ -883,7 +883,7 @@ impl std::fmt::Debug for InferError {
 /// tree is fully annotated and contains no `Type::Hole`; defer constructs
 /// may still carry `Type::History` (feed) types with `Type::Infer` channel domains
 /// — those are erased by `channelize`, which runs next (see
-/// [`Strictness::PreDesugar`]).
+/// [`Strictness::PreChannelize`]).
 ///
 /// It also **consumes every user annotation**: annotations are an input to
 /// inference, and on success no `user_annotation` slot survives it (see
@@ -1006,7 +1006,7 @@ pub enum Strictness {
     /// channels (`Feed` histories with a rigid `ChanDom(d)` domain) and
     /// induction accumulators (`Overwrite` histories whose `Infer` domain the unified
     /// phase resolves), none of which are erased yet.
-    PreDesugar,
+    PreChannelize,
 }
 
 /// Check that every [`crate::ccl::TypedExpr::ty`] and [`crate::ccl::TypedBinding::ty`]
@@ -1162,7 +1162,7 @@ fn collect_type_errors(
             at: context_sym.to_string(),
         }),
         Type::Infer(var) => {
-            // Pre-desugar, an induction accumulator's domain is still `Infer` (a
+            // Pre-channelize, an induction accumulator's domain is still `Infer` (a
             // `Mut(V)` with no annotated domain — the unified phase resolves it
             // to the writing loop's extent); the relaxation tolerates it (see
             // [`Strictness`]). Feed channel domains are the rigid `ChanDom`
@@ -1174,7 +1174,7 @@ fn collect_type_errors(
                 });
             }
         }
-        // a nominal channel domain is a pre-desugar artifact
+        // a nominal channel domain is a pre-channelize artifact
         // exactly like an `Infer` channel domain — `channelize` must
         // substitute it away; a survivor at the strict wall is a compiler bug.
         Type::ChanDom(name, _) => {
@@ -1303,15 +1303,15 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// the same hole-freeness and semantic checks, but transient histories
 /// (`Feed` channels with a `ChanDom` domain, `Overwrite`s with an `Infer` domain)
 /// are permitted — the unified phase and `channelize` erase them (see
-/// [`Strictness::PreDesugar`]).
-pub fn check_pre_desugar(expr: &Expr) -> Result<(), Vec<InferError>> {
+/// [`Strictness::PreChannelize`]).
+pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
     // The relaxation applies only when the tree carries transient histories
     // (feed/mutable machinery). A program with none should be fully resolved
     // after inference, so a residual `Infer` there is an ambiguous program
     // (e.g. an unexercised generic) — check it strictly so it surfaces as an
     // `UnresolvedInfer` diagnostic.
-    let strictness = if has_pre_desugar_artifacts(expr) {
-        Strictness::PreDesugar
+    let strictness = if has_pre_channelize_artifacts(expr) {
+        Strictness::PreChannelize
     } else {
         Strictness::Strict
     };
@@ -1319,19 +1319,19 @@ pub fn check_pre_desugar(expr: &Expr) -> Result<(), Vec<InferError>> {
     crate::ccl::infer::check(expr)
 }
 
-/// Whether the tree carries pre-desugar artifacts: a `Defer`/`Feed`/
+/// Whether the tree carries pre-channelize artifacts: a `Defer`/`Feed`/
 /// `Define` node, **or** a transient [`Type::History`] (a feed channel or a
 /// mutable variable) in any reachable type slot — and hence the channel
-/// `Feed`/`ChanDom` (and `Overwrite`-history `Infer`-domain) types the pre-desugar check
+/// `Feed`/`ChanDom` (and `Overwrite`-history `Infer`-domain) types the pre-channelize check
 /// tolerates.
 ///
 /// The transient-*type* check matters because a defer-read *alias* (`Var(x) :
 /// feed(_)`) carries a `Feed` type with no defer *node*. Inline runs before
-/// desugar, so its beta-reduction ([`crate::ccl::lambda_elim::substitute`])
+/// channelize, so its beta-reduction ([`crate::ccl::lambda_elim::substitute`])
 /// can hand such an alias to [`debug_typecheck`] as a standalone subtree;
 /// keying only on defer nodes would wrongly check it strictly and reject the
 /// legitimate channel type. `Mut` is analogous: a mutable reference carries a
-/// `Mut` type whose `Infer` domain the pre-desugar relaxation must tolerate
+/// `Mut` type whose `Infer` domain the pre-channelize relaxation must tolerate
 /// until the unified phase resolves it.
 ///
 /// The transient type can live on a **binder slot** rather than a node type — a
@@ -1340,7 +1340,7 @@ pub fn check_pre_desugar(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// the `Let` node's type is `Unit`). The strict checker inspects binder types
 /// (`check_binder`), so the selector must too, or it under-detects and drives
 /// such a subtree to the strict arm — a spurious `debug_typecheck` panic.
-fn has_pre_desugar_artifacts(expr: &Expr) -> bool {
+fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
     fn ty_has_transient(ty: &Type) -> bool {
         if matches!(ty, Type::History { .. }) {
             return true;
@@ -1359,7 +1359,7 @@ fn has_pre_desugar_artifacts(expr: &Expr) -> bool {
         TypedExprNode::Defer | TypedExprNode::Feed { .. } | TypedExprNode::Define { .. }
     ) || ty_has_transient(&expr.ty)
         || binder_has_transient(expr)
-        || expr.any_child(has_pre_desugar_artifacts)
+        || expr.any_child(has_pre_channelize_artifacts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,7 +1369,7 @@ fn has_pre_desugar_artifacts(expr: &Expr) -> bool {
 /// Enforce the second-class `Mut` discipline (design doc
 /// `src/ccl/design/mutability.md`, "No aliasing: `Mut` values are
 /// second-class (downward-only)"): a post-inference structural pass over the
-/// fully-typed, still-`Mut`-bearing tree. Runs *after* [`check_pre_desugar`]
+/// fully-typed, still-`Mut`-bearing tree. Runs *after* [`check_pre_channelize`]
 /// and *before* `inline`, so it sees the pre-inline `Apply`/parameter
 /// structure (rule 1's argument check) and the coalesced `.ty` slots. Every rule
 /// reads the binder's `ty`; none reads an annotation, which inference has already
@@ -1691,14 +1691,14 @@ fn check_mut_write_targets_go(
 ///
 /// Pass-internal helpers (lambda elimination, substitution, simplify) call this
 /// after each rewrite to localize *which* operation first produced an ill-typed
-/// tree. Routes through [`check_pre_desugar`], which self-selects strictness: a
+/// tree. Routes through [`check_pre_channelize`], which self-selects strictness: a
 /// (sub)tree carrying defer artifacts (a `Feed`/`Infer` channel type — which
-/// `substitute` now sees, since inline runs before desugar) is checked at the
-/// relaxed `PreDesugar` level; a fully-desugared tree is checked strictly (the
+/// `substitute` now sees, since inline runs before channelize) is checked at the
+/// relaxed `PreChannelize` level; a fully-channelized tree is checked strictly (the
 /// `typecheck` bar).
 ///
 /// Gated behind the opt-in `deep-typecheck` feature. `compile_program` already
-/// runs [`check_pre_desugar`] at every *pass boundary* — those walls are the
+/// runs [`check_pre_channelize`] at every *pass boundary* — those walls are the
 /// always-on correctness net — so this per-op version only adds localization.
 /// It is O(subtree) and fires once per rewrite, so on nested comprehensions it
 /// is superlinear (O(rewrites) × O(subtree)) and dominated debug/test compile
@@ -1707,7 +1707,7 @@ fn check_mut_write_targets_go(
 pub fn debug_typecheck(expr: &Expr) {
     #[cfg(feature = "deep-typecheck")]
     assert_eq!(
-        check_pre_desugar(expr),
+        check_pre_channelize(expr),
         Ok(()),
         "Failed post-transform typecheck: {}",
         crate::ccl::symbolic::symbolic_typed(expr)

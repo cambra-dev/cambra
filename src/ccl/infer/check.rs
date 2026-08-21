@@ -141,8 +141,8 @@ impl Typing for CheckCtx {
         // across the suite: it never fires.
         let bases: Option<Vec<&BaseType>> = operands.iter().map(|t| offered_base(t)).collect();
         let Some(bases) = bases else {
-            // Pre-desugar residue (a `Feed` handle, an un-eliminated `Mut`, a
-            // still-`Infer` position under `Strictness::PreDesugar`) is not something
+            // Pre-channelize residue (a `Feed` handle, an un-eliminated `Mut`, a
+            // still-`Infer` position under `Strictness::PreChannelize`) is not something
             // this rule can judge — the strictness wall decides whether a residual
             // type is tolerable at this point in the pipeline.
             return Ok(assoc.map(|_| self.fresh()));
@@ -269,12 +269,12 @@ impl Typing for CheckCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError> {
         // Destructure the resolved type directly (no inference vars), and —
-        // pre-desugar only — read through a transparent handle to the value it
+        // pre-channelize only — read through a transparent handle to the value it
         // wraps: a `Mut` history to its value (a `Mut`-typed collection used as a
         // for-loop source derefs to the collection), a defer's `Feed` to its
         // channel. Both mirror the solver's transparent-read rule that Emit applies
         // when it destructures the same position, so Check and Emit agree at the
-        // consistency wall; post-desugar/-erasure trees carry neither type.
+        // consistency wall; post-channelize/-erasure trees carry neither type.
         let mut peeled = t.peel_refinements();
         while let Some(value) = peeled.mut_value_type() {
             peeled = value.peel_refinements();
@@ -564,7 +564,7 @@ pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
         // Check-mode failures are compiler bugs (a pass produced an ill-typed
         // tree), and every caller either `.expect()`s them or renders them
         // without source context, so the blame nodes are dropped here rather
-        // than plumbed through `typecheck`/`check_pre_desugar`. They are
+        // than plumbed through `typecheck`/`check_pre_channelize`. They are
         // recorded per error, so surfacing them is a signature change away when
         // a caller wants an underlined report.
         Err(ctx.errors.into_iter().map(|e| e.error).collect())

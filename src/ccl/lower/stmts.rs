@@ -749,7 +749,7 @@ pub(super) fn lower_middle_stmt(
             }
 
             // A feed/yield loop with no accumulator is a side-effecting
-            // `Compose` (desugar routes its feeds).
+            // `Compose` (channelize routes its feeds).
             let for_expr = lower_generator_for(target, iter, for_body, &scope, stmt.span, ctx)?;
             Ok(ctx.tag_machinery(Expr::expr_stmt(for_expr, body), stmt.span, "lower.stmt_seq"))
         }

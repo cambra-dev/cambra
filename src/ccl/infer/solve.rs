@@ -1500,7 +1500,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // by `mut_elim`, several passes after closure is demanded. So a refinement that
         // mentions the binder cannot be closed at this point, and the program is
         // rejected with a source position rather than left to trip the debug-only scope
-        // net or, in release, to reach the pre-desugar wall as a surviving mutable type.
+        // net or, in release, to reach the pre-channelize wall as a surviving mutable type.
         // Why that is staging rather than impossibility, and what lifting it would take:
         // see `InferError::MutableInRefinedType`.
         TypedExprNode::MutDecl { binding, body, .. } => {

@@ -14,7 +14,7 @@ use crate::{
         Expr, channelize,
         infer::{
             InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
-            check_pre_desugar, infer, typecheck,
+            check_pre_channelize, infer, typecheck,
         },
         inline, lambda_elim,
         lineage::{
@@ -71,15 +71,15 @@ pub enum CompileError {
     /// The (parseable) AST uses a construct the lowering pass does not
     /// support yet.
     Lower(LoweringError),
-    /// Defer/Feed/Define desugaring rejected the program (e.g. a defer
+    /// Defer/Feed/Define channelization rejected the program (e.g. a defer
     /// binding with no feeds, mixed `<<`/`<<=` on the same handle, or a
     /// `<<=` inside a non-top-level scope).
     ///
-    /// Desugaring runs *after* inference (so type errors report against
+    /// Channelization runs *after* inference (so type errors report against
     /// the user's program shape); a program with both a type error and a
     /// structural defer error therefore surfaces only the type error
     /// first.
-    DesugarDefers(channelize::DeferError),
+    ChannelizeDefers(channelize::DeferError),
     /// Type inference rejected one expression.
     ///
     /// `span` is the offending source range, resolved at the `compile_program`
@@ -132,7 +132,7 @@ impl CompileError {
                     .write((src_name, ariadne::Source::from(src)), &mut buf)
                     .expect("ariadne write should not fail on Vec<u8>");
             }
-            CompileError::DesugarDefers(e) => {
+            CompileError::ChannelizeDefers(e) => {
                 buf.extend_from_slice(format!("error: deferred collection: {e}\n").as_bytes());
             }
             CompileError::Infer {
@@ -252,7 +252,7 @@ impl From<lambda_elim::LambdaElimError> for CompileError {
 
 impl From<channelize::DeferError> for CompileError {
     fn from(e: channelize::DeferError) -> Self {
-        Self::DesugarDefers(e)
+        Self::ChannelizeDefers(e)
     }
 }
 
@@ -293,7 +293,7 @@ impl IntoCompileErrors for lambda_elim::LambdaElimError {
 
 impl IntoCompileErrors for channelize::DeferError {
     fn into_compile_errors(self) -> Vec<CompileError> {
-        vec![CompileError::DesugarDefers(self)]
+        vec![CompileError::ChannelizeDefers(self)]
     }
 }
 
@@ -522,7 +522,7 @@ pub struct CompiledProgram {
     /// execution-shaped (point-free, fused) — the wrong tree for a source-level
     /// view. The inspector anchors here instead.
     pub post_inference_ir: Expr,
-    /// The post-desugar IR snapshot — the inspector's **downstream** pane, one
+    /// The post-channelize IR snapshot — the inspector's **downstream** pane, one
     /// pipeline stage *below* [`post_inference_ir`](Self::post_inference_ir).
     ///
     /// This is `expr` captured **right after `channelize`** (which now runs
@@ -532,9 +532,9 @@ pub struct CompiledProgram {
     /// fan-ins) are present. Because monomorphization ran earlier (inside
     /// `infer`), this tree is post-mono like [`post_inference_ir`](Self::post_inference_ir).
     ///
-    /// Every id preserved through inline/transact/letrec/desugar is shared with
+    /// Every id preserved through inline/transact/letrec/channelize is shared with
     /// [`post_inference_ir`](Self::post_inference_ir).
-    pub post_desugar_ir: Expr,
+    pub post_channelize_ir: Expr,
     /// The compile's lineage record: `NodeId → { parents, blame, rule }`, one
     /// row per node a pass produced, written by the recorder as those passes run
     /// ([`crate::ccl::lineage`]).
@@ -544,9 +544,9 @@ pub struct CompiledProgram {
     /// `via` is what a pane relation restricts by. The passes that record are
     /// [`Pass::Mono`] (everything monomorphization mints inside `infer`, which
     /// bridges the pre-inference ⇄ post-inference panes) and [`Pass::Inline`],
-    /// [`Pass::Transact`], [`Pass::Letrec`], [`Pass::Desugar`] (the four passes
-    /// between the post-inference and post-desugar snapshots) — see
-    /// [`MONO_PASSES`] and [`DESUGAR_PASSES`].
+    /// [`Pass::Transact`], [`Pass::Letrec`], [`Pass::Channelize`] (the four passes
+    /// between the post-inference and post-channelize snapshots) — see
+    /// [`MONO_PASSES`] and [`CHANNELIZE_PASSES`].
     ///
     /// Rows exist only for nodes a recording produced: an untouched node has none
     /// (it was never rewritten), and neither has a refinement-predicate interior
@@ -613,7 +613,7 @@ impl CompiledProgram {
     ///   id in place, so lowering's keys are still the pane's keys);
     /// * post-inference pane = fold the [`MONO_PASSES`] rows against the
     ///   pre-inference pane;
-    /// * post-desugar pane = fold the [`DESUGAR_PASSES`] rows against the
+    /// * post-channelize pane = fold the [`CHANNELIZE_PASSES`] rows against the
     ///   post-inference pane.
     ///
     /// The leaks are **returned, not asserted**: `Unexplained` is the capture
@@ -625,7 +625,7 @@ impl CompiledProgram {
     pub(crate) fn materialize_panes(&self) -> MaterializedPanes {
         let pre_ids = collect_tree_ids(&self.pre_inference_ir);
         let post_inf_ids = collect_tree_ids(&self.post_inference_ir);
-        let post_des_ids = collect_tree_ids(&self.post_desugar_ir);
+        let post_des_ids = collect_tree_ids(&self.post_channelize_ir);
 
         let (mono_map, post_inference, mono_leaks) = collapse(
             &self.lineage_table,
@@ -634,9 +634,9 @@ impl CompiledProgram {
             &post_inf_ids,
             &self.lowering_projection,
         );
-        let (desugar_map, post_desugar, desugar_leaks) = collapse(
+        let (channelize_map, post_channelize, channelize_leaks) = collapse(
             &self.lineage_table,
-            DESUGAR_PASSES,
+            CHANNELIZE_PASSES,
             &post_inf_ids,
             &post_des_ids,
             &post_inference,
@@ -645,11 +645,11 @@ impl CompiledProgram {
         MaterializedPanes {
             pre_inference: self.lowering_projection.clone(),
             post_inference,
-            post_desugar,
+            post_channelize,
             mono_map,
-            desugar_map,
+            channelize_map,
             mono_leaks,
-            desugar_leaks,
+            channelize_leaks,
         }
     }
 }
@@ -663,10 +663,10 @@ impl CompiledProgram {
 /// ordinary un-produced id.
 pub(crate) const MONO_PASSES: &[Pass] = &[Pass::Mono];
 
-/// The passes between the post-inference and post-desugar panes. See
+/// The passes between the post-inference and post-channelize panes. See
 /// [`MONO_PASSES`].
-pub(crate) const DESUGAR_PASSES: &[Pass] =
-    &[Pass::Inline, Pass::Transact, Pass::Letrec, Pass::Desugar];
+pub(crate) const CHANNELIZE_PASSES: &[Pass] =
+    &[Pass::Inline, Pass::Transact, Pass::Letrec, Pass::Channelize];
 
 /// The per-pane projections, pane-pair lineage maps, and per-relation leaks
 /// materialized from [`CompiledProgram::lineage_table`] — see
@@ -678,17 +678,17 @@ pub(crate) struct MaterializedPanes {
     pub(crate) pre_inference: SourceProjection,
     /// post-inference pane projection.
     pub(crate) post_inference: SourceProjection,
-    /// post-desugar pane projection.
-    pub(crate) post_desugar: SourceProjection,
+    /// post-channelize pane projection.
+    pub(crate) post_channelize: SourceProjection,
     /// pre-inference → post-inference lineage map (the `Mono` fan-out). Dense:
     /// an id that survived is its own self-edge.
     pub(crate) mono_map: LineageMap<NodeId, NodeId>,
-    /// post-inference → post-desugar lineage map.
-    pub(crate) desugar_map: LineageMap<NodeId, NodeId>,
+    /// post-inference → post-channelize lineage map.
+    pub(crate) channelize_map: LineageMap<NodeId, NodeId>,
     /// Leaks at the pre-inference → post-inference pane relation.
     pub(crate) mono_leaks: Vec<Leak>,
-    /// Leaks at the post-inference → post-desugar pane relation.
-    pub(crate) desugar_leaks: Vec<Leak>,
+    /// Leaks at the post-inference → post-channelize pane relation.
+    pub(crate) channelize_leaks: Vec<Leak>,
 }
 
 impl MaterializedPanes {
@@ -697,7 +697,7 @@ impl MaterializedPanes {
     pub(crate) fn pane_relations(&self) -> [(&'static str, &[Leak]); 2] {
         [
             ("pre-inference → post-inference", &self.mono_leaks),
-            ("post-inference → post-desugar", &self.desugar_leaks),
+            ("post-inference → post-channelize", &self.channelize_leaks),
         ]
     }
 
@@ -717,7 +717,7 @@ impl MaterializedPanes {
     /// here in the commit that makes inference record**, exactly as an audit
     /// span's endpoint moves with the pass that earns it.
     pub(crate) fn gated_pane_relations(&self) -> [(&'static str, &[Leak]); 1] {
-        [("post-inference → post-desugar", &self.desugar_leaks)]
+        [("post-inference → post-channelize", &self.channelize_leaks)]
     }
 }
 
@@ -1250,13 +1250,13 @@ pub fn compile_program(
         projection
     };
 
-    debug!("Lowered (pre-desugar):\n{}", symbolic(&expr));
+    debug!("Lowered (pre-channelize):\n{}", symbolic(&expr));
 
     // α-uniquify all binders (Barendregt convention): every binding site gets
     // a globally fresh `Name` uid, so shadowing ceases to exist before any
-    // pass that compares names. Must run before defer desugaring — desugar's
+    // pass that compares names. Must run before channelization — channelize's
     // rewrites splice and rename terms under the assumption that distinct
-    // binders are distinct names. (Desugar now runs after inference; see below.)
+    // binders are distinct names. (Channelize now runs after inference; see below.)
     expr = uniquify::run(expr);
 
     // Retain the pre-inference IR for the inspector's upstream pane before
@@ -1320,14 +1320,14 @@ pub fn compile_program(
     debug!("Inferred:\n{}", symbolic(&expr));
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
     // Consistency wall between `infer` and `channelize`. It is the relaxed
-    // *pre-desugar* check (`check_pre_desugar`), which permits the transient
-    // `Feed` / `Infer`-channel-domain types only desugar can erase. A failure
+    // *pre-channelize* check (`check_pre_channelize`), which permits the transient
+    // `Feed` / `Infer`-channel-domain types only channelize can erase. A failure
     // here is a compiler bug — with one exception: residual `Type::Infer`
     // variables, which inference deliberately tolerates for a generalized
     // definition the program never exercises at a concrete type (see
     // `Type::Infer`'s invariant). That residue is an *ambiguous program* — a
     // user error — so it is rendered as a diagnostic; anything else panics.
-    check_pre_desugar(&expr).map_err(|errs| {
+    check_pre_channelize(&expr).map_err(|errs| {
         if errs
             .iter()
             .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
@@ -1343,7 +1343,7 @@ pub fn compile_program(
     // fully-typed, still-`Mut`-bearing tree — after the consistency wall,
     // before inlining. It needs the pre-inline `Apply`/parameter structure
     // (rule 1's argument check) and the coalesced `.ty` slots and
-    // `user_annotation`s. Unlike the surrounding `check_pre_desugar` walls
+    // `user_annotation`s. Unlike the surrounding `check_pre_channelize` walls
     // (compiler-bug backstops), these are user errors: aliasing or nesting a
     // mutable reference.
     check_mut_discipline(&expr).map_err(|errs| errs.into_compile_errors())?;
@@ -1358,18 +1358,18 @@ pub fn compile_program(
     // binding — or to one monomorphization has since dropped.
     check_mut_write_targets(&expr).map_err(|errs| errs.into_compile_errors())?;
 
-    // Inline UDFs *before* desugar: a defer-mediating UDF (`λ out → out << e`)
+    // Inline UDFs *before* channelize: a defer-mediating UDF (`λ out → out << e`)
     // or a cross-function writer is beta-reduced to its call site before
-    // desugar routes feeds and before the unified letrec phase folds writers,
+    // channelize routes feeds and before the unified letrec phase folds writers,
     // both of which need their targets lexically present. Inlining runs on the
     // still-defer-bearing tree (Defer/Feed nodes and `Feed` types present) via
     // the defer-aware `Subst` engine (which renames a fed-to handle on
     // beta-reduction) and preserves defer-returning generators, so the
-    // post-inline wall is the relaxed `check_pre_desugar`, not strict
+    // post-inline wall is the relaxed `check_pre_channelize`, not strict
     // `typecheck`.
     // Retain the post-inference IR for the inspector before `inline` consumes
     // `expr`. This is the source-shaped, fully-typed anchor (lambdas intact, not
-    // yet point-free; inline/transact/letrec/desugar/lambda_elim/planning have
+    // yet point-free; inline/transact/letrec/channelize/lambda_elim/planning have
     // not run). `ast` (`join_planned`) is the *wrong* tree for a source
     // view — `lambda_elim`/`planning` re-mint ids and produce execution shape.
     // See `CompiledProgram::post_inference_ir`.
@@ -1407,7 +1407,7 @@ pub fn compile_program(
     });
     assert_unique_node_ids(&expr, "post-inline");
     debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
-    check_pre_desugar(&expr).map_err(|errs| {
+    check_pre_channelize(&expr).map_err(|errs| {
         if errs
             .iter()
             .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
@@ -1463,16 +1463,16 @@ pub fn compile_program(
     .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     assert_unique_node_ids(&expr, "post-transact");
     debug!("Transact phase CCL:\n{}", symbolic(&expr));
-    check_pre_desugar(&expr).expect("transact phase produced an inconsistent tree");
+    check_pre_channelize(&expr).expect("transact phase produced an inconsistent tree");
 
     // The unified letrec phase: direct-mirror mutation loops (`For` /
     // `MutWrite`) become causal `LetRec` groups — mutable histories over
     // the induction domain, per src/ccl/design/mutability.md. Runs after
     // inlining (so cross-function writers land at their call sites) and
     // *before* channelize, so a per-iteration feed inside a loop is
-    // hoisted to an ordinary feed of the loop's history for desugar to route.
+    // hoisted to an ordinary feed of the loop's history for channelize to route.
     // The tree still carries Defer/Feed here, so the walls are the relaxed
-    // pre-desugar check.
+    // pre-channelize check.
     // Isolated pane pair over `mut_elim` alone — the pass whose fate prediction
     // driver capture is meant to delete.
     let audit_mutelim = LineageAudit::start("mutelim", "post-transact..post-letrec", &expr);
@@ -1481,7 +1481,7 @@ pub fn compile_program(
     assert_unique_node_ids(&phase_out, "post-letrec-run");
     audit_letrec.finish(&phase_out);
     debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));
-    check_pre_desugar(&phase_out).expect("letrec phase produced an inconsistent tree");
+    check_pre_channelize(&phase_out).expect("letrec phase produced an inconsistent tree");
 
     // Feed channelization — the feed-routing step of the unified phase, run on
     // the phase-emitted `LetRec` tree (recognition happens *after*
@@ -1493,20 +1493,20 @@ pub fn compile_program(
     // remain: channelization is type-preserving by construction and closes
     // channel domains by substitution; the strict `typecheck` below is the
     // release-visible enforcement.
-    let mut desugared = recorded(capture_lineage, Pass::Desugar, || {
+    let mut channelized = recorded(capture_lineage, Pass::Channelize, || {
         channelize::run(phase_out)
     })
     .errs()?;
-    assert_unique_node_ids(&desugared, "post-desugar");
-    debug!("Channelized:\n{}", symbolic(&desugared));
-    typecheck(&desugared).expect("channelize produced an ill-typed tree");
+    assert_unique_node_ids(&channelized, "post-channelize");
+    debug!("Channelized:\n{}", symbolic(&channelized));
+    typecheck(&channelized).expect("channelize produced an ill-typed tree");
 
     // Retain the post-channelize tree for the inspector's downstream pane. On the
-    // post-inference desugar order this snapshot is *downstream* of
+    // post-inference channelize order this snapshot is *downstream* of
     // `post_inference_ir` (post-inline/transact/letrec/channelize); see the doc
-    // comment on `post_desugar_ir`.
+    // comment on `post_channelize_ir`.
     // A pane snapshot; see `pre_inference_ir`.
-    let post_desugar_ir = desugared.clone_preserving_ids();
+    let post_channelize_ir = channelized.clone_preserving_ids();
 
     // Fed-out mutable variable reads: rewrite a read-only reply that reads a mutable variable out of
     // its block into an outer-indexed as-of join (an as-of read at the reading
@@ -1515,14 +1515,14 @@ pub fn compile_program(
     // rather than a point-free `const` a planning-time recognizer would have to
     // reject. Uniform across the reading loop's domain. See
     // `transact_phase::rewrite_as_of_reads`.
-    transact_phase::rewrite_as_of_reads(&mut desugared)
+    transact_phase::rewrite_as_of_reads(&mut channelized)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    assert_unique_node_ids(&desugared, "post-as-of-read");
-    typecheck(&desugared).expect("as-of-read rewrite produced an ill-typed tree");
+    assert_unique_node_ids(&channelized, "post-as-of-read");
+    typecheck(&channelized).expect("as-of-read rewrite produced an ill-typed tree");
     // The last instrumented pane: see the span's own note at `LineageAudit::start`.
-    audit.finish(&desugared);
+    audit.finish(&channelized);
 
-    let lambda_elim = lambda_elim::run(desugared).errs()?;
+    let lambda_elim = lambda_elim::run(channelized).errs()?;
     assert_unique_node_ids(&lambda_elim, "post-lambda-elim");
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
     debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
@@ -1658,7 +1658,7 @@ pub fn compile_program(
         lowering_projection,
         pre_inference_ir,
         post_inference_ir,
-        post_desugar_ir,
+        post_channelize_ir,
         lineage_table,
         source_ast: module,
         source: code.to_string(),
@@ -1829,18 +1829,21 @@ mod tests {
             // hold entries for the tree it describes, and each map edges.
             assert!(!panes.pre_inference.is_empty(), "{name}");
             assert!(!panes.post_inference.is_empty(), "{name}");
-            assert!(!panes.post_desugar.is_empty(), "{name}");
+            assert!(!panes.post_channelize.is_empty(), "{name}");
             assert!(!panes.mono_map.edges().is_empty(), "{name}");
-            assert!(!panes.desugar_map.edges().is_empty(), "{name}");
+            assert!(!panes.channelize_map.edges().is_empty(), "{name}");
         }
         eprintln!("[pane totals] pre→post-inference {:?}", totals[0]);
-        eprintln!("[pane totals] post-inference→post-desugar {:?}", totals[1]);
+        eprintln!(
+            "[pane totals] post-inference→post-channelize {:?}",
+            totals[1]
+        );
     }
 
     /// Every pass that records rows in a normal compile belongs to exactly one
     /// pane relation, so no rewrite is folded twice and none is silently dropped.
     ///
-    /// [`MONO_PASSES`] and [`DESUGAR_PASSES`] are the only things that decide
+    /// [`MONO_PASSES`] and [`CHANNELIZE_PASSES`] are the only things that decide
     /// which pane relation a row reaches, so a pass that opens a scope without
     /// joining neither would record rows nothing ever folds.
     #[test]
@@ -1849,7 +1852,7 @@ mod tests {
             let program = compile_ok(&code);
             for p in program.lineage_table.recorded_passes() {
                 assert!(
-                    MONO_PASSES.contains(&p) != DESUGAR_PASSES.contains(&p),
+                    MONO_PASSES.contains(&p) != CHANNELIZE_PASSES.contains(&p),
                     "{name}: {p:?} is in neither pane relation, or in both",
                 );
             }
@@ -1868,20 +1871,20 @@ mod tests {
     /// nothing captured.
     const EXERCISED_BOUNDARIES: &[&str] = &[
         "arithmetic / pre-inference → post-inference",
-        "feed_loop / post-inference → post-desugar",
+        "feed_loop / post-inference → post-channelize",
         "feed_loop / pre-inference → post-inference",
         "filter_and_aggregate / pre-inference → post-inference",
-        "for_accumulator / post-inference → post-desugar",
+        "for_accumulator / post-inference → post-channelize",
         "for_accumulator / pre-inference → post-inference",
-        "generator_pipeline / post-inference → post-desugar",
+        "generator_pipeline / post-inference → post-channelize",
         "generator_pipeline / pre-inference → post-inference",
         "group_by / pre-inference → post-inference",
         "inner_join / pre-inference → post-inference",
         "prefix_lines / pre-inference → post-inference",
         "streaming_echo / pre-inference → post-inference",
-        "transaction / post-inference → post-desugar",
+        "transaction / post-inference → post-channelize",
         "transaction / pre-inference → post-inference",
-        "udf_chain / post-inference → post-desugar",
+        "udf_chain / post-inference → post-channelize",
         "udf_chain / pre-inference → post-inference",
     ];
 
@@ -1905,7 +1908,7 @@ mod tests {
             let panes = program.materialize_panes();
             let pre = collect_tree_ids(&program.pre_inference_ir);
             let post_inf = collect_tree_ids(&program.post_inference_ir);
-            let post_des = collect_tree_ids(&program.post_desugar_ir);
+            let post_des = collect_tree_ids(&program.post_channelize_ir);
 
             let relations: [(&str, &LineageMap<NodeId, NodeId>, _, _); 2] = [
                 (
@@ -1915,8 +1918,8 @@ mod tests {
                     &post_inf,
                 ),
                 (
-                    "post-inference → post-desugar",
-                    &panes.desugar_map,
+                    "post-inference → post-channelize",
+                    &panes.channelize_map,
                     &post_inf,
                     &post_des,
                 ),
@@ -1970,8 +1973,8 @@ mod tests {
     /// edge it contributed. See
     /// [`blame_reaches_the_pane_relation_labelled`].
     const RELATING_BOUNDARIES: &[&str] = &[
-        "for_accumulator / post-inference → post-desugar",
-        "transaction / post-inference → post-desugar",
+        "for_accumulator / post-inference → post-channelize",
+        "transaction / post-inference → post-channelize",
     ];
 
     /// **Blame reaches the pane relation, labelled**: the `blame` column is
@@ -1995,7 +1998,7 @@ mod tests {
             let panes = program.materialize_panes();
             let relations = [
                 ("pre-inference → post-inference", &panes.mono_map),
-                ("post-inference → post-desugar", &panes.desugar_map),
+                ("post-inference → post-channelize", &panes.channelize_map),
             ];
             for (relation, map) in relations {
                 if map.edges().iter().any(|(_, d)| d.labels.has_blame()) {
@@ -2069,11 +2072,11 @@ mod tests {
         const WHOLE_PROGRAM_REWRITES: &[&str] = &["transaction", "feed_loop", "generator_pipeline"];
         for (name, code) in corpus() {
             let panes = compile_ok(&code).materialize_panes();
-            let c = LeakCounts::tally(&panes.desugar_leaks);
+            let c = LeakCounts::tally(&panes.channelize_leaks);
             assert_eq!(c.structural(), 0, "{name}: {c:?}");
             assert_eq!(
                 c.unexplained, 0,
-                "{name}: post-inference → post-desugar is uncaptured: {c:?}"
+                "{name}: post-inference → post-channelize is uncaptured: {c:?}"
             );
             if WHOLE_PROGRAM_REWRITES.contains(&name) {
                 assert!(
@@ -2095,11 +2098,11 @@ mod tests {
         ));
         let panes = program.materialize_panes();
         let input = collect_tree_ids(&program.post_inference_ir);
-        let output = collect_tree_ids(&program.post_desugar_ir);
+        let output = collect_tree_ids(&program.post_channelize_ir);
         let mut expected: Vec<NodeId> = input.difference(&output).copied().collect();
         expected.sort_unstable();
         let mut reported: Vec<NodeId> = panes
-            .desugar_leaks
+            .channelize_leaks
             .iter()
             .filter_map(|l| match l {
                 Leak::Died { input } => Some(*input),
@@ -2119,7 +2122,7 @@ mod tests {
     /// is the preserve case and correct (most of the corpus preserves end to
     /// end), so the fixture is one that drives three of the five: the
     /// transaction, which `transact_phase` disassembles, `mut_elim` rebuilds as
-    /// a `LetRec`, and `channelize` desugars.
+    /// a `LetRec`, and `channelize` rewrites.
     /// **Distinct predicate terms never share a `NodeId`** — with each other, or
     /// with the main tree.
     ///
@@ -2145,7 +2148,7 @@ mod tests {
             for (pane, tree) in [
                 ("pre-inference", &program.pre_inference_ir),
                 ("post-inference", &program.post_inference_ir),
-                ("post-desugar", &program.post_desugar_ir),
+                ("post-channelize", &program.post_channelize_ir),
             ] {
                 for (_, kind) in predicate_id_collisions(tree) {
                     found.push((format!("{name} / {pane}"), 1, kind));
@@ -2170,7 +2173,7 @@ mod tests {
         recorded.sort_by_key(|p| format!("{p:?}"));
         assert_eq!(
             recorded,
-            vec![Pass::Desugar, Pass::Letrec, Pass::Mono, Pass::Transact],
+            vec![Pass::Channelize, Pass::Letrec, Pass::Mono, Pass::Transact],
             "the transaction fixture is rewritten by exactly these four passes",
         );
     }
@@ -2304,11 +2307,11 @@ mod tests {
                 rules = program.lineage_table.rule_count();
                 panes_nodes = collect_tree_ids(&program.pre_inference_ir).len()
                     + collect_tree_ids(&program.post_inference_ir).len()
-                    + collect_tree_ids(&program.post_desugar_ir).len();
+                    + collect_tree_ids(&program.post_channelize_ir).len();
                 if capture {
                     let t1 = std::time::Instant::now();
                     let panes = program.materialize_panes();
-                    std::hint::black_box(&panes.post_desugar);
+                    std::hint::black_box(&panes.post_channelize);
                     best_fold = best_fold.min(t1.elapsed());
                 }
             }

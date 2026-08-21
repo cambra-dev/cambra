@@ -922,7 +922,7 @@ fn an_equal_width_mut_parameter_still_accepts_a_mut_var() {
 ///
 /// Before this was reported here it tripped `check_scope_valid`, a debug-only
 /// regression net documented as never firing on a well-typed program — so a *release*
-/// build had no check at all and reached the pre-desugar wall with a surviving mutable
+/// build had no check at all and reached the pre-channelize wall with a surviving mutable
 /// type.
 #[rstest]
 #[case::direct(indoc! {r#"

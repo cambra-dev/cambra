@@ -53,7 +53,7 @@
 //!
 //! This pass runs **before** [`crate::ccl::channelize`] (so the unified
 //! letrec phase can route an in-loop feed against inlined writers, and a
-//! defer-mediating UDF reaches its call site before desugar routes it), so it
+//! defer-mediating UDF reaches its call site before channelize routes it), so it
 //! *does* see [`Defer`]/[`Feed`]/[`Define`] nodes and `Type::History` (feed) domains.
 //! Beta-reduction goes through the defer-aware [`crate::ccl::subst::Subst`]
 //! engine, whose `Feed`/`Define` arms rename a fed-to handle correctly when a

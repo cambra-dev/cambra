@@ -1462,7 +1462,7 @@ fn build_transact_store(
 /// The reply taps on a writer body's `` {`commit{writes, to_<defer>*} | `abort} ``
 /// decision — every field of the (dense) `commit` payload record other than
 /// `writes`, with its per-commit value type. A tap is a reply (`out << e`) that
-/// desugar folded onto the writer body; for a commit store, op-conversion commits
+/// channelize folded onto the writer body; for a commit store, op-conversion commits
 /// each tap as a write-only key so the reply rides the transaction's commit and is
 /// read back as a value-stream. Empty for a writer with no reply.
 fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {

@@ -799,7 +799,7 @@ fn constrain_go_impl(
         // coalesces to the bare channel, and monomorphization's two-way pin then
         // meets that view against the definition's feed channel. Align it with
         // the reconstructed channel function. Structural validation of *genuine*
-        // misuse (feeding a plain collection) still lands in desugar's checks.
+        // misuse (feeding a plain collection) still lands in channelize's checks.
         (
             Type::Fun { .. },
             Type::History {
