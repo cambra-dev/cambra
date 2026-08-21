@@ -465,8 +465,6 @@ pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
 ) -> Result<Type, Vec<LocatedInferError>> {
-    // The witness range index's scope is one inference run: see `clear_witness_ctx`.
-    solver::clear_witness_ctx();
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
         let pre = InferCtx::new(HashMap::new(), expr.node_id());

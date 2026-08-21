@@ -108,12 +108,6 @@ pub enum PartialKind {
 // Coalesce: CompactGraph → ccl::Type
 // ---------------------------------------------------------------------------
 
-/// Drop the witness range index between programs — a growth bound, not a correctness
-/// requirement: [`crate::ccl::infer_var::WitnessBinderId`]s are globally unique.
-pub fn clear_witness_ctx() {
-    crate::ccl::ty::witness_ctx::clear();
-}
-
 /// Bind `ty` over every witness left free in it, once the consumer's result is finally
 /// known.
 ///

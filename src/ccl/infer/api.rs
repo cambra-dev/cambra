@@ -106,6 +106,12 @@ impl InferArena {
     /// [`crate::ccl::arena_enter`]).
     pub fn new() -> Self {
         crate::ccl::arena_enter();
+        // The witness range index is per-run for the same reason the variable capture is:
+        // it maps a binder minted by this run to the domains that run found it ranging
+        // over. Binder ids are globally unique, so a stale entry is unreachable rather
+        // than wrong — dropping it here is a growth bound, and it is what makes the
+        // index's lifetime the arena's.
+        crate::ccl::ty::witness_ctx::clear();
         // The trait-narrowing audit trail is per-run, exactly as the variable
         // capture is: checking one run's obligations against another's graph would
         // resolve variables that no longer have bounds.
