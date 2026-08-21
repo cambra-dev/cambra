@@ -203,6 +203,7 @@ The connections between the layers above and the capabilities Cambra claims:
 - **Incremental views by construction.** Monotone tilings mean live aggregates are maintained, not recomputed. The materializable time-pinned view is the decided form of this — the history substrate is implemented, the transaction-handle read it needs is not yet (the ledger's `txn_kv` pins it).
 - **Verification [Sketched].** A small referentially-transparent core plus a refinement-typed checker means a semantic predicate established at one point composes across the whole program. The machinery exists today; whole-application contracts on top of it are the driving direction.
 - **Validation and program branching [Open].** Referential transparency makes program versions *syntactically comparable with well-defined semantics*, and temporal functional mutation makes state a value over time domains — *branchable and pinnable by construction*. Together they are the substrate for branching a running application — logic and state — exercising the branch under a realistic workload, and diffing behaviour.
+- **Live update [Partial].** A running program can be replaced by a new version of its source over the control port (`--control`): `/diff` reports how the two versions differ, at a pipeline phase the caller picks, and `/update` swaps the program. The new version inherits the running one's sources and sinks, may add to them, and retires a route it stops serving, and inherits the operator behind every `Let` binding whose computation is unchanged; a variable whose logic the edit did touch resumes from the value it held. The one refused update is one that cannot take over the state — a variable the new version no longer declares, declares at a different type, or moved to a different loop. See [live-update.md](/src/ccl/design/live-update.md). Running two versions at once is not implemented.
 - **Observability.** The compilation pipeline preserves a legible chain from source to running state. The web inspector (`--inspect`) serves the CHL AST, the lowered CCL, the operator graph, and live per-producer runtime state for any running program; the program inspector (`--inspect-only`, `src/inspector_model/` and `src/inspector_server/`) serves one IR pane per compiler stage for a program it compiles and does not run.
 
 ## Feature status at a glance
@@ -221,6 +222,7 @@ The connections between the layers above and the capabilities Cambra claims:
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | Organizing idea decided; encodings **[Sketched]** |
 | `match` / `case` | Tag dispatch implemented; deeper patterns **[Tentative]** |
+| Live update of a running program (`--control`) | Implemented for logic, endpoint changes, and state resume; running two versions at once is **[Open]** |
 | `while`, floats, imports, classes, exceptions | Absent (see the spec) |
 
 The [spec](chl-spec.md) carries the authoritative per-construct markers; [demo-programs.md](demo-programs.md) maps them to runnable programs and their blockers.

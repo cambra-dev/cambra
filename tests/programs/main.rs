@@ -30,6 +30,7 @@ mod inner_join;
 mod join_then_groupby;
 mod ledger_balance;
 mod list_min;
+mod live_update;
 mod nonneg_inventory;
 mod polymorphic;
 mod prefix_lines;

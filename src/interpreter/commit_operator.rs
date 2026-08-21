@@ -126,6 +126,23 @@ impl CommitEngine {
         }
     }
 
+    /// Create an engine whose initial state is `init` at tick `at`, for a store
+    /// whose first iteration position is not `0`.
+    ///
+    /// A store replacing one in a running program starts where its source has
+    /// reached. The drive maps position `p` to tick `p + 1` and reads the
+    /// previous accumulator as of tick `p`, so the seed sits at the tick the
+    /// first position reads. Re-basing the ticks instead would break the
+    /// position-to-tick correspondence the dense read shares with the drive.
+    pub fn seeded_at(at: CommitTs, init: HashMap<Value, Value>) -> Self {
+        let latest_write = init.keys().map(|k| (k.clone(), at)).collect();
+        Self {
+            committed: BTreeMap::from([(at, init)]),
+            latest_write,
+            next_ts: at + 1,
+        }
+    }
+
     /// An empty engine for a **position-driven induction store**: no tick-0 init
     /// seed (the accumulator's init is the reader's fold default, supplied by
     /// `get_prev_seq`), driven by [`step`](Self::step) rather than
@@ -1115,52 +1132,17 @@ impl TileProducer for CommitProducer {
     }
 }
 
-/// Extract a source stream's codomain elements (the items to transact over) in
-/// the codomain's **column order**.
-///
-/// This is correct for the **commit writer** precisely because transactions are
-/// *unordered* — each item becomes a commit proposal the [`CommitOperator`]
-/// serializes by frontier/conflict, and any serialization is a valid commit order
-/// (see the unordered-mutability design commitment). So an async source whose
-/// domain arrives out of position order (a `HashMap` enumeration) may be processed
-/// in arrival order without affecting the result.
-///
-/// The **induction** driver must NOT use this: its recurrence `xₙ = f(xₙ₋₁, itemₙ)`
-/// is position-ordered, so it reads by absolute domain position via
-/// [`decode_source_positioned`], which sorts. The two look alike but carry opposite
-/// ordering requirements — do not swap one for the other.
-fn decode_source_items(tile: &Tile) -> Vec<Value> {
-    let Tile::SealedFunction {
-        domain, codomain, ..
-    } = tile
-    else {
-        return Vec::new();
-    };
-    match codomain.as_ref() {
-        Tile::Scalar(cv) => (0..domain.len()).map(|i| cv.index_at(i)).collect(),
-        // A cross-domain co-iterated source `zip((item, acc(r), …))`: each position
-        // is a `Record` of the scalar columns. The writer body reads the loop item
-        // off `._0` and each threaded induction accumulator off its own field —
-        // the shape `build_writer` lays out for a commit decision that reads an
-        // accumulator at its request position.
-        Tile::Record(_) => (0..domain.len())
-            .map(|i| source_value_at(codomain, i))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// Decode an iteration source tile into `(absolute domain position, item)` pairs,
-/// **sorted by position** — the ordered counterpart of [`decode_source_items`].
+/// **sorted by position**.
 ///
-/// The induction driver's recurrence is position-ordered, so it cannot use column
-/// order: an **async** source's domain arrives *unordered* (it enumerates a set of
-/// arrived keys) and *compacts* as its consumed prefix is released, so column order
-/// is not position order. Pairing each item with its actual `UInt` domain position
-/// and sorting makes the driver read `x₀, x₁, …` in order regardless of arrival. A
-/// finite list is the special case (its domain is already `[0, 1, …]`). Contrast
-/// [`decode_source_items`], which the *transaction* writer uses because commit
-/// order is unordered.
+/// Both drivers read their source through this. An **async** source's domain
+/// arrives *unordered* (it enumerates a set of arrived keys) and *compacts* as its
+/// consumed prefix is released, so a column index is neither a domain position nor
+/// stable across a release. Pairing each item with its actual `UInt` domain
+/// position gives both drivers a name for an item that outlives the view it was
+/// read from — which the induction recurrence needs to run `x₀, x₁, …` in order,
+/// and the transaction driver needs to say which items it has finished. A finite
+/// list is the special case (its domain is already `[0, 1, …]`).
 fn decode_source_positioned(tile: &Tile) -> Vec<(usize, Value)> {
     let Tile::SealedFunction {
         domain, codomain, ..
@@ -1229,6 +1211,10 @@ pub struct InductionStore {
     /// Keys written, in decision-`writes` order: the accumulator mutable variables, then
     /// any reply-tap (`to_<defer>`) keys.
     write_keys: Vec<Value>,
+    /// The tick this store's seed sits at, and so the first position it decides.
+    /// `0` for a store that starts with its source; the resume position for one
+    /// replacing a store in a running program.
+    resume_at: CommitTs,
     /// Reply-tap decision fields, appended to each write set (see
     /// [`body_decision_at`]). Empty for a store with no feed.
     tap_fields: Vec<String>,
@@ -1245,6 +1231,7 @@ impl InductionStore {
         tap_fields: Vec<String>,
         key_extent: Extent,
         value_extent: Extent,
+        resume_at: CommitTs,
     ) -> Self {
         let output_tiling = full_store_tiling(&key_extent, &value_extent);
         Self {
@@ -1253,6 +1240,7 @@ impl InductionStore {
             write_keys,
             tap_fields,
             output_tiling,
+            resume_at,
         }
     }
 
@@ -1318,7 +1306,13 @@ impl TileOperator for InductionStore {
             // the first *iteration* change (a leading carry) without an external
             // default. Iterations therefore occupy ticks 1.., a `+ 1` offset the
             // driver and the dense read both apply.
-            engine: CommitEngine::new(inits),
+            engine: if self.resume_at == 0 {
+                CommitEngine::new(inits)
+            } else {
+                // Resuming: the seed sits at the tick the first position this
+                // store decides will read. See [`CommitEngine::seeded_at`].
+                CommitEngine::seeded_at(self.resume_at, inits)
+            },
             body_producer,
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
@@ -2621,11 +2615,16 @@ struct DriverWindow {
 }
 
 impl DriverWindow {
-    fn new(read_extents: Vec<Extent>, item_extent: Extent) -> Self {
+    /// `base` is the first absolute position this window will hold — `0` for a
+    /// driver that starts with its source, and the resume position for one
+    /// replacing a driver in a running program. Rows are addressed absolutely, so
+    /// starting a resuming window at `0` would offer the body a decision at a
+    /// position the store never decides.
+    fn new(read_extents: Vec<Extent>, item_extent: Extent, base: usize) -> Self {
         Self {
             read_extents,
             item_extent,
-            next_position: 0,
+            next_position: base,
             rows: Vec::new(),
             release_cursor: PrefixReleaseCursor::default(),
         }
@@ -2785,6 +2784,8 @@ pub struct InductionDriver {
     read_keys: Vec<Value>,
     read_extents: Vec<Extent>,
     item_extent: Extent,
+    /// The first position this driver emits at. See [`DriverWindow::new`].
+    resume_at: usize,
 }
 
 impl InductionDriver {
@@ -2794,6 +2795,7 @@ impl InductionDriver {
         read_keys: Vec<Value>,
         read_extents: Vec<Extent>,
         item_extent: Extent,
+        resume_at: usize,
     ) -> Self {
         debug_assert_eq!(
             read_keys.len(),
@@ -2807,6 +2809,7 @@ impl InductionDriver {
             read_keys,
             read_extents,
             item_extent,
+            resume_at,
         }
     }
 }
@@ -2835,7 +2838,11 @@ impl TileOperator for InductionDriver {
             consumer: inputs.consumer,
             wakeups: scheduler.wakeup_queue(),
             read_keys: self.read_keys.clone(),
-            window: DriverWindow::new(self.read_extents.clone(), self.item_extent.clone()),
+            window: DriverWindow::new(
+                self.read_extents.clone(),
+                self.item_extent.clone(),
+                self.resume_at,
+            ),
             emitted_through: None,
             source_released_through: None,
             source_fully_released: false,
@@ -3129,7 +3136,7 @@ impl TileOperator for TransactDriver {
             consumer: inputs.consumer,
             wakeups: scheduler.wakeup_queue(),
             read_keys: self.read_keys.clone(),
-            window: DriverWindow::new(self.read_extents.clone(), self.item_extent.clone()),
+            window: DriverWindow::new(self.read_extents.clone(), self.item_extent.clone(), 0),
             current: 0,
             latest_emit: None,
         })
@@ -3149,8 +3156,14 @@ struct TransactDriverProducer {
     /// requests its own re-pull instead of looping inside `get`.
     wakeups: WakeupQueue,
     read_keys: Vec<Value>,
-    /// The source item being attempted. Advanced only by `release` — the
-    /// writer's ack that an attempt finished.
+    /// The **absolute source position** of the item being attempted. Every
+    /// position below it has finished, because the drive always attempts the
+    /// lowest position the source still offers.
+    ///
+    /// Absolute rather than a count of the columns the source currently offers:
+    /// a column count names a position in a view, so it means nothing to a drive
+    /// that did not emit it, and a replacement drive taking over a running
+    /// program would re-attempt every transaction the retired one committed.
     current: usize,
     /// The emitted rows — the attempts in flight, including superseded retries
     /// not yet reclaimed.
@@ -3233,7 +3246,13 @@ impl TileProducer for TransactDriverProducer {
         // (a list) is terminal on the first pull; a live source (an HTTP request
         // stream) never is, so a momentarily drained one must not read as done.
         let source_complete = src.is_terminal();
-        let items = decode_source_items(&src);
+        // Positioned, so an item is named by where it sits in the source's own
+        // domain rather than by where it sits in the columns still on offer. The
+        // lowest position at or above the cursor is the next item: the cursor is
+        // the attempt in flight until its ack, and the ack both advances it and
+        // withdraws the position from the source.
+        let items = decode_source_positioned(&src);
+        let next_item = items.iter().find(|(pos, _)| *pos >= self.current);
         let store = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -3247,11 +3266,12 @@ impl TileProducer for TransactDriverProducer {
             .map(|k| store_current(&store, k).map(|(_, v)| v))
             .collect();
 
-        if self.current < items.len()
+        if let Some((pos, item)) = next_item
             && let Some(frontier) = frontier
-            && self.latest_emit != Some((self.current, frontier))
+            && self.latest_emit != Some((*pos, frontier))
         {
-            let item = items[self.current].clone();
+            let (pos, item) = (*pos, item.clone());
+            self.current = pos;
             // The body reads snapshot position `i` as `p.i`. A read key with no
             // value yet gets the item as a stand-in of the right extent. Load-
             // bearing assumption: a body that writes an *absent* key is
@@ -3275,7 +3295,7 @@ impl TileProducer for TransactDriverProducer {
         // "all transactions attempted" is exactly this tile closing. A live
         // window that is momentarily empty over an incomplete source stays
         // non-terminal — the drained-but-live case.
-        let done = source_complete && self.current >= items.len();
+        let done = source_complete && next_item.is_none();
         // Re-arm while a transaction remains to attempt. It covers every
         // continuation uniformly: an attempt awaiting its commit-ack, a retry
         // waiting for the frontier to move, and the first pull of all — where the
@@ -3283,7 +3303,7 @@ impl TileProducer for TransactDriverProducer {
         // an attempt against yet. A writer that is *drained but live* does not
         // re-arm: a future arrival wakes it through the source, so re-arming
         // would busy-poll an idle server.
-        if self.current < items.len() {
+        if next_item.is_some() {
             self.wakeups.request(self.consumer.clone());
         }
         self.window.render(done)
@@ -3310,7 +3330,19 @@ impl TileProducer for TransactDriverProducer {
         if let Some((pos, row)) = self.window.newest()
             && pred.contains(&Value::UInt(pos))
         {
-            self.current = self.current.max(row.item_index + 1);
+            let finished = row.item_index;
+            self.current = self.current.max(finished + 1);
+            // A prefix release, which is sound because rows are emitted for the
+            // lowest offered position only: everything at or below the one that
+            // just finished has finished too. Releasing it is what makes the
+            // source's own release state this drive's progress record, so a
+            // replacement drive is offered what this one did not finish and
+            // nothing it did — see `src/ccl/design/live-update.md`, "The model:
+            // every carrier has its own cut".
+            self.source_producer
+                .release(TileGuard::Function(FunctionGuard::Domain(
+                    Predicate::LessThanEq(Value::UInt(finished)),
+                )));
         }
         self.window.compact(pred);
         self.debug_assert_window_invariants();
@@ -4330,6 +4362,8 @@ mod tests {
             Vec::new(),
             key_extent(),
             value_extent(),
+            // A store built with its source, not one resuming a running program.
+            0,
         );
         let set_body = store.body_input_setter();
         let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
@@ -4339,6 +4373,7 @@ mod tests {
             vec![acc.clone()],
             vec![value_extent()],
             value_extent(),
+            0,
         );
         set_body(Box::new(AddIfBody::new(Box::new(driver), threshold, "acc")));
         (fan, acc)

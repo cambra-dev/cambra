@@ -1,5 +1,8 @@
 use log::trace;
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+};
 
 use super::*;
 use crate::{
@@ -63,10 +66,37 @@ struct FanOutShared {
     consumers: Vec<Rc<RefCell<Box<dyn Consumer>>>>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
+    /// Liveness token per subscriber, parallel to [`release_guards`] and
+    /// [`consumers`].
+    ///
+    /// The [`FanOutProducer`] a subscription handed out owns the strong side, so
+    /// a dead token means that subscriber's producer has been dropped. Its slot
+    /// is then skipped: it neither blocks the release intersection nor gets
+    /// notified.
+    ///
+    /// Slots are never removed, because a producer addresses its guard by the
+    /// index its subscription took and renumbering would point it at another
+    /// subscriber's slot. A program update leaves one dead slot per replaced
+    /// subscriber and appends the new one.
+    ///
+    /// [`release_guards`]: FanOutShared::release_guards
+    /// [`consumers`]: FanOutShared::consumers
+    subscribers: Vec<Weak<()>>,
     /// Re-entrancy bookkeeping for cyclic op graphs.  `None` for non-cyclic
     /// fan-outs (the overwhelming majority); `Some` only when constructed
     /// via [`FanOut::new_cyclic`].
     reentrancy: Option<FanOutReentrancy>,
+}
+
+impl FanOutShared {
+    /// The slots whose subscriber still exists, in subscription order.
+    fn live_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.subscribers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.strong_count() > 0)
+            .map(|(i, _)| i)
+    }
 }
 
 /// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created
@@ -165,6 +195,7 @@ impl FanOut {
             producer: None,
             consumers: Vec::new(),
             release_guards: Vec::new(),
+            subscribers: Vec::new(),
             reentrancy,
         }));
         Self {
@@ -191,6 +222,36 @@ impl FanOut {
 
     pub fn tiling(&self) -> &Tiling {
         &self.tiling
+    }
+
+    /// The tile this fan-out most recently served, for a cyclic fan-out;
+    /// `None` for an ordinary one, which keeps no memo.
+    ///
+    /// Reads the cyclic-mode memo rather than pulling the input, so it is safe
+    /// wherever the graph is not mid-traversal and observes exactly what the
+    /// fan's consumers last saw. A store's value is carried on its fan, so this
+    /// is how a version replacing this program reads what its variables hold
+    /// without a second channel out of the operator.
+    pub fn cached_tile(&self) -> Option<Tile> {
+        self.shared
+            .borrow()
+            .reentrancy
+            .as_ref()
+            .map(|r| r.cached_tile.clone())
+    }
+
+    /// Reopen this fan-out for a fresh set of branches, keeping the inner
+    /// producer and everything it has accumulated.
+    ///
+    /// For carrying one operator across a program update. Only the
+    /// [`inspect`](TileOperator::inspect) bookkeeping resets: which branch
+    /// renders the input subtree and which renders a back-reference. The
+    /// subscriptions need no attention, because each is tied to the life of the
+    /// producer it handed out ([`FanOutShared::subscribers`]) — a subscriber the
+    /// update dropped stops counting on its own, and one the update carried
+    /// forward keeps its guard.
+    pub fn reopen(&self) {
+        *self.used.borrow_mut() = false;
     }
 }
 
@@ -230,11 +291,13 @@ impl TileOperator for FanOutBranch {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         // Register the consumer and reserve its release-guard slot.
+        let liveness = Rc::new(());
         let index = {
             let mut shared = self.shared.borrow_mut();
             let index = shared.consumers.len();
             shared.consumers.push(Rc::new(RefCell::new(consumer)));
             shared.release_guards.push(self.tiling.empty_guard());
+            shared.subscribers.push(Rc::downgrade(&liveness));
             index
         }; // borrow released here before we might call input.subscribe
 
@@ -283,7 +346,13 @@ impl TileOperator for FanOutBranch {
                     // prevents a re-entrant panic when a consumer (e.g.
                     // SinkConsumer) calls FanOutProducer::get_impl(), which
                     // needs shared.borrow_mut() for the same Rc.
-                    let consumers = shared_rc.borrow().consumers.clone();
+                    let consumers = {
+                        let shared = shared_rc.borrow();
+                        shared
+                            .live_indices()
+                            .map(|i| shared.consumers[i].clone())
+                            .collect::<Vec<_>>()
+                    };
                     for c in &consumers {
                         c.borrow_mut().notify();
                     }
@@ -298,6 +367,7 @@ impl TileOperator for FanOutBranch {
             base: ProducerBase::new(self.shared.borrow().id, &self.tiling),
             shared: self.shared.clone(),
             index,
+            _liveness: liveness,
         })
     }
 
@@ -310,6 +380,9 @@ struct FanOutProducer {
     base: ProducerBase,
     /// Shared state (consumers + release guards).
     shared: Rc<RefCell<FanOutShared>>,
+    /// Keeps this subscription's slot counted for as long as the producer
+    /// exists. See [`FanOutShared::subscribers`].
+    _liveness: Rc<()>,
     /// This producer's index into `shared.consumers` and `shared.release_guards`.
     index: usize,
 }
@@ -410,10 +483,15 @@ impl TileProducer for FanOutProducer {
         // re-deliver data that a consumer has already released.
         let accumulated = shared.release_guards[self.index].union(&obsolete_guard);
         shared.release_guards[self.index] = accumulated;
+        // Only live subscribers constrain the release. A subscriber whose
+        // producer has been dropped never releases again, so counting its guard
+        // would hold the intersection wherever that subscriber left it and the
+        // input would retain everything from there on.
         let intersection = shared
-            .release_guards
-            .iter()
-            .fold(self.tiling().universal_guard(), |acc, g| acc.intersect(g));
+            .live_indices()
+            .fold(self.tiling().universal_guard(), |acc, i| {
+                acc.intersect(&shared.release_guards[i])
+            });
         trace!("{} releasing: {intersection:?}", self.name());
         // In cyclic mode the inner producer can be temporarily taken out
         // by a sibling-branch `get_impl`; skip the inner release in that

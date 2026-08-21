@@ -96,7 +96,25 @@ Pass `--inspect-only` to compile a program and serve a read-only view of it — 
 cargo run -- --inspect-only tests/programs/polymorphic/program.cambra
 ```
 
-Same default port, and exclusive with `--inspect`: one answers what the program *is*, the other what a run of it *does*. `--dump-snapshot` prints the same payload as JSON and exits. See [cambra-inspector/README.md](cambra-inspector/README.md).
+Same default port, and exclusive with the flags that run a program (`--inspect`, `--control`): one answers what the program *is*, the other what a run of it *does*. `--dump-snapshot` prints the same payload as JSON and exits. See [cambra-inspector/README.md](cambra-inspector/README.md).
+
+### Control port
+
+Pass `--control` to let a running program be diffed against, and replaced by, a new version of its source. Both endpoints take the new source as the query string or the request body:
+
+```bash
+cargo run -- --control tests/programs/http_greeter/program.cambra
+
+# in another terminal, with the edited program in v2.cambra:
+curl --data-binary @v2.cambra localhost:8081/diff
+curl --data-binary @v2.cambra localhost:8081/update
+```
+
+`/diff` reports how the two versions differ and changes nothing. `/update` replaces the program in place: sockets stay open, every binding whose computation is unchanged keeps running, and a variable whose logic you did edit resumes from the value it was holding. Add `phase=<name>&` before the source to diff somewhere other than the default (`lowered`, `inferred`, `inlined`, `channelized`, `lambda-elim`, `planned`).
+
+An update may change the program's logic freely, add endpoints, and stop serving ones it no longer wants (their addresses then answer 404). The one thing it may not do is break continuity of state: a variable the running program is holding a value for must be one the new version declares, at the same type and in the same loop, or the update is refused and the running program is left serving. See [live-update.md](src/ccl/design/live-update.md).
+
+The control port defaults to 8081 (`--control=9090` to change it).
 
 ## License
 

@@ -1178,6 +1178,55 @@ pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
     out
 }
 
+/// Every name free in `expr`, in its term structure **and** inside the
+/// refinement predicates riding its type slots — the set counterpart of
+/// [`is_free`], as [`free_names_in_value`] is of [`is_free_in_value`].
+///
+/// Answers "which bindings does this term read?" for a caller that must decide
+/// something for all of them at once and would otherwise walk the term once per
+/// candidate name. Predicates count because a term can depend on a binding
+/// through one: a refinement is a term in a type position, and a domain
+/// restriction built from it reaches the operator graph.
+///
+/// Self-referential predicates terminate on the same `visited` discipline as
+/// [`count_free`], and the refinement element binder is excluded in type
+/// position for the reason given on [`count_free_in_type_with_visited`].
+pub fn free_names(expr: &Expr) -> HashSet<Name> {
+    fn go(
+        e: &Expr,
+        bound: &mut Vec<Name>,
+        visited: &mut HashSet<PredicateId>,
+        out: &mut HashSet<Name>,
+    ) {
+        e.walk_type_slots(|ty| {
+            walk_refined_predicates(ty, visited, &mut |pred, vis| {
+                // A binder's declared type sits in the enclosing scope, so the
+                // predicate is walked under the binders in force *here*.
+                let mut inner = HashSet::new();
+                go(pred, bound, vis, &mut inner);
+                out.extend(inner.into_iter().filter(|n| !n.is_elem()));
+            });
+        });
+        for_each_scoped_item(e, &mut |item| match item {
+            ScopedItem::VarRef(n) => {
+                if !bound.contains(n) {
+                    out.insert(n.clone());
+                }
+            }
+            ScopedItem::KeyRef(_) => {}
+            ScopedItem::Child { expr, binders } => {
+                let depth = bound.len();
+                bound.extend(binders.iter().map(|b| b.name.clone()));
+                go(expr, bound, visited, out);
+                bound.truncate(depth);
+            }
+        });
+    }
+    let mut out = HashSet::new();
+    go(expr, &mut Vec::new(), &mut HashSet::new(), &mut out);
+    out
+}
+
 /// Value-only worker for [`is_free_in_value`]: the same fold over
 /// [`crate::ccl::scope::for_each_scoped_item`] as [`count_free`], minus the type
 /// slots (so a refinement on a `Lambda` param — which lives in the type — is

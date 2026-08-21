@@ -1,0 +1,13 @@
+set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+log: Mut(String, Txn) := ""
+
+for msg in set_reqs:
+    with begin():
+        log := log + "-" + msg
+    set_resps << "ok\n"
+
+for req in get_reqs:
+    with begin():
+        get_resps << log

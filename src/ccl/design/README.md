@@ -31,6 +31,7 @@ CHL source
 | [optimization.md](optimization.md) | The optimization/compilation passes: inlining, lambda elimination, join/aggregate planning, algebraic simplification, and conversion to tile operators. |
 | [provenance.md](provenance.md) | How a node keeps its link to the source the user wrote across the whole pipeline: the `NodeId`/`Phase` identity primitives, the `ProvenanceTable` model and its fold, the recorder, the always-on lowering projection release diagnostics read, and what the inspector consumes. |
 | [diffing.md](diffing.md) | Program diffing: α-invariant content addressing of CCL terms and the GumTree correspondence between two compiled programs. |
+| [live-update.md](live-update.md) | Replacing a running program with a new version: the endpoint set a version inherits, operator reuse keyed by the term a `Let` binds, and the weak subscriptions that let one graph be swapped for another. |
 
 Provenance is the one cross-cutting concern in the table: every pass above both
 preserves node identity and records what it rewrote, so

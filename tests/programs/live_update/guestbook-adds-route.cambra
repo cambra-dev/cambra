@@ -1,0 +1,15 @@
+entries := ""
+
+sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+added_reqs, added_resps = http_serve("{PORT}", "GET", "/added")
+
+for entry in sign_reqs:
+    entries := entries + entry + "\n"
+    sign_resps << entries
+
+for req in peek_reqs:
+    peek_resps << "peek\n"
+
+for req in added_reqs:
+    added_resps << "added\n"
