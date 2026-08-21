@@ -923,6 +923,28 @@ where
             .ignore_then(expr.clone())
             .map_with(|value, e| Spanned::new(e.span(), Expr::Yield(Box::new(value))));
 
+        // ---- Function type `T => U` (annotation-only; §4.1, §6) ------
+        //
+        // The loosest binary form, below `feed`. Right-associative: the codomain
+        // is the whole `expr`, so `A => B => C` is `A => (B => C)` — the same
+        // shape the ternary's else-branch uses. `=>` in a `def`'s return
+        // annotation is consumed at statement level before this runs, so that
+        // position is unaffected. The parser accepts any expression on either
+        // side; lowering reads a type here and rejects a `=>` used as a value.
+        let fun_type = feed
+            .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
+            .map_with(|(domain, codomain), e| match codomain {
+                None => domain,
+                Some(codomain) => Spanned::new(
+                    e.span(),
+                    Expr::FunctionType {
+                        domain: Box::new(domain),
+                        codomain: Box::new(codomain),
+                    },
+                ),
+            })
+            .boxed();
+
         // Label the whole expression production so a failure here reports
         // "expected expression" instead of unpacking the 20+ tokens that
         // could legitimately start one. Lower-level productions
@@ -936,7 +958,7 @@ where
         // matched expression, which is what lets `if x` (no colon) show
         // *where* the in-progress expression was when the missing `:`
         // was hit.
-        choice((lambda, yield_expr, feed))
+        choice((lambda, yield_expr, fun_type))
             .labelled("expression")
             .as_context()
             .boxed()
@@ -1586,6 +1608,68 @@ mod tests {
                 !result.errors.is_empty(),
                 "expected `{src}` to be rejected (refinement base is a single type)"
             );
+        }
+    }
+
+    #[test]
+    fn function_type_parses() {
+        // `T => U` (§4.1, §6): a domain and a codomain around the `=>` arrow.
+        let Expr::FunctionType { domain, codomain } = parse_e("Int => Bool").node else {
+            panic!(
+                "expected a FunctionType, got {:?}",
+                parse_e("Int => Bool").node
+            );
+        };
+        assert!(matches!(domain.node, Expr::Name(ref n) if n == "Int"));
+        assert!(matches!(codomain.node, Expr::Name(ref n) if n == "Bool"));
+
+        // Parenthesised, as it appears in a binding annotation `f: (Int => Int)`.
+        assert!(matches!(
+            parse_e("(Int => Int)").node,
+            Expr::FunctionType { .. }
+        ));
+
+        // The domain and codomain may be structural types.
+        let Expr::FunctionType { domain, codomain } = parse_e("{Int, Int} => Bool").node else {
+            panic!("expected a FunctionType over a tuple-type domain");
+        };
+        assert!(matches!(domain.node, Expr::BraceGroup(_)));
+        assert!(matches!(codomain.node, Expr::Name(ref n) if n == "Bool"));
+        let Expr::FunctionType { codomain, .. } = parse_e("Int => {Int where _ > 0}").node else {
+            panic!("expected a FunctionType with a refinement codomain");
+        };
+        assert!(matches!(codomain.node, Expr::BraceRefinement { .. }));
+    }
+
+    #[test]
+    fn function_type_is_right_associative() {
+        // `A => B => C` is `A => (B => C)` — the codomain is the whole rest.
+        let Expr::FunctionType { domain, codomain } = parse_e("A => B => C").node else {
+            panic!("expected a FunctionType");
+        };
+        assert!(matches!(domain.node, Expr::Name(ref n) if n == "A"));
+        let Expr::FunctionType {
+            domain: b,
+            codomain: c,
+        } = codomain.node
+        else {
+            panic!("expected the codomain to itself be a FunctionType");
+        };
+        assert!(matches!(b.node, Expr::Name(ref n) if n == "B"));
+        assert!(matches!(c.node, Expr::Name(ref n) if n == "C"));
+    }
+
+    #[test]
+    fn function_def_return_annotation_may_be_a_function_type() {
+        // The `def`'s structural `=>` is consumed before the return type is
+        // parsed, so the return type may itself be a function type.
+        let m = parse_m("def f(x: Int) => (Int => Bool):\n    x\n");
+        match &m.body[0].node {
+            Stmt::FunctionDef { output, .. } => {
+                let output = output.as_ref().expect("expected an output annotation");
+                assert!(matches!(output.node, Expr::FunctionType { .. }));
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
         }
     }
 

@@ -130,6 +130,15 @@ Key shape choices:
   clause gates off the one-element `{T}` diagnostic, and its predicate `p` — an
   ordinary expression whose subject `_` lowering maps to the refinement binder —
   is parsed with the same `expr` as everything else.
+- **The function-type arrow `=>` is the loosest binary form.** `T => U` parses
+  to `Expr::FunctionType`, a level below `feed` in the precedence chain. It is
+  right-associative — `A => B => C` is `A => (B => C)` — because it takes the
+  whole expression to its right as the codomain, the same way the ternary's
+  else-branch does. A `def`'s return annotation consumes its `=>` at statement
+  level before the expression parser runs, so that position is unaffected and its
+  return type may itself be a function type. Lowering reads `Expr::FunctionType`
+  as a `Type::Fun` in annotation position and rejects it as a value
+  ([docs/chl-spec.md](../../docs/chl-spec.md), "6. Types (informal sketch)").
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.
