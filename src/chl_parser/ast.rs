@@ -506,6 +506,21 @@ pub enum Expr {
         predicate: Box<Spanned<Expr>>,
     },
 
+    /// A function type `T => U`: a domain type, the `=>` arrow, and a codomain
+    /// type (`docs/chl-spec.md`, "4.1 `def` — function definition" and "6. Types
+    /// (informal sketch)").
+    ///
+    /// Like [`Expr::BraceRefinement`], this is structural **type** syntax,
+    /// meaningful only in annotation position: lowering reads it as a
+    /// [`crate::ccl::Type::Fun`] (a compute function, `⇒`) and rejects it in
+    /// value position. It is right-associative — `A => B => C` parses as
+    /// `A => (B => C)` — because the parser takes the whole expression to the
+    /// right of `=>` as the codomain.
+    FunctionType {
+        domain: Box<Spanned<Expr>>,
+        codomain: Box<Spanned<Expr>>,
+    },
+
     /// Subscript: `target[index]` — **collection lookup only**. Projecting a product
     /// is a different operation and has its own spelling, [`Expr::Attribute`].
     Subscript {

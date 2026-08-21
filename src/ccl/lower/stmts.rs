@@ -1096,6 +1096,8 @@ pub(super) fn lower_type_annotation(
 /// - A variant type `` {`a | `b{Int}} `` — the same brace group, told apart from
 ///   a tuple type by its arms' backticks.
 /// - The empty group `{}` — the unit type, `Unit`.
+/// - A function type `T => U` — a [`Type::Fun`] compute function
+///   (`docs/chl-spec.md`, "6. Types (informal sketch)").
 pub(super) fn lower_type_expr(
     annotation: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
@@ -1180,6 +1182,17 @@ pub(super) fn lower_type_expr(
             annotation.span,
             "a variant type is written in braces, and its arms are backticked tags: \
              `` {`a | `b{Int}} ``",
+        )),
+        // A function type `T => U` (`docs/chl-spec.md`, "6. Types (informal
+        // sketch)"). The surface arrow is the compute arrow `⇒`
+        // ([`FunKind::Compute`]) — the kind a `def`/lambda produces — so an
+        // annotated binding `f: (Int => Int) = \x -> …` matches its value.
+        // `Type::fun` builds the non-dependent form (`name: None`); the surface
+        // has no binder to make it a Pi type, and a data collection (`⤇`) is
+        // written with its own constructor, never with `=>`.
+        ChlExpr::FunctionType { domain, codomain } => Ok(Type::fun(
+            lower_type_expr(domain, ctx)?,
+            lower_type_expr(codomain, ctx)?,
         )),
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple
         // *type* is written with braces `{T, U}` (`docs/chl-spec.md`).

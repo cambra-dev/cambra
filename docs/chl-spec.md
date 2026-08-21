@@ -206,8 +206,9 @@ parsing-then-erroring.
 
 `=>` is the function-type arrow. It separates a `def`'s parameter list
 from its return-type annotation — `def f(x: Int) => Int:` (§4.1), which
-type inference checks against the body's value. Its use as a general
-type operator inside an expression is **[Planned]**.
+type inference checks against the body's value. It is also a general type
+operator inside an expression: `T => U` is a function type, writable in
+any annotation position (§6).
 
 > **Direction.** `->` additionally becomes the pair / map-entry arrow
 > (`a -> b` for a two-tuple, `[k -> v, …]` for a map literal — §2.4,
@@ -1195,12 +1196,11 @@ function must be definable without referring to its own name.
 > `store: Mut(Map(…), Txn)`. Either way the capability is visible in the
 > types at the binder, not smuggled in.
 
-> **Direction [Planned].** `=>` is the function-type arrow, so a `def`'s
-> signature can equivalently be written as a binding,
-> `f: (T => U) = \t -> …`. Using `=>` as a *type* operator inside an
-> expression is not yet parsed; only its `def`-return-annotation position
-> (implemented above) is. Recommended style annotates both parameters and
-> the return type on top-level `def`s; the north-star programs follow it.
+`=>` is the function-type arrow, so a `def`'s signature has an equivalent
+binding form: `f: (T => U) = \t -> …` binds `f` to a lambda checked against
+the function type `T => U` (§6), the same type `def f(t: T) => U:` gives it.
+Recommended style annotates both parameters and the return type on top-level
+`def`s; the north-star programs follow it.
 
 ### 4.2 `def` — generator function
 
@@ -1773,8 +1773,8 @@ marked one carries its status per "How to read this document".)
 - `{T₀, T₁, …} ⇒ U` — function type. A function takes exactly one
   argument (§3.8): an n-parameter function's domain is the
   corresponding tuple type, and a keyword-argument function's domain
-  is a record type — `{x: T, y: U} ⇒ V`. Surface syntax for function
-  types in annotations is **[Planned]**.
+  is a record type — `{x: T, y: U} ⇒ V`. Surface syntax uses the `=>`
+  arrow.
 
 CHL also supports **refinement types**: a value of the refined type is
 a value of the base type for which a predicate holds. Refinements are

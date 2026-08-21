@@ -831,6 +831,13 @@ fn lower_expr_inner(
             "`{T where p}` is a refinement *type*; it is written in annotation \
              position, not as a value",
         )),
+        // A function type `T => U` is structural *type* syntax; it names a type,
+        // not a value. (Accepted in annotation position — see `lower_type_expr`.)
+        ChlExpr::FunctionType { .. } => Err(LoweringError::unsupported(
+            expr.span,
+            "`T => U` is a function *type*; it is written in annotation \
+             position, not as a value",
+        )),
         // Attribute access `target.attr` → `Apply(target, Proj(k))`. The `Proj` images
         // the `.attr` access the user wrote.
         //
