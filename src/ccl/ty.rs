@@ -1260,6 +1260,47 @@ impl Type {
         }
     }
 
+    /// Is this a type inference has yet to determine — a [`Type::Hole`] placeholder
+    /// or an unsolved [`Type::Infer`] variable?
+    ///
+    /// The rebuilding constructors below refuse to build a function type over one:
+    /// a type derived from a placeholder is a guess, and `Hole` is the answer
+    /// inference can still fill.
+    pub fn is_unresolved(&self) -> bool {
+        matches!(self, Type::Hole | Type::Infer(_))
+    }
+
+    /// [`Self::fun_like`], returning [`Type::Hole`] when either side is unresolved.
+    ///
+    /// The rebuilding passes set a result type only where concrete type information
+    /// is available, leaving `Hole` for inference to fill rather than committing to a
+    /// type built from one.
+    pub fn fun_like_or_hole(exemplar: &Type, domain: &Type, codomain: &Type) -> Self {
+        if domain.is_unresolved() || codomain.is_unresolved() {
+            Type::Hole
+        } else {
+            Type::fun_like(exemplar, domain.clone(), codomain.clone())
+        }
+    }
+
+    /// [`Self::fun`] — a `Compute` function with no Pi binder — returning
+    /// [`Type::Hole`] when either side is unresolved.
+    ///
+    /// Callers are the sites where `Compute` is the answer rather than a default: the
+    /// type a built-in carries when it stands in a node's function slot (`zip`,
+    /// `curry`, `const`, `apply`, an aggregate). Such a built-in transforms morphisms
+    /// and has no data behind it, and whatever kind does matter rides the `codomain`
+    /// the caller computed. Rebuilding a morphism's own type is the other case and
+    /// takes [`Self::fun_like_or_hole`]; `Compute` there reads a collection as a
+    /// compute function and strands its consumer.
+    pub fn compute_fun_or_hole(domain: &Type, codomain: &Type) -> Self {
+        if domain.is_unresolved() || codomain.is_unresolved() {
+            Type::Hole
+        } else {
+            Type::fun(domain.clone(), codomain.clone())
+        }
+    }
+
     /// Build `base` narrowed by `refinements` — **the** way to construct a
     /// [`Type::Refinement`], establishing both of its invariants.
     ///
@@ -1298,7 +1339,7 @@ impl Type {
         }
     }
 
-    /// Look through the [`Type::Refinement`] wrapper, returning the bare
+    /// Look through every outer [`Type::Refinement`] layer, returning the bare
     /// structural type underneath. Borrowing and non-allocating; refinements
     /// nested inside the structure are left in place.
     ///
@@ -1411,7 +1452,7 @@ impl Type {
     /// `Some` vs `None`: both compared types descend from one derivation, so
     /// when both carry a binder it is the *same* [`crate::ccl::Name`] (uids are preserved
     /// by every copy in the chain). What elimination does not preserve is
-    /// the binder's presence — rebuilt combinator types (`fun_ty_or_hole`,
+    /// the binder's presence — the rebuilt function types ([`Type::compute_fun_or_hole`],
     /// [`Type::fun`]) are constructed with `name: None`. If those sites ever
     /// preserve binders on rebuilt types, this helper can retire.
     pub fn without_pi_names(&self) -> Type {

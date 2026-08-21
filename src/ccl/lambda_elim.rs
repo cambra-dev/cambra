@@ -158,7 +158,7 @@ pub(crate) fn typed_tuple(elts: Vec<Expr>) -> Expr {
 pub(crate) fn zip_pair(f: Expr, g: Expr) -> Expr {
     let result_ty = zip_pair_ty(&f, &g);
     let inner_tuple = typed_tuple(vec![f, g]);
-    let zip_fn_ty = fun_ty_or_hole(&inner_tuple.ty, &result_ty);
+    let zip_fn_ty = Type::compute_fun_or_hole(&inner_tuple.ty, &result_ty);
     let zip_var = Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty);
     dbg_typecheck_mv(Expr::apply(inner_tuple, zip_var).with_ty(result_ty))
 }
@@ -176,7 +176,7 @@ pub(crate) fn zip_pair(f: Expr, g: Expr) -> Expr {
 /// *inner* one is a group of a partition — a collection — and reading it as a
 /// capability strands the per-group aggregate that consumes it.
 pub(crate) fn curry_at(f: Expr, curry_result: Type) -> Expr {
-    let curry_fn_ty = fun_ty_or_hole(&f.ty, &curry_result);
+    let curry_fn_ty = Type::compute_fun_or_hole(&f.ty, &curry_result);
     let curry_var = Expr::builtin(Builtin::Curry).with_ty(curry_fn_ty);
     Expr::apply(f, curry_var).with_ty(curry_result)
 }
@@ -222,22 +222,6 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 
 // `BinOpKind` and `UnaryOpKind` are mapped to the corresponding [`Builtin`]
 // variant via [`Builtin::for_binop`] / [`Builtin::for_unaryop`].
-
-/// Compute `Fun(domain, codomain)`, returning [`Type::Hole`] if either
-/// component is [`Type::Hole`] or [`Type::Infer`].
-///
-/// Used throughout lambda elimination to set result types only when concrete
-/// type information is available, leaving [`Type::Hole`] otherwise so the
-/// post-elimination inference pass can fill in the gaps without conflict.
-pub(crate) fn fun_ty_or_hole(domain: &Type, codomain: &Type) -> Type {
-    if matches!(domain, Type::Hole | Type::Infer(_))
-        || matches!(codomain, Type::Hole | Type::Infer(_))
-    {
-        Type::Hole
-    } else {
-        Type::fun(domain.clone(), codomain.clone())
-    }
-}
 
 /// Compute the type of `zip(f, g): A → (B, C)` from `f: A → B` and `g: A → C`.
 ///
@@ -788,32 +772,17 @@ fn elim_lambda_impl(
     // Pi the occurrences dangle and the checker's α-alignment has nothing to
     // bind them against.
     let body_ty = body.ty.clone();
-    let result_ty = match fun_ty_or_hole(param_ty, &body_ty) {
-        // `fun_ty_or_hole` builds a bare combinator type, so both the Pi binder
-        // and the kind are re-attached here: the binder when the codomain
-        // depends on `param`, the kind always, since the caller is the one that
-        // knows whether this morphism denotes a collection. Attaching the
-        // binder closes the codomain (`Type::pi_kinded`), which is what keeps this
-        // function in the same form as the recorded type it replaces.
-        //
-        // The dependence test admits closed or name-spelled
-        // (`subst::codomain_depends_on`), like coalesce's: a `body_ty` whose
-        // refinement landed closed references `param` as an index, and a name-only
-        // test would drop the binder and strand it.
+    let result_ty = if param_ty.is_unresolved() || body_ty.is_unresolved() {
+        Type::Hole
+    } else if crate::ccl::subst::codomain_depends_on(param, &body_ty) {
+        Type::pi_kinded(param, param_ty.clone(), body_ty.clone(), fun_kind.clone())
+    } else {
         Type::Fun {
-            domain, codomain, ..
-        } if crate::ccl::subst::codomain_depends_on(param, &body_ty) => {
-            Type::pi_kinded(param, *domain, *codomain, fun_kind.clone())
-        }
-        Type::Fun {
-            domain, codomain, ..
-        } => Type::Fun {
             name: None,
             kind: fun_kind.clone(),
-            domain,
-            codomain,
-        },
-        t => t,
+            domain: Box::new(param_ty.clone()),
+            codomain: Box::new(body_ty.clone()),
+        }
     };
     assert_ne!(Type::Hole, result_ty);
 
@@ -822,7 +791,7 @@ fn elim_lambda_impl(
     // reference param should also be treated as a constant.
     if !is_free(param, &body) {
         // const: T → (A → T) where T = body.ty and result_ty = A → T
-        let const_fn_ty = fun_ty_or_hole(&body.ty, &result_ty);
+        let const_fn_ty = Type::compute_fun_or_hole(&body.ty, &result_ty);
         let const_var = Expr::builtin(Builtin::Const).with_ty(const_fn_ty);
         let result = Expr::apply(body, const_var).with_ty(result_ty);
         debug_typecheck(&result);
@@ -950,9 +919,10 @@ fn elim_lambda_impl(
             // The transformer sits under the pair's binder, so its domain speaks
             // the opened form `body_ty` is already in.
             let apply_ty = match &pair.ty {
-                Type::Fun { codomain: cod, .. } => {
-                    fun_ty_or_hole(&crate::ccl::subst::open_codomain(&pair.ty, cod), &body_ty)
-                }
+                Type::Fun { codomain: cod, .. } => Type::compute_fun_or_hole(
+                    &crate::ccl::subst::open_codomain(&pair.ty, cod),
+                    &body_ty,
+                ),
                 _ => Type::Hole,
             };
             let apply_var = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
@@ -995,7 +965,7 @@ fn elim_lambda_impl(
                                 // makes composing onto a collection yield a
                                 // capability.
                                 let chain = Type::fun_like(first, *a.clone(), *c.clone());
-                                fun_ty_or_hole(cod, &chain)
+                                Type::compute_fun_or_hole(cod, &chain)
                             }
                             _ => Type::Hole,
                         },
@@ -1019,7 +989,7 @@ fn elim_lambda_impl(
             let left = *left;
             let right = *right;
             let tuple = typed_tuple(vec![left, right]);
-            let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
+            let fn_ty = Type::compute_fun_or_hole(&tuple.ty, &body_ty);
             let fn_var = Expr::builtin(Builtin::BinOp(op)).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
@@ -1037,7 +1007,7 @@ fn elim_lambda_impl(
         // keeps the N-ary value-form intact.
         TypedExprNode::Copair(ops) => {
             let tuple = typed_tuple(ops);
-            let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
+            let fn_ty = Type::compute_fun_or_hole(&tuple.ty, &body_ty);
             let fn_var = Expr::builtin(Builtin::Copair).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
@@ -1050,7 +1020,7 @@ fn elim_lambda_impl(
         TypedExprNode::UnaryOp(op, inner) => {
             let op_builtin = Builtin::for_unaryop(op);
             let inner = *inner;
-            let fn_ty = fun_ty_or_hole(&inner.ty, &body_ty);
+            let fn_ty = Type::compute_fun_or_hole(&inner.ty, &body_ty);
             let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let desugared = Expr::apply(inner, fn_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
@@ -1067,7 +1037,7 @@ fn elim_lambda_impl(
                 .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()))
                 .collect::<Result<_, _>>()?;
             let inner_tuple = typed_tuple(elim_elts);
-            let zip_fn_ty = fun_ty_or_hole(&inner_tuple.ty, &result_ty);
+            let zip_fn_ty = Type::compute_fun_or_hole(&inner_tuple.ty, &result_ty);
             let zip_var = Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty);
             Ok(Expr::apply(inner_tuple, zip_var).with_ty(result_ty))
         }
@@ -1090,7 +1060,7 @@ fn elim_lambda_impl(
                     .collect(),
             );
             let inner_record = TypedExpr::new(TypedExprNode::Record(elim_fields)).with_ty(inner_ty);
-            let zip_fn_ty = fun_ty_or_hole(&inner_record.ty, &result_ty);
+            let zip_fn_ty = Type::compute_fun_or_hole(&inner_record.ty, &result_ty);
             let zip_var = Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty);
             Ok(Expr::apply(inner_record, zip_var).with_ty(result_ty))
         }
@@ -1157,7 +1127,7 @@ fn elim_lambda_impl(
         TypedExprNode::Aggregate { input, kind } => {
             let agg_builtin = Builtin::for_aggregate(kind);
             let input = *input;
-            let agg_ty = fun_ty_or_hole(&input.ty, &body_ty);
+            let agg_ty = Type::compute_fun_or_hole(&input.ty, &body_ty);
             let agg_var = Expr::builtin(agg_builtin).with_ty(agg_ty);
             let desugared = Expr::apply(input, agg_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
@@ -1599,8 +1569,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             )?;
             // Compare modulo Pi binder *presence*: the point-free
             // construction keeps a dependent morphism's own binder (same
-            // `Name`, uid-preserved) but rebuilds combinator types with
-            // `name: None`; see `Type::without_pi_names`.
+            // `Name`, uid-preserved) but rebuilds a built-in's own function type
+            // with `name: None`; see `Type::without_pi_names`.
             #[cfg(debug_assertions)]
             assert!(
                 original_ty.without_pi_names() == result.ty.without_pi_names(),
@@ -1679,7 +1649,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let left_elim = elim_lambdas(ctx, *left)?;
             let right_elim = elim_lambdas(ctx, *right)?;
             let tuple_ty = Type::Tuple(vec![left_elim.ty.clone(), right_elim.ty.clone()]);
-            let fn_ty = fun_ty_or_hole(&tuple_ty, &ty);
+            let fn_ty = Type::compute_fun_or_hole(&tuple_ty, &ty);
             let tuple = Expr::tuple(vec![left_elim, right_elim]).with_ty(tuple_ty);
             let fn_var = Expr::builtin(Builtin::BinOp(op)).with_ty(fn_ty);
             let mut desugared = Expr::apply(tuple, fn_var);
@@ -1710,7 +1680,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         TypedExprNode::UnaryOp(op, inner) => {
             let op_builtin = Builtin::for_unaryop(op);
             let inner_elim = elim_lambdas(ctx, *inner)?;
-            let fn_ty = fun_ty_or_hole(&inner_elim.ty, &ty);
+            let fn_ty = Type::compute_fun_or_hole(&inner_elim.ty, &ty);
             let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let mut desugared = Expr::apply(inner_elim, fn_var);
             desugared.ty = ty;
@@ -1721,7 +1691,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         TypedExprNode::Aggregate { input, kind } => {
             let input2 = elim_lambdas(ctx, *input)?;
             let agg_builtin = Builtin::for_aggregate(kind);
-            let agg_ty = fun_ty_or_hole(&input2.ty, &ty);
+            let agg_ty = Type::compute_fun_or_hole(&input2.ty, &ty);
             Ok(dbg_typecheck_mv(
                 Expr::apply(input2, Expr::builtin(agg_builtin).with_ty(agg_ty)).with_ty(ty),
             ))
@@ -1845,8 +1815,8 @@ mod tests {
     ///
     /// The point-free form denotes what the lambda denoted, so a lambda that was
     /// a collection stays one. It is not automatic: elimination rebuilds the
-    /// function type through combinator constructors (`fun_ty_or_hole`, `Type::pi`) that
-    /// mint the capability kind, and after elimination the domain no longer
+    /// function type through constructors ([`Type::compute_fun_or_hole`], `Type::pi`)
+    /// that mint `Compute`, and after elimination the domain no longer
     /// distinguishes the two — a collection's is its index set, a morphism's its
     /// element type, and both are just types.
     #[test]
