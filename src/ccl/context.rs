@@ -548,9 +548,13 @@ pub struct CompiledProgram {
     /// between the post-inference and post-channelize snapshots) — see
     /// [`MONO_PASSES`] and [`CHANNELIZE_PASSES`].
     ///
-    /// Rows exist only for nodes a recording produced: an untouched node has none
-    /// (it was never rewritten), and neither has a refinement-predicate interior
-    /// (see `LineageTable`'s `TODO(predicate-rows)`).
+    /// Rows exist only for nodes a recording produced, so an untouched node has
+    /// none — it was never rewritten. Refinement-predicate interiors are rows
+    /// like any other: `collect_tree_ids` enumerates them, so the fold must
+    /// explain them, and `PredMemo::rebuild` records a derived predicate against
+    /// the one it was built from. What is not recorded is planning **raising** a
+    /// predicate back into the main tree; see `design/provenance.md`, "Known
+    /// prerequisites for panes past `post-channelize`".
     ///
     /// Empty when capture is switched off — no pass scope is opened then, so
     /// every flush is a no-op — see [`lineage_capture_enabled`]. This is the
@@ -1982,10 +1986,10 @@ mod tests {
     /// blame edges and can render or prune them.
     ///
     /// Pinned as the set of pane relations where such an edge exists, for the same
-    /// reason [`EXERCISED_BOUNDARIES`] is pinned: blame is named at four sites
-    /// in the compiler, two of them inside a pane relation, and a corpus or
-    /// recording edit that stopped exercising them would otherwise leave the
-    /// labelled half of the relation untested.
+    /// reason [`EXERCISED_BOUNDARIES`] is pinned: blame is named at a handful of
+    /// sites, all in the mutability phases and so all inside the second pane
+    /// relation, and a corpus or recording edit that stopped exercising them
+    /// would otherwise leave the labelled half of the relation untested.
     ///
     /// A blame edge is *only* blame here: no corpus rewrite both
     /// consumes a node and blames it, so nothing in the corpus pins the
@@ -2114,15 +2118,6 @@ mod tests {
         assert_eq!(reported, expected);
     }
 
-    /// A pass that rewrites the program records its rewrites under its own pass
-    /// tag — the tag being the one part of a row no recording site knows, and the
-    /// only thing that places a row in a pane relation.
-    ///
-    /// A pass that rewrites *nothing* on a given program records nothing, which
-    /// is the preserve case and correct (most of the corpus preserves end to
-    /// end), so the fixture is one that drives three of the five: the
-    /// transaction, which `transact_phase` disassembles, `mut_elim` rebuilds as
-    /// a `LetRec`, and `channelize` rewrites.
     /// **Distinct predicate terms never share a `NodeId`** — with each other, or
     /// with the main tree.
     ///
@@ -2162,6 +2157,15 @@ mod tests {
         );
     }
 
+    /// A pass that rewrites the program records its rewrites under its own pass
+    /// tag — the tag being the one part of a row no recording site knows, and the
+    /// only thing that places a row in a pane relation.
+    ///
+    /// A pass that rewrites *nothing* on a given program records nothing, which
+    /// is the preserve case and correct (most of the corpus preserves end to
+    /// end), so the fixture is one that drives three of the five: the
+    /// transaction, which `transact_phase` disassembles, `mut_elim` rebuilds as
+    /// a `LetRec`, and `channelize` rewrites.
     #[test]
     fn a_rewriting_pass_tags_its_rows_with_itself() {
         let (_, code) = corpus()

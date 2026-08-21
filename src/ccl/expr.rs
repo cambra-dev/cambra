@@ -904,12 +904,32 @@ impl TypedExpr {
     /// [`preserve`](Self::preserve), and the opt-out from the freshening
     /// [`Clone`].
     ///
-    /// Reach for this in exactly two situations. Anywhere else, a copy that
+    /// Reach for this in the four situations below. Anywhere else, a copy that
     /// duplicates ids is a bug waiting to be found by an id-uniqueness assert,
     /// and the right fix is to **record** the freshened copy — open a recording
     /// around it — not to suppress the freshen.
     ///
-    /// # 1. A snapshot taken for rollback or comparison
+    /// # 1. A `Subst` discharge template
+    ///
+    /// A [`Subst`](crate::ccl::subst::Subst) discharge payload is never a tree
+    /// node. Every read of it materializes a copy with its own identity —
+    /// `Mapping::as_expr` a wholly fresh node-set, `as_expr_preserving` a fresh
+    /// interior under the occurrence's own root — so the *template* must mint
+    /// nothing, or each read strands the generation it copied from. Every site of
+    /// this shape is either the argument to `Subst::discharge` or `Mapping`'s own
+    /// `Clone` propagating one, and the solver copies substitutions constantly.
+    ///
+    /// # 2. A retained pane snapshot
+    ///
+    /// The three trees the inspector displays — `pre_inference_ir`,
+    /// `post_inference_ir`, `post_channelize_ir` — are taken at their pass
+    /// boundaries and kept. A pane's whole purpose is to be joined to its
+    /// neighbour *by shared id*, so freshening one would leave the fold nothing
+    /// to join on. The two trees are simultaneously live and deliberately so:
+    /// they are separate trees, never both reachable from one root, which is what
+    /// keeps `assert_unique_node_ids` honest on each.
+    ///
+    /// # 3. A snapshot taken for rollback or comparison
     ///
     /// A copy the normal path *discards*, kept only so a failure or a later
     /// comparison has something to look at. Lowering's per-statement rollback
@@ -919,7 +939,7 @@ impl TypedExpr {
     /// reads — quadratic in both cases; each site carries a `TODO` saying so, and
     /// the real fix at both is to stop needing the copy at all.
     ///
-    /// # 2. Tests that compare trees across a transformation
+    /// # 4. Tests that compare trees across a transformation
     ///
     /// A test that runs a pass over a copy and compares against the original
     /// needs the two to be *the same nodes*, or it is not testing the pass. See
@@ -927,9 +947,15 @@ impl TypedExpr {
     ///
     /// # Why this is sound
     ///
-    /// In both shapes the copy **replaces or shadows** its source rather than
-    /// standing beside it: at no point are both reachable from one tree, so
-    /// nothing ever observes two live nodes at one identity.
+    /// No shape puts the source and the copy in one tree. A template is not a
+    /// tree node; a pane is its own tree; a rollback or test snapshot sits
+    /// outside the tree the pipeline goes on rewriting. So nothing ever observes
+    /// two live nodes at one identity within a walk.
+    ///
+    /// The **move out of a borrow** rides along on the same reasoning: where Rust
+    /// forces a copy to get a value out of a map or a slice and the source is
+    /// then dropped, the copy *is* the node it came from
+    /// (`transact_phase`'s key-init stash and its carrier binding list).
     ///
     /// # What this is *not* for
     ///

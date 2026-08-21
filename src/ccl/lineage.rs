@@ -49,10 +49,10 @@
 //! states the composition.
 //!
 //! Attribution reads both columns, unioned: a node's spans are its parents'
-//! spans plus whatever distinct spans its blame adds. Blame is named at four
-//! sites in the compiler, so for almost every node this is the spans of
-//! whatever it was made from. Attribution reads no label — a span is a span
-//! whichever column named the node it came from.
+//! spans plus whatever distinct spans its blame adds. Blame is named at a
+//! handful of sites, all in the mutability phases, so for almost every node this
+//! is the spans of whatever it was made from. Attribution reads no label — a
+//! span is a span whichever column named the node it came from.
 //!
 //! # Domains, not passes
 //!
@@ -526,9 +526,9 @@ impl Leak {
 /// a rewrite that names blame is saying "these outputs are also about that
 /// node", not "attribute them there instead". A row with no parents (the pure
 /// insertion) has blame as all there is; a row with no blame — the common case,
-/// blame being named at four sites in the whole compiler — resolves through what
-/// it was made from, which is why walking the lineage recovers a source location
-/// for almost every node.
+/// blame being named at a handful of sites, all in the mutability phases —
+/// resolves through what it was made from, which is why walking the lineage
+/// recovers a source location for almost every node.
 ///
 /// The union is **unlabelled**: a span is a span whichever channel named the
 /// node it came from, so this function reads the two columns as one sequence.

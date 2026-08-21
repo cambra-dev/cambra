@@ -15,7 +15,10 @@ the inspector's consumption of the panes. A reader can tell the two apart by the
 marker alone; unmarked prose describes code you can go read.
 
 Adoption is complete across the five passes the two pane relations span — `Mono`,
-`Inline`, `Transact`, `Letrec`, `Channelize` — and the gate holds at zero on both.
+`Inline`, `Transact`, `Letrec`, `Channelize`. The always-on gate holds at zero on
+both relations over `context.rs`'s eleven-program `corpus()`; the whole-suite gate
+covers the second relation only, for the reason below.
+
 Three further sites record without reaching any table in a normal build, because
 `compile_program` opens no `PassScope` around them: `simplify`,
 `planning/iterate`, and `transact_phase`'s as-of-read rewrite. `lambda_elim`
@@ -204,11 +207,14 @@ Three shapes, and the choice between them is about what the copy *denotes*:
   `on_copy`, so an open recording rows the copy on the node it duplicated, and
   with none open nothing is written. No call site needs to know which.
 - **`clone_preserving_ids`** — the copy *is the same node*, so it keeps its ids.
-  Sound because the copy replaces or shadows its source: the two are never both
-  reachable from one tree. Two shapes qualify — a snapshot taken for rollback or
-  comparison, which the normal path discards, and a test comparing trees across a
-  pass — plus the moves-out-of-a-borrow, where Rust forces a copy and the source
-  is dropped.
+  Sound because no shape puts the source and the copy in one tree. Four shapes
+  qualify: a `Subst` discharge template, which is never a tree node and whose
+  every read mints its own identity; a retained pane snapshot, which exists to be
+  joined to its neighbour by shared id; a snapshot taken for rollback or
+  comparison, which the normal path discards; and a test comparing trees across a
+  pass. The moves-out-of-a-borrow — where Rust forces a copy to get a value out of
+  a map or a slice and the source is then dropped — rides along on the same
+  reasoning. `TypedExpr::clone_preserving_ids` carries each with its sites.
 
   **Not a way to silence a leak.** An `Unexplained` or `ParentUnknown` means a
   copy was made with nothing recording, or against an origin the table never
@@ -295,9 +301,10 @@ even so, which is why a surviving node carries an ancestry self-edge
 
 Attribution resolves through **`parents` ∪ `blame`** — parentage first, then
 blame's distinct additions, so the span order is deterministic and blame is never
-dropped when it names a node the parents do not. Blame is named at four sites in the whole tree, so for almost
-every node this is simply the spans of what it was made from, which is why
-walking the lineage recovers a source location at all.
+dropped when it names a node the parents do not. Blame is named at a handful of
+sites, all in the mutability phases, so for almost every node this is simply the
+spans of what it was made from, which is why walking the lineage recovers a
+source location at all.
 
 **Two labels on one relation, which is why they stay separate columns.** Both
 relate a node to other nodes; what differs is what the relation *asserts* — a
@@ -375,9 +382,9 @@ a loud failure rather than a silent misattribution):
   second parent on a row and the only place any id is named at record time.
 - `blame(ids)` — nodes this rewrite is **related to but did not consume to
   produce** its outputs. Attribution unions them with the parents; the lineage
-  relation carries them as *blame* edges. Blame is named at four sites in
-  the whole tree, so `parents` alone is what recovers a source location for
-  almost every node.
+  relation carries them as *blame* edges. Blame is named at a handful of sites,
+  all in the mutability phases, so `parents` alone is what recovers a source
+  location for almost every node.
 
 `enter` is the only constructor a pass uses. `copy_frame` is the one recording
 that names **no** node: uncurry's template-interior freshens and the compare-chain
@@ -629,7 +636,9 @@ cannot see.
 
 Construction closes the gap the check would have watched: a node is built either
 by `TypedExpr::new` (mint, recorded) or `TypedExpr::preserve` (carry an existing
-id, nothing recorded), so an id cannot be minted and then discarded.
+id, nothing recorded), so an id cannot be minted **unrecorded**. Minting one and
+then discarding it stays possible, and costs the stranded row named under
+"Freshen at placement, not at construction".
 
 The fold runs over the inspector's two pane relations today; **planned** is the
 inspector's consumption of what it produces.
@@ -713,7 +722,7 @@ inspector's consumption of what it produces.
   mutated incrementally.
 - **Materialization (cold, inspector-only).** `CompiledProgram::materialize_panes`
   folds `lineage_table` across the two pane relations, restricting it by pass:
-  `MONO_WINDOW` bridges pre → post-inference; `CHANNELIZE_PASSES` (Inline, Transact,
+  `MONO_PASSES` bridges pre → post-inference; `CHANNELIZE_PASSES` (Inline, Transact,
   Letrec, Channelize) bridges post-inference → post-channelize. It returns the three per-pane
   `SourceProjection`s, the two pane-pair `LineageMap`s, and each relation's leak
   vector. There is no catch-all bridge: a node is explained by a recorded row or
@@ -727,10 +736,14 @@ inspector's consumption of what it produces.
   construction — it is the death report, and gating on it would be unsatisfiable
   now that no pass declares what it consumes.
 
-  Where the gate stands on a real corpus: **zero on every gated class, at both
-  pane relations, for every program.** Capture is total over the adopted span —
-  every output-pane node has an origin — and the corpus test asserts it as a
-  property rather than pinning a residue count.
+  Where the gate stands: **zero on every gated class, at both pane relations,
+  for every program in `corpus()`** — that being what
+  `pane_relations_fold_with_no_structural_leaks` asserts, as a property rather
+  than a pinned residue count. Capture is total over the adopted span: every
+  output-pane node has an origin. The whole-suite gate
+  (`CAMBRA_LINEAGE_GATE=1`) is the wider corpus and the narrower relation — it
+  holds at zero over every program the caller compiles, at the second relation
+  only.
 
 ## Known prerequisites for panes past `post-channelize`
 
