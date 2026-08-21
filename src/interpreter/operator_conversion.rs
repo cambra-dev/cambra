@@ -26,11 +26,11 @@ use crate::{
             StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
         },
         tile_operators::{
-            Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
-            FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
-            MapFilter, MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource,
-            Memo, PermuteRecordDomain, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
-            VariantProject, VariantWrap, fan_in, fan_in_named,
+            Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
+            Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
+            MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
+            MapResultWithSource, Memo, PermuteRecordDomain, Restrict, TileOperator, Tiling,
+            Uncurry, UnionOperator, VariantProject, VariantWrap, fan_in, fan_in_named,
         },
         tuple_field,
     },
@@ -1109,6 +1109,63 @@ fn convert_impl_inner(
             convert_permute_domain(function, argument, ctx)
         }
 
+        // A **partially applied** checked lookup: `𝑐 ▷ curry(lookup?)` is the morphism "look a
+        // key up in `𝑐`", so this node arrives with the keys as its input. `simplify`'s
+        // `try_partial_lookup` mints it wherever the collection does not vary, which is what
+        // lets the collection be compiled once and read per key — a streamed collection
+        // cannot be replicated into every row, since broadcasting copies a single value.
+        TypedExprNode::Apply { argument, function }
+            if as_curried_builtin(function) == Some(Builtin::LookupChecked) =>
+        {
+            let keys = expect_input(input, "partial checked lookup")?;
+            let option_ty = expr.ty.codomain().ok_or_else(|| {
+                ConversionError::TypeError(format!(
+                    "`c ▷ curry(lookup?)` must have function type, got {}",
+                    expr.ty
+                ))
+            })?;
+            let option_extent = ctx.extent_of(&option_ty)?;
+            let collection = convert_impl(argument, None, ctx)?;
+            reject_collection_valued_lookup(collection.tiling())?;
+            Ok(Box::new(CheckedLookup::new(
+                collection,
+                keys,
+                option_extent,
+            )))
+        }
+
+        // The **checked lookup** with both operands syntactic: `(𝑐, 𝑘) ▷ lookup?` where the
+        // pair is still a term, so each leg compiles as its own source and the collection is
+        // read once rather than lifted into every row. This is the shape a lookup at a point
+        // takes. Where the pair has already been assembled into a stream of `(collection,
+        // key)` rows, the bare-`lookup?` arm below takes over.
+        TypedExprNode::Apply { argument, function }
+            if matches!(
+                &function.node,
+                TypedExprNode::Builtin(Builtin::LookupChecked)
+            ) && matches!(&argument.node, TypedExprNode::Tuple(_)) =>
+        {
+            expect_no_input(input, "checked lookup")?;
+            let TypedExprNode::Tuple(pair) = &argument.node else {
+                unreachable!("guarded above")
+            };
+            let [coll_expr, key_expr] = pair.as_slice() else {
+                return Err(ConversionError::Unsupported(format!(
+                    "`lookup?` takes exactly a collection and a key, got {} operands",
+                    pair.len()
+                )));
+            };
+            let option_extent = ctx.extent_of(&expr.ty)?;
+            let collection = convert_impl(coll_expr, None, ctx)?;
+            reject_collection_valued_lookup(collection.tiling())?;
+            let keys = convert_impl(key_expr, None, ctx)?;
+            Ok(Box::new(CheckedLookup::new(
+                collection,
+                keys,
+                option_extent,
+            )))
+        }
+
         TypedExprNode::Apply { argument, function } => {
             if input.is_some() {
                 return Err(ConversionError::Unsupported(format!(
@@ -2143,6 +2200,38 @@ fn proj_field(
     Ok(Box::new(MapResult::new(
         input,
         Box::new(Constant::new(fn_value, fn_extent)),
+    )))
+}
+
+/// The builtin under a `curry`, if `expr` is `curry(b)` — `Apply { argument: Builtin(b),
+/// function: Builtin(Curry) }`. A partial application of a tupled builtin is the only shape
+/// `Curry` takes that op-conversion compiles.
+fn as_curried_builtin(expr: &Expr) -> Option<Builtin> {
+    let TypedExprNode::Apply { argument, function } = &expr.node else {
+        return None;
+    };
+    if as_builtin(function) != Some(Builtin::Curry) {
+        return None;
+    }
+    as_builtin(argument)
+}
+
+/// Reject a lookup whose collection does not tile as a sealed function.
+///
+/// The operator reads the domain column of a sealed function to decide presence, so any
+/// other tiling has nothing to search. A collection-**valued** codomain is the shape this
+/// guards: its rows tile as a `CurriedFunction`, and the answer would carry a collection as
+/// its `` `some `` payload, which nothing materializes. Typing rejects the one producer of
+/// those today (a key-dependent codomain has no checked lookup), so this is the boundary
+/// check for a shape that reaches op-conversion by some other route.
+fn reject_collection_valued_lookup(tiling: &Tiling) -> Result<(), ConversionError> {
+    if matches!(tiling, Tiling::SealedFunction { .. }) {
+        return Ok(());
+    }
+    Err(ConversionError::Unsupported(format!(
+        "`c[k]?` needs a collection that tiles as a sealed function, so that its domain can \
+         be searched; this one tiles as {tiling}. A collection-valued codomain is the usual \
+         reason — the answer would carry a collection as its `some` payload"
     )))
 }
 

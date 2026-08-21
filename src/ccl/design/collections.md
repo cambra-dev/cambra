@@ -29,6 +29,8 @@ that is `unit` for one, so the operation layer has nothing to dispatch on betwee
 > **What is built.** Everything in this document is implemented unless it is tagged
 > `[Planned]` (e.g. the operation layer). Where a `[Planned]` feature has an interim
 > behavior in today's code, that is tagged `[Interim]`.
+> A section tagged `[Partly implemented]` states which of its operators exist and
+> which do not, in the section itself.
 
 ## The six collection types
 
@@ -235,18 +237,112 @@ rejects — and a `debug_assert` in `coalesce_node`'s `Compose` arm holds the in
 
 ## Lookup: membership discharge
 
-> **[Planned]** — `c[k]` lowers as the lookup `c(k)`, but no rule discharges the index's
-> membership, so it is a type error at the `Apply` for every index. The surface operators are
-> specified in [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access);
-> this is the mechanic that decides which one type-checks.
+> **[Partly implemented]** — the two surface operators, proven `c[k] : 𝑇` and checked
+> `c[k]? : Option(𝑇)`, are specified in
+> [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access).
+> `c[k]?` types today for a keyed collection whose type is known at the lookup
+> ([`Builtin::LookupChecked`]); `c[k]` is still rejected, with a hint naming `c[k]?`, and
+> that is the design — what is missing is not a rule but a *source*, since no expression
+> yields a key carrying its collection's key domain while iteration binds the codomain.
 
 Lookup is uniform across ranges and keys: `𝑐[𝑥]` is well-typed when `𝑥`'s type proves
 `𝑥 ∈ dom(𝑐)`, and its totality is *whether that proof discharges*. Membership rides on the
 **element's** type, not the collection's, so iterating a collection's own domain hands the
 proof over and `m[k]` is total there, while a key from outside carries no proof and takes
-the checked `m[k]?`. The range case is the same rule at a different domain: `arr[𝑖] : 𝑇`
-where `{𝑖 | 𝑖 < 𝑛}` discharges, `lst[𝑖]? : Option(𝑇)` where it cannot. One mechanic covers
-all four collection types rather than one per type.
+the checked `m[k]?`.
+
+That uniformity is a claim about the **rule**, not yet about the representation. A keyed
+domain is a refinement, so a key interoperates with `𝐾` by refinement drop and the
+discharge has ordinary machinery to work with. A range domain is the primitive
+`UIntRange(𝑛)`, which relates only by equality, so nothing lets `{𝑖 | 𝑖 < 𝑛}` discharge
+against it — realizing the range case means either a subtyping arm relating the two or
+making a range domain a refinement like the keyed one.
+
+### `𝑐[𝑘]?` is not an application
+
+`𝑐[𝑘]?` types as `Option(𝑉)`, and it is its own total operation rather than an application
+of `𝑐`. An application requires its argument to lie in the function's domain, and a checked
+lookup is reached exactly when that is not known — so typing it as one would first have to
+relax `𝑐`'s domain, and a collection type with its domain relaxed is a type no value has.
+
+The rule instead relates the key to what the collection's keys *are*:
+
+- **The key owes the key base.** A data function's domain refinement describes which keys
+  are present — the membership predicate a re-keying constructor writes, the filter a
+  comprehension writes — and deciding presence is the operator's job at runtime, so none of
+  it is the key's obligation. An abstract `Map(𝐾, 𝑉)` arrives at `𝐾` already, its kind
+  having stated it; a concrete keyed collection carries its own present-key domain, whose
+  base is `𝐾`.
+- **The answer is `Option` of the value.** Nothing is applied and nothing is discharged.
+
+[`Builtin::CollectionContains`] is the same shape one payload lighter — `∀ι κ. (ι ⤇ κ) ⇒
+(κ ⇒ Bool)`, a runtime-decided question behind a *total* function — and `𝑐[𝑘]?` is that
+question answering with the value instead of a tag.
+
+Reading the key type off the collection alone is load-bearing. Relating the key and the
+collection's keys to a *common* type — the literal reading of `SubtypesOf` — is satisfied
+by any join, so a `String` key against an `Int`-keyed map widens the key type instead of
+failing (`a_checked_lookup_is_not_an_application`).
+
+**A key-dependent codomain answers at the key.** A group-by's group is refined by the key
+binder, and `𝑔[𝑘]` reads the group refined at `𝑘`, the binder discharged to the key term
+(`a_key_dependent_lookup_discharges_the_key_binder`). The substituted type stands for any
+key of the key type — the empty group where the key is absent — which is sound for exactly
+the reason above: nothing is applied, so the binder's declared domain is where the binder
+was introduced rather than an obligation the key owes. That is the deferred `m[𝑘] : 𝑉(𝑘)`
+this document names under [`groupby`'s exact type](#groupbys-exact-type), now paid at the
+type level. What the answer cannot do is *materialize* — see below.
+
+### How `𝑐[𝑘]?` compiles
+
+**A `CheckedLookup` operator, which decides the membership.** It takes the collection and
+the key as separate sources, searches the collection's domain for the key, and emits
+`` `some(𝑐(𝑘)) `` or `` `none ``.
+
+Deciding is the work, and no arrangement of existing operators avoids it. A collection is a
+**total** function on its own domain, `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ 𝑉`, and
+says nothing about keys outside it — applying it at an unproven key is exactly what
+[the proven lookup](#lookup-membership-discharge) refuses. What `𝑐[𝑘]?` returns is a tagged
+sum, and producing one means answering the predicate. [`Builtin::CollectionContains`] is
+the type-level name for the key set; asking whether an arbitrary key is in that set is a
+search, not a reading.
+
+**Absence is decided, not read off an empty tile.** An empty tile means "no rows known
+here", which covers a key genuinely absent *and* a producer that has not converged.
+Answering `` `none `` from emptiness would make the tag a function of how far the source had
+run rather than of the collection's value, so the same lookup on a live source would answer
+`` `none `` and later `` `some `` — and a live source is the ordinary case here. Terminality
+is therefore the **readiness** condition: `CheckedLookup` withholds until the domain is
+decided, and only then answers `` `none ``.
+
+**Applied to a pair.** The lowering emits `(𝑐, 𝑘) ▷ lookup?`. Inference relates the key to
+the collection's key **base** and discharges a dependent binder to the key *term*, which is
+what makes a group-by lookup read the group refined at the key it was looked up at. Nothing
+is applied at the key, so the domain's membership refinement is not an obligation for the
+rule to relax.
+
+Emission computes that discharge; a check reads it back off the operator's stamped type
+rather than re-running it. Planning compiles a refinement's predicate to point-free form,
+and compilation records the binder's type on the `const` minted to carry it — a place
+substituting the binder's occurrence does not reach — so a discharge re-run after planning
+builds a term emission never produced (`Typing::keyed_value_at`).
+
+The operator's domain is a pair, so it never produces a function value. Its point-free form
+is a morphism from a zip, `⟨𝑐, 𝑘⟩ ≫ lookup?`, and a collection reaches that zip one way:
+
+- **One collection for the whole iteration**, where the collection leg is closed in the loop
+  binder. `simplify`'s partial-lookup rule rewrites `⟨const(𝑐), 𝑔⟩ ≫ lookup?` to
+  `𝑔 ≫ (𝑐 ▷ curry(lookup?))`, and op-conversion compiles that partial application to a
+  collection read once with every key answered against it. The rewrite is not an
+  optimization: a streamed collection cannot be replicated into every row, because
+  broadcasting copies a single present value and a collection is a tile.
+
+**A collection-valued collection is not supported.** A group-by's rows are themselves
+collections, so the answer would carry a collection as its `` `some `` payload, and a
+variant payload that is a collection has no materialization. Op-conversion rejects that
+shape by name (`a_group_valued_lookup_is_rejected_by_name`). It is also the case where
+presence and emptiness genuinely differ: a `Map(𝐾, Collection(𝑉))` can store an empty
+collection at a present key.
 
 ### Prerequisite: the proof has to survive being consumed
 
@@ -280,7 +376,9 @@ codomain is the group, and it **depends on `𝑘`**.
 That dependency decides what the type is: a [`FullMap`](#the-six-collection-types), not a
 `Map`, since a `Map(𝐾, 𝑉)` holds one `𝑉` with no binder for the group to name. No
 annotation or consumer converts one into the other, so a group-by is consumed at the type
-it has.
+it has. A checked lookup answers at the key, the binder discharging to the key term
+([`𝑐[𝑘]?` is not an application](#𝑐𝑘-is-not-an-application)); what it cannot do is
+materialize, a group being a collection.
 
 ### Lowering realization: the key binder states its domain
 

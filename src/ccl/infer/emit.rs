@@ -854,6 +854,40 @@ pub(super) fn emit_apply<C: Typing>(
     argument: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
+    // The **checked** lookup `c[k]?`, intercepted rather than given a scheme. A scheme
+    // would have to name the key type, and only a `SubtypesOf(𝐾)` kind states one — so it
+    // would read `(Σ (σ : SubtypesOf(𝑘)). σ ⤇ 𝑣, 𝑘) ⇒ Option(𝑣)` and every concrete
+    // collection would need an entry term first, which is a term only a typed pass can
+    // decide to insert. The rule states the same relation directly instead.
+    if matches!(
+        &function.node,
+        TypedExprNode::Builtin(crate::ccl::Builtin::LookupChecked)
+    ) {
+        // The argument is the `(collection, key)` pair lowering built, so emitting it
+        // types both halves.
+        let pair_ty = ctx.subexpr(argument)?;
+        let Type::Tuple(elts) = &pair_ty else {
+            return Err(ctx.raise(InferError::Unsupported(format!(
+                "`lookup?` is applied to a `(collection, key)` pair, got `{pair_ty}`"
+            ))));
+        };
+        let [collection, key_ty] = elts.as_slice() else {
+            return Err(ctx.raise(InferError::Unsupported(format!(
+                "`lookup?` takes exactly a collection and a key, got `{pair_ty}`"
+            ))));
+        };
+        let (collection, key_ty) = (read_through(collection), key_ty.clone());
+        // The key **term**, not just its type: a dependent codomain discharges its key
+        // binder to it, so `g[k]` reads the group refined at `k`.
+        let TypedExprNode::Tuple(pair) = &argument.node else {
+            unreachable!("`lookup?`'s argument typed as a Tuple, so its node is one");
+        };
+        let [_, key] = pair.as_slice() else {
+            unreachable!("`lookup?`'s argument typed as a two-element Tuple");
+        };
+        let key = key.clone_preserving_ids();
+        return emit_lookup_checked(function, &collection, &key, &key_ty, ctx);
+    }
     let raw_arg_ty = ctx.subexpr(argument)?;
     let fn_ty = ctx.subexpr(function)?;
     // **The one position where a mutable variable's handle survives.** If the parameter is a
@@ -916,6 +950,155 @@ pub(super) fn emit_apply<C: Typing>(
     ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| {
         "Apply".to_string()
     })
+}
+
+/// The value type `𝑚[𝑘]` reads, with the key related to the collection's keys.
+///
+/// One shape per keyed access, so every use of `m[k]` reads the same type off it rather
+/// than restating the rule. The read ([`emit_lookup_checked`]) wraps it in `Option`.
+///
+/// **Not an application.** A keyed access is reached precisely when the key is *not* known
+/// to lie in the collection's domain, and application demands that it does — so typing one
+/// as the other would have to relax the domain first, and a relaxed collection type is a
+/// type no value has. The relation that does hold is `SubtypesOf`'s: the collection's keys
+/// and this key are both keys, so both are below one key type
+/// (`src/ccl/design/type-inference.md`, "Type kind containment"). Whether *this* key is
+/// present is decided at runtime, exactly as [`Builtin::CollectionContains`] decides membership
+/// behind a total `𝜅 ⇒ Bool`.
+fn keyed_access_value<C: Typing>(
+    keys: &Type,
+    value: Type,
+    key_ty: &Type,
+    at: &dyn Fn() -> String,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    // The key owes the collection's key **base**. A data function's domain refinement is
+    // what describes which keys are present — the membership predicate a re-keying
+    // constructor writes, the filter a comprehension writes — and deciding presence is the
+    // operator's job at runtime, so none of it is the key's obligation. An abstract
+    // `Map(𝐾, 𝑉)` arrives already at `𝐾`, its kind having stated it.
+    //
+    // Reading the key type off the collection alone is load-bearing. Relating the key and
+    // the collection's keys to a *common* type instead — the literal reading of
+    // `SubtypesOf` — is satisfied by any join, so a `String` key against an `Int`-keyed map
+    // widens the key type rather than failing.
+    ctx.require_sub(key_ty, keys.peel_refinements(), at)?;
+    Ok(value)
+}
+
+/// Type the **checked** lookup `(𝑐, 𝑘) ▷ lookup?`: the codomain `𝑐[𝑘]` names, wrapped in
+/// `Option`.
+///
+/// The key is related to the collection's keys and nothing is applied at it
+/// ([`keyed_access_value`]); presence is what the operator decides at runtime.
+fn emit_lookup_checked<C: Typing>(
+    function: &mut Expr,
+    collection: &Type,
+    key: &Expr,
+    key_ty: &Type,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    let (keys, binder, codomain) = keyed_access_types(collection)
+        .ok_or_else(|| not_a_keyed_access(collection, "checked lookup `c[k]?`"))
+        .map_err(|e| ctx.raise(e))?;
+    let value = ctx.keyed_value_at(&codomain, binder.as_ref(), key, &function.ty);
+    let at_key = keyed_access_value(
+        &keys,
+        value,
+        key_ty,
+        &|| "checked lookup key".to_string(),
+        ctx,
+    )?;
+    let result = Type::option_of(at_key);
+    // Stamp the builtin with the concrete instance at this site, as `reify` does, so later
+    // passes read a consistent type off the node. The domain is the pair the operator is
+    // applied to, which is what op-conversion reads to size its output.
+    function.ty = Type::fun(
+        Type::Tuple(vec![collection.clone(), key_ty.clone()]),
+        result.clone(),
+    );
+    Ok(result)
+}
+
+/// Why `what` has no keyed access on `collection`.
+///
+/// An unresolved target is the natural shape of an access through a parameter, and a
+/// dependent codomain is the deferred `m[𝑘] : 𝑉(𝑘)` — both say what is missing rather than
+/// reporting a shape mismatch.
+fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
+    if matches!(collection, Type::Infer(_) | Type::Hole) {
+        return InferError::Unsupported(format!(
+            "{what} needs the collection's type at this point, but `{collection}` is not \
+             resolved yet. Reaching a collection through a *parameter* is not supported yet \
+             — bind it with `=` in the same scope, or iterate it instead"
+        ));
+    }
+    if let Type::Fun {
+        name: Some(binder),
+        codomain,
+        ..
+    } = collection.peel_refinements()
+        && (crate::ccl::subst::references_enclosing_function(codomain)
+            || crate::ccl::subst::type_free_vars(codomain).contains(binder))
+    {
+        return InferError::Unsupported(format!(
+            "{what} is not supported on a collection whose values depend on the key: \
+             `{collection}`'s codomain names its key binder, so the answer at a key that is \
+             only *maybe* present would have to be typed under the assumption that it is. \
+             Iterate the collection instead, which binds each key to a group that is \
+             present by construction"
+        ));
+    }
+    InferError::ExpectedFunction {
+        found: collection.clone(),
+        at: format!("{what} target"),
+    }
+}
+
+/// The **key type and value type** a keyed collection reads at — what `𝑐[𝑘]?` and
+/// `𝑚[𝑘] := 𝑣` both need. `None` when `collection` is not a keyed collection.
+///
+/// An **abstract** `Map(𝐾, 𝑉)` states its key type in its kind: `SubtypesOf(𝐾)` says
+/// "some domain over `𝐾`", so instantiating the sum there is the Σ elimination rule
+/// (`src/ccl/design/type-inference.md`, "How a sum flows through the solver") and `𝐾`
+/// comes back without anything being taken apart. A **concrete** keyed collection states
+/// its own present-key domain instead, and the key type is what that domain and the
+/// looked-up key have in common — recovered by the caller's edges, not by this function.
+///
+/// A **dependent** codomain comes back with its key binder, for
+/// [`Typing::keyed_value_at`] to discharge to the key term: a group-by's group is refined
+/// by that binder, and `𝑔[𝑘]` reads the group refined at `𝑘`. The discharge is sound at a
+/// key that is only *maybe* present precisely because a keyed access is not an
+/// application — the binder's declared domain is where the binder was introduced, not an
+/// obligation the key owes — and the substituted type stands for any key of the key type,
+/// denoting the empty group when the key is absent. Whether the answer can be
+/// *materialized* is a separate question, decided at op-conversion
+/// (`reject_collection_valued_lookup`).
+fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
+    let collection = collection.peel_refinements();
+    let viewed = match collection.sum() {
+        Some([witness, ..]) => {
+            let crate::ccl::ty::TypeKind::SubtypesOf(key) = witness.type_kind() else {
+                return None;
+            };
+            collection.instantiate_sum(&key)
+        }
+        _ => collection.clone(),
+    };
+    let Type::Fun {
+        name,
+        domain,
+        codomain,
+        ..
+    } = &viewed
+    else {
+        return None;
+    };
+    // The binder rides out with the codomain rather than being applied here: whether the
+    // discharge is computed or read back is the context's call. A codomain that names it in
+    // neither reference form makes the discharge vacuous, so this needs no dependence test
+    // of its own ([`crate::ccl::subst::discharge_codomain`]).
+    Some(((**domain).clone(), name.clone(), (**codomain).clone()))
 }
 
 /// Record an operator's single obligation and give back its result type.

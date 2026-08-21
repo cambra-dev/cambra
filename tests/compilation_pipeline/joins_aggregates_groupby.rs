@@ -16,6 +16,7 @@ use cambra::interpreter::{
     BaseType, ColumnValue, Extent, Predicate, TestDataSource, Tile, Value,
     sort_sealed_function_by_domain,
 };
+use indoc::indoc;
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -771,8 +772,8 @@ fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
 }
 
 /// The same sharing where at least one use is a **lookup**, split out because those are
-/// deferred with every other `g(k)` (see `test_grouping_lookup_edges`). The sharing
-/// claim is the same one; only how the grouping is used differs.
+/// deferred with every other `g(k)` (see [`test_grouping_lookup_edges`] for what they
+/// wait on). The sharing claim is the same one; only how the grouping is used differs.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // A grouping iterated *and* looked up.
@@ -785,7 +786,7 @@ fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
     "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))",
     Value::Int(9)
 )]
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see `test_grouping_lookup_edges`)"]
+#[ignore = "a bare-key `g(k)` is rejected by design and is not coming back; restating as `g[k]?` needs dependent lookup and then a materializable collection payload (see `test_grouping_lookup_edges`)"]
 fn test_shared_grouping_through_a_lookup(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -795,12 +796,14 @@ fn test_shared_grouping_through_a_lookup(#[case] code: &str, #[case] expected: V
 /// A lookup walks the grouping for the key and slices out its rows; a key the
 /// grouping settled without ever seeing yields the empty group, which sums to
 /// zero rather than failing.
-// **Lookup cases are deferred.** `groupby` infers the honest keyed type
-// `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group`, so `g(k)` at a plain key demands proving the key
-// is in *that* key domain — the discharge in `src/ccl/design/collections.md`, "Lookup:
-// membership discharge", which re-enables them as discharged / `Option` lookups. They
-// passed before only because the old total-function type was too loose: any key was
-// admitted, and an absent one gave the empty group.
+// **Lookup cases are deferred, and not on one capability.** `groupby` infers the honest
+// keyed type `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ group`, so the proven `g(k)` at a
+// plain key cannot be shown present, and rejecting it is the design rather than a gap. The
+// checked `g[k]?` does not stand in for it either: it types — the key binder discharges to
+// the key term — but a group is a collection, so the answer would carry one as its `some`
+// payload and op-conversion rejects that
+// (`a_group_valued_lookup_is_rejected_by_name`). These come back when the proven lookup
+// lands *and* a collection-valued `some` payload materializes — two capabilities.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(3))", Value::Int(3))]
@@ -809,7 +812,7 @@ fn test_shared_grouping_through_a_lookup(#[case] code: &str, #[case] expected: V
     "g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(9))",
     Value::Int(2)
 )]
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see the comment above)"]
+#[ignore = "a bare-key `g(k)` is rejected by design and is not coming back; restating as `g[k]?` needs dependent lookup and then a materializable collection payload (see the comment above)"]
 fn test_grouping_lookup_edges(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -848,13 +851,13 @@ fn test_grouping_built_once(#[case] code: &str) {
 }
 
 /// The same claim where the uses are **lookups**, deferred with every other `g(k)`
-/// (see `test_grouping_lookup_edges`). One `converse` per program is the property
-/// either way; only how the grouping is used differs.
+/// (see [`test_grouping_lookup_edges`] for what they wait on). One `converse` per program
+/// is the property either way; only how the grouping is used differs.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum(g(1)) + sum(g(2)) + sum(g(3))")]
 #[case("g = groupby([1,1,2,2,3], \\x -> x)\nsum([sum(x) for x in g]) + sum(g(2))")]
-#[ignore = "regression: a bare key cannot prove membership until the lookup discharge lands (see `test_grouping_lookup_edges`)"]
+#[ignore = "a bare-key `g(k)` is rejected by design and is not coming back; restating as `g[k]?` needs dependent lookup and then a materializable collection payload (see `test_grouping_lookup_edges`)"]
 fn test_grouping_built_once_through_a_lookup(#[case] code: &str) {
     use cambra::ccl::symbolic::symbolic;
 
@@ -866,4 +869,85 @@ fn test_grouping_built_once_through_a_lookup(#[case] code: &str) {
         1,
         "the grouping should be bucketized once however many uses it has; got:\n{ccl}"
     );
+}
+
+/// The checked lookup `c[k]?` end to end: membership decided against the collection's
+/// domain, answered as the `` {`none | `some{𝑉}} `` sum the type promises.
+///
+/// The absent case is the one worth pinning. Absence is **decided** here rather than read
+/// off an empty tile: an empty tile means "no rows known", which covers a key genuinely
+/// missing and a producer that has not converged, so reading `` `none `` off it would make
+/// the answer depend on how far the source had run. `CheckedLookup` withholds until the
+/// domain is decided and only then answers `` `none ``.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::map_present(
+    "m = map([(1, 10), (2, 20)])\nmatch m[1]?:\n    case `some(v):\n        v\n    case `none:\n        0",
+    Value::Int(10)
+)]
+#[case::map_absent(
+    "m = map([(1, 10), (2, 20)])\nmatch m[9]?:\n    case `some(v):\n        v\n    case `none:\n        0",
+    Value::Int(0)
+)]
+// A `Set(K)` is `Map(K, unit)`, so its lookup is membership as a value.
+#[case::set_present(
+    "s = set([1, 2, 3])\nmatch s[2]?:\n    case `some(_):\n        1\n    case `none:\n        0",
+    Value::Int(1)
+)]
+#[case::set_absent(
+    "s = set([1, 2, 3])\nmatch s[9]?:\n    case `some(_):\n        1\n    case `none:\n        0",
+    Value::Int(0)
+)]
+fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A group-by's groups are themselves collections, so a checked lookup on one would carry
+/// a collection as its `` `some `` payload — which nothing materializes.
+///
+/// Rejected at **op-conversion**, not by the typing rule: the answer's *type* is fine, the
+/// key binder having discharged to the key
+/// (`tests/type_check.rs`'s `a_key_dependent_lookup_discharges_the_key_binder`), and it is
+/// the tiling that has no shape for it. The pipeline test earns its place beside the typing
+/// one: this is the whole program failing, and at the layer that owns the reason.
+#[test]
+fn a_group_valued_lookup_is_rejected_by_name() {
+    check_compile_error(
+        indoc! {r#"
+            g = groupby([1, 1, 2], \x -> x)
+            match g[1]?:
+                case `some(grp):
+                    sum(grp)
+                case `none:
+                    0
+        "#},
+        "A collection-valued codomain is the usual reason",
+    );
+}
+
+/// A checked lookup **inside an iteration**, which is what currying buys.
+///
+/// `𝑐 ▷ lookup?` is a morphism, so a lookup whose collection does not vary eta-reduces to a
+/// plain composition `keys ≫ (𝑐 ▷ lookup?)`. The collection is read once and each key
+/// answered against it — where a pair argument would have had to lift the whole collection
+/// into every row.
+///
+/// `match` is a statement, so the arms are reached through a `def`, which is the spelling
+/// `docs/chl-spec.md`, "4.10 `match` — tag dispatch" gives for per-element dispatch.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::both_present("sum([or_zero(m[k]?) for k in [1, 2]])", Value::Int(30))]
+#[case::one_absent("sum([or_zero(m[k]?) for k in [1, 9]])", Value::Int(10))]
+#[case::all_absent("sum([or_zero(m[k]?) for k in [8, 9]])", Value::Int(0))]
+fn checked_lookup_over_a_key_stream(#[case] tail: &str, #[case] expected: Value) {
+    let code = format!(
+        "def or_zero(o: Option(Int)) => Int:\n\
+         \x20   match o:\n\
+         \x20       case `some(v):\n\
+         \x20           v\n\
+         \x20       case `none:\n\
+         \x20           0\n\
+         m = map([(1, 10), (2, 20)])\n{tail}"
+    );
+    check_scalar(&code, expected);
 }

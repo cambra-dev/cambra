@@ -636,6 +636,30 @@ pub enum Builtin {
     /// to a `Restrict`, so no `collection_contains` reaches op-conversion as a term. That
     /// holds because nothing reifies it, not because a check rejects one that does.
     CollectionContains,
+
+    /// `lookup? : ((𝑘: 𝐷) ⤇ 𝑉, 𝐾) → Option(𝑉[𝑘 ↦ key])` — the **checked** lookup `c[k]?`,
+    /// evaluating a finite function at a point not known to be in its domain
+    /// (`docs/chl-spec.md`, "3.9 Subscript and attribute access").
+    ///
+    /// **Not an application**, so the key owes the collection's key *base* and presence is
+    /// what the operator decides at runtime (`src/ccl/design/collections.md`,
+    /// "`𝑐[𝑘]?` is not an application"). A dependent codomain answers at the key, its
+    /// binder discharging to the key term.
+    ///
+    /// Applied as a tupled argument, the convention [`Self::GetPrevTxn`] shares:
+    /// `Apply(Tuple([collection, key]), Builtin(LookupChecked))`. It never carries a
+    /// function value, so its point-free form is an ordinary morphism from a zip. A lookup
+    /// whose collection does not vary takes the partial application `𝑐 ▷ lookup?` that
+    /// `simplify`'s partial-lookup rule mints — the only shape [`Self::Curry`] takes that
+    /// op-conversion compiles.
+    ///
+    /// Typed by a dedicated arm in [`emit_apply`](crate::ccl::infer) rather than by a
+    /// scheme, which would have to name the codomain outside the key binder's scope.
+    /// Emission computes the discharge and a check reads it back off this operator's
+    /// stamped type rather than re-running it: planning point-free-compiles a predicate,
+    /// and substituting into a compiled one leaves the `const` carrying the binder at the
+    /// binder's type (`Typing::keyed_value_at`).
+    LookupChecked,
 }
 
 impl Builtin {
@@ -682,6 +706,7 @@ impl Builtin {
             Self::VariantProject(_) => "variant_project",
             Self::VariantWrap(_) => "variant_wrap",
             Self::CollectionContains => "collection_contains",
+            Self::LookupChecked => "lookup?",
         }
     }
 

@@ -302,6 +302,10 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
         ),
         expr,
     );
+    changed |= check(
+        ruled("simplify.partial_lookup", expr, try_partial_lookup),
+        expr,
+    );
 
     // Rules that may discard or restructure sub-expressions.  Equationally
     // valid only on pure CCC morphisms, so they must not touch a sub-tree
@@ -910,6 +914,76 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             let id_node = id().with_ty(id_ty);
             let zip_node = zip_pair(id_node, g, mint_kind).with_ty(zip_ty);
             vec![zip_node, *h]
+        },
+    )
+}
+
+/// Partial lookup: `⟨const(𝑐), 𝑔⟩ ≫ lookup?  ⟹  𝑔 ≫ (𝑐 ▷ curry(lookup?))`
+///
+/// `lookup?` takes a `(collection, key)` pair, so a lookup whose collection does not vary
+/// has no term for "look a key up in `𝑐`" until the pair is broken apart again. `curry` is
+/// that term, and supplying `𝑐` to it is the partial application op-conversion compiles to a
+/// collection read once with every key answered against it. Without this the collection would
+/// have to be replicated into every row, which a streamed collection cannot be: broadcasting
+/// copies one present value, and a collection is a tile.
+///
+/// Stated on `lookup?` rather than on any tupled morphism. The rewrite is only an improvement
+/// where the partial application has a compiled meaning, and `curry` of an arbitrary morphism
+/// does not — `⟨const(2), 𝑔⟩ ≫ add` would become a function value nothing consumes.
+fn try_partial_lookup(expr: &mut Expr) -> bool {
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            is_builtin(right, Builtin::LookupChecked)
+                && as_zip(left).is_some_and(|(l, _)| as_const(l).is_some())
+        },
+        |left, lookup, mint_kind| {
+            let TypedExpr {
+                node: TypedExprNode::Apply { argument, .. },
+                ..
+            } = left
+            else {
+                unreachable!()
+            };
+            let TypedExpr {
+                node: TypedExprNode::Tuple(mut elts),
+                ..
+            } = *argument
+            else {
+                unreachable!()
+            };
+            let keys = elts.swap_remove(1);
+            let const_c = elts.swap_remove(0);
+            let TypedExpr {
+                node: TypedExprNode::Apply { argument: c, .. },
+                ..
+            } = const_c
+            else {
+                unreachable!()
+            };
+            // `curry(lookup?) : 𝐶 ⇒ (𝐾 ⇒ Option(𝑉))`, and applying it at `𝑐` leaves the
+            // morphism the keys compose into. Both types are read off `lookup?`'s own
+            // stamped pair type, which inference made concrete.
+            let lookup_ty = lookup.ty.clone();
+            let option_ty = lookup_ty.codomain().unwrap_or(Type::Hole);
+            let key_ty = keys.ty.codomain().unwrap_or(Type::Hole);
+            let at_key = Type::Fun {
+                name: None,
+                fun_kind: mint_kind.clone(),
+                domain: Box::new(key_ty),
+                codomain: Box::new(option_ty),
+            };
+            // `curry(lookup?) : ((𝐶, 𝐾) ⇒ Option(𝑉)) ⇒ (𝐶 ⇒ (𝐾 ⇒ Option(𝑉)))`, applied at
+            // the collection to leave the morphism the keys compose into.
+            let curry_ty = Type::fun(c.ty.clone(), at_key.clone());
+            let curry_of_lookup = Expr::apply(
+                lookup,
+                Expr::builtin(Builtin::Curry)
+                    .with_ty(Type::fun(lookup_ty.clone(), curry_ty.clone())),
+            )
+            .with_ty(curry_ty);
+            let partial = Expr::apply(*c, curry_of_lookup).with_ty(at_key);
+            vec![keys, partial]
         },
     )
 }

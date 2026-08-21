@@ -654,8 +654,10 @@ where
                 } else {
                     Spanned::new(e.span(), Expr::Tuple(idxs))
                 };
-                PostfixOp::Subscript(Box::new(idx))
-            });
+                Box::new(idx)
+            })
+            .then(just(Token::Question).or_not())
+            .map(|(idx, q)| PostfixOp::Subscript(idx, q.is_some()));
         // `.name` or `.0` — one operation, projecting a field keyed by name or by
         // position. A positional key is spelled as an integer literal because an
         // identifier can never begin with a digit, so the two forms cannot collide; the
@@ -682,9 +684,10 @@ where
                             func: Box::new(target),
                             args,
                         },
-                        PostfixOp::Subscript(index) => Expr::Subscript {
+                        PostfixOp::Subscript(index, checked) => Expr::Subscript {
                             target: Box::new(target),
                             index,
+                            checked,
                         },
                         PostfixOp::Attribute(attr, attr_span) => Expr::Attribute {
                             target: Box::new(target),
@@ -1042,7 +1045,8 @@ enum PayloadBracket {
 #[derive(Clone)]
 enum PostfixOp {
     Call(Vec<Spanned<Expr>>),
-    Subscript(Box<Spanned<Expr>>),
+    /// A subscript, plus whether it carried the `?` checked suffix.
+    Subscript(Box<Spanned<Expr>>, bool),
     Attribute(SmolStr, Span),
 }
 

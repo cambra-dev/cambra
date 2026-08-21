@@ -2985,3 +2985,31 @@ fn interleaved_two_writer_commit_abort_through_store() {
         Tile::Scalar(ColumnValue::Ints(vec![70])),
     );
 }
+
+/// A `match` on a variant inside a `with begin():` block.
+///
+/// The block's operators are released **per commit** — the store bounds itself by releasing
+/// each writer's window as it advances — so every operator on the path takes a partial domain
+/// release. `VariantProject`'s output domain is the scrutinee's own keys at the rows carrying
+/// its tag, so that release passes through to the scrutinee; the sibling arm's projection
+/// shares the scrutinee through a `FanOut`, which intersects the branches' guards, so a key
+/// reaches the scrutinee only once both arms are done with it.
+///
+/// Nothing here is keyed: the same release reaches any variant eliminator in a block.
+#[test]
+fn a_variant_match_inside_a_block_releases_per_commit() {
+    let value = final_mut_var_value(indoc! {r#"
+        def or_zero(o: Option(Int)) => Int:
+            match o:
+                case `some(v):
+                    v
+                case `none:
+                    0
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                n := n + or_zero(`some(r))
+        await_final(n)
+    "#});
+    assert_eq!(value, Value::Int(3));
+}

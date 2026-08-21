@@ -316,4 +316,24 @@ pub(super) trait Typing {
         kind: Option<&crate::ccl::ty::FunKind>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError>;
+
+    /// The value a keyed access `𝑐[𝑘]` reads: `codomain` with the collection's key
+    /// binder discharged to the key term, or `codomain` unchanged when the collection's
+    /// codomain names no binder.
+    ///
+    /// **Emission computes it; a check reads it back** from `stamped`, the type emission
+    /// left on the operator node. Re-deriving the discharge is only sound while the
+    /// predicate is pointful. Planning point-free-compiles a refinement's predicate, and
+    /// compilation records the binder's type on the `const` minted to carry it — a place
+    /// substituting the binder's occurrence does not reach — so a discharge re-run after
+    /// planning yields a term emission never produced, with `const` claiming a domain its
+    /// new argument does not inhabit. Decomposing a recorded type instead is what
+    /// [`crate::ccl::expr::TypedExprNode::Proj`]'s rule does, for the same reason.
+    fn keyed_value_at(
+        &mut self,
+        codomain: &Type,
+        key_binder: Option<&Name>,
+        key: &Expr,
+        stamped: &Type,
+    ) -> Type;
 }

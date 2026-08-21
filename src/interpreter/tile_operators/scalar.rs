@@ -559,7 +559,24 @@ impl TileProducer for VariantProjectProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // The scrutinee is always read in full, so there is no sub-region of it
+        // A **domain** release passes straight through. This producer's output domain is the
+        // scrutinee's own keys at the rows carrying `tag` (`get_impl` gathers them from the
+        // scrutinee's domain column), so a released output key names a scrutinee key
+        // directly. The sibling projections of one `match` share that scrutinee through a
+        // `FanOut`, whose `release_impl` intersects the branches' guards, so a key reaches
+        // the scrutinee only once *every* arm is done with it — this arm releasing a key it
+        // did not carry does not take it from the arm that did.
+        //
+        // A bare `Scalar(Union)` scrutinee has no domain column — `get_impl` supplies the
+        // positions themselves — so it takes no domain guard and falls to the whole-tile
+        // case below.
+        if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard
+            && matches!(self.input.tiling(), Tiling::SealedFunction { .. })
+        {
+            self.input.release(obsolete_guard);
+            return;
+        }
+        // Anything else is all-or-nothing: there is no other sub-region of the scrutinee
         // this producer could stop requesting.
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.input.release(self.input.tiling().universal_guard());

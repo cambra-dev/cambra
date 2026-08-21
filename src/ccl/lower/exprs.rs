@@ -511,6 +511,55 @@ fn present_key_domain(
     Type::refined_one(key, Refinement::born(Rc::new(predicate)))
 }
 
+/// Lower a subscript `target[index]`, or its **checked** form `target[index]?`.
+///
+/// Subscript and application are the *same* operation — evaluate a finite function at a
+/// point (`docs/chl-spec.md`, "3.9 Subscript and attribute access") — so the plain form
+/// lowers to exactly what the application `target(index)` does, and inherits its proof
+/// obligation: the index must be in the collection's domain, which for a keyed collection
+/// means the key's type carries that collection's key domain.
+///
+/// `[…]` is therefore **only** collection lookup, with no case on the index's shape. A
+/// tuple is a heterogeneous product rather than a finite function, so projecting one is a
+/// different operation and gets a different spelling: `t.0`, alongside `r.name`. Deciding
+/// between them by whether the index happened to be a literal was a guess lowering had no
+/// types to make, and it made `xs[0]` — the commonest thing to write — mean projection and
+/// fail obscurely.
+pub(super) fn lower_subscript(
+    target: &Spanned<ChlExpr>,
+    index: &Spanned<ChlExpr>,
+    checked: bool,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let collection = lower_expr(target, ctx)?;
+    let key = lower_expr(index, ctx)?;
+    if checked {
+        // `(collection, key) ▷ lookup?` — tupled, so the operator's domain is a pair. It
+        // therefore never carries a function value, and the point-free form is an ordinary
+        // morphism from a zip. A keyed write takes the same shape when it lands, so the
+        // read and the write of one keyed access compile the same way.
+        //
+        // Both minted nodes are recorded: the operator and the pair it is applied to are
+        // machinery this rule introduces, and an unrecorded mint is a lineage leak at the
+        // lowering boundary (`src/ccl/design/provenance.md`, "The recorder"). The `Apply`
+        // root is tagged by the caller.
+        let op = ctx.tag_machinery(
+            Expr::builtin(Builtin::LookupChecked),
+            span,
+            "lower.lookup_checked",
+        );
+        let pair = ctx.tag_machinery(
+            Expr::tuple(vec![collection, key]),
+            span,
+            "lower.lookup_checked.pair",
+        );
+        return Ok(Expr::apply(pair, op));
+    }
+    // Evaluate the finite function at the point.
+    Ok(Expr::apply(key, collection))
+}
+
 /// Lower a user-function call argument. A **bare variable** argument is the only
 /// shape a pass-by-reference `Mut` parameter accepts (design doc
 /// `src/ccl/design/mutability.md`, rule 1: "a `Mut`-typed value must be a bare
@@ -530,29 +579,6 @@ fn lower_call_arg(
     } else {
         lower_expr(arg, ctx)
     }
-}
-
-/// Lower a subscript `target[index]`.
-///
-/// Subscript and application are the *same* operation — evaluate a finite function at a
-/// point (`docs/chl-spec.md`, "3.9 Subscript and attribute access") — so `c[k]` lowers to
-/// exactly what the application `c(k)` does, and inherits its proof obligation: the index
-/// must lie in the collection's domain.
-///
-/// `[…]` is therefore **only** collection lookup, with no case on the index's shape. A
-/// tuple is a heterogeneous product rather than a finite function, so projecting one is a
-/// different operation with a different spelling — `t.0`, alongside `r.name` — resolved in
-/// the [`ChlExpr::Attribute`] arm of [`lower_expr`]. Deciding between the two by whether
-/// the index happened to be a literal would be a guess lowering has no types to make, and
-/// it is the wrong guess for `xs[0]`, the commonest subscript anyone writes.
-pub(super) fn lower_subscript(
-    target: &Spanned<ChlExpr>,
-    index: &Spanned<ChlExpr>,
-    ctx: &mut LoweringContext,
-) -> Result<Expr, LoweringError> {
-    // The collection is the *function* and the index the *argument*: `c[k]` is `c(k)`.
-    let collection = lower_expr(target, ctx)?;
-    Ok(Expr::apply(lower_expr(index, ctx)?, collection))
 }
 
 pub(super) fn lower_binop(
