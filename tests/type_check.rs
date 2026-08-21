@@ -15,13 +15,14 @@ use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
-    FieldKey, HistoryKind, Lit, PredicateId, Type,
+    Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypedExprNode,
     ccl_utils::walk_refined_predicates,
     infer::{
         InferError, LocatedInferError, TypeInferenceContext, check_pre_desugar, infer,
         lit_singleton,
     },
     lower::{LoweringContext, lower_stmts},
+    uniquify,
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
@@ -31,6 +32,23 @@ use rstest::rstest;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Lower `stmts` and α-uniquify — the pipeline's prefix to `infer`
+/// (`ccl::context` runs `uniquify::run` immediately before it).
+///
+/// Every test in this file that infers from CHL source goes through here, so
+/// inference sees the α-unique binders its own invariants are stated over: the
+/// telescope check is a name lookup *because* uniquify gives every binding site
+/// one uid, and the `Fun`/`Fun` opening gate reasons about a collision needing
+/// the same uid. Inferring a source-spelled tree asks those rules a question the
+/// product never asks, and shadowing — which uniquify removes — is exactly what
+/// makes the answer differ.
+fn lower_uniquified(stmts: &[chl_ast::Spanned<chl_ast::Stmt>], lctx: &mut LoweringContext) -> Expr {
+    let expr = lower_stmts(stmts, lctx)
+        .into_result()
+        .expect("lowering failed");
+    uniquify::run(expr)
+}
 
 /// Parse Python module code, lower to CCL, run type inference, and return the
 /// inferred type of the whole program. Panics on lowering or inference failure.
@@ -59,9 +77,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
         ictx.register_source_type(name, elem_ty.clone());
     }
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx).expect("inference failed")
 }
 
@@ -70,9 +86,7 @@ fn infer_program_err(code: &str) -> Vec<InferError> {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx)
         .map_err(LocatedInferError::bare)
         .expect_err("expected inference error")
@@ -96,9 +110,7 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
         ictx.register_source_type(name, elem_ty.clone());
     }
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx)
         .map_err(LocatedInferError::bare)
         .expect_err("expected inference error")
@@ -1712,6 +1724,65 @@ apply0(groups)
     );
 }
 
+/// An undischarged group-by partition stores the key reference as a de Bruijn
+/// index and renders it as the key binder's name. The two spellings are the
+/// representation's contract end to end: identity is decided on the index, and
+/// the reader sees the name (`src/ccl/design/type-inference.md`, "A binder
+/// reference is stored in one of two forms" and "Rendering opens what it
+/// descended through").
+#[test]
+fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
+    let ty = infer_program("groupby([1, 2, 3], \\x -> x)");
+    let Type::Fun {
+        name: Some(key_binder),
+        codomain,
+        ..
+    } = &ty
+    else {
+        panic!("a group-by is a dependent function from key to partition, got {ty}");
+    };
+    let Type::Fun { domain: dom, .. } = &**codomain else {
+        panic!("expected the partition function inside the key function, got {ty}");
+    };
+    let Type::Refinement(_, r) = &**dom else {
+        panic!("expected a refined partition domain, got {ty}");
+    };
+    // Stored: the reference is a bound index, not a free name. Read off the
+    // term, because the *rendering* deliberately spells it as the binder.
+    let TypedExprNode::BinOp { right, .. } = &r.predicate.node else {
+        panic!("expected the dependent refinement, got {ty}");
+    };
+    let TypedExprNode::Var(reference) = &right.node else {
+        panic!("expected a variable reference, got {ty}");
+    };
+    assert_eq!(
+        reference.pi_bound_index(),
+        Some(0),
+        "the stored refinement must reference the key binder as an index: {ty}"
+    );
+    assert!(
+        cambra::ccl::subst::type_free_vars(&ty).is_empty(),
+        "no free name for the key binder may survive in the stored type: {ty}"
+    );
+    // Read: the reference spells as the binder, and no bare index survives
+    // into a rendering — whole type or refinement on its own.
+    let rendered = ty.to_string();
+    assert!(
+        rendered.contains(&format!("== {key_binder}")),
+        "the rendered type must spell the reference as the binder: {rendered}"
+    );
+    assert!(
+        !rendered.contains('#'),
+        "no index may survive into a rendered type: {rendered}"
+    );
+    let refinement = dom.to_string();
+    assert!(
+        !refinement.contains('#'),
+        "a refinement rendered detached from its function still spells the binder, \
+         off the reference's own hint: {refinement}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Case / if expression tests
 // ---------------------------------------------------------------------------
@@ -1950,9 +2021,7 @@ fn infer_and_check(code: &str) -> Type {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     let stmts = parse_module(code.trim());
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     let ty = infer(&mut expr, &mut ictx).expect("inference failed");
     check_pre_desugar(&expr)
         .expect("post-inference consistency wall must accept the inferred tree");
@@ -1969,6 +2038,12 @@ fn infer_and_check(code: &str) -> Type {
 /// one side of a domain edge demands `[0, N] <: {[0, N] | p}` and rejects two arms
 /// that are the same expression, and stripping both discards a domain that no
 /// branch widens.
+///
+/// The arms' refinements differ in the uid of the term lambda their filter
+/// introduces — `λ x#3 → x#3 > 1` against `λ x#6 → x#6 > 1`, one per lowering —
+/// so the join rests on refinement identity being α-invariant
+/// (`eq_refinement_predicate`). Comparing that binder by name splits the refinement
+/// set and a `Data` domain then reports two domains that do not join.
 #[test]
 fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
     let ty = infer_and_check(
@@ -2572,9 +2647,7 @@ mod binder_slot_records_the_bound_at_type {
         }
         let mut lctx = LoweringContext::default();
         let stmts = parse_module(code);
-        let mut expr = lower_stmts(&stmts, &mut lctx)
-            .into_result()
-            .expect("lowering failed");
+        let mut expr = lower_uniquified(&stmts, &mut lctx);
         infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
         let mut out = None;
         find(&expr, name, &mut out);
@@ -2713,9 +2786,7 @@ mod binder_slot_records_the_bound_at_type {
 
         let mut lctx = LoweringContext::default();
         let stmts = parse_module("[sum(g) for g in groupby([1, 1, 2], \\x -> x)]");
-        let mut expr = lower_stmts(&stmts, &mut lctx)
-            .into_result()
-            .expect("lowering failed");
+        let mut expr = lower_uniquified(&stmts, &mut lctx);
         infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
 
         let mut out = Vec::new();
@@ -3046,9 +3117,7 @@ mod annotation_kinds {
         fn clones(code: &str) -> usize {
             let mut lctx = LoweringContext::default();
             let stmts = parse_module(code);
-            let mut expr = lower_stmts(&stmts, &mut lctx)
-                .into_result()
-                .expect("lowering failed");
+            let mut expr = lower_uniquified(&stmts, &mut lctx);
             infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
             symbolic(&expr).matches("let __mono").count()
         }
@@ -3213,5 +3282,148 @@ fn joining_a_capability_with_a_collection_is_a_kind_conflict() {
                 if msg.contains("compute function") && msg.contains("data collection")
         )),
         "expected a kind conflict, got {errs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// User-written refinements: a refinement's reference to an enclosing binder
+// ---------------------------------------------------------------------------
+
+/// A user-written refinement that references an enclosing binder reaches the solver
+/// with that reference intact, and the binder it names is one the tree holds.
+/// These are the surface-syntax counterparts of the hand-built acceptance tests
+/// in `compact.rs` and `spec_key.rs`: `{T where p}` puts a refinement on a variable
+/// whose telescope has to carry the binder `p` names, the same traveler class
+/// group-by's lowering produces.
+///
+/// The observable is the diagnostic. Nothing discharges a user-written
+/// predicate — a refined parameter admits an argument only when the argument's
+/// own refinement set already carries the predicate — so every case here is rejected
+/// at the subsumption step, and what the assertion reads is the refinement the
+/// solver arrived at.
+#[rstest]
+// A `let` binder is a telescope entry, and a refinement may reference one while it
+// is in scope.
+#[case::let_bound(
+    indoc! {r#"
+        n = 5
+        def f(x: {Int where _ > n}):
+            x
+
+        f(7)
+    "#},
+    "{Int | __elem > n}"
+)]
+// A predicate that projects out of the refined element keeps the projection.
+#[case::projection(
+    indoc! {r#"
+        def f(r: { {x: Int, y: Int} where _.y != 0}):
+            r.x
+
+        f((x=1, y=2))
+    "#},
+    "{{x: Int, y: Int} | __elem.y != 0}"
+)]
+// An output annotation referencing a parameter is rewritten to the tuple
+// projection when uncurrying tuples the parameter list, so the refinement names the
+// binder the lambda actually binds.
+#[case::uncurried_output(
+    indoc! {r#"
+        def f(a: Int, b: Int) => {Int where _ >= a}:
+            a + b
+
+        f(1, 2)
+    "#},
+    "{Int | __elem >= __arg_tuple_0.0}"
+)]
+fn a_user_written_refinement_keeps_its_binder_reference(
+    #[case] code: &str,
+    #[case] refinement: &str,
+) {
+    let errs = infer_program_err(code);
+    assert!(
+        errs.iter()
+            .map(|e| format!("{e:?}"))
+            .any(|msg| msg.contains(refinement)),
+        "expected a diagnostic naming the refinement `{refinement}`, got {errs:?}"
+    );
+}
+
+/// A refinement referencing no binder types through as itself, at both
+/// polarities of the parameter it annotates. This is the control for the cases
+/// above: the refinement travels the same route and closes trivially, so a failure
+/// here is about refinements rather than about scope.
+#[test]
+fn a_refinement_referencing_no_binder_types_through() {
+    let ty = infer_program(indoc! {r#"
+        def f(c: {Int where _ >= 0}):
+            c
+
+        f
+    "#});
+    assert_eq!(
+        format!("{ty}"),
+        "({Int | __elem >= 0} ⇒ {Int | __elem >= 0})",
+        "a closed refinement rides both the domain and the codomain unchanged"
+    );
+}
+
+/// Two α-variant dependent refinements share a position. Both definitions are
+/// identical character for character, so their refinements differ only in binder
+/// identity — the enclosing function's reference lands as an index, and the term
+/// lambda the filter introduces carries a per-lowering uid — and a join at one
+/// position sees one refinement.
+///
+/// Before refinement identity became α-invariant this was a `Data` domain
+/// conflict: `union_domains` kept the two refinements as two alternatives, and a
+/// collection's domain admits no join across them.
+#[test]
+fn two_alpha_variant_dependent_refinements_share_a_position() {
+    let ty = infer_program(indoc! {r#"
+        def f(k):
+            [y for y in [1, 2, 3] if y == k]
+
+        def g(m):
+            [y for y in [1, 2, 3] if y == m]
+
+        [f, g]
+    "#});
+    // `[0, 1] ⤇ ((k: Int) ⇒ ({[0, 2] | …} ⤇ Int))` — the two arms met at the
+    // list's element position and produced one refinement, not two stacked layers.
+    let Type::Fun { codomain, .. } = &ty else {
+        panic!("expected the list's collection type, got {ty}");
+    };
+    let Type::Fun {
+        codomain: inner, ..
+    } = &**codomain
+    else {
+        panic!("expected the dependent function as the element, got {ty}");
+    };
+    let Type::Fun { domain, .. } = &**inner else {
+        panic!("expected the filtered collection, got {ty}");
+    };
+    let Type::Refinement(base, _) = &**domain else {
+        panic!("the filter both arms establish must survive the join, got {ty}");
+    };
+    assert!(
+        !matches!(&**base, Type::Refinement(..)),
+        "the two α-variant refinements must dedup to one layer, got {ty}"
+    );
+}
+
+/// The join above does not depend on which arm arrives first. Only the `Fun`
+/// binder slot follows arrival — it is display metadata, and the refinement itself is
+/// index-spelled — so the two orders agree modulo `without_pi_names`.
+#[test]
+fn the_alpha_variant_join_is_arrival_order_independent() {
+    let program = |arms: &str| {
+        format!(
+            "def f(k):\n    [y for y in [1, 2, 3] if y == k]\n\n\
+             def g(m):\n    [y for y in [1, 2, 3] if y == m]\n\n{arms}\n"
+        )
+    };
+    assert_eq!(
+        infer_program(&program("[f, g]")).without_pi_names(),
+        infer_program(&program("[g, f]")).without_pi_names(),
     );
 }

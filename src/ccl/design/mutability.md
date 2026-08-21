@@ -1090,7 +1090,7 @@ Both a **finite** loop and an **async** (streaming) source drive an induction ac
 model treats a finite domain as a stream that terminates (§Liveness) — and every induction accumulator
 uses *one* realization: the changelog `InductionStore`. Plain, conditional, and feed-carrying loops
 over finite or async extents all route through it. The
-drive reads its source by absolute domain position (async domains arrive unordered), reclaims the
+drive reads its source by absolute domain position (async domains arrive unordered), rerefinements the
 consumed prefix as it advances, and carries reply feeds as `__fire`-gated taps — see *Induction
 stores as a changelog* in `../../interpreter/design-operators.md`.
 

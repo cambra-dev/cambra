@@ -299,7 +299,7 @@ pub struct TraitObligationId(pub(crate) u32);
 static OBLIGATION_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// What one use of a trait records: the demand that some instance fit the type
-/// positions at that use. It carries both halves of the claim — that the operand
+/// positions at that use. It carries both halves of the refinement — that the operand
 /// positions are types some instance accepts, and that each associated position is
 /// what that same instance associates. Arity and
 /// association count are the trait's — `Addable(𝐴, 𝐵 ⇝ 𝑂)` is one shape,

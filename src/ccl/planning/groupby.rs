@@ -51,11 +51,13 @@ fn emit_groupby(
     // readable as its supertype under the contravariant reading of a function —
     // wrong for a collection. The binder must ride the function type as a Pi for the
     // predicate's `k` to stay bound.
-    let partition = |codomain: Type| Type::Fun {
-        name: key_binder.clone(),
-        kind: FunKind::Data,
-        domain: Box::new(key_ty.clone()),
-        codomain: Box::new(codomain),
+    // Construction closes (`Type::pi_kinded`): the group's predicate references
+    // the key binder, and a stored function spells that reference as an index,
+    // so building it with a bare literal would leave the name free and the
+    // checker's rebuilt (closed) type would no longer match the recorded one.
+    let partition = |codomain: Type| match &key_binder {
+        Some(k) => Type::pi_kinded(k.clone(), key_ty.clone(), codomain, FunKind::Data),
+        None => Type::data_fun(key_ty.clone(), codomain),
     };
     let group_of = |codomain: Type| Type::data_fun(group_idx_ty.clone(), codomain);
 
@@ -120,6 +122,7 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     };
     // head.ty = (k: K) ⇒ ({I | pred} ⇒ V) — read the types (name-agnostic).
     let Type::Fun {
+        name: key_binder,
         domain: key_ty,
         codomain: inner,
         ..
@@ -127,11 +130,16 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     else {
         return None;
     };
+    // Descent opens (`src/ccl/design/type-inference.md`, "Where the conversions
+    // run"): the family is stored closed, so `pred`'s reference to the key is an
+    // index until the codomain is read under the binder. The match below is
+    // structural on that reference being a free `Var`.
+    let inner = crate::ccl::subst::open_codomain(&head.ty, inner);
     let Type::Fun {
         domain: refined_dom,
         codomain: value_ty,
         ..
-    } = inner.as_ref()
+    } = &inner
     else {
         return None;
     };
@@ -193,15 +201,11 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     let value_idx_ty = (**idx_ty).clone();
     let keys =
         compose((**c).clone(), key_pf).with_ty(Type::fun(value_idx_ty.clone(), (**key_ty).clone()));
-    let key_binder = match &head.ty {
-        Type::Fun { name, .. } => name.clone(),
-        _ => None,
-    };
     let grouped_values = emit_groupby(
         keys,
         (**c).clone(),
         (**refined_dom).clone(),
-        key_binder,
+        key_binder.clone(),
         (**key_ty).clone(),
         (**value_ty).clone(),
     );

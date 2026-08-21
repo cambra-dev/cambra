@@ -53,7 +53,9 @@ pub mod traits;
 // directory split is path-transparent.
 pub use coalesce::{CoalesceError, coalesce_compact};
 pub use compact::{CompactGraph, CompactType, compact_type, compact_type_polarity_only};
-pub use constrain::{ConstrainCache, ConstrainError, ExtrudeCache, constrain_subtype, extrude};
+pub use constrain::{
+    ConstrainCache, ConstrainError, Derivation, ExtrudeCache, constrain_subtype, extrude,
+};
 pub use scheme::{
     FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots,
     seed_chan_dom_pairings,
@@ -135,6 +137,17 @@ pub(crate) mod test_helpers {
 
     use crate::ccl::{FieldKey, Refinement, Type};
 
+    /// The dependent refinement `__elem == <name>` — a predicate referencing an
+    /// enclosing Pi binder by (raw) name, the mid-solve form.
+    pub(crate) fn dep_pred(name: &str) -> Rc<crate::ccl::TypedExpr> {
+        use crate::ccl::{BinOpKind, CompareKind, Name, TypedExpr};
+        Rc::new(TypedExpr::binop(
+            TypedExpr::var(Name::elem()),
+            BinOpKind::Compare(CompareKind::Equals),
+            TypedExpr::var(Name::raw(name)),
+        ))
+    }
+
     /// Build a `Type` from `FieldKey`-keyed fields: all-`Name` → `Record`,
     /// otherwise a dense `Tuple` (the only product shapes `ccl::Type` has).
     /// Sparse-`Index` inputs have no `Type` form — tests that need them
@@ -205,7 +218,7 @@ mod tests {
 
     /// Regression: mutually-constrained inference variables form an `Rc`
     /// cycle through their bounds (`?a <: ?b` stores `?b` in `?a`'s upper
-    /// bounds and vice versa). Reference counting alone never reclaims it;
+    /// bounds and vice versa). Reference counting alone never rerefinements it;
     /// the owning [`InferArena`](crate::ccl::infer::InferArena)'s `Drop` is
     /// what clears the bounds and breaks the cycle.
     /// If this fails, the cycle is leaking again.

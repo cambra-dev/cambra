@@ -585,7 +585,7 @@ pub(super) fn lower_middle_stmt(
                     // that sequences it onto the rest of the block is
                     // manufactured — the user wrote no sequencing operator. Two
                     // `"lower.image"` tags at one `stmt.span` would have two
-                    // nodes each claiming to be the image of one statement.
+                    // nodes each refinementing to be the image of one statement.
                     let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
                     return Ok(ctx.tag_machinery(
                         Expr::expr_stmt(write, body),
@@ -1470,7 +1470,7 @@ pub(super) fn lower_match(
             PayloadPattern::Named(name) => name.as_str().to_string(),
             PayloadPattern::Ignored | PayloadPattern::Absent => ctx.fresh_ignored_payload(),
         };
-        // Whether the arm *claims the tag carries nothing*. `` case `tag: `` is a
+        // Whether the arm *refinements the tag carries nothing*. `` case `tag: `` is a
         // statement about the type, not an elision of the binder: it matches a
         // payload-less tag, and `emit_case` turns the claim into a constraint on that
         // arm's payload. `_` makes no such claim — it has a payload and declines to

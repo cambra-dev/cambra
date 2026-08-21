@@ -82,6 +82,53 @@ pub(super) fn validate_function_params(
     Ok(())
 }
 
+/// Why a parameter annotation may not name a parameter, at the two shapes where
+/// it may not. The wording is the second half of the diagnostic
+/// [`reject_annotation_references`] raises.
+const TUPLED_PARAMS: &str = "a multi-parameter function takes one tuple argument, which binds no component \
+     for the predicate to name";
+const OWN_BINDER: &str = "a parameter's type cannot depend on the parameter itself";
+
+/// Reject a parameter annotation whose predicate references a parameter.
+///
+/// Unimplemented rather than ill-formed. `(a: Int, c: {Int where _ >= a})` means
+/// `(a: Int) ⇒ ((c: {Int | _ >= a}) ⇒ …)`, and neither shape reaching here carries
+/// that scope: a tupled parameter list binds one tuple, and a `Type::Tuple` binds no
+/// component for the predicate to name or a call site to discharge; a single
+/// parameter can only be naming itself. Rejecting here keeps the reference from
+/// reaching the solver, which reports it as an internal error rather than as a
+/// diagnostic about the program (`src/ccl/design/type-inference.md`, "The
+/// invariant").
+///
+/// A curried parameter list does carry the scope for a reference to a parameter on
+/// its left, which is why an annotation on a nested `def` may name the enclosing
+/// `def`'s parameter. The `Mut`-parameter path is curried and skips this check, a
+/// forward reference included; nothing reaches the solver, because that path
+/// declares only the `Mut` parameters' types and drops every other annotation.
+///
+/// `lowered` is `params`' annotations after [`lower_type_annotation`], positionally.
+fn reject_annotation_references(
+    params: &[Param],
+    lowered: &[Type],
+    fn_span: Span,
+    why: &str,
+) -> Result<(), LoweringError> {
+    let param_names: Vec<Name> = params.iter().map(|p| Name::raw(p.name.as_str())).collect();
+    for (p, ann) in params.iter().zip(lowered) {
+        let free = crate::ccl::subst::type_free_vars(ann);
+        if let Some(referenced) = param_names.iter().find(|n| free.contains(n)) {
+            return Err(LoweringError::unsupported(
+                p.annotation.as_ref().map_or(fn_span, |a| a.ty.span),
+                format!(
+                    "a parameter's annotation may not reference the parameter \
+                     `{referenced}`: {why}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Wrap `body_expr` in a single uncurried lambda over `args`.
 ///
 /// Single-arg `(x): body` → `λ x → body`.
@@ -149,7 +196,14 @@ pub(super) fn uncurry_params(
                 // rejected at the call site. Without this the annotation was
                 // silently dropped and the param inferred purely from its body (so
                 // `def g(a: int)` with an identity body accepted any argument).
-                param.declare(lower_type_annotation(ann, ctx)?);
+                let lowered = lower_type_annotation(ann, ctx)?;
+                reject_annotation_references(
+                    params,
+                    std::slice::from_ref(&lowered),
+                    fn_span,
+                    OWN_BINDER,
+                )?;
+                param.declare(lowered);
             }
         }
         return Ok(lam);
@@ -222,6 +276,7 @@ pub(super) fn uncurry_params(
             None => Type::Hole,
         });
     }
+    reject_annotation_references(params, &elem_anns, fn_span, TUPLED_PARAMS)?;
     let mut lam = Expr::lambda(&tuple_name, Type::Hole, body_with_subs);
     if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
         && let TypedExprNode::Lambda { param, .. } = &mut lam.node
@@ -404,6 +459,56 @@ mod tests {
     // -----------------------------------------------------------------------
     // Regular function definition tests
     // -----------------------------------------------------------------------
+
+    /// A parameter annotation naming a parameter is rejected here, with the
+    /// parameter it names and why that shape has nowhere to bind it. Leaving it
+    /// to the solver spends the error budget on an internal-error diagnostic
+    /// about a claim referencing a binder nothing binds
+    /// (`src/ccl/design/type-inference.md`, "The invariant").
+    #[rstest]
+    // Tupled: the sibling reference has no component binder to name…
+    #[case::sibling("def f(a: Int, c: {Int where _ >= a}):\n    c\n\nf\n", "a")]
+    // …in either order, since the check is about the parameter list, not about
+    // whether the referenced parameter comes first.
+    #[case::sibling_reversed("def f(c: {Int where _ >= a}, a: Int):\n    c\n\nf\n", "a")]
+    #[case::sibling_of_three("def f(a: Int, b: Int, c: {Int where _ >= b}):\n    c\n\nf\n", "b")]
+    // Single parameter: the only parameter it can name is itself.
+    #[case::own_binder("def f(a: {Int where _ >= a}):\n    a\n\nf\n", "a")]
+    fn a_parameter_annotation_may_not_reference_a_parameter(
+        #[case] code: &str,
+        #[case] referenced: &str,
+    ) {
+        let stmts = parse_module(code);
+        let errs = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect_err("a parameter annotation naming a parameter is rejected");
+        let rendered = format!("{errs:?}");
+        assert!(
+            rendered.contains(&format!("reference the parameter `{referenced}`")),
+            "expected the diagnostic to name `{referenced}`, got {rendered}"
+        );
+    }
+
+    /// The references that stay legal, so the rejection above is about the
+    /// parameter list and not about refinements referencing anything at all.
+    #[rstest]
+    // An enclosing `let` binding: in scope, and discharged to its definiens as
+    // the type leaves that scope.
+    #[case::outer_let("n = 5\ndef f(a: Int, c: {Int where _ >= n}):\n    c\n\nf\n")]
+    // The *output* annotation may name a parameter: it rides a `let` inside the
+    // lambda, so uncurrying rewrites it to the tuple projection along with the
+    // body.
+    #[case::output_annotation("def f(a: Int, b: Int) => {Int where _ >= a}:\n    a + b\n\nf\n")]
+    // An enclosing `def`'s parameter: a curried binder, so the telescope is real.
+    #[case::enclosing_param(
+        "def g(k: Int):\n    def h(x: {Int where _ >= k}):\n        x\n    h\n\ng\n"
+    )]
+    fn a_refinement_may_reference_a_binder_outside_the_parameter_list(#[case] code: &str) {
+        let stmts = parse_module(code);
+        lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering accepts a reference to a binder outside the parameter list");
+    }
 
     #[rstest]
     // Simple function: body is a single expression.

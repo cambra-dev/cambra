@@ -826,100 +826,162 @@ impl serde::Serialize for Type {
     }
 }
 
+/// Renders through [`fmt_type`] with no enclosing function: a self-contained
+/// type carries every function its references name, so the spelling is
+/// complete. A type shown detached from a function that binds one of its references renders that
+/// reference as its bare index — see [`symbolic::PiBinderEnv`].
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Type::Base(b) => write!(f, "{}", b.keyword()),
-            // `n == 0` means an empty range (e.g. the domain of `[]`); render
-            // it as `∅` instead of computing `n - 1` and underflowing.
-            Type::BoundedHole(t) => write!(f, "<:{t}"),
-            Type::UIntRange(0) => write!(f, "∅"),
-            Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
-            // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
-            // capability (and an unresolved kind var), `⤇` for a data collection
-            // (see `FunKind::arrow`), making the collection/capability distinction
-            // legible in every type string.
-            Type::Fun {
-                name: Some(x),
-                kind,
-                domain,
-                codomain,
-            } => write!(f, "(({x}: {domain}) {} {codomain})", kind.arrow()),
-            Type::Fun {
-                name: None,
-                kind,
-                domain,
-                codomain,
-            } => write!(f, "({domain} {} {codomain})", kind.arrow()),
-            Type::Tuple(ts) => {
-                let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
-                write!(f, "({})", parts.join(", "))
+        fmt_type(f, self, None)
+    }
+}
+
+/// `ty` rendered inside `binders` — the [`Display`](fmt::Display) form of
+/// [`fmt_type`], for a caller that holds an environment and needs a type
+/// string. The symbolic printer takes this for the type slots it renders
+/// inside a refinement predicate, so a reference to an enclosing function
+/// prints as that function's binder name there too.
+pub(crate) struct TypeUnder<'a, 'b>(
+    pub(crate) &'a Type,
+    pub(crate) Option<&'a symbolic::PiBinderEnv<'b>>,
+);
+
+impl fmt::Display for TypeUnder<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_type(f, self.0, self.1)
+    }
+}
+
+/// Render `ty` inside `binders`, the functions the rendering has descended
+/// through. Threading them is what lets a refinement predicate print a
+/// reference to one of them by that function's own binder name rather than
+/// as a de Bruijn index (`src/ccl/design/type-inference.md`, "Rendering opens
+/// what it descended through").
+fn fmt_type(
+    f: &mut fmt::Formatter<'_>,
+    ty: &Type,
+    binders: Option<&symbolic::PiBinderEnv<'_>>,
+) -> fmt::Result {
+    /// `ty` in the same environment, as something `write!` can take directly, so
+    /// a single-child arm formats straight into `f`. The `Tuple`/`Record`/`Variant`
+    /// arms still materialize a `String` per child, because they `join` them.
+    fn at<'a, 'b>(
+        ty: &'a Type,
+        binders: Option<&'a symbolic::PiBinderEnv<'b>>,
+    ) -> TypeUnder<'a, 'b> {
+        TypeUnder(ty, binders)
+    }
+    match ty {
+        Type::Base(b) => write!(f, "{}", b.keyword()),
+        // `n == 0` means an empty range (e.g. the domain of `[]`); render
+        // it as `∅` instead of computing `n - 1` and underflowing.
+        Type::BoundedHole(t) => write!(f, "<:{}", at(t, binders)),
+        Type::UIntRange(0) => write!(f, "∅"),
+        Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
+        // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
+        // capability (and an unresolved kind var), `⤇` for a data collection
+        // (see `FunKind::arrow`), making the collection/capability distinction
+        // legible in every type string.
+        //
+        // The codomain renders one function deeper, named or not: the index
+        // counts crossings, so an unnamed one occupies an entry too.
+        Type::Fun {
+            name,
+            kind,
+            domain,
+            codomain,
+        } => {
+            let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
+            let cod = at(codomain, Some(&inner));
+            let dom = at(domain, binders);
+            match name {
+                Some(x) => write!(f, "(({x}: {dom}) {} {cod})", kind.arrow()),
+                None => write!(f, "({dom} {} {cod})", kind.arrow()),
             }
-            Type::Record(fields) => {
-                let parts: Vec<_> = fields.iter().map(|(n, t)| format!("{n}: {t}")).collect();
-                write!(f, "{{{}}}", parts.join(", "))
+        }
+        Type::Tuple(ts) => {
+            let parts: Vec<_> = ts.iter().map(|t| at(t, binders).to_string()).collect();
+            write!(f, "({})", parts.join(", "))
+        }
+        Type::Record(fields) => {
+            let parts: Vec<_> = fields
+                .iter()
+                .map(|(n, t)| format!("{n}: {}", at(t, binders)))
+                .collect();
+            write!(f, "{{{}}}", parts.join(", "))
+        }
+        Type::Variant(tags, openness) => {
+            // An **open** arm set renders with a trailing `| …`, so a demand that
+            // admits further tags never reads as an exact sum in a diagnostic or a
+            // symbolic dump. (Only a demand is ever open — see `Openness`.)
+            let ellipsis = if openness.permits_extra_tags() {
+                " | …"
+            } else {
+                ""
+            };
+            // Anonymous positional variants (all tags are
+            // `FieldKey::Index`, as `++`/`Copair` produces) are
+            // rendered as a flat `A | B` join — the positional tags
+            // carry no user-meaningful information. Nested
+            // all-positional variants flatten recursively so
+            // `a ++ b ++ c` prints as `A | B | C` rather than
+            // `[._0: [._0: A | ._1: B] | ._1: C]`.
+            if let Some(payloads) = synthetic_payloads(tags) {
+                let parts: Vec<_> = payloads
+                    .iter()
+                    .map(|t| at(t, binders).to_string())
+                    .collect();
+                write!(f, "{}{ellipsis}", parts.join(" | "))
+            } else {
+                // CHL's surface spelling — see `fmt_variant_arms`. A `Unit`
+                // payload is the nullary constructor and renders bare.
+                crate::util::fmt_variant_arms(
+                    f,
+                    tags.iter().map(|(n, t)| {
+                        let payload = match t {
+                            Type::Base(BaseType::Unit) => None,
+                            _ => Some(at(t, binders).to_string()),
+                        };
+                        (n.to_string(), payload)
+                    }),
+                    openness.permits_extra_tags(),
+                )
             }
-            Type::Variant(tags, openness) => {
-                // An **open** arm set renders with a trailing `| …`, so a demand that
-                // admits further tags never reads as an exact sum in a diagnostic or a
-                // symbolic dump. (Only a demand is ever open — see `Openness`.)
-                let ellipsis = if openness.permits_extra_tags() {
-                    " | …"
-                } else {
-                    ""
-                };
-                // Anonymous positional variants (all tags are
-                // `FieldKey::Index`, as `++`/`Copair` produces) are
-                // rendered as a flat `A | B` join — the positional tags
-                // carry no user-meaningful information. Nested
-                // all-positional variants flatten recursively so
-                // `a ++ b ++ c` prints as `A | B | C` rather than
-                // `[._0: [._0: A | ._1: B] | ._1: C]`.
-                if let Some(payloads) = synthetic_payloads(tags) {
-                    let parts: Vec<_> = payloads.iter().map(|t| t.to_string()).collect();
-                    write!(f, "{}{ellipsis}", parts.join(" | "))
-                } else {
-                    // CHL's surface spelling — see `fmt_variant_arms`. A `Unit`
-                    // payload is the nullary constructor and renders bare.
-                    crate::util::fmt_variant_arms(
-                        f,
-                        tags.iter().map(|(n, t)| {
-                            let payload = match t {
-                                Type::Base(BaseType::Unit) => None,
-                                _ => Some(t.to_string()),
-                            };
-                            (n.to_string(), payload)
-                        }),
-                        openness.permits_extra_tags(),
-                    )
-                }
-            }
-            // A **singleton** prints as its base pinned to the literal: `{Int |
-            // __elem == 5}` is `Int@5`. The predicate is the type's whole content,
-            // and spelling it out puts one in front of the reader at every literal.
-            // Every other refinement prints in the general form.
-            Type::Refinement(t, r) => match singleton_value(self) {
-                Some(lit) => write!(f, "{t}@{}", symbolic::symbolic(lit)),
-                None => write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate)),
-            },
-            Type::Hole => write!(f, "_"),
-            // A hole with an identity renders as one: `_#0` and `_#1` are distinct
-            // requests, two `_#0`s are the same one.
-            Type::SharedHole(id) => write!(f, "_#{id}"),
-            Type::Infer(var) => write!(f, "?{}", var.uid),
-            Type::DataSource(name) => write!(f, "source({name})"),
-            Type::ChanDom(name, _) => write!(f, "chan({name})"),
-            Type::Txn => write!(f, "Txn"),
-            Type::History {
-                value,
-                domain,
-                kind,
-            } => {
-                if *kind == HistoryKind::Overwrite {
-                    write!(f, "Mut({value}, {domain})")
-                } else {
-                    write!(f, "feed({domain} ⇒ {value})")
-                }
+        }
+        // A **singleton** prints as its base pinned to the literal: `{Int |
+        // __elem == 5}` is `Int@5`. The predicate is the type's whole content,
+        // and spelling it out puts one in front of the reader at every literal.
+        // Every other refinement prints in the general form.
+        //
+        // The predicate renders inside `binders`, so a reference to an
+        // enclosing function prints as that function's binder name.
+        Type::Refinement(t, r) => match singleton_value(ty) {
+            Some(lit) => write!(f, "{}@{}", at(t, binders), symbolic::symbolic(lit)),
+            None => write!(
+                f,
+                "{{{} | {}}}",
+                at(t, binders),
+                symbolic::symbolic_under(&r.predicate, binders)
+            ),
+        },
+        Type::Hole => write!(f, "_"),
+        // A hole with an identity renders as one: `_#0` and `_#1` are distinct
+        // requests, two `_#0`s are the same one.
+        Type::SharedHole(id) => write!(f, "_#{id}"),
+        Type::Infer(var) => write!(f, "?{}", var.uid),
+        Type::DataSource(name) => write!(f, "source({name})"),
+        Type::ChanDom(name, _) => write!(f, "chan({name})"),
+        Type::Txn => write!(f, "Txn"),
+        Type::History {
+            value,
+            domain,
+            kind,
+        } => {
+            let (value, domain) = (at(value, binders), at(domain, binders));
+            if *kind == HistoryKind::Overwrite {
+                write!(f, "Mut({value}, {domain})")
+            } else {
+                write!(f, "feed({domain} ⇒ {value})")
             }
         }
     }
@@ -1038,10 +1100,34 @@ impl Type {
 
     /// Helper for creating a dependent (Pi) **compute** function type
     /// `(name: domain) ⇒ codomain`.
+    ///
+    /// Construction closes: free references to `name` in `codomain` become
+    /// de Bruijn indices ([`crate::ccl::subst::close_pi_binder`]), so the
+    /// constructed function never carries a free name for its own binder and
+    /// two α-variant function types are structurally identical. See
+    /// `src/ccl/design/type-inference.md`, "Where the conversions run".
     pub fn pi(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
+        Type::pi_kinded(name, domain, codomain, FunKind::Compute)
+    }
+
+    /// [`Type::pi`] at an explicit kind, for a rebuild that carries the `FunKind`
+    /// it is replacing: a group-by partition function is a dependent *collection*,
+    /// so its Pi stays `⤇` instead of flattening to the capability arrow.
+    ///
+    /// Closes its codomain exactly as [`Type::pi`] does — the kind is the only
+    /// difference, and reaching for a bare [`Type::Fun`] literal to get it is what
+    /// leaves a free binder name in a stored type.
+    pub fn pi_kinded(
+        name: impl Into<crate::ccl::Name>,
+        domain: Self,
+        codomain: Self,
+        kind: FunKind,
+    ) -> Self {
+        let name = name.into();
+        let codomain = crate::ccl::subst::close_pi_binder(&name, &codomain);
         Type::Fun {
-            name: Some(name.into()),
-            kind: FunKind::Compute,
+            name: Some(name),
+            kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
@@ -1109,12 +1195,7 @@ impl Type {
     /// Contrast [`Type::pi`] / [`Type::fun`] / [`Type::data_fun`], which *stamp*
     /// a kind and are for a position that genuinely means one of the two.
     pub fn pi_eliminated(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
-        Type::Fun {
-            name: Some(name.into()),
-            kind: FunKind::fresh_var(),
-            domain: Box::new(domain),
-            codomain: Box::new(codomain),
-        }
+        Type::pi_kinded(name, domain, codomain, FunKind::fresh_var())
     }
 
     /// The non-dependent [`Type::pi_eliminated`] — an elimination's demand
@@ -1146,12 +1227,22 @@ impl Type {
     /// the safe default at a site with no function type to copy from.
     pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
-            Type::Fun { name, kind, .. } => Type::Fun {
-                name: name.clone(),
-                kind: kind.clone(),
-                domain: Box::new(domain),
-                codomain: Box::new(codomain),
-            },
+            Type::Fun { name, kind, .. } => {
+                // Construction closes (see [`Type::pi`]): a rebuild computes
+                // its codomain from node types, which reference the binder by
+                // name. Idempotent on a codomain extracted from a closed
+                // function — its references are already indices.
+                let codomain = match name {
+                    Some(b) => crate::ccl::subst::close_pi_binder(b, &codomain),
+                    None => codomain,
+                };
+                Type::Fun {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    domain: Box::new(domain),
+                    codomain: Box::new(codomain),
+                }
+            }
             _ => Type::fun(domain, codomain),
         }
     }
@@ -1167,7 +1258,7 @@ impl Type {
     /// the handle accessors below.
     ///
     /// The all-depths counterpart, [`crate::ccl::ccl_utils::strip_refinements`],
-    /// is a different operation: it *drops* claims rather than looking past them,
+    /// is a different operation: it *drops* refinements rather than looking past them,
     /// allocates, and is only meaningful on a resolved type.
     pub fn peel_refinements(&self) -> &Type {
         let mut cur = self;
@@ -1255,6 +1346,13 @@ impl Type {
     /// carry a lambda's kind across (`elim_lambda_kinded`); normalizing here only
     /// keeps the structural asserts (and the feed-operand agreement check) from
     /// comparing it.
+    ///
+    /// Binder **presence** is all this canonicalizes. It does not reconcile the
+    /// two binder-reference coordinates: a refinement spelled as an index and its
+    /// name-spelled twin stay unequal here, so the comparisons below hold
+    /// only between two types on the same side of a construction boundary. That
+    /// is the invariant they are checking, not an assumption they make — a pass
+    /// that dropped a binder and left the index behind fails them.
     ///
     /// Under the Barendregt convention the blindness needed at the remaining
     /// call sites (lambda elimination's type-preservation asserts) is exactly
@@ -1573,11 +1671,19 @@ impl Eq for Refinement {}
 /// chosen for its context, not an approximation of a finer one — there is no
 /// plan to make it a derived `==` (which would wrongly compare those slots).
 ///
-/// Binder names compare by equality, which coincides with α-equivalence under
-/// the Barendregt convention (uniquified, globally-distinct binders; copies
-/// preserve uids). Should a future pass need to compare predicates whose bound
-/// binders were independently minted, this is the site to make α-aware (thread
-/// a binder correspondence) rather than chase global name determinism.
+/// The relation is **α-invariant**: a reference to a binder the predicate
+/// itself introduces compares by *position* rather than by name, so two
+/// predicates that differ only in an interior binder's identity are the same
+/// restriction. Two lowerings of one filter mint that binder independently —
+/// `[x for x in xs if x > 1]` written twice gives `λ x#3 → x#3 > 1` and
+/// `λ x#6 → x#6 > 1` — and comparing them by name splits a refinement set that
+/// should dedup, which a `Data` domain then reports as two domains that do not
+/// join. A reference to a binder *outside* the predicate still compares by
+/// name, which is what keeps two refinements about different enclosing binders
+/// apart (uids make that comparison exact).
+///
+/// [`hash_refinement_predicate`] threads the same scope and hashes a bound
+/// reference by position, so the `Eq`/`Hash` contract survives α-invariance.
 ///
 /// One type-anchored slot **is** compared: a [`TypedExprNode::Cast`]'s
 /// `target` carries the cast's domain-refinement *predicate term*
@@ -1596,14 +1702,55 @@ impl Eq for Refinement {}
 /// cast-target predicates) makes eq finer than hash, preserving the
 /// `Eq`/`Hash` contract.
 pub(crate) fn eq_refinement_predicate(a: &TypedExpr, b: &TypedExpr) -> bool {
-    eq_refinement_predicate_go(a, b)
+    eq_refinement_predicate_go(a, b, &mut Vec::new())
+}
+
+/// Binders the two sides of an [`eq_refinement_predicate`] comparison have
+/// introduced, paired and innermost last. Two references match when they
+/// resolve to the same pair, or when neither resolves and they are the same
+/// name; a reference bound on one side only never matches. `rposition` is what
+/// makes shadowing right: the innermost pair spelling a name is the one it
+/// resolves to.
+fn paired_refs_match(
+    pairs: &[(crate::ccl::Name, crate::ccl::Name)],
+    x: &crate::ccl::Name,
+    y: &crate::ccl::Name,
+) -> bool {
+    match (
+        pairs.iter().rposition(|(l, _)| l == x),
+        pairs.iter().rposition(|(_, r)| r == y),
+    ) {
+        (Some(i), Some(j)) => i == j,
+        (None, None) => x == y,
+        _ => false,
+    }
+}
+
+/// Compare `a` and `b` with `(l, r)` paired over them, restoring `pairs` before
+/// returning — the binder scopes over these children and nothing after them.
+fn eq_under_binder(
+    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+    l: &crate::ccl::Name,
+    r: &crate::ccl::Name,
+    children: &[(&TypedExpr, &TypedExpr)],
+) -> bool {
+    pairs.push((l.clone(), r.clone()));
+    let matched = children
+        .iter()
+        .all(|(x, y)| eq_refinement_predicate_go(x, y, pairs));
+    pairs.pop();
+    matched
 }
 
 /// Compare two cast targets' domain-refinement predicates term-wise (see
 /// [`eq_refinement_predicate`]). Pointer-equal predicates short-circuit;
 /// otherwise the comparison recurses structurally (acyclic terms, so it
 /// terminates without a cycle guard).
-fn eq_cast_target_predicates(t1: &Type, t2: &Type) -> bool {
+fn eq_cast_target_predicates(
+    t1: &Type,
+    t2: &Type,
+    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+) -> bool {
     match (
         ccl_utils::cast_target_refinement(t1),
         ccl_utils::cast_target_refinement(t2),
@@ -1613,25 +1760,36 @@ fn eq_cast_target_predicates(t1: &Type, t2: &Type) -> bool {
             if Rc::ptr_eq(&r1.predicate, &r2.predicate) {
                 return true;
             }
-            eq_refinement_predicate_go(&r1.predicate, &r2.predicate)
+            // Under the *enclosing* pairing: a nested predicate may reference a
+            // binder the outer predicate introduced (a comprehension inside a
+            // filter), and that reference resolves by position like any other.
+            eq_refinement_predicate_go(&r1.predicate, &r2.predicate, pairs)
         }
         _ => false,
     }
 }
 
 /// Recursive worker for [`eq_refinement_predicate`].
-fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
+fn eq_refinement_predicate_go(
+    a: &TypedExpr,
+    b: &TypedExpr,
+    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+) -> bool {
     use TypedExprNode as N;
-    fn all_eq(xs: &[TypedExpr], ys: &[TypedExpr]) -> bool {
+    fn all_eq(
+        xs: &[TypedExpr],
+        ys: &[TypedExpr],
+        pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+    ) -> bool {
         xs.len() == ys.len()
             && xs
                 .iter()
                 .zip(ys)
-                .all(|(x, y)| eq_refinement_predicate_go(x, y))
+                .all(|(x, y)| eq_refinement_predicate_go(x, y, pairs))
     }
     match (&a.node, &b.node) {
         (N::Lit(x), N::Lit(y)) => x == y,
-        (N::Var(x), N::Var(y)) => x == y,
+        (N::Var(x), N::Var(y)) => paired_refs_match(pairs, x, y),
         (N::Builtin(x), N::Builtin(y)) => x == y,
         (N::Proj(x), N::Proj(y)) => x == y,
         (N::Source(x), N::Source(y)) => x == y,
@@ -1645,7 +1803,7 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 function: f2,
                 argument: a2,
             },
-        ) => eq_refinement_predicate_go(f1, f2) && eq_refinement_predicate_go(a1, a2),
+        ) => eq_refinement_predicate_go(f1, f2, pairs) && eq_refinement_predicate_go(a1, a2, pairs),
         (
             N::Cast {
                 value: v1,
@@ -1655,7 +1813,7 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 value: v2,
                 target: t2,
             },
-        ) => eq_refinement_predicate_go(v1, v2) && eq_cast_target_predicates(t1, t2),
+        ) => eq_refinement_predicate_go(v1, v2, pairs) && eq_cast_target_predicates(t1, t2, pairs),
         (
             N::BinOp {
                 left: l1,
@@ -1667,8 +1825,14 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 op: o2,
                 right: r2,
             },
-        ) => o1 == o2 && eq_refinement_predicate_go(l1, l2) && eq_refinement_predicate_go(r1, r2),
-        (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => k1 == k2 && eq_refinement_predicate_go(e1, e2),
+        ) => {
+            o1 == o2
+                && eq_refinement_predicate_go(l1, l2, pairs)
+                && eq_refinement_predicate_go(r1, r2, pairs)
+        }
+        (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => {
+            k1 == k2 && eq_refinement_predicate_go(e1, e2, pairs)
+        }
         (
             N::Lambda {
                 param: p1,
@@ -1680,7 +1844,10 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 body: b2,
                 ..
             },
-        ) => p1.name == p2.name && eq_refinement_predicate_go(b1, b2),
+            // A lambda's parameter is a binder the predicate introduces: pair
+            // the two and compare the bodies under the pairing, so the bodies'
+            // references to it match by position.
+        ) => eq_under_binder(pairs, &p1.name, &p2.name, &[(b1, b2)]),
         (
             N::Aggregate {
                 input: i1,
@@ -1690,7 +1857,7 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 input: i2,
                 kind: k2,
             },
-        ) => k1 == k2 && eq_refinement_predicate_go(i1, i2),
+        ) => k1 == k2 && eq_refinement_predicate_go(i1, i2, pairs),
         (
             N::Let {
                 binding: bd1,
@@ -1703,15 +1870,15 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 body: b2,
             },
         ) => {
-            bd1.name == bd2.name
-                && eq_refinement_predicate_go(e1, e2)
-                && eq_refinement_predicate_go(b1, b2)
+            // The definiens sits outside the binder, the body inside it.
+            eq_refinement_predicate_go(e1, e2, pairs)
+                && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
         }
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
         | (N::Compose(x), N::Compose(y))
         | (N::Copair(x), N::Copair(y))
-        | (N::DisjointJoin(x), N::DisjointJoin(y)) => all_eq(x, y),
+        | (N::DisjointJoin(x), N::DisjointJoin(y)) => all_eq(x, y, pairs),
         (
             N::Case {
                 scrutinee: s1,
@@ -1724,21 +1891,32 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
         ) => {
             let scrutinee_eq = match (s1, s2) {
                 (None, None) => true,
-                (Some(x), Some(y)) => eq_refinement_predicate_go(x, y),
+                (Some(x), Some(y)) => eq_refinement_predicate_go(x, y, pairs),
                 _ => false,
             };
             scrutinee_eq
                 && br1.len() == br2.len()
-                && br1.iter().zip(br2).all(|(x, y)| {
-                    let pattern_eq = match (&x.pattern, &y.pattern) {
-                        (None, None) => true,
-                        (Some(p), Some(q)) => p.tag == q.tag && p.binding.name == q.binding.name,
+                && br1
+                    .iter()
+                    .zip(br2)
+                    .all(|(x, y)| match (&x.pattern, &y.pattern) {
+                        // A payload binder scopes over the guard and the body
+                        // both, so both compare under the pairing.
+                        (Some(p), Some(q)) => {
+                            p.tag == q.tag
+                                && eq_under_binder(
+                                    pairs,
+                                    &p.binding.name,
+                                    &q.binding.name,
+                                    &[(&x.guard, &y.guard), (&x.body, &y.body)],
+                                )
+                        }
+                        (None, None) => {
+                            eq_refinement_predicate_go(&x.guard, &y.guard, pairs)
+                                && eq_refinement_predicate_go(&x.body, &y.body, pairs)
+                        }
                         _ => false,
-                    };
-                    pattern_eq
-                        && eq_refinement_predicate_go(&x.guard, &y.guard)
-                        && eq_refinement_predicate_go(&x.body, &y.body)
-                })
+                    })
         }
         (
             N::VariantCtor {
@@ -1749,16 +1927,15 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 tag: t2,
                 payload: p2,
             },
-        ) => t1 == t2 && eq_refinement_predicate_go(p1, p2),
+        ) => t1 == t2 && eq_refinement_predicate_go(p1, p2, pairs),
         (N::Record(f1), N::Record(f2)) => {
             f1.len() == f2.len()
-                && f1
-                    .iter()
-                    .zip(f2)
-                    .all(|((n1, e1), (n2, e2))| n1 == n2 && eq_refinement_predicate_go(e1, e2))
+                && f1.iter().zip(f2).all(|((n1, e1), (n2, e2))| {
+                    n1 == n2 && eq_refinement_predicate_go(e1, e2, pairs)
+                })
         }
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
-            eq_refinement_predicate_go(e1, e2) && eq_refinement_predicate_go(b1, b2)
+            eq_refinement_predicate_go(e1, e2, pairs) && eq_refinement_predicate_go(b1, b2, pairs)
         }
         (
             N::Feed {
@@ -1779,7 +1956,9 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 name: n2,
                 value: v2,
             },
-        ) => n1 == n2 && eq_refinement_predicate_go(v1, v2),
+            // A `Feed`/`Define` name is a *use* of the binder that introduced
+            // the handle (`ccl::scope`), so it resolves like any reference.
+        ) => paired_refs_match(pairs, n1, n2) && eq_refinement_predicate_go(v1, v2, pairs),
         _ => false,
     }
 }
@@ -1791,7 +1970,18 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
 /// types keeps the hash stable while inference resolves the predicate's
 /// type slots in place, and keeps it non-recursive through refinements (so
 /// it always terminates and adds no extra borrows).
-fn hash_refinement_predicate<H: std::hash::Hasher>(e: &TypedExpr, state: &mut H) {
+///
+/// A reference to a binder the predicate itself introduces hashes as that
+/// binder's **position**, not its name, which is what makes the hash
+/// α-invariant alongside `eq`. `scope` carries the binders in scope, innermost
+/// last, exactly as [`eq_refinement_predicate`] carries its pairing; a binder's
+/// own name is never hashed, so hash stays coarser than `eq` and the
+/// `Eq`/`Hash` contract holds.
+fn hash_refinement_predicate<H: std::hash::Hasher>(
+    e: &TypedExpr,
+    state: &mut H,
+    scope: &mut Vec<crate::ccl::Name>,
+) {
     use std::hash::Hash;
     std::mem::discriminant(&e.node).hash(state);
     match &e.node {
@@ -1799,7 +1989,12 @@ fn hash_refinement_predicate<H: std::hash::Hasher>(e: &TypedExpr, state: &mut H)
         TypedExprNode::Lit(Lit::String(s)) => s.hash(state),
         TypedExprNode::Lit(Lit::Bool(b)) => b.hash(state),
         TypedExprNode::Lit(Lit::Unit) => {}
-        TypedExprNode::Var(name) => name.hash(state),
+        // A bound reference hashes by position (innermost match, so shadowing
+        // resolves as it does in `eq`); a free one by name.
+        TypedExprNode::Var(name) => match scope.iter().rposition(|b| b == name) {
+            Some(level) => level.hash(state),
+            None => name.hash(state),
+        },
         TypedExprNode::Builtin(b) => b.hash(state),
         TypedExprNode::BinOp { op, .. } => op.hash(state),
         TypedExprNode::UnaryOp(kind, _) => kind.hash(state),
@@ -1809,7 +2004,59 @@ fn hash_refinement_predicate<H: std::hash::Hasher>(e: &TypedExpr, state: &mut H)
         TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(state),
         _ => {}
     }
-    e.walk_children(|child| hash_refinement_predicate(child, state));
+    // The binding arms `eq` handles, threading the same scope over the same
+    // children. Every other node's children sit in the node's own scope, so the
+    // generic walk covers them.
+    match &e.node {
+        TypedExprNode::Lambda { param, body } => {
+            hash_under_binder(state, scope, &param.name, &[body]);
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            hash_refinement_predicate(bound_expr, state, scope);
+            hash_under_binder(state, scope, &binding.name, &[body]);
+        }
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(s) = scrutinee {
+                hash_refinement_predicate(s, state, scope);
+            }
+            for b in branches {
+                match &b.pattern {
+                    Some(p) => {
+                        hash_under_binder(state, scope, &p.binding.name, &[&b.guard, &b.body]);
+                    }
+                    None => {
+                        hash_refinement_predicate(&b.guard, state, scope);
+                        hash_refinement_predicate(&b.body, state, scope);
+                    }
+                }
+            }
+        }
+        _ => e.walk_children(|child| hash_refinement_predicate(child, state, scope)),
+    }
+}
+
+/// Hash `children` with `binder` in scope, restoring `scope` afterwards — the
+/// hashing counterpart of [`eq_under_binder`]. The binder's own name is not
+/// hashed: `eq` compares it by position too, so hashing it would make the hash
+/// finer than `eq` for no gain.
+fn hash_under_binder<H: std::hash::Hasher>(
+    state: &mut H,
+    scope: &mut Vec<crate::ccl::Name>,
+    binder: &crate::ccl::Name,
+    children: &[&TypedExpr],
+) {
+    scope.push(binder.clone());
+    for c in children {
+        hash_refinement_predicate(c, state, scope);
+    }
+    scope.pop();
 }
 
 impl std::hash::Hash for Refinement {
@@ -1822,7 +2069,7 @@ impl std::hash::Hash for Refinement {
     /// which keeps the `Eq`/`Hash` contract. The predicate is immutable, so a
     /// `Type` used as a `ConstrainCache` key never re-hashes differently.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        hash_refinement_predicate(&self.predicate, state);
+        hash_refinement_predicate(&self.predicate, state, &mut Vec::new());
     }
 }
 
@@ -1830,6 +2077,127 @@ impl std::hash::Hash for Refinement {
 mod tests {
     use super::*;
     use crate::ccl::{BinOpKind, CompareKind};
+    use rstest::rstest;
+
+    /// `Refinement`'s hash of `pred`, for asserting the `Eq`/`Hash` contract.
+    fn refinement_hash(pred: &TypedExpr) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        Refinement::born(Rc::new(pred.clone())).hash(&mut h);
+        h.finish()
+    }
+
+    /// Two predicates equal under [`eq_refinement_predicate`] must hash alike,
+    /// or a refinement is two different `HashMap` keys.
+    fn assert_same_restriction(a: &TypedExpr, b: &TypedExpr) {
+        assert!(
+            eq_refinement_predicate(a, b),
+            "expected the same restriction:\n  {}\n  {}",
+            symbolic::symbolic(a),
+            symbolic::symbolic(b),
+        );
+        assert_eq!(
+            refinement_hash(a),
+            refinement_hash(b),
+            "equal refinements must hash alike (Eq/Hash contract)",
+        );
+    }
+
+    /// A reference to a binder the predicate introduces compares by position,
+    /// so two lowerings of one filter are the same restriction. Each binding
+    /// form `eq_refinement_predicate` handles gets its own case: a form whose
+    /// binder is compared by name instead would split the refinement set and a
+    /// `Data` domain would then report two domains that do not join.
+    #[rstest]
+    // `λ p → p > 1`, the shape a filter lowers to.
+    #[case::lambda(0)]
+    // `let p = 1 in p > 1`.
+    #[case::let_binding(1)]
+    // `match _ { `some(p) → p > 1 }` — the payload binder scopes over guard and
+    // body both.
+    #[case::case_pattern(2)]
+    fn alpha_variant_predicates_are_one_restriction(#[case] form: usize) {
+        let build = |binder: &str| {
+            let b = crate::ccl::Name::raw(binder);
+            let cmp = TypedExpr::binop(
+                TypedExpr::var(b.clone()),
+                BinOpKind::Compare(CompareKind::Greater),
+                TypedExpr::lit(Lit::Int(1)),
+            );
+            match form {
+                0 => TypedExpr::lambda(b, Type::Base(BaseType::Int), cmp),
+                1 => TypedExpr::let_bind(b, TypedExpr::lit(Lit::Int(1)), cmp),
+                _ => TypedExpr::match_expr(
+                    TypedExpr::lit(Lit::Unit),
+                    vec![crate::ccl::Branch {
+                        pattern: Some(crate::ccl::Pattern {
+                            tag: "some".into(),
+                            binding: crate::ccl::TypedBinding::new_annotated(
+                                b,
+                                Type::Base(BaseType::Int),
+                            ),
+                            empty_payload: false,
+                        }),
+                        guard: TypedExpr::lit(Lit::Bool(true)),
+                        body: cmp,
+                    }],
+                ),
+            }
+        };
+        assert_same_restriction(&build("p"), &build("q"));
+    }
+
+    /// Shadowing resolves innermost-first on both sides: the inner binder is
+    /// what an inner reference denotes, whatever either side spells it.
+    #[test]
+    fn alpha_invariance_resolves_shadowing_innermost_first() {
+        let nested = |outer: &str, inner: &str, referenced: &str| {
+            let int = || Type::Base(BaseType::Int);
+            TypedExpr::lambda(
+                crate::ccl::Name::raw(outer),
+                int(),
+                TypedExpr::lambda(
+                    crate::ccl::Name::raw(inner),
+                    int(),
+                    TypedExpr::var(crate::ccl::Name::raw(referenced)),
+                ),
+            )
+        };
+        // Both reference the inner binder, however each side spells the pair.
+        assert_same_restriction(&nested("a", "b", "b"), &nested("x", "y", "y"));
+        // A predicate whose inner binder shadows the outer: the reference is the
+        // inner one on both sides.
+        assert_same_restriction(&nested("a", "a", "a"), &nested("x", "x", "x"));
+        // Referencing the *outer* binder is a different restriction from
+        // referencing the inner one.
+        assert!(!eq_refinement_predicate(
+            &nested("a", "b", "a"),
+            &nested("x", "y", "y")
+        ));
+    }
+
+    /// A reference to a binder *outside* the predicate still compares by name.
+    /// That is what keeps two refinements about different enclosing binders apart,
+    /// and uids make the comparison exact.
+    #[test]
+    fn a_free_reference_still_compares_by_name() {
+        let refinement = |free: &str| {
+            TypedExpr::lambda(
+                crate::ccl::Name::raw("p"),
+                Type::Base(BaseType::Int),
+                TypedExpr::binop(
+                    TypedExpr::var(crate::ccl::Name::raw("p")),
+                    BinOpKind::Compare(CompareKind::Equals),
+                    TypedExpr::var(crate::ccl::Name::raw(free)),
+                ),
+            )
+        };
+        assert_same_restriction(&refinement("k"), &refinement("k"));
+        assert!(
+            !eq_refinement_predicate(&refinement("k"), &refinement("m")),
+            "distinct enclosing binders must stay distinct"
+        );
+    }
 
     /// Two predicates that each contain a [`TypedExprNode::Cast`] and differ
     /// only in the *target's* domain-refinement predicate denote different
@@ -1870,13 +2238,13 @@ mod tests {
     /// A shape test looks *through* a refinement: a refined mutable variable is still
     /// one and a refined channel is still a channel. Nothing in the pipeline
     /// wraps a handle today — a handle type is built structurally rather than
-    /// resolved from a variable, so no position accumulates a claim onto one — which
+    /// resolved from a variable, so no position accumulates a refinement onto one — which
     /// is exactly why the rule needs stating here: it is the accessors' contract,
     /// not a shape a program can be written to exercise.
     #[test]
     fn handle_accessors_see_through_a_refinement() {
-        let claim = Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true))));
-        let refine = |t: Type| Type::Refinement(Box::new(t), claim.clone());
+        let refinement = Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true))));
+        let refine = |t: Type| Type::Refinement(Box::new(t), refinement.clone());
         let int = Type::Base(BaseType::Int);
         let mut_var = Type::History {
             value: Box::new(int.clone()),
@@ -2080,5 +2448,71 @@ mod tests {
         let l = TagMap::from_arms(vec![(name("a"), 1), (name("b"), 2)]);
         let r = TagMap::from_arms(vec![(name("a"), 10)]);
         let _ = l.zip_same_tags(&r, "test", |x, y| x + y);
+    }
+
+    /// A dependent function's refinement *stores* an index and *reads* as the
+    /// binder's name, detached from the function or not. Two spellings, two
+    /// mechanisms: a rendering that holds the function reads its name slot, and one that does
+    /// not falls back to the reference's own hint. Identity is the index in
+    /// both cases, which is what the assertion on the term checks.
+    #[test]
+    fn a_dependent_arrow_renders_its_binder_by_name() {
+        let k = crate::ccl::Name::raw("k");
+        let refined = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(Rc::new(TypedExpr::binop(
+                TypedExpr::var(crate::ccl::Name::elem()),
+                BinOpKind::Compare(CompareKind::Equals),
+                TypedExpr::var(k.clone()),
+            ))),
+        );
+        let ty = Type::pi(k.clone(), Type::Base(BaseType::Int), refined);
+        assert_eq!(ty.to_string(), "((k: Int) ⇒ {Int | __elem == k})");
+
+        // Detached from the function, the reference still reads as the binder —
+        // now off its own hint rather than off the function's name slot. A bare
+        // `#0` in a diagnostic tells a reader nothing, and a fragment plucked
+        // out of a half-assembled function is exactly what a diagnostic blames.
+        let Type::Fun { codomain, .. } = &ty else {
+            panic!("expected a function");
+        };
+        assert_eq!(codomain.to_string(), "{Int | __elem == k}");
+
+        // Stored, though, it is the index: the spelling is metadata that
+        // identity ignores, so the refinement is α-canonical.
+        let Type::Refinement(_, r) = &**codomain else {
+            panic!("expected the refinement");
+        };
+        let TypedExprNode::BinOp { right, .. } = &r.predicate.node else {
+            panic!("expected the dependent refinement");
+        };
+        let TypedExprNode::Var(reference) = &right.node else {
+            panic!("expected a variable reference");
+        };
+        assert_eq!(reference.pi_bound_index(), Some(0));
+        assert_eq!(
+            *reference,
+            crate::ccl::Name::pi_bound_bare(0),
+            "the hint does not participate in identity"
+        );
+    }
+
+    /// The index counts function crossings, so an unnamed function between the
+    /// reference and its binder occupies an environment entry: dropping it
+    /// would resolve the reference to the wrong binder.
+    #[test]
+    fn an_unnamed_crossing_still_counts_when_rendering() {
+        let refined = Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement::born(Rc::new(TypedExpr::var(crate::ccl::Name::pi_bound_bare(1)))),
+        );
+        // (k: Int) ⇒ (Int ⇒ {Int | #1}) — one unnamed crossing in between.
+        let ty = Type::Fun {
+            name: Some(crate::ccl::Name::raw("k")),
+            kind: FunKind::Compute,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::fun(Type::Base(BaseType::Int), refined)),
+        };
+        assert_eq!(ty.to_string(), "((k: Int) ⇒ (Int ⇒ {Int | k}))");
     }
 }

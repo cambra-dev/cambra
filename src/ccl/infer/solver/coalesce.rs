@@ -157,13 +157,21 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                 doms.push(dt);
             }
         }
-        // Strip the Pi binder unless the codomain's refinement predicates
-        // actually reference it (design §3.2 / O10): keeps ordinary functions
-        // `name: None` while a genuinely dependent codomain keeps its binder.
+        // Strip the Pi binder unless the codomain actually depends on it
+        // (design §3.2 / O10): keeps ordinary functions `name: None` while a
+        // genuinely dependent codomain keeps its binder. Closed or name-spelled
+        // both count (`subst::codomain_depends_on`) — the kept name slot is what
+        // lets descent and application open the function later, so dropping it
+        // on a codomain that references it strands the reference.
+        debug_assert!(
+            cf.name.is_some() || !crate::ccl::subst::references_enclosing_function(&c),
+            "an index is only ever assigned pointing at a *named* function, so an \
+             unnamed function's codomain cannot reference it",
+        );
         let kept_name = cf
             .name
             .clone()
-            .filter(|b| crate::ccl::subst::type_free_vars(&c).contains(b));
+            .filter(|b| crate::ccl::subst::codomain_depends_on(b, &c));
         match cf.kind {
             KindMerge::Conflict => {
                 let doms_s = doms
@@ -253,7 +261,8 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         0 => {
             // No concrete contribution; emit a fresh Infer slot.
             // check_fully_typed reports it as UnresolvedInfer if it
-            // survives.
+            // survives. Scope-free: the slot is an error placeholder that
+            // never takes a bound, so it has no telescope to close against.
             Type::Infer(InferVar::fresh(0))
         }
         1 => all.remove(0),

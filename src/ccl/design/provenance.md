@@ -232,7 +232,7 @@ audit (`Leak`) guarantees no node silently loses its history: an output with no
 lineage (`Unexplained`) and an input that vanished unconsumed (`Dropped`).
 
 Both checks enumerate from the **tree**. There is no third check on the *produced*
-side — "every id a step claims to produce is held by some node" — because
+side — "every id a step refinements to produce is held by some node" — because
 legitimate shapes violate it.
 
 Uncurrying `def f(x, y)`

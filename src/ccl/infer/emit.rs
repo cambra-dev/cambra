@@ -746,6 +746,14 @@ pub(super) fn emit_cast<C: Typing>(
         Type::Fun { name: Some(k), .. } => Some(k.clone()),
         _ => None,
     };
+    // Construction closes (see `Type::pi`): re-viewing the value at the
+    // target rebuilds a function around the value's codomain, so references to
+    // the preserved binder close here. Idempotent when `v` came out of a
+    // closed function (its references are already indices).
+    let v = match &name {
+        Some(k) => crate::ccl::subst::close_pi_binder(k, &v),
+        None => v,
+    };
     Ok(Type::Fun {
         name,
         kind,
@@ -1675,7 +1683,7 @@ pub(super) fn emit_case<C: Typing>(
             variant_type(expected_tags)
         };
         ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
-        // An arm that names no payload claims the tag carries nothing. The claim is
+        // An arm that names no payload refinements the tag carries nothing. The refinement is
         // checked per arm rather than folded into the variant above so that the
         // rejection names the arm, and the message can point at `` case `some(_): ``.
         // Recorded after the scrutinee constraint so the payload has flowed in by
@@ -1757,38 +1765,101 @@ pub(super) fn emit_variant_ctor<C: Typing>(
     Ok(variant_type(tags))
 }
 
+/// What [`compose_chain`] reports back about the chain it walked: the head
+/// morphism's domain, the trailing codomain, and the final morphism's type (read
+/// for its Pi binder).
+struct ChainEnds {
+    first_dom: Type,
+    cod: Type,
+    last_ty: Type,
+}
+
+/// Type each morphism from `i` on and draw the adjacency edges between them,
+/// **under the Pi binders of the dependent morphisms before it**.
+///
+/// A chain composes a family with the transformers that consume it — the group-by
+/// partition and its per-group aggregate is the shape — and after `lambda_elim`
+/// only the family's *type* still binds the key: the term binder is gone. Every
+/// morphism after the family therefore mentions that binder in its own type, and
+/// the walk has to be inside it, both for the adjacency comparison
+/// ([`crate::ccl::subst::open_codomain`] spells the reference as the name there)
+/// and for typing the morphism itself, since the variables that step mints must
+/// close against it (`src/ccl/design/type-inference.md`, "The invariant").
+/// Recursion is what carries the scope: each step runs inside every dependent
+/// morphism before it. Entering the binder through [`Typing::scoped`] is what
+/// `normalize_annotation` already does for the Pi binders it descends past.
+///
+/// The adjacency is strict and refinement-aware: `prev_cod <: next_dom`,
+/// refinements and all — no cast escape. A producer must already supply the
+/// refinement its consumer demands. Join planning surfaces the join-satisfying /
+/// iterated extent on each producing morphism (`planning`'s `refine_extent` /
+/// iteration-source `set_extent`), so a `… ≫ (id ≫ cast({D|r} ⇒ V))` chain
+/// composes because the upstream genuinely carries `{D | r}` — matched
+/// structurally even across the predicate terms planning re-mints.
+///
+/// The chain type this produces is a **codomain**, not a standalone type, so a
+/// reference to a binder the walk entered and left is bound by the enclosing
+/// dependent function rather than by anything the chain keeps. What
+/// [`emit_compose`] keeps is the *final* morphism's binder, which makes the chain
+/// itself dependent; a reference to an earlier morphism's binder rides out free and
+/// resolves against the position the chain lands in. `check_scope_valid` holds that:
+/// it checks every node's type against its lexical scope once inference ends.
+///
+/// `as_function` destructures the resolved function in Check and
+/// introduces-and-constrains in Emit. The single-sided `Var <: Var` rule leaves a
+/// `Proj` morphism's domain under-determined here (it only ever gets the lower
+/// bound from this forward edge); the concrete domain is rebuilt post-coalesce in
+/// `coalesce_node`'s `Compose` arm from the preceding morphism's codomain, so
+/// there is no reverse-adjacency constraint at emit time.
+fn compose_chain<C: Typing>(
+    elts: &mut [Expr],
+    i: usize,
+    prev_cod: Option<Type>,
+    ctx: &mut C,
+) -> Result<ChainEnds, LocatedInferError> {
+    let (head, rest) = elts.split_at_mut(1);
+    let ty = ctx.subexpr(&mut head[0])?;
+    let (dom, cod) = ctx.as_function(&ty, &|| format!("Compose[{i}]"))?;
+    if let Some(prev) = prev_cod {
+        ctx.require_sub(&prev, &dom, &|| format!("Compose[{i}]"))?;
+    }
+    let cod = crate::ccl::subst::open_codomain(&ty, &cod);
+    if rest.is_empty() {
+        return Ok(ChainEnds {
+            first_dom: dom,
+            cod,
+            last_ty: ty,
+        });
+    }
+    let mut tail = |ctx: &mut C| compose_chain(rest, i + 1, Some(cod.clone()), ctx);
+    let ends = match ty.peel_refinements() {
+        Type::Fun {
+            name: Some(b),
+            domain,
+            ..
+        } => {
+            let (b, binder_dom) = (b.clone(), (**domain).clone());
+            ctx.scoped(&b, &binder_dom, tail)?
+        }
+        _ => tail(ctx)?,
+    };
+    Ok(ChainEnds {
+        first_dom: dom,
+        ..ends
+    })
+}
+
 pub(super) fn emit_compose<C: Typing>(
     elts: &mut [Expr],
     recorded: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     assert!(elts.len() >= 2, "Compose requires at least two elements");
-    let mut tys = Vec::with_capacity(elts.len());
-    for e in elts.iter_mut() {
-        tys.push(ctx.subexpr(e)?);
-    }
-    // Decompose each morphism into (domain, codomain); adjacent pairs must
-    // compose (`prev_cod <: next_dom`). `as_function` destructures the resolved
-    // function in Check and introduces-and-constrains in Emit.
-    //
-    // The single-sided `Var <: Var` rule leaves a `Proj` morphism's domain
-    // under-determined here (it only ever gets the lower bound from this
-    // forward edge); the concrete domain is rebuilt post-coalesce in
-    // `coalesce_node`'s `Compose` arm from the preceding morphism's codomain,
-    // so there is no reverse-adjacency constraint at emit time.
-    let (first_dom, mut prev_cod) = ctx.as_function(&tys[0], &|| "Compose[0]".to_string())?;
-    for (i, t) in tys.iter().enumerate().skip(1) {
-        let (d_i, c_i) = ctx.as_function(t, &|| "Compose[i]".to_string())?;
-        // Strict refinement-aware adjacency: `prev_cod <: next_dom`, refinement
-        // refinements and all — no cast escape. A producer must already supply the
-        // refinement its consumer demands. Join planning surfaces the
-        // join-satisfying / iterated extent on each producing morphism
-        // (`planning`'s `refine_extent` / iteration-source `set_extent`), so a `… ≫ (id ≫ cast({D|r} ⇒ V))` chain composes
-        // because the upstream genuinely carries `{D | r}` — matched
-        // structurally even across the predicate terms planning re-mints.
-        ctx.require_sub(&prev_cod, &d_i, &|| format!("Compose[{i}]"))?;
-        prev_cod = c_i;
-    }
+    let ChainEnds {
+        first_dom,
+        cod: prev_cod,
+        last_ty,
+    } = compose_chain(elts, 0, None, ctx)?;
     // Keep a dependent *final* morphism's Pi binder on the chain type: the
     // chain's codomain is the final codomain, which may reference that binder
     // (`id ≫ cast(…) ▷ const : (__gb_k: Int) ⇒ {… == __gb_k} ⇒ …` is the
@@ -1800,7 +1871,7 @@ pub(super) fn emit_compose<C: Typing>(
     // morphism today.) A morphism types as a function in both modes — Emit's
     // `Proj`/`Lambda`/source rules all return a function type — so the binder is read off
     // directly; only the groupby shape puts a `Some` there.
-    let last_name = match tys.last().expect("len >= 2").peel_refinements() {
+    let last_name = match last_ty.peel_refinements() {
         Type::Fun { name, .. } => name.clone(),
         _ => None,
     };
@@ -1820,11 +1891,17 @@ pub(super) fn emit_compose<C: Typing>(
         Type::Fun { kind, .. } => kind.clone(),
         _ => FunKind::Compute,
     };
-    Ok(Type::Fun {
-        name: last_name,
-        kind,
-        domain: Box::new(first_dom),
-        codomain: Box::new(prev_cod),
+    // Construction closes: the chain's codomain was opened at the binder for the
+    // adjacency above, so assembling the Pi puts the reference back in the index
+    // form every stored type is in.
+    Ok(match last_name {
+        Some(b) => Type::pi_kinded(b, first_dom, prev_cod, kind),
+        None => Type::Fun {
+            name: None,
+            kind,
+            domain: Box::new(first_dom),
+            codomain: Box::new(prev_cod),
+        },
     })
 }
 

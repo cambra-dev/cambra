@@ -121,7 +121,7 @@ struct Uniquifier {
     /// Uniquification is a predicate-*rebuilding* pass like every other, so it
     /// memoizes with the shared [`PredMemo`] — including its keepalive
     /// discipline, without which overwriting `r.predicate` could free an address
-    /// a later `Rc::new` in the same walk reclaims, colliding an unrelated
+    /// a later `Rc::new` in the same walk rerefinements, colliding an unrelated
     /// predicate with this entry.
     ///
     /// **Why reusing an entry is sound here**, given that the transform resolves

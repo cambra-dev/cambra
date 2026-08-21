@@ -3,8 +3,11 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
-use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fresh_var, prim};
+use crate::ccl::infer::solver::{
+    ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
+};
 use crate::ccl::infer::{InferError, LocatedInferError};
+use crate::ccl::infer_var::{Telescope, TelescopeWalk};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{BaseType, Expr, Level, Name, Type, TypedExprNode};
@@ -65,10 +68,19 @@ pub(super) struct CheckCtx {
     /// `emit_node` maintains Emit's. Seeded with the tree's root at
     /// construction, so a rule always has a node to blame.
     current_node: NodeId,
+    /// The binders in lexical scope at the current position. Check resolves
+    /// no names through it — recorded types are trusted — but the variables
+    /// it mints sit at lexical positions like Emit's, so they carry the live
+    /// telescope and the record-time closure observation stays meaningful in
+    /// both modes.
+    telescope: Telescope,
+    /// Whether this walk has the whole tree or a sub-tree cut from its context
+    /// — the two answer the closure invariant differently. See [`Derivation`].
+    derivation: Derivation,
 }
 
 impl CheckCtx {
-    fn new(root: NodeId) -> Self {
+    fn new(root: NodeId, derivation: Derivation) -> Self {
         // Level 0 matches inference (Stage 1 holds the level at 0) and the
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
@@ -78,7 +90,15 @@ impl CheckCtx {
             errors: Vec::new(),
             pred_memo: Default::default(),
             current_node: root,
+            telescope: Telescope::empty(),
+            derivation,
         }
+    }
+}
+
+impl TelescopeWalk for CheckCtx {
+    fn telescope_mut(&mut self) -> &mut Telescope {
+        &mut self.telescope
     }
 }
 
@@ -101,11 +121,15 @@ impl Typing for CheckCtx {
     }
 
     fn fresh(&mut self) -> Type {
-        fresh_var(self.level)
+        Type::Infer(crate::ccl::InferVar::fresh_in(self.level, &self.telescope))
     }
 
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
-        scheme.instantiate(self.level)
+        // `Typing::instantiate` is the operator-scheme path: the template's
+        // variables stand nowhere, so the instantiation takes this position's
+        // telescope. (A let-generalized binding instantiates directly via
+        // `PolyScheme::instantiate` and keeps its definition-site telescopes.)
+        scheme.instantiate_in(self.level, &self.telescope)
     }
 
     fn normalize(&mut self, ann: &Type) -> Type {
@@ -193,17 +217,23 @@ impl Typing for CheckCtx {
         // truth for width/variance and (since refinements ride the lattice as
         // restriction refinements) refinement subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
-        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new()) {
+        //
+        // The cache serves this walk's derivation: a whole tree enforces the
+        // closure invariant like the live solve, a sub-tree probe cannot (the
+        // binders its refinements reference are held by the context it was cut from).
+        let mut cache = ConstrainCache::for_derivation(self.derivation);
+        if let Err(e) = constrain_subtype(sub, sup, &mut cache) {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
         }
         Ok(())
     }
 
-    fn scoped<R>(&mut self, _name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn scoped<R>(&mut self, name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
         // Check trusts each `Var`/binder node's recorded `Type` rather than
-        // resolving names, so there is no scope to maintain.
-        f(self)
+        // resolving names, so there is no name scope to maintain — only the
+        // telescope, for the variables minted under this binder.
+        self.under_binder(name, f)
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -220,13 +250,13 @@ impl Typing for CheckCtx {
 
     fn scoped_let<R>(
         &mut self,
-        _name: &Name,
+        name: &Name,
         _bound_ty: &Type,
         _generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        // See `scoped`: Check maintains no scope and does not generalize.
-        f(self)
+        // See `scoped`: no name scope, no generalization — telescope only.
+        self.under_binder(name, f)
     }
 
     fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
@@ -335,16 +365,30 @@ impl Typing for CheckCtx {
         // Re-run the discharge on the resolved codomain so the reconstructed
         // type matches the recorded (discharged) one. A named Pi discharges its
         // binder to the argument; an ordinary function's codomain is unchanged.
+        // The binder's references are indices when the function is closed (the
+        // usual case — application opens the function at the argument, β) and
+        // free names when a name-spelled form survived; both discharge to
+        // the same argument term.
         let result = match fn_ty.peel_refinements() {
-            // Discharge only when the Pi binder is actually free in the
-            // codomain's refinement predicates; otherwise the argument clone
-            // would feed a no-op substitution.
-            Type::Fun { name: Some(b), .. }
-                if crate::ccl::subst::type_free_vars(&codomain).contains(b) =>
-            {
-                // A discharge template; see the `Let` rule above.
-                crate::ccl::subst::Subst::discharge(b, argument.clone_preserving_ids())
-                    .apply_type(&codomain)
+            Type::Fun { name: Some(b), .. } => {
+                // Both clones are discharge *templates*; see the `Let` rule
+                // above for why they preserve ids.
+                let codomain = if crate::ccl::subst::references_enclosing_function(&codomain) {
+                    crate::ccl::subst::open_pi_binder(
+                        &crate::ccl::subst::Mapping::Discharge(Box::new(
+                            argument.clone_preserving_ids(),
+                        )),
+                        &codomain,
+                    )
+                } else {
+                    codomain
+                };
+                if crate::ccl::subst::type_free_vars(&codomain).contains(b) {
+                    crate::ccl::subst::Subst::discharge(b, argument.clone_preserving_ids())
+                        .apply_type(&codomain)
+                } else {
+                    codomain
+                }
             }
             _ => codomain,
         };
@@ -543,9 +587,9 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 /// nothing but reads. Splitting the rules' slot access — a `&mut` writer in
 /// Infer mode, a reader in Check mode — removes the copy entirely rather than
 /// making it cheaper.
-pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn check(expr: &Expr, derivation: Derivation) -> Result<(), Vec<InferError>> {
     let mut cloned = expr.clone_preserving_ids();
-    let mut ctx = CheckCtx::new(cloned.node_id());
+    let mut ctx = CheckCtx::new(cloned.node_id(), derivation);
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
     // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned
@@ -594,7 +638,7 @@ mod tests {
         let (a_id, b_id) = (bad_a.node_id(), bad_b.node_id());
         let mut tree = TypedExpr::tuple(vec![bad_a, bad_b]);
 
-        let mut ctx = CheckCtx::new(tree.node_id());
+        let mut ctx = CheckCtx::new(tree.node_id(), Derivation::PostPass);
         let _ = check_node(&mut tree, &mut ctx);
 
         let blamed: Vec<_> = ctx.errors.iter().map(|e| e.node_id).collect();

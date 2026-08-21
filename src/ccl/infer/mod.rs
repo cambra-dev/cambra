@@ -548,7 +548,9 @@ pub(crate) fn run(
     // (subtracted by `type_free_vars`) or an enclosing AST binder. This holds at
     // *every* node now that dependent application discharges its binder to the
     // argument at both polarities and `let`-closing discharges bound names as
-    // the type leaves their scope. The program's sources are in scope at the root.
+    // the type leaves their scope. The root scope is empty: a program source is
+    // referenced by a `TypedExprNode::Source` node rather than by a variable, so
+    // no source name reaches `type_free_vars`.
     // Debug-only: the uniform substitution traverses type slots in the same
     // pass as the term (no value-only contract), so a type-borne occurrence of
     // a discharged binder is rewritten where it sits and the dangling-binder
@@ -556,9 +558,8 @@ pub(crate) fn run(
     // as the debug-build regression net for substitution-descent bugs.
     #[cfg(debug_assertions)]
     {
-        let root_scope: std::collections::BTreeSet<Name> = sources.keys().map(Name::from).collect();
         let mut scope_errors = Vec::new();
-        check_scope_valid(expr, &root_scope, &mut scope_errors);
+        check_scope_valid(expr, &Default::default(), &mut scope_errors);
         if !scope_errors.is_empty() {
             return Err(scope_errors);
         }
