@@ -1,22 +1,19 @@
 //! Group sales records by region and report the per-region total —
 //! the canonical "group by + per-group aggregate" shape.
 //!
-//! **Currently blocked.**  The natural form
+//! The projecting inner comprehension
 //! `[sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]`
-//! — i.e. groupby over records with a projecting inner comprehension —
-//! panics during operator conversion because the `curry` combinator isn't
-//! yet supported there.  Tracks completing `curry` combinator support in
-//! `operator_conversion`.
-//!
-//! Expected output once unblocked (sorted by key):
-//! `Function [ "east" -> 200, "south" -> 75, "west" -> 300 ]`.
+//! reaches operator conversion only through the exponential-eta rule in
+//! `src/ccl/simplify.rs`: λ-elimination closes `s.amount` over both the group
+//! and the element and re-splits it with `curry`, which operator conversion has
+//! no arm for.
 
-use super::common::expect_compile_error;
+use super::common::expect_scalar;
 
 #[test]
-fn groupby_rollup_currently_blocked() {
-    expect_compile_error(
+fn groupby_rollup() {
+    expect_scalar(
         include_str!("program.cambra"),
-        "found input for non-combinator curry",
+        r#"Function [ "east" -> 200, "south" -> 75, "west" -> 300 ]"#,
     );
 }
