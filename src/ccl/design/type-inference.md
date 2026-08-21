@@ -33,7 +33,21 @@ When a new constraint involves a variable, the solver records the bound and then
 
 This recursive propagation replaces the traditional "union-find" algorithm used in HM type inference.
 
-Note that propagation only sweeps the *existing* bounds on the side of the new bound — it does not eagerly transfer the other side's bounds onto the variable. For a variable-against-variable constraint `constrain(Var v, Var w)`, the LHS-variable arm fires (recording `w` as an upper bound of `v` and sweeping `v`'s lower bounds); the missing edges are recovered later by walking the bounds graph during simplification. Whether this one-sided handling is purely a redundancy-avoidance optimization or is semantically load-bearing is noted as an open question in the review thread.
+Note that propagation only sweeps the *existing* bounds on the side of the new bound — it does not
+eagerly transfer the other side's bounds onto the variable. For a variable-against-variable
+constraint `constrain(Var v, Var w)`, the LHS-variable arm fires (recording `w` as an upper bound of
+`v` and sweeping `v`'s lower bounds); the missing edges are recovered later by walking the bounds
+graph during simplification.
+
+**Arrival order does not change the answer.** Record-then-sweep makes that a property of the
+algorithm rather than of any one constraint, and one-sided var-var propagation is where it is least
+obvious: the edge records less than a symmetric rule would, and the difference is only recovered at
+simplification. `tests/type_merge_fuzz.rs` states the property — the same constraint set applied in
+permuted orders coalesces every variable to the same type, or is rejected in every order — and
+checks it over 2000 generated sets, eight permutations each. Which constraint trips the rejection of
+an unsatisfiable set is order-relative and deliberately not part of the outcome: the last edge to
+arrive is the one that meets the already-recorded bounds, and emission order is fixed by the AST
+walk.
 
 ### Positions and Polarity
 
