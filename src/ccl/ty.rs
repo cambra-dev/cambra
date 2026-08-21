@@ -1331,14 +1331,19 @@ impl SigmaType {
     /// before you get here ([`Witness::fresh`], [`Witness::with_kind`],
     /// [`Witness::alpha_convert`], or simply reusing one).
     ///
-    /// No vacuity check here. A body that does not mention its witness is
-    /// vacuous by the witness-erasure law, but this is also every pass's rebuild — a
-    /// substitution walking an outer sum whose binder happens to live only in a nested
-    /// sum's *body* passes through exactly that shape transiently. The pairing error such
-    /// a check would catch is no longer expressible anyway: the binder arrives inside the
-    /// [`Witness`], so the only way to pair a body with a foreign one is
-    /// [`Witness::bound_to`].
+    /// **A body must mention its witness.** A sum whose body does not records a choice
+    /// nothing can observe: it lies below its own body by the ordinary consumption rule and
+    /// is related to it by no rule in the other direction, so the two are one type that
+    /// structural equality reports as different. Asserting it here rather than at the
+    /// boundaries a sum crosses is what makes the shape unconstructible — the substitution
+    /// that used to produce one now **opens** the sum binding the witness it instantiates
+    /// ([`subst_witness_ref`]) instead of walking through it.
     pub fn bound(witness: Witness, body: Type) -> SigmaType {
+        debug_assert!(
+            mentions_witness(&body, witness.binder()),
+            "a sum's body must mention its own witness, but {body} does not mention {:?}",
+            witness.binder()
+        );
         SigmaType {
             witness,
             body: Box::new(body),
@@ -1358,12 +1363,6 @@ impl SigmaType {
             self.binder(),
             &Type::WitnessRef(witness.binder()),
         );
-        if renamed == *self.body {
-            // Vacuous in its own witness: nothing names the binder, so nothing to rename,
-            // and the fresh binder minted above would only be a second name for a witness
-            // no occurrence mentions.
-            return self.clone();
-        }
         SigmaType::bound(witness, renamed)
     }
 
@@ -1379,10 +1378,6 @@ impl SigmaType {
             return self.clone();
         }
         let renamed = subst_witness_ref(&self.body, self.binder(), &Type::WitnessRef(to));
-        if renamed == *self.body {
-            // Vacuous in its own witness: nothing names the binder, so nothing to rename.
-            return self.clone();
-        }
         SigmaType::bound(Witness::bound_to(to, self.kind().clone()), renamed)
     }
 
@@ -2870,11 +2865,15 @@ pub fn free_witness_refs(
 }
 
 /// Replace every occurrence of `binder` in `ty` by `candidate` — the same substitution
-/// [`SigmaType::instantiate_body`] performs, for a type that is **not** a sum's body.
+/// [`SigmaType::instantiate_body`] performs, for a type reached from outside a sum's body.
 ///
-/// A witness escapes its sum once a term is decomposed: a filter's predicate is indexed by
-/// the element, so its types name the witness while no `Σ` is in sight. Instantiating such
-/// a type means substituting at the occurrences, there being no binder to strip.
+/// Two shapes arrive here, and realization ([`crate::ccl::planning`]) walks a leg's type
+/// slots without knowing which it holds. A witness **escapes** its sum once a term is
+/// decomposed: a filter's predicate is indexed by the element, so its types name the
+/// witness while no `Σ` is in sight, and instantiating means substituting at the
+/// occurrences with no binder to strip. A slot may equally still hold the **whole sum**,
+/// which this opens at `candidate` rather than walking through
+/// ([`subst_witness_ref`]).
 pub fn instantiate_witness(
     ty: &Type,
     binder: crate::ccl::infer_var::WitnessBinderId,
@@ -3010,6 +3009,11 @@ fn correspond_witnesses(mine: &Type, theirs: &Type, out: &mut WitnessRenaming) {
 /// A reference naming a **different** binder is never touched — it belongs to another sum,
 /// and rewriting it would capture. Identity is what makes that test exact, so the walk can
 /// descend everywhere rather than stopping at positions where a foreign witness might sit.
+///
+/// The sum binding *this* witness is the one position the walk does not descend into but
+/// **opens**: instantiating its body answers the choice it records, so the binder has
+/// nothing left to name and re-wrapping would leave a body that does not mention its own
+/// witness ([`SigmaType::bound`] rejects that).
 fn subst_witness_ref(
     ty: &Type,
     binder: crate::ccl::infer_var::WitnessBinderId,
@@ -3017,6 +3021,12 @@ fn subst_witness_ref(
 ) -> Type {
     match ty {
         Type::WitnessRef(w) if *w == binder => candidate.clone(),
+        // **The sum that binds it is opened, not walked through.** Its body's occurrences
+        // are this binder's, so instantiating them answers the choice the sum records, and
+        // a sum over an answered choice is no sum: re-wrapping would leave a binder its
+        // body no longer mentions. Reached from realization, where a leg's type slot still
+        // holds the whole sum and the leg's own domain is the answer.
+        Type::Sigma(s) if s.binder() == binder => subst_witness_ref(&s.body, binder, candidate),
         Type::Sigma(s) => Type::Sigma(Box::new(SigmaType::bound(
             s.witness
                 .map_types(|t| subst_witness_ref(t, binder, candidate)),
@@ -3928,6 +3938,26 @@ mod witness_subst_tests {
         SigmaType::bound(witness, body)
     }
 
+    /// Instantiating a witness in a type that **is** the sum binding it opens the sum: the
+    /// choice is answered, so no binder is left to record it. Realization reaches this —
+    /// a leg's type slot still holds the whole sum, and the leg's own domain is the answer
+    /// ([`crate::ccl::ty::instantiate_witness`]). Walking through the sum instead would
+    /// rebuild it around a body that no longer mentions its witness.
+    #[test]
+    fn instantiating_a_sum_at_its_own_binder_opens_it() {
+        let elem = Type::Base(BaseType::Int);
+        let s = sum(TypeKind::Enumerated(vec![range(2)]), |w| {
+            Type::data_fun(Type::WitnessRef(w), elem.clone())
+        });
+        let binder = s.binder();
+        let whole = Type::Sigma(Box::new(s));
+        assert_eq!(
+            instantiate_witness(&whole, binder, &range(2)),
+            Type::data_fun(range(2), elem),
+            "the sum is opened at the candidate, not rebuilt around it"
+        );
+    }
+
     /// A body that *is* the witness instantiates to the candidate itself — the
     /// unfactored shape `box` builds, where every part of the body varies.
     #[test]
@@ -4019,8 +4049,14 @@ mod witness_subst_tests {
     #[test]
     fn a_nested_sums_body_is_not_captured() {
         let inner = Type::Sigma(Box::new(sum(TypeKind::UIntRanges, Type::WitnessRef)));
-        let outer = sum(TypeKind::Enumerated(vec![range(1)]), |_| inner.clone());
-        assert_eq!(outer.instantiate_body(&range(1)), inner);
+        let outer = sum(TypeKind::Enumerated(vec![range(1)]), |w| {
+            Type::data_fun(Type::WitnessRef(w), inner.clone())
+        });
+        assert_eq!(
+            outer.instantiate_body(&range(1)),
+            Type::data_fun(range(1), inner.clone()),
+            "the outer binder is substituted; the inner sum's body is untouched"
+        );
     }
 
     /// A candidate listed in a nested sum's **kind** is a type in the *outer* scope, so
