@@ -437,6 +437,10 @@ impl Typing for InferCtx {
         Ok(wanted.map(|(_, ty)| ty))
     }
 
+    fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError> {
+        crate::ccl::infer::emit::emit_annotation_predicates(ty, self)
+    }
+
     fn require_sub(
         &mut self,
         sub: &Type,

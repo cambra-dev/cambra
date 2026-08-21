@@ -2581,6 +2581,24 @@ impl Type {
         Type::sum_over(TypeKind::SubtypesOf(Box::new(key)), None, value)
     }
 
+    /// The type of a **set**: [`map_of`](Self::map_of) at a `unit` value, so the key domain
+    /// is the payload and the codomain carries nothing.
+    pub fn set_of(key: Type) -> Self {
+        Type::map_of(key, Type::Base(BaseType::Unit))
+    }
+
+    /// The type of a **full map**: the data function `(𝑘: 𝐾) ⤇ 𝑉` — a map holding a value
+    /// for every key of `𝐾`, so a lookup needs no proof of presence.
+    ///
+    /// Not a sum. Totality is earned by `𝐾` being refined down to keys known to exist, so
+    /// the key set is readable from the type rather than standing behind a witness, which
+    /// is what a [`map`](Self::map_of) gives up. Crossing from here to a map is therefore
+    /// [`Builtin::Box`](crate::ccl::Builtin), and that `box` is where the key type stops
+    /// being available to reason with.
+    pub fn full_map_of(key: Type, value: Type) -> Self {
+        Type::data_fun(key, value)
+    }
+
     /// The type of a **collection**: the dependent sum `Σ (𝐷: Any). 𝐷 ⤇ elem` — a
     /// *type*-witness of [`TypeKind::Type`] (the universe of types). Its domain is an
     /// unknown, unordered, opaque domain, which is what makes it the ⊤ of the kind
