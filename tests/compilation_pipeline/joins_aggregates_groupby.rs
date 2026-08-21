@@ -16,6 +16,7 @@ use cambra::interpreter::{
     BaseType, ColumnValue, Extent, Predicate, TestDataSource, Tile, Value,
     sort_sealed_function_by_domain,
 };
+use indoc::indoc;
 use rstest_log::rstest;
 
 use crate::helpers::*;

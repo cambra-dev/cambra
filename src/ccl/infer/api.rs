@@ -763,6 +763,47 @@ fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     }
 }
 
+/// The hint for an application whose **domain is a collection's** and whose argument
+/// cannot be shown to lie in it — i.e. an attempted lookup.
+///
+/// A collection's domain is not a type an ordinary value inhabits: an `Array(3, 𝑇)`'s is
+/// the range `[0, 3)`, and a keyed collection's is that collection's own key domain. So a
+/// bare `Int` index, literal or not, fails the edge — and the raw mismatch reads as an
+/// internal confusion rather than as what it is, a lookup whose proof obligation cannot be
+/// discharged. Named here rather than at the subscript form because `c[k]` lowers to
+/// exactly the application `c(k)`, so the diagnosis has to be type-directed to cover both
+/// spellings.
+///
+/// The proven/checked operator pair this points at is specified in `docs/chl-spec.md`,
+/// "3.9 Subscript and attribute access"; the discharge it rests on is
+/// `src/ccl/design/collections.md`, "Lookup: membership discharge".
+fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
+    // A **refined** domain only. Its refinement is what describes which keys are present,
+    // so the checked form has something to decide. A range domain's mismatch is already
+    // self-explanatory — it demanded an index in the range and got an integer — and naming
+    // the checked form there would send the reader to a spelling that fails identically.
+    fn is_collection_domain(ty: &Type) -> bool {
+        !ty.refinements().is_empty()
+    }
+    // Read whichever side is the domain. The two are not in a fixed order here: which one
+    // the solver reports as "expected" depends on where the edge was raised, and an
+    // application's domain can be reported from either side of it.
+    let (domain, index) = match (is_collection_domain(type_a), is_collection_domain(type_b)) {
+        (true, false) => (type_a, type_b),
+        (false, true) => (type_b, type_a),
+        // Neither side is a collection domain (an ordinary mismatch, which keeps its
+        // unadorned message), or both are (a genuine domain-vs-domain edge, where the
+        // index is not what went wrong).
+        _ => return None,
+    };
+    Some(format!(
+        "hint: `{index}` is not known to lie in the collection's domain `{domain}`, so this \
+         lookup is not provably total. A proven lookup needs an index whose type carries \
+         that proof (one drawn from the collection itself); write `c[k]?` for the checked \
+         form, which answers `some(v)`/`none` for any key."
+    ))
+}
+
 impl std::fmt::Debug for InferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -781,6 +822,11 @@ impl std::fmt::Debug for InferError {
                     if let Some(hint) = product_keying_hint(expected, found) {
                         write!(f, "\n  {hint}")?;
                     }
+                    if let Some(hint) = undischarged_index_hint(found, expected) {
+                        write!(f, "\n  {hint}")?;
+                    }
+                    // Last: it fires only when the two render identically, which the
+                    // hints above have already had their chance to explain.
                     if let Some(hint) = identical_rendering_hint(found, expected) {
                         write!(f, "\n  {hint}")?;
                     }

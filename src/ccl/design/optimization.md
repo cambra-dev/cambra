@@ -15,7 +15,7 @@ The passes that turn a fully type-inferred CCL tree into tile-dataflow operators
 
 **Scalar UDFs** (e.g. `Fun(Int, Int)`): operator conversion compiles `Let`-bound expressions independently with `input = None`. For a function whose domain is scalar, this causes the operator graph to insert an `IterateExtent` for the domain — which panics at runtime ("Attempted to iterate on infinite Extent") because base types have no finite enumerable extent.
 
-**List-producing UDFs** (e.g. generator `def`s, `Fun(Fun(UIntRange, Int), Fun(UIntRange, Int))`): these lower to `λ user_arg → λ __iter_record → body`. If that nested-lambda shape reaches `lambda_elim` intact, the rule emits a `curry` combinator, which `operator_conversion.rs` has no arm for, so compilation fails.
+**List-producing UDFs** (e.g. generator `def`s, `Fun(Fun(UIntRange, Int), Fun(UIntRange, Int))`): these lower to `λ user_arg → λ __iter_record → body`. If that nested-lambda shape reaches `lambda_elim` intact, the rule emits a `curry` combinator over a *lambda body*, which `operator_conversion.rs` has no arm for, so compilation fails. Its one compiled shape is `curry` of a **tupled builtin** — a partial application, closing over nothing — which is how a lookup at a fixed collection reaches the operator graph.
 
 Inlining at the CCL level threads the call-site argument as `input`, and beta-reducing the outer lambda strips the user-parameter layer, leaving a single `__iter_record`-wrapping lambda that matches the list-comprehension shape `lambda_elim` already handles.
 
