@@ -568,7 +568,7 @@ fn constrain_go_impl(
                 _ => sl.clone(),
             };
             // Descent opens (`src/ccl/design/type-inference.md`, "Where the
-            // conversions run"): a *closed* codomain — one whose claims
+            // conversions run"): a *closed* codomain — one whose refinements
             // reference this function's binder as indices — opens at its own
             // binder name before the edge decomposes it, so the bounds
             // recorded on inner variables are name-spelled against their
@@ -598,9 +598,9 @@ fn constrain_go_impl(
                 // compares against the other side's name — a mismatch reported as a
                 // type error rather than as the malformed input it is. The same
                 // tripwire guards `subst::open_codomain`, the rebuild passes' entry
-                // to this conversion; a binder dropped off a closed function
-                // (`Type::without_pi_names`, or a pass rebuilding a `Fun` and
-                // filtering the name slot) is what arms it.
+                // to this conversion. A binder dropped off a closed function arms it:
+                // `Type::without_pi_names`, or a pass rebuilding a `Fun` and filtering
+                // the name slot.
                 debug_assert!(
                     n.is_some() || !crate::ccl::subst::references_enclosing_function(c),
                     "an unnamed function's codomain references it: the index has no \
@@ -1375,7 +1375,7 @@ mod tests {
     /// `{Int | escaped}` — a refinement naming a uniquified binder that nothing in
     /// scope binds, the shape the closure invariant rejects.
     #[cfg(debug_assertions)]
-    fn escaped_claim() -> Type {
+    fn escaped_refinement() -> Type {
         crate::ccl::ccl_utils::refine_with_bare(
             Type::Base(BaseType::Int),
             &TypedExpr::var(Name::fresh("escaped")),
@@ -1387,7 +1387,7 @@ mod tests {
     /// index.
     ///
     /// `(x: Int) ⇒ {Int | __elem == #0}` and `Int ⇒ {Int | __elem == x}` state
-    /// different claims: one is about the function's own argument, the other about
+    /// different refinements: one is about the function's own argument, the other about
     /// whatever binds `x` outside the type. Opening the closed side at its
     /// display name spells both `__elem == x` and reads them as one. Uniquified
     /// binders make the collision need the same uid, which is the same binder,
@@ -1415,7 +1415,7 @@ mod tests {
         );
         assert!(
             constrain_subtype(&closed, &free, &mut ConstrainCache::new()).is_err(),
-            "a closed refinement about the function's own binder does not satisfy a refinement \
+            "a closed refinement about the function's own binder does not satisfy one \
              about a free name that shares its spelling"
         );
     }
@@ -1431,7 +1431,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "open bound recorded")]
     fn a_whole_tree_re_derivation_enforces_the_closure_invariant() {
-        let escaped = escaped_claim();
+        let escaped = escaped_refinement();
         let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
         let v = fresh_var(0);
         let _ = constrain_subtype(&escaped, &v, &mut cache);
@@ -1443,7 +1443,7 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn a_sub_tree_probe_admits_a_reference_its_context_binds() {
-        let escaped = escaped_claim();
+        let escaped = escaped_refinement();
         let mut cache = ConstrainCache::for_derivation(Derivation::SubTree);
         let v = fresh_var(0);
         constrain_subtype(&escaped, &v, &mut cache)

@@ -156,10 +156,10 @@ pub struct PiRef {
     /// Boxed to keep [`Name`] at the width its `Unique` variant already needs:
     /// an inline `SmolStr` here fits the payload but leaves the enum no niche
     /// for its discriminant, which widens every `Name` in the IR. The
-    /// allocation is per *distinct closed refinement* — [`ClaimScope`] memoizes on
-    /// (predicate, enclosing binders) — not per comparison.
+    /// allocation is per distinct closed refinement, not per comparison:
+    /// [`RefinementScope`] memoizes on (predicate, enclosing binders).
     ///
-    /// [`ClaimScope`]: crate::ccl::subst::ClaimScope
+    /// [`RefinementScope`]: crate::ccl::subst::RefinementScope
     pub hint: Option<Box<str>>,
 }
 

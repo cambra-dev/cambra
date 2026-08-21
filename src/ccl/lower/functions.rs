@@ -91,23 +91,20 @@ const OWN_BINDER: &str = "a parameter's type cannot depend on the parameter itse
 
 /// Reject a parameter annotation whose predicate references a parameter.
 ///
-/// Such an annotation asks for a **telescope**: `(a: Int, c: {Int where _ >= a})`
-/// means `(a: Int) ⇒ ((c: {Int | _ >= a}) ⇒ …)`, with `a` in scope in `c`'s type.
-/// Neither shape that reaches here carries that scope. A tupled parameter list
-/// collapses the telescope — the lambda binds one tuple and a `Type::Tuple` binds
-/// no component, so the predicate has nothing to name and no call site has
-/// anywhere to discharge it. A single parameter can only be naming *itself*,
-/// which no currying would make well-formed.
+/// Unimplemented rather than ill-formed. `(a: Int, c: {Int where _ >= a})` means
+/// `(a: Int) ⇒ ((c: {Int | _ >= a}) ⇒ …)`, and neither shape reaching here carries
+/// that scope: a tupled parameter list binds one tuple, and a `Type::Tuple` binds no
+/// component for the predicate to name or a call site to discharge; a single
+/// parameter can only be naming itself. Rejecting here keeps the reference from
+/// reaching the solver, which reports it as an internal error rather than as a
+/// diagnostic about the program (`src/ccl/design/type-inference.md`, "The
+/// invariant").
 ///
-/// Rejecting here is what keeps the reference from reaching the solver as a refinement
-/// about a binder nothing binds, where it surfaces as an internal error rather
-/// than as a diagnostic about the program. A **curried** parameter list carries the
-/// telescope for a *backward* reference — an annotation naming a parameter to its
-/// left — which is why an annotation on a nested `def` may reference the enclosing
-/// `def`'s parameter. A `Mut` parameter list is curried and skips this check
-/// entirely, including for the forward reference the telescope does not cover; no
-/// claim escapes, because that path declares only the `Mut` parameters' types and
-/// drops every other annotation.
+/// A curried parameter list does carry the scope for a reference to a parameter on
+/// its left, which is why an annotation on a nested `def` may name the enclosing
+/// `def`'s parameter. The `Mut`-parameter path is curried and skips this check, a
+/// forward reference included; nothing reaches the solver, because that path
+/// declares only the `Mut` parameters' types and drops every other annotation.
 ///
 /// `lowered` is `params`' annotations after [`lower_type_annotation`], positionally.
 fn reject_annotation_references(

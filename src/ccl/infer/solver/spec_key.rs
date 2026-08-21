@@ -93,7 +93,7 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::subst::{ClaimScope, Subst};
+use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
 use super::compact::{AtomKey, KindMerge};
@@ -323,12 +323,11 @@ struct KeyCtx {
     /// back-edge would have contributed — so it must not be memoized. Comparing
     /// the counter before and after a variable's expansion is what detects that.
     truncations: usize,
-    /// The functions the walk is inside of, and the closing memo over them — the
-    /// same type `compact_go` threads, which is what keeps a key and a compacted
-    /// type from closing one refinement two ways. A refinement lands index-spelled, so two
-    /// α-variant instantiations key together and the memo shares their
-    /// specialization.
-    refinements: ClaimScope,
+    /// The functions the walk is inside of, and the closing memo over them. The same
+    /// type `compact_go` threads, so a key and a compacted type cannot close one
+    /// refinement two ways. A refinement lands index-spelled, so two α-variant
+    /// instantiations key together and the memo shares their specialization.
+    scope: RefinementScope,
 }
 
 /// The specialization key of `ty`: its two directed reads (see the module docs).
@@ -342,7 +341,7 @@ pub fn spec_key(ty: &Type) -> SpecKey {
         visiting: HashSet::new(),
         memo: HashMap::new(),
         truncations: 0,
-        refinements: ClaimScope::default(),
+        scope: RefinementScope::default(),
     };
     // One walk-wide `ctx` for both reads: its memo is keyed by polarity, so the
     // two reads share it without contaminating each other.
@@ -387,8 +386,8 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let mut k = key_go(inner, pol, subst_acc, ctx);
             let r = subst_acc.force_refinement(r);
             // Landing closes, as in `compact_go`: the key stores the
-            // index-spelled claim, so α-variant instantiations key together.
-            let r = ctx.refinements.close(&r);
+            // index-spelled refinement, so α-variant instantiations key together.
+            let r = ctx.scope.close(&r);
             if !k.refinements.contains(&r) {
                 k.refinements.push(r);
             }
@@ -411,9 +410,9 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 None => subst_acc.clone(),
             };
             // Entering the codomain crosses this function, as in `compact_go`.
-            ctx.refinements.enter(name.clone());
+            ctx.scope.enter(name.clone());
             let cod = key_go(codomain, pol, &cod_acc, ctx);
-            ctx.refinements.exit();
+            ctx.scope.exit();
             // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
             // so keying on it would split every use; its pins are the answer, and
@@ -483,7 +482,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // opposite-polarity fallback either — the dual read subsumes it.
         Type::Infer(state) => {
             let visit_key = (state.uid, pol);
-            let memo_key = (state.uid, pol, ctx.refinements.enclosing().to_vec());
+            let memo_key = (state.uid, pol, ctx.scope.enclosing().to_vec());
             let memoizable = subst_acc.is_id();
             if memoizable && let Some(k) = ctx.memo.get(&memo_key) {
                 return k.clone();
@@ -826,13 +825,13 @@ mod tests {
             visiting: HashSet::new(),
             memo: HashMap::new(),
             truncations: 0,
-            refinements: ClaimScope::default(),
+            scope: RefinementScope::default(),
         }
     }
 }
 
 #[cfg(test)]
-mod claim_closing_tests {
+mod refinement_closing_tests {
     use super::*;
     use crate::ccl::infer::solver::test_helpers::dep_pred;
     use crate::ccl::infer::solver::{ConstrainCache, constrain_subtype};

@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::subst::{ClaimScope, Subst};
+use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{
     BaseType, HistoryKind, InferVarId, Name, Openness, Refinement, Type, fresh_infer_var_id,
 };
@@ -636,7 +636,7 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         recursive: HashMap::new(),
         rec_vars: BTreeMap::new(),
         collapse,
-        refinements: ClaimScope::default(),
+        scope: RefinementScope::default(),
     };
     let term = compact_go(ty, true, &Subst::id(), None, &mut st);
     CompactGraph {
@@ -717,11 +717,11 @@ struct CompactState {
     collapse: bool,
     /// The functions the walk is inside of, and the closing memo over them
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run"): a
-    /// refinement's references to enclosing binders become indices *before*
+    /// refinement's references to enclosing binders become indices before
     /// `merge_refinements` compares refinements, so a closed cast and a live emitted
     /// function meeting at one variable spell one refinement one way. `key_go` threads
-    /// the same type, which is what keeps a key and a compacted type agreeing.
-    refinements: ClaimScope,
+    /// the same type, so a key and a compacted type agree.
+    scope: RefinementScope,
 }
 
 /// Compact `ty` at polarity `pol`, composing `subst_acc` — the substitution
@@ -783,7 +783,7 @@ fn compact_go(
             let r = subst_acc.force_refinement(r);
             // Landing closes: references to the walk's enclosing binders
             // become indices before the refinement is compared or stored.
-            let r = st.refinements.close(&r);
+            let r = st.scope.close(&r);
             if !ct.refinements.contains(&r) {
                 ct.refinements.push(r);
             }
@@ -811,9 +811,9 @@ fn compact_go(
             };
             // Entering the codomain crosses this function — named or not, it
             // deepens what a refinement landing below closes against.
-            st.refinements.enter(name.clone());
+            st.scope.enter(name.clone());
             let cod = compact_go(c, pol, &cod_acc, None, st);
-            st.refinements.exit();
+            st.scope.exit();
             CompactType {
                 fun: Some(CompactFun {
                     name: name.clone(),
@@ -1263,7 +1263,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod claim_closing_tests {
+mod refinement_closing_tests {
     use super::*;
     use crate::ccl::infer::solver::test_helpers::dep_pred;
     use crate::ccl::ty::FunKind;
@@ -1286,7 +1286,7 @@ mod claim_closing_tests {
     /// binder while the refinement sets unioned both α-copies of one
     /// constraint, coalescing to the order-dependent — and dangling —
     /// `(𝑥: 𝐷) ⤇ {{Int | __elem == 𝑥} | __elem == 𝑦}`. With refinements closing
-    /// as they land (`CompactState::claims`), α-variants compact identically:
+    /// as they land (`CompactState::scope`), α-variants compact identically:
     /// the copies dedup and nothing dangles. The binder *slot* is display
     /// metadata and still follows arrival (`na.or(nb)`), so the equality is
     /// modulo `without_pi_names`.

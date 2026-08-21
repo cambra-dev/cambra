@@ -1825,9 +1825,8 @@ struct ChainEnds {
 /// dependent function rather than by anything the chain keeps. What
 /// [`emit_compose`] keeps is the *final* morphism's binder, which makes the chain
 /// itself dependent; a reference to an earlier morphism's binder rides out free and
-/// resolves against the position the chain lands in. `check_scope_valid` is what
-/// holds that: it checks every node's type against its lexical scope once inference
-/// ends.
+/// resolves against the position the chain lands in. `check_scope_valid` holds that:
+/// it checks every node's type against its lexical scope once inference ends.
 ///
 /// `as_function` destructures the resolved function in Check and
 /// introduces-and-constrains in Emit. The single-sided `Var <: Var` rule leaves a

@@ -2450,7 +2450,7 @@ mod tests {
         let _ = l.zip_same_tags(&r, "test", |x, y| x + y);
     }
 
-    /// A dependent function's claim *stores* an index and *reads* as the
+    /// A dependent function's refinement *stores* an index and *reads* as the
     /// binder's name, detached from the function or not. Two spellings, two
     /// mechanisms: a rendering that holds the function reads its name slot, and one that does
     /// not falls back to the reference's own hint. Identity is the index in
@@ -2458,7 +2458,7 @@ mod tests {
     #[test]
     fn a_dependent_arrow_renders_its_binder_by_name() {
         let k = crate::ccl::Name::raw("k");
-        let refinement = Type::Refinement(
+        let refined = Type::Refinement(
             Box::new(Type::Base(BaseType::Int)),
             Refinement::born(Rc::new(TypedExpr::binop(
                 TypedExpr::var(crate::ccl::Name::elem()),
@@ -2466,7 +2466,7 @@ mod tests {
                 TypedExpr::var(k.clone()),
             ))),
         );
-        let ty = Type::pi(k.clone(), Type::Base(BaseType::Int), refinement);
+        let ty = Type::pi(k.clone(), Type::Base(BaseType::Int), refined);
         assert_eq!(ty.to_string(), "((k: Int) ⇒ {Int | __elem == k})");
 
         // Detached from the function, the reference still reads as the binder —
@@ -2502,7 +2502,7 @@ mod tests {
     /// would resolve the reference to the wrong binder.
     #[test]
     fn an_unnamed_crossing_still_counts_when_rendering() {
-        let refinement = Type::Refinement(
+        let refined = Type::Refinement(
             Box::new(Type::Base(BaseType::Int)),
             Refinement::born(Rc::new(TypedExpr::var(crate::ccl::Name::pi_bound_bare(1)))),
         );
@@ -2511,7 +2511,7 @@ mod tests {
             name: Some(crate::ccl::Name::raw("k")),
             kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
-            codomain: Box::new(Type::fun(Type::Base(BaseType::Int), refinement)),
+            codomain: Box::new(Type::fun(Type::Base(BaseType::Int), refined)),
         };
         assert_eq!(ty.to_string(), "((k: Int) ⇒ (Int ⇒ {Int | k}))");
     }
