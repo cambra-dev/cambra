@@ -355,10 +355,9 @@ impl fmt::Debug for Telescope {
 /// whose `scoped` / `scoped_let` enter a binder around a sub-walk.
 ///
 /// Entering owns the restore. A site that extends the scope and returns without
-/// restoring it leaves every later variable claiming a scope it is not in, and the
-/// record-time closure check then admits the bound that escaped — the failure this
-/// telescope exists to catch. One implementation of the save/restore is one place
-/// that can get it wrong.
+/// restoring it leaves every later variable recording a scope it does not sit in,
+/// and the closure check then admits a bound that references a binder out of scope.
+/// One implementation of the save/restore is one place that can get it wrong.
 pub(crate) trait TelescopeWalk {
     /// The walk's live scope.
     fn telescope_mut(&mut self) -> &mut Telescope;
@@ -414,8 +413,8 @@ pub(crate) fn bound_scope_gaps(
 /// ([`Derivation::enforces_closure`]), and a caller passing a bool would be the
 /// second place it is answered.
 ///
-/// Runs at **every recorded bound**, not once per pass, which is what makes the
-/// blame a variable and a name rather than a tree walked after the fact. The cost
+/// Runs at every recorded bound rather than once per pass, so the blame is a
+/// variable and a name rather than a tree walked after the fact. The cost
 /// is one [`subst::type_free_vars`] walk per edge, measured at ~4% of debug-build
 /// inference time; it allocates only for a bound whose type carries a refinement,
 /// since an empty `BTreeSet` does not allocate. Narrowing it to a pass boundary is

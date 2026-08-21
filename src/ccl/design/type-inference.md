@@ -946,13 +946,18 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ### Scoped inference variables: a stored bound closes against a telescope
 
-Every inference variable records the binders in scope where it was created. A bound recorded on the
-variable must close against that record, and a reference to anything else is a record-time internal
-error. References that a bound's own functions introduce are stored as de Bruijn indices assigned
-when the function is constructed, so two α-variant closed types are structurally identical wherever
-the solver decides identity: `RefinementSet` dedup, `CompactType::merge`, the constraint cache, and
-`SpecKey` each compare stored types structurally, and `CompactFun::merge` keeps one arrival's binder
-while unioning both refinement sets.
+A refinement predicate may reference an enclosing binder, and the bound carrying that refinement
+travels away from the binder during inference. Group-by's lowering does that: it puts the dependent
+refinement in a cast target while the function binding `__gb_k` is minted separately, so the
+refinement lands on a variable whose position has no enclosing function. Nothing checked it there —
+`check_scope_valid` runs on coalesced node types once inference ends, never on bounds — and the
+sites that decide identity compare stored types structurally, which is α-sensitive.
+
+Two mechanisms answer that. Each inference variable carries the scope it was created in, and a bound
+recorded on it that references anything else is a record-time internal error. References a bound's
+own functions introduce are stored as de Bruijn indices assigned when the function is constructed,
+so two α-variant closed types are structurally identical at every site that decides identity:
+refinement-set dedup, `CompactType::merge`, the constraint cache, and `SpecKey`.
 
 #### The invariant
 
@@ -962,45 +967,34 @@ binders and `let` binders, interleaved in scope order. Emission already holds th
 
 A bound recorded on a variable **closes against the holder's telescope**: every free term variable
 of the bound's type is in the telescope or in the edge's substitution domain. The check runs when
-the bound is recorded, which is a lookup, since uniquify gives every binding site one uid. A
+the bound is recorded, and it is a lookup, since uniquify gives every binding site one uid. A
 violation names the variable and the reference and fails.
 
 Enforcement covers every derivation over a self-contained tree: the live solve, meaning emission and
 its specialization pins, and the pass-boundary re-derivations that check what a pass produced. A
-re-derivation walks a tree where a pass has erased term binders, and the refinements it meets still name
-them; what binds them there is the family's type, whose Pi binder the chain walk enters (see [Where
-the conversions run](#where-the-conversions-run)). The tree holds every binder its refinements reference,
-and a reference to one it does not hold is the escape this invariant catches.
+re-derivation walks a tree where a pass has erased term binders, and the refinements it meets still
+name them. The dependent function's type binds them there, and the chain walk enters its Pi binder
+(see [Where the conversions run](#where-the-conversions-run)). The tree holds every binder its
+refinements reference; a reference to one it does not hold is a bound that left its binder's scope.
 
-One derivation is excused, because its absent context is what holds the binders: a probe over a
-sub-tree cut from its tree, which is `debug_typecheck`'s per-operation check and nothing else. No
-walk of the sub-tree can enter a binder the enclosing tree holds. Planning's in-place checks of a
-morphism it has just built are not excused, because a morphism carries its own binder.
-`ConstrainCache::for_derivation` names the three cases, and the `Fun`/`Fun` codomain opening reads
-the same value: the live solve opens only toward a side carrying inference variables, where a
-dangling index could land on a recorded bound, and either re-derivation opens unconditionally
-because it reconciles two passes' spellings of one type. `CAMBRA_TELESCOPE_LOG` enables the
-observation log.
+One derivation is excused: a probe over a sub-tree cut from its tree, which is `debug_typecheck`'s
+per-operation check and nothing else. The context it was cut from holds the binders, and no walk of
+the sub-tree can enter them. Planning's in-place checks of a morphism it has just built are not
+excused, because a morphism carries its own binder. `ConstrainCache::for_derivation` names the three
+cases, and the `Fun`/`Fun` codomain edge reads the same value (see [Where the conversions
+run](#where-the-conversions-run)). `CAMBRA_TELESCOPE_LOG` enables the observation log.
 
-A program source needs no standing in the telescope, because it is never a reference the check sees.
-A source is referenced by a `TypedExprNode::Source` node, not by a variable: lowering emits that
-node for every source reference, `emit_node`'s `Source` arm types it from the source registry, and
-the `Var` arm resolves against the scope stack alone and rejects any name not in it. A source name
-therefore never reaches `subst::type_free_vars`, so every gap the check finds is a reference that
-should have been rewritten and is not excused.
-
-A parameter annotation's predicate referencing a parameter would be such a reference, and lowering
-rejects it (`lower::functions`'s `reject_annotation_references`). The annotation asks for a
-telescope — `(a: Int, c: {Int where _ >= a})` is `(a: Int) ⇒ ((c: {Int | _ >= a}) ⇒ …)` — and
-neither shape reaching that check carries one: a tupled parameter list binds one tuple, whose
-`Type::Tuple` binds no component for the predicate to name, and a single parameter can only be
-naming itself. A curried parameter list does carry the telescope, which is why a nested `def`'s
-annotation may name the enclosing `def`'s parameter.
+A program source needs no standing in the telescope, because the check never sees a reference to
+one. A source is referenced by a `TypedExprNode::Source` node rather than by a variable: lowering
+emits that node for every source reference, `emit_node`'s `Source` arm types it from the source
+registry, and the `Var` arm resolves against the scope stack alone and rejects any name not in it. A
+source name therefore never reaches `subst::type_free_vars`, so every gap the check finds is a
+reference some pass failed to rewrite.
 
 #### A binder reference is stored in one of two forms
 
-The form says whether the type itself binds it. The scheme is the standard locally nameless one: a
-free reference is a name, a bound one an index.
+The form says whether the type itself binds the reference. The scheme is the standard locally
+nameless one: a free reference is a name, a bound one an index.
 
 - **A reference to a telescope entry is a name.** A uniquified name identifies its telescope entry
   exactly, so the record-time check is a lookup, and the same name denotes the same binder at every
@@ -1009,78 +1003,78 @@ free reference is a name, a bound one an index.
   telescope. The discharge machinery keeps addressing binders by name, unchanged.
 - **A reference to one of the type's own functions is a de Bruijn index, assigned at abstraction.**
   Constructing a function over a body closes the body: a free reference to the function's binder
-  becomes an index counting outward. `Type::pi` at emit and coalesce assembling a lambda's type are
-  the same operation, so the constructor owns it, and a function whose codomain carries a dangling
-  internal name is unconstructible. A closed family is α-canonical by construction, which is what
-  the merge, the caches, and `SpecKey` need.
+  becomes an index counting outward. The type constructors own the conversion, so a function they
+  build cannot carry a free name for its own binder, and a closed function is α-canonical. That is
+  what the merge, the caches, and `SpecKey` compare on.
 
-Where identity runs forces the split. An identity site sees a refinement without its enclosing functions
-— `merge_refinements` compares refinement sets sitting beside `CompactFun`'s binder slot, one function
-below it — so which of the two kinds a reference is must be readable off the reference alone. A
-name is ambiguous between them; an index is self-evidently the second kind and says by what. The
+The split follows from where identity runs. An identity site sees a refinement without its enclosing
+functions — `merge_refinements` compares refinement sets sitting beside `CompactFun`'s `name` slot,
+one function below it — so a reference must say which of the two kinds it is, on its own. A name is
+ambiguous between them; an index is the second kind and names the function by counting. The
 telescope supplies context for the first kind and cannot for the second, whose binders are not in
 it.
 
-Structural equality is context-free sound: names are globally unique, indices are anchored to
+Structural equality then needs no context: names are globally unique, indices are anchored to
 functions that travel with the type, and neither needs re-basing anywhere. The constraint cache's
 `(Type, Type)` key is unaffected.
 
+`Type::Fun`'s `name` slot therefore carries no identity: a refinement's binding is its index, so the
+slot never participates in an identity comparison. It is the opening address that descent and
+application open the function at, so coalesce keeps it exactly on the functions whose codomains
+reference it (`subst::codomain_depends_on`) and strips it elsewhere.
+
 #### Interior term binders stay named, and compare by position
 
-A predicate may contain a term lambda — `λ x → x // 2` in the group-by claim — and its parameter
-stays a name. Closing treats such a parameter as a shadow: inside the lambda, a reference spelled
-like the function's binder is the lambda's and keeps its name. Uniquification already keeps the two
-spellings apart in a compiled program, so the shadow is what makes closing correct without depending
-on that convention, as the `Fun`/`Fun` opening gate does not depend on it either.
+A refinement's predicate may contain a term lambda — `λ x → x // 2` in the group-by case — and its
+parameter stays a name. That binder sits inside the refinement rather than outside it, so the
+compared terms carry it
+and the correspondence is local: `eq_refinement_predicate` threads a pairing and compares a
+reference to it by its binder's position, and `hash_refinement_predicate` hashes it by position so
+the `Eq`/`Hash` contract survives. The name stays the stored form, so the predicate is still a term
+planning can compile.
 
-**Where the binder sits decides how it is stored.** A function's binder sits outside the refinement —
-the refinement set is beside `CompactFun`'s name slot, one function below it — so a reference to it must
-be readable off the reference alone, which is the index. A lambda's binder sits *inside* the refinement,
-so the compared terms carry the binder and the correspondence is local: `eq_refinement_predicate`
-threads a pairing and compares such a reference by its binder's position, and
-`hash_refinement_predicate` hashes it by position for the same reason. The name stays the stored
-form, so the predicate is still a term planning can compile.
+Closing treats such a parameter as a shadow: inside the lambda, a reference spelled like the
+enclosing function's binder is the lambda's and keeps its name. Uniquification already keeps the two
+spellings apart in a compiled program, so the shadow makes closing correct without depending on that
+convention, as the `Fun`/`Fun` opening gate does not depend on it either.
 
-Both halves are needed together. Every refinement a program produces routes its element through a
-function, so it carries an interior lambda, and a filter written twice mints that binder twice
-(`λ x#3 → x#3 > 1` against `λ x#6 → x#6 > 1`). Comparing it by name splits a refinement set that should
-dedup, and a `Data` domain admits no join across the split: with indices alone,
+Positions and indices are both needed. Every refinement a program produces routes its element
+through a function, so it carries an interior lambda, and a filter written twice mints that binder
+twice (`λ x#3 → x#3 > 1` against `λ x#6 → x#6 > 1`). Comparing it by name splits a refinement set
+that should dedup, and a `Data` domain admits no join across the split: with indices alone,
 `if c: [x for x in xs if x > 1] else: [x for x in xs if x > 1]` is rejected
 (`tests/type_check.rs`, `test_case_with_filtered_comprehension_arms_passes_consistency_wall`).
 
 #### `let` binders and scope exit
 
-A `let` telescope entry carries its definiens. A refinement may reference it while in scope, which is
-what a user-written refinement type needs (`{Int | __elem > n}` with `n` let-bound), and lifting a
-type past the binding discharges the reference to the definiens through the existing `let`-closing
-discharge in `coalesce_node`. No re-addressing is needed: a uniquified name is its telescope entry's
-address, so the name-keyed discharge already speaks in entries. A Pi entry has no
-definiens, and lifting past one abstracts instead of discharging.
+A `let` telescope entry carries its definiens. A refinement may reference it while in scope, which a
+user-written refinement type needs (`{Int | __elem > n}` with `n` let-bound). Lifting a type past
+the binding discharges the reference to the definiens, through the existing `let`-closing discharge
+in `coalesce_node`. No re-addressing is needed: a uniquified name is its telescope entry's
+address, so the name-keyed discharge already speaks in entries. A Pi entry has no definiens, and
+lifting past one abstracts instead of discharging.
 
 #### Discharge is application
 
-A `Bound { self_subst, ty, ty_subst }` whose substitution discharges a binder is a closed family
+A `Bound { self_subst, ty, ty_subst }` whose substitution discharges a binder is a closed function
 applied at an argument — `(λ𝑥. ty) arg`, written as a type with a free variable plus a map that
 promises to remove it. The substitution's domain binders therefore count as the type's own in the
 record-time check, and β fires at coalesce against the telescope.
 
-`Type::Fun`'s binder slot carries no refinement identity. A refinement's binding is its index, so the slot
-never participates in an identity comparison. It remains the opening address, which descent and
-application open the function at, so coalesce keeps it exactly on the functions whose codomains
-reference them (`subst::codomain_depends_on`) and strips it elsewhere. The `Fun`/`Fun`
-`extended_rename` and `Subst::licensed_correspondence_view` transport the *name* form rather than
-refinement identity, so they retire with it: with indices landed,
-disabling the licensed view still trips the closure bridge's O1/O4 tripwire on extrusion across
-levels under a generalized `let` and on per-occurrence group-by keys through a polymorphic
-definition.
+Two mechanisms transported the name form rather than the index, and they retire with it: the
+`Fun`/`Fun` `extended_rename` and `Subst::licensed_correspondence_view`. Disabling the licensed view
+trips `bridge_holder_gap`'s tripwire on extrusion across levels under a generalized `let` and on
+per-occurrence group-by keys through a polymorphic definition, so the index does not subsume them.
 
 #### Where the conversions run
 
-A type is **closed** — references to its own functions stored as indices — from construction on,
-and a bound recorded mid-solve is **open**, with references to telescope entries stored as names. An
+A type is **closed** — references to its own functions stored as indices — from construction on, and
+a bound recorded mid-solve is **open**, with references to telescope entries stored as names. An
 index counts the functions crossed from their codomain side between the reference and its binder,
-named and unnamed alike, so it survives `Type::without_pi_names`. One closing function and one
-opening function own the conversions, and four sites are their only callers.
+named and unnamed alike, so it survives `Type::without_pi_names`. Closing and opening are one walk
+each over the mixed type/term structure (`subst`'s `PiWalk`), reached through `close_pi_binder` and
+`open_pi_binder` at construction, descent and application, and through `RefinementScope` at landing.
+Those are the four kinds of site.
 
 **Construction closes.** The type constructors — `Type::pi`, `Type::pi_kinded`,
 `Type::pi_eliminated`, `Type::fun_like` — abstract the codomain they are given, and so does every
@@ -1090,32 +1084,37 @@ rebuild that assembles a dependent function around a codomain it computed from n
 against their telescopes. A rebuild that carries a `FunKind` takes `Type::pi_kinded` rather than a
 `Fun` literal: the group-by partition function (`planning::groupby`'s `emit_groupby`) and the
 eliminated group-by lambda's Pi (`lambda_elim`) are dependent collections, and reaching for the
-literal to set `kind` is what leaves a free binder name in a stored type.
+literal to set `kind` leaves a free binder name in a stored type.
 
 Two sites assemble a `Fun { name: Some(_), .. }` and close nothing, one on each side of the
 construction boundary. `emit_lambda`'s codomain is the live in-solve type, which stays name-spelled:
-its refinements accumulate behind an inference variable, and closing them is landing's job, so closing
-the reachable ones here would put an index-spelled claim and a name-spelled claim at one position —
-what landing-close exists to prevent. `coalesce_compact_go`'s refinements arrive already closed, and the
-compact view it assembles from mirrors `Fun`s one-to-one, so a landed index counts to the function
-being built; closing is the identity there and the literal is what says so.
+its refinements accumulate behind an inference variable, and closing them is landing's job, so
+closing the reachable ones here would put an index-spelled refinement and a name-spelled one at a
+single position — what landing-close exists to prevent. `coalesce_compact_go`'s refinements arrive
+already closed, and the compact view it assembles from mirrors `Fun`s one-to-one, so a landed index
+counts to the function being built; closing is the identity there, and the `Fun` literal says so.
 
-**Refinement landing closes.** The compact and key walks close a refinement against the enclosing functions
-the walk is inside of, as it lands in the view, in the same two arms that force the edge
-substitutions into it (`force_refinement`). Landing is where it must happen: `CompactType::merge`
-dedups refinements while bounds fold, before any function is assembled, so a closed cast and a live
-emitted function meeting at one variable would otherwise put an index-spelled claim and a
-name-spelled claim at one position. Assembly (`coalesce_compact_go`) then consumes closed refinements and
-rebuilds the function around them; the walk mirrors `Fun`s one-to-one, so a landed index is already
-relative to the assembled structure.
+**Landing closes.** The compact and key walks close a refinement against the enclosing functions the
+walk is inside of, as it lands in the view, in the same two arms that force the edge substitutions
+into it (`force_refinement`). Landing is the only point that works: `CompactType::merge` dedups
+refinements while bounds fold, before any function is assembled, so a closed cast and a live emitted
+function meeting at one variable would otherwise put an index-spelled refinement and a name-spelled
+one at a single position. `subst::RefinementScope` is the state both walks thread — the
+enclosing-binder stack and the closing memo in one type, so the two cannot disagree about what a
+refinement closes against.
 
 **Descent opens.** Walking under a binder converts that binder's indices back to a name. The `Fun`/
 `Fun` codomain edge opens each side at its own binder name and carries the correspondence as a
 discharge at a variable (`[k ↦ x]`, read as an application), so a bound recorded on an inner
 variable references the binder by name and closes against that variable's telescope.
+Which derivation is running decides whether that edge opens at all. The live solve opens only toward
+a side carrying inference variables, since a dangling index can only land on a bound and only a live
+side records one. Either re-derivation opens unconditionally, because it reconciles two passes'
+spellings of one type.
+
 `normalize_annotation` extends the emission telescope with each Pi binder it descends past, so the
-variables it mints inside a dependent annotation carry the binder in scope; this is what closes the
-group-by case, whose refinements land on variables whose telescopes never saw `__gb_k`.
+variables it mints inside a dependent annotation carry the binder in scope; this closes the group-by
+case, whose refinements land on variables whose telescopes never saw `__gb_k`.
 `subst::open_codomain` is the same conversion at a rebuild, where a pass holds a morphism and the
 codomain it just read off it. Three passes call it:
 
@@ -1123,26 +1122,24 @@ codomain it just read off it. Three passes call it:
   names the binder the chain composes under;
 - `lambda_elim`'s application rule, for the `apply` transformer's domain, which sits under the pair
   morphism's binder;
-- the group-by recognizer, on the family it matches, because it identifies the key binder as the
+- the group-by recognizer, on the function it matches, because it identifies the key binder as the
   free `Var` on one side of the predicate's equality.
 
 Opening at a name puts a free reference into the type being compared, so the walk descends into the
-binder's scope as well. A chain is typed morphism by morphism inside the families before it
-(`emit_compose`'s `compose_chain`), which is what lets the variables those steps mint close against
-the binder their refinements name: a family and the transformers consuming it are siblings in the term
-and nested in scope.
+binder's scope as well. A chain is typed morphism by morphism inside the dependent functions before
+it (`emit_compose`'s `compose_chain`), so the variables those steps mint close against the binder
+their refinements name: a dependent function and the transformers consuming it are siblings in the
+term and nested in scope.
 
-**Application opens at the argument.** Applying a closed family — the dependent-application
+**Application opens at the argument.** Applying a closed function — the dependent-application
 discharge, β at coalesce — replaces the binder's indices with the argument term. Opening at a name
 and opening at an argument are one operation with a different replacement. The post-inference
 check's `apply` rule is this site's second caller: it re-derives an application's type from the
 closed function the tree records, so it opens the codomain at the argument before comparing against
 the stored, already-discharged type.
 
-A bound recorded mid-solve stays name-spelled, and an intact closed type — a lowered dependent
-cast recorded whole as a bound — stays index-spelled. Each identity site compares like with like,
-because whether a type is closed follows from which side of a construction boundary it sits on and
-not from when it arrives.
+Each identity site therefore compares like with like: whether a type is closed follows from which
+side of the construction boundary it sits on, not from when it arrives.
 
 #### Rendering opens what it descended through
 
@@ -1160,7 +1157,7 @@ differently.
 A diagnostic is the rendering that does not hold the function. It blames a fragment rather than a
 whole type — `coalesce_compact_go`'s domain-join conflict reports the domains of the function it is
 half-way through assembling, and the function binding their references is further out in the walk,
-so there is nothing to descend through. Without the spelling on the reference that domain reads
+so there is nothing to descend through. Without the spelling on the reference, that domain reads
 `{[0, 2] | __elem ▷ [1, 2, 3] ▷ (λ x : Int → x) == #0}`.
 
 The stored form never converts back. Construction closes at every phase — planning builds functions
@@ -1174,15 +1171,15 @@ stored at level `L` with its refinements closed (`#n` is an index):
 
     (k: ?K) |=> ((i: {?D | __elem |> f == #0}) |=> ?V)
 
-`#0` is the refinement's reference to `k`. The predicate sits in the inner function's domain, where only
-the outer binder is in scope, because a binder scopes over its codomain and not its domain; the same
+`#0` is the reference to `k`. The predicate sits in the inner function's domain, where only the
+outer binder is in scope, because a binder scopes over its codomain and not its domain; the same
 reference from the inner codomain would be `#1`.
 
 Freshening copies indices verbatim, and that is the whole interaction. `freshen_above` copies a
-`Fun`'s name slot structurally, and `freshen_refinement_predicate` rewrites only a predicate's type
-slots (through `freshen_expr_type_slots`), leaving term structure including `#0` untouched. An index
-is anchored to a function inside the same type being copied, so the copy cannot dangle. Free names
-in a predicate — the definition's captured environment, level ≤ `L` — copy verbatim and stay
+`Fun`'s `name` slot structurally, and `freshen_refinement_predicate` rewrites only a predicate's
+type slots (through `freshen_expr_type_slots`), leaving term structure including `#0` untouched. An
+index is anchored to a function inside the same type being copied, so the copy cannot dangle. Free
+names in a predicate — the definition's captured environment, level ≤ `L` — copy verbatim and stay
 correct, because every use of the definition sits lexically inside those binders' scope and all
 clones share the one captured binder.
 
@@ -1190,16 +1187,16 @@ clones share the one captured binder.
 α-variant, such as two textually identical group-bys each minting its own binder uids, spell
 identically once closed, so their keys agree and the memo shares the specialization. A refinement
 referencing a binder outside the walked type keeps its uniquified name in the key, so two uses under
-distinct enclosing binders key apart. Fiber distinctions — one family discharged at two arguments —
-ride the σ-forced predicates, since `key_go` forces each edge's substitution into a refinement before it
+distinct enclosing binders key apart. One function discharged at two arguments keys apart on the
+σ-forced predicates, since `key_go` forces each edge's substitution into a refinement before it
 lands in the key.
 
 The pin re-bases by opening, not by rewriting indices. `specialize_use` pins a clone to the use's
 resolved type: the resolved side is closed, and the clone's emitted functions are live (`pi(x, D,
-?c)` with refinements behind variables). The pin's `Fun`/`Fun` edges open the closed side at the clone's
-binder names as bounds cross, after which every bound landing on a clone variable is name-spelled
-against that variable's telescope. No index is re-based: an index converts to a name at a binder
-crossing or to a term at an application, and otherwise travels untouched.
+?c)` with refinements behind variables). The pin's `Fun`/`Fun` edges open the closed side at the
+clone's binder names as bounds cross, after which every bound landing on a clone variable is
+name-spelled against that variable's telescope. No index is re-based: an index converts to a name at
+a binder crossing or to a term at an application, and otherwise travels untouched.
 
 ## 4.6 Data vs compute functions
 

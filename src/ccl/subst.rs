@@ -1575,7 +1575,7 @@ impl<'a> PiWalk<'a> {
                     && let Some(dist) = enclosing.iter().rev().position(|f| f.as_ref() == Some(n))
                 {
                     // The spelling rides along as the reference's display
-                    // hint: a diagnostic that blames this claim detached from
+                    // hint: a diagnostic that blames this refinement detached from
                     // its function has none to read a name off.
                     e.node = TypedExprNode::Var(Name::pi_bound(dist as u32 + depth, n));
                     self.changed += 1;
@@ -1696,14 +1696,14 @@ pub fn codomain_depends_on(binder: &Name, codomain: &Type) -> bool {
 /// refinements against them (see `src/ccl/design/type-inference.md`, "Where the
 /// conversions run").
 ///
-/// One type because two walks must agree. `compact_go` and `key_go` both close a
-/// claim as it lands, and each has to enter and leave the same crossings at the
-/// same arms: a compacted type and the `SpecKey` beside it that disagreed would
-/// spell one refinement two ways, and the key would then split — or share — a
-/// specialization the type does not. Owning the stack and the memo together is what
-/// leaves the two walks nothing to disagree about.
+/// One type, because two walks have to agree. `compact_go` and `key_go` each close
+/// a refinement as it lands, and each must enter and leave the same crossings at the
+/// same arms. Two walks that disagreed would spell one refinement two ways, and the
+/// `SpecKey` would then split — or share — a specialization the compacted type does
+/// not. Holding the stack and the memo in one type leaves them nothing to disagree
+/// about.
 #[derive(Default)]
-pub(crate) struct ClaimScope {
+pub(crate) struct RefinementScope {
     /// The binders of the `Fun`s the walk is inside of, innermost last (`None`
     /// for an unnamed one — it still counts as a crossing). Pushed entering a
     /// codomain, never a domain: a binder scopes over its codomain only.
@@ -1714,7 +1714,7 @@ pub(crate) struct ClaimScope {
     memo: HashMap<(PredicateId, Vec<Option<Name>>), crate::ccl::Refinement>,
 }
 
-impl ClaimScope {
+impl RefinementScope {
     /// Enter the codomain of a `Fun` binding `name` — one crossing deeper.
     pub(crate) fn enter(&mut self, name: Option<Name>) {
         self.enclosing.push(name);
