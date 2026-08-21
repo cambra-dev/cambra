@@ -208,10 +208,12 @@ pub(super) fn lower_list_comp(
     // of its source's, and a *multi-generator* one's is a product of all of them.
     // Those keep their `Hole` and stay ordered by the argument edge alone.
     //
-    // A source that already *names* its domain keeps that name: `groupby` stamps
-    // its own key `SharedHole` there (`lower_call`), and adopting it says the
-    // stronger, truer thing — this comprehension iterates the partition's keys —
-    // where minting a second id would overwrite the annotation carrying it.
+    // A source that already *names* its domain keeps that name — a nested
+    // comprehension, whose own annotation carries the id minted here. Adopting it
+    // says the stronger thing (these two iterate one domain) where minting a second
+    // id would overwrite the annotation carrying it. A `groupby` source names no
+    // domain: its key binder states the keys directly, as membership in what its key
+    // morphism produces, so there is nothing for a second position to share.
     let iter_dom = (single_gen && pred_op.is_none()).then(|| {
         gen_sources[0]
             .user_annotation
