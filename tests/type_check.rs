@@ -1624,7 +1624,7 @@ fn test_source_list_comp_element_type() {
 /// *computed* (a comprehension), its domain is an inference variable at emit time and
 /// has no shape to read, so the requirement is recorded as a **kinding constraint** on
 /// that variable and discharged when its position resolves. See
-/// `src/ccl/design/collections.md`, "Entering a collection type whose domain has no shape yet".
+/// `src/ccl/design/collections.md`, "What `box` checks against a collection type, and when".
 #[test]
 fn test_comprehension_enters_a_list_annotation() {
     // The comprehension's domain resolves to `[0, 3)` — a range — which realizes

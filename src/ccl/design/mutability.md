@@ -56,10 +56,9 @@ Because every cycle in the group crosses a causal accessor, values at any positi
 strictly earlier positions, and the group has a unique (well-founded) solution by induction along
 the domain order. (Only the *overwrite* law forms these cycles: an append feed carries no
 carry-forward, so channels never close a causal cycle — see [merge laws](#the-idea-in-one-line).
-The one exception is a *recursive keyed collection* — a `Set`/`Map` fed from a loop over itself,
-as in transitive closure — which closes a cycle well-founded by **monotone lattice convergence**
-rather than causal decrease; that is a distinct discipline under the same `LetRec` node, specified
-in [collections.md](collections.md#recursive-keyed-collections-fixpoint).)
+The one exception is a `Set`/`Map` fed from a loop over itself, as in transitive closure, which
+closes a cycle well-founded by monotone lattice convergence rather than causal decrease;
+`plan_loops` rejects it as a non-causal cycle, and admitting it is unspecified.)
 
 ### Sequencing domains
 

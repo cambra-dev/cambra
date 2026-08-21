@@ -475,7 +475,7 @@ impl Typing for InferCtx {
         // a coercion with no sound denotation. One-way leaves a collection annotation
         // to be met by Σ-*width*, which is the only edge into a sum — a bare `[0,3)⤇V`
         // does not reach `List(V)` at all without a `box`
-        // (`src/ccl/design/collections.md`, "Subtyping").
+        // (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
         //
         // Information still flows *from* the annotation, so "annotation wins" is
         // preserved: against a `Hole`-based annotation (`channelize`'s filter-feed

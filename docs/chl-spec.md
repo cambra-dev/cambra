@@ -1514,7 +1514,7 @@ element is chosen per type — it is *not* uniformly the value:
 |---|---|
 | `List(T)` / `Array(n, T)` / `Collection(T)` | the value `T` |
 | `Set(K)` | the key `K` |
-| `Map(K, V)` / `Dict(K, V)` | the entry `(K, V)` |
+| `Map(K, V)` | the entry `(K, V)` |
 
 A **single** target binds the whole element; a **tuple / `->`** target
 destructures it, so a map iterates entries unpacked as `for k -> v in m:` (the
@@ -2148,8 +2148,7 @@ and how the checker carries the distinction, is
 - `Set(K)` — distinct keys and no values. Membership is `k in s` (§3.4); there
   is no subscript, because the keys are the content.
 - `Map(K, V)` — one value per key. `m[k]: V` where `k` is proven present,
-  `m[k]?: Option(V)` otherwise (§3.9); membership `k in m`. `Dict(K, V)` is a
-  second spelling of the same type.
+  `m[k]?: Option(V)` otherwise (§3.9); membership `k in m`.
 - `Collection(T)` — some collection of `T`, saying nothing about which. Every
   other collection type widens to it.
 

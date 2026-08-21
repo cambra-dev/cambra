@@ -2193,7 +2193,7 @@ impl Type {
     /// `len` is a property of that domain. An `Array` reaches it as `box(arr)`, whose
     /// one-candidate sum `Σ (𝐷 ∈ {[0, k)}). 𝐷 ⤇ elem` is contained by plain kind
     /// containment: `{[0, k)} ⊆ UIntRanges`. The `box` is not optional — without it there
-    /// is no edge at all (`src/ccl/design/collections.md`, "Subtyping").
+    /// is no edge at all (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
     ///
     /// There is no `{𝑖 | 𝑖 < 𝑛}` domain refinement: the *kind* already
     /// says "a dense prefix range", so nothing needs saying about the elements — and
@@ -2212,10 +2212,8 @@ impl Type {
     /// unknown, unordered, opaque domain, which is what makes it the ⊤ of the kind
     /// order.
     ///
-    /// `Any` is that ⊤ and **nothing more**. In particular it is not load-bearing for
-    /// keyed-ness: a `Map`/`Set` is a sum over `TypeKind::Keyed`, not over a
-    /// `Collection(𝐾)` key-set witness — that design was rejected, and why is in
-    /// `src/ccl/design/collections.md`, "The referenceable opaque domain".
+    /// `Any` is that ⊤ and **nothing more**: it admits every domain, which is what makes
+    /// width-to-top fall out of the ordinary rule instead of needing a row per kind.
     ///
     /// Reaching this type is [`Builtin::Box`](crate::ccl::Builtin)-mediated like every
     /// other subtyping edge into a sum: a bare

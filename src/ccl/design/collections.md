@@ -1,12 +1,10 @@
 # Collections
 
-Cambra's surface language (CHL) has lists, arrays, sets, maps, and dicts. The runtime has
-one collection primitive: a **data function** `𝐷 ⤇ 𝑉`, a function whose domain is the
-data ([type-inference.md §4.6](type-inference.md#46-data-vs-compute-functions)). This
-document is how the five surface collection types are that one primitive over different
-domains, what the new type-level idea is (a **referenceable opaque domain** — the dormant
-Σ witness), how ordering, feeds and mutation follow from the domain's shape, and how it
-compiles.
+Cambra's surface language (CHL) has lists, arrays, sets and maps. The runtime has one
+collection primitive: a **data function** `𝐷 ⤇ 𝑉`, a function whose domain is the data
+([type-inference.md, 4.6 Data vs compute functions](type-inference.md#46-data-vs-compute-functions)).
+This document is how the five collection types those four spellings and the abstract
+`Collection(𝑇)` name are that one primitive over different domains, and how they compile.
 
 What a program writes, and what each collection type means to it, is
 [chl-spec, Direction: collection types](../../../docs/chl-spec.md#63-direction-collection-types-decided).
@@ -14,28 +12,23 @@ Start there if the question is about the language rather than the checker;
 [The five collection types](#the-five-collection-types) below is the same list with its
 domains.
 
-What this document rests on, all of it prior work: `FunKind`, the Σ domain-join, refined
-domains, kind-aware subtyping, and the compound registers of
-[mutability.md](mutability.md).
+The type-level machinery is `Type::Sigma` and its witness kinds, specified in
+[type-inference.md, Subtyping for sums](type-inference.md#subtyping-for-sums). A collection
+type is a Σ over a witness **kind**, and this document says which kind each surface type
+picks.
 
-The **kind axis** is the part still open. `List`, `Array`, `Set`, `Map` and `Collection`
-are meant to be distinct types, each with its own operations, and how that distinction is
-*represented* is only tentatively settled: the witness kind for four of them, a nominal
-head for the ambiguous pair. Today it is not represented at all — `Array(𝑛, 𝑇)` and
-`List(𝑇)` share the range representation `[0,𝑛) ⤇ 𝑇`, `Set(𝐾)` and `Map(𝐾, 𝑉)` will share
-the `Keyed(𝐾)` witness kind, with `Set(𝐾)` literally `Map(𝐾, unit)` — so the operation
-layer has nothing to dispatch on yet.
+The **kind axis** is the part still open, and only for one pair. The witness kind already
+tells four of the five apart: `Array(𝑛, 𝑇)` is a bare data function over one range,
+`List(𝑇)` a Σ over `UIntRanges`, `Collection(𝑇)` a Σ over `Any`. `Set(𝐾)` and `Map(𝐾, 𝑉)`
+are the pair it cannot, sharing the `Keyed(𝐾)` kind and its key parameter and differing
+only in a codomain that is `unit` for one — so the operation layer has nothing to dispatch
+on between them.
 
-> **Where status lives.** This document is the design of record for collections, and it
-> grows with the work: a mechanism's section arrives in the branch that implements it, so
-> what is written here is either built or unbuilt everywhere in the stack. [Status](#status)
-> is the one place status is recorded, and its **Branch** column is where each remaining
-> capability lands. A section carries an inline `[Planned]` tag only where it is planned
-> throughout — the operation layer, ordering, mutable / deferred / recursive collections.
->
-> Where a [Planned] feature has an interim behavior in today's code, that is tagged
-> **[Interim]** inline: an unfinished state on the path to the design, not a shim to
-> remove.
+> **What is built.** A mechanism's section arrives in the branch that implements it, so a
+> section being here means its mechanism is built unless it is tagged `[Planned]` — which
+> the operation layer is, throughout. Where a `[Planned]` feature has an interim behavior in
+> today's code, that is tagged `[Interim]`: an unfinished state on the path to the design,
+> not a shim to remove.
 
 ## The kind is declared, not read off the shape
 
@@ -49,9 +42,10 @@ declared kind rather than reading it back from the arrow. For the same reason
 **"keyed-ness" is not a primitive**: there is no structural keyed property, only a
 per-kind choice of what `for`-in surfaces.
 
-Subtyping is the other axis and reads the shape as usual — `Array → List → Collection`
-([Subtyping](#subtyping)) — so the two do not coincide: a `Set(𝐾)` is structurally a
-collection of `unit` and iterates `𝐾`.
+Subtyping is the other axis and reads the shape as usual — `box(arr) <: List(𝑇) <:
+Collection(𝑇)`, each edge the ordinary Σ-width rule at that kind
+([type-inference.md, The width rule](type-inference.md#the-width-rule)) — so the two axes do
+not coincide: a `Set(𝐾)` is structurally a collection of `unit` and iterates `𝐾`.
 
 > **Tentative — the ambiguous pair gets a nominal type.** `Set` and `Map`, and only
 > those two, become **nominal type heads** — the `type` strength of
@@ -110,10 +104,10 @@ The organizing distinction is **positional vs. content-addressed** and
 | **key domain** *(new)* | no | opaque | the keys that occur | no |
 | **Σ witness `𝐷`** *(activated)* | inherits `𝐷` | opaque, kind-classified | inherits `𝐷` | inherits `𝐷` |
 
-The last two rows are **one primitive**, which this design activates:
-[the referenceable opaque domain](#the-referenceable-opaque-domain). A key domain is a
-`Keyed(𝐾)` member; the ≥ 2 control-flow join is an `Enumerated` witness; a `List`'s is a
-`UIntRanges` member.
+The last two rows are **one primitive**, the Σ witness classified by a kind
+([type-inference.md, The wired witness kinds](type-inference.md#the-wired-witness-kinds)).
+A key domain is a `Keyed(𝐾)` member; the ≥ 2 control-flow join is an `Enumerated` witness;
+a `List`'s is a `UIntRanges` member.
 
 ## The five collection types
 
@@ -140,45 +134,16 @@ With `𝐷` a witness domain and `𝑛` a length:
   This is the type that needs a **runtime** witness, since iterating a `Collection(𝑇)`
   parameter has no static domain to read ([Future work](#future-work)).
 
-`Dict(𝐾, 𝑉)` is the surface spelling of `Map(𝐾, 𝑉)`; there is no separate type.
+Each is a `Type::Sigma` over the named kind, and every rule they obey is the general Σ
+rule at that kind — entry by a term, width, and consumption
+([type-inference.md, Subtyping for sums](type-inference.md#subtyping-for-sums)). Only
+`Array` is not a sum: its domain is one concrete range, so it needs no witness.
 
-## The referenceable opaque domain
+## What `box` checks against a collection type, and when
 
-The one new type-level idea. A data function may quantify its domain over a
-**witness** `𝑛`, whose members it does not statically know but can *name
-and refine*:
-
-- **Σ join (sum, ≥ 2 choices)** — the existing use, from control-flow merges:
-  `Σ 𝑛 ∈ {𝐷₀, 𝐷₁}. 𝑛 ⤇ 𝑉`. Already materialized by coalesce; the witness
-  `name` is stripped today because no predicate references it.
-- **List runtime length (single range witness)** — `Σ 𝑛. [0, 𝑛) ⤇ 𝑇`, `𝑛` an
-  opaque `Nat`. The codomain does not reference `𝑛`, but the *element* type of
-  the domain does (`{𝑖 | 𝑖 < 𝑛}`), which is what makes lookup partial.
-- **Map / Set keyed domain** — `Σ (𝐷: Keyed(𝐾)). 𝐷 ⤇ 𝑉`, over the kind of *every*
-  key domain on 𝐾. The annotation is the abstract map: it says "keyed by 𝐾"
-  without naming which keys.
-
-**Representation — a witness *kind*, not a value and not a new leaf.** Every
-witness is a **type**, classified by a [`TypeKind`], and a keyed collection is
-`Type::Sigma` over `TypeKind::Keyed(𝐾)`:
-
-```
-Map(𝐾, 𝑉) = Σ (𝐷: Keyed(𝐾)). 𝐷 ⤇ 𝑉
-Set(𝐾)    = Σ (𝐷: Keyed(𝐾)). 𝐷 ⤇ unit
-List(𝑇)   = Σ (𝐷: UIntRanges). 𝐷 ⤇ 𝑇
-```
-
-The three lines are the same shape with a different kind, which is the whole
-point: `Map` needs no rule of its own, only a kind. Subtyping is the
-[single Σ rule](type-inference.md#the-width-rule) — kind containment plus body
-subtyping — and a concrete keyed collection reaches
-`Map(𝐾, 𝑉)` by that same rule, once `box` has made it a one-candidate sum.
-
-### Entering a collection type whose domain has no shape yet
-
-The term that builds a sum forms the dependent pair `(𝐷, body)` for
-`List(𝑇) = Σ (𝐷: UIntRanges). 𝐷 ⤇ 𝑇` from a concrete `𝐷 ⤇ 𝑇`, and succeeds iff the
-concrete domain is a **member of the kind** — for `UIntRanges`, iff it is a `UIntRange`.
+`box` forms the dependent pair `(𝐷, body)` for `List(𝑇) = Σ (𝐷: UIntRanges). 𝐷 ⤇ 𝑇` from a
+concrete `𝐷 ⤇ 𝑇`, and succeeds iff the concrete domain is a **member of the kind** — for
+`UIntRanges`, iff it is a `UIntRange`.
 Membership is a predicate on the domain's shape rather than a constraint that records a
 bound.
 
@@ -188,11 +153,10 @@ size, so `len` is the first projection — and the same holds for a keyed domain
 `keys` is a `Map`/`Set`'s first projection. The witness is already present in the runtime
 `SealedFunction`, so the pairing copies nothing.
 
-Which collection is entering decides when the predicate can run. A **literal**'s domain
-is already a concrete `UIntRange`, so it runs at emission. A **computed** collection — a
-comprehension — has a domain that is still an inference variable
-there, so the membership is recorded as a kinding constraint and discharged once the
-shape exists
+Which collection is boxed decides when that predicate can run. A **literal**'s domain is
+already a concrete `UIntRange`, so it runs at emission. A **computed** collection — a
+comprehension — has a domain that is still an inference variable there, so the membership is
+recorded as a kinding constraint and discharged once the shape exists
 ([type-inference.md, What the kind level needs from the solver](type-inference.md#what-the-kind-level-needs-from-the-solver)).
 Read at a collection, that discharge is: a range discharges, and a source or a membership
 refinement is a mismatch, reported as the collection-annotation error it is.
@@ -226,8 +190,8 @@ become the per-kind standard-library instances with no semantic change. Everythi
   entries (`Map`). Because that is chosen by the kind, and the kind is known only
   after inference, the binding **cannot be fixed at lowering** (pre-inference); it
   is resolved at **coalesce**, once the node's type (hence kind) is known — the
-  same hook a [kinding constraint](#entering-a-collection-type-whose-domain-has-no-shape-yet)
-  is discharged at. The realization is cheap: the loop encoding already threads the domain
+  same hook a [kinding constraint](#what-box-checks-against-a-collection-type-and-when) is
+  discharged at. The realization is cheap: the loop encoding already threads the domain
   element as `__iter_record` (`comprehension.rs`), so binding the domain, the
   codomain, or both is a choice of *which* slot to bind, not a materialization.
   **[Interim]:** today the loop binds the codomain unconditionally (a map iterates
@@ -243,7 +207,10 @@ become the per-kind standard-library instances with no semantic change. Everythi
   of `Map`'s instance, **not** a type-level keyed marker — the nominal kind is the
   marker.
 - **Order.** Sequentiality is deduced from loop-carried dependencies and ordering
-  is supplied as an `Ord` given, never fabricated — [Ordering](#ordering) below.
+  is supplied as an `Ord` given, never fabricated. A positional domain (`UIntRange`, `Txn`,
+  an induction domain) is totally ordered by construction, so `Array` and `List` are
+  ordered; a keyed or opaque domain carries no order and an order-dependent operation over
+  one needs an `Ord[𝐾]` instance rather than a fabricated one.
 - **Views (`keys` / `values` / `items`).** `Map`'s projection operations, each a
   **lazy view** — no copy: `keys(m) : Collection(𝐾)` (the key set), `values(m) :
   Collection(𝑉)` (the map's own arrow), `items(m) : Collection((𝐾, 𝑉))`
@@ -260,260 +227,10 @@ become the per-kind standard-library instances with no semantic change. Everythi
   `sum(values(m))`; see step 3 of the [Implementation
   roadmap](#implementation-roadmap).
 
-## Ordering
-
-> **[Planned]** — the `Ord` given and ordered operations are designed, not built.
-> User-facing ordering rules (unordered/parallel `for`-in, sequentiality) are in
-> [chl-spec §4.6](../../../docs/chl-spec.md#46-for--iteration).
-
-Ordering is **derived from the domain species, not stored** — no per-collection
-ordering flag.
-
-- **Positional / sequencing domains** (`UIntRange`, `Txn`, induction /
-  `source` domains) are totally ordered by construction — the mutability model
-  already relies on this ("each sequencing domain is a total order"). Ordered
-  operations (positional index, first/last, ordered folds) work directly. So
-  `Array` and `List` are ordered because their domain is a range.
-- **Keyed / opaque domains** (`Set`, `Map`, `Collection`) carry no intrinsic
-  order. An order-dependent operation over them requires an `Ord[𝐾]`
-  **given** — supplied through the same contextual-parameter mechanism the spec
-  gives `Transaction` ([chl-spec §8](../../../docs/chl-spec.md#8-mutability-transactions-and-feeds)). No order is
-  fabricated for an unordered domain; the operation simply does not typecheck
-  without the instance.
-
-## Subtyping
-
-Collection subtyping is data-function subtyping. The general arms are
-[the width rule](type-inference.md#the-width-rule) and
-[Data domains are invariant](type-inference.md#data-domains-are-invariant); what follows
-is how each collection type lands on them.
-
-- **`Data <: Compute`** — a collection used as a capability upcasts; a
-  `Compute <: Data` is rejected (a capability where a collection is demanded is
-  silent row-loss). Landed.
-- **Codomain covariance** — `𝐷 ⤇ 𝑉₀ <: 𝐷 ⤇ 𝑉₁` when `𝑉₀ <: 𝑉₁`. Landed.
-- **`Array <: List` is not an edge.** Only a term builds a sum
-  ([type-inference.md, Introduction is a
-  term](type-inference.md#only-a-term-builds-a-sum)), so an array reaches a `List(𝑇)`
-  by being boxed: `box(arr) <: List(𝑇)`, discharged by ordinary Σ-width — the listing
-  `{[0, 𝑛) ⤇ 𝑇}` against the description `UIntRanges`, which picks the array's own
-  domain as the witness. The membership test that width runs
-  — `[0, 𝑛) ∈ UIntRanges` — is what keeps a *filtered* range out, since a
-  `Refinement` is not a `UIntRange` and domain invariance leaves width no other
-  candidate to choose.
-- **Width to the top** — `Σ <: Collection(𝑉)`: the `TypeKind::Any` witness admits
-  every domain, so any lhs witness kind is contained in it and width reduces to
-  codomain covariance. `Collection(𝑉)` is therefore the top **of the sums** — `List`,
-  `Map`, `Set` and a boxed collection all widen to it, keyed lhs included, because ⊤
-  absorbs structurally rather than by a row per kind and a `Map(𝐾, 𝑉)` genuinely *is*
-  a data function with codomain `𝑉`.
-
-  It is **not** a top of the whole collection lattice: a bare `𝐷 ⤇ 𝑉` is not below it,
-  because that edge would build a sum
-  ([type-inference.md, Join is the least upper bound](type-inference.md#join-is-the-least-upper-bound-under--and-nothing-else)
-  is why keeping it would defeat `box`). This is the one place the explicit-`box`
-  decision is felt in ordinary code: an array or a comprehension result reaches a
-  `Collection(𝑉)` parameter by being boxed.
-
-  The reason to write `values(m)` anyway, and what rejects `sum(m)`, is the iteration
-  element rather than this edge (see
-  [Views](#operations-how-the-trait-layer-is-realized-planned) and
-  [chl-spec §6.3](../../../docs/chl-spec.md#63-direction-collection-types-decided)).
-- **Domain invariance** — the arm is inherited rather than written here, though
-  comparing two *refined* domains modulo predicate normalization is still open (the
-  Status row). A data function's domain relates only to itself, in both halves: a wider or narrower base is rejected because
-  ranges compare by equality, and neither refinement direction holds
-  ([type-inference.md, Data domains are
-  invariant](type-inference.md#data-domains-are-invariant)). So a **sub-map** is not a
-  subtype: `{𝑘: 𝐾 | 𝑝 ∧ 𝑞} ⤇ 𝑉` and `{𝑘: 𝐾 | 𝑝} ⤇ 𝑉` are unrelated, in both
-  directions. Two consequences the collection types are designed against:
-  - A *filtered* collection `{[0,𝑛] | 𝑝} ⤇ 𝑉` does **not** flow where `[0,𝑛] ⤇ 𝑉`
-    is declared. Dropping a domain refinement looks sound — [`extent_of`] strips
-    refinements anyway, so it is invisible to iteration — but it is not sound for a
-    consumer that discharges membership, which is exactly what a keyed lookup does:
-    a filtered list keeps the source's index numbering, so the coarsened type
-    licenses proving `1 ∈ [0, 2]` while the `Filter` may have removed index 1.
-  - A collection cannot **acquire** a domain refinement by subsumption either, so
-    keyed entry needs the explicit
-    [`Cast`](ir.md#cast--explicit-refinement-acquisition) rather than an implicit
-    edge.
-
-## Deferred keyed collections
-
-> **[Planned].**
-
-A collection can be *defined incrementally* — declared, then contributed to from
-elsewhere in the program (`𝑐 << 𝑒`, `𝑐[𝑘] = 𝑣`), the way a `Feed` is. The
-critical decision here is **what type such a thing has**, and it is *not*
-`Feed[Set(𝐾)]` / `Feed[Map(𝐾, 𝑉)]`.
-
-**No sequencing layer for unordered collections.** A `Feed[𝑉]`
-(`Type::History { kind: Append }`) is a function over a *contribution /
-sequencing domain* — it exists to remember *which* contribution a value came
-from, i.e. to keep a stream's positions (or a bag's duplicates) distinct. A
-`Set` / `Map` is **unordered and deduplicated**: the sequence of writes is not
-observable, so there is nothing to track. Wrapping it as `Feed[Set(𝐾)]` =
-`𝐷 ⤇ Set(𝐾)` imposes an extra `𝐷 ⤇` function layer that the
-semantics never uses. So a deferred keyed collection is exposed as **the
-collection type itself** — `Set(𝐾)` / `Map(𝐾, 𝑉)`, i.e. one arrow over a key
-domain, contributed *directly into that domain*, with no contribution domain.
-
-**Write permission is a type-level distinction (open vs. closed).** Whether a
-collection may still receive contributions is carried in its type, exactly as
-feed-ability and mutability are ([chl-spec §6.2](../../../docs/chl-spec.md#62-non-purity-as-type-wrappers),
-"impurity is a type wrapper"): the write operator demands the open type, and a
-closed binding does not have it.
-
-- An **open / deferred** keyed collection is `Type::History { kind: Append }`
-  *during inference and checking* — the same feedability marker feeds use. A
-  keyed collection declared without an initializer (`reach_feed: Set({src,
-  dst})`) mints an open key domain (the keyed, element-typed instance of the
-  channel-flavored `ChanDom` a `defer()` already mints) under that marker.
-- A **closed / immutable** collection — a `set([…])` literal, or any `= {…}`
-  initializer — is a plain `Fun { kind: Data }`, no `History` marker.
-- `𝑐 << 𝑒` / `𝑐[𝑘] = 𝑣` **requires** the target to be `History { Append }`
-  (open). So `m: Map(Int, Int) = [1 -> 2, 4 -> 5]` binds `m` at plain
-  `Fun { Data }`, and `m[3] = 7` is a **type error** — the same mechanism that
-  rejects `x = 5; x << 3`. An already-defined immutable collection cannot be
-  extended, by construction.
-
-**This does not reintroduce a wrapper layer** — that is the whole point of the
-keyed domain. A *bag* feed's `History { Append }` has a *separate anonymous
-contribution index* as its domain (`𝐷 ⤇ 𝑉`), because a multiset must hold
-duplicates. A *keyed* collection's `History { Append }` has **its own key domain
-`𝐷` as the domain**, so `History { Append, domain: 𝐷, value: 𝑉 }` and the closed
-`𝐷 ⤇ 𝑉` are the *same arrow* — the marker tags the domain's open-ness, it does
-not wrap the collection in a second `𝐷 ⤇` function. Like every `History`, it is
-transient: `channelize` erases the marker and closes the domain (resolving the
-open `ChanDom`-flavored domain to its concrete value), leaving a plain
-`Fun { Data }`. So the open/closed distinction is present precisely when the
-checker needs it — when it must accept or reject a write — and gone by planning.
-
-**Merge law by collection kind.** Contributions combine by the collection's
-lattice join — set union (`Set`), keyed define / last-write-wins (`Map`) — which
-is **idempotent / order-insensitive**, which is *why* no sequencing domain is
-needed. The well-formedness condition ([chl-spec
-§6.3](../../../docs/chl-spec.md#63-direction-collection-types-decided):
-"multiple out-of-line definitions don't overlap") is that two defines at one key `𝑘` conflict unless
-the merge is idempotent (`Set`) or last-write-wins (`Map`). Contrast a **bag
-feed** (`orders: Feed({…})`, `ledger: Feed({…})`) — a multiset with no key, no
-dedup — which *does* need the anonymous contribution index to hold duplicates
-and stays `Feed[𝑉]` = `𝐷 ⤇ 𝑉`. So the fork is keyed/unordered/idempotent →
-bare collection type, no sequencing; unkeyed/multiset → `Feed` with an index.
-
-Surface forms, all direct-into-domain (no `Feed` layer):
-
-- **`resps[req.id] = 𝑣`** (`txn_kv`, `storefront`) — the response collection is
-  `Map(RequestId, Response)`, keyed by the request id; the assignment defines it
-  at key `req.id`. This *is* the existing "`http_serve` pairs each response with
-  its request by shared domain" contract ([chl-spec
-  §7.4](../../../docs/chl-spec.md#74-sources)), now explicit: the pairing
-  is keyed, not sequenced. `channelize` routes the contribution to key `req.id`.
-- **`reach_feed << 𝑒` where `reach_feed: Set(…)`** (`reachability`) — codomain
-  `unit`, the key domain *is* the payload, merge idempotent set union.
-
-Collections and feeds are still the one `𝐷 ⤇ 𝑉` object; the difference from the
-bag-feed case is that a keyed, unordered, idempotent collection needs neither a
-sequencing domain nor a `Feed` wrapper — it is contributed straight into its own
-key domain.
-
-## Recursive keyed collections (fixpoint)
-
-> **Status: model specified here; the fixpoint engine is deferred** (a roadmap
-> item, north-star `reachability`).
-
-`reachability` feeds `reach_feed` from a loop *over `reach_feed` itself* — a
-transitive closure. This is a **recursively-defined keyed collection**, and its
-well-foundedness is *different in kind* from every recurrence
-[mutability.md](mutability.md) handles:
-
-- Those cycles are well-founded by **causal position-decrease**: a `get_prev_*`
-  reads strictly-earlier positions of a sequencing domain. mutability.md states
-  *"an append feed carries no carry-forward, so channels never close a causal
-  cycle"* — true for the output feeds it considered, but `reach_feed`'s self-feed
-  closes a cycle through its **whole value**, which the causal check would reject
-  (the "non-causal cycle → compile error" row of `plan_loops`).
-- A recursive keyed collection is instead well-founded by **monotone convergence
-  on a bounded lattice**: each round adds elements, the collection's join is
-  idempotent, so the sequence increases monotonically to a **least fixpoint** in
-  finitely many steps (semi-naive Datalog evaluation).
-
-**Keyedness is the enabling condition for recursion.** The fixpoint converges
-*because* the collection is a lattice with an idempotent join — a `Set`/`Map`.
-A plain multiset `Feed` (bag) has no idempotent join, so a recursive bag feed
-diverges: this is exactly why `reachability`'s own comment says a `List` "would
-be multiset semantics… and never terminate." So "how a deferred keyed
-collection works" is not only about routing one write — the keyed (dedup /
-lattice) merge law is *what makes deferred definition safe to make recursive*.
-The `rec` set-comprehension form in the same program is the immutable dual of
-the same fixpoint.
-
-**Two well-foundedness rules for `LetRec`.** The `LetRec` node is already
-general enough ([mutability.md](mutability.md#letrec): "recursively-defined
-collections… all target the same node"); what it needs is a **second**
-admissible cycle shape beside causal-decrease:
-
-- *causal* — every cycle crosses a `get_prev_*` accessor (position strictly
-  decreases). The existing rule, for overwrite/sequenced histories.
-- *monotone-lattice* — every cycle's binding is a lattice-valued collection
-  (`Set`/`Map`) whose recursive references are **monotone** (union / insert, no
-  removal), so the group has a least fixpoint. The new rule, for recursive keyed
-  collections.
-
-The two disciplines are disjoint and both live under `LetRec`.
-
-**Engine (deferred).** The monotone-lattice cycle needs a **fixpoint-iteration
-engine** — semi-naive evaluation to convergence — as a third loop-planning
-pattern beside `InductionStore` and the commit operator. Specifying it (delta
-maintenance, convergence detection on the bounded lattice, stratification) is
-out of scope here; recorded as a roadmap item with `reachability` as its
-north-star. Until it lands a recursive keyed collection is rejected (the
-`plan_loops` non-causal-cycle error), not silently mishandled.
-
-## Mutable collections
-
-> **[Planned].**
-
-A mutable collection is a register whose *value type is a collection*:
-`inventory: Mut[Map(𝐾, 𝑉), Txn]`, written `inventory[𝑘] := 𝑒`. It is the
-**keyed generalization of the compound (tuple/record) registers** that already
-exist: a compound register's write set is keyed by *static* fields
-(`{𝑘₁: 𝑉₁, …}`); a mutable map's write set is keyed by *runtime* `𝐾` values.
-
-The engine already stores this shape. The commit operator's store is an MVCC
-log `Txn ⤇ (Key ⤇ Value)` ([mutability.md](mutability.md#the-runtime-engines)),
-and a multi-variable atomic block already produces one shared record `{time,
-writes: {𝑘₁: 𝑉₁, …}}` per commit with a **per-key view** through which each
-variable's history reads. A mutable map is that store with the field-key set
-made dynamic:
-
-- **Point mutation** `store[𝑘] := 𝑣` is a point-write to a register of history
-  `Txn ⇒ Map(𝐾, 𝑉)`; the per-key view `get_prev_txn` searches per `(register, 𝑘)`.
-  The static compound case is the special case where the key set is a fixed record
-  shape.
-- **Global mutation** `store := 𝑚` (replacing the whole collection register with a
-  new collection value) is the ordinary whole-register write — the register's
-  value type is a collection, so it rides the existing `Mut[Coll, Txn] := …`
-  compound-register write at the whole-value level, no per-key view. The two
-  compose: a global write establishes a new key-set generation, point writes
-  amend it. (Whole-collection-value writes are not yet exercised e2e — a
-  verification item, not new engine work.)
-- **Dynamic-key write-sets** are the genuinely new engine bit: the commit
-  record's `writes` column is `𝐾 ⤇ 𝑉`, not a fixed `Record`, so the per-key
-  view is parameterized by a runtime key.
-- **Refinement discharge at the write site.** `Mut[Map(𝐾, {𝑞: Int | 𝑞 ≥ 0}),
-  Txn]` (`nonneg_inventory`, `storefront`): each `store[𝑘] := 𝑒` must discharge
-  the value refinement — the `stock >= qty` guard is what proves `𝑞 ≥ 0` on the
-  committing branch. This is refinement discharge at a `MutWrite`, the write-site
-  dual of the boundary-assert lifting in `discount_contract`.
-
-Everything else — the causal `LetRec`, the commit-decision variant, the
-per-key carry-forward — is the compound-register machinery unchanged.
-
 ## Compilation
 
-Collections need no new pass; they extend the existing lowering, inference, and
-planning surfaces.
+Collections add one planning phase, **realization**, and otherwise extend the existing
+lowering, inference, and planning surfaces.
 
 - **lower** (`ccl/lower/`) — map literals `[k -> v]` (today `Unsupported`),
   `set(…)` / `list(…)` / `map(…)` constructors, `(𝑘, 𝑣)` entry-iteration binders, and
@@ -524,14 +241,24 @@ planning surfaces.
   (partial); `groupby`'s result type unifies with `Map` (mostly *deleting*
   special-casing).
 - **constrain** (`ccl/infer/solver/constrain.rs`) — finish domain invariance modulo
-  refinements ([Subtyping](#subtyping)); everything else reuses the refinement-width and
-  Σ-width arms.
+  refinements ([type-inference.md, Data domains are
+  invariant](type-inference.md#data-domains-are-invariant)); everything else reuses the
+  refinement-width and Σ-width arms.
 - **planning** (`ccl/planning/`) — `extent_of` dispatches a keyed domain to a
   hash store and a range to a dense array; `restrict` / `FilterValues` already
   lower a domain refinement; the mutable-map store is the existing keyed MVCC
   store with a dynamic key column.
 
 ### Realizing a conditional collection
+
+**Realization** turns a conditional collection from the type its arms joined to into the
+term the runtime can drive: a `Case` typed `Σ 𝐷 ∈ 𝐾. 𝐷 ⤇ 𝑉` becomes the gated union
+`⧺ᵢ (armᵢ | π̂ᵢ)` over the same domains, gated by the branch predicates the `if`/`elif`
+compiled to. Exactly one gate passes, so the union's extent is the selected domain, which
+is what makes the two the same collection. It runs in planning
+(`planning/conditionals.rs`) and asserts its pre-realization type rather than relating the
+two by a typing rule ([type-inference.md, Realization asserts rather than
+rewrites](type-inference.md#realization-asserts-rather-than-rewrites)).
 
 **Realization is demand-directed, so a restricted conditional is copied to each
 consumer.** A consuming site's filter rides the witness — `Σ 𝜎 ∈ 𝐾. ({𝜎 | 𝑝} ⤇ 𝑉)` —
@@ -581,49 +308,9 @@ Realizing at the site is also what retires a restriction *map*: the site that pl
 restriction is the site being copied, so the filter is already inside the leg, and there
 is nothing to carry down from an ancestor.
 
-## Status
-
-The single status surface for this design. Every other section states design and tags
-itself `[Implemented]` / `[Planned]` against this table. The **Branch** column is where a
-row is or will be implemented, so the table is accurate at whichever branch is checked
-out. Each row names a capability and nothing else — what it means is the section that
-owns it.
-
-| Capability | Status | Branch |
-|---|---|---|
-| `FunKind` (`⇒`/`⤇`), kind-aware subtyping, conditional-collection Σ | Implemented | `conditionals-sigma-types` |
-| value-`Case` compilation (gated partition / fan-out) | Implemented | `conditionals-value-case-compilation` |
-| `Array(𝑛, 𝑇)` / `List(𝑇)` annotations; `List` as a `UIntRanges` Σ, with its own term, consumption, and width | Implemented | `collections-design` |
-| [`box`](type-inference.md#only-a-term-builds-a-sum) as the sole way into a sum | Implemented | `collections-design` |
-| the [Σ carrier](type-inference.md#how-a-sum-flows-through-the-solver), one per constructor | Implemented | `collections-design` |
-| [naming the witness](type-inference.md#consuming-a-sum-naming-the-witness) at a consumer, in any constraint order | Implemented | `collections-design` |
-| the Σ-width [pairing search](type-inference.md#where-the-pairing-search-runs) over ground candidates | Implemented | `collections-design` |
-| `List` entry with an inferred domain, as a kinding constraint on the domain variable | Implemented | `collections-design` |
-| a sum's candidates as an invariant position, so an inferred-domain arm joins like a written one | Implemented | `collections-design` |
-| [realization](#realizing-a-conditional-collection) asserting its pre-realization type | Implemented | `collections-design` |
-| direct group-by key application `g(k)` | Works, via `groupby`'s imprecise total type | — |
-| `Collection(𝑇)`: its own term, consumption, and width to the top of the kind order | Implemented | `collections-design` |
-| `Map` / `Set` / `Dict` annotations as the `Keyed(𝐾)` witness kind | Planned | `collection-constructors` |
-| kind parameters (a `Keyed` kind's key type) related invariantly | Planned | `collection-constructors` |
-| a shared hole — one annotation type variable written at two lowering sites | Planned | `groupby-keyed-collection` |
-| the keyed discharge — keyed term, consumption, and width as kind containment | Planned | `groupby-keyed-collection` |
-| `groupby` infers the keyed `Map` type; kind-based inlining | Planned | `groupby-keyed-collection` |
-| the concrete keyed domain and its identity | Planned | `groupby-keyed-collection` |
-| keyed entry into a nominal `Map`/`Set` | Planned | `groupby-keyed-collection` / `map-set-constructors` |
-| `set(…)` values | Planned | `map-set-constructors` |
-| [how a collection kind is represented](#the-kind-is-declared-not-read-off-the-shape) | Planned | — |
-| the [operation layer](#operations-how-the-trait-layer-is-realized-planned): iteration element, `[]`/`[]?`, `in`, ordering, `keys`/`values`/`items` | Planned | — |
-| lookup discharge and `Option` | Planned | — |
-| domain invariance modulo refinements | Planned | — |
-| driving a keyed collection as a nested comprehension source, and a bare `groupby` tail | Planned | — |
-| the general deferred keyed gate | Planned | — |
-| [mutable](#mutable-collections) / [deferred](#deferred-keyed-collections) / [recursive](#recursive-keyed-collections-fixpoint) keyed collections | Planned | — |
-| the [runtime witness](#future-work) — a Σ value as a pair, with the domain read off a value | Planned | — |
-
 ## Implementation roadmap
 
-[Status](#status) records what is built. This section is the order to build the rest
-in, and why that order. A step names what it unblocks and what it depends on; the
+The order to build the rest in, and why that order. A step names what it unblocks and what it depends on; the
 design is the section it links to.
 
 > **A step-0 obligation.** It is cheap now and unrecoverable later, so it gates the
@@ -654,8 +341,10 @@ design is the section it links to.
    also what makes `sum(m)` an error rather than `sum(values(m))`
    ([Views](#operations-how-the-trait-layer-is-realized-planned)).
 
-4. **Keyed entry under an invariant domain.** The subtyping arm is done, so what is left
-   is the explicit `Cast` its consequence requires ([Subtyping](#subtyping)).
+4. **Keyed entry under an invariant domain.** The subtyping arm is done
+   ([type-inference.md, Data domains are
+   invariant](type-inference.md#data-domains-are-invariant)), so what is left is the
+   explicit `Cast` its consequence requires.
    Land it before refined keyed domains, not after: a keyed Σ's body domain is the nullary
    [`Type::WitnessRef`] on both sides, so the whole domain content sits in the kind, where
    containment checks the key domain's shape and stops. The moment a keyed domain carries
@@ -673,24 +362,10 @@ design is the section it links to.
    restricting the witness, which [realization](#realizing-a-conditional-collection)
    discharges into the legs.
 
-6. **The rest of the constructor surface.** Map/dict literals `[k -> v]`, `list()`,
+6. **The rest of the constructor surface.** Map literals `[k -> v]`, `list()`,
    `map()`, general `𝑚[𝑘]` subscript lowering, and keyed entry for a collection whose key
    domain is only concrete after coalesce. Also the one planning change that lets a keyed
    collection be driven as a nested comprehension source and as a bare `groupby` tail.
-
-7. **Mutable maps** ([Mutable collections](#mutable-collections)). Dynamic-key write-sets
-   and per-key `get_prev_txn` over runtime keys; refinement discharge at `store[𝑘] := 𝑒`.
-   Sits directly on the compound registers. Pins `nonneg_inventory`.
-
-8. **Deferred keyed collections** ([Deferred keyed
-   collections](#deferred-keyed-collections)). `reach_feed << 𝑒` and `resps[req.id] = 𝑣`
-   contributed into an open key domain, which `channelize` closes. Pins
-   `ledger_balance`'s feed side and the `http_serve` response pairing.
-
-9. **Recursive keyed collections** ([Recursive keyed
-   collections](#recursive-keyed-collections-fixpoint)). The second `LetRec`
-   well-foundedness rule and the semi-naive fixpoint engine. Pins `reachability`. The
-   largest single step, deferred behind the rest.
 
 `storefront` is the composition test, red until steps 1–2 plus the HTTP library (a
 separate design) land.
@@ -736,12 +411,13 @@ separate design) land.
 
   It also unblocks a **live** witness — one referenced by an element-membership
   predicate and so kept by the keep-iff-referenced filter — which `lambda_elim` and
-  planning must handle instead of the always-`None` dormant one. That is [roadmap step
+  planning must handle instead of a witness that is always `None`. That is [roadmap step
   4](#implementation-roadmap) regardless.
 
-- **First-class collections of `Mut`.** `Mut` values are second-class
-  (downward-only); a collection of registers needs the same index-types generality as
-  the domain-join corner, so it lands with the runtime witness above.
-- **Set/map algebra as refinement algebra** — union, intersection, difference as
-  operations on the membership predicate. Falls out of the refinement algebra
-  once the keyed domain is live; not committed as surface yet.
+- **A mutable keyed collection has no type yet.** A keyed collection carries its key
+  domain *in* its type, so a point write that inserts a key changes that type, and
+  `Mut[Map(𝐾, 𝑉), Txn]` fixes one key domain for the register's whole history. Modelling
+  `store[𝑘] := 𝑣` needs a value type whose key domain varies over the sequencing domain,
+  which is a dependency the history model does not have. The compound registers of
+  [mutability.md](mutability.md) are the static-key special case and do not generalize on
+  their own.

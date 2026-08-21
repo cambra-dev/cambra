@@ -1353,24 +1353,22 @@ fn lower_type_application(
         // A list literal of extent `k` reaches it as `box(lit)`, whose one-candidate sum
         // is contained by width because `[0, k)` is a member of that kind. The `box` is
         // required: a bare `[0, k) ⤇ T` is not below the sum
-        // (`Type::list_of`, `src/ccl/design/collections.md`, "Subtyping").
+        // (`Type::list_of`, `src/ccl/design/type-inference.md`, "Only a term builds a sum").
         "List" => {
             let [elem] = args else {
                 return Err(arity_err("one element type"));
             };
             Ok(Type::list_of(lower_type_expr(elem, ctx)?))
         }
-        // The **keyed** collections (`Map`/`Set`/`Dict`) are data functions over a
-        // keyed extent `𝐸` with keys `{𝑘: 𝐾 | 𝑘 ∈ 𝐸}` (design/collections.md).
-        // Deferred: Cambra has no map/set/dict *values* yet, so a keyed Σ would be
-        // an uninhabited type. Wired once a keyed-collection value form exists
-        // (higher in the stack).
-        "Map" | "Dict" | "Set" => Err(LoweringError::unsupported(
+        // The **keyed** collections (`Map`/`Set`) are sums over `TypeKind::Keyed`
+        // (`src/ccl/design/collections.md`, "The five collection types"). Deferred:
+        // Cambra has no keyed-collection *values* yet, so the type would be uninhabited.
+        "Map" | "Set" => Err(LoweringError::unsupported(
             span,
             format!(
                 "`{head}(…)` is deferred — Cambra has no {head}/keyed-collection \
                  values yet, so the type would be uninhabited (see \
-                 `src/ccl/design/collections.md` \"Status\"); \
+                 `src/ccl/design/collections.md` \"The five collection types\"); \
                  `Array(n, T)` and `List(T)` are available"
             ),
         )),

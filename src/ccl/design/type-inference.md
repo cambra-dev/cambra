@@ -1250,9 +1250,9 @@ test that makes it an edge — `[0, 𝑘) ∈ UIntRanges` — is the guard that 
 itself, and `{[0, 𝑘) | 𝑝}` is a `Refinement` rather than a `UIntRange`, so it is
 rejected. The guard is reached through the ordinary rule rather than restated.
 
-Keyed entry was already explicit for an independent reason (a collection cannot
-acquire a domain refinement by subsumption — `src/ccl/design/collections.md`,
-"Subtyping"), so it too needs nothing new.
+Keyed entry was already explicit for an independent reason: a collection cannot acquire a
+domain refinement by subsumption, so an entry needing one carries an explicit
+[`Cast`](ir.md#cast--explicit-refinement-acquisition). So it too needs nothing new.
 
 **`Collection(𝑇)` is therefore not a structural top.** `𝐷 ⤇ 𝑉 <: Collection(𝑉)` was
 the edge that made it one, and it goes with the rest of that story — necessarily,
@@ -1741,7 +1741,7 @@ candidates can be non-ground at emission — which is what forming the Σ at the
 introduces ([Deliberately incomplete here](#deliberately-incomplete-here)), and is the
 same argument that puts a membership predicate's discharge late
 ([Entering a collection type whose domain has no shape
-yet](collections.md#entering-a-collection-type-whose-domain-has-no-shape-yet)).
+when](collections.md#what-box-checks-against-a-collection-type-and-when)).
 
 The codomain edge is not merely an optimization to emit early — it *has* to be emitted
 during emission, because **post-coalesce records no bounds**. Anything needed to resolve a
@@ -2365,8 +2365,7 @@ to a consumer that **discharges membership**: a filtered list keeps the source's
 numbering, so `{[0, 2] | 𝑝} ⤇ Int` coarsened to `[0, 2] ⤇ Int` licenses proving
 `1 ∈ [0, 2]` and typing `xs[1] : Int` while the `Filter` may have removed index 1.
 That makes the rule and the lookup design one choice, not two: a domain's *predicate*
-must never be a proof source, membership riding the key against the domain's identity
-(`design/collections.md`, "Subtyping").
+must never be a proof source, membership riding the key against the domain's identity.
 
 ### Deliberately incomplete here
 
@@ -2422,7 +2421,7 @@ from](#where-the-conditional-collection-σ-comes-from)).
   A sum is a pair, and consuming one projects its witness and dispatches; nothing today
   can read a witness off a value. That is a gap to close, not a property of the design —
   the runtime witness is the load-bearing planned item
-  (`src/ccl/design/collections.md`, "Status"). For an **enumerated** sum this does not bite — the
+  (`src/ccl/design/collections.md`, "Future work"). For an **enumerated** sum this does not bite — the
   gate fan-out compiles the conditional and the realized union's extent is the selected
   domain — which is exactly why the gap has stayed invisible: the conditional-collection
   path is the one case that does not need the general mechanism. It bites for a
