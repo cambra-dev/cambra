@@ -1,0 +1,9 @@
+right := ""
+left := ""
+
+reqs, resps = http_serve("{PORT}", "POST", "/bump")
+
+for x in reqs:
+    right := right + "B"
+    left := left + "a"
+    resps << left + "|" + right + "\n"

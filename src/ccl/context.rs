@@ -3,7 +3,12 @@
 // builtins
 // ---------------------------------------------------------------------------
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::Arc,
+};
 
 use crate::chl_parser;
 use crate::chl_parser::parser::ParseError;
@@ -18,14 +23,15 @@ use crate::{
         },
         inline, lambda_elim,
         lineage::{Leak, RecorderSession, SourceProjection, collapse_lowering},
-        lower::{LoweringContext, LoweringError, lower_stmts},
+        lower::{LoweredRoute, LoweringContext, LoweringError, lower_stmts},
         mut_elim, planning,
         provenance::NodeId,
         symbolic::{symbolic, symbolic_typed},
         transact_phase, uniquify,
     },
     interpreter::{
-        Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        http_server::SharedHttpServer,
         operator_conversion::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
             convert_to_operators,
@@ -350,6 +356,129 @@ impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
     }
 }
 
+pub use crate::interpreter::operator_conversion::{ReuseTally, StateConflict};
+
+/// One open `http_serve` route: the sink its replies dispatch through, and what
+/// is needed to stop serving it.
+struct HttpRoute {
+    sink: Arc<dyn DataSink>,
+    server: Arc<SharedHttpServer>,
+    port: u16,
+    method: String,
+    path: String,
+}
+
+/// The data sources and sinks a program holds open, and the HTTP listeners
+/// behind them.
+///
+/// Program state rather than compilation state. A listener's socket, its
+/// routing-table entry, and the requests buffered behind it outlive the version
+/// of the program that opened them, so they are what a replacement version
+/// inherits: every compilation seeds a fresh [`LoweringContext`] from here, and
+/// a `http_serve` naming a route already held binds it rather than opening a
+/// second listener on the same address.
+#[derive(Default)]
+pub struct SourceSinkRegistry {
+    /// Every open source, by the name `Source(name)` resolves against.
+    sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    /// Every open `http_serve` route, by the route's source name. Keyed by route
+    /// rather than by response-binding name, which a new version may spell
+    /// differently.
+    http_routes: HashMap<String, HttpRoute>,
+    /// One listener per bound TCP port.
+    shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
+}
+
+impl SourceSinkRegistry {
+    /// The names of every open source.
+    pub fn source_names(&self) -> impl Iterator<Item = &str> {
+        self.sources.keys().map(String::as_str)
+    }
+
+    /// Fold everything a completed lowering pass opened into the registry.
+    fn absorb(&mut self, lowering: &LoweringContext) {
+        self.sources.extend(
+            lowering
+                .registered_sources()
+                .map(|(n, s)| (n.to_string(), s.clone())),
+        );
+        self.shared_servers
+            .extend(lowering.registered_servers().map(|(p, s)| (*p, s.clone())));
+        for (name, sink, port, method, path) in lowering.registered_routes() {
+            let Some(server) = self.shared_servers.get(&port) else {
+                continue;
+            };
+            self.http_routes.insert(
+                name.to_string(),
+                HttpRoute {
+                    sink: sink.clone(),
+                    server: server.clone(),
+                    port,
+                    method: method.to_string(),
+                    path: path.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Stop serving every route `still_bound` does not name.
+    ///
+    /// A route is registry state, so a version that stops binding one leaves it
+    /// dispatching into a source nobody reads: the request still matches, is
+    /// still buffered, and the client waits on a reply that will never be
+    /// computed. Retiring it makes the address answer 404 instead, which is what
+    /// "this program no longer serves that" should look like from outside.
+    fn retire_routes_absent_from(&mut self, still_bound: &HashSet<String>) {
+        let dropped: Vec<String> = self
+            .http_routes
+            .keys()
+            .filter(|name| !still_bound.contains(*name))
+            .cloned()
+            .collect();
+        for name in dropped {
+            let route = self.http_routes.remove(&name).expect("just listed");
+            debug!("retiring route {} {}", route.method, route.path);
+            route.server.unregister(&route.method, &route.path);
+            self.sources.remove(&name);
+        }
+    }
+    /// A [`LoweringContext`] holding everything this registry does.
+    ///
+    /// Every compilation starts from one of these, so a `http_serve` naming a
+    /// route already open binds it and one naming anything else opens it.
+    fn seed_lowering_context(&self) -> LoweringContext {
+        let mut lowering = LoweringContext::default();
+        lowering.adopt_sources_and_sinks(
+            self.sources.iter().map(|(n, s)| (n.clone(), s.clone())),
+            self.http_routes.iter().map(|(n, r)| {
+                (
+                    n.clone(),
+                    LoweredRoute {
+                        sink: r.sink.clone(),
+                        port: r.port,
+                        method: r.method.clone(),
+                        path: r.path.clone(),
+                    },
+                )
+            }),
+            self.shared_servers.iter().map(|(p, s)| (*p, s.clone())),
+        );
+        lowering
+    }
+
+    /// Compile `code` to `stage` against these sources and sinks, without
+    /// touching the running program.
+    ///
+    /// The scratch lowering and inference contexts this builds are discarded on
+    /// return and nothing here opens, retires or mutates anything, so it is safe
+    /// to answer a diff query about a *running* program. The naive alternative —
+    /// [`compile_to`]'s fresh [`GlobalContext`] — would try to bind a port the
+    /// running program already holds and fail.
+    pub fn compile_to(&self, code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileError>> {
+        compile_to_in(self.seed_lowering_context(), code, stage)
+    }
+}
+
 /// Bundles the per-stage registries needed to thread externally-managed data
 /// sources through the full CCL pipeline (lowering → type inference → compilation).
 pub struct GlobalContext {
@@ -361,6 +490,9 @@ pub struct GlobalContext {
     conversion: OpConversionContext,
     /// Scheduler for triggering notifications.
     scheduler: Scheduler,
+    /// The sources and sinks the program holds open, which outlive any one
+    /// version of it.
+    sources_and_sinks: SourceSinkRegistry,
 }
 
 impl GlobalContext {
@@ -375,10 +507,53 @@ impl GlobalContext {
             inference: TypeInferenceContext::new(),
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
+            sources_and_sinks: SourceSinkRegistry::default(),
         };
         let stdin = Rc::new(RefCell::new(StdinDataSource::new()));
         result.register_source(stdin);
         result
+    }
+
+    /// The sources and sinks the program holds open — what a replacement version
+    /// binds against rather than reopening.
+    pub fn sources_and_sinks(&self) -> &SourceSinkRegistry {
+        &self.sources_and_sinks
+    }
+
+    /// Retire the running version's conversion context and carry its operators
+    /// forward to the version replacing it.
+    ///
+    /// Call once the running operator graph has been dropped. Each operator a
+    /// `Let` binding produced is offered to the next compilation by the identity
+    /// of the term it computes, and the replaced version's subscriptions to it
+    /// are neutralized ([`OpConversionContext::into_inheritance`]). The source
+    /// consumers the scheduler holds go the same way: a source handle outlives a
+    /// version, the subscriptions against it do not.
+    ///
+    /// Scheduler registrations need no attention here: they are weak and owned
+    /// by the producers that made them, so dropping the graph prunes exactly the
+    /// ones whose producer went with it (see [`Scheduler::add_source_handle`]).
+    pub fn retire_version(&mut self) {
+        // Every source starts the replacement's new producers at its current
+        // position: an operator the replacement rebuilds registers as a new
+        // producer, and a source hands a newly-registered producer everything it
+        // has retained. An adopted operator keeps the registration it already has.
+        for source in self.sources_and_sinks.sources.values() {
+            source.borrow_mut().advance_new_producer_frontier();
+        }
+        let previous = std::mem::replace(&mut self.conversion, OpConversionContext::new());
+        self.conversion.inherit(previous.into_inheritance());
+    }
+
+    /// Install a fresh [`LoweringContext`] seeded from the source/sink registry,
+    /// discarding the previous compilation's lowering state.
+    ///
+    /// A fresh context rather than a reused one because everything else
+    /// `LoweringContext` accumulates (synthetic-name counter, transactional
+    /// variables, mutable-parameter functions) is per-pass, and carrying it into
+    /// a second pass would let one version's declarations leak into the next.
+    fn seed_lowering(&mut self) {
+        self.lowering = self.sources_and_sinks.seed_lowering_context();
     }
 
     /// Returns the context for lowering
@@ -389,6 +564,17 @@ impl GlobalContext {
     /// Returns the context for type inference
     pub fn inference_ctx(&mut self) -> &mut TypeInferenceContext {
         &mut self.inference
+    }
+
+    /// Every variable the running program holds that `planned` cannot take over
+    /// — one it no longer declares, or declares at a different type.
+    pub fn state_conflicts(&self, planned: &Expr) -> Vec<StateConflict> {
+        self.conversion.state_conflicts(planned)
+    }
+
+    /// How much of the version it replaced the last compilation adopted.
+    pub fn reuse(&self) -> ReuseTally {
+        self.conversion.reuse()
     }
 
     /// Returns the context for operator conversion
@@ -408,7 +594,8 @@ impl GlobalContext {
     /// (pre-registered and discovered) is registered in one uniform pass.
     pub fn register_source(&mut self, source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {
         let name = source.borrow().get_id().to_string();
-        self.lowering.register_source(name, source);
+        self.lowering.register_source(name.clone(), source.clone());
+        self.sources_and_sinks.sources.insert(name, source);
     }
 }
 
@@ -579,12 +766,12 @@ impl CompiledProgram {
 /// Every main-tree node id reachable in `expr` (the `walk_children` node set,
 /// refinement-predicate interiors excluded — the domain the lineage steps and
 /// the pane projections reason about).
-pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId> {
-    fn go(e: &Expr, acc: &mut std::collections::HashSet<NodeId>) {
+pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
+    fn go(e: &Expr, acc: &mut HashSet<NodeId>) {
         acc.insert(e.node_id());
         e.walk_children(|c| go(c, acc));
     }
-    let mut acc = std::collections::HashSet::new();
+    let mut acc = HashSet::new();
     go(expr, &mut acc);
     acc
 }
@@ -609,17 +796,13 @@ fn assert_leaks_clean(leaks: &[Leak], boundary: &str) {
 /// check does not false-fire there). Returns `(id, node kind)` for each
 /// occurrence *beyond the first*.
 fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
-    fn walk(
-        e: &Expr,
-        seen: &mut std::collections::HashSet<NodeId>,
-        dups: &mut Vec<(NodeId, &'static str)>,
-    ) {
+    fn walk(e: &Expr, seen: &mut HashSet<NodeId>, dups: &mut Vec<(NodeId, &'static str)>) {
         if !seen.insert(e.node_id()) {
             dups.push((e.node_id(), e.node.kind_name()));
         }
         e.walk_children(|c| walk(c, seen, dups));
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut dups = Vec::new();
     walk(expr, &mut seen, &mut dups);
     dups
@@ -753,7 +936,24 @@ pub enum CompileStage {
 ///
 /// [`Channelized`]: CompileStage::Channelized
 pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileError>> {
-    let mut ctx = GlobalContext::new();
+    compile_to_in(GlobalContext::new().lowering, code, stage)
+}
+
+/// Compile `code` to `stage` against an already-open source/sink set, without
+/// touching the running program.
+///
+/// The scratch lowering and inference contexts this builds are discarded on
+/// return, and the seeded registry is frozen, so nothing here binds a port,
+/// registers a route, or mutates the live compilation contexts. That is what
+/// makes it safe to answer a diff query about a *running* program: the naive
+/// alternative — [`compile_to`]'s fresh [`GlobalContext`] — would try to bind a
+/// port the running program already holds and fail.
+fn compile_to_in(
+    mut lowering: LoweringContext,
+    code: &str,
+    stage: CompileStage,
+) -> Result<Expr, Vec<CompileError>> {
+    let mut inference = TypeInferenceContext::new();
     let mut errors: Vec<CompileError> = Vec::new();
 
     let parse_result = chl_parser::parse_module(code);
@@ -769,7 +969,7 @@ pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileEr
         return Err(errors);
     }
 
-    let lower_result = lower_stmts(&module.body, ctx.lowering_ctx());
+    let lower_result = lower_stmts(&module.body, &mut lowering);
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
@@ -784,18 +984,18 @@ pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileEr
     }
 
     expr = uniquify::run(expr);
-    for (_name, source) in ctx.lowering_ctx().take_sources() {
+    for (_name, source) in lowering.take_sources() {
         let name = source.borrow().get_id().to_string();
         let output_type = source.borrow().output_type();
         // The source's data-function type is constructed inside
         // `register_source_type` from the element type — the `Data` kind is
         // intrinsic, not stamped here.
-        ctx.inference_ctx().register_source_type(&name, output_type);
+        inference.register_source_type(&name, output_type);
     }
     // No lowering projection is threaded here — this entry point exists to hand a
     // tree to the differ, not to render diagnostics — so an inference error keeps
     // its blame node but degrades to a span-less `CompileError`.
-    if let Err(errors) = infer(&mut expr, ctx.inference_ctx()) {
+    if let Err(errors) = infer(&mut expr, &mut inference) {
         return Err(errors
             .into_iter()
             .map(|located| CompileError::Infer {
@@ -866,6 +1066,7 @@ pub fn compile_program(
     code: &str,
     main_consumer: Box<dyn Consumer>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
+    ctx.seed_lowering();
     // ---- User-facing failure points ----
     //
     // The pipeline now accumulates errors across the *parse* and *lower*
@@ -917,6 +1118,17 @@ pub fn compile_program(
     if !errors.is_empty() {
         return Err(errors);
     }
+
+    // Fold anything this pass opened into the source/sink registry before the
+    // per-compilation registries are drained, so the next version inherits it.
+    // A no-op for an `Inherited` pass, which opens nothing.
+    ctx.sources_and_sinks.absorb(&ctx.lowering);
+    // A route the registry holds and this version did not bind is one the
+    // version stopped serving. Retire it, or it keeps matching requests and
+    // buffering them for a reader that no longer exists. A no-op for a first
+    // compilation, whose pass bound every route the registry has.
+    let bound = ctx.lowering.routes_bound_this_pass().clone();
+    ctx.sources_and_sinks.retire_routes_absent_from(&bound);
 
     // Drain sink bindings discovered during lowering before taking sources.
     let sink_bindings_registry = ctx.lowering_ctx().take_sink_bindings();

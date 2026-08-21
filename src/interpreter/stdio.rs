@@ -128,6 +128,14 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     fn release(&mut self, producer: &str, obsolete: Predicate) {
         self.buf.release(producer, obsolete);
     }
+
+    fn advance_new_producer_frontier(&mut self) {
+        self.buf.advance_new_producer_frontier();
+    }
+
+    fn new_producer_frontier(&self) -> usize {
+        self.buf.frontier()
+    }
 }
 
 #[cfg(test)]

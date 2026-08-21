@@ -133,6 +133,21 @@ impl SharedHttpServer {
         self.routes.lock().unwrap().insert((method, path), tx);
         rx
     }
+
+    /// Stop dispatching `method path`, so requests to it get the dispatcher's
+    /// 404 rather than being buffered for a reader that no longer exists.
+    ///
+    /// A route outlives the version of the program that opened it — the listener
+    /// and its table entry are held by the source/sink registry, not by the
+    /// operator graph — so a version that stops serving one has to say so.
+    /// Without this the route still matches, still buffers, and the client waits
+    /// on a reply nobody will compute.
+    pub fn unregister(&self, method: &str, path: &str) {
+        self.routes
+            .lock()
+            .unwrap()
+            .remove(&(method.to_string(), path.to_string()));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,5 +446,13 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 
     fn release(&mut self, producer: &str, obsolete: Predicate) {
         self.buf.release(producer, obsolete);
+    }
+
+    fn advance_new_producer_frontier(&mut self) {
+        self.buf.advance_new_producer_frontier();
+    }
+
+    fn new_producer_frontier(&self) -> usize {
+        self.buf.frontier()
     }
 }

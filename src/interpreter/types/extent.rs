@@ -284,6 +284,24 @@ pub trait DataSourceDomainExtentImpl {
     /// Release the region described by `obsolete` for the given producer — those domain values no longer
     /// need to be retained by the source.
     fn release(&mut self, producer: &str, obsolete: Predicate);
+    /// Start any producer registering with this source from now on at the source's
+    /// current position rather than at the oldest value it still holds.
+    ///
+    /// Called when a running program is replaced
+    /// ([`LiveProgram::update`](crate::live_program::LiveProgram::update)). The
+    /// operators the replacement rebuilds register as new producers, and a source
+    /// hands a newly-registered producer everything it has retained, so without
+    /// this the replacement recomputes the program's history instead of
+    /// continuing it and re-emits an output for every input the replaced version
+    /// already answered.
+    ///
+    /// The default does nothing, for a source with nothing retained to hand over.
+    fn advance_new_producer_frontier(&mut self) {}
+    /// The position a producer registering now begins at — where a store replacing
+    /// a running one resumes. `0` for a source that retains nothing to skip.
+    fn new_producer_frontier(&self) -> usize {
+        0
+    }
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {

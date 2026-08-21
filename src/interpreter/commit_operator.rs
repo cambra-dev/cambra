@@ -126,6 +126,23 @@ impl CommitEngine {
         }
     }
 
+    /// Create an engine whose initial state is `init` at tick `at`, for a store
+    /// whose first iteration position is not `0`.
+    ///
+    /// A store replacing one in a running program starts where its source has
+    /// reached. The drive maps position `p` to tick `p + 1` and reads the
+    /// previous accumulator as of tick `p`, so the seed sits at the tick the
+    /// first position reads. Re-basing the ticks instead would break the
+    /// position-to-tick correspondence the dense read shares with the drive.
+    pub fn seeded_at(at: CommitTs, init: HashMap<Value, Value>) -> Self {
+        let latest_write = init.keys().map(|k| (k.clone(), at)).collect();
+        Self {
+            committed: BTreeMap::from([(at, init)]),
+            latest_write,
+            next_ts: at + 1,
+        }
+    }
+
     /// An empty engine for a **position-driven induction store**: no tick-0 init
     /// seed (the accumulator's init is the reader's fold default, supplied by
     /// `get_prev_seq`), driven by [`step`](Self::step) rather than
@@ -1181,6 +1198,10 @@ pub struct InductionStore {
     /// Keys written, in decision-`writes` order: the accumulator mutable variables, then
     /// any reply-tap (`to_<defer>`) keys.
     write_keys: Vec<Value>,
+    /// The tick this store's seed sits at, and so the first position it decides.
+    /// `0` for a store that starts with its source; the resume position for one
+    /// replacing a store in a running program.
+    resume_at: CommitTs,
     /// Reply-tap decision fields, appended to each write set (see
     /// [`body_decision_at`]). Empty for a store with no feed.
     tap_fields: Vec<String>,
@@ -1197,6 +1218,7 @@ impl InductionStore {
         tap_fields: Vec<String>,
         key_extent: Extent,
         value_extent: Extent,
+        resume_at: CommitTs,
     ) -> Self {
         let output_tiling = full_store_tiling(&key_extent, &value_extent);
         Self {
@@ -1205,6 +1227,7 @@ impl InductionStore {
             write_keys,
             tap_fields,
             output_tiling,
+            resume_at,
         }
     }
 
@@ -1270,7 +1293,13 @@ impl TileOperator for InductionStore {
             // the first *iteration* change (a leading carry) without an external
             // default. Iterations therefore occupy ticks 1.., a `+ 1` offset the
             // drive and the dense read both apply.
-            engine: CommitEngine::new(inits),
+            engine: if self.resume_at == 0 {
+                CommitEngine::new(inits)
+            } else {
+                // Resuming: the seed sits at the tick the first position this
+                // store decides will read. See [`CommitEngine::seeded_at`].
+                CommitEngine::seeded_at(self.resume_at, inits)
+            },
             body_producer,
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
@@ -2532,11 +2561,16 @@ struct DriveWindow {
 }
 
 impl DriveWindow {
-    fn new(read_extents: Vec<Extent>, item_extent: Extent) -> Self {
+    /// `base` is the first absolute position this window will hold — `0` for a
+    /// drive that starts with its source, and the resume position for one
+    /// replacing a drive in a running program. Rows are addressed absolutely, so
+    /// starting a resuming window at `0` would offer the body a decision at a
+    /// position the store never decides.
+    fn new(read_extents: Vec<Extent>, item_extent: Extent, base: usize) -> Self {
         Self {
             read_extents,
             item_extent,
-            base: 0,
+            base,
             rows: Vec::new(),
             release_cursor: PrefixReleaseCursor::default(),
         }
@@ -2692,6 +2726,8 @@ pub struct InductionDrive {
     read_keys: Vec<Value>,
     read_extents: Vec<Extent>,
     item_extent: Extent,
+    /// The first position this drive emits at. See [`DriveWindow::new`].
+    resume_at: usize,
 }
 
 impl InductionDrive {
@@ -2701,6 +2737,7 @@ impl InductionDrive {
         read_keys: Vec<Value>,
         read_extents: Vec<Extent>,
         item_extent: Extent,
+        resume_at: usize,
     ) -> Self {
         debug_assert_eq!(
             read_keys.len(),
@@ -2714,6 +2751,7 @@ impl InductionDrive {
             read_keys,
             read_extents,
             item_extent,
+            resume_at,
         }
     }
 }
@@ -2742,7 +2780,11 @@ impl TileOperator for InductionDrive {
             consumer: inputs.consumer,
             wakeups: scheduler.wakeup_queue(),
             read_keys: self.read_keys.clone(),
-            window: DriveWindow::new(self.read_extents.clone(), self.item_extent.clone()),
+            window: DriveWindow::new(
+                self.read_extents.clone(),
+                self.item_extent.clone(),
+                self.resume_at,
+            ),
             source_released_through: None,
             source_fully_released: false,
         })
@@ -3009,7 +3051,7 @@ impl TileOperator for TransactDrive {
             consumer: inputs.consumer,
             wakeups: scheduler.wakeup_queue(),
             read_keys: self.read_keys.clone(),
-            window: DriveWindow::new(self.read_extents.clone(), self.item_extent.clone()),
+            window: DriveWindow::new(self.read_extents.clone(), self.item_extent.clone(), 0),
             current: 0,
             latest_emit: None,
         })
@@ -4189,6 +4231,8 @@ mod tests {
             Vec::new(),
             key_extent(),
             value_extent(),
+            // A store built with its source, not one resuming a running program.
+            0,
         );
         let set_body = store.body_input_setter();
         let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
@@ -4198,6 +4242,7 @@ mod tests {
             vec![acc.clone()],
             vec![value_extent()],
             value_extent(),
+            0,
         );
         set_body(Box::new(AddIfBody::new(Box::new(drive), threshold, "acc")));
         (fan, acc)

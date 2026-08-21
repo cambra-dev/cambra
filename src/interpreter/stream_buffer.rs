@@ -39,6 +39,22 @@ pub(crate) struct UIntStreamBuffer {
 
     /// Per-producer obsolete predicates, accumulated via union on each [`release`].
     pub(crate) obsolete_predicates: HashMap<String, Predicate>,
+
+    /// Where a producer registering from now on begins: it is recorded as having
+    /// already released everything below this index.
+    ///
+    /// `0` until [`advance_new_producer_frontier`](Self::advance_new_producer_frontier)
+    /// moves it, so a program's own producers — which all register before it starts
+    /// consuming — read the whole buffer, including anything that arrived while
+    /// the program was compiling.
+    ///
+    /// Replacing a running program moves it to the current position. Operators
+    /// the replacement rebuilds register as new producers, and a source hands a
+    /// newly-registered producer everything it still holds, so without this the
+    /// replacement would recompute the program's history rather than continue it
+    /// — over however much the source happened to retain, and re-emitting an
+    /// output for every input the replaced version had already answered.
+    new_producer_frontier: usize,
 }
 
 impl UIntStreamBuffer {
@@ -50,6 +66,7 @@ impl UIntStreamBuffer {
             eof_reached: false,
             closed: false,
             obsolete_predicates: HashMap::new(),
+            new_producer_frontier: 0,
         }
     }
 
@@ -176,13 +193,35 @@ impl UIntStreamBuffer {
         ColumnValue::from_uints(indices)
     }
 
+    /// Start any producer that registers from now on at the current position, so
+    /// that a program replacing this one continues the stream rather than
+    /// reprocessing it. See
+    /// [`new_producer_frontier`](Self::new_producer_frontier).
+    pub(crate) fn advance_new_producer_frontier(&mut self) {
+        self.new_producer_frontier = self.ready_size;
+    }
+
+    /// Where a producer registering now begins.
+    pub(crate) fn frontier(&self) -> usize {
+        self.new_producer_frontier
+    }
+
+    /// What a producer registering now counts as having already released.
+    fn new_producer_obsolete(&self) -> Predicate {
+        match self.new_producer_frontier {
+            0 => Predicate::False,
+            n => Predicate::LessThanEq(Value::UInt(n - 1)),
+        }
+    }
+
     /// Update per-producer obsolete predicates and release any buffer entries
     /// that all producers agree are no longer needed.
     pub(crate) fn release(&mut self, producer: &str, obsolete: Predicate) {
+        let starts_at = self.new_producer_obsolete();
         let recorded = self
             .obsolete_predicates
             .entry(producer.to_string())
-            .or_insert(Predicate::False);
+            .or_insert(starts_at);
         *recorded = recorded.union(&obsolete);
 
         // Every registered producer is done with every index, so nothing will be
@@ -291,7 +330,7 @@ mod tests {
     /// is the intersection across producers, not the latest one to arrive.
     ///
     /// Both producers register before any release, which is what subscribing
-    /// does (`IterateExtent::subscribe` releases `Predicate::False` to enrol
+    /// does (`IterateExtent::subscribe` releases `Predicate::False` to register
     /// with each source in its extent). A producer with no entry is not in the
     /// intersection and so does not hold anything back.
     #[test]
@@ -383,5 +422,76 @@ mod tests {
     fn a_guard_over_the_wrong_value_sort_is_rejected() {
         let mut buf = buffer_with(8);
         buf.release("p", Predicate::LessThanEq(Value::Int(4)));
+    }
+
+    /// A producer registering before the frontier moves reads the whole buffer,
+    /// including values that arrived before it registered.
+    ///
+    /// This is a program's own producers, which all enrol during compilation:
+    /// anything that arrived while the program was being compiled is still
+    /// theirs to read.
+    #[test]
+    fn a_producer_registering_at_the_start_reads_everything() {
+        let mut buf = buffer_with(3);
+        buf.release("p", Predicate::False);
+        assert_eq!(
+            buf.get_elements("p"),
+            ColumnValue::from_uints(vec![0, 1, 2])
+        );
+    }
+
+    /// After the frontier moves, a producer registering from then on reads only
+    /// what arrives next.
+    ///
+    /// This is what stops a replacement version reprocessing the stream: the
+    /// operators it rebuilds enrol as new producers, and a source hands a
+    /// newly-registered producer everything it still holds.
+    #[test]
+    fn a_producer_registering_after_the_frontier_reads_only_what_follows() {
+        let mut buf = buffer_with(3);
+        buf.advance_new_producer_frontier();
+        buf.release("late", Predicate::False);
+        assert_eq!(
+            buf.get_elements("late"),
+            ColumnValue::from_uints(Vec::new()),
+            "everything already buffered is behind the frontier"
+        );
+
+        buf.push(SmolStr::new("e3"));
+        assert_eq!(
+            buf.get_elements("late"),
+            ColumnValue::from_uints(vec![3]),
+            "and what arrives next is not"
+        );
+    }
+
+    /// Moving the frontier does not retroactively change a producer that had
+    /// already registered.
+    #[test]
+    fn moving_the_frontier_leaves_registered_producers_alone() {
+        let mut buf = buffer_with(3);
+        buf.release("early", Predicate::False);
+        buf.advance_new_producer_frontier();
+        assert_eq!(
+            buf.get_elements("early"),
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            "the frontier applies at registration, not to whoever is already reading"
+        );
+    }
+
+    /// A producer that registers past the frontier still holds the buffer: the
+    /// prefix is only freed once it has released it too.
+    #[test]
+    fn a_late_producer_still_counts_toward_the_release_intersection() {
+        let mut buf = buffer_with(3);
+        buf.release("early", Predicate::False);
+        buf.advance_new_producer_frontier();
+        buf.release("late", Predicate::False);
+
+        buf.release("early", covering(0, 2));
+        assert_eq!(
+            buf.start_idx, 3,
+            "the late producer registered as having released 0..=2, so the prefix frees"
+        );
     }
 }

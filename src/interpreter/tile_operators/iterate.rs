@@ -6,7 +6,7 @@ use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Scheduler, SharedConsumer,
-    UnionArm, Value, forwarding_consumer,
+    UnionArm, Value, scheduler::shared_consumer,
 };
 
 /// Produces a sealed-function tile whose domain and codomain both equal `extent`.
@@ -36,7 +36,7 @@ impl IterateExtent {
     ) {
         match extent {
             Extent::DataSourceDomain(extent_impl, ..) => {
-                scheduler.add_source_handle(extent_impl.clone(), forwarding_consumer(&consumer));
+                scheduler.add_source_handle(extent_impl.clone(), Rc::downgrade(&consumer));
             }
             Extent::Record(fields) => {
                 for field_extent in fields.values() {
@@ -72,6 +72,7 @@ impl TileOperator for IterateExtent {
             base: ProducerBase::new(IterateExtentProducer::alloc_id(), &self.tiling),
             extent: self.extent.clone(),
             released: Predicate::False,
+            source_wakeup: None,
         });
 
         let NotifyOrSubscribeResult { notify, subscribe } =
@@ -80,10 +81,12 @@ impl TileOperator for IterateExtent {
             consumer.notify();
         }
         if subscribe {
-            let consumer_wrapper = Rc::new(RefCell::new(move || {
-                consumer.notify();
-            }));
-            Self::add_all_source_handles(&self.extent, consumer_wrapper, scheduler);
+            // The producer owns the registration: the scheduler holds only a
+            // `Weak`, so this handle is what keeps the source waking this
+            // producer, and dropping the producer deregisters it.
+            let consumer_wrapper = shared_consumer(consumer);
+            Self::add_all_source_handles(&self.extent, consumer_wrapper.clone(), scheduler);
+            producer.source_wakeup = Some(consumer_wrapper);
             let name = producer.name();
             // Register this producer with any data sources in the extent by calling release with
             // a false predicate.  This way the sources knows about all producers that read it
@@ -116,6 +119,15 @@ struct IterateExtentProducer {
     /// be safely shrunk (shrinking source2's key 0 would prevent future
     /// cross-product pairs like (1, 0) from ever being produced).
     released: Predicate,
+    /// The wake-up this producer registered with the scheduler, which holds only
+    /// a `Weak` to it.
+    ///
+    /// Owning it here ties the registration's lifetime to the producer's: a
+    /// producer carried across a program update keeps waking, and one the update
+    /// dropped is pruned on the next
+    /// [`check_for_notifications`](Scheduler::check_for_notifications).
+    /// `None` when the extent needs no source subscription.
+    source_wakeup: Option<Rc<RefCell<dyn Consumer>>>,
 }
 
 fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
@@ -477,6 +489,7 @@ mod tests {
             base: ProducerBase::new(0, &tiling),
             extent,
             released: Predicate::False,
+            source_wakeup: None,
         };
         let tile = producer.get(producer.tiling().universal_guard());
         let Tile::SealedFunction { domain, .. } = tile else {
