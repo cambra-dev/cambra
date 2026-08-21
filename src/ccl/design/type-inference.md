@@ -1024,7 +1024,7 @@ Structural equality is context-free sound: names are globally unique, indices ar
 that travel with the type, and neither needs re-basing anywhere. The constraint cache's
 `(Type, Type)` key is unaffected.
 
-#### Interior term binders stay named
+#### Interior term binders stay named, and compare by position
 
 A predicate may contain a term lambda — `λ x → x // 2` in the group-by claim — and its parameter
 stays a name. Closing treats such a parameter as a shadow: inside the lambda, a reference spelled
@@ -1032,13 +1032,20 @@ like the arrow's binder is the lambda's and keeps its name. Uniquification alrea
 spellings apart in a compiled program, so the shadow is what makes closing correct without depending
 on that convention, as the `Fun`/`Fun` opening gate does not depend on it either.
 
-Two α-variant predicates whose interior lambdas carry different uids compare unequal, and the
-identity sites split them. That split is what bounds this section's reach: every refinement a program
-produces routes its element through a function, so it carries an interior lambda, and two refinements
-that would otherwise coalesce differ in that lambda's uid. A `Data` domain admits no join across the
-split, so the program is rejected —
-`tests/type_check.rs`, `two_alpha_variant_dependent_refinements_share_a_position` is the case. Closing an
-interior binder needs no telescope, since it is bound inside the term being compared.
+**Where the binder sits decides how it is stored.** An arrow's binder sits outside the refinement — the
+refinement set is beside `CompactFun`'s name slot, one frame below it — so a reference to it must be
+readable off the reference alone, which is the index. A lambda's binder sits *inside* the refinement, so
+the compared terms carry the binder and the correspondence is local: `eq_refinement_predicate`
+threads a pairing and compares such a reference by its binder's position, and
+`hash_refinement_predicate` hashes it by position for the same reason. The name stays the stored
+form, so the predicate is still a term planning can compile.
+
+Both halves are needed together. Every refinement a program produces routes its element through a
+function, so it carries an interior lambda, and a filter written twice mints that binder twice
+(`λ x#3 → x#3 > 1` against `λ x#6 → x#6 > 1`). Comparing it by name splits a refinement set that should
+dedup, and a `Data` domain admits no join across the split: with the index coordinate alone,
+`if c: [x for x in xs if x > 1] else: [x for x in xs if x > 1]` is rejected
+(`tests/type_check.rs`, `test_case_with_filtered_comprehension_arms_passes_consistency_wall`).
 
 #### `let` binders and scope exit
 

@@ -1665,11 +1665,19 @@ impl Eq for Refinement {}
 /// chosen for its context, not an approximation of a finer one — there is no
 /// plan to make it a derived `==` (which would wrongly compare those slots).
 ///
-/// Binder names compare by equality, which coincides with α-equivalence under
-/// the Barendregt convention (uniquified, globally-distinct binders; copies
-/// preserve uids). Should a future pass need to compare predicates whose bound
-/// binders were independently minted, this is the site to make α-aware (thread
-/// a binder correspondence) rather than chase global name determinism.
+/// The relation is **α-invariant**: a reference to a binder the predicate
+/// itself introduces compares by *position* rather than by name, so two
+/// predicates that differ only in an interior binder's identity are the same
+/// restriction. Two lowerings of one filter mint that binder independently —
+/// `[x for x in xs if x > 1]` written twice gives `λ x#3 → x#3 > 1` and
+/// `λ x#6 → x#6 > 1` — and comparing them by name splits a refinement set that
+/// should dedup, which a `Data` domain then reports as two domains that do not
+/// join. A reference to a binder *outside* the predicate still compares by
+/// name, which is what keeps two refinements about different enclosing binders
+/// apart (uids make that comparison exact).
+///
+/// [`hash_refinement_predicate`] threads the same scope and hashes a bound
+/// reference by position, so the `Eq`/`Hash` contract survives α-invariance.
 ///
 /// One type-anchored slot **is** compared: a [`TypedExprNode::Cast`]'s
 /// `target` carries the cast's domain-refinement *predicate term*
@@ -1688,14 +1696,55 @@ impl Eq for Refinement {}
 /// cast-target predicates) makes eq finer than hash, preserving the
 /// `Eq`/`Hash` contract.
 pub(crate) fn eq_refinement_predicate(a: &TypedExpr, b: &TypedExpr) -> bool {
-    eq_refinement_predicate_go(a, b)
+    eq_refinement_predicate_go(a, b, &mut Vec::new())
+}
+
+/// Binders the two sides of an [`eq_refinement_predicate`] comparison have
+/// introduced, paired and innermost last. Two references match when they
+/// resolve to the same pair, or when neither resolves and they are the same
+/// name; a reference bound on one side only never matches. `rposition` is what
+/// makes shadowing right: the innermost pair spelling a name is the one it
+/// resolves to.
+fn paired_refs_match(
+    pairs: &[(crate::ccl::Name, crate::ccl::Name)],
+    x: &crate::ccl::Name,
+    y: &crate::ccl::Name,
+) -> bool {
+    match (
+        pairs.iter().rposition(|(l, _)| l == x),
+        pairs.iter().rposition(|(_, r)| r == y),
+    ) {
+        (Some(i), Some(j)) => i == j,
+        (None, None) => x == y,
+        _ => false,
+    }
+}
+
+/// Compare `a` and `b` with `(l, r)` paired over them, restoring `pairs` before
+/// returning — the binder scopes over these children and nothing after them.
+fn eq_under_binder(
+    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+    l: &crate::ccl::Name,
+    r: &crate::ccl::Name,
+    children: &[(&TypedExpr, &TypedExpr)],
+) -> bool {
+    pairs.push((l.clone(), r.clone()));
+    let matched = children
+        .iter()
+        .all(|(x, y)| eq_refinement_predicate_go(x, y, pairs));
+    pairs.pop();
+    matched
 }
 
 /// Compare two cast targets' domain-refinement predicates term-wise (see
 /// [`eq_refinement_predicate`]). Pointer-equal predicates short-circuit;
 /// otherwise the comparison recurses structurally (acyclic terms, so it
 /// terminates without a cycle guard).
-fn eq_cast_target_predicates(t1: &Type, t2: &Type) -> bool {
+fn eq_cast_target_predicates(
+    t1: &Type,
+    t2: &Type,
+    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+) -> bool {
     match (
         ccl_utils::cast_target_refinement(t1),
         ccl_utils::cast_target_refinement(t2),
@@ -1705,25 +1754,36 @@ fn eq_cast_target_predicates(t1: &Type, t2: &Type) -> bool {
             if Rc::ptr_eq(&r1.predicate, &r2.predicate) {
                 return true;
             }
-            eq_refinement_predicate_go(&r1.predicate, &r2.predicate)
+            // Under the *enclosing* pairing: a nested predicate may reference a
+            // binder the outer predicate introduced (a comprehension inside a
+            // filter), and that reference resolves by position like any other.
+            eq_refinement_predicate_go(&r1.predicate, &r2.predicate, pairs)
         }
         _ => false,
     }
 }
 
 /// Recursive worker for [`eq_refinement_predicate`].
-fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
+fn eq_refinement_predicate_go(
+    a: &TypedExpr,
+    b: &TypedExpr,
+    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+) -> bool {
     use TypedExprNode as N;
-    fn all_eq(xs: &[TypedExpr], ys: &[TypedExpr]) -> bool {
+    fn all_eq(
+        xs: &[TypedExpr],
+        ys: &[TypedExpr],
+        pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+    ) -> bool {
         xs.len() == ys.len()
             && xs
                 .iter()
                 .zip(ys)
-                .all(|(x, y)| eq_refinement_predicate_go(x, y))
+                .all(|(x, y)| eq_refinement_predicate_go(x, y, pairs))
     }
     match (&a.node, &b.node) {
         (N::Lit(x), N::Lit(y)) => x == y,
-        (N::Var(x), N::Var(y)) => x == y,
+        (N::Var(x), N::Var(y)) => paired_refs_match(pairs, x, y),
         (N::Builtin(x), N::Builtin(y)) => x == y,
         (N::Proj(x), N::Proj(y)) => x == y,
         (N::Source(x), N::Source(y)) => x == y,
@@ -1737,7 +1797,7 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 function: f2,
                 argument: a2,
             },
-        ) => eq_refinement_predicate_go(f1, f2) && eq_refinement_predicate_go(a1, a2),
+        ) => eq_refinement_predicate_go(f1, f2, pairs) && eq_refinement_predicate_go(a1, a2, pairs),
         (
             N::Cast {
                 value: v1,
@@ -1747,7 +1807,7 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 value: v2,
                 target: t2,
             },
-        ) => eq_refinement_predicate_go(v1, v2) && eq_cast_target_predicates(t1, t2),
+        ) => eq_refinement_predicate_go(v1, v2, pairs) && eq_cast_target_predicates(t1, t2, pairs),
         (
             N::BinOp {
                 left: l1,
@@ -1759,8 +1819,14 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 op: o2,
                 right: r2,
             },
-        ) => o1 == o2 && eq_refinement_predicate_go(l1, l2) && eq_refinement_predicate_go(r1, r2),
-        (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => k1 == k2 && eq_refinement_predicate_go(e1, e2),
+        ) => {
+            o1 == o2
+                && eq_refinement_predicate_go(l1, l2, pairs)
+                && eq_refinement_predicate_go(r1, r2, pairs)
+        }
+        (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => {
+            k1 == k2 && eq_refinement_predicate_go(e1, e2, pairs)
+        }
         (
             N::Lambda {
                 param: p1,
@@ -1772,7 +1838,10 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 body: b2,
                 ..
             },
-        ) => p1.name == p2.name && eq_refinement_predicate_go(b1, b2),
+            // A lambda's parameter is a binder the predicate introduces: pair
+            // the two and compare the bodies under the pairing, so the bodies'
+            // references to it match by position.
+        ) => eq_under_binder(pairs, &p1.name, &p2.name, &[(b1, b2)]),
         (
             N::Aggregate {
                 input: i1,
@@ -1782,7 +1851,7 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 input: i2,
                 kind: k2,
             },
-        ) => k1 == k2 && eq_refinement_predicate_go(i1, i2),
+        ) => k1 == k2 && eq_refinement_predicate_go(i1, i2, pairs),
         (
             N::Let {
                 binding: bd1,
@@ -1795,15 +1864,15 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 body: b2,
             },
         ) => {
-            bd1.name == bd2.name
-                && eq_refinement_predicate_go(e1, e2)
-                && eq_refinement_predicate_go(b1, b2)
+            // The definiens sits outside the binder, the body inside it.
+            eq_refinement_predicate_go(e1, e2, pairs)
+                && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
         }
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
         | (N::Compose(x), N::Compose(y))
         | (N::Copair(x), N::Copair(y))
-        | (N::DisjointJoin(x), N::DisjointJoin(y)) => all_eq(x, y),
+        | (N::DisjointJoin(x), N::DisjointJoin(y)) => all_eq(x, y, pairs),
         (
             N::Case {
                 scrutinee: s1,
@@ -1816,21 +1885,32 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
         ) => {
             let scrutinee_eq = match (s1, s2) {
                 (None, None) => true,
-                (Some(x), Some(y)) => eq_refinement_predicate_go(x, y),
+                (Some(x), Some(y)) => eq_refinement_predicate_go(x, y, pairs),
                 _ => false,
             };
             scrutinee_eq
                 && br1.len() == br2.len()
-                && br1.iter().zip(br2).all(|(x, y)| {
-                    let pattern_eq = match (&x.pattern, &y.pattern) {
-                        (None, None) => true,
-                        (Some(p), Some(q)) => p.tag == q.tag && p.binding.name == q.binding.name,
+                && br1
+                    .iter()
+                    .zip(br2)
+                    .all(|(x, y)| match (&x.pattern, &y.pattern) {
+                        // A payload binder scopes over the guard and the body
+                        // both, so both compare under the pairing.
+                        (Some(p), Some(q)) => {
+                            p.tag == q.tag
+                                && eq_under_binder(
+                                    pairs,
+                                    &p.binding.name,
+                                    &q.binding.name,
+                                    &[(&x.guard, &y.guard), (&x.body, &y.body)],
+                                )
+                        }
+                        (None, None) => {
+                            eq_refinement_predicate_go(&x.guard, &y.guard, pairs)
+                                && eq_refinement_predicate_go(&x.body, &y.body, pairs)
+                        }
                         _ => false,
-                    };
-                    pattern_eq
-                        && eq_refinement_predicate_go(&x.guard, &y.guard)
-                        && eq_refinement_predicate_go(&x.body, &y.body)
-                })
+                    })
         }
         (
             N::VariantCtor {
@@ -1841,16 +1921,15 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 tag: t2,
                 payload: p2,
             },
-        ) => t1 == t2 && eq_refinement_predicate_go(p1, p2),
+        ) => t1 == t2 && eq_refinement_predicate_go(p1, p2, pairs),
         (N::Record(f1), N::Record(f2)) => {
             f1.len() == f2.len()
-                && f1
-                    .iter()
-                    .zip(f2)
-                    .all(|((n1, e1), (n2, e2))| n1 == n2 && eq_refinement_predicate_go(e1, e2))
+                && f1.iter().zip(f2).all(|((n1, e1), (n2, e2))| {
+                    n1 == n2 && eq_refinement_predicate_go(e1, e2, pairs)
+                })
         }
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
-            eq_refinement_predicate_go(e1, e2) && eq_refinement_predicate_go(b1, b2)
+            eq_refinement_predicate_go(e1, e2, pairs) && eq_refinement_predicate_go(b1, b2, pairs)
         }
         (
             N::Feed {
@@ -1871,7 +1950,9 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                 name: n2,
                 value: v2,
             },
-        ) => n1 == n2 && eq_refinement_predicate_go(v1, v2),
+            // A `Feed`/`Define` name is a *use* of the binder that introduced
+            // the handle (`ccl::scope`), so it resolves like any reference.
+        ) => paired_refs_match(pairs, n1, n2) && eq_refinement_predicate_go(v1, v2, pairs),
         _ => false,
     }
 }
@@ -1883,7 +1964,18 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
 /// types keeps the hash stable while inference resolves the predicate's
 /// type slots in place, and keeps it non-recursive through refinements (so
 /// it always terminates and adds no extra borrows).
-fn hash_refinement_predicate<H: std::hash::Hasher>(e: &TypedExpr, state: &mut H) {
+///
+/// A reference to a binder the predicate itself introduces hashes as that
+/// binder's **position**, not its name, which is what makes the hash
+/// α-invariant alongside `eq`. `scope` carries the binders in scope, innermost
+/// last, exactly as [`eq_refinement_predicate`] carries its pairing; a binder's
+/// own name is never hashed, so hash stays coarser than `eq` and the
+/// `Eq`/`Hash` contract holds.
+fn hash_refinement_predicate<H: std::hash::Hasher>(
+    e: &TypedExpr,
+    state: &mut H,
+    scope: &mut Vec<crate::ccl::Name>,
+) {
     use std::hash::Hash;
     std::mem::discriminant(&e.node).hash(state);
     match &e.node {
@@ -1891,7 +1983,12 @@ fn hash_refinement_predicate<H: std::hash::Hasher>(e: &TypedExpr, state: &mut H)
         TypedExprNode::Lit(Lit::String(s)) => s.hash(state),
         TypedExprNode::Lit(Lit::Bool(b)) => b.hash(state),
         TypedExprNode::Lit(Lit::Unit) => {}
-        TypedExprNode::Var(name) => name.hash(state),
+        // A bound reference hashes by position (innermost match, so shadowing
+        // resolves as it does in `eq`); a free one by name.
+        TypedExprNode::Var(name) => match scope.iter().rposition(|b| b == name) {
+            Some(level) => level.hash(state),
+            None => name.hash(state),
+        },
         TypedExprNode::Builtin(b) => b.hash(state),
         TypedExprNode::BinOp { op, .. } => op.hash(state),
         TypedExprNode::UnaryOp(kind, _) => kind.hash(state),
@@ -1901,7 +1998,59 @@ fn hash_refinement_predicate<H: std::hash::Hasher>(e: &TypedExpr, state: &mut H)
         TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(state),
         _ => {}
     }
-    e.walk_children(|child| hash_refinement_predicate(child, state));
+    // The binding arms `eq` handles, threading the same scope over the same
+    // children. Every other node's children sit in the node's own scope, so the
+    // generic walk covers them.
+    match &e.node {
+        TypedExprNode::Lambda { param, body } => {
+            hash_under_binder(state, scope, &param.name, &[body]);
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            hash_refinement_predicate(bound_expr, state, scope);
+            hash_under_binder(state, scope, &binding.name, &[body]);
+        }
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(s) = scrutinee {
+                hash_refinement_predicate(s, state, scope);
+            }
+            for b in branches {
+                match &b.pattern {
+                    Some(p) => {
+                        hash_under_binder(state, scope, &p.binding.name, &[&b.guard, &b.body]);
+                    }
+                    None => {
+                        hash_refinement_predicate(&b.guard, state, scope);
+                        hash_refinement_predicate(&b.body, state, scope);
+                    }
+                }
+            }
+        }
+        _ => e.walk_children(|child| hash_refinement_predicate(child, state, scope)),
+    }
+}
+
+/// Hash `children` with `binder` in scope, restoring `scope` afterwards — the
+/// hashing counterpart of [`eq_under_binder`]. The binder's own name is not
+/// hashed: `eq` compares it by position too, so hashing it would make the hash
+/// finer than `eq` for no gain.
+fn hash_under_binder<H: std::hash::Hasher>(
+    state: &mut H,
+    scope: &mut Vec<crate::ccl::Name>,
+    binder: &crate::ccl::Name,
+    children: &[&TypedExpr],
+) {
+    scope.push(binder.clone());
+    for c in children {
+        hash_refinement_predicate(c, state, scope);
+    }
+    scope.pop();
 }
 
 impl std::hash::Hash for Refinement {
@@ -1914,7 +2063,7 @@ impl std::hash::Hash for Refinement {
     /// which keeps the `Eq`/`Hash` contract. The predicate is immutable, so a
     /// `Type` used as a `ConstrainCache` key never re-hashes differently.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        hash_refinement_predicate(&self.predicate, state);
+        hash_refinement_predicate(&self.predicate, state, &mut Vec::new());
     }
 }
 
@@ -1922,6 +2071,127 @@ impl std::hash::Hash for Refinement {
 mod tests {
     use super::*;
     use crate::ccl::{BinOpKind, CompareKind};
+    use rstest::rstest;
+
+    /// `Refinement`'s hash of `pred`, for asserting the `Eq`/`Hash` contract.
+    fn refinement_hash(pred: &TypedExpr) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        Refinement::born(Rc::new(pred.clone())).hash(&mut h);
+        h.finish()
+    }
+
+    /// Two predicates equal under [`eq_refinement_predicate`] must hash alike,
+    /// or a refinement is two different `HashMap` keys.
+    fn assert_same_restriction(a: &TypedExpr, b: &TypedExpr) {
+        assert!(
+            eq_refinement_predicate(a, b),
+            "expected the same restriction:\n  {}\n  {}",
+            symbolic::symbolic(a),
+            symbolic::symbolic(b),
+        );
+        assert_eq!(
+            refinement_hash(a),
+            refinement_hash(b),
+            "equal refinements must hash alike (Eq/Hash contract)",
+        );
+    }
+
+    /// A reference to a binder the predicate introduces compares by position,
+    /// so two lowerings of one filter are the same restriction. Each binding
+    /// form `eq_refinement_predicate` handles gets its own case: a form whose
+    /// binder is compared by name instead would split the refinement set and a
+    /// `Data` domain would then report two domains that do not join.
+    #[rstest]
+    // `λ p → p > 1`, the shape a filter lowers to.
+    #[case::lambda(0)]
+    // `let p = 1 in p > 1`.
+    #[case::let_binding(1)]
+    // `match _ { `some(p) → p > 1 }` — the payload binder scopes over guard and
+    // body both.
+    #[case::case_pattern(2)]
+    fn alpha_variant_predicates_are_one_restriction(#[case] form: usize) {
+        let build = |binder: &str| {
+            let b = crate::ccl::Name::raw(binder);
+            let cmp = TypedExpr::binop(
+                TypedExpr::var(b.clone()),
+                BinOpKind::Compare(CompareKind::Greater),
+                TypedExpr::lit(Lit::Int(1)),
+            );
+            match form {
+                0 => TypedExpr::lambda(b, Type::Base(BaseType::Int), cmp),
+                1 => TypedExpr::let_bind(b, TypedExpr::lit(Lit::Int(1)), cmp),
+                _ => TypedExpr::match_expr(
+                    TypedExpr::lit(Lit::Unit),
+                    vec![crate::ccl::Branch {
+                        pattern: Some(crate::ccl::Pattern {
+                            tag: "some".into(),
+                            binding: crate::ccl::TypedBinding::new_annotated(
+                                b,
+                                Type::Base(BaseType::Int),
+                            ),
+                            empty_payload: false,
+                        }),
+                        guard: TypedExpr::lit(Lit::Bool(true)),
+                        body: cmp,
+                    }],
+                ),
+            }
+        };
+        assert_same_restriction(&build("p"), &build("q"));
+    }
+
+    /// Shadowing resolves innermost-first on both sides: the inner binder is
+    /// what an inner reference denotes, whatever either side spells it.
+    #[test]
+    fn alpha_invariance_resolves_shadowing_innermost_first() {
+        let nested = |outer: &str, inner: &str, referenced: &str| {
+            let int = || Type::Base(BaseType::Int);
+            TypedExpr::lambda(
+                crate::ccl::Name::raw(outer),
+                int(),
+                TypedExpr::lambda(
+                    crate::ccl::Name::raw(inner),
+                    int(),
+                    TypedExpr::var(crate::ccl::Name::raw(referenced)),
+                ),
+            )
+        };
+        // Both reference the inner binder, however each side spells the pair.
+        assert_same_restriction(&nested("a", "b", "b"), &nested("x", "y", "y"));
+        // A predicate whose inner binder shadows the outer: the reference is the
+        // inner one on both sides.
+        assert_same_restriction(&nested("a", "a", "a"), &nested("x", "x", "x"));
+        // Referencing the *outer* binder is a different restriction from
+        // referencing the inner one.
+        assert!(!eq_refinement_predicate(
+            &nested("a", "b", "a"),
+            &nested("x", "y", "y")
+        ));
+    }
+
+    /// A reference to a binder *outside* the predicate still compares by name.
+    /// That is what keeps two refinements about different enclosing binders apart,
+    /// and uids make the comparison exact.
+    #[test]
+    fn a_free_reference_still_compares_by_name() {
+        let refinement = |free: &str| {
+            TypedExpr::lambda(
+                crate::ccl::Name::raw("p"),
+                Type::Base(BaseType::Int),
+                TypedExpr::binop(
+                    TypedExpr::var(crate::ccl::Name::raw("p")),
+                    BinOpKind::Compare(CompareKind::Equals),
+                    TypedExpr::var(crate::ccl::Name::raw(free)),
+                ),
+            )
+        };
+        assert_same_restriction(&refinement("k"), &refinement("k"));
+        assert!(
+            !eq_refinement_predicate(&refinement("k"), &refinement("m")),
+            "distinct enclosing binders must stay distinct"
+        );
+    }
 
     /// Two predicates that each contain a [`TypedExprNode::Cast`] and differ
     /// only in the *target's* domain-refinement predicate denote different
