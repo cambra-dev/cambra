@@ -548,7 +548,7 @@ pub struct CompiledProgram {
     /// between the post-inference and post-desugar snapshots) — see
     /// [`MONO_WINDOW`] and [`DESUGAR_WINDOW`].
     ///
-    /// Rows exist only for nodes a bracket produced: an untouched node has none
+    /// Rows exist only for nodes a recording produced: an untouched node has none
     /// (it was never rewritten), and neither has a refinement-predicate interior
     /// (see `LineageTable`'s `TODO(predicate-rows)`).
     ///
@@ -618,7 +618,7 @@ impl CompiledProgram {
     ///
     /// The leaks are **returned, not asserted**: `Unexplained` is the capture
     /// gate ([`gate_leaks`]) but a boundary is only clean once every pass inside
-    /// it brackets its rewrites, and `Died` is the death report, which a caller
+    /// it records its rewrites, and `Died` is the death report, which a caller
     /// reads rather than gates on.
     // Cold path: the inspector's snapshot serve, which is not in this workspace.
     #[allow(dead_code)]
@@ -1014,7 +1014,7 @@ pub(crate) fn lineage_capture_enabled() -> bool {
 /// **What this buys.** The always-on gate is
 /// `pane_boundaries_fold_with_no_structural_leaks`, whose corpus is the handful
 /// of programs listed in `corpus()`. That is a *sample*, and a recording gap in
-/// a shape the sample misses is invisible: the unbracketed
+/// a shape the sample misses is invisible: the unrecorded
 /// `fold_induction_loop` call in `transact_phase` (a commit decision reading
 /// another loop's accumulator) and `flatten_spine`'s value-position writer hoist
 /// both sat outside it. With this on, the corpus is every program the caller
@@ -1035,11 +1035,11 @@ fn lineage_gate_every_compile() -> bool {
 }
 
 /// Run `f` with `pass` installed as the recorder's ambient pass, so every row a
-/// bracket inside it writes is tagged with that pass. With `capture` false this
+/// recording inside it writes is tagged with that pass. With `capture` false this
 /// is exactly `f()` — no scope, and every construction hook stays a no-op.
 ///
-/// The pass identity lives in the *data* — the row's `RewriteTag`, completed at
-/// flush time from the scope — which is why one helper covers every pass
+/// The pass identity lives in the *data* — the row's `RewriteTag`, completed
+/// from the scope when a guard drops — which is why one helper covers every pass
 /// regardless of its signature: the passes here are free functions of four
 /// different shapes and nothing is threaded through them.
 fn recorded<R>(capture: bool, pass: Pass, f: impl FnOnce() -> R) -> R {
@@ -1059,7 +1059,7 @@ fn recorded<R>(capture: bool, pass: Pass, f: impl FnOnce() -> R) -> R {
 /// and every genuinely-dead input id surfaces as [`Leak::Died`]. That class is
 /// therefore the *death report*, not an error, and the audit counts it
 /// separately from the classes that really are recording bugs
-/// ([`Leak::Unexplained`] — an output node no bracket accounted for).
+/// ([`Leak::Unexplained`] — an output node no recording accounted for).
 struct LineageAudit {
     window: &'static str,
     state: Option<(PassScope, std::collections::HashSet<NodeId>)>,
@@ -1126,7 +1126,7 @@ impl LineageAudit {
         for l in &leaks {
             *counts
                 .entry(match l {
-                    Leak::Unexplained { .. } => "Unexplained(output not covered by any bracket)",
+                    Leak::Unexplained { .. } => "Unexplained(output not covered by any recording)",
                     Leak::Died { .. } => "Died(= the death report)",
                     Leak::ParentUnknown { .. } => "ParentUnknown",
                 })
@@ -1202,7 +1202,7 @@ pub fn compile_program(
 
     // The always-on lowering session: installed in every
     // build for the whole of lowering. Its leaf entries (`tag_source`/
-    // `tag_machinery`) and copy-frame flushes (uncurry, compare-chain) record a
+    // `tag_machinery`) and copy-sink writes (uncurry, compare-chain) record a
     // `LoweringLog`, folded once at the handoff below into the always-on lowering
     // projection. It must fully drain before the first pass (Mono) session opens.
     let lowering_session = LoweringSession::install();
@@ -1381,7 +1381,7 @@ pub fn compile_program(
     // transact, mut_elim, channelize and the as-of-read rewrite.
     //
     // The endpoint is the window's whole point, so it is chosen rather than
-    // inherited. An audit measures what the brackets explain, so a window that
+    // inherited. An audit measures what the recordings explain, so a window that
     // runs past the last instrumented pass reports every node the uninstrumented
     // tail mints as a defect — a number that cannot reach zero however correct
     // the recording is, which makes the audit read as a broken gate instead of a
@@ -1789,7 +1789,7 @@ mod tests {
         }
 
         /// The structural class — a record-integrity defect, independent of how
-        /// much of the pipeline brackets its rewrites. See [`gate_leaks`].
+        /// much of the pipeline records its rewrites. See [`gate_leaks`].
         fn structural(&self) -> usize {
             self.parent_unknown
         }
@@ -1821,7 +1821,7 @@ mod tests {
                 assert_eq!(
                     c.unexplained, 0,
                     "{name}: unexplained output nodes at the {boundary} boundary — a rewrite \
-                     that mints outside any frame: {c:?}"
+                     that mints with nothing recording: {c:?}"
                 );
                 eprintln!("[pane {name} / {boundary}] {c:?}");
                 totals[i].add(&c);
@@ -1865,8 +1865,8 @@ mod tests {
     /// retained — when monomorphization and transport-mode substitution started
     /// recording. `pre-inference → post-inference` in particular was vacuous on
     /// eight programs because the only pass rewriting in that window, `Mono`,
-    /// opened its frame *after* the clone that produced its nodes, so nothing
-    /// captured.
+    /// opened its recording *after* the clone that produced its nodes, so
+    /// nothing captured.
     const EXERCISED_BOUNDARIES: &[&str] = &[
         "arithmetic / pre-inference → post-inference",
         "feed_loop / post-inference → post-desugar",
@@ -1982,7 +1982,7 @@ mod tests {
     /// Pinned as the set of boundaries where such an edge exists, for the same
     /// reason [`EXERCISED_BOUNDARIES`] is pinned: blame is named at four sites
     /// in the compiler, two of them inside a pane window, and a corpus or
-    /// bracket edit that stopped exercising them would otherwise leave the
+    /// recording edit that stopped exercising them would otherwise leave the
     /// labelled half of the relation untested.
     ///
     /// A relatedness edge is *only* relatedness here: no corpus rewrite both
@@ -2020,7 +2020,7 @@ mod tests {
     /// explains every node it produces, on first-order and specializing
     /// programs alike.
     ///
-    /// Two brackets get it there, and both are needed: `specialize_use` sinks
+    /// Two recordings get it there, and both are needed: `specialize_use` sinks
     /// the clone's `on_copy` pairs, and `coalesce_generalized_let` sinks the
     /// chain of `let`s the binding rebuilds itself as. Without the second, a
     /// specializing program leaves one unexplained `let` per demanded
@@ -2053,12 +2053,12 @@ mod tests {
     /// All four passes inside the second boundary explain what they produce.
     ///
     /// The interesting programs are the ones that drive a *whole-program*
-    /// rewrite, where the driver bracket is least obviously applicable: a
+    /// rewrite, where naming one node is least obviously applicable: a
     /// transaction is disassembled into a commit carrier whose pieces have no
     /// single source node, and a defer cluster becomes a `LetRec` assembled from
-    /// contributions scattered across the body. Both are covered by bracketing
-    /// on the node each product stands in for — the `with begin():` statement,
-    /// the register declaration, the `let d = Defer`.
+    /// contributions scattered across the body. Both are covered by recording
+    /// against the node each product stands in for — the `with begin():`
+    /// statement, the register declaration, the `let d = Defer`.
     ///
     /// Asserted with a non-vacuity guard for the same reason boundary 1 is: a
     /// program that reaches one of these passes must also kill nodes, so a
@@ -2066,7 +2066,7 @@ mod tests {
     #[test]
     fn the_second_pane_boundary_explains_every_node_its_passes_produce() {
         /// Reaches `transact_phase` or `channelize` — the whole-program
-        /// rewrites, and the last two passes to adopt the driver bracket.
+        /// rewrites, and the last two passes to adopt the recorder.
         const WHOLE_PROGRAM_REWRITES: &[&str] = &["transaction", "feed_loop", "generator_pipeline"];
         for (name, code) in corpus() {
             let panes = compile_ok(&code).materialize_panes();
@@ -2113,7 +2113,7 @@ mod tests {
     }
 
     /// A pass that rewrites the program records its rewrites under its own pass
-    /// tag — the tag being the one part of a row no bracket site knows, and the
+    /// tag — the tag being the one part of a row no recording site knows, and the
     /// only thing that places a row in a pane window.
     ///
     /// A pass that rewrites *nothing* on a given program records nothing, which
@@ -2442,7 +2442,7 @@ Error: lowering error
         let pointed = &code[span.start..span.end];
         assert_eq!(
             pointed, "1 + \"a\"",
-            "the blame is the node whose coalesce frame raised the error — here the \
+            "the blame is the node whose coalesce rule raised the error — here the \
              `+` application over both operands, not the whole program or nothing"
         );
     }

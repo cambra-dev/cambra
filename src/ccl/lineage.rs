@@ -3,15 +3,20 @@
 //!
 //! # The model
 //!
-//! Every IR node has a stable [`NodeId`], and every node a pass *produces* gets
-//! a row in the [`LineageTable`]: the ids the rewrite consumed to produce it
-//! (`parents`), the ids it attributes to (`blame` — **not** the same as what it
-//! consumed), and an interned [`RewriteTag`] carrying the pass, the fidelity
-//! `nature`, and a stable `label`. An id with no row was never rewritten.
+//! Every IR node has a stable [`NodeId`], unique within a tree — a pipeline
+//! invariant asserted at every pass boundary by `assert_unique_node_ids`. Rows
+//! are keyed by that identity, so everything below rests on it: two nodes
+//! sharing an id would share one row and one attribution.
 //!
-//! Rows are a **byproduct of performing the rewrite**, never a post-pass diff: a
-//! pass brackets the node it is about to rewrite ([`enter`]) and the
-//! construction hooks capture what that bracket's extent mints.
+//! Every node a pass *produces* gets a row in the [`LineageTable`]: the ids the
+//! rewrite consumed to produce it (`parents`), the ids it attributes to
+//! (`blame` — **not** the same as what it consumed), and an interned
+//! [`RewriteTag`] carrying the pass, the fidelity `nature`, and a stable
+//! `label`. An id with no row was never rewritten.
+//!
+//! Rows are a byproduct of performing the rewrite, never a post-pass diff. A
+//! pass names the node it is about to rewrite ([`enter`]), and the construction
+//! hooks record every node minted while that guard is the innermost one open.
 //!
 //! At an inspector pane boundary the rows the boundary's passes wrote are folded
 //! once by [`collapse`] into a [`LineageMap`] — a bidirectional node↔node
@@ -21,46 +26,39 @@
 //! consumed within the phase, and its two-sided leak check ([`Leak`]) is what
 //! says whether a node silently lost its history.
 //!
-//! The fold is **order-free**: it reads the rows as an edge set and sweeps them
-//! in ascending [`NodeId`], which is a topological order of the definition graph
-//! (see [`collapse`], "The algebra"). Nothing depends on the order rows were
-//! written in — which matters, because a frame's rows are written when the frame
-//! *closes*, so an enclosing rewrite's rows land after the rows of the rewrites
-//! it contains.
+//! The fold is order-free: it reads the rows as an edge set and sweeps them in
+//! ascending [`NodeId`], which is a topological order of the definition graph
+//! (see [`collapse`], "The algebra"). Write order is not chronology, and
+//! [`collapse`] explains why nothing may depend on it.
 //!
-//! # Two columns, because they are two kinds of relation (load-bearing)
+//! # Two columns, because they are two kinds of relation
 //!
-//! Both columns relate a node to other nodes; they differ in **what the
-//! relation asserts**, which is a label on the edge rather than the presence of
-//! one. Both reach [`LineageMap`], each labelling the edges it contributes:
+//! Both columns relate a node to other nodes, and differ in what the relation
+//! asserts. Both reach [`LineageMap`], each labelling the edges it contributes:
 //!
-//! * **`parents`** — *descends from*. The ids the rewrite consumed to produce
+//! * **`parents`** — descends from. The ids the rewrite consumed to produce
 //!   this node, and the column the leak audit reads: a parent the boundary
 //!   never heard of is a lineage that stops at an id describing nothing
 //!   ([`Leak::ParentUnknown`]).
-//! * **`blame`** — *related to, but not consumed*. It may name ids that
-//!   **survive** the rewrite, so it is not an ancestry claim: the edges it
-//!   contributes carry the relatedness label, and a consumer asking "what was
-//!   this made from" reads the label rather than the edge's presence.
+//! * **`blame`** — related to, but not consumed. It may name ids that survive
+//!   the rewrite, so it is not an ancestry claim, and a reader asking "what was
+//!   this made from" reads the edge's label rather than its presence.
 //!
-//! The labels compose **weakest-link** along a path ([`EdgeLabels`]): a closed
-//! edge asserts descent only when every hop on the way consumed the one before
-//! it, and one relatedness hop anywhere makes the whole path relatedness. That
-//! is what keeps the two readings apart once transitivity has run, and what lets
-//! a consumer render the relatedness or prune it — instead of receiving one
-//! unlabelled edge set it cannot take apart again.
+//! The labels compose weakest-link along a path, so that the inspector can
+//! render relatedness or prune it once transitivity has run; [`EdgeLabels`]
+//! states the composition.
 //!
-//! Attribution reads **both, unioned**: a node's spans are its parents' spans
-//! plus whatever distinct spans its blame adds. Blame is the rare case (four
-//! sites in the whole compiler), so for almost every node this is simply the
-//! spans of whatever it was made from. Attribution reads no label — a span is
-//! a span whichever channel named the node it came from.
+//! Attribution reads both columns, unioned: a node's spans are its parents'
+//! spans plus whatever distinct spans its blame adds. Blame is named at four
+//! sites in the compiler, so for almost every node this is the spans of
+//! whatever it was made from. Attribution reads no label — a span is a span
+//! whichever column named the node it came from.
 //!
 //! # Domains, not passes
 //!
-//! [`LineageMap`] is generic over its two id domains so the same relation serves
-//! lowering's `SourceKey → NodeId` projection, a pane pair's `NodeId → NodeId`, and a
-//! future `NodeId → OperatorId` edge. Passes live in the *data* (each row's
+//! [`LineageMap`] is generic over its two id domains so the same relation can
+//! serve a pane pair's `NodeId → NodeId` and a future `NodeId → OperatorId`
+//! edge; both domains are `NodeId` today. Passes live in the *data* (each row's
 //! [`RewriteTag`]), never in the type.
 
 use std::cell::RefCell;
@@ -70,8 +68,8 @@ use std::hash::Hash;
 use crate::ccl::provenance::{NodeId, Pass};
 use crate::chl_parser::ast::Span;
 
-/// A stable, human-readable name for a rewrite, e.g. `"channelize.feed_union"`
-/// or `"inline.fanout"`. Fixed at the bracket site, interned into every row's
+/// A stable, human-readable name for a rewrite, e.g. `"channelize.cluster"` or
+/// `"inline.beta"`. Fixed at the recording site, interned into every row's
 /// [`RewriteTag`], and surfaced from there for inspector tooltips.
 pub type RewriteLabel = &'static str;
 
@@ -80,13 +78,12 @@ pub type RewriteLabel = &'static str;
 ///
 /// **Work in progress.** This axis exists to carry display metadata to the
 /// inspector frontend, and neither the vocabulary nor the tagging is settled: the
-/// three variants are a first cut, the rule assigning them is deliberately
-/// structural for now (below), and `Expansion` has no production producer yet.
-/// Treat a node's nature as a hint the frontend may present, not as a fact any
-/// compiler decision should turn on — nothing in `ccl/` branches on it today, and
-/// the per-site `label` is the durable datum. Retagging is cheap precisely
-/// because of that: a label-keyed remap can recompute a different taxonomy
-/// without touching how any pass records.
+/// three variants are a first cut and the rule assigning them is deliberately
+/// structural for now (below). Treat a node's nature as a hint the frontend may
+/// present, not as a fact any compiler decision should turn on — nothing in
+/// `ccl/` branches on it today, and the per-site `label` is the durable datum.
+/// Retagging is cheap precisely because of that: a label-keyed remap can
+/// recompute a different taxonomy without touching how any pass records.
 ///
 /// Public because it rides in the public [`RewriteTag`] (and thus
 /// [`SourceAttribution`]); a [`LoweringStep::Leaf`] carries one too.
@@ -95,9 +92,9 @@ pub type RewriteLabel = &'static str;
 /// root of a lowered source expression. The rule for who gets it is *structural*
 /// and stated in one place — see `LoweringContext::tag_source` in
 /// `src/ccl/lower/mod.rs`, and `design/provenance.md`, "The seam
-/// (`src/ccl/context.rs`)". It is emitted **only by lowering** — [`attribute`]
-/// and both wire validators carry debug guards that no *pass* rewrite ever
-/// carries it. On the wire a `Source`-nature tag null-compresses
+/// (`src/ccl/context.rs`)". It is emitted **only by lowering**: [`attribute`]
+/// debug-asserts that no *pass* rewrite carries it, and that is the one guard.
+/// On the wire a `Source`-nature tag null-compresses
 /// (serializes as
 /// `rewritten: null` via [`is_source`](Nature::is_source)) so the wire stays
 /// byte-identical to the retired `rewritten: None` encoding.
@@ -109,8 +106,10 @@ pub enum Nature {
     /// callee, a chained comparison's operands) carries `Machinery` with the
     /// `"lower.image"` label instead.
     Source,
-    /// Faithful expansion of a source construct (a comparison chain, a
-    /// comprehension, a lambda-elim combinator).
+    /// Faithful expansion of a source construct (an inlined UDF body, a
+    /// transaction's writer, a desugared defer cluster). Recorded by passes,
+    /// never by lowering, whose expansions carry `Machinery` with a per-rule
+    /// label.
     Expansion,
     /// Pure plumbing with no direct source counterpart.
     Machinery,
@@ -121,9 +120,9 @@ impl Nature {
     /// `"machinery"`), shared by the per-node `ir` tree tag and the
     /// `SourceAttribution` query wire so the two encodings never diverge.
     ///
-    /// `"source"` must **never** actually reach the wire — a `Source`-nature tag
-    /// null-compresses at the emission sites (see [`is_source`](Self::is_source));
-    /// the arm exists for the validators' guard and for completeness.
+    /// `"source"` never reaches the wire: the sole emission path branches on
+    /// [`is_source`](Self::is_source) first and writes `null` instead. The arm
+    /// exists for completeness.
     ///
     /// Compiled only under the `serde` feature (the `Serialize` impl below is its
     /// sole caller), so a default build sees it as dead.
@@ -191,9 +190,10 @@ pub(crate) enum LoweringStep {
     },
 }
 
-/// Lowering's ordered record. Appended at leaf grain by
-/// [`lowering_leaf`]/the copy frames; folded once at the lowering boundary by
-/// [`collapse_lowering`] into the always-on lowering projection.
+/// Lowering's ordered record. Appended at leaf grain by [`lowering_leaf`] and by
+/// the copy-capturing recordings [`copy_frame`] opens; folded once at the
+/// lowering boundary by [`collapse_lowering`] into the always-on lowering
+/// projection.
 pub(crate) type LoweringLog = Vec<LoweringStep>;
 
 /// The lowering log, plus the set of [`NodeId`]s it has already explained.
@@ -390,8 +390,8 @@ pub struct SourceAttribution {
 // frontend format the tag itself rather than consuming a pre-flattened string.
 //
 // Null-compression: a `Source`-nature tag (a direct image) serializes its
-// `rewritten` as `null`. Both validators carry a debug guard that a `"source"`
-// nature never actually ships, so this compression boundary cannot rot.
+// `rewritten` as `null`. This is the sole emission path, so a `"source"` nature
+// cannot reach the wire.
 #[cfg(feature = "serde")]
 impl serde::Serialize for SourceAttribution {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -426,8 +426,9 @@ impl serde::Serialize for SourceAttribution {
 /// How a rewritten node came to exist, for tooltips and display policy.
 ///
 /// `Hash`/`Eq` are what let a [`LineageTable`] intern the whole triple as one
-/// [`RuleId`]: the three fields are fixed together at a bracket site, so they
-/// are one value, not three columns.
+/// [`RuleId`]. The recording site fixes `label` and `nature`, the enclosing
+/// [`PassScope`] supplies `via`, and both are settled before a row is written,
+/// so the triple is one value rather than three columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RewriteTag {
     /// The pass that performed the rewrite.
@@ -636,9 +637,9 @@ fn row_hops(table: &LineageTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
 /// order, are exactly what make the fold insensitive to the order the rows were
 /// written in. (Idempotence buys cheapness, not order-freeness.)
 ///
-/// Order-freeness is not a nicety: write order is *not* chronology. A frame's
-/// rows are written when the frame closes, so an enclosing rewrite's rows land
-/// after the rows of the rewrites it contains.
+/// Order-freeness is load-bearing, because write order is not chronology: rows
+/// are written when their guard drops, so an enclosing rewrite's rows land after
+/// the rows of the rewrites nested inside it.
 ///
 /// Ids born and consumed inside the window are interior vertices on a path and
 /// compose away; the self-edge for an untouched id falls out; the N:M bipartite
@@ -830,7 +831,7 @@ pub(crate) fn sweep_metrics(
 /// Fold a [`LoweringLog`] into the always-on **lowering projection** and any
 /// integrity [`Leak`]s. The lowering counterpart to [`collapse`], and the one
 /// fold that is **sequential**: its log genuinely is chronology (leaf entries
-/// are appended at construction, not at frame close), and its last-tag-wins
+/// are appended at construction, not when a guard drops), and its last-tag-wins
 /// re-imaging is real semantics rather than an artifact of reading a log as a
 /// sequence. Four simplifications follow from lowering minting from scratch:
 ///
@@ -933,11 +934,12 @@ pub(crate) fn collapse_lowering(
 
 /// An interned [`RewriteTag`] — a [`LineageTable`] row's `rule` column.
 ///
-/// The whole `{via, nature, label}` triple is interned as **one** id because a
-/// bracket site fixes all three together: `via` is the session's pass, and
+/// The whole `{via, nature, label}` triple is interned as one id because the
+/// three are settled together: `via` is the session's pass, and
 /// `nature`/`label` are the two literals at the [`enter`] call. There are on the
-/// order of thirty distinct triples in the compiler, so one index buys all
-/// three columns and a row carries a single handle instead of three fields.
+/// order of fifty distinct triples in the compiler — a property of the source,
+/// not of the program being compiled — so one index buys all three columns and a
+/// row carries a single handle instead of three fields.
 ///
 /// Only meaningful against the table that minted it: the ids are dense indices
 /// into that table's tag vector, not global constants.
@@ -958,15 +960,15 @@ struct Row {
 ///
 /// # The two edge kinds stay separate
 ///
-/// `parents` are the ids a rewrite **consumed** to produce the node (a
-/// bracket's slot, or a fusion's whole consumed set); `blame` are the ids the
-/// rewrite is *related to* but did not consume, which may still be alive
-/// elsewhere in the tree and say nothing about any node's fate. Both are
+/// `parents` are the ids a rewrite consumed to produce the node — the node the
+/// recording named, or a fusion's whole consumed set. `blame` are the ids the
+/// rewrite is *related to* but did not consume; they may still be alive
+/// elsewhere in the tree, and they say nothing about any node's fate. Both are
 /// relations over the same pair of ids and both reach the fold, so what the
-/// columns buy is the **label** the fold puts on the edge ([`EdgeLabels`]) —
-/// welding them would answer "what was this made from" with a node that merely
+/// columns buy is the **label** the fold puts on the edge ([`EdgeLabels`]).
+/// Merging them would answer "what was this made from" with a node that merely
 /// survives beside the answer (see the module docs, "Two columns, because they
-/// are two kinds of relation (load-bearing)").
+/// are two kinds of relation").
 ///
 /// # There is no span column, deliberately
 ///
@@ -998,7 +1000,8 @@ struct Row {
 ///
 /// This was a `TODO(predicate-rows)` and is now done for two of the three
 /// crossings: a term entering a predicate is recorded (lowering sweeps the
-/// finished term; inference brackets `singleton_predicate` on its literal), and a
+/// finished term; inference records `singleton_predicate` against its literal),
+/// and a
 /// predicate being rewritten is recorded. The third — planning **raising** a
 /// predicate back into the main tree — is not, and lands with the planning
 /// commit; those nodes are minted below the last pane, so no boundary gates them
@@ -1030,15 +1033,16 @@ pub(crate) struct LineageTable {
 impl LineageTable {
     /// The [`RuleId`] for `tag` in this table, assigning one on first sight.
     ///
-    /// Interning is separate from [`record`](Self::record) because a flush
-    /// writes many rows under one tag: the caller interns once per frame and
-    /// hands the handle to each row.
+    /// Interning is separate from [`record`](Self::record) because one closing
+    /// guard writes many rows under one tag: the caller interns once and hands
+    /// the handle to each row.
     pub(crate) fn intern_rule(&mut self, tag: RewriteTag) -> RuleId {
         if let Some(id) = self.interned.get(&tag) {
             return *id;
         }
-        // u32 is not a real limit — the distinct-tag count is the number of
-        // bracket sites in the compiler, which is a source-code property.
+        // u32 is not a real limit: the distinct-tag count is a source-code
+        // property — one triple per label-and-nature pair the compiler writes —
+        // not a function of the program being compiled.
         let id = RuleId(
             u32::try_from(self.rules.len()).expect("more distinct rewrite tags than a u32 indexes"),
         );
@@ -1072,10 +1076,10 @@ impl LineageTable {
     ///   nothing, and that is correct, because identity here is *referent*
     ///   identity and the pane resolves it by shared id.
     ///
-    /// The checks are `debug_assert!`s because this is the construction hot path
-    /// — every mint under an open frame lands here — and each one costs a hash
-    /// probe or a scan. What is gated is the *checking*: the row written is the
-    /// same row in every build.
+    /// The checks are `debug_assert!`s because this is the construction hot
+    /// path — every mint under an open guard lands here — and each one costs a
+    /// hash probe or a scan. What is gated is the checking; the row written is
+    /// the same row in every build.
     pub(crate) fn record(
         &mut self,
         id: NodeId,
@@ -1214,8 +1218,8 @@ impl LineageTable {
 }
 
 // ===========================================================================
-// The recorder: an ambient thread-local step stack that turns node construction
-// into lineage rows as a byproduct of the rewrite (never a post-pass diff).
+// The recorder: an ambient thread-local stack of open recordings that turns node
+// construction into lineage rows as a byproduct of the rewrite.
 //
 // Discipline mirrors `infer_var::ACTIVE_ARENA`: install a capture target at a
 // boundary, let construction hooks feed it, drain at the boundary. The compile
@@ -1226,14 +1230,14 @@ impl LineageTable {
 // ===========================================================================
 
 thread_local! {
-    /// The open frames, innermost last. Empty ⇒ recording off. A construction
-    /// hook ([`on_mint`]/[`on_copy`]) pushes into the innermost frame only;
-    /// nesting is by frame depth.
+    /// The open recordings, innermost last. Empty ⇒ recording off. A
+    /// construction hook ([`on_mint`]/[`on_copy`]) pushes into the innermost
+    /// one only.
     static STEP_STACK: RefCell<Vec<OpenStep>> = const { RefCell::new(Vec::new()) };
 
-    /// The [`LineageTable`] a pass frame's flush writes its rows into, installed
-    /// by a [`TableSession`]. `None` ⇒ no table: a flush is a silent no-op
-    /// (uniform single code path).
+    /// The [`LineageTable`] a closing guard writes its rows into, installed by
+    /// a [`TableSession`]. `None` ⇒ no table, and the write is a silent no-op,
+    /// so there is one code path either way.
     ///
     /// Installed for a **whole compile** rather than per pass, unlike
     /// [`ACTIVE_PASS`]: a row is keyed by a node id, which is unique for the
@@ -1241,82 +1245,77 @@ thread_local! {
     /// id can collide between them.
     static ACTIVE_TABLE: RefCell<Option<LineageTable>> = const { RefCell::new(None) };
 
-    /// The pass a flush tags its rows with, installed per pass by a
-    /// [`PassScope`]. `None` ⇒ no pass is being recorded: a frame still captures
-    /// into itself, but its flush writes nothing.
+    /// The pass a row is tagged with, installed per pass by a [`PassScope`].
+    /// `None` ⇒ no pass is being recorded: a guard still captures into itself,
+    /// but writes nothing when it drops.
     ///
-    /// The pass is **ambient for the scope's extent** because a [`RewriteTag`]
-    /// needs it and a frame cannot supply it: an [`OpenStep`] carries the two
-    /// literals at its bracket site (`label`, `nature`) and knows nothing about
-    /// which pass is running, while the boundary that opens the scope knows
-    /// exactly that.
+    /// The pass is ambient for the scope's extent because a [`RewriteTag`] needs
+    /// it and the recording site cannot supply it: an [`OpenStep`] carries the
+    /// two literals at its [`enter`] call (`label`, `nature`) and knows nothing
+    /// about which pass is running, while the boundary that opens the scope
+    /// knows exactly that.
     static ACTIVE_PASS: RefCell<Option<Pass>> = const { RefCell::new(None) };
 
     /// Lowering's log, installed by the always-on [`LoweringSession`]. `None` ⇒
-    /// not lowering. Lowering records into its own sink because its attribution
-    /// is a literal span rather than a resolved reference (see [`LoweringStep`]).
+    /// lowering is not running. Lowering records into its own sink because its
+    /// attribution is a literal span rather than a reference resolved later (see
+    /// [`LoweringStep`]).
     static ACTIVE_LOWERING_LOG: RefCell<Option<LoweringRecord>> = const { RefCell::new(None) };
 }
 
-/// An in-flight frame accumulating the ids born and copied within its dynamic
-/// extent. Finalized by its [`FrameGuard`]'s `Drop`. The `births`/copy sides are
-/// *captured*, not declared: this is what makes recording a byproduct of
-/// construction rather than a parallel annotation.
+/// One in-flight recording, accumulating the ids born and copied while its guard
+/// is the innermost one open. Finalized when the [`FrameGuard`] drops. The
+/// produced side is captured from the construction hooks rather than declared,
+/// which is what makes a row a byproduct of the rewrite.
 struct OpenStep {
     label: RewriteLabel,
-    /// The ids this frame declared it would consume. The produced side is
+    /// Extra ids the rewrite consumed, added through
+    /// [`FrameGuard::also_consumes`] for a fusion. The produced side is
     /// discovered from the construction hooks, never declared.
     ///
-    /// An [`enter`] frame opens with this **empty** and only ever gains entries
-    /// through [`FrameGuard::also_consumes`] — the fusion escape hatch. See
-    /// [`origin`](Self::origin).
+    /// Empty at open, and — `also_consumes` having no production caller — empty
+    /// for every rewrite in the compiler today. See [`origin`](Self::origin).
     consumed: Vec<NodeId>,
-    /// The id occupying the rewritten slot when an [`enter`] frame opened.
-    /// `None` for a [`copy_frame`], the one frame kind with no slot.
+    /// The id the recording site named — the node occupying the slot about to be
+    /// rewritten. `None` for a [`copy_frame`], which names no node.
     ///
-    /// This is the *driver* channel: the frame names the node it is rewriting,
-    /// not the nodes it destroys. Every id minted in its extent takes it as a
-    /// **parent** — "this output was made from that node" — which is
-    /// deliberately **silent on the origin's fate**. Fate is decided by the
-    /// live-set difference at the pane boundary, never at record time, so a
-    /// bracket over a node that *survives* (the adopt-a-live-subtree shape: keep
-    /// the id, mint a wrapper over a child) is not a false death claim.
+    /// Every id minted in the guard's extent takes this as a **parent**: the
+    /// output was made from that node. The claim says nothing about whether that
+    /// node dies, which is what makes it safe to name a node the rewrite keeps
+    /// (keep the id, mint a wrapper over a child). Death is the live-set
+    /// difference at a pane boundary, never a record-time claim.
     origin: Option<NodeId>,
     blame: Vec<NodeId>,
     nature: Nature,
-    /// Ids minted via `Expr::new` while this was the innermost open frame.
+    /// Ids minted via `Expr::new` while this guard was the innermost open one.
     births: Vec<NodeId>,
-    /// `(origin, fresh)` pairs reported by the freshen hooks while this was the
-    /// innermost open frame.
+    /// `(origin, fresh)` pairs the freshen hooks reported while this guard was
+    /// the innermost open one.
     copies: Vec<(NodeId, NodeId)>,
 }
 
 impl OpenStep {
-    /// Finalize this frame into the installed [`LineageTable`], one row per node
-    /// it produced.
+    /// Finalize this recording into the installed [`LineageTable`], one row per
+    /// node it produced.
     ///
-    /// Two products, and the split is the whole of the design:
+    /// Two products:
     ///
-    /// * **the bracket's own births** — every id minted in the frame's extent
-    ///   takes the frame's parentage. With no fusion that is the single slot id:
-    ///   "this node was made from the node I was rewriting", asserting *nothing*
-    ///   about whether that node died. With fusion ([`FrameGuard::also_consumes`])
-    ///   it is the slot plus every extra id, which is the many:1 shape — a
-    ///   product of several origins' lineages, and the only place any id is
-    ///   named at record time. That set is a *lineage-edge* declaration, not a
-    ///   fate assertion: the boundary's live-set difference decides death, so
-    ///   naming a survivor costs an over-broad edge, never a phantom death.
+    /// * **the mints** — every id minted in the guard's extent takes the named
+    ///   node as its parent. With a fusion ([`FrameGuard::also_consumes`]) it
+    ///   takes the named node plus every extra id, which is the many:1 shape and
+    ///   the only place any id is named at record time. Either way the parents
+    ///   are lineage edges, not fate claims, so naming a node that survives
+    ///   costs an over-broad edge and never a phantom death.
     /// * **the captured freshens** — each `(origin, fresh)` pair the `on_copy`
     ///   hook reported rows the fresh id on the node it was duplicated from, not
-    ///   on the frame's slot. A copy's origin is always *discovered* through the
-    ///   hook, never declared up front: every duplication path funnels through
-    ///   [`TypedExpr::freshen_node_id`](crate::ccl::expr::TypedExpr::freshen_node_id),
-    ///   so capture is total and a declared-origin frame kind would be redundant.
+    ///   on the named node. A copy's origin is discovered through the hook rather
+    ///   than declared: every duplication path runs through [`copy_id`], called
+    ///   from `TypedExpr`'s `Clone`, so capture needs no help from the site.
     ///
-    /// A frame that minted nothing, freshened nothing and fused nothing is a
-    /// **preserve** and writes no row — the in-place mutation case
-    /// (`*op = BinOpKind::Concat`), and what lets a pass bracket every rewrite
-    /// *attempt* rather than every firing.
+    /// A guard that minted nothing, freshened nothing and fused nothing writes no
+    /// row. That is the **preserve** case — an in-place mutation such as `*op =
+    /// BinOpKind::Concat` — and it is what lets a pass open a recording on every
+    /// rewrite *attempt* rather than only on the ones that fire.
     fn flush_into_table(self, via: Pass) {
         let OpenStep {
             label,
@@ -1334,8 +1333,8 @@ impl OpenStep {
         };
         debug_assert!(
             !births.contains(&origin),
-            "bracket {label:?} minted its own slot id {origin:?} — the slot id is read \
-             before the rewrite runs, so it cannot also be a birth",
+            "recording {label:?} minted the node it named, {origin:?} — the named id is \
+             read before the rewrite runs, so it cannot also be a birth",
         );
         if !births.is_empty() {
             let mut parents = vec![origin];
@@ -1364,25 +1363,26 @@ impl OpenStep {
         });
     }
 
-    /// An originless frame ([`copy_frame`]) has nowhere to attach a consume or a
-    /// mint: a row needs a parent and the frame has none, so anything captured
-    /// into one would vanish from the record rather than land somewhere wrong. A
-    /// pass site that trips this wants [`enter`] on the node it is rewriting; a
-    /// lowering site wants [`lowering_leaf`] for its mints.
+    /// A [`copy_frame`] names no node, so it has nowhere to attach a consume or
+    /// a mint: a row needs a parent. Anything captured into one would vanish
+    /// from the record rather than land somewhere wrong. A pass site that trips
+    /// this wants [`enter`] on the node it is rewriting; a lowering site wants
+    /// [`lowering_leaf`] for its mints.
     fn assert_copy_only(label: RewriteLabel, consumed: &[NodeId], births: &[NodeId]) {
         debug_assert!(
             consumed.is_empty() && births.is_empty(),
-            "copy frame {label:?} captured consumes {consumed:?} and mints {births:?} — a frame \
-             with no origin has nothing to attach them to. A pass site wants `enter` on the \
-             node being rewritten; a lowering leaf mint belongs in `lowering_leaf`",
+            "copy frame {label:?} captured consumes {consumed:?} and mints {births:?} — a \
+             recording that names no node has nothing to attach them to. A pass site wants \
+             `enter` on the node being rewritten; a lowering leaf mint belongs in \
+             `lowering_leaf`",
         );
     }
 
-    /// Finalize this frame into a [`LoweringLog`]. Lowering frames are opened
-    /// **only** to capture ambient copies (uncurry's template-interior freshens,
-    /// the compare-chain operand freshens); the leaf mints append directly via
-    /// [`lowering_leaf`], so a lowering frame carries no consumed ids and no
-    /// births — only the captured per-origin copies flush here, as
+    /// Finalize this recording into a [`LoweringLog`]. Lowering opens a guard
+    /// only to capture ambient copies — uncurry's template-interior freshens and
+    /// the compare-chain operand freshens — while its leaf mints append directly
+    /// via [`lowering_leaf`]. So a lowering guard carries no consumed ids and no
+    /// births, and only the captured per-origin copies are written here, as
     /// [`LoweringStep::Copy`]s mirroring their origins' folded entries.
     fn flush_into_lowering(self, rec: &mut LoweringRecord) {
         let OpenStep {
@@ -1414,6 +1414,7 @@ impl OpenStep {
 /// sweep's coarse ones, because the fold is last-write-wins. Measured on the
 /// pipeline corpus: 318 nodes would be clobbered without it, and no leak class
 /// would report anything, since a clobbered node is still explained.
+/// `the_predicate_sweep_skips_already_recorded_nodes` pins the skip.
 pub(crate) fn lowering_predicate_leaf(id: NodeId, span: Span, nature: Nature, label: RewriteLabel) {
     if id == NodeId::PLACEHOLDER {
         return;
@@ -1462,12 +1463,12 @@ fn with_table(f: impl FnOnce(&mut LineageTable)) {
     });
 }
 
-/// RAII installer for the per-compile [`LineageTable`] — the sink every pass
-/// frame's flush writes into.
+/// RAII installer for the per-compile [`LineageTable`] — the sink every closing
+/// guard writes into.
 ///
-/// It brackets a **whole compile** rather than a pass, so it outlives — and
-/// nests around — every [`PassScope`] that compile opens; `Drop` clears the slot
-/// so a panicking compile never leaves a stale table for the next one.
+/// It covers a **whole compile** rather than a pass, so it outlives and nests
+/// around every [`PassScope`] that compile opens. `Drop` clears the slot, so a
+/// panicking compile never leaves a stale table for the next one.
 pub(crate) struct TableSession {
     // Not `Copy`/`Clone`; holds the installed-table invariant for its lifetime.
     _private: (),
@@ -1489,7 +1490,8 @@ impl TableSession {
         TableSession { _private: () }
     }
 
-    /// Drain and return the table, ending the session.
+    /// Drain and return the table, ending the session. The `Drop` that follows
+    /// finds the slot already empty and is a no-op.
     pub(crate) fn into_table(self) -> LineageTable {
         ACTIVE_TABLE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
     }
@@ -1514,28 +1516,26 @@ fn group_copies(copies: &[(NodeId, NodeId)]) -> Vec<(NodeId, Vec<NodeId>)> {
     out
 }
 
-/// Open a **lowering** copy-only frame: it consumes nothing, mints nothing, and
-/// exists solely to capture the `(origin, fresh)` pairs a clone's freshen reports,
-/// which flush as per-origin [`LoweringStep::Copy`]s (or, under a pass scope, as
-/// one row per copy).
+/// Open a **lowering** copy-only recording: it consumes nothing, mints nothing,
+/// and exists to capture the `(origin, fresh)` pairs a clone's freshen reports,
+/// which are written as per-origin [`LoweringStep::Copy`]s (or, under a pass
+/// scope, as one row per copy).
 ///
-/// This is the one frame kind with **no origin**, and lowering is the one place
-/// that shape is right: uncurry's template-interior freshens and the
-/// compare-chain operand freshens duplicate nodes with no slot being rewritten,
-/// so there is no id for a bracket to name. Every copy the frame captures
-/// carries its own origin from the hook, so the frame itself needs none — which
-/// is exactly why it can afford to declare nothing at all. A *pass* that
-/// duplicates uses [`enter`], whose origin is the node the duplication is being
+/// This is the one recording that **names no node**, and lowering is where that
+/// shape fits: uncurry's template-interior freshens and the compare-chain
+/// operand freshens duplicate nodes with no slot being rewritten, so there is no
+/// id to name. Every captured copy carries its own origin from the hook, which
+/// is exactly why this one can afford to declare nothing at all. A *pass* that
+/// duplicates uses [`enter`] instead, naming the node the duplication is
 /// performed for.
 ///
 /// `nature` is fixed at [`Machinery`](Nature::Machinery) rather than taken as an
 /// argument because a lowering copy's nature is never read: a
 /// [`LoweringStep::Copy`] mirrors the origin's already-folded attribution
-/// *verbatim*, so passing a nature here would be passing an unobservable value —
-/// and a wrong one (a `Nature::Source` on a copy frame) would look meaningful
-/// while being inert. A pass copy's row *does* carry a nature that reaches the
-/// attribution; that is one more reason a pass duplication belongs in [`enter`],
-/// which names it.
+/// *verbatim*, so a nature here would be unobservable, and a wrong one (a
+/// `Nature::Source` on a copy) would look meaningful while being inert. A pass
+/// copy's row *does* carry a nature that reaches the attribution, which is one
+/// more reason a pass duplication belongs in [`enter`].
 pub(crate) fn copy_frame(label: RewriteLabel) -> FrameGuard {
     STEP_STACK.with(|s| {
         let mut stack = s.borrow_mut();
@@ -1554,50 +1554,43 @@ pub(crate) fn copy_frame(label: RewriteLabel) -> FrameGuard {
 }
 
 // ===========================================================================
-// Driver capture: brackets keyed on node identity.
+// Capture keyed on node identity.
 //
-// A pass opens a bracket naming the node it is *about to rewrite* and declares
-// nothing else. Everything minted while the bracket is innermost attaches to
-// that node as a `Copy` — "mirrors its lineage" — which is silent on whether the
-// node survived. Deaths are the pane boundary's live-set difference, so no site
-// predicts a fate.
+// A rewriting site names the node it is *about to rewrite* and declares nothing
+// else. Every id minted while that guard is the innermost one open records the
+// named node as its parent, which says nothing about whether the named node
+// survived: death is the pane boundary's live-set difference, so no site predicts
+// a fate.
 //
-// A frame therefore carries an `origin: NodeId` — an observed parentage — and
-// not a predicted death set. The produced side is never declared at all: it is a
-// byproduct of construction, discovered through the mint hooks.
-//
-// There is no constructor for a frame that declares anything: every rewriting
-// site opens an `enter` bracket, and the one frame with no origin (`copy_frame`)
-// is lowering's copy sink, which declares nothing either.
+// The produced side is never declared. It is a byproduct of construction,
+// discovered through the mint and copy hooks. The one recording that names no
+// node is `copy_frame`, lowering's copy sink, whose captured copies each carry
+// their own origin.
 // ===========================================================================
 
-/// Open a **driver bracket** over the node currently in the slot being
-/// rewritten, returning an RAII guard that finalizes it on drop.
+/// Open a recording over the node currently in the slot being rewritten,
+/// returning an RAII guard that finalizes it on drop.
 ///
 /// `slot_id` is read off the node *before* the rewrite runs; every id minted
-/// while this is the innermost frame records `slot_id` as its parent. Nothing is
-/// declared and no fate is predicted — see [`OpenStep::flush_bracket`].
+/// while this guard is the innermost one open records `slot_id` as its parent.
+/// The site declares nothing further — see [`OpenStep::flush_into_table`].
 ///
-/// The guard form rather than a closure is an **ergonomics judgment**, not a
-/// type-system limitation: every current site's bracketed region is
-/// `return <one expression>`, which a `FnOnce` would wrap fine. Two things make
-/// the scope the better unit anyway:
+/// A guard rather than a closure, for two reasons that outlive the ergonomics:
 ///
-/// * **The bracketed region is a scope, not an expression.** A site may want to
-///   talk to the open frame after opening it — `mut_elim` calls [`FrameGuard::blame`] on the
+/// * **The region is a scope, not an expression.** A site may talk to the open
+///   recording after opening it — `mut_elim` calls [`FrameGuard::blame`] on the
 ///   next line, naming the `For` so the products resolve to the loop keyword's
 ///   span rather than the enclosing statement's. A closure taking only the
-///   rewrite has no channel for that; the frame's extra channels would have to
-///   become parameters, one per channel.
+///   rewrite has no channel for that, so each extra channel would become a
+///   parameter.
 /// * **A channel may fire from a runtime-decided point inside the region.**
-///   Whether a rewrite takes the arm that widens its attribution is decided by
-///   a `match` on the node, potentially far below the `enter`. Expressing that
-///   as a closure means making a function's whole tail a closure body so that
-///   one arm can reach the frame.
+///   Whether a rewrite takes the arm that widens its attribution is decided by a
+///   `match` on the node, potentially far below the `enter`. As a closure, that
+///   means making a function's whole tail a closure body so one arm can reach
+///   the recording.
 ///
-/// Nothing is lost by the guard: the bracket needs the id only at *entry* (the
-/// `Copy` encoding never inspects the exit state), so a scope guard carries
-/// exactly the information a closure would.
+/// The guard costs nothing in expressiveness: the id is needed only at *entry*,
+/// and nothing inspects the slot at exit.
 pub(crate) fn enter(slot_id: NodeId, label: RewriteLabel, nature: Nature) -> FrameGuard {
     STEP_STACK.with(|s| {
         let mut stack = s.borrow_mut();
@@ -1615,39 +1608,41 @@ pub(crate) fn enter(slot_id: NodeId, label: RewriteLabel, nature: Nature) -> Fra
     })
 }
 
-/// RAII finalizer for an open frame. Popping and flushing on `Drop` is
-/// panic-safe: an unwind through an open frame still pops it (so the stack
-/// is never left corrupt) and flushes what was captured before the panic.
+/// RAII finalizer for an open recording. Popping and writing on `Drop` is
+/// panic-safe: an unwind through an open recording still pops it, so the stack
+/// is never left corrupt, and writes what was captured before the panic.
 ///
-/// The guard is also the *only* handle on the frame it opened: the extra
+/// The guard is also the *only* handle on the recording it opened: the extra
 /// channels ([`FrameGuard::also_consumes`], [`FrameGuard::blame`]) are inherent
-/// methods on it, so a site cannot address a frame it does not hold — the
-/// innermost frame may belong to a callee or to an enclosing recursion.
+/// methods on it, so a site cannot address a recording it does not hold — the
+/// innermost one may belong to a callee or to an enclosing recursion.
 #[must_use = "a dropped FrameGuard records nothing — bind it (`let _g = …`), \
               and note `let _ = …` drops it immediately"]
 pub(crate) struct FrameGuard {
-    /// The stack index this frame occupied when opened, for the LIFO tripwire.
+    /// The stack index this recording occupied when opened, for the LIFO
+    /// tripwire.
     depth: usize,
 }
 
 impl FrameGuard {
-    /// Fusion (many:1): this frame **also** destroys `id`, a node the driver
-    /// cannot see because it is not the bracketed one.
+    /// Fusion (many:1): this rewrite **also** consumed `id`, a node the
+    /// construction hooks cannot attribute because it is not the one the site
+    /// named.
     ///
-    /// The intended sole escape hatch, and **the only place any id is named at
-    /// record time** — everything else about a frame is observed. The named id
-    /// joins the bracketed origin in the products' `parents`, so it asserts
-    /// descent, not a fate.
+    /// The only channel that adds a *consumed* id beyond the named one, and so
+    /// **the only place any id is named at record time** — everything else about
+    /// a recording is observed. The named id joins the site's own node in the
+    /// products' `parents`, asserting descent and nothing about `id`'s fate.
     ///
-    /// A [`copy_frame`] has no origin for it to sit beside, so this is
+    /// A [`copy_frame`] names no node for it to sit beside, so this is
     /// meaningless there and [`assert_copy_only`] catches it.
     ///
     /// [`assert_copy_only`]: OpenStep::assert_copy_only
-    // No production caller: the compiler's rewrites are all 1:many, so every
-    // bracket flushes a `Copy`. The hatch is retained because it is the only way
-    // to express the many:1 shape at all — a fusion onto an older survivor has
-    // to remint (`consumed: [S, D…] → produced: [S′]`) to keep parents ahead of
-    // children, and there is no other channel that can say so. Exercised by
+    // No production caller: every rewrite in the compiler is 1:many, so each
+    // recording writes one parent per product. The channel is retained because
+    // nothing else can express the many:1 shape — a fusion onto an older
+    // survivor has to remint (`consumed: [S, D…] → produced: [S′]`) to keep
+    // parents ahead of children. Exercised by
     // `a_fusion_gives_every_product_the_bipartite_product`.
     #[allow(dead_code)]
     pub(crate) fn also_consumes(&self, id: NodeId) {
@@ -1657,38 +1652,38 @@ impl FrameGuard {
         self.with_own_frame(|top| top.consumed.push(id));
     }
 
-    /// Additional source attribution for this frame: nodes its products are
-    /// *about* beyond the one being rewritten.
+    /// Additional source attribution: nodes this rewrite's products are *about*
+    /// beyond the one being rewritten.
     ///
-    /// With empty blame the products take the bracketed node's spans (the
-    /// default, and right for most rewrites). Naming blame **adds** to that —
-    /// attribution is the union of the parents' spans and these — so a site
-    /// widens the attribution rather than redirecting it.
+    /// With no blame the products take the named node's spans, which is right for
+    /// most rewrites. Naming blame **adds** to that — attribution is the union of
+    /// the parents' spans and these — so a site widens the attribution rather
+    /// than redirecting it.
     ///
-    /// It relates without claiming descent: these ids may name nodes that
-    /// survive the rewrite, so they ride the `blame` column rather than
-    /// `parents` and reach the pane-to-pane relation as *relatedness* edges
-    /// ([`EdgeLabels`]) — a consumer receives both labels and can render or
-    /// prune the relatedness itself. Weakest-link closure keeps the distinction
-    /// alive downstream: anything reached through one of these hops is related,
-    /// never descended.
+    /// Blame relates without claiming descent: these ids may name nodes that
+    /// survive the rewrite, so they ride the `blame` column rather than `parents`
+    /// and reach the pane-to-pane relation as *relatedness* edges
+    /// ([`EdgeLabels`]), which the inspector can render or prune. Weakest-link
+    /// closure keeps that distinction alive at a distance: anything reached
+    /// through one of these hops is related, never descended.
     pub(crate) fn blame(&self, ids: &[NodeId]) {
         self.with_own_frame(|top| top.blame.extend(ids.iter().copied()));
     }
 
-    /// Address *this* guard's frame, asserting it is the innermost open one.
+    /// Address *this* guard's own recording, asserting it is the innermost open
+    /// one.
     ///
-    /// The channels above are only meaningful about the frame the caller holds;
-    /// reaching whatever happens to be on top would silently retarget a callee's
-    /// or an enclosing recursion's frame. Same `debug_assert_eq!` convention as
-    /// the LIFO tripwire in [`Drop`](FrameGuard::drop).
+    /// The channels above are only meaningful about the recording the caller
+    /// holds; reaching whatever happens to be on top would silently retarget a
+    /// callee's or an enclosing recursion's. Same `debug_assert_eq!` convention
+    /// as the LIFO tripwire in [`Drop`](FrameGuard::drop).
     fn with_own_frame(&self, f: impl FnOnce(&mut OpenStep)) {
         STEP_STACK.with(|s| {
             let mut stack = s.borrow_mut();
             debug_assert_eq!(
                 stack.len(),
                 self.depth + 1,
-                "FrameGuard channel used while it is not the innermost open frame \
+                "FrameGuard channel used while it is not the innermost open recording \
                  (expected depth {}, stack has {})",
                 self.depth,
                 stack.len(),
@@ -1702,8 +1697,9 @@ impl FrameGuard {
 
 impl Drop for FrameGuard {
     fn drop(&mut self) {
-        // Pop our frame. Guards drop in LIFO order in normal control flow and on
-        // unwind alike; the tripwire catches a manually-mis-ordered drop.
+        // Pop this guard's recording. Guards drop in LIFO order in normal
+        // control flow and on unwind alike; the tripwire catches a
+        // manually-mis-ordered drop.
         let frame = STEP_STACK.with(|s| {
             let mut stack = s.borrow_mut();
             debug_assert_eq!(
@@ -1716,9 +1712,9 @@ impl Drop for FrameGuard {
             stack.pop()
         });
         let Some(frame) = frame else { return };
-        // Lowering records into its own log; a pass frame writes table rows
-        // tagged with the ambient pass. Under neither, the flush is a silent
-        // no-op — the frame still captured, it simply has nowhere to land.
+        // Lowering records into its own log; under a pass scope the rows go to
+        // the table, tagged with the ambient pass. Under neither, the write is a
+        // silent no-op: the recording captured, and has nowhere to land.
         if ACTIVE_LOWERING_LOG.with(|slot| slot.borrow().is_some()) {
             ACTIVE_LOWERING_LOG.with(|slot| {
                 if let Some(rec) = slot.borrow_mut().as_mut() {
@@ -1734,9 +1730,10 @@ impl Drop for FrameGuard {
 }
 
 /// A hook called from `Expr::new` for every minted [`NodeId`]. Pushes the id
-/// into the innermost open frame's births, or does nothing when no frame is open
+/// into the innermost open recording's births, or does nothing when none is open
 /// (the common case — a borrow and an emptiness check). The [`PLACEHOLDER`]
-/// sentinel is ignored so `Default`/`mem::take` throwaways never pollute a frame.
+/// sentinel is ignored, so `Default`/`mem::take` throwaways are never attributed
+/// to a rewrite.
 ///
 /// [`PLACEHOLDER`]: NodeId::PLACEHOLDER
 pub(crate) fn on_mint(id: NodeId) {
@@ -1772,7 +1769,11 @@ impl Drop for PreservingIds {
 /// Open a scope in which [`TypedExpr`](crate::ccl::expr::TypedExpr)'s `Clone`
 /// **preserves** ids instead of freshening them.
 ///
-/// Reach for this through
+/// Freshening is the default and the norm: a clone is a sibling of what it
+/// copied, with its own identity and a row recording the pair. This scope
+/// suppresses that, so every use is an exception that has to argue for itself.
+///
+/// Reach for it through
 /// [`TypedExpr::clone_preserving_ids`](crate::ccl::expr::TypedExpr::clone_preserving_ids),
 /// never directly: the scope must cover the clone and nothing else, and a
 /// genuine duplication performed inside one would silently produce a
@@ -1831,8 +1832,8 @@ pub(crate) fn copy_id(origin: NodeId) -> NodeId {
 }
 
 /// A hook called from the freshen helpers for every `(origin, fresh)`
-/// duplication. Pushes the pair into the innermost open frame's copies, or does
-/// nothing when no frame is open. Guards the [`PLACEHOLDER`] sentinel on both
+/// duplication. Pushes the pair into the innermost open recording's copies, or
+/// does nothing when none is open. Guards the [`PLACEHOLDER`] sentinel on both
 /// sides, as [`on_mint`] does: a placeholder origin would fold as
 /// [`Leak::ParentUnknown`] against an id nothing ever records.
 ///
@@ -1855,7 +1856,7 @@ pub(crate) fn on_copy(origin: NodeId, fresh: NodeId) {
 /// its blame node to a span through it. [`into_log`](Self::into_log) drains and
 /// ends the session; `Drop` clears the slot so a panic never leaves a stale log
 /// installed. At most one per thread, and it must fully drain before the first
-/// [`PassScope`] opens — a frame flushing while both were installed would record
+/// [`PassScope`] opens — a guard closing while both were installed would record
 /// lowering-shaped copies for a pass rewrite.
 pub(crate) struct LoweringSession {
     // Not `Copy`/`Clone`; holds the installed-log invariant for its lifetime.
@@ -1877,8 +1878,8 @@ impl LoweringSession {
         LoweringSession { _private: () }
     }
 
-    /// Drain and return the recorded log, ending the session. The subsequent
-    /// `Drop` is then a no-op (the slot is already empty).
+    /// Drain and return the recorded log, ending the session. The `Drop` that
+    /// follows finds the slot already empty and is a no-op.
     pub(crate) fn into_log(self) -> LoweringLog {
         ACTIVE_LOWERING_LOG.with(|slot| slot.borrow_mut().take().unwrap_or_default().log)
     }
@@ -1890,19 +1891,18 @@ impl Drop for LoweringSession {
     }
 }
 
-/// RAII installer for the ambient [`Pass`] a frame's flush tags its rows with.
+/// RAII installer for the ambient [`Pass`] every row is tagged with.
 ///
 /// One scope per pass, opened at the boundary that runs it. The pass is carried
-/// here rather than passed per frame because a bracket site knows its `label`
-/// and `nature` but not which pass is running, and because the boundary that
-/// opens the scope is precisely the thing that does: one pass runs inside one
-/// scope, so the pass is ambient over the scope's whole extent. (A scope over a
-/// *window* of several passes, as the audits open, tags every row with the one
-/// pass it names — no single pass being the truthful answer there.)
+/// here rather than named per recording because a recording site knows its
+/// `label` and `nature` but not which pass is running, while the boundary that
+/// opens the scope knows exactly that: one pass runs inside one scope, so the
+/// pass is ambient over the scope's whole extent. (A scope spanning several
+/// passes, as an audit window opens, tags every row with the one pass it names —
+/// no single pass being the truthful answer there.)
 ///
-/// Opening a scope is what turns pass recording **on**: outside one a frame
-/// still captures, but its flush has no tag to complete a row with and writes
-/// nothing.
+/// Opening a scope is what turns pass recording **on**: outside one a guard still
+/// captures, but has no tag to complete a row with and writes nothing.
 pub(crate) struct PassScope {
     // Not `Copy`/`Clone`; holds the installed-pass invariant for its lifetime.
     _private: (),
@@ -1916,8 +1916,8 @@ impl PassScope {
         debug_assert!(
             ACTIVE_LOWERING_LOG.with(|slot| slot.borrow().is_none()),
             "opening a PassScope ({pass:?}) while lowering's log is still installed — a \
-             frame would flush lowering-shaped copies for a pass rewrite. Drain the \
-             LoweringSession first",
+             closing guard would write lowering-shaped copies for a pass rewrite. Drain \
+             the LoweringSession first",
         );
         ACTIVE_PASS.with(|slot| {
             let mut slot = slot.borrow_mut();
@@ -2174,9 +2174,9 @@ mod tests {
     fn the_write_order_of_the_rows_does_not_change_the_fold() {
         // The property the ascending sweep buys: the rows are an edge set, so
         // writing them in dependency order or in reverse gives byte-identical
-        // results. It is not a nicety — a frame's rows are written when the
-        // frame closes, so an enclosing rewrite's rows land after the rows of
-        // the rewrites it contains.
+        // results. Write order is not chronology — rows are written when their
+        // guard drops, so an enclosing rewrite's rows land after the rows of the
+        // rewrites nested inside it.
         let (rows, inputs, outputs, upstream) = mixed_window();
         let mut reversed = rows.clone();
         reversed.reverse();
@@ -2931,7 +2931,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bracket_rows_every_birth_on_its_slot() {
+    fn a_recording_rows_every_birth_on_its_slot() {
         let slot = NodeId::fresh();
         let (mut a, mut b) = (NodeId::PLACEHOLDER, NodeId::PLACEHOLDER);
         let table = recorded(|| {
@@ -2942,7 +2942,7 @@ mod tests {
         assert_eq!(
             table.parents(a),
             &[slot],
-            "a birth is parented on the node the bracket named",
+            "a birth is parented on the node the recording named",
         );
         assert_eq!(table.parents(b), &[slot]);
         assert_eq!(
@@ -2953,21 +2953,21 @@ mod tests {
                 label: "rw.build",
             }),
             "the row's `via` is the ambient pass — the one part of the tag no \
-             bracket site knows",
+             recording site knows",
         );
         assert_eq!(table.rule(a), table.rule(b));
         assert!(
             !table.contains(slot),
-            "the bracketed slot is read, not produced: it gets no row of its own",
+            "the named slot is read, not produced: it gets no row of its own",
         );
         assert_eq!(table.len(), 2, "one row per produced id");
-        assert_eq!(step_stack_depth(), 0, "guard popped its frame");
+        assert_eq!(step_stack_depth(), 0, "guard popped its recording");
     }
 
     #[test]
-    fn nested_brackets_attribute_each_mint_to_its_innermost_slot() {
-        // Bracket granularity is precision: a mint attributes to the innermost
-        // open bracket. Coarser bracketing is not *wrong*, it is less precise —
+    fn nested_recordings_attribute_each_mint_to_its_innermost_slot() {
+        // Granularity is precision: a mint attributes to the innermost open
+        // recording. A coarser recording is not *wrong*, it is less precise —
         // the mint attaches to whatever enclosing node was named.
         let (outer_slot, inner_slot) = (NodeId::fresh(), NodeId::fresh());
         let (mut outer_pre, mut inner_id, mut outer_post) = (
@@ -2989,7 +2989,7 @@ mod tests {
         assert_eq!(
             table.parents(outer_post),
             &[outer_slot],
-            "the outer bracket owns the births outside the inner extent, and only those",
+            "the outer recording owns the births outside the inner extent, and only those",
         );
         assert_eq!(table.rule(inner_id).map(|t| t.label), Some("rw.inner"));
         assert_eq!(table.rule(outer_pre).map(|t| t.label), Some("rw.outer"));
@@ -2997,10 +2997,10 @@ mod tests {
 
     #[test]
     fn a_deep_freshen_rows_each_node_on_its_own_origin() {
-        // Build a 3-node tree (tuple + two lits) OUTSIDE any frame, then clone it
-        // inside a copy-only frame — one that consumes nothing and mints nothing
-        // of its own, so its whole output is the freshen pairs `Clone` reports
-        // through the `on_copy` hook.
+        // Build a 3-node tree (tuple + two lits) with nothing recording, then
+        // clone it inside a copy-only recording — one that consumes nothing and
+        // mints nothing of its own, so its whole output is the freshen pairs
+        // `Clone` reports through the `on_copy` hook.
         let source = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
         // The source's node ids are the origins each per-node row should name.
         let old_ids: HashSet<NodeId> = std::iter::once(source.node_id())
@@ -3035,12 +3035,12 @@ mod tests {
     }
 
     #[test]
-    fn a_bracket_that_only_clones_records_nothing_of_its_own() {
-        // A bracket whose rewrite turns out to be a pure duplication (nothing
+    fn a_recording_that_only_clones_records_nothing_of_its_own() {
+        // A recording whose rewrite turns out to be a pure duplication (nothing
         // minted by hand, nothing fused) writes only the rows the clone reported,
         // none of them naming its slot.
         let source = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
-        // The bracketed slot is the node being rewritten, not the tree being
+        // The named slot is the node being rewritten, not the tree being
         // duplicated — the two are distinct at every real site.
         let slot = NodeId::fresh();
         let mut clone = Expr::lit(Lit::Int(0));
@@ -3055,7 +3055,7 @@ mod tests {
             assert_ne!(
                 table.parents(id),
                 &[slot],
-                "each row names the cloned node's own origin, not the frame's slot",
+                "each row names the cloned node's own origin, not the recording's slot",
             );
         }
     }
@@ -3064,8 +3064,8 @@ mod tests {
     fn a_captured_freshen_rows_on_its_own_origin() {
         // Most production in `channelize`/`transact_phase` is a `clone`, not
         // an `Expr::new`. Those fire `on_copy`, whose origin is the *copied* node,
-        // not the bracketed slot — so the copy channel stays independent of the
-        // bracket's own parentage rather than being folded into it.
+        // not the named slot — so the copy channel stays independent of the
+        // recording's own parentage rather than being folded into it.
         let tree = Expr::tuple(vec![Expr::lit(Lit::Int(1))]);
         let slot = NodeId::fresh();
         let mut copy_root = NodeId::PLACEHOLDER;
@@ -3093,9 +3093,9 @@ mod tests {
 
     #[test]
     fn no_pass_scope_open_makes_the_flush_a_silent_no_op() {
-        // A bracket open with no ambient pass: births still capture into the
-        // frame, but the guard's flush has no tag to complete a row with and
-        // does nothing (no panic).
+        // A recording open with no ambient pass: births still capture into it,
+        // but the guard has no tag to complete a row with and writes nothing (no
+        // panic).
         assert!(
             ACTIVE_PASS.with(|s| s.borrow().is_none()),
             "precondition: no pass scope open",
@@ -3129,18 +3129,18 @@ mod tests {
     }
 
     #[test]
-    fn panic_inside_a_bracket_unwinds_without_poisoning_the_stack() {
+    fn panic_inside_a_recording_unwinds_without_poisoning_the_stack() {
         assert_eq!(step_stack_depth(), 0, "clean precondition");
         let result = std::panic::catch_unwind(|| {
             let _g = enter(NodeId::fresh(), "boom", Nature::Expansion);
             let _a = Expr::lit(Lit::Int(1));
-            panic!("deliberate panic inside an open bracket");
+            panic!("deliberate panic inside an open recording");
         });
         assert!(result.is_err(), "the panic propagated");
         assert_eq!(
             step_stack_depth(),
             0,
-            "the guard's Drop popped the frame on unwind"
+            "the guard's Drop popped the recording on unwind"
         );
 
         // Recording still works afterward.
@@ -3161,13 +3161,13 @@ mod tests {
         let table = recorded(|| {
             d1 = Expr::default().node_id();
             d2 = Expr::default().node_id();
-            // Even inside an open bracket, a Default throwaway must not be
+            // Even inside an open recording, a Default throwaway must not be
             // captured.
             let _g = enter(slot, "rw", Nature::Expansion);
             let _d3 = Expr::default();
-            // A real mint alongside it, so the frame records at all: a bracket
-            // that captures nothing is a preserve and stays silent, which would
-            // make "the Default was not captured" vacuously true.
+            // A real mint alongside it, so something is recorded at all: a
+            // recording that captures nothing is a preserve and stays silent,
+            // which would make "the Default was not captured" vacuously true.
             kept = Expr::lit(Lit::Int(3)).node_id();
         });
 
@@ -3214,10 +3214,10 @@ mod tests {
     }
 
     #[test]
-    fn bracket_over_an_untouched_node_records_nothing() {
+    fn a_recording_over_an_untouched_node_records_nothing() {
         // A rule that inspects and declines. No mint, no copy, id unchanged:
         // the *preserve*, and it must not cost a row — this is what lets a pass
-        // bracket every rewrite *attempt* rather than every firing.
+        // open a recording on every rewrite *attempt* rather than every firing.
         let e = Expr::lit(Lit::Int(1));
         let table = recorded(|| {
             let _g = enter(e.node_id(), "rw.noop", Nature::Machinery);
@@ -3226,7 +3226,7 @@ mod tests {
     }
 
     #[test]
-    fn bracket_over_an_in_place_mutation_records_nothing() {
+    fn a_recording_over_an_in_place_mutation_records_nothing() {
         // `simplify`'s `*op = BinOpKind::Concat` shape: the node's *value*
         // changes, its identity does not. A preserve, and correctly silent —
         // the node's lineage is the self-edge it already had.
@@ -3240,15 +3240,15 @@ mod tests {
         assert_eq!(table.len(), 0);
     }
 
-    // ---- driver capture: a bracket declares nothing ------------------------
+    // ---- a recording declares nothing --------------------------------------
     //
-    // The property under test throughout: a bracket names the node being
-    // rewritten; births are captured; fate is the boundary's live-set
-    // difference. These are the pass/fail statements behind the design.
+    // The property under test throughout: a site names the node being rewritten,
+    // births are captured, and fate is the boundary's live-set difference. These
+    // are the pass/fail statements behind the design.
 
     #[test]
-    fn end_to_end_bracket_feeds_the_fold() {
-        // Record a real rewrite through a bracket, then fold the rows and check
+    fn an_end_to_end_recording_feeds_the_fold() {
+        // Record a real rewrite, then fold the rows and check
         // the resulting relation and attribution.
         let a = Expr::lit(Lit::Int(1));
         let a_id = a.node_id();
@@ -3277,13 +3277,14 @@ mod tests {
     #[test]
     fn born_copied_discarded_template_composes_without_leaks() {
         // The `fold_induction_loop`/`build_writer` template shape (transact/letrec
-        // instrumentation hazard): a single frame births a template `T`, copies
+        // instrumentation hazard): one recording births a template `T`, copies
         // it per read site (the read-your-writes environment discharge freshens
         // a clone's interior at each), and discards `T` (it never reaches the
         // output tree). `T` is neither an input-pane nor an output-pane id, so
         // it triggers no leak (`Died` checks inputs only, `Unexplained` checks
-        // outputs only) — the whole shape composes in ONE frame, no split needed.
-        let origin = NodeId::fresh(); // the bracketed slot, an input-pane id
+        // outputs only) — the whole shape composes in ONE recording, no split
+        // needed.
+        let origin = NodeId::fresh(); // the named slot, an input-pane id
         let (mut t, mut c1, mut c2) = (
             NodeId::PLACEHOLDER,
             NodeId::PLACEHOLDER,
@@ -3291,7 +3292,8 @@ mod tests {
         );
         let table = recorded(|| {
             let _g = enter(origin, "test.template", Nature::Machinery);
-            // Birth the template inside the frame (a mint captured as a birth).
+            // Birth the template inside the recording (a mint captured as a
+            // birth).
             let template = Expr::lit(Lit::Int(0));
             t = template.node_id();
             // Copy it twice — one freshened clone per read site.
@@ -3321,9 +3323,9 @@ mod tests {
         );
         assert!(
             defects(&leaks).is_empty(),
-            "born-copied-discarded template composes defect-free in one frame: {leaks:?}",
+            "born-copied-discarded template composes defect-free in one recording: {leaks:?}",
         );
-        // c1/c2 carry T's roots — the frame's parentage (`origin`).
+        // c1/c2 carry T's roots — the recording's parentage (`origin`).
         assert_eq!(ids_of(map.upstream(&c1)), vec![origin]);
         assert_eq!(ids_of(map.upstream(&c2)), vec![origin]);
         assert_eq!(
@@ -3333,9 +3335,9 @@ mod tests {
     }
 
     #[test]
-    fn bracketed_wrap_does_not_claim_the_wrapped_node_died() {
-        // The adopt-a-live-subtree shape: mint a wrapper *over* the bracketed
-        // node, which stays in the tree as a child. Both ids are live at the
+    fn a_recorded_wrap_does_not_claim_the_wrapped_node_died() {
+        // The adopt-a-live-subtree shape: mint a wrapper *over* the named node,
+        // which stays in the tree as a child. Both ids are live at the
         // boundary; the fold must report no death and no leak. A record that
         // declared the slot consumed would report it dead.
         let slot = NodeId::fresh();
@@ -3363,7 +3365,7 @@ mod tests {
     #[test]
     fn deaths_are_the_boundary_difference_not_a_declaration() {
         // The fate-prediction replacement, end to end. One rewrite; whether the
-        // bracketed node survives is decided *only* by which snapshot it is in.
+        // named node survives is decided *only* by which snapshot it is in.
         // The identical record yields "survived" against one output pane and
         // "died" against another, and no site said either.
         let make = || {
@@ -3449,7 +3451,7 @@ mod tests {
     #[test]
     fn an_unrecorded_id_reads_empty_rather_than_panicking() {
         // The predicate-interior case: a real id from the same counter that no
-        // bracket ever produced. Every read must have an answer for it.
+        // recording ever produced. Every read must have an answer for it.
         let mut table = LineageTable::default();
         let [parent, recorded, never] = ids();
         let rule = table.intern_rule(tag("rw.one"));
@@ -3537,7 +3539,7 @@ mod tests {
     fn a_differing_nature_is_a_distinct_rule_despite_a_shared_label() {
         // The triple is interned whole: one arm of a rewrite relabelled to a
         // different nature is a different rule, which is exactly why a site that
-        // needs two natures opens a second frame rather than mutating one.
+        // needs two natures opens a second recording rather than mutating one.
         let mut table = LineageTable::default();
         let machinery = table.intern_rule(tag("rw.one"));
         let expansion = table.intern_rule(RewriteTag {

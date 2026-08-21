@@ -503,8 +503,8 @@ impl Subst {
         // editing one already in the tree (that is `rewrite_expr_go`, which takes
         // `&mut` and installs the replacement at the occurrence's own id). So the
         // nodes below are genuinely new and want **recording**, not id-preserving
-        // — and the node they are derived from is `e`. The bracket is at function
-        // entry because the `Var` arm returns early.
+        // — and the node they are derived from is `e`. The recording opens at
+        // function entry because the `Var` arm returns early.
         let _g = crate::ccl::lineage::enter(
             e.node_id(),
             "subst.transport",

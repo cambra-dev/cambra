@@ -233,7 +233,7 @@ fn inline_impl(expr: Expr) -> Expr {
                 && !is_mut_written(repl_name, &body)
             {
                 // Alias collapse: the `Let` and its `Var` bound-expr die, the
-                // body is promoted. Nothing is minted, so the bracket exists
+                // body is promoted. Nothing is minted, so the recording exists
                 // only to own the substitution's copies.
                 let _g = lineage::enter(node_id, "inline.alias", lineage::Nature::Machinery);
                 return substitute(body, &binding.name, &bound_expr);
@@ -395,13 +395,13 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                     param.ty,
                     argument.ty
                 );
-                // Beta reduction, bracketed on the `Apply` node it collapses.
-                // Notably it needs **no** escape hatch: the `Apply` and the
-                // `Lambda` both vanish and neither is named, because neither is
-                // in the output tree — the boundary difference reports both. The
-                // promoted `body` keeps its own id and is its own self-edge; the
-                // substituted argument copies arrive through `on_copy` as copies
-                // of the argument's own interior, which is what they are.
+                // Beta reduction, recorded against the `Apply` node it
+                // collapses. It needs no `FrameGuard::also_consumes`: the
+                // `Apply` and the `Lambda` both vanish, and neither has to be
+                // named, because the boundary difference reports both. The
+                // promoted `body` keeps its own id and is its own self-edge, and
+                // the substituted argument's copies arrive through `on_copy` as
+                // copies of the argument's own interior, which is what they are.
                 let _g = lineage::enter(node_id, "inline.beta", lineage::Nature::Expansion);
                 return substitute(*body, &param.name, &argument);
             }

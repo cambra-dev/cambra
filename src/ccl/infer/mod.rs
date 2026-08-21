@@ -535,7 +535,7 @@ pub(crate) fn run(
     // instances and a use-site coalesce *rebuilds* a predicate rather than
     // mutating one shared with the definition — occurrences share no mutable
     // state, so nothing needs to be kept in sync across them.
-    // Each coalesce error arrives blamed on the node whose frame raised it, so
+    // Each coalesce error arrives blamed on the node whose rule raised it, so
     // this pass's (potentially several) errors need no post-hoc attribution.
     let errors = coalesce_pass(expr);
     if !errors.is_empty() {

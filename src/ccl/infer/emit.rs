@@ -33,7 +33,7 @@ use crate::ccl::infer::solver::traits::Trait;
 /// All recursion (including the generic `Typing::subexpr` impl) routes through
 /// here, so the mark is maintained for every emitted node.
 ///
-/// The innermost frame wins for free: a nested rule overwrites the mark for its
+/// The innermost rule wins for free: a nested rule overwrites the mark for its
 /// own extent, so an error is stamped with the node that raised it, not with an
 /// ancestor that propagated it. Nothing is read after the walk unwinds.
 ///
@@ -48,7 +48,7 @@ use crate::ccl::infer::solver::traits::Trait;
 /// carry N nodes with no further change here.
 pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     let prev = ctx.enter_node(expr.node_id());
-    // One frame per node over the whole tree; grow on demand, as the other
+    // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
     let result = stacker::maybe_grow(512 * 1024, 1024 * 1024, || emit_node_inner(expr, ctx));
     ctx.leave_node(prev);
@@ -60,8 +60,8 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Loc
 fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
-    // The literal's own id, taken before the walk borrows the node — the slot the
-    // `Lit` rule brackets its singleton predicate on. See there.
+    // The literal's own id, taken before the walk borrows the node — the node the
+    // `Lit` rule records its singleton predicate against. See there.
     let node_id = expr.node_id();
     // The `Lambda` rule reads the node's own type for its kind (see
     // `emit_lambda`), taken before the walk borrows the node.
@@ -74,10 +74,10 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // predicate is a pure function of the literal value, memoized per
             // pass, so it is born the first time each distinct value is seen.
             //
-            // Bracket on the literal's own node. Two things follow. The mints
-            // land inside a frame, so the widened `collect_tree_ids` (which now
-            // reaches refinement predicates) can explain them instead of
-            // reporting `Unexplained`. And the resulting edge is the one
+            // Record against the literal's own node. Two things follow. The
+            // mints land inside an open recording, so the widened
+            // `collect_tree_ids` (which now reaches refinement predicates) can
+            // explain them instead of reporting `Unexplained`. And the resulting edge is the one
             // `predicate-lineage-report` records as missing: nothing used to
             // link a singleton refinement back to the literal the user wrote.
             let _g = crate::ccl::lineage::enter(

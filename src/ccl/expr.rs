@@ -854,8 +854,11 @@ impl TypedExpr {
     /// `src` is some *other* node — is this constructor's shape, and the one where
     /// a stray `node_id: NodeId::fresh()` hides: a preserve and a mint differ by
     /// one token in otherwise identical five-line literals. Those sites are marked
-    /// `TODO(preserve)` and are greppable; five remain, in `channelize`,
-    /// `mut_elim`, and `transact_phase`.
+    /// `TODO(preserve)` and are greppable: thirteen across five files —
+    /// `channelize` (eight), `mut_elim` (two), and one each in `transact_phase`,
+    /// `subst`, and `lambda_elim`. Eleven are this reach-for-another-id shape; the
+    /// two in `subst` and `lambda_elim` ask a different question, whether their
+    /// rebuild should mint or preserve at all.
     ///
     /// **A field-wise rebuild** — `let TypedExpr { node, ty, user_annotation,
     /// node_id } = expr;` then rebuilding with one child swapped — is *not* this
@@ -903,8 +906,8 @@ impl TypedExpr {
     ///
     /// Reach for this in exactly two situations. Anywhere else, a copy that
     /// duplicates ids is a bug waiting to be found by an id-uniqueness assert,
-    /// and the right fix is to **record** the freshened copy — open a frame — not
-    /// to suppress the freshen.
+    /// and the right fix is to **record** the freshened copy — open a recording
+    /// around it — not to suppress the freshen.
     ///
     /// # 1. A snapshot taken for rollback or comparison
     ///
@@ -931,11 +934,11 @@ impl TypedExpr {
     /// # What this is *not* for
     ///
     /// Not for silencing a `Leak::Unexplained` or `Leak::ParentUnknown`. Those
-    /// mean a copy was made with no frame open, or against an origin the table
-    /// never recorded — a **recording** gap. Measured: freshening everywhere and
-    /// recording it costs no compile time and no meaningful memory (the naive
-    /// arm ran *faster* than baseline at 2-3x the ids), so the honest fix is a
-    /// bracket. See the vault's `freshening-clone-report`.
+    /// mean a copy was made with nothing recording, or against an origin the
+    /// table never recorded — a **recording** gap. Measured: freshening
+    /// everywhere and recording it costs no compile time and no meaningful memory
+    /// (the naive arm ran *faster* than baseline at 2-3x the ids), so the honest
+    /// fix is to record the copy. See the vault's `freshening-clone-report`.
     pub(crate) fn clone_preserving_ids(&self) -> Self {
         let _preserving = crate::ccl::lineage::preserve_ids();
         self.clone()

@@ -157,9 +157,14 @@ fn rewrite_as_of_reads_go(expr: &mut Expr) {
     // as-of read; the join is the faithful rendering of what the user wrote, not
     // plumbing.
     //
-    // Bracketing the *attempt* rather than the firing is free: a non-matching
-    // node mints nothing, so the frame flushes nothing. The walk below is
-    // outside the frame, so a nested chain attributes to its own `let`.
+    // Recording the *attempt* rather than the firing is free: a non-matching
+    // node mints nothing, so the recording writes nothing. The walk below sits
+    // outside the recording, so a nested chain attributes to its own `let`.
+    //
+    // These rows reach no table in a normal compile: `compile_program` calls
+    // `rewrite_as_of_reads` outside every pass scope it opens, so they land only
+    // under an audit window (`CAMBRA_LINEAGE_AUDIT=full`, which ends at
+    // `post-as-of-read`).
     {
         let _g = lineage::enter(
             expr.node_id(),
@@ -759,7 +764,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
             // The rewritten seed *replaces* the stash, so the copy Rust forces here
             // is a move rather than a duplication: preserve the ids, which the
             // stash already recorded against the key's `MutDecl`. The terminal
-            // reads the rewrite mints are bracketed inside `resolve_await_finals`.
+            // reads the rewrite mints are recorded inside `resolve_await_finals`.
             let mut init = key_init[&k].init.clone_preserving_ids();
             resolve_await_finals(&mut init, &hist, &key_init);
             let decl = key_init[&k].decl;
@@ -992,7 +997,7 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         // `blame` names the `For` rather than the `ExprStmt`, so the products
         // resolve to the loop keyword's span rather than the statement's; blame ⊥
         // consumption, so this asserts nothing about the `For`'s fate. Both
-        // choices mirror `mut_elim`'s `letrec.loop`, which brackets the *same*
+        // choices mirror `mut_elim`'s `letrec.loop`, which records the *same*
         // `fold_induction_loop` call for a loop that stays in that pass — the one
         // difference being which statement is being folded away.
         //
@@ -1155,7 +1160,7 @@ fn strip(
                  standalone block in a singleton `For`)",
             );
             let new_rest = {
-                // Bracketed: the source copy the site takes, the statement
+                // Recorded here: the source copy the site takes, the statement
                 // wrappers `prepend_effects` mints for the lifted induction
                 // writes, and whatever `partition_block` rebuilds. The block
                 // itself is *not* consumed here — it travels on the site and is
@@ -1191,8 +1196,8 @@ fn strip(
         }
         let spliced = {
             // `splice_block` re-types the spine as it re-points each statement's
-            // continuation, but preserves every id, so this bracket usually
-            // captures nothing and emits nothing. It is here because the arm is a
+            // continuation, but preserves every id, so this recording usually
+            // captures nothing and writes nothing. It is here because the arm is a
             // rewrite: if a re-typed rebuild ever starts minting, the node lands
             // on the statement it belongs to instead of becoming a leak.
             let g = lineage::enter(stmt_id, "transact.unwrap_block", lineage::Nature::Machinery);
@@ -2465,7 +2470,7 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
         && keys.contains(&binding.name)
         && !out.contains_key(&binding.name)
     {
-        // Stash the register's init so a later stage can place it: `rebind_letrec`
+        // Stash the register's init so a later stage can place it: `walk_spine`
         // drops this whole `MutDecl` for a register key, so the original is gone
         // by then. The copy freshens and is **recorded** against the `MutDecl`
         // it is taken from — the same node the stash already carries as `decl`,
@@ -2474,8 +2479,8 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
         // Preserving instead would also be sound (only one of the two is ever
         // live), but it saved 20 ids over the whole pipeline suite — subtrees of
         // 1 to 3 nodes — which does not pay for an opt-out. What matters is only
-        // that the copy is not an *unrecorded* mint; a bracket gets that as well
-        // as preserving does.
+        // that the copy is not an *unrecorded* mint, and a recording gets that as
+        // well as preserving does.
         let _g = lineage::enter(
             expr.node_id(),
             "transact.key_init_stash",
