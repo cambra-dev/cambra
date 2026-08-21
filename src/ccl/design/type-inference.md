@@ -1083,13 +1083,23 @@ index counts the functions crossed from their codomain side between the referenc
 named and unnamed alike, so it survives `Type::without_pi_names`. One closing function and one
 opening function own the conversions, and four sites are their only callers.
 
-**Construction closes.** `Type::pi`, and every site assembling a `Fun { name: Some(_), .. }`,
-abstracts its codomain. A codomain that is a bare variable has nothing to close; emission's
+**Construction closes.** The type constructors — `Type::pi`, `Type::pi_kinded`,
+`Type::pi_eliminated`, `Type::fun_like` — abstract the codomain they are given, and so does every
+rebuild that assembles a dependent function around a codomain it computed from node types
+(`emit_cast`, `emit_compose`). A codomain that is a bare variable has nothing to close; emission's
 `pi(x, D, ?c)` is that case, and the refinements that later accumulate on `?c` reference `x` by name
 against their telescopes. A rebuild that carries a `FunKind` takes `Type::pi_kinded` rather than a
 `Fun` literal: the group-by partition function (`planning::groupby`'s `emit_groupby`) and the
 eliminated group-by lambda's Pi (`lambda_elim`) are dependent collections, and reaching for the
 literal to set `kind` is what leaves a free binder name in a stored type.
+
+Two sites assemble a `Fun { name: Some(_), .. }` and close nothing, one on each side of the
+construction boundary. `emit_lambda`'s codomain is the live in-solve type, which stays name-spelled:
+its refinements accumulate behind an inference variable, and closing them is landing's job, so closing
+the reachable ones here would put an index-spelled claim and a name-spelled claim at one position —
+what landing-close exists to prevent. `coalesce_compact_go`'s refinements arrive already closed, and the
+compact view it assembles from mirrors `Fun`s one-to-one, so a landed index counts to the function
+being built; closing is the identity there and the literal is what says so.
 
 **Refinement landing closes.** The compact and key walks close a refinement against the enclosing functions
 the walk is inside of, as it lands in the view, in the same two arms that force the edge

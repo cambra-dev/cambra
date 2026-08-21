@@ -7,7 +7,7 @@ use crate::ccl::infer::solver::{
     ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
-use crate::ccl::infer_var::Telescope;
+use crate::ccl::infer_var::{Telescope, TelescopeWalk};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{BaseType, Expr, Level, Name, Type, TypedExprNode};
@@ -93,6 +93,12 @@ impl CheckCtx {
             telescope: Telescope::empty(),
             derivation,
         }
+    }
+}
+
+impl TelescopeWalk for CheckCtx {
+    fn telescope_mut(&mut self) -> &mut Telescope {
+        &mut self.telescope
     }
 }
 
@@ -227,11 +233,7 @@ impl Typing for CheckCtx {
         // Check trusts each `Var`/binder node's recorded `Type` rather than
         // resolving names, so there is no name scope to maintain — only the
         // telescope, for the variables minted under this binder.
-        let extended = self.telescope.extended(name.clone());
-        let saved = std::mem::replace(&mut self.telescope, extended);
-        let r = f(self);
-        self.telescope = saved;
-        r
+        self.under_binder(name, f)
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -254,11 +256,7 @@ impl Typing for CheckCtx {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         // See `scoped`: no name scope, no generalization — telescope only.
-        let extended = self.telescope.extended(name.clone());
-        let saved = std::mem::replace(&mut self.telescope, extended);
-        let r = f(self);
-        self.telescope = saved;
-        r
+        self.under_binder(name, f)
     }
 
     fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {

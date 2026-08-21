@@ -1820,6 +1820,15 @@ struct ChainEnds {
 /// composes because the upstream genuinely carries `{D | r}` — matched
 /// structurally even across the predicate terms planning re-mints.
 ///
+/// The chain type this produces is a **codomain**, not a standalone type, so a
+/// reference to a binder the walk entered and left is bound by the enclosing
+/// dependent function rather than by anything the chain keeps. What
+/// [`emit_compose`] keeps is the *final* morphism's binder, which makes the chain
+/// itself dependent; a reference to an earlier morphism's binder rides out free and
+/// resolves against the position the chain lands in. `check_scope_valid` is what
+/// holds that: it checks every node's type against its lexical scope once inference
+/// ends.
+///
 /// `as_function` destructures the resolved function in Check and
 /// introduces-and-constrains in Emit. The single-sided `Var <: Var` rule leaves a
 /// `Proj` morphism's domain under-determined here (it only ever gets the lower

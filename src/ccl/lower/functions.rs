@@ -101,9 +101,13 @@ const OWN_BINDER: &str = "a parameter's type cannot depend on the parameter itse
 ///
 /// Rejecting here is what keeps the reference from reaching the solver as a refinement
 /// about a binder nothing binds, where it surfaces as an internal error rather
-/// than as a diagnostic about the program. A **curried** parameter list does carry
-/// the telescope, which is why a `Mut` parameter list is never checked and why an
-/// annotation on a nested `def` may reference the enclosing `def`'s parameter.
+/// than as a diagnostic about the program. A **curried** parameter list carries the
+/// telescope for a *backward* reference — an annotation naming a parameter to its
+/// left — which is why an annotation on a nested `def` may reference the enclosing
+/// `def`'s parameter. A `Mut` parameter list is curried and skips this check
+/// entirely, including for the forward reference the telescope does not cover; no
+/// claim escapes, because that path declares only the `Mut` parameters' types and
+/// drops every other annotation.
 ///
 /// `lowered` is `params`' annotations after [`lower_type_annotation`], positionally.
 fn reject_annotation_references(
