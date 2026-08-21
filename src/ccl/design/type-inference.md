@@ -1580,6 +1580,9 @@ so a comprehension over it gives back `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ 𝑇` ra
 Membership in a described kind tests a domain's shape, so a computed collection —
 whose domain is still a variable at emit — records a kinding constraint instead
 ([What the kind level needs from the solver](#what-the-kind-level-needs-from-the-solver)).
+The constraint has to live on the **variable** rather than be re-checked from the syntax
+later, because no annotation is left on the tree by then: monomorphization rebuilds the
+`let` and drops `user_annotation`, the binding becoming an anonymous `__mono`.
 
 `TypeKind::Any` is two containment rows: everything is contained in the universe, and the
 universe in nothing narrower, which is what rejects consuming a `Collection` where a
@@ -1741,7 +1744,7 @@ candidates can be non-ground at emission — which is what forming the Σ at the
 introduces ([Deliberately incomplete here](#deliberately-incomplete-here)), and is the
 same argument that puts a membership predicate's discharge late
 ([Entering a collection type whose domain has no shape
-when](collections.md#what-box-checks-against-a-collection-type-and-when)).
+solver](#what-the-kind-level-needs-from-the-solver)).
 
 The codomain edge is not merely an optimization to emit early — it *has* to be emitted
 during emission, because **post-coalesce records no bounds**. Anything needed to resolve a
@@ -2421,7 +2424,8 @@ from](#where-the-conditional-collection-σ-comes-from)).
   A sum is a pair, and consuming one projects its witness and dispatches; nothing today
   can read a witness off a value. That is a gap to close, not a property of the design —
   the runtime witness is the load-bearing planned item
-  (`src/ccl/design/collections.md`, "Future work"). For an **enumerated** sum this does not bite — the
+  (`src/ccl/design/collections.md`, "Realizing a conditional collection"). For an
+  **enumerated** sum this does not bite — the
   gate fan-out compiles the conditional and the realized union's extent is the selected
   domain — which is exactly why the gap has stayed invisible: the conditional-collection
   path is the one case that does not need the general mechanism. It bites for a
@@ -2429,7 +2433,8 @@ from](#where-the-conditional-collection-σ-comes-from)).
   runtime domain, and [`extent_of`] maps a *type* to an `Extent`. The shape to follow is
   `Type::DataSource` → `Extent::DataSourceDomain`, which resolves an opaque domain to a
   runtime handle; the witness wants the same treatment. This is the general machinery
-  the [first-class `Collection` value](collections.md#future-work) needs, and the
+  a [first-class `Collection` value](collections.md#realizing-a-conditional-collection)
+  needs, and the
   conditional-collection fan-out is its special case rather than a step toward it.
 
   Consuming a **heterogeneous** sum (`Σ 𝑇 ∈ {Int, String}. 𝑇`) additionally needs the

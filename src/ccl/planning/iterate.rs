@@ -369,7 +369,8 @@ pub(super) fn wrap_with_iterate(
     // its witness — "whichever candidate was taken" — and that is not something
     // `extent_of` can turn into an iteration source. Marking it for iteration would put a
     // witness where a domain belongs, replacing op-conversion's named rejection of an
-    // unrealized sum (`src/ccl/design/collections.md`, "Future work") with a confusing one.
+    // unrealized sum (`src/ccl/design/collections.md`, "Realizing a conditional
+    // collection") with a confusing one.
     //
     // **A refined witness is different: it still owes a restrict.** A consumer's filter
     // over a summed collection rides the witness (`{𝑤 | 𝑝}`, see

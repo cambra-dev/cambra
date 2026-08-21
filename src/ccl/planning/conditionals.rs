@@ -22,7 +22,7 @@
 //! monomorphization resolve its domain from the concrete producer before op-conversion. A
 //! described Σ that reaches op-conversion with no concrete domain fails there, which is the
 //! correct signal: that is the case needing a runtime witness rather than a static
-//! realization (`src/ccl/design/collections.md`, "Future work").
+//! realization (`src/ccl/design/collections.md`, "Realizing a conditional collection").
 
 use crate::ccl::ccl_utils::{
     PredMemo, apply_primitive, flatten_trailing_value_case, make_cast, refine_with,
@@ -211,7 +211,8 @@ fn realize_and_unbox(
     // sum with two or more candidates that reaches here was **not** realized by a fan-out
     // above, so its witness is real and has to exist at runtime; erasing it would drop the
     // discriminant and silently compile the wrong program. Nothing can represent such a
-    // witness yet (`src/ccl/design/collections.md`, "Future work"), so it is left standing
+    // witness yet (`src/ccl/design/collections.md`, "Realizing a conditional
+    // collection"), so it is left standing
     // to be rejected by name at op-conversion — which is the correct failure, and the
     // signal that the runtime witness is what the program needs.
     let (unboxed, erased_here) = unbox(

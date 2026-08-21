@@ -74,7 +74,7 @@ fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
 //
 // That inlining is also why a *runtime* witness is not yet reachable from source: it is
 // what monomorphizes the parameter back to something op-conversion can iterate
-// (`src/ccl/design/collections.md`, "Future work").
+// (`src/ccl/design/collections.md`, "Realizing a conditional collection").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
