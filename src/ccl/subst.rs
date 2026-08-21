@@ -197,6 +197,19 @@ impl Mapping {
     }
 }
 
+/// A [`Subst`] domain is free names. A [`Name::PiBound`] is a *bound* reference
+/// to an enclosing arrow, so nothing substitutes for one: the conversions in
+/// this module remove it, at a binder crossing or at an application. The
+/// invariant is stated in [`Name::PiBound`]'s docs and asserted here, at the two
+/// constructors that build a domain.
+fn debug_assert_no_pi_bound(binder: &Name) {
+    debug_assert!(
+        binder.pi_bound_index().is_none(),
+        "a `PiBound` is never a substitution's domain binder: it is bound by an \
+         arrow the type carries, and `open_pi_binder` is what removes it",
+    );
+}
+
 /// A simultaneous substitution `{binder ↦ mapping, …}`. An absent binder maps
 /// to itself (the identity). The empty map is [`Subst::id`].
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -218,8 +231,10 @@ impl Subst {
 
     /// A rename `[from ↦ to]` — a bijection on binders, hence invertible.
     pub fn rename(from: impl Into<Name>, to: impl Into<Name>) -> Self {
+        let from = from.into();
+        debug_assert_no_pi_bound(&from);
         let mut m = BTreeMap::new();
-        m.insert(from.into(), Mapping::Rename(to.into()));
+        m.insert(from, Mapping::Rename(to.into()));
         Subst(m)
     }
 
@@ -235,8 +250,10 @@ impl Subst {
     /// (relabeling, inversion-safe with no license) must say so with
     /// [`Subst::rename`].
     pub fn discharge(binder: impl Into<Name>, term: TypedExpr) -> Self {
+        let binder = binder.into();
+        debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
-        m.insert(binder.into(), Mapping::Discharge(Box::new(term)));
+        m.insert(binder, Mapping::Discharge(Box::new(term)));
         Subst(m)
     }
 
@@ -1405,6 +1422,11 @@ pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
         "a Pi binder is never the refinement element binder, which \
          `is_free_in_type` reports as never free",
     );
+    debug_assert!(
+        binder.pi_bound_index().is_none(),
+        "a `PiBound` is a reference, never a binder, so nothing abstracts over \
+         one: closing at one would rewrite references to an unrelated frame",
+    );
     if !crate::ccl::ccl_utils::is_free_in_type(binder, ty) {
         return ty.clone();
     }
@@ -1633,8 +1655,11 @@ impl<'a> PiWalk<'a> {
                 self.shadowed.extend(binders.iter().cloned());
             }
             ScopedItemMut::Child(child) => self.expr(child, depth),
-            // A handle node's write target names a mutable variable, and a
-            // key names a record field. Neither is a Pi binder reference.
+            // A `VarRef` here is either this node's own `Var` — already
+            // converted above, since `expr` is called on every child — or a
+            // handle node's write target, which names a mutable variable. A
+            // `KeyRef` names a record field. Neither of the latter two is a Pi
+            // binder reference.
             ScopedItemMut::VarRef(_) | ScopedItemMut::KeyRef(_) => {}
         });
         self.shadowed.truncate(base);

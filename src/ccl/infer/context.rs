@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fun, type_level};
+use crate::ccl::infer_var::Telescope;
 use std::rc::Rc;
 
 use crate::ccl::infer::{InferError, LocatedInferError};
@@ -147,7 +148,7 @@ pub(super) struct InferCtx {
     /// [`Typing::fresh`] stamps on each minted variable as its telescope.
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
     /// [`scopes`](Self::scopes).
-    telescope: crate::ccl::infer_var::Telescope,
+    telescope: Telescope,
 }
 
 impl InferCtx {
@@ -164,7 +165,7 @@ impl InferCtx {
             lit_singletons: HashMap::new(),
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
-            telescope: crate::ccl::infer_var::Telescope::empty(),
+            telescope: Telescope::empty(),
         }
     }
 
@@ -197,11 +198,7 @@ impl InferCtx {
     /// holder (`src/ccl/design/type-inference.md`, "Where the conversions
     /// run"). The method takes `&self`, so the extension rides the recursion
     /// rather than the context.
-    fn normalize_annotation_in(
-        &self,
-        ty: &Type,
-        telescope: &crate::ccl::infer_var::Telescope,
-    ) -> Type {
+    fn normalize_annotation_in(&self, ty: &Type, telescope: &Telescope) -> Type {
         match ty {
             // A `Hole` annotation means "infer this" → fresh variable, at
             // the current lexical position (it carries the live telescope).
@@ -652,8 +649,13 @@ impl Typing for InferCtx {
             result,
             crate::ccl::subst::Subst::discharge(&x, argument.clone_preserving_ids()),
         );
-        // The dependent-apply push is live-solve only, so it always enforces.
-        crate::ccl::infer_var::observe_bound_scope(v, "lower", &bound, true);
+        // The dependent-apply push is emission's, so it is always the live solve.
+        crate::ccl::infer_var::observe_bound_scope(
+            v,
+            "lower",
+            &bound,
+            crate::ccl::infer::solver::Derivation::LiveSolve,
+        );
         v.bounds.borrow_mut().lower_mut().push(bound);
         Ok(applied)
     }

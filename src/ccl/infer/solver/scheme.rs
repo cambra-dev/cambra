@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::traits::{TraitObligation, TraitObligationId};
+use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
 use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr};
@@ -81,11 +82,7 @@ impl PolyScheme {
     /// [`instantiate`](Self::instantiate): its clone stands where the
     /// definition stood, and the definition-site telescopes are the contract
     /// (see `src/ccl/design/type-inference.md`, "Freshening and `SpecKey`").
-    pub fn instantiate_in(
-        &self,
-        current_level: Level,
-        telescope: &crate::ccl::infer_var::Telescope,
-    ) -> Type {
+    pub fn instantiate_in(&self, current_level: Level, telescope: &Telescope) -> Type {
         let mut cache = FreshenCache::new();
         cache.site_telescope = Some(telescope.clone());
         freshen_above(
@@ -107,7 +104,7 @@ pub struct FreshenCache {
     /// instead of inheriting its original's — the operator-scheme
     /// instantiation mode ([`PolyScheme::instantiate_in`]). Unset for
     /// specialization clones, which stand where their definition stood.
-    pub site_telescope: Option<crate::ccl::infer_var::Telescope>,
+    pub site_telescope: Option<Telescope>,
     /// Original quantified var → its fresh replacement.
     pub vars: HashMap<InferVarId, Rc<InferVar>>,
     /// Original quantified channel-domain name → its rename. Seeded by

@@ -862,120 +862,125 @@ fn fmt_type(
     ty: &Type,
     binders: Option<&symbolic::PiBinderEnv<'_>>,
 ) -> fmt::Result {
-    /// `ty` as a string in the same environment, for the arms that join parts.
-    fn render(ty: &Type, binders: Option<&symbolic::PiBinderEnv<'_>>) -> String {
-        TypeUnder(ty, binders).to_string()
+    /// `ty` in the same environment, as something `write!` can take directly —
+    /// no intermediate `String` per child.
+    fn at<'a, 'b>(
+        ty: &'a Type,
+        binders: Option<&'a symbolic::PiBinderEnv<'b>>,
+    ) -> TypeUnder<'a, 'b> {
+        TypeUnder(ty, binders)
     }
-    {
-        match ty {
-            Type::Base(b) => write!(f, "{}", b.keyword()),
-            // `n == 0` means an empty range (e.g. the domain of `[]`); render
-            // it as `∅` instead of computing `n - 1` and underflowing.
-            Type::BoundedHole(t) => write!(f, "<:{}", render(t, binders)),
-            Type::UIntRange(0) => write!(f, "∅"),
-            Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
-            // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
-            // capability (and an unresolved kind var), `⤇` for a data collection
-            // (see `FunKind::arrow`), making the collection/capability distinction
-            // legible in every type string.
-            //
-            // The codomain renders one arrow deeper, named or not: the index
-            // counts crossings, so an unnamed arrow occupies an entry too.
-            Type::Fun {
-                name,
-                kind,
-                domain,
-                codomain,
-            } => {
-                let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
-                let cod = render(codomain, Some(&inner));
-                let dom = render(domain, binders);
-                match name {
-                    Some(x) => write!(f, "(({x}: {dom}) {} {cod})", kind.arrow()),
-                    None => write!(f, "({dom} {} {cod})", kind.arrow()),
-                }
+    match ty {
+        Type::Base(b) => write!(f, "{}", b.keyword()),
+        // `n == 0` means an empty range (e.g. the domain of `[]`); render
+        // it as `∅` instead of computing `n - 1` and underflowing.
+        Type::BoundedHole(t) => write!(f, "<:{}", at(t, binders)),
+        Type::UIntRange(0) => write!(f, "∅"),
+        Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
+        // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
+        // capability (and an unresolved kind var), `⤇` for a data collection
+        // (see `FunKind::arrow`), making the collection/capability distinction
+        // legible in every type string.
+        //
+        // The codomain renders one arrow deeper, named or not: the index
+        // counts crossings, so an unnamed arrow occupies an entry too.
+        Type::Fun {
+            name,
+            kind,
+            domain,
+            codomain,
+        } => {
+            let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
+            let cod = at(codomain, Some(&inner));
+            let dom = at(domain, binders);
+            match name {
+                Some(x) => write!(f, "(({x}: {dom}) {} {cod})", kind.arrow()),
+                None => write!(f, "({dom} {} {cod})", kind.arrow()),
             }
-            Type::Tuple(ts) => {
-                let parts: Vec<_> = ts.iter().map(|t| render(t, binders)).collect();
-                write!(f, "({})", parts.join(", "))
-            }
-            Type::Record(fields) => {
-                let parts: Vec<_> = fields
+        }
+        Type::Tuple(ts) => {
+            let parts: Vec<_> = ts.iter().map(|t| at(t, binders).to_string()).collect();
+            write!(f, "({})", parts.join(", "))
+        }
+        Type::Record(fields) => {
+            let parts: Vec<_> = fields
+                .iter()
+                .map(|(n, t)| format!("{n}: {}", at(t, binders)))
+                .collect();
+            write!(f, "{{{}}}", parts.join(", "))
+        }
+        Type::Variant(tags, openness) => {
+            // An **open** arm set renders with a trailing `| …`, so a demand that
+            // admits further tags never reads as an exact sum in a diagnostic or a
+            // symbolic dump. (Only a demand is ever open — see `Openness`.)
+            let ellipsis = if openness.permits_extra_tags() {
+                " | …"
+            } else {
+                ""
+            };
+            // Anonymous positional variants (all tags are
+            // `FieldKey::Index`, as `++`/`Copair` produces) are
+            // rendered as a flat `A | B` join — the positional tags
+            // carry no user-meaningful information. Nested
+            // all-positional variants flatten recursively so
+            // `a ++ b ++ c` prints as `A | B | C` rather than
+            // `[._0: [._0: A | ._1: B] | ._1: C]`.
+            if let Some(payloads) = synthetic_payloads(tags) {
+                let parts: Vec<_> = payloads
                     .iter()
-                    .map(|(n, t)| format!("{n}: {}", render(t, binders)))
+                    .map(|t| at(t, binders).to_string())
                     .collect();
-                write!(f, "{{{}}}", parts.join(", "))
-            }
-            Type::Variant(tags, openness) => {
-                // An **open** arm set renders with a trailing `| …`, so a demand that
-                // admits further tags never reads as an exact sum in a diagnostic or a
-                // symbolic dump. (Only a demand is ever open — see `Openness`.)
-                let ellipsis = if openness.permits_extra_tags() {
-                    " | …"
-                } else {
-                    ""
-                };
-                // Anonymous positional variants (all tags are
-                // `FieldKey::Index`, as `++`/`Copair` produces) are
-                // rendered as a flat `A | B` join — the positional tags
-                // carry no user-meaningful information. Nested
-                // all-positional variants flatten recursively so
-                // `a ++ b ++ c` prints as `A | B | C` rather than
-                // `[._0: [._0: A | ._1: B] | ._1: C]`.
-                if let Some(payloads) = synthetic_payloads(tags) {
-                    let parts: Vec<_> = payloads.iter().map(|t| render(t, binders)).collect();
-                    write!(f, "{}{ellipsis}", parts.join(" | "))
-                } else {
-                    // CHL's surface spelling — see `fmt_variant_arms`. A `Unit`
-                    // payload is the nullary constructor and renders bare.
-                    crate::util::fmt_variant_arms(
-                        f,
-                        tags.iter().map(|(n, t)| {
-                            let payload = match t {
-                                Type::Base(BaseType::Unit) => None,
-                                _ => Some(render(t, binders)),
-                            };
-                            (n.to_string(), payload)
-                        }),
-                        openness.permits_extra_tags(),
-                    )
-                }
-            }
-            // A **singleton** prints as its base pinned to the literal: `{Int |
-            // __elem == 5}` is `Int@5`. The predicate is the type's whole content,
-            // and spelling it out puts one in front of the reader at every literal.
-            // Every other refinement prints in the general form.
-            //
-            // The predicate renders inside `binders`, so a reference to an
-            // enclosing arrow prints as that arrow's binder name.
-            Type::Refinement(t, r) => match singleton_value(ty) {
-                Some(lit) => write!(f, "{}@{}", render(t, binders), symbolic::symbolic(lit)),
-                None => write!(
+                write!(f, "{}{ellipsis}", parts.join(" | "))
+            } else {
+                // CHL's surface spelling — see `fmt_variant_arms`. A `Unit`
+                // payload is the nullary constructor and renders bare.
+                crate::util::fmt_variant_arms(
                     f,
-                    "{{{} | {}}}",
-                    render(t, binders),
-                    symbolic::symbolic_under(&r.predicate, binders)
-                ),
-            },
-            Type::Hole => write!(f, "_"),
-            // A hole with an identity renders as one: `_#0` and `_#1` are distinct
-            // requests, two `_#0`s are the same one.
-            Type::SharedHole(id) => write!(f, "_#{id}"),
-            Type::Infer(var) => write!(f, "?{}", var.uid),
-            Type::DataSource(name) => write!(f, "source({name})"),
-            Type::ChanDom(name, _) => write!(f, "chan({name})"),
-            Type::Txn => write!(f, "Txn"),
-            Type::History {
-                value,
-                domain,
-                kind,
-            } => {
-                let (value, domain) = (render(value, binders), render(domain, binders));
-                if *kind == HistoryKind::Overwrite {
-                    write!(f, "Mut({value}, {domain})")
-                } else {
-                    write!(f, "feed({domain} ⇒ {value})")
-                }
+                    tags.iter().map(|(n, t)| {
+                        let payload = match t {
+                            Type::Base(BaseType::Unit) => None,
+                            _ => Some(at(t, binders).to_string()),
+                        };
+                        (n.to_string(), payload)
+                    }),
+                    openness.permits_extra_tags(),
+                )
+            }
+        }
+        // A **singleton** prints as its base pinned to the literal: `{Int |
+        // __elem == 5}` is `Int@5`. The predicate is the type's whole content,
+        // and spelling it out puts one in front of the reader at every literal.
+        // Every other refinement prints in the general form.
+        //
+        // The predicate renders inside `binders`, so a reference to an
+        // enclosing arrow prints as that arrow's binder name.
+        Type::Refinement(t, r) => match singleton_value(ty) {
+            Some(lit) => write!(f, "{}@{}", at(t, binders), symbolic::symbolic(lit)),
+            None => write!(
+                f,
+                "{{{} | {}}}",
+                at(t, binders),
+                symbolic::symbolic_under(&r.predicate, binders)
+            ),
+        },
+        Type::Hole => write!(f, "_"),
+        // A hole with an identity renders as one: `_#0` and `_#1` are distinct
+        // requests, two `_#0`s are the same one.
+        Type::SharedHole(id) => write!(f, "_#{id}"),
+        Type::Infer(var) => write!(f, "?{}", var.uid),
+        Type::DataSource(name) => write!(f, "source({name})"),
+        Type::ChanDom(name, _) => write!(f, "chan({name})"),
+        Type::Txn => write!(f, "Txn"),
+        Type::History {
+            value,
+            domain,
+            kind,
+        } => {
+            let (value, domain) = (at(value, binders), at(domain, binders));
+            if *kind == HistoryKind::Overwrite {
+                write!(f, "Mut({value}, {domain})")
+            } else {
+                write!(f, "feed({domain} ⇒ {value})")
             }
         }
     }
