@@ -34,18 +34,18 @@
 //!   which is what makes refinement equality plain structural equality of bare
 //!   predicates. Uniquification never mints it; substitution shadows it.
 //! * [`Name::PiBound`] — a **bound reference to an enclosing arrow's Pi
-//!   binder**, as a de Bruijn index. Not a binder: nothing introduces one; a
-//!   reference becomes one when arrow construction closes its codomain
-//!   ([`crate::ccl::subst::close_pi_binder`]) and becomes a name or a term
-//!   again when descent or application opens the arrow
+//!   binder**, as a de Bruijn index ([`PiRef`]). Not a binder: nothing
+//!   introduces one; a reference becomes one when arrow construction closes
+//!   its codomain ([`crate::ccl::subst::close_pi_binder`]) and becomes a name
+//!   or a term again when descent or application opens the arrow
 //!   ([`crate::ccl::subst::open_pi_binder`]). Identity is the index, so two
 //!   α-variant closed arrows are structurally identical — what the solver's
-//!   identity sites key on.
+//!   identity sites key on — and the binder's source spelling rides alongside
+//!   it as display metadata.
 //!
-//! Display prints [`Name::base`] (for a [`Name::PiBound`], the index as
-//! `#0`) — under the convention names are distinct, so the spelling is
-//! unambiguous in almost every rendering. `Debug` surfaces the `uid` for
-//! [`Name::Unique`].
+//! Display prints [`Name::base`] — under the convention names are distinct, so
+//! the spelling is unambiguous in almost every rendering. `Debug` surfaces the
+//! `uid` for [`Name::Unique`].
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -128,7 +128,75 @@ impl SyntheticKind {
     }
 }
 
-/// A binder or variable name. See the module docs for the four variants.
+/// A reference to an enclosing arrow's Pi binder: a de Bruijn `index` plus the
+/// binder's source spelling.
+///
+/// **`index` is the identity.** `PartialEq`/`Ord`/`Hash` read it alone, so two
+/// α-variant closed types compare equal wherever the solver decides identity,
+/// which is the whole point of the coordinate
+/// (`src/ccl/design/type-inference.md`, "The coordinate is locally nameless").
+///
+/// **`hint` is display metadata**, stamped by the closing walk from the binder
+/// it just abstracted. Its job is a type rendered *detached* from the arrow
+/// that binds it: a diagnostic that blames a domain plucked out of a
+/// half-assembled arrow has no arrow to read a spelling off, and a bare `#0`
+/// reaching a user says nothing. Two equal `PiRef`s may therefore carry
+/// different hints and print differently — the hint never decides anything.
+///
+/// A rendering that *does* hold the arrow prefers the arrow's own name slot
+/// (see [`crate::ccl::symbolic::PiBinderEnv`]): a later pass may rename the
+/// binder, which leaves the hint stale and the name slot right.
+#[derive(Clone, Debug)]
+pub struct PiRef {
+    /// Codomain crossings between the reference and the arrow binding it.
+    pub index: u32,
+    /// The binder's spelling where the closing happened. Display only.
+    ///
+    /// Boxed to keep [`Name`] at the width its `Unique` variant already needs:
+    /// an inline `SmolStr` here fits the payload but leaves the enum no niche
+    /// for its discriminant, which widens every `Name` in the IR. The
+    /// allocation is per *distinct closed refinement* — [`ClaimCloser`] memoizes on
+    /// (predicate, frames) — not per comparison.
+    ///
+    /// [`ClaimCloser`]: crate::ccl::subst::ClaimCloser
+    pub hint: Option<Box<str>>,
+}
+
+impl PiRef {
+    /// A reference to the arrow `index` crossings out, with no spelling — for a
+    /// site that has no binder to read one off (tests, and a re-index).
+    pub fn bare(index: u32) -> Self {
+        PiRef { index, hint: None }
+    }
+}
+
+impl PartialEq for PiRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+    }
+}
+
+impl Eq for PiRef {}
+
+impl PartialOrd for PiRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PiRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.index.cmp(&other.index)
+    }
+}
+
+impl std::hash::Hash for PiRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.index.hash(state);
+    }
+}
+
+/// A binder or variable name. See the module docs for the five variants.
 ///
 /// Derived `Eq`/`Ord`/`Hash` compare the whole variant. For [`Name::Unique`]
 /// that compares `(base, uid)` and for [`Name::Synthetic`] `(kind, uid)`,
@@ -149,18 +217,19 @@ pub enum Name {
     Synthetic { kind: SyntheticKind, uid: Uid },
     /// A name with custom semantics (currently only `__elem`).
     Reserved(ReservedName),
-    /// A bound reference to an enclosing arrow's Pi binder, as a de Bruijn
-    /// index: the number of `Fun` codomains crossed between the reference and
-    /// the arrow that binds it, named and unnamed frames alike (so the
-    /// coordinate survives `Type::without_pi_names`). Assigned at abstraction
-    /// by [`crate::ccl::subst::close_pi_binder`]; converted back to a name or
-    /// a term by [`crate::ccl::subst::open_pi_binder`] when descent or
+    /// A bound reference to an enclosing arrow's Pi binder ([`PiRef`]): the
+    /// number of `Fun` codomains crossed between the reference and the arrow
+    /// that binds it, named and unnamed frames alike (so the coordinate
+    /// survives `Type::without_pi_names`), plus the binder's spelling as
+    /// display metadata. Assigned at abstraction by
+    /// [`crate::ccl::subst::close_pi_binder`]; converted back to a name or a
+    /// term by [`crate::ccl::subst::open_pi_binder`] when descent or
     /// application opens the arrow. Never a binder — no binding site
     /// introduces one, uniquification never mints one, and a substitution
     /// never maps one (a [`crate::ccl::subst::Subst`] domain is free names).
     /// See `src/ccl/design/type-inference.md`, "The coordinate is locally
     /// nameless".
-    PiBound(u32),
+    PiBound(PiRef),
 }
 
 impl Name {
@@ -224,17 +293,18 @@ impl Name {
     }
 
     /// The display spelling. Total over every variant; never use it for an
-    /// identity decision — that is what `Name` equality is for. A
-    /// [`Name::PiBound`] has no spelling of its own — its index needs a
-    /// formatter, so it surfaces through [`Display`](fmt::Display) (`#0`) and
-    /// this returns just the `#` marker.
+    /// identity decision — that is what `Name` equality is for, and for a
+    /// [`Name::PiBound`] the spelling is metadata that identity ignores
+    /// outright ([`PiRef`]). A `PiBound` carrying no hint has no spelling to
+    /// give and returns the `#` marker; its index needs a formatter, so it
+    /// surfaces through [`Display`](fmt::Display) (`#0`).
     pub fn base(&self) -> &str {
         match self {
             Name::Raw(s) => s,
             Name::Unique { base, .. } => base,
             Name::Synthetic { kind, .. } => kind.stem(),
             Name::Reserved(r) => r.spelling(),
-            Name::PiBound(_) => "#",
+            Name::PiBound(r) => r.hint.as_deref().unwrap_or("#"),
         }
     }
 
@@ -269,10 +339,26 @@ impl Name {
         matches!(self, Name::Reserved(ReservedName::Elem))
     }
 
+    /// A reference to the enclosing arrow `index` crossings out, spelled by
+    /// `binder` — what [`crate::ccl::subst::close_pi_binder`] mints when it
+    /// abstracts `binder`.
+    pub fn pi_bound(index: u32, binder: &Name) -> Self {
+        Name::PiBound(PiRef {
+            index,
+            hint: Some(binder.base().into()),
+        })
+    }
+
+    /// [`pi_bound`](Self::pi_bound) with no spelling — for a site holding no
+    /// binder to read one off. Equal to any `PiBound` at the same index.
+    pub fn pi_bound_bare(index: u32) -> Self {
+        Name::PiBound(PiRef::bare(index))
+    }
+
     /// The de Bruijn index if this is a [`Name::PiBound`] reference.
     pub fn pi_bound_index(&self) -> Option<u32> {
         match self {
-            Name::PiBound(k) => Some(*k),
+            Name::PiBound(r) => Some(r.index),
             _ => None,
         }
     }
@@ -316,12 +402,13 @@ impl From<&Name> for Name {
 }
 
 /// Prints the bare base (see module docs); the `uid` surfaces only through
-/// [`Debug`]. A [`Name::PiBound`] prints its index (`#0`) — the one variant
-/// whose display needs a formatter.
+/// [`Debug`]. A [`Name::PiBound`] prints the binder's spelling when it carries
+/// one and its index (`#0`) when it does not — the one variant whose display
+/// needs a formatter.
 impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Name::PiBound(k) => write!(f, "#{k}"),
+            Name::PiBound(PiRef { index, hint: None }) => write!(f, "#{index}"),
             _ => f.write_str(self.base()),
         }
     }

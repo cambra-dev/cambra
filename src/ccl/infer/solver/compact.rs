@@ -1337,7 +1337,7 @@ mod claim_closing_tests {
             );
         };
         assert!(
-            matches!(&right.node, TypedExprNode::Var(Name::PiBound(0))),
+            matches!(&right.node, TypedExprNode::Var(n) if n.pi_bound_index() == Some(0)),
             "the refinement's binder reference lands as the index #0"
         );
     }

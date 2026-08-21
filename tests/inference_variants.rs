@@ -11,6 +11,7 @@ use cambra::ccl::ArithmeticKind;
 use cambra::ccl::{
     Branch, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExpr, TypedExprNode,
     infer::{InferError, LocatedInferError, TypeInferenceContext, infer},
+    uniquify,
 };
 use cambra::interpreter::BaseType;
 use rstest::rstest;
@@ -82,14 +83,23 @@ fn var(name: &str) -> TypedExpr {
 }
 
 /// Run inference on an expression, returning the inferred root type.
-fn run(mut expr: TypedExpr) -> Result<Type, Vec<InferError>> {
+///
+/// α-uniquifies first, as the pipeline does before `infer`: these trees are
+/// hand-built at source spellings, and inference's invariants are stated over
+/// α-unique binders (the telescope check is a name lookup because uniquify gives
+/// every binding site one uid). Without it a test can pass — or fail — because
+/// two distinct binders share a spelling, which the product never hands
+/// inference.
+fn run(expr: TypedExpr) -> Result<Type, Vec<InferError>> {
+    let mut expr = uniquify::run(expr);
     let mut ctx = TypeInferenceContext::new();
     infer(&mut expr, &mut ctx).map_err(LocatedInferError::bare)
 }
 
 /// Run inference and return the fully-inferred expression (so tests can
 /// inspect inner `expr.ty` / `binding.ty` slots, not just the root type).
-fn run_full(mut expr: TypedExpr) -> Result<TypedExpr, Vec<InferError>> {
+fn run_full(expr: TypedExpr) -> Result<TypedExpr, Vec<InferError>> {
+    let mut expr = uniquify::run(expr);
     let mut ctx = TypeInferenceContext::new();
     infer(&mut expr, &mut ctx).map_err(LocatedInferError::bare)?;
     Ok(expr)

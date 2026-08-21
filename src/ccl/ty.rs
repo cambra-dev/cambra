@@ -1189,12 +1189,7 @@ impl Type {
     /// Contrast [`Type::pi`] / [`Type::fun`] / [`Type::data_fun`], which *stamp*
     /// a kind and are for a position that genuinely means one of the two.
     pub fn pi_eliminated(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
-        Type::Fun {
-            name: Some(name.into()),
-            kind: FunKind::fresh_var(),
-            domain: Box::new(domain),
-            codomain: Box::new(codomain),
-        }
+        Type::pi_kinded(name, domain, codomain, FunKind::fresh_var())
     }
 
     /// The non-dependent [`Type::pi_eliminated`] — an elimination's demand
@@ -1345,6 +1340,13 @@ impl Type {
     /// carry a lambda's kind across (`elim_lambda_kinded`); normalizing here only
     /// keeps the structural asserts (and the feed-operand agreement check) from
     /// comparing it.
+    ///
+    /// Binder **presence** is all this canonicalizes. It does not reconcile the
+    /// two binder-reference coordinates: a refinement spelled as an index and its
+    /// name-coordinate twin stay unequal here, so the comparisons below hold
+    /// only between two types on the same side of a construction boundary. That
+    /// is the invariant they are checking, not an assumption they make — a pass
+    /// that dropped a binder and left the index behind fails them.
     ///
     /// Under the Barendregt convention the blindness needed at the remaining
     /// call sites (lambda elimination's type-preservation asserts) is exactly
@@ -2172,9 +2174,11 @@ mod tests {
         let _ = l.zip_same_tags(&r, "test", |x, y| x + y);
     }
 
-    /// A dependent arrow renders its refinement's binder reference as the binder's
-    /// own name: the arrow is in the rendering, so the spelling is available.
-    /// The index is the stored form and the name is the read form.
+    /// A dependent arrow's claim *stores* an index and *reads* as the binder's
+    /// name, detached from the arrow or not. Two spellings, two mechanisms: a
+    /// rendering that holds the arrow reads its name slot, and one that does
+    /// not falls back to the reference's own hint. Identity is the index in
+    /// both cases, which is what the assertion on the term checks.
     #[test]
     fn a_dependent_arrow_renders_its_binder_by_name() {
         let k = crate::ccl::Name::raw("k");
@@ -2189,12 +2193,32 @@ mod tests {
         let ty = Type::pi(k.clone(), Type::Base(BaseType::Int), refinement);
         assert_eq!(ty.to_string(), "((k: Int) ⇒ {Int | __elem == k})");
 
-        // Rendered detached from the arrow, the same claim has no spelling to
-        // reach and reads as the bare index.
+        // Detached from the arrow, the reference still reads as the binder —
+        // now off its own hint rather than off the arrow's name slot. A bare
+        // `#0` in a diagnostic tells a reader nothing, and a fragment plucked
+        // out of a half-assembled arrow is exactly what a diagnostic blames.
         let Type::Fun { codomain, .. } = &ty else {
             panic!("expected an arrow");
         };
-        assert_eq!(codomain.to_string(), "{Int | __elem == #0}");
+        assert_eq!(codomain.to_string(), "{Int | __elem == k}");
+
+        // Stored, though, it is the index: the spelling is metadata that
+        // identity ignores, so the refinement is α-canonical.
+        let Type::Refinement(_, r) = &**codomain else {
+            panic!("expected the refinement");
+        };
+        let TypedExprNode::BinOp { right, .. } = &r.predicate.node else {
+            panic!("expected the dependent refinement");
+        };
+        let TypedExprNode::Var(reference) = &right.node else {
+            panic!("expected a variable reference");
+        };
+        assert_eq!(reference.pi_bound_index(), Some(0));
+        assert_eq!(
+            *reference,
+            crate::ccl::Name::pi_bound_bare(0),
+            "the hint does not participate in identity"
+        );
     }
 
     /// The index counts arrow crossings, so an unnamed arrow between the
@@ -2204,7 +2228,7 @@ mod tests {
     fn an_unnamed_crossing_still_counts_when_rendering() {
         let refinement = Type::Refinement(
             Box::new(Type::Base(BaseType::Int)),
-            Refinement::born(Rc::new(TypedExpr::var(crate::ccl::Name::PiBound(1)))),
+            Refinement::born(Rc::new(TypedExpr::var(crate::ccl::Name::pi_bound_bare(1)))),
         );
         // (k: Int) ⇒ (Int ⇒ {Int | #1}) — one unnamed crossing in between.
         let ty = Type::Fun {

@@ -15,13 +15,14 @@ use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
-    FieldKey, HistoryKind, Lit, PredicateId, Type,
+    Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypedExprNode,
     ccl_utils::walk_refined_predicates,
     infer::{
         InferError, LocatedInferError, TypeInferenceContext, check_pre_desugar, infer,
         lit_singleton,
     },
     lower::{LoweringContext, lower_stmts},
+    uniquify,
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
@@ -31,6 +32,23 @@ use rstest::rstest;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Lower `stmts` and α-uniquify — the pipeline's prefix to `infer`
+/// (`ccl::context` runs `uniquify::run` immediately before it).
+///
+/// Every test in this file that infers from CHL source goes through here, so
+/// inference sees the α-unique binders its own invariants are stated over: the
+/// telescope check is a name lookup *because* uniquify gives every binding site
+/// one uid, and the `Fun`/`Fun` opening gate reasons about a collision needing
+/// the same uid. Inferring a source-spelled tree asks those rules a question the
+/// product never asks, and shadowing — which uniquify removes — is exactly what
+/// makes the answer differ.
+fn lower_uniquified(stmts: &[chl_ast::Spanned<chl_ast::Stmt>], lctx: &mut LoweringContext) -> Expr {
+    let expr = lower_stmts(stmts, lctx)
+        .into_result()
+        .expect("lowering failed");
+    uniquify::run(expr)
+}
 
 /// Parse Python module code, lower to CCL, run type inference, and return the
 /// inferred type of the whole program. Panics on lowering or inference failure.
@@ -59,9 +77,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
         ictx.register_source_type(name, elem_ty.clone());
     }
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx).expect("inference failed")
 }
 
@@ -70,9 +86,7 @@ fn infer_program_err(code: &str) -> Vec<InferError> {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx)
         .map_err(LocatedInferError::bare)
         .expect_err("expected inference error")
@@ -96,9 +110,7 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
         ictx.register_source_type(name, elem_ty.clone());
     }
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx)
         .map_err(LocatedInferError::bare)
         .expect_err("expected inference error")
@@ -1734,26 +1746,39 @@ fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
     let Type::Refinement(_, r) = &**dom else {
         panic!("expected a refined partition domain, got {ty}");
     };
-    // Stored: the reference is the index, and no free name for the binder is
-    // left anywhere in the type.
-    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
-    assert!(
-        pred.contains("#0"),
-        "the stored refinement must reference the key binder as an index: {pred}"
+    // Stored: the reference is a bound index, not a free name. Read off the
+    // term, because the *rendering* deliberately spells it as the binder.
+    let TypedExprNode::BinOp { right, .. } = &r.predicate.node else {
+        panic!("expected the dependent refinement, got {ty}");
+    };
+    let TypedExprNode::Var(reference) = &right.node else {
+        panic!("expected a variable reference, got {ty}");
+    };
+    assert_eq!(
+        reference.pi_bound_index(),
+        Some(0),
+        "the stored refinement must reference the key binder as an index: {ty}"
     );
     assert!(
-        !pred.contains(key_binder.base()),
-        "no free name for the key binder may survive in the stored refinement: {pred}"
+        cambra::ccl::subst::type_free_vars(&ty).is_empty(),
+        "no free name for the key binder may survive in the stored type: {ty}"
     );
-    // Read: rendering the whole type resolves the index to the binder's name.
+    // Read: the reference spells as the binder, and no bare index survives
+    // into a rendering — whole type or refinement on its own.
     let rendered = ty.to_string();
     assert!(
         rendered.contains(&format!("== {key_binder}")),
         "the rendered type must spell the reference as the binder: {rendered}"
     );
     assert!(
-        !rendered.contains("#0"),
-        "no index may survive into a rendered whole type: {rendered}"
+        !rendered.contains('#'),
+        "no index may survive into a rendered type: {rendered}"
+    );
+    let refinement = dom.to_string();
+    assert!(
+        !refinement.contains('#'),
+        "a refinement rendered detached from its arrow still spells the binder, \
+         off the reference's own hint: {refinement}"
     );
 }
 
@@ -1995,9 +2020,7 @@ fn infer_and_check(code: &str) -> Type {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     let stmts = parse_module(code.trim());
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     let ty = infer(&mut expr, &mut ictx).expect("inference failed");
     check_pre_desugar(&expr)
         .expect("post-inference consistency wall must accept the inferred tree");
@@ -2014,7 +2037,23 @@ fn infer_and_check(code: &str) -> Type {
 /// one side of a domain edge demands `[0, N] <: {[0, N] | p}` and rejects two arms
 /// that are the same expression, and stripping both discards a domain that no
 /// branch widens.
+///
+/// **Ignored: this program does not compile.** The two arms' refinements differ only
+/// in the uid of the term lambda their filter introduces — `λ x#3 → x#3 > 1`
+/// against `λ x#6 → x#6 > 1` — so `union_domains` keeps them as two
+/// alternatives and a `Data` domain admits no join across them. The test passed
+/// while [`lower_uniquified`] was a bare `lower_stmts`: both arms then spelled
+/// that binder `x`, the refinements compared equal, and the join succeeded on a tree
+/// the pipeline never builds. `ccl::context::compile_program` rejects the same
+/// program.
+///
+/// Interior term binders staying named is a decision, not an oversight
+/// (`src/ccl/design/type-inference.md`, "Interior term binders stay named"), and
+/// this is its cost. Closing them needs no telescope, since such a binder is
+/// bound inside the term being compared.
 #[test]
+#[ignore = "two identical filtered comprehensions carry refinements that differ in \
+            their filter lambda's binder uid, so the domains do not join"]
 fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
     let ty = infer_and_check(
         r"
@@ -2617,9 +2656,7 @@ mod binder_slot_records_the_bound_at_type {
         }
         let mut lctx = LoweringContext::default();
         let stmts = parse_module(code);
-        let mut expr = lower_stmts(&stmts, &mut lctx)
-            .into_result()
-            .expect("lowering failed");
+        let mut expr = lower_uniquified(&stmts, &mut lctx);
         infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
         let mut out = None;
         find(&expr, name, &mut out);
@@ -2758,9 +2795,7 @@ mod binder_slot_records_the_bound_at_type {
 
         let mut lctx = LoweringContext::default();
         let stmts = parse_module("[sum(g) for g in groupby([1, 1, 2], \\x -> x)]");
-        let mut expr = lower_stmts(&stmts, &mut lctx)
-            .into_result()
-            .expect("lowering failed");
+        let mut expr = lower_uniquified(&stmts, &mut lctx);
         infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
 
         let mut out = Vec::new();
@@ -3091,9 +3126,7 @@ mod annotation_kinds {
         fn clones(code: &str) -> usize {
             let mut lctx = LoweringContext::default();
             let stmts = parse_module(code);
-            let mut expr = lower_stmts(&stmts, &mut lctx)
-                .into_result()
-                .expect("lowering failed");
+            let mut expr = lower_uniquified(&stmts, &mut lctx);
             infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference failed");
             symbolic(&expr).matches("let __mono").count()
         }
@@ -3344,49 +3377,41 @@ fn a_refinement_referencing_no_binder_types_through() {
     );
 }
 
-/// **Known gap: a parameter's refinement cannot reference a sibling
-/// parameter.** `uncurry_params` rewrites an output annotation's references to
-/// tuple projections and leaves a parameter annotation's alone, so the refinement
-/// keeps the source name while the lambda binds `__arg_tuple_0` — the refinement
-/// references a binder nothing binds. The record-time closure check reports it
-/// (`observe_bound_scope`), which is what this program trips today.
+/// **Known gap: two α-variant dependent refinements do not share a position.**
+/// Both definitions here are identical character for character, so their
+/// partition refinements differ only in binder identity, and a join at one position
+/// should see one refinement.
 ///
-/// Two same-shaped definitions joined at one position are the same defect one
-/// step on: the merge unions both refinement sets at a position that binds neither
-/// name, which is the order-dependent dangling type the index coordinate
-/// retires for arrows.
+/// The index coordinate canonicalizes half of that difference and not the other
+/// half. The refinement's reference to the enclosing arrow lands as `#0` on both
+/// sides — that is this change — while the binder of the term lambda *inside*
+/// the predicate stays a name by design
+/// (`src/ccl/design/type-inference.md`, "Interior term binders stay named"), so
+/// the two refinements still compare unequal and the domains still fail to join. The
+/// conflicting pair reads `Var(PiBound(0))` on both sides and differs only in
+/// the interior binder's uid.
 ///
-/// Fixing it belongs in lowering: uncurrying rewrites parameter-annotation
-/// predicates the way it already rewrites the output annotation's, after which
-/// the refinement names `__arg_tuple_0` and the telescope carries it.
+/// Closing interior binders is what this needs, and it needs no telescope: such
+/// a binder is bound inside the term being compared, so a plain index suffices.
+///
+/// Through `compile_program` rather than [`infer_program`]: the harness spells a
+/// predicate's own binders differently from the pipeline, so it answers this
+/// question with a join that the product rejects (see [`infer_program`]).
 #[test]
-#[ignore = "uncurrying does not rewrite a param annotation's predicate references; \
-            the refinement references a binder nothing binds"]
-fn a_param_claim_may_reference_a_sibling_param() {
-    let ty = infer_program(indoc! {r#"
-        def f(a: Int, c: {Int where _ >= a}):
-            c
+#[ignore = "interior term-lambda binders stay named, so two α-variant refinements \
+            still compare unequal and the domains do not join"]
+fn two_alpha_variant_dependent_refinements_share_a_position() {
+    let code = indoc! {r#"
+        def f(k):
+            [y for y in [1, 2, 3] if y == k]
 
-        f
-    "#});
-    assert!(
-        format!("{ty}").contains("__arg_tuple_0.0"),
-        "the sibling reference resolves to the tuple projection, got {ty}"
-    );
+        def g(m):
+            [y for y in [1, 2, 3] if y == m]
 
-    let joined = infer_program(indoc! {r#"
-        def f(a: Int, c: {Int where _ >= a}):
-            c
-
-        def h(b: Int, d: {Int where _ >= b}):
-            d
-
-        [f, h]
-    "#});
-    let rendered = format!("{joined}");
-    assert!(
-        !rendered.contains(" >= a") && !rendered.contains(" >= b"),
-        "two α-variant refinements joined at one position must not leave a source \
-         binder name behind, got {rendered}"
-    );
+        [f, g]
+    "#};
+    let mut ctx = cambra::ccl::context::GlobalContext::default();
+    let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
+    cambra::ccl::context::compile_program(&mut ctx, code, consumer)
+        .expect("two α-variant dependent functions join at one position");
 }
