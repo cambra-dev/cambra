@@ -2038,22 +2038,12 @@ fn infer_and_check(code: &str) -> Type {
 /// that are the same expression, and stripping both discards a domain that no
 /// branch widens.
 ///
-/// **Ignored: this program does not compile.** The two arms' refinements differ only
-/// in the uid of the term lambda their filter introduces — `λ x#3 → x#3 > 1`
-/// against `λ x#6 → x#6 > 1` — so `union_domains` keeps them as two
-/// alternatives and a `Data` domain admits no join across them. The test passed
-/// while [`lower_uniquified`] was a bare `lower_stmts`: both arms then spelled
-/// that binder `x`, the refinements compared equal, and the join succeeded on a tree
-/// the pipeline never builds. `ccl::context::compile_program` rejects the same
-/// program.
-///
-/// Interior term binders staying named is a decision, not an oversight
-/// (`src/ccl/design/type-inference.md`, "Interior term binders stay named"), and
-/// this is its cost. Closing them needs no telescope, since such a binder is
-/// bound inside the term being compared.
+/// The arms' refinements differ in the uid of the term lambda their filter
+/// introduces — `λ x#3 → x#3 > 1` against `λ x#6 → x#6 > 1`, one per lowering —
+/// so the join rests on refinement identity being α-invariant
+/// (`eq_refinement_predicate`). Comparing that binder by name splits the refinement
+/// set and a `Data` domain then reports two domains that do not join.
 #[test]
-#[ignore = "two identical filtered comprehensions carry refinements that differ in \
-            their filter lambda's binder uid, so the domains do not join"]
 fn test_case_with_filtered_comprehension_arms_passes_consistency_wall() {
     let ty = infer_and_check(
         r"
@@ -3377,31 +3367,18 @@ fn a_refinement_referencing_no_binder_types_through() {
     );
 }
 
-/// **Known gap: two α-variant dependent refinements do not share a position.**
-/// Both definitions here are identical character for character, so their
-/// partition refinements differ only in binder identity, and a join at one position
-/// should see one refinement.
+/// Two α-variant dependent refinements share a position. Both definitions are
+/// identical character for character, so their refinements differ only in binder
+/// identity — the enclosing arrow's reference lands as an index, and the term
+/// lambda the filter introduces carries a per-lowering uid — and a join at one
+/// position sees one refinement.
 ///
-/// The index coordinate canonicalizes half of that difference and not the other
-/// half. The refinement's reference to the enclosing arrow lands as `#0` on both
-/// sides — that is this change — while the binder of the term lambda *inside*
-/// the predicate stays a name by design
-/// (`src/ccl/design/type-inference.md`, "Interior term binders stay named"), so
-/// the two refinements still compare unequal and the domains still fail to join. The
-/// conflicting pair reads `Var(PiBound(0))` on both sides and differs only in
-/// the interior binder's uid.
-///
-/// Closing interior binders is what this needs, and it needs no telescope: such
-/// a binder is bound inside the term being compared, so a plain index suffices.
-///
-/// Through `compile_program` rather than [`infer_program`]: the harness spells a
-/// predicate's own binders differently from the pipeline, so it answers this
-/// question with a join that the product rejects (see [`infer_program`]).
+/// Before refinement identity became α-invariant this was a `Data` domain
+/// conflict: `union_domains` kept the two refinements as two alternatives, and a
+/// collection's domain admits no join across them.
 #[test]
-#[ignore = "interior term-lambda binders stay named, so two α-variant refinements \
-            still compare unequal and the domains do not join"]
 fn two_alpha_variant_dependent_refinements_share_a_position() {
-    let code = indoc! {r#"
+    let ty = infer_program(indoc! {r#"
         def f(k):
             [y for y in [1, 2, 3] if y == k]
 
@@ -3409,9 +3386,43 @@ fn two_alpha_variant_dependent_refinements_share_a_position() {
             [y for y in [1, 2, 3] if y == m]
 
         [f, g]
-    "#};
-    let mut ctx = cambra::ccl::context::GlobalContext::default();
-    let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
-    cambra::ccl::context::compile_program(&mut ctx, code, consumer)
-        .expect("two α-variant dependent functions join at one position");
+    "#});
+    // `[0, 1] ⤇ ((k: Int) ⇒ ({[0, 2] | …} ⤇ Int))` — the two arms met at the
+    // list's element position and produced one refinement, not two stacked layers.
+    let Type::Fun { codomain, .. } = &ty else {
+        panic!("expected the list's collection type, got {ty}");
+    };
+    let Type::Fun {
+        codomain: inner, ..
+    } = &**codomain
+    else {
+        panic!("expected the dependent function as the element, got {ty}");
+    };
+    let Type::Fun { domain, .. } = &**inner else {
+        panic!("expected the filtered collection, got {ty}");
+    };
+    let Type::Refinement(base, _) = &**domain else {
+        panic!("the filter both arms establish must survive the join, got {ty}");
+    };
+    assert!(
+        !matches!(&**base, Type::Refinement(..)),
+        "the two α-variant refinements must dedup to one layer, got {ty}"
+    );
+}
+
+/// The join above does not depend on which arm arrives first. Only the `Fun`
+/// binder slot follows arrival — it is display metadata, and the refinement itself is
+/// index-spelled — so the two orders agree modulo `without_pi_names`.
+#[test]
+fn the_alpha_variant_join_is_arrival_order_independent() {
+    let program = |arms: &str| {
+        format!(
+            "def f(k):\n    [y for y in [1, 2, 3] if y == k]\n\n\
+             def g(m):\n    [y for y in [1, 2, 3] if y == m]\n\n{arms}\n"
+        )
+    };
+    assert_eq!(
+        infer_program(&program("[f, g]")).without_pi_names(),
+        infer_program(&program("[g, f]")).without_pi_names(),
+    );
 }

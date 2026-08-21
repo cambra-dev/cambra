@@ -1490,7 +1490,7 @@ struct PiWalk<'a> {
     /// reference to one of these is bound by the predicate's own lambda, not
     /// by an enclosing arrow, so closing leaves it alone
     /// (`src/ccl/design/type-inference.md`, "Interior term binders stay
-    /// named").
+    /// named, and compare by position").
     shadowed: Vec<Name>,
 }
 
@@ -2609,7 +2609,7 @@ mod pi_coordinate_tests {
     /// arrow's. Uniquification keeps the two spellings apart in a compiled
     /// program, so this is what makes closing correct without depending on
     /// that convention (`src/ccl/design/type-inference.md`, "Interior term
-    /// binders stay named").
+    /// binders stay named, and compare by position").
     #[test]
     fn closing_stops_at_a_shadowing_term_binder() {
         let k = Name::fresh("k");
