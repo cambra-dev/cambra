@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" width="760" role="img"
+     font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <title>The fragment execution model: a shared fragment splitting into per-arm fragments</title>
+  <desc>Two subfigures. In A, one shared execution path splits at a divergence point into a
+  v0 path reaching a real sink and a v1 path reaching a sandbox, never reconverging. In B,
+  the same split reconverges into a single shared path, because nothing downstream of the
+  join is divergence-reachable.</desc>
+
+  <!-- ── A · divergence reaches the boundary ────────────────────────────── -->
+  <text x="12" y="24" font-size="13" fill="#6B7A8A">A · divergence reaches the boundary</text>
+
+  <text x="44" y="106" font-size="12.5" fill="#6B7A8A">agreed · one fragment</text>
+
+  <path d="M44 118 H262" stroke="#1C88A7" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <path d="M262 118 H556" stroke="#1C88A7" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <path d="M262 118 C306 118, 312 66, 356 66 H556" stroke="#D75A2E" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <circle cx="262" cy="118" r="6.5" fill="#D75A2E"/>
+
+  <text x="285" y="137" font-size="12.5" fill="#1C88A7">v0</text>
+  <text x="368" y="57" font-size="12.5" fill="#D75A2E">v1</text>
+
+  <rect x="556" y="104" width="92" height="28" rx="6" stroke="#1C88A7" stroke-width="2" fill="none"/>
+  <text x="602" y="123" font-size="12" fill="#1C88A7" text-anchor="middle">sink</text>
+
+  <rect x="556" y="52" width="92" height="28" rx="6" stroke="#D75A2E" stroke-width="2" fill="none" stroke-dasharray="6 5"/>
+  <text x="602" y="71" font-size="12" fill="#D75A2E" text-anchor="middle">sandbox</text>
+
+  <path d="M262 148 V158 H556 V148" stroke="#6B7A8A" stroke-width="1.5" fill="none" opacity="0.6"/>
+  <text x="409" y="178" font-size="11.5" fill="#6B7A8A" text-anchor="middle">divergence-reachable · one fragment and one store per arm (CoW)</text>
+
+  <!-- ── B · divergence reconverges ─────────────────────────────────────── -->
+  <text x="12" y="244" font-size="13" fill="#6B7A8A">B · divergence reconverges</text>
+
+  <text x="44" y="326" font-size="12.5" fill="#6B7A8A">agreed · one fragment</text>
+  <text x="516" y="326" font-size="12.5" fill="#6B7A8A">shared fragment resumes</text>
+
+  <path d="M44 338 H262" stroke="#1C88A7" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <path d="M262 338 H496" stroke="#1C88A7" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <path d="M496 338 H704" stroke="#1C88A7" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <path d="M262 338 C306 338, 312 286, 356 286 H402 C446 286, 452 338, 496 338" stroke="#D75A2E" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <circle cx="262" cy="338" r="6.5" fill="#D75A2E"/>
+  <circle cx="496" cy="338" r="6.5" fill="#1C88A7"/>
+
+  <text x="285" y="357" font-size="12.5" fill="#1C88A7">v0</text>
+  <text x="368" y="277" font-size="12.5" fill="#D75A2E">v1</text>
+
+  <path d="M262 368 V378 H496 V368" stroke="#6B7A8A" stroke-width="1.5" fill="none" opacity="0.6"/>
+  <text x="379" y="398" font-size="11.5" fill="#6B7A8A" text-anchor="middle">reconvergence · nothing downstream is divergence-reachable</text>
+</svg>

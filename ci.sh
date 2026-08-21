@@ -61,6 +61,45 @@ ci_doc_refs() {
   python3 .github/scripts/doc-refs/check_doc_refs.py || return 1
 }
 
+# TODO: add a `ci_mermaid` gate here. No gate validates ```mermaid blocks, and
+# `src/ccl/design/branching.md` + `branching-sequence-diagrams.md` are the first
+# docs in the repo to carry any — so a diagram that fails to render, or renders
+# illegibly in one theme, merges silently and is only ever caught by eye.
+#
+# Two halves, and only the first is off-the-shelf:
+#
+#   1. Syntax. `mermaid`'s own `mermaid.parse()` validates a `sequenceDiagram`
+#      or `flowchart` under jsdom with no headless browser (`@mermaid-js/parser`
+#      does NOT — it covers only the newer diagram types). Costs a pinned Node
+#      dependency, which this repo does not otherwise have.
+#
+#   2. House rules, which no renderer checks because a diagram breaking them
+#      renders fine and is merely unreadable. Mermaid takes label and note text
+#      colour from the *host's* theme, which the diagram cannot see, so any
+#      opaque fill breaks in whichever of light/dark it was not chosen for —
+#      Obsidian dark puts light-grey arrow labels on a light `rect`. Hence:
+#        - Colour areas only with low-alpha `rgba` (<= ~0.2, so the tint reads as
+#          emphasis rather than a panel) — `rect rgba(110,130,200,0.18)`, and
+#          `noteBkgColor` likewise. Border/stroke colours are exempt: a hairline
+#          carries no text, so `noteBorderColor` at 0.5 is correct.
+#        - Never set `noteTextColor`/`textColor`, and never `fill:` a node. Mark
+#          nodes with `stroke:` alone (`style X stroke:#f08c00`), which reads in
+#          either theme.
+#        - No `;` anywhere in a diagram: it is Mermaid's statement separator, so
+#          in label text it is a parse error reported against the *following*
+#          line. Use a dash.
+#        - No parentheses in a `box` label — a greedy regex in Mermaid's
+#          box-label parser swallows the closing paren, silently dropping the
+#          colour and mangling the text. (`box` grouping was tried and dropped
+#          anyway: two full-height empty frames and a lot of width for one label
+#          each, which a `Note` carries for far less space.)
+#      A per-theme palette is possible only from outside the file, via an Obsidian
+#      CSS snippet keyed on `.theme-dark` — which then travels with neither the
+#      note nor GitHub, so it is not an option.
+#
+# These are lintable from the block text with stdlib Python, on the `ci_doc_refs`
+# model (unit tests first, so a checker bug cannot mask real breakage).
+
 # Fast inner-loop gate for local iteration: format, lint (debug, lib+bins only),
 # and test. Deliberately skips the phases whose cost is compile-bound and rarely
 # relevant mid-iteration — the *release* clippy pass (~2x the debug one; only
