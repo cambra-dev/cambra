@@ -18,7 +18,7 @@
 //! pass names the node it is about to rewrite ([`enter`]), and the construction
 //! hooks record every node minted while that guard is the innermost one open.
 //!
-//! At an inspector pane boundary the rows the boundary's passes wrote are folded
+//! For an inspector pane relation the rows its passes wrote are folded
 //! once by [`collapse`] into a [`LineageMap`] — a bidirectional node↔node
 //! relation with an explicit self-edge for every id that survived — and, in
 //! parallel, into a [`SourceProjection`] that resolves each surviving node's
@@ -37,7 +37,7 @@
 //! asserts. Both reach [`LineageMap`], each labelling the edges it contributes:
 //!
 //! * **`parents`** — descends from. The ids the rewrite consumed to produce
-//!   this node, and the column the leak audit reads: a parent the boundary
+//!   this node, and the column the leak audit reads: a parent the fold
 //!   never heard of is a lineage that stops at an id describing nothing
 //!   ([`Leak::ParentUnknown`]).
 //! * **`blame`** — related to, but not consumed. It may name ids that survive
@@ -45,7 +45,7 @@
 //!   this made from" reads the edge's label rather than its presence.
 //!
 //! The labels compose weakest-link along a path, so that the inspector can
-//! render relatedness or prune it once transitivity has run; [`EdgeLabels`]
+//! render blame or prune it once transitivity has run; [`EdgeLabels`]
 //! states the composition.
 //!
 //! Attribution reads both columns, unioned: a node's spans are its parents'
@@ -211,70 +211,71 @@ struct LoweringRecord {
 }
 
 /// What an edge asserts about its two endpoints — a **set**, because one pair of
-/// ids can be related both ways at once.
+/// ids can carry both labels at once.
 ///
-/// The two labels are the two relations a row records, closed transitively:
+/// Each label is one row column, closed transitively:
 ///
-/// * **descent** — the downstream node *descends from* the upstream one, i.e.
-///   every hop between them consumed the node before it to produce the next.
-///   A row's `parents` are its descent hops.
-/// * **relatedness** — the downstream node is *related to, but not consumed
-///   from*, the upstream one. A row's `blame` are its relatedness hops, and
-///   they may name a node that is still alive elsewhere in the output tree,
-///   which is exactly why relatedness is not an ancestry claim.
+/// * **ancestry** — the closure of `parents`: the downstream node descends from
+///   the upstream one, every hop between them having consumed the node before it
+///   to produce the next. Reflexive, so a surviving node is its own ancestor;
+///   the column itself is irreflexive, since an in-place rewrite that keeps a
+///   node's id is a *preserve* and records nothing.
+/// * **blame** — the closure of `blame`: the downstream node is related to, but
+///   did not consume, the upstream one. A blamed id may name a node still alive
+///   elsewhere in the output tree, which is why it is not an ancestry claim.
 ///
-/// The closure is **weakest-link** ([`then`](Self::then)): a path is descent
-/// only while every hop on it is a descent hop, and one relatedness hop anywhere
-/// makes the endpoint related. Without that rule the label would decay into
+/// The closure is **weakest-link** ([`then`](Self::then)): a path is ancestry
+/// only while every hop on it is an ancestry hop, and one blame hop anywhere
+/// makes the whole path blame. Without that rule the label would decay into
 /// "reachable somehow" over two hops — you do not descend from something you are
-/// merely related to. Paths meeting at one endpoint pair [`union`](Self::union)
+/// merely blamed on. Paths meeting at one endpoint pair [`union`](Self::union)
 /// their labels, which is how a pair comes to carry both.
 ///
 /// The set is never empty: a label set exists only where an edge does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EdgeLabels {
-    descent: bool,
-    related: bool,
+    ancestry: bool,
+    blame: bool,
 }
 
 impl EdgeLabels {
     /// *Descends from*, alone — a `parents` hop, and the identity of
     /// [`then`](Self::then): the zero-length path from a surviving node to
-    /// itself is descent, which is what makes a dense self-edge read as
-    /// ancestry.
-    pub const DESCENT: Self = EdgeLabels {
-        descent: true,
-        related: false,
+    /// itself is ancestry, which is what makes a dense self-edge read as
+    /// ancestry rather than needing a special case.
+    pub const ANCESTRY: Self = EdgeLabels {
+        ancestry: true,
+        blame: false,
     };
 
     /// *Related to, but not consumed*, alone — a `blame` hop.
-    pub const RELATED: Self = EdgeLabels {
-        descent: false,
-        related: true,
+    pub const BLAME: Self = EdgeLabels {
+        ancestry: false,
+        blame: true,
     };
 
-    /// Whether the pair is in the descent relation.
-    pub fn descends(self) -> bool {
-        self.descent
+    /// Whether the pair is in the ancestry relation.
+    pub fn has_ancestry(self) -> bool {
+        self.ancestry
     }
 
-    /// Whether the pair is in the relatedness relation.
-    pub fn relates(self) -> bool {
-        self.related
+    /// Whether the pair is in the blame relation.
+    pub fn has_blame(self) -> bool {
+        self.blame
     }
 
     /// Extend a path by one hop: the weakest-link composition.
     ///
-    /// Descent survives only if both the path so far and the hop are descent;
-    /// relatedness appears as soon as either is related, because a path may take
-    /// the relatedness reading of any hop that offers one. Associative, with
-    /// [`DESCENT`](Self::DESCENT) as its identity, so the sweep can carry one
+    /// Ancestry survives only if both the path so far and the hop are ancestry;
+    /// blame appears as soon as either is blame, because a path may take the
+    /// blame reading of any hop that offers one. Associative, with
+    /// [`ANCESTRY`](Self::ANCESTRY) as its identity, so the sweep can carry one
     /// label per root and fold hops in any order.
     #[must_use]
     pub fn then(self, hop: Self) -> Self {
         EdgeLabels {
-            descent: self.descent && hop.descent,
-            related: self.related || hop.related,
+            ancestry: self.ancestry && hop.ancestry,
+            blame: self.blame || hop.blame,
         }
     }
 
@@ -282,8 +283,8 @@ impl EdgeLabels {
     #[must_use]
     pub fn union(self, other: Self) -> Self {
         EdgeLabels {
-            descent: self.descent || other.descent,
-            related: self.related || other.related,
+            ancestry: self.ancestry || other.ancestry,
+            blame: self.blame || other.blame,
         }
     }
 }
@@ -293,7 +294,7 @@ impl EdgeLabels {
 ///
 /// The accessors hand back these rather than bare ids because the label is the
 /// content of the edge, not a detail to project away — a consumer that cannot
-/// tell relatedness from descent cannot choose to render or prune it.
+/// tell blame from ancestry cannot choose to render or prune it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Link<T> {
     /// The id at the far end of the edge.
@@ -306,10 +307,10 @@ pub struct Link<T> {
 /// by what they assert ([`EdgeLabels`]).
 ///
 /// **One entry per `(upstream, downstream)` pair**, holding the label set: a
-/// pair reached both by descent and by relatedness is one edge carrying both,
+/// pair reached both by ancestry and by blame is one edge carrying both,
 /// never two edges disagreeing about one pair.
 ///
-/// **Dense**: an id that survived a phase appears as its own descent self-edge,
+/// **Dense**: an id that survived a phase appears as its own ancestry self-edge,
 /// so there is one uniform edge kind and no identity special case. Self-edges
 /// are derivable (an id present in both snapshots is its own edge) and so are
 /// the two directions from each other, so a later sparse re-encoding behind the
@@ -473,7 +474,7 @@ pub type SourceProjection = HashMap<NodeId, SourceAttribution>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Leak {
     /// An output id with no lineage — a `fresh()` where a preserve was intended:
-    /// no row in the window produced it and the input pane does not hold it, so
+    /// no row the fold read produced it and the input pane does not hold it, so
     /// nothing explains why it is in the output tree.
     Unexplained { output: NodeId },
     /// An input id that is absent from the output pane — **the death report**,
@@ -481,18 +482,18 @@ pub enum Leak {
     ///
     /// Deaths are the set difference `input_ids ∖ output_ids`, which is the
     /// whole of it: nothing declares a fate, so nothing can over-claim one, and
-    /// this class fires for *every* node that dies in the window. It is data the
+    /// this class fires for *every* node that dies across the fold. It is data the
     /// inspector reads, never something a gate asserts against. The class that
     /// *is* a defect on this side is [`Unexplained`](Leak::Unexplained) — an
     /// output node no capture explains.
     Died { input: NodeId },
-    /// A row named a parent the window has never heard of: no row inside the
-    /// window produced it and the input pane does not hold it. The node's
+    /// A row named a parent the fold has never heard of: no row it read
+    /// produced it and the input pane does not hold it. The node's
     /// lineage stops at an id that describes nothing.
     ///
     /// **One class for both edge shapes**, deliberately. The sole parent of a
     /// freshened copy and one consumed id of a fusion are the identical
-    /// condition — an edge to an id outside the window — and telling them apart
+    /// condition — an edge to an id outside the fold — and telling them apart
     /// would mean recording the *shape* of the rewrite, which the `parents`
     /// column does not and should not carry: its cardinality already expresses
     /// 1:1, 1:many and many:1, and nothing else about the shape was ever read.
@@ -504,7 +505,7 @@ impl Leak {
     /// than the death report.
     ///
     /// The split is the gate: every class but [`Died`](Leak::Died) means the
-    /// record is inconsistent or incomplete, while `Died` is the boundary's set
+    /// record is inconsistent or incomplete, while `Died` is the relation's set
     /// difference and fires on every ordinary death. Living on the enum rather
     /// than at the one gate keeps the two readings from drifting apart — adding
     /// a class forces the question here.
@@ -578,7 +579,7 @@ fn attribute(
 }
 
 /// A row's one-hop upstream edges, each with what that hop asserts: `parents` as
-/// descent hops, `blame` as relatedness hops.
+/// ancestry hops, `blame` as blame hops.
 ///
 /// **One entry per id.** A row naming an id in both columns is one hop carrying
 /// both labels, not two hops — the pair `(p, x)` is a single edge, and emitting
@@ -587,8 +588,8 @@ fn attribute(
 /// linear scan is over a row's own columns, which hold a handful of ids.
 fn row_hops(table: &LineageTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
     let mut hops: Vec<(NodeId, EdgeLabels)> = Vec::new();
-    let named = (table.parents(x).iter().map(|p| (*p, EdgeLabels::DESCENT)))
-        .chain(table.blame(x).iter().map(|b| (*b, EdgeLabels::RELATED)));
+    let named = (table.parents(x).iter().map(|p| (*p, EdgeLabels::ANCESTRY)))
+        .chain(table.blame(x).iter().map(|b| (*b, EdgeLabels::BLAME)));
     for (id, label) in named {
         match hops.iter_mut().find(|(h, _)| *h == id) {
             Some((_, labels)) => *labels = labels.union(label),
@@ -598,18 +599,17 @@ fn row_hops(table: &LineageTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
     hops
 }
 
-/// Fold the rows a pane boundary's passes wrote into the pane-pair
+/// Fold the rows a pane relation's passes wrote into the pane-pair
 /// [`LineageMap`], the output pane's [`SourceProjection`], and any integrity
 /// [`Leak`]s.
 ///
-/// `window` is the passes the boundary spans, and it is what turns a
-/// whole-compile table back into a per-boundary window: one table covers every
-/// session a compile opens, so a row's `via` is the only thing that says which
-/// boundary produced it. **An id whose row lies outside `window` is, to this
-/// boundary, an ordinary un-produced id** — an input-pane node if the input pane
-/// holds it, and unknown otherwise. Without that restriction a `Mono`-produced
-/// input-pane id at the post-desugar boundary would resolve straight past the
-/// pane it is supposed to bottom out in.
+/// `passes` are the ones the relation spans, and they are what restricts a
+/// whole-compile table to it: one table covers every session a compile opens, so
+/// a row's `via` is the only thing that says which relation produced it. **An id
+/// whose row lies outside `passes` is, to this relation, an ordinary un-produced
+/// id** — an input-pane node if the input pane holds it, and unknown otherwise.
+/// Without that restriction a `Mono`-produced input-pane id would resolve
+/// straight past the post-desugar pane it is supposed to bottom out in.
 ///
 /// `input_ids` / `output_ids` are the two pane snapshots; `upstream_attr` is the
 /// input pane's already-resolved projection, which untouched ids inherit
@@ -622,10 +622,10 @@ fn row_hops(table: &LineageTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
 ///
 /// ```text
 /// roots(x) = ⋃ { roots(p) ∘ hop(p → x) : p ∈ parents(x) ∪ blame(x) }
-/// roots(x) = { x ↦ descent }                   if x is an input-pane id
+/// roots(x) = { x ↦ ancestry }                  if x is an input-pane id
 /// ```
 ///
-/// where `hop(p → x)` is descent for a `parents` edge, relatedness for a `blame`
+/// where `hop(p → x)` is ancestry for a `parents` edge, blame for a `blame`
 /// edge and both for an id the row names in both columns; `∘` extends every path
 /// in `roots(p)` by that hop, weakest-link ([`EdgeLabels::then`]); and `⋃` unions
 /// the labels of paths that arrive at one root. The empty union `∅` is a row
@@ -641,7 +641,7 @@ fn row_hops(table: &LineageTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
 /// are written when their guard drops, so an enclosing rewrite's rows land after
 /// the rows of the rewrites nested inside it.
 ///
-/// Ids born and consumed inside the window are interior vertices on a path and
+/// Ids born and consumed inside those passes are interior vertices on a path and
 /// compose away; the self-edge for an untouched id falls out; the N:M bipartite
 /// product of a fusion falls out of its product rows each holding the whole
 /// consumed set as parents.
@@ -657,7 +657,7 @@ fn row_hops(table: &LineageTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
 /// backward edge).
 ///
 /// A node reachable from nothing still keeps an entry holding `∅`, which is what
-/// distinguishes "known, with empty lineage" from "the window has never heard of
+/// distinguishes "known, with empty lineage" from "the fold has never heard of
 /// this id" ([`Leak::Unexplained`]).
 ///
 /// # The attribution channel rides along, and is not a monoid
@@ -670,17 +670,17 @@ fn row_hops(table: &LineageTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
 /// write time, where the second writer is standing.
 pub(crate) fn collapse(
     table: &LineageTable,
-    window: &[Pass],
+    passes: &[Pass],
     input_ids: &HashSet<NodeId>,
     output_ids: &HashSet<NodeId>,
     upstream_attr: &SourceProjection,
 ) -> (LineageMap<NodeId, NodeId>, SourceProjection, Vec<Leak>) {
     let mut leaks: Vec<Leak> = Vec::new();
 
-    // The vertex set: every id the window knows, in mint order — which is a
+    // The vertex set: every id the fold knows, in mint order — which is a
     // topological order of the edges (see the doc comment).
     let mut vertices: Vec<NodeId> = table
-        .rows_in(window)
+        .rows_in(passes)
         .chain(input_ids.iter().copied())
         .collect();
     vertices.sort_unstable();
@@ -690,11 +690,11 @@ pub(crate) fn collapse(
     let mut attr: SourceProjection = upstream_attr.clone();
 
     for &x in &vertices {
-        let Some(tag) = table.rule_in(x, window) else {
-            // No row in this window: an input-pane id, reachable from itself and
-            // nothing else. A node descends from itself, so the self-edge is a
-            // descent edge. Its upstream attribution passes through unchanged.
-            roots.insert(x, HashMap::from([(x, EdgeLabels::DESCENT)]));
+        let Some(tag) = table.rule_in(x, passes) else {
+            // No row among these passes: an input-pane id, reachable from itself and
+            // nothing else. A node descends from itself, so the self-edge is an
+            // ancestry edge. Its upstream attribution passes through unchanged.
+            roots.insert(x, HashMap::from([(x, EdgeLabels::ANCESTRY)]));
             continue;
         };
 
@@ -706,12 +706,12 @@ pub(crate) fn collapse(
                  ids the rewrite read before it minted, so ascending NodeId order must be \
                  a topological order of the definition graph",
             );
-            // An upstream older than `x` is already resolved if the window knows
+            // An upstream older than `x` is already resolved if the fold knows
             // it at all. No entry means it is neither an input-pane id nor
-            // produced here: a *descent* hop there is a lineage stopping at an id
-            // that describes nothing, while a relatedness-only hop is the same
+            // produced here: an *ancestry* hop there is a lineage stopping at an id
+            // that describes nothing, while a blame-only hop is the same
             // silence `attribute` keeps for a blamed id with no known spans —
-            // blame is a pointer at material the boundary need not hold, so it
+            // blame is a pointer at material the relation need not hold, so it
             // contributes no edge and no class.
             match roots.get(&p) {
                 Some(pr) => {
@@ -722,7 +722,7 @@ pub(crate) fn collapse(
                             .or_insert(composed);
                     }
                 }
-                None if hop.descends() => leaks.push(Leak::ParentUnknown { parent: p }),
+                None if hop.has_ancestry() => leaks.push(Leak::ParentUnknown { parent: p }),
                 None => {}
             }
         }
@@ -755,7 +755,7 @@ pub(crate) fn collapse(
                 }
                 up.insert(*o, origins);
             }
-            // Neither an input-pane id nor produced by any row in the window.
+            // Neither an input-pane id nor produced by any row the fold read.
             None => leaks.push(Leak::Unexplained { output: *o }),
         }
     }
@@ -783,7 +783,7 @@ pub(crate) fn collapse(
     (LineageMap { down, up }, projection, leaks)
 }
 
-/// What one ascending sweep of [`collapse`] costs on a given window, and whether
+/// What one ascending sweep of [`collapse`] costs over a given set of passes, and whether
 /// the sweep's premise holds. Measurement-only.
 ///
 /// [`backward_edges`](Self::backward_edges) is the falsifier: ascending `NodeId`
@@ -795,25 +795,25 @@ pub(crate) struct SweepMetrics {
     /// Vertices the sweep visits — and, since `roots` only ever grows, its peak
     /// entry count.
     pub vertices: usize,
-    /// Lineage edges (`upstream → node`, either label) in the window.
+    /// Lineage edges (`upstream → node`, either label) the fold reads.
     pub edges: usize,
     /// Edges running from a larger `NodeId` to a smaller one — the revisit
     /// count. Must be zero.
     pub backward_edges: usize,
 }
 
-/// Measure a window without folding it: enumerate the same vertices and edges
+/// Measure the cost without folding: enumerate the same vertices and edges
 /// [`collapse`] sweeps and count any edge that runs backwards.
 #[cfg(test)]
 pub(crate) fn sweep_metrics(
     table: &LineageTable,
-    window: &[Pass],
+    passes: &[Pass],
     input_ids: &HashSet<NodeId>,
 ) -> SweepMetrics {
-    let mut vertices: HashSet<NodeId> = table.rows_in(window).collect();
+    let mut vertices: HashSet<NodeId> = table.rows_in(passes).collect();
     vertices.extend(input_ids.iter().copied());
     let (mut edges, mut backward_edges) = (0usize, 0usize);
-    for x in table.rows_in(window) {
+    for x in table.rows_in(passes) {
         for (p, _) in row_hops(table, x) {
             edges += 1;
             if p >= x {
@@ -929,7 +929,7 @@ pub(crate) fn collapse_lowering(
 //
 // One row per recorded *node*, which is how every consumer asks its question
 // ("where did this node come from?"), so a lookup is a hash probe and the pane
-// fold is one ascending sweep over the rows a boundary's passes wrote.
+// fold is one ascending sweep over the rows a pane relation's passes wrote.
 // ===========================================================================
 
 /// An interned [`RewriteTag`] — a [`LineageTable`] row's `rule` column.
@@ -990,7 +990,7 @@ struct Row {
 /// never existed as deaths. Row enumeration is private for exactly that reason —
 /// [`deaths`](Self::deaths) and the pane fold's `rows_in` are the operations
 /// that legitimately need it, and each takes the difference against something
-/// (a live set, a pass window) rather than against the key space.
+/// (a live set, a set of passes) rather than against the key space.
 ///
 /// Refinement-predicate interiors **are** recorded here. They are `TypedExpr`s
 /// inside a `Type::Refinement`'s predicate, carrying real `NodeId`s from the same
@@ -1004,13 +1004,13 @@ struct Row {
 /// and a
 /// predicate being rewritten is recorded. The third — planning **raising** a
 /// predicate back into the main tree — is not, and lands with the planning
-/// commit; those nodes are minted below the last pane, so no boundary gates them
+/// commit; those nodes are minted below the last pane, so no relation gates them
 /// yet.
 ///
 /// It was a **population** change, not a schema change: these ids already had
 /// addresses here, so no column moved. The prior measurement that justified it
 /// stands as the attribution evidence — over the eleven-program corpus at the
-/// `post-inference..join-planned` audit window the residue was 1184
+/// `post-inference..join-planned` audit span the residue was 1184
 /// [`Leak::ParentUnknown`] edges and nothing else, every one a predicate-interior
 /// id of the input tree, and admitting them took every gated class to zero.
 ///
@@ -1142,27 +1142,27 @@ impl LineageTable {
         self.rows.contains_key(&id)
     }
 
-    /// The rewrite that produced `id` **if that rewrite is one of `window`'s
-    /// passes**, else `None`.
+    /// The rewrite that produced `id` **if that rewrite is one of `passes`**,
+    /// else `None`.
     ///
-    /// This is what restricts a whole-compile table to one pane boundary: to a
-    /// boundary, an id produced by a pass outside its window is an ordinary
+    /// This is what restricts a whole-compile table to one pane relation: to that
+    /// relation, an id produced by a pass it does not span is an ordinary
     /// un-produced id, which is exactly how the input pane's own nodes have to
     /// read for the fold to bottom out there.
-    pub(crate) fn rule_in(&self, id: NodeId, window: &[Pass]) -> Option<RewriteTag> {
-        self.rule(id).filter(|tag| window.contains(&tag.via))
+    pub(crate) fn rule_in(&self, id: NodeId, passes: &[Pass]) -> Option<RewriteTag> {
+        self.rule(id).filter(|tag| passes.contains(&tag.via))
     }
 
-    /// The ids `window`'s passes produced, in arbitrary order.
+    /// The ids `passes` produced, in arbitrary order.
     ///
     /// Private, and the same rule [`deaths`](Self::deaths) rests on: enumerating
-    /// rows is only ever correct against a *window* or against a live set, never
-    /// against the key space, since a `NodeId` can be addressed without ever
-    /// having been recorded. This module's folds are the only callers.
-    fn rows_in<'a>(&'a self, window: &'a [Pass]) -> impl Iterator<Item = NodeId> + 'a {
+    /// rows is only ever correct against a *set of passes* or against a live set,
+    /// never against the key space, since a `NodeId` can be addressed without
+    /// ever having been recorded. This module's folds are the only callers.
+    fn rows_in<'a>(&'a self, passes: &'a [Pass]) -> impl Iterator<Item = NodeId> + 'a {
         self.rows
             .iter()
-            .filter(|(_, row)| window.contains(&self.rules[row.rule.0 as usize].via))
+            .filter(|(_, row)| passes.contains(&self.rules[row.rule.0 as usize].via))
             .map(|(id, _)| *id)
     }
 
@@ -1283,7 +1283,7 @@ struct OpenStep {
     /// output was made from that node. The claim says nothing about whether that
     /// node dies, which is what makes it safe to name a node the rewrite keeps
     /// (keep the id, mint a wrapper over a child). Death is the live-set
-    /// difference at a pane boundary, never a record-time claim.
+    /// difference across a pane relation, never a record-time claim.
     origin: Option<NodeId>,
     blame: Vec<NodeId>,
     nature: Nature,
@@ -1559,7 +1559,7 @@ pub(crate) fn copy_frame(label: RewriteLabel) -> FrameGuard {
 // A rewriting site names the node it is *about to rewrite* and declares nothing
 // else. Every id minted while that guard is the innermost one open records the
 // named node as its parent, which says nothing about whether the named node
-// survived: death is the pane boundary's live-set difference, so no site predicts
+// survived: death is the pane relation's live-set difference, so no site predicts
 // a fate.
 //
 // The produced side is never declared. It is a byproduct of construction,
@@ -1591,6 +1591,17 @@ pub(crate) fn copy_frame(label: RewriteLabel) -> FrameGuard {
 ///
 /// The guard costs nothing in expressiveness: the id is needed only at *entry*,
 /// and nothing inspects the slot at exit.
+///
+/// Two consequences a site does not restate:
+///
+/// * **A recording is where the hooks write.** An installed table captures
+///   nothing on its own; the mint and copy hooks need an open recording to
+///   attach to, so a rewrite that clones or mints outside one drops its pairs on
+///   the floor. That is the failure mode, not a wrong parent.
+/// * **Open it after any recursion into children.** A recording adopts
+///   everything minted under it, so opening one around a recursive call attaches
+///   the callee's own products to this node instead of theirs. Open it around the
+///   rewrite alone, and after the early returns that abandon it.
 pub(crate) fn enter(slot_id: NodeId, label: RewriteLabel, nature: Nature) -> FrameGuard {
     STEP_STACK.with(|s| {
         let mut stack = s.borrow_mut();
@@ -1632,7 +1643,7 @@ impl FrameGuard {
     /// The only channel that adds a *consumed* id beyond the named one, and so
     /// **the only place any id is named at record time** — everything else about
     /// a recording is observed. The named id joins the site's own node in the
-    /// products' `parents`, asserting descent and nothing about `id`'s fate.
+    /// products' `parents`, asserting ancestry and nothing about `id`'s fate.
     ///
     /// A [`copy_frame`] names no node for it to sit beside, so this is
     /// meaningless there and [`assert_copy_only`] catches it.
@@ -1660,12 +1671,14 @@ impl FrameGuard {
     /// the parents' spans and these — so a site widens the attribution rather
     /// than redirecting it.
     ///
-    /// Blame relates without claiming descent: these ids may name nodes that
+    /// Blame relates without claiming ancestry: these ids may name nodes that
     /// survive the rewrite, so they ride the `blame` column rather than `parents`
-    /// and reach the pane-to-pane relation as *relatedness* edges
-    /// ([`EdgeLabels`]), which the inspector can render or prune. Weakest-link
-    /// closure keeps that distinction alive at a distance: anything reached
-    /// through one of these hops is related, never descended.
+    /// and reach the pane relation as *blame* edges ([`EdgeLabels`]), which the
+    /// inspector can render or prune. Weakest-link closure keeps that distinction
+    /// alive at a distance: anything reached through one of these hops is
+    /// related, never descended. Naming an id here therefore asserts nothing
+    /// about its fate, which is what lets a site blame a node it leaves in the
+    /// tree.
     pub(crate) fn blame(&self, ids: &[NodeId]) {
         self.with_own_frame(|top| top.blame.extend(ids.iter().copied()));
     }
@@ -1898,7 +1911,7 @@ impl Drop for LoweringSession {
 /// `label` and `nature` but not which pass is running, while the boundary that
 /// opens the scope knows exactly that: one pass runs inside one scope, so the
 /// pass is ambient over the scope's whole extent. (A scope spanning several
-/// passes, as an audit window opens, tags every row with the one pass it names —
+/// passes, as an audit span opens, tags every row with the one pass it names —
 /// no single pass being the truthful answer there.)
 ///
 /// Opening a scope is what turns pass recording **on**: outside one a guard still
@@ -1941,7 +1954,7 @@ impl Drop for PassScope {
 /// [`TableSession`] is installed.
 ///
 /// The compile's table is drained at the end of the compile, so a measurement
-/// that folds a window *inside* one — the lineage audit — has no other way to
+/// that folds a span *inside* one — the lineage audit — has no other way to
 /// reach the rows it just caused to be written.
 pub(crate) fn with_active_table<R>(f: impl FnOnce(&LineageTable) -> R) -> Option<R> {
     ACTIVE_TABLE.with(|slot| slot.borrow().as_ref().map(f))
@@ -1967,8 +1980,8 @@ mod tests {
     /// from looking meaningful at each call site.
     const TEST_PASS: Pass = Pass::Inline;
 
-    /// The boundary window every fold test uses: the one pass its rows carry.
-    const WINDOW: &[Pass] = &[TEST_PASS];
+    /// The pass set every fold test uses: the one pass its rows carry.
+    const PASSES: &[Pass] = &[TEST_PASS];
 
     fn ids<const N: usize>() -> [NodeId; N] {
         std::array::from_fn(|_| NodeId::fresh())
@@ -2059,7 +2072,7 @@ mod tests {
         let table = table_of(&[(b, &[a]), (c, &[b])]);
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([c]),
             &SourceProjection::new(),
@@ -2081,7 +2094,7 @@ mod tests {
         let table = table_of(&[(b, &[a]), (c, &[a])]);
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([a, b, c]),
             &SourceProjection::new(),
@@ -2106,7 +2119,7 @@ mod tests {
         let table = table_of(&[(c, &[a, b]), (d, &[a, b])]);
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a, b]),
             &set([c, d]),
             &SourceProjection::new(),
@@ -2128,7 +2141,7 @@ mod tests {
         upstream.insert(a, imaged(&[span(3, 9)]));
         let (map, proj, leaks) = collapse(
             &LineageTable::default(),
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([a]),
             &upstream,
@@ -2139,12 +2152,12 @@ mod tests {
         assert_eq!(proj.get(&a), upstream.get(&a), "attribution unchanged");
     }
 
-    /// A window exercising a chain, a fan-out and an N:1 merge, with every
+    /// A pass set exercising a chain, a fan-out and an N:1 merge, with every
     /// parent known and every input dying — so it folds leak-free whichever
     /// order its rows were written in. Returns `(rows, inputs, outputs,
     /// upstream_attr)` with the rows in dependency order.
     #[allow(clippy::type_complexity)]
-    fn mixed_window() -> (
+    fn mixed_passes() -> (
         Vec<(NodeId, Vec<NodeId>, Vec<NodeId>)>,
         HashSet<NodeId>,
         HashSet<NodeId>,
@@ -2177,13 +2190,13 @@ mod tests {
         // results. Write order is not chronology — rows are written when their
         // guard drops, so an enclosing rewrite's rows land after the rows of the
         // rewrites nested inside it.
-        let (rows, inputs, outputs, upstream) = mixed_window();
+        let (rows, inputs, outputs, upstream) = mixed_passes();
         let mut reversed = rows.clone();
         reversed.reverse();
 
-        let (map, proj, leaks) = collapse(&table_from(&rows), WINDOW, &inputs, &outputs, &upstream);
+        let (map, proj, leaks) = collapse(&table_from(&rows), PASSES, &inputs, &outputs, &upstream);
         let (rev_map, rev_proj, rev_leaks) =
-            collapse(&table_from(&reversed), WINDOW, &inputs, &outputs, &upstream);
+            collapse(&table_from(&reversed), PASSES, &inputs, &outputs, &upstream);
 
         assert!(defects(&leaks).is_empty(), "{leaks:?}");
         assert_eq!(leaks, rev_leaks, "same leaks in either order");
@@ -2199,8 +2212,8 @@ mod tests {
     fn the_sweep_visits_every_vertex_once_and_never_backwards() {
         // The sweep's premise, measured: ascending NodeId is a topological order
         // of the definition graph, so the revisit count is zero.
-        let (rows, inputs, _outputs, _upstream) = mixed_window();
-        let m = sweep_metrics(&table_from(&rows), WINDOW, &inputs);
+        let (rows, inputs, _outputs, _upstream) = mixed_passes();
+        let m = sweep_metrics(&table_from(&rows), PASSES, &inputs);
         assert_eq!(m.vertices, 5, "two input ids + three produced");
         assert_eq!(m.edges, 4, "a→x, x→y, x→z, b→z");
         assert_eq!(
@@ -2210,10 +2223,10 @@ mod tests {
     }
 
     #[test]
-    fn a_row_produced_outside_the_window_reads_as_un_produced() {
-        // The window restriction, which is what turns a whole-compile table back
-        // into a per-boundary one. B was produced by a pass this boundary does
-        // not span, so to this boundary it is an ordinary input-pane node: the
+    fn a_row_produced_outside_the_passes_reads_as_un_produced() {
+        // The pass restriction, which is what turns a whole-compile table back
+        // into a per-relation one. B was produced by a pass this relation does
+        // not span, so to this relation it is an ordinary input-pane node: the
         // fold stops there rather than resolving through to A.
         let [a, b, c] = ids();
         let mut table = LineageTable::default();
@@ -2231,7 +2244,7 @@ mod tests {
         row(&mut table, c, &[b], &[]);
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([b]),
             &set([c]),
             &SourceProjection::new(),
@@ -2240,7 +2253,7 @@ mod tests {
         assert_eq!(
             ids_of(map.upstream(&c)),
             vec![b],
-            "the out-of-window row is the boundary's input, not a step through it",
+            "the out-of-scope row is the relation's input, not a step through it",
         );
     }
 
@@ -2252,7 +2265,7 @@ mod tests {
         let table = table_of(&[(b, &[a])]);
         let (_map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([a, b]),
             &SourceProjection::new(),
@@ -2267,7 +2280,7 @@ mod tests {
         let [a, z] = ids();
         let (_map, _proj, leaks) = collapse(
             &LineageTable::default(),
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([a, z]),
             &SourceProjection::new(),
@@ -2284,7 +2297,7 @@ mod tests {
         let [a, b] = ids();
         let (_map, _proj, leaks) = collapse(
             &LineageTable::default(),
-            WINDOW,
+            PASSES,
             &set([a, b]),
             &set([a]),
             &SourceProjection::new(),
@@ -2293,8 +2306,8 @@ mod tests {
     }
 
     #[test]
-    fn leak_parent_unknown_fires_on_a_parent_the_window_never_heard_of() {
-        // X is neither an input-pane id nor produced in the window, so B's
+    fn leak_parent_unknown_fires_on_a_parent_the_fold_never_heard_of() {
+        // X is neither an input-pane id nor produced by a pass the fold read, so B's
         // lineage stops at an id that describes nothing. One class, whether the
         // unknown id is a lone parent (as here) or one of a fusion's several —
         // the parents column does not record which.
@@ -2302,7 +2315,7 @@ mod tests {
         let table = table_of(&[(b, &[x])]);
         let (_map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([a, b]),
             &SourceProjection::new(),
@@ -2316,7 +2329,7 @@ mod tests {
         let table = table_of(&[(b2, &[a2, x2])]);
         let (_map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a2]),
             &set([b2]),
             &SourceProjection::new(),
@@ -2378,20 +2391,20 @@ mod tests {
     // ---- blame / attribution ----------------------------------------------
 
     #[test]
-    fn a_pure_insertion_is_related_to_its_blame_and_descends_from_nothing() {
+    fn a_pure_insertion_is_blamed_and_descends_from_nothing() {
         // A node placed over surviving material: no parents at all, attributed
-        // through blame. Its one edge is the relatedness edge blame contributes;
+        // through blame. Its one edge is the blame edge blame contributes;
         // nothing claims it descends from anything.
         let [a, b] = ids();
         let mut upstream = SourceProjection::new();
         upstream.insert(a, imaged(&[span(1, 4)]));
         let mut table = LineageTable::default();
         row(&mut table, b, &[], &[a]);
-        let (map, proj, leaks) = collapse(&table, WINDOW, &set([a]), &set([a, b]), &upstream);
+        let (map, proj, leaks) = collapse(&table, PASSES, &set([a]), &set([a, b]), &upstream);
         assert!(leaks.is_empty(), "pure insertion is leak-free: {leaks:?}");
         assert_eq!(
             labels_of(map.upstream(&b), a),
-            Some(EdgeLabels::RELATED),
+            Some(EdgeLabels::BLAME),
             "the insertion is related to what it was blamed on, and descends from nothing",
         );
         assert_eq!(ids_of(map.upstream(&b)), vec![a], "and from nothing else");
@@ -2411,7 +2424,7 @@ mod tests {
         let mut table = LineageTable::default();
         row(&mut table, out, &[a], &[a, b]);
         // B is carried to the output pane so the fold reports no death for it.
-        let (_map, proj, leaks) = collapse(&table, WINDOW, &set([a, b]), &set([out, b]), &upstream);
+        let (_map, proj, leaks) = collapse(&table, PASSES, &set([a, b]), &set([out, b]), &upstream);
         assert_eq!(
             defects(&leaks),
             Vec::<&Leak>::new(),
@@ -2442,7 +2455,7 @@ mod tests {
                 label: "copy.mirror",
             },
         );
-        let (_map, proj, leaks) = collapse(&table, WINDOW, &set([a]), &set([a, b]), &upstream);
+        let (_map, proj, leaks) = collapse(&table, PASSES, &set([a]), &set([a, b]), &upstream);
         assert!(leaks.is_empty(), "{leaks:?}");
         let attr = proj.get(&b).expect("product attributed");
         assert_eq!(attr.spans, vec![span(1, 2)], "mirrors the parent's spans");
@@ -2461,7 +2474,7 @@ mod tests {
         upstream.insert(a, imaged(&[span(0, 3)]));
         upstream.insert(b, imaged(&[span(7, 9)]));
         let table = table_of(&[(out, &[a, b])]);
-        let (_map, proj, leaks) = collapse(&table, WINDOW, &set([a, b]), &set([out]), &upstream);
+        let (_map, proj, leaks) = collapse(&table, PASSES, &set([a, b]), &set([out]), &upstream);
         assert!(defects(&leaks).is_empty(), "{leaks:?}");
         assert_eq!(
             proj.get(&out).expect("fusion attributed").spans,
@@ -2483,7 +2496,7 @@ mod tests {
         upstream.insert(b, imaged(&[sb]));
         let mut table = LineageTable::default();
         row(&mut table, out, &[p], &[b]);
-        let (map, proj, leaks) = collapse(&table, WINDOW, &set([p, b]), &set([b, out]), &upstream);
+        let (map, proj, leaks) = collapse(&table, PASSES, &set([p, b]), &set([b, out]), &upstream);
         assert!(defects(&leaks).is_empty(), "{leaks:?}");
         assert_eq!(
             proj.get(&out).expect("out attributed").spans,
@@ -2492,17 +2505,17 @@ mod tests {
         );
         assert_eq!(
             labels_of(map.upstream(&out), p),
-            Some(EdgeLabels::DESCENT),
-            "descent-only: the consumed node is an ancestor and nothing else",
+            Some(EdgeLabels::ANCESTRY),
+            "ancestry-only: the consumed node is an ancestor and nothing else",
         );
         assert_eq!(
             labels_of(map.upstream(&out), b),
-            Some(EdgeLabels::RELATED),
-            "relatedness-only: the blamed node is named, not descended from",
+            Some(EdgeLabels::BLAME),
+            "blame-only: the blamed node is named, not descended from",
         );
         assert_eq!(
             labels_of(map.downstream(&b), b),
-            Some(EdgeLabels::DESCENT),
+            Some(EdgeLabels::ANCESTRY),
             "and B, surviving, still descends from itself",
         );
     }
@@ -2518,7 +2531,7 @@ mod tests {
         row(&mut table, out, &[p], &[p]);
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([p]),
             &set([out]),
             &SourceProjection::new(),
@@ -2530,7 +2543,7 @@ mod tests {
             "one entry for one pair"
         );
         let labels = labels_of(map.upstream(&out), p).expect("the pair is an edge");
-        assert!(labels.descends() && labels.relates(), "{labels:?}");
+        assert!(labels.has_ancestry() && labels.has_blame(), "{labels:?}");
     }
 
     #[test]
@@ -2538,26 +2551,26 @@ mod tests {
         // The same pair reached twice, once each way: OUT descends from X, which
         // descends from R, and OUT is separately blamed on R. Both readings are
         // true of the pair `(R, OUT)`, and the entry carries both — a consumer
-        // pruning relatedness still sees the descent, and one pruning descent
-        // still sees the relatedness.
+        // pruning blame still sees the ancestry, and one pruning ancestry
+        // still sees the blame.
         let [r, x, out] = ids();
         let mut table = LineageTable::default();
         row(&mut table, x, &[r], &[]);
         row(&mut table, out, &[x], &[r]);
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([r]),
             &set([out]),
             &SourceProjection::new(),
         );
         assert!(defects(&leaks).is_empty(), "{leaks:?}");
         let labels = labels_of(map.upstream(&out), r).expect("the pair is an edge");
-        assert!(labels.descends() && labels.relates(), "{labels:?}");
+        assert!(labels.has_ancestry() && labels.has_blame(), "{labels:?}");
     }
 
     #[test]
-    fn a_mixed_path_is_relatedness_not_descent() {
+    fn a_mixed_path_is_blame_not_ancestry() {
         // Weakest link, which is the whole content of the label. OUT descends
         // from M, and M is *related to* R — so OUT is related to R and does not
         // descend from it. Reading the closure as unlabelled reachability would
@@ -2568,7 +2581,7 @@ mod tests {
         row(&mut table, out, &[m], &[]);
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([r]),
             &set([r, out]),
             &SourceProjection::new(),
@@ -2576,39 +2589,39 @@ mod tests {
         assert!(leaks.is_empty(), "{leaks:?}");
         assert_eq!(
             labels_of(map.upstream(&out), r),
-            Some(EdgeLabels::RELATED),
-            "one relatedness hop on the path makes the endpoint related",
+            Some(EdgeLabels::BLAME),
+            "one blame hop on the path makes the endpoint related",
         );
         assert_eq!(
             labels_of(map.downstream(&r), out),
-            Some(EdgeLabels::RELATED),
+            Some(EdgeLabels::BLAME),
             "and the mirrored direction agrees",
         );
     }
 
     #[test]
-    fn an_all_descent_path_stays_descent_through_a_transient() {
-        // The other half of weakest-link: composing descent with descent is
-        // descent however many transients the path runs through, so the label
+    fn an_all_ancestry_path_stays_ancestry_through_a_transient() {
+        // The other half of weakest-link: composing ancestry with ancestry is
+        // ancestry however many transients the path runs through, so the label
         // is not merely "one hop, unrewritten".
         let [a, b, c] = ids();
         let table = table_of(&[(b, &[a]), (c, &[b])]);
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([c]),
             &SourceProjection::new(),
         );
         assert!(defects(&leaks).is_empty(), "{leaks:?}");
-        assert_eq!(labels_of(map.upstream(&c), a), Some(EdgeLabels::DESCENT));
+        assert_eq!(labels_of(map.upstream(&c), a), Some(EdgeLabels::ANCESTRY));
     }
 
     #[test]
-    fn a_blamed_id_the_window_never_heard_of_is_not_a_parent_unknown() {
-        // `ParentUnknown` is a claim about the `parents` column: a *descent* hop
+    fn a_blamed_id_the_fold_never_heard_of_is_not_a_parent_unknown() {
+        // `ParentUnknown` is a claim about the `parents` column: an *ancestry* hop
         // that stops at an id describing nothing. Blame points at material the
-        // boundary need not hold, so an unknown blamed id contributes no edge and
+        // relation need not hold, so an unknown blamed id contributes no edge and
         // no leak — the same silence `attribute` keeps for a blamed id with no
         // known spans.
         let [a, unknown, b] = ids();
@@ -2616,7 +2629,7 @@ mod tests {
         row(&mut table, b, &[a], &[unknown]);
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([b]),
             &SourceProjection::new(),
@@ -2653,7 +2666,7 @@ mod tests {
         );
         let (_map, proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([b]),
             &SourceProjection::new(),
@@ -2671,7 +2684,7 @@ mod tests {
         let [a] = ids();
         let (_map, proj, leaks) = collapse(
             &LineageTable::default(),
-            WINDOW,
+            PASSES,
             &set([a]),
             &set([a]),
             &SourceProjection::new(),
@@ -3243,7 +3256,7 @@ mod tests {
     // ---- a recording declares nothing --------------------------------------
     //
     // The property under test throughout: a site names the node being rewritten,
-    // births are captured, and fate is the boundary's live-set difference. These
+    // births are captured, and fate is the relation's live-set difference. These
     // are the pass/fail statements behind the design.
 
     #[test]
@@ -3260,7 +3273,7 @@ mod tests {
 
         let (map, proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([a_id]),
             &set([out_id]),
             &SourceProjection::new(),
@@ -3310,13 +3323,13 @@ mod tests {
         // hand: capture-only births plus one monotone counter means no edge runs
         // backwards, so no vertex is ever revisited.
         assert_eq!(
-            sweep_metrics(&table, WINDOW, &set([origin])).backward_edges,
+            sweep_metrics(&table, PASSES, &set([origin])).backward_edges,
             0,
             "a captured record's edges all run from smaller NodeId to larger",
         );
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([origin]),
             &set([c1, c2]),
             &SourceProjection::new(),
@@ -3338,7 +3351,7 @@ mod tests {
     fn a_recorded_wrap_does_not_claim_the_wrapped_node_died() {
         // The adopt-a-live-subtree shape: mint a wrapper *over* the named node,
         // which stays in the tree as a child. Both ids are live at the
-        // boundary; the fold must report no death and no leak. A record that
+        // fold; it must report no death and no leak. A record that
         // declared the slot consumed would report it dead.
         let slot = NodeId::fresh();
         let mut wrapper = NodeId::PLACEHOLDER;
@@ -3348,7 +3361,7 @@ mod tests {
         });
         let (map, _proj, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([slot]),
             &set([slot, wrapper]),
             &SourceProjection::new(),
@@ -3363,7 +3376,7 @@ mod tests {
     }
 
     #[test]
-    fn deaths_are_the_boundary_difference_not_a_declaration() {
+    fn deaths_are_the_live_set_difference_not_a_declaration() {
         // The fate-prediction replacement, end to end. One rewrite; whether the
         // named node survives is decided *only* by which snapshot it is in.
         // The identical record yields "survived" against one output pane and
@@ -3381,7 +3394,7 @@ mod tests {
         let (slot, born, table) = make();
         let (_m, _p, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([slot]),
             &set([slot, born]),
             &SourceProjection::new(),
@@ -3391,7 +3404,7 @@ mod tests {
         let (slot, born, table) = make();
         let (map, _p, leaks) = collapse(
             &table,
-            WINDOW,
+            PASSES,
             &set([slot]),
             &set([born]),
             &SourceProjection::new(),
@@ -3460,12 +3473,12 @@ mod tests {
         assert!(table.parents(never).is_empty());
         assert!(table.blame(never).is_empty());
         assert_eq!(table.rule(never), None);
-        assert_eq!(table.rule_in(never, WINDOW), None);
+        assert_eq!(table.rule_in(never, PASSES), None);
         assert!(!table.contains(never));
     }
 
     #[test]
-    fn a_row_outside_the_window_reads_as_unrecorded_to_that_boundary() {
+    fn a_row_outside_the_passes_reads_as_unrecorded_to_that_relation() {
         let mut table = LineageTable::default();
         let [parent, node] = ids();
         let rule = table.intern_rule(RewriteTag {
@@ -3476,9 +3489,9 @@ mod tests {
 
         assert!(table.rule(node).is_some(), "the row exists");
         assert_eq!(
-            table.rule_in(node, WINDOW),
+            table.rule_in(node, PASSES),
             None,
-            "but not to a boundary whose window excludes its pass",
+            "but not to a pane relation whose passes exclude it",
         );
     }
 

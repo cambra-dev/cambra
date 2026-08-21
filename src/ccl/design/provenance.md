@@ -9,51 +9,69 @@ fusing clauses).
 **Status markers.** The substrate — the identity primitives, the lineage model,
 the recorder, the passes' adoption of it, the always-on lowering projection, the
 `NodeId`-keyed table that is the sink
-([The node table](#the-node-table-srcccllineagers)), and the pane-boundary fold
-over it — is in tree. Everything a **Planned** marker introduces is designed but
-not yet built: the inspector's consumption of the panes. A reader can tell the
-two apart by the marker alone; unmarked prose describes code you can go read.
+([The node table](#the-node-table-srcccllineagers)), and the fold over it — is in
+tree. Everything a **Planned** marker introduces is designed but not yet built:
+the inspector's consumption of the panes. A reader can tell the two apart by the
+marker alone; unmarked prose describes code you can go read.
 
-Adoption is complete across the five passes the two pane boundaries span —
-`Mono`, `Inline`, `Transact`, `Letrec`, `Desugar` — and the gate holds at zero on
-both boundaries. Three further sites record without reaching any table in a
-normal build, because `compile_program` opens no `PassScope` around them:
-`simplify`, `planning/iterate`, and `transact_phase`'s as-of-read rewrite.
-`lambda_elim` records nothing at all, and operator conversion has no identity to
-record against; see
+Adoption is complete across the five passes the two pane relations span — `Mono`,
+`Inline`, `Transact`, `Letrec`, `Desugar` — and the gate holds at zero on both.
+Three further sites record without reaching any table in a normal build, because
+`compile_program` opens no `PassScope` around them: `simplify`,
+`planning/iterate`, and `transact_phase`'s as-of-read rewrite. `lambda_elim`
+records nothing at all, and operator conversion has no identity to record
+against; see
 [Known prerequisites for panes past `post-desugar`](#known-prerequisites-for-panes-past-post-desugar).
+
+## Mechanism at a glance
+
+Every node carries a `NodeId`, unique for the process and preserved across a
+rewrite that keeps the node. Identity is the only thing the pipeline threads; the
+rest is derived from it.
+
+A rewrite **records**: it names the node it is about to rewrite, and every node
+minted while that recording is the innermost open one takes the named node as a
+parent. A site declares nothing else. It does not declare what it produced — the
+produced side is discovered through the mint and copy hooks — and it does not
+declare what it destroyed, because a death is the difference between the ids live
+before and after.
+
+Those rows accumulate in one `NodeId`-keyed table per compile, one row per node:
+its `parents`, its `blame`, and an interned rule tag. Folding the rows of a chosen
+set of passes turns the table into a relation between the trees at each end of
+those passes, labelling every edge and reporting the ids it could not explain.
+
+Two things fold. A **pane** is a retained snapshot the inspector displays,
+materialized after a set of passes; the fold over the passes between two adjacent
+panes is the **pane relation**, and the leak classes are asserted empty there on
+every compile. A `LineageAudit` folds between two chosen points against the live
+tree rather than a snapshot, and measures instead of gating: it is how a pass's
+recording is checked before any pane spans it, and how a suspected gap is located
+without waiting for the gate to be extended.
+
+Source spans enter at one place. Lowering projects every id `collect_tree_ids`
+enumerates onto the span of the CHL it came from, and every later span is derived
+by walking `parents` back into that projection.
 
 ## Terms
 
-Six words do most of the work here, and two pairs of them are easy to run
-together. Pinned once, used consistently below.
-
 | term | what it is |
 |---|---|
-| **pane** | One of the three retained AST snapshots on `CompiledProgram`: `pre_inference_ir`, `post_inference_ir`, `post_desugar_ir`. A pane is a *thing the inspector displays*. There are three, and adding one costs a retained full-tree clone. |
-| **pane boundary** | The fold between two **adjacent panes** — `pre → post-inference` and `post-inference → post-desugar`. Produced by `materialize_panes`, which restricts the table by the boundary's passes. This is the **durable, gated** artifact: the leak classes are asserted here. |
-| **window** | A set of passes a fold restricts the table by, and by extension the `LineageAudit` measurement span that opens one at an arbitrary point and folds at another, reading the *live tree* at each end rather than a retained snapshot. An audit is env-selected, and a **measurement, never a gate**. |
+| **pane** | A retained AST snapshot the inspector displays, materialized after a set of passes. Each one costs a retained full-tree clone. |
+| **pane relation** | What folding the passes between two adjacent panes produces: an id-to-id relation with labelled edges. The **durable, gated** artifact — the leak classes are asserted here. |
 | **recording** | The scope `lineage::enter` opens over one rewrite, held as a `FrameGuard`. Every node minted while it is the innermost open one takes the node it names as a parent. Prose here says "a recording" for the scope, "the recording site" for the code location, and "records against X"; the guard is the RAII value that closes it. |
-| **slot** | The node a recording names — `lineage::enter(slot_id, …)` — read off the tree *before* the rewrite runs. Normally a main-tree node. A predicate interior *may* be one now that predicate ids are in the id domain, but work **on** a predicate is usually recorded against the predicate's own root, and work that *produces* one against the main-tree node whose type will carry it. |
-| **predicate interior** | A `NodeId` carried by a `TypedExpr` inside a `Type::Refinement`'s predicate. Real ids from the same counter, and **in the id domain**: `collect_tree_ids` enumerates them, so the fold must *explain* them. It does **not** follow that they are unique — `assert_unique_node_ids` still walks the main tree only. See "Walking the ids". |
+| **slot** | The node a recording names — `lineage::enter(slot_id, …)` — read off the tree *before* the rewrite runs. Normally a main-tree node. A predicate interior *may* be one, but work **on** a predicate is usually recorded against the predicate's own root, and work that *produces* one against the main-tree node whose type will carry it. |
+| **predicate interior** | A `NodeId` on a `TypedExpr` inside a `Type::Refinement`'s predicate. Ordinary ids from the same counter, and inside the id domain a fold must explain: `collect_tree_ids` enumerates them. They are the one place explanation and uniqueness come apart — `assert_unique_node_ids` walks the main tree only, because a predicate interior may legitimately carry a main-tree id. See "Walking the ids". |
 
-The distinction that matters most: **a window may extend past the last pane, and
-it may not extend past the last instrumented pass.** A window's endpoint is not a
-pane and nothing in a normal build folds it, so a pass below `post_desugar_ir` can
-record every rewrite and still contribute to no gate — the current state of
-`simplify` and `planning/iterate`.
-
-That freedom cuts both ways, so the endpoint is **chosen, and it is the window's
-whole point.** An audit measures what the recordings explain, so a window running
-past the last instrumented pass counts everything the uninstrumented tail mints as
-a defect: a number that cannot reach zero however correct the recording is, which
-makes the audit read as a broken gate rather than a measurement. The `full` window
-therefore ends at the last instrumented pane — `post-inference..post-as-of-read`
-today, stopping in front of `lambda_elim`, which records nothing because it
-re-mints nearly every pass-through node.
+An audit's endpoint is **chosen**, because a span running past the last
+instrumented pass counts everything the uninstrumented tail mints as a defect — a
+number that cannot reach zero however correct the recording is, which makes the
+audit read as a broken gate rather than a measurement. The `full` span therefore
+ends at the last instrumented pane, `post-inference..post-as-of-read`, stopping in
+front of `lambda_elim`.
 
 **The same discipline governs the gate.** `CAMBRA_LINEAGE_GATE=1` makes *every*
-compile fold its pane boundaries and gate the leak classes, so the gate's corpus
+compile fold its pane relations and gate the leak classes, so the gate's corpus
 becomes whatever the caller compiles — point it at the test suite and it covers
 every program there instead of the handful `context.rs`'s `corpus()` lists. That
 sample is what let two recording gaps live: `transact_phase` calling
@@ -61,13 +79,13 @@ sample is what let two recording gaps live: `transact_phase` calling
 value-position writer hoist. Both are shapes the eleven listed programs do not
 have. CI runs with it on; it costs about 4% of the test step.
 
-It gates `gated_boundaries()`, not both boundaries, for the reason above: the
-first boundary spans monomorphization and inference, and **inference's predicate
+It gates `gated_pane_relations()`, not both, for the reason above: the first
+relation spans monomorphization and inference, and **inference's predicate
 producers do not record**. `specialize_use` clones a definition per
 instantiation, and the copies of a predicate term inside it row against interior
 ids no pass produced. Over `tests/compilation_pipeline` that is 5 programs, all
 UDF-with-filter or poly-wrapper shapes. Gating it today would report a constant,
-not a regression. **Add it to `gated_boundaries()` in the commit that makes
+not a regression. **Add it to `gated_pane_relations()` in the commit that makes
 inference record**, the same way an endpoint moves.
 
 **Move the endpoint when a pass becomes instrumented, in the commit that
@@ -173,8 +191,8 @@ the call site's job to remember.
 `assert_unique_node_ids` enforces it at every pass boundary in `compile_program`
 — post-lowering, -inline, -transact, -letrec-run, -desugar, -as-of-read,
 -lambda-elim, -planning — gated on `cfg!(any(debug_assertions, test))`. The walk
-is `O(nodes)` per boundary and buys nothing in a release compile, where the fold's
-leak classes cover the same ground. A boundary check is a tree invariant and
+is `O(nodes)` per pass boundary and buys nothing in a release compile, where the
+fold's leak classes cover the same ground. The check is a tree invariant and
 encodes no pass order, so a reordered pass carries its check with it. It also
 means a pass is implicated only at a boundary that looks at it: a clean run is
 evidence about the gates, not about the passes between them.
@@ -228,7 +246,7 @@ outcomes carry different costs.
   generation is stranded, so the placed copy names an origin no node holds, a
   `parents` walk for a span dead-ends, and the fold reports `ParentUnknown`.
   Freshening the substitution engine's `Subst`-resident templates produces
-  exactly this, and the boundary gate fails.
+  exactly this, and the pane-relation gate fails.
 - **Dropped**: one spent id and one row no query reaches. No check reports it —
   both leak checks enumerate from the tree, there is no produced-side check
   (below), and a node absent from the tree is outside `assert_unique_node_ids`.
@@ -255,26 +273,29 @@ a pass runs, every node it *produces* gets a row in the `LineageTable`:
 | `blame` | the upstream ids the node is *related to but did not consume* — **not** the same as `parents` |
 | `rule` | an interned `RewriteTag` — the `{via, nature, label}` triple |
 
-A row is **silent on its parents' own fate**. That silence is what makes
-*adopt-a-live-subtree* expressible: a rewrite that keeps a node's id while
-minting a wrapper over one of its children must not be read as declaring that
-node dead. It is equally what makes a fusion's parent set safe — naming a
-survivor there costs an over-broad edge, never a phantom death.
+**No column records a fate.** Both columns make a claim about the *product* — one
+that it was consumed from these ids, one that it is about them — and neither says
+whether any named id survived. Deaths come from one place only: `input_ids ∖
+output_ids` across a pane relation. Nothing predicts a fate, so no pass can
+over-claim one.
+
+That silence is what makes *adopt-a-live-subtree* expressible: a rewrite that
+keeps a node's id while minting a wrapper over one of its children must not be
+read as declaring that node dead. It is equally what makes a fusion's parent set
+safe — naming a survivor there costs an over-broad edge, never a phantom death.
 
 The parents column's **cardinality** carries the rewrite's shape, and nothing
 else about the shape is recorded: one parent is a 1:1 or 1:many rewrite (several
 products each rowing on the same slot), several parents is a genuine fusion. A
 node cannot be its own parent — an in-place rewrite that keeps its id is a
 *preserve*, which records nothing, because identity here is referent identity
-and the pane resolves it by shared id.
+and the pane resolves it by shared id. The *closure* of `parents` is reflexive
+even so, which is why a surviving node carries an ancestry self-edge
+([The edge labels](#the-edge-labels)).
 
-Deaths are recorded by **nobody**: they are `input_ids ∖ output_ids` at the
-boundary. Nothing predicts a fate, so no pass can over-claim one.
-
-`blame` says nothing about any node's fate. Attribution resolves through
-**`parents` ∪ `blame`** — parentage first, then blame's distinct additions, so
-the span order is deterministic and blame is never dropped when it names a node
-the parents do not. Blame is named at four sites in the whole tree, so for almost
+Attribution resolves through **`parents` ∪ `blame`** — parentage first, then
+blame's distinct additions, so the span order is deterministic and blame is never
+dropped when it names a node the parents do not. Blame is named at four sites in the whole tree, so for almost
 every node this is simply the spans of what it was made from, which is why
 walking the lineage recovers a source location at all.
 
@@ -284,12 +305,12 @@ label on the edge, not the presence of one. `parents` says **descends from**;
 `blame` says **related to, but not consumed**. Blame may name a node that
 *survives* the rewrite, so welding it into `parents` would answer "what was this
 made from" with a live node elsewhere in the tree. Both columns reach the
-pane-to-pane relation, each labelling the edges it contributes, and the leak
-audit reads the descent column alone (see
+pane relation, each labelling the edges it contributes, and the leak audit reads
+the ancestry label alone (see
 [The edge labels](#the-edge-labels)).
 
 Keeping the two apart is what lets a consumer render each faithfully — show the
-relatedness, or prune it — rather than receiving one unlabelled edge set it
+blame, or prune it — rather than receiving one unlabelled edge set it
 cannot take apart again. `mut_elim`'s `enter(stmt_id)` + `blame(for_id)` is the
 shape: the products descend from the statement and are *about* the loop keyword.
 
@@ -313,7 +334,7 @@ rather than a NodeId reference resolved later through the accumulating
 projection. A `LoweringStep` is therefore not a row but one of the two shapes
 lowering actually has — a **leaf mint** (one id, one span, a nature and a label)
 or a **copy** (an origin and its freshened duplicates, mirroring the origin's
-folded entry verbatim). Its log is folded **once** at the lowering boundary by
+folded entry verbatim). Its log is folded **once** at the lowering handoff by
 `collapse_lowering` into the always-on lowering projection (below).
 
 ### The recorder
@@ -327,10 +348,10 @@ sink, mirroring `infer_var::ACTIVE_ARENA`:
   emptiness check on the construction hot path.
 - `TableSession` installs the table for a **whole compile**; `PassScope` names
   the pass rows are tagged with, for **one pass**. The two nest that way because a
-  row's key is a process-unique `NodeId` and needs no window to disambiguate it,
-  while a `RewriteTag` needs a pass the recording site cannot supply: the site
-  knows its `label` and `nature` but not which pass is running, and the boundary
-  that opens the scope knows exactly that.
+  row's key is a process-unique `NodeId` and needs no pass set to disambiguate
+  it, while a `RewriteTag` needs a pass the recording site cannot supply: the site
+  knows its `label` and `nature` but not which pass is running, and the pass
+  boundary that opens the scope knows exactly that.
 - `LoweringSession` installs lowering's log instead, and is always-on.
 
 **A site declares nothing.** It names the node it is *about to rewrite*:
@@ -354,7 +375,7 @@ a loud failure rather than a silent misattribution):
   second parent on a row and the only place any id is named at record time.
 - `blame(ids)` — nodes this rewrite is **related to but did not consume to
   produce** its outputs. Attribution unions them with the parents; the lineage
-  relation carries them as *relatedness* edges. Blame is named at four sites in
+  relation carries them as *blame* edges. Blame is named at four sites in
   the whole tree, so `parents` alone is what recovers a source location for
   almost every node.
 
@@ -366,7 +387,7 @@ nowhere to attach a mint or a consume, which `OpenStep::assert_copy_only`
 enforces.
 
 **Where recordings are open today.** Lowering's leaf appends and copy sinks, plus
-recordings inside the two pane windows: `infer/solve` (`mono.specialize`,
+recordings inside the two pane relations: `infer/solve` (`mono.specialize`,
 `mono.coalesce_let`), `infer/emit` (`infer.lit_singleton`), `inline`
 (`inline.alias`, `inline.udf`, `inline.beta`), `mut_elim` (`letrec.loop`,
 `letrec.bare_write`, `letrec.hoist_writer_body`, `letrec.terminalize_write`),
@@ -378,16 +399,17 @@ scope is open around them: `subst` (`subst.vacuous`, `subst.transport`,
 `subst.force_refinement`) and `ccl_utils`' `PredMemo::rebuild`
 (`predicate.rebuild`).
 
-Three sites record **below** `post_desugar_ir`, so no boundary folds their rows:
+Three sites record **below** `post_desugar_ir`, so no pane relation folds their
+rows:
 `simplify` (one combinator covering all thirteen `&mut` rule invocations, with no
 rule-body edits), `planning/iterate`, and `transact_phase`'s as-of-read rewrite.
 `compile_program` opens no `PassScope` around any of them, so their recordings
-are inert in a normal build and land only under a window a caller opens.
+are inert in a normal build and land only under an audit a caller opens.
 `CAMBRA_LINEAGE_AUDIT=full` (`post-inference..post-as-of-read`) covers the
 as-of-read rewrite; reaching `simplify` and `planning/iterate` needs
 `CAMBRA_LINEAGE_AUDIT=planning` (`recognized..join-planned`), which is what the
-coverage figures below were measured with. `lambda_elim` records nothing (see "a
-window may not extend past the last instrumented pass").
+coverage figures below were measured with. `lambda_elim` records nothing, which
+is what an audit's endpoint stops in front of.
 
 ### Where to open a recording
 
@@ -422,7 +444,7 @@ Three refinements the shapes above do not cover:
   scattered `with begin():` blocks and register declarations collectively became.
   Parent it on the **outermost** node it replaces, never on a synthetic stand-in.
 - **The named node may be one the pass itself just minted**, provided it was
-  minted under a recording: it is then produced-in-window, and the fold reaches
+  minted under a recording: it is then produced by a pass the fold reads, and the fold reaches
   the original in two hops. Reading `slot_id` *before* the rewrite does not
   require it to be an input-pane node.
 - **One entry serving arms of different `Nature`** — open a **second recording on
@@ -461,22 +483,22 @@ Four properties, each load-bearing:
   lengthen as programs grow. Storing spans per row would denormalize that onto
   every row ever minted.
 - **"No row" is a legitimate state.** The key space is `NodeId`, and a `NodeId`
-  can be addressed without ever having been recorded — every
-  refinement-predicate interior is (see [Walking the ids](#walking-the-ids)). Reads
-  answer empty / `None`; nothing panics.
+  can be addressed without ever having been recorded: an id minted by a pass that
+  records nothing, or one whose producer lies outside the passes a fold reads.
+  Reads answer empty / `None`; nothing panics.
 - **Deaths are taken over rows, never over the key space.** `deaths(live)` is
   `recorded ∖ live`, and row enumeration is private so it cannot be taken any
   other way: a difference over addressed-but-unrecorded ids would report a death
-  per predicate node in the program.
+  for every id no pass produced.
 - **One table per compile, one pass scope per pass.** A row's key is
-  process-unique, so no window is needed to disambiguate it. That is also why
+  process-unique, so no pass set is needed to disambiguate it. That is also why
   the pass reaches the write as an *ambient* fact: a recording site knows its
   `label` and `nature` but not which pass is running, so `PassScope::enter(pass)`
   carries it for the scope's extent and the tag is completed from it.
 
 **There is deliberately no rewrite-kind column.** A 1:1 copy and a many:1 fusion
 differ only in a claim about the origins' *fate*, and driver capture already
-decided fate is never declared — it is the boundary set difference. What is
+decided fate is never declared — it is the live-set difference. What is
 load-bearing is the parents column's cardinality, which already carries 1:1,
 1:many and many:1. A site that finds itself needing to know the kind is asking a
 fate question that nothing here answers.
@@ -484,19 +506,22 @@ fate question that nothing here answers.
 The backing store is a `HashMap`; the paged, delta-encoded form is a later pure
 re-encoding behind the same accessors.
 
-A row's `via` is what restricts the whole-compile table to one boundary: an id
-whose row lies outside a boundary's window is, to that boundary, an ordinary
-un-produced id. The restriction is load-bearing — at the post-desugar boundary a
+A row's `via` is what restricts the whole-compile table to one pane relation: an
+id produced by a pass the relation does not span is, to that relation, an ordinary
+un-produced id. The restriction is load-bearing — at the second relation a
 `Mono`-produced input-pane id has a row, and walking through it would resolve
 past the pane.
 
-**Planned** is admitting predicate interiors as rows — a *population* change,
-not a schema change, since those ids already have addresses in the key space.
+Predicate interiors are rows like any other. Lowering's projection covers every
+id `collect_tree_ids` enumerates, and `PredMemo::rebuild` records a derived
+predicate against the one it was built from. What is **not** recorded is planning
+raising a predicate back into the main tree; see
+[Known prerequisites for panes past `post-desugar`](#known-prerequisites-for-panes-past-post-desugar).
 
 ### The collapse
 
-`collapse(table, window, input_ids, output_ids, upstream_attr)` folds the rows
-`window`'s passes wrote into:
+`collapse(table, passes, input_ids, output_ids, upstream_attr)` folds the rows
+those passes wrote into:
 
 - a `LineageMap<NodeId, NodeId>` — a dense bidirectional node↔node relation
   (self-edge for every survivor), each edge carrying the **label set** described
@@ -511,7 +536,7 @@ not a schema change, since those ids already have addresses in the key space.
   validators carry a debug guard that a `"source"` nature never actually ships.
 
 Transients (born + consumed within the phase) compose away. A two-sided leak
-audit (`Leak`) reports both sides of the boundary difference: an output with no
+audit (`Leak`) reports both sides of the live-set difference: an output with no
 lineage (`Unexplained` — a capture defect) and an input absent from the output
 pane (`Died` — the death report, data rather than a defect, since under driver
 capture nothing declares a fate).
@@ -519,28 +544,28 @@ capture nothing declares a fate).
 #### The edge labels
 
 An edge carries a **set** of labels, not one, and the set is stored once per
-`(upstream, downstream)` pair: a pair that is both descent and relatedness is one
+`(upstream, downstream)` pair: a pair that is both ancestry and blame is one
 edge asserting both, never two edges disagreeing about one pair. Two labels
 exist, one per column — `parents` contributes *descends from*, `blame`
 contributes *related to, but not consumed* — and a row naming one id in both
 columns contributes a single hop carrying both.
 
 Both are closed transitively, in the same sweep, and the closure composes
-**weakest link**: a path is descent only while *every* hop on it is a descent
-hop, and one relatedness hop anywhere makes the endpoint related. That is what
+**weakest link**: a path is ancestry only while *every* hop on it is an ancestry
+hop, and one blame hop anywhere makes the whole path blame. That is what
 makes the label mean something at distance — you do not descend from something
 you are merely related to two hops back — and it is why the sweep carries a label
 alongside each root rather than running two closures whose results could not be
 recombined afterwards. Paths meeting at one root union their labels, which is the
 other way a pair comes to carry both.
 
-The dense self-edge is **descent**: a surviving node descends from itself, which
+The dense self-edge is **ancestry**: a surviving node descends from itself, which
 is the identity of the weakest-link composition, so density needs no special
 case.
 
-The leak audit reads the descent column alone. `ParentUnknown` is a claim about
-`parents` — a descent hop stopping at an id that describes nothing — while a
-blamed id the boundary never heard of contributes no edge and no class, the same
+The leak audit reads the ancestry label alone. `ParentUnknown` is a claim about
+`parents` — an ancestry hop stopping at an id that describes nothing — while a
+blamed id the fold never heard of contributes no edge and no class, the same
 silence attribution keeps for a blamed id with no known spans.
 
 #### The fold is order-free
@@ -573,11 +598,11 @@ the number of vertices a sweep would have to revisit.
 The leak taxonomy follows the set reading, and has three classes. `Unexplained`
 is an output-pane id no row produced and the input pane does not hold. `Died` is
 the input-pane set difference. `ParentUnknown` is a parent that is neither an
-input-pane id nor produced inside the window — **one** class for both edge
+input-pane id nor produced by a pass the fold reads — **one** class for both edge
 shapes, because a lone parent and one of a fusion's several are the identical
 condition, and telling them apart would mean recording the rewrite's shape.
 
-The classes that are properties of a *record* rather than of a boundary live at
+The classes that are properties of a *record* rather than of a fold live at
 the write instead: one row per id, and every row anchored through consumption or
 blame, are asserted in `LineageTable::record` (see
 [The lineage model](#the-lineage-model-srcccllineagers)). "Two rewrites claimed
@@ -593,13 +618,8 @@ has no lineage to compose — lowering mints from scratch, so what would be a se
 of input-pane roots per id degenerates to a plain live set.
 
 Both checks enumerate from the **tree**. There is deliberately no third check on
-the *produced* side — "every recorded id is held by some node" —
-because it is not decidable against the node set the fold works over: lowering
-tags the nodes inside a refinement predicate, but that set is `collect_tree_ids`,
-the `walk_children` domain, which excludes predicate interiors, so every
-predicate id would read as a violation.
-
-Two legitimate shapes would read as violations too. Uncurrying `def f(x, y)`
+the *produced* side — "every recorded id is held by some node" — because two
+legitimate shapes would read as violations. Uncurrying `def f(x, y)`
 builds one `__arg_tuple_0.0` projection template and substitutes a freshened copy
 of it at each `x`; every copy's root carries that occurrence's own id, so the
 template's own root id is tagged and then held by no node. The read-your-writes
@@ -611,7 +631,7 @@ Construction closes the gap the check would have watched: a node is built either
 by `TypedExpr::new` (mint, recorded) or `TypedExpr::preserve` (carry an existing
 id, nothing recorded), so an id cannot be minted and then discarded.
 
-The fold runs at the inspector's two pane boundaries today; **planned** is the
+The fold runs over the inspector's two pane relations today; **planned** is the
 inspector's consumption of what it produces.
 
 ## The seam (`src/ccl/context.rs`)
@@ -688,34 +708,34 @@ inspector's consumption of what it produces.
   record covered as `Leak::ParentUnknown`; a born-copied-discarded template id
   composes away (live but neither placed nor an output). The fold is always-on
   (its product is release-critical); the leak *checks* are debug/test-gated at
-  the boundary via `gate_leaks`. Orphaned projection keys are
+  the lowering handoff via `gate_leaks`. Orphaned projection keys are
   structurally impossible — the projection is *produced by* the fold, never
   mutated incrementally.
 - **Materialization (cold, inspector-only).** `CompiledProgram::materialize_panes`
-  folds `lineage_table` at the two pane boundaries, restricting it by pass:
+  folds `lineage_table` across the two pane relations, restricting it by pass:
   `MONO_WINDOW` bridges pre → post-inference; `DESUGAR_WINDOW` (Inline, Transact,
   Letrec, Desugar) bridges post-inference → post-desugar. It returns the three per-pane
-  `SourceProjection`s, the two pane-pair `LineageMap`s, and each boundary's leak
+  `SourceProjection`s, the two pane-pair `LineageMap`s, and each relation's leak
   vector. There is no catch-all bridge: a node is explained by a recorded row or
   it is not explained at all, and the gate is what says which. Materialization
   cannot assert its own gate — with `Died` as a payload the leak vector is a
   *product*, not an error channel — so it returns the leaks and callers gate.
-- **The pane leak gate.** `gate_leaks` gates the lowering boundary and both
-  **pane** boundaries on the *defect* classes: `Unexplained` (an output node no
-  capture explains) and `ParentUnknown` (a lineage edge to an id the window has
+- **The pane leak gate.** `gate_leaks` gates the lowering handoff and both
+  **pane relations** on the *defect* classes: `Unexplained` (an output node no
+  capture explains) and `ParentUnknown` (a lineage edge to an id the fold has
   never heard of). The split lives on `Leak::is_defect`. `Died` is excluded by
   construction — it is the death report, and gating on it would be unsatisfiable
   now that no pass declares what it consumes.
 
   Where the gate stands on a real corpus: **zero on every gated class, at both
-  pane boundaries, for every program.** Capture is total over the adopted span —
+  pane relations, for every program.** Capture is total over the adopted span —
   every output-pane node has an origin — and the corpus test asserts it as a
   property rather than pinning a residue count.
 
 ## Known prerequisites for panes past `post-desugar`
 
 A pane may be issued at **any** point during compilation — the current adoption
-boundary is an artifact of what has been built, not a statement about the design.
+point is an artifact of what has been built, not a statement about the design.
 Three things block extending it, all acknowledged and none blocking the two panes
 that exist:
 
@@ -729,20 +749,20 @@ that exist:
   is no `OperatorId`, so a pane after it has nothing to resolve against.
 - **Planning does not record what it raises out of the predicate domain.** Three
   sites cross: `planning/iterate`'s `fn_of_bare_predicate` lift, the group-by key
-  extraction, and the hash-join key morphisms. Each would record against its term-tree
-  site — the right slot, a predicate interior being nothing a pane enumerates —
-  but the `on_copy` hook reports the *origin it freshened*, and no channel re-roots
-  a captured copy onto the node the site named. Only `planning/iterate` records at
+  extraction, and the hash-join key morphisms. Each would record against its
+  term-tree site, that being the node the raised material becomes, but the
+  `on_copy` hook reports the *origin it freshened*, and no channel re-roots a
+  captured copy onto the node the site named. Only `planning/iterate` records at
   all, and no pass scope covers it.
 
   Measured at `post-inference..join-planned`, when that was `full`'s span: over
   the 11-program corpus the residue was 1184 `ParentUnknown` edges and nothing
   else, every unknown parent a predicate-interior id of the input tree, and
-  widening the window's live set (`CAMBRA_LINEAGE_PREDICATES=1`) took every gated
+  widening the audit's live set (`CAMBRA_LINEAGE_PREDICATES=1`) took every gated
   class to zero. (The count is from before the endpoint moved and has not been
-  re-taken.) That says the recording is total for the window and the narrow live
+  re-taken.) That says the recording is total for the span and the narrow live
   set is what makes the crossing read as a leak. It says nothing about the two
-  pane boundaries, whose passes rebuild predicates through `PredMemo` and are
+  pane relations, whose passes rebuild predicates through `PredMemo` and are
   recorded there.
 
 ## Planned — inspector consumers (`src/inspector_model/`)
@@ -762,7 +782,7 @@ pane folds; the release compiler reads the lowering projection and nothing else.
 - `paneLinks` ship each pane-pair `LineageMap` **dense** — self-edges included,
   no identity-edge filter — via `stage::dense_edges`; the frontend only follows
   edges, never reconstructing them, and reads each edge's label set to decide
-  whether to render the relatedness or prune it. Both validators check that every
+  whether to render the blame or prune it. Both validators check that every
   edge endpoint is a live node id in its respective pane.
 
 The snapshot payload carries its own version in `meta.schema`, owned by the

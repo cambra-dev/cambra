@@ -540,13 +540,13 @@ pub struct CompiledProgram {
     /// ([`crate::ccl::lineage`]).
     ///
     /// One table covers the whole compile, because a row's key is a
-    /// process-unique `NodeId` and needs no window to disambiguate it; a row's
-    /// `via` is what a pane boundary restricts by. The passes that record are
+    /// process-unique `NodeId` and needs no pass set to disambiguate it; a row's
+    /// `via` is what a pane relation restricts by. The passes that record are
     /// [`Pass::Mono`] (everything monomorphization mints inside `infer`, which
     /// bridges the pre-inference ⇄ post-inference panes) and [`Pass::Inline`],
     /// [`Pass::Transact`], [`Pass::Letrec`], [`Pass::Desugar`] (the four passes
     /// between the post-inference and post-desugar snapshots) — see
-    /// [`MONO_WINDOW`] and [`DESUGAR_WINDOW`].
+    /// [`MONO_PASSES`] and [`DESUGAR_PASSES`].
     ///
     /// Rows exist only for nodes a recording produced: an untouched node has none
     /// (it was never rewritten), and neither has a refinement-predicate interior
@@ -555,8 +555,8 @@ pub struct CompiledProgram {
     /// Empty when capture is switched off — no pass scope is opened then, so
     /// every flush is a no-op — see [`lineage_capture_enabled`]. This is the
     /// authoritative lineage surface:
-    /// [`materialize_panes`](Self::materialize_panes) folds it at each pane
-    /// boundary.
+    /// [`materialize_panes`](Self::materialize_panes) folds it for each pane
+    /// relation.
     // Consumed by `materialize_panes` and the inspector model; the compiler
     // itself never reads it.
     #[allow(dead_code)]
@@ -604,20 +604,20 @@ impl CompiledProgram {
         self.outputs.iter().filter(|o| !o.is_main())
     }
 
-    /// Fold [`lineage_table`](Self::lineage_table) at the two pane boundaries into
+    /// Fold [`lineage_table`](Self::lineage_table) across the two pane relations into
     /// the per-pane [`SourceProjection`]s, the pane-pair [`LineageMap`]s, and
-    /// each boundary's [`Leak`]s. Cold path (snapshot-serve only), never called
+    /// each relation's [`Leak`]s. Cold path (snapshot-serve only), never called
     /// by [`compile_program`]:
     ///
     /// * pre-inference pane = the lowering projection (`uniquify` preserves every
     ///   id in place, so lowering's keys are still the pane's keys);
-    /// * post-inference pane = fold the [`MONO_WINDOW`] rows against the
+    /// * post-inference pane = fold the [`MONO_PASSES`] rows against the
     ///   pre-inference pane;
-    /// * post-desugar pane = fold the [`DESUGAR_WINDOW`] rows against the
+    /// * post-desugar pane = fold the [`DESUGAR_PASSES`] rows against the
     ///   post-inference pane.
     ///
     /// The leaks are **returned, not asserted**: `Unexplained` is the capture
-    /// gate ([`gate_leaks`]) but a boundary is only clean once every pass inside
+    /// gate ([`gate_leaks`]) but a relation is only clean once every pass inside
     /// it records its rewrites, and `Died` is the death report, which a caller
     /// reads rather than gates on.
     // Cold path: the inspector's snapshot serve, which is not in this workspace.
@@ -629,14 +629,14 @@ impl CompiledProgram {
 
         let (mono_map, post_inference, mono_leaks) = collapse(
             &self.lineage_table,
-            MONO_WINDOW,
+            MONO_PASSES,
             &pre_ids,
             &post_inf_ids,
             &self.lowering_projection,
         );
         let (desugar_map, post_desugar, desugar_leaks) = collapse(
             &self.lineage_table,
-            DESUGAR_WINDOW,
+            DESUGAR_PASSES,
             &post_inf_ids,
             &post_des_ids,
             &post_inference,
@@ -654,21 +654,21 @@ impl CompiledProgram {
     }
 }
 
-/// The passes each pane boundary spans — the window
+/// The passes each pane relation spans — the set
 /// [`CompiledProgram::materialize_panes`] restricts the whole-compile table by.
 ///
-/// A boundary is defined by the passes that ran inside it, not by a position in
-/// a list: a program that skips a pass must not shift the other boundary's
-/// window, and a row produced outside a window has to read to that window as an
+/// A pane relation is defined by the passes that ran between its panes, not by a
+/// position in a list: a program that skips a pass must not shift the other one's
+/// set, and a row produced outside a relation's passes has to read to it as an
 /// ordinary un-produced id.
-pub(crate) const MONO_WINDOW: &[Pass] = &[Pass::Mono];
+pub(crate) const MONO_PASSES: &[Pass] = &[Pass::Mono];
 
 /// The passes between the post-inference and post-desugar panes. See
-/// [`MONO_WINDOW`].
-pub(crate) const DESUGAR_WINDOW: &[Pass] =
+/// [`MONO_PASSES`].
+pub(crate) const DESUGAR_PASSES: &[Pass] =
     &[Pass::Inline, Pass::Transact, Pass::Letrec, Pass::Desugar];
 
-/// The per-pane projections, pane-pair lineage maps, and per-boundary leaks
+/// The per-pane projections, pane-pair lineage maps, and per-relation leaks
 /// materialized from [`CompiledProgram::lineage_table`] — see
 /// [`CompiledProgram::materialize_panes`].
 // Consumed by the inspector model; unused within the compiler itself.
@@ -685,38 +685,38 @@ pub(crate) struct MaterializedPanes {
     pub(crate) mono_map: LineageMap<NodeId, NodeId>,
     /// post-inference → post-desugar lineage map.
     pub(crate) desugar_map: LineageMap<NodeId, NodeId>,
-    /// Leaks at the pre-inference → post-inference boundary.
+    /// Leaks at the pre-inference → post-inference pane relation.
     pub(crate) mono_leaks: Vec<Leak>,
-    /// Leaks at the post-inference → post-desugar boundary.
+    /// Leaks at the post-inference → post-desugar pane relation.
     pub(crate) desugar_leaks: Vec<Leak>,
 }
 
 impl MaterializedPanes {
-    /// `(boundary name, leaks)` for each pane boundary, in pipeline order.
+    /// `(relation name, leaks)` for each pane relation, in pipeline order.
     #[allow(dead_code)]
-    pub(crate) fn boundaries(&self) -> [(&'static str, &[Leak]); 2] {
+    pub(crate) fn pane_relations(&self) -> [(&'static str, &[Leak]); 2] {
         [
             ("pre-inference → post-inference", &self.mono_leaks),
             ("post-inference → post-desugar", &self.desugar_leaks),
         ]
     }
 
-    /// The boundaries a gate can hold at zero: the ones whose passes are
-    /// **instrumented**. Same discipline as an audit window's endpoint — a gate
-    /// over a boundary whose passes do not record cannot reach zero however
+    /// The pane relations a gate can hold at zero: the ones whose passes are
+    /// **instrumented**. Same discipline as an audit span's endpoint — a gate
+    /// over a relation whose passes do not record cannot reach zero however
     /// correct the recording is, so it would report a constant rather than a
     /// regression.
     ///
-    /// Today that is the second boundary only. The first spans monomorphization
+    /// Today that is the second relation only. The first spans monomorphization
     /// and inference, and **inference's predicate producers do not record**:
     /// `specialize_use` clones a definition per instantiation, and the copies of
     /// a predicate term inside it row against interior ids no pass ever produced
     /// (`Leak::ParentUnknown`). Over `tests/compilation_pipeline` that is 5
     /// programs, all of them UDF-with-filter or poly-wrapper shapes, and all of
-    /// it the crossing "Known prerequisites" records. **Add the first boundary
+    /// it the crossing "Known prerequisites" records. **Add the first relation
     /// here in the commit that makes inference record**, exactly as an audit
-    /// window's endpoint moves with the pass that earns it.
-    pub(crate) fn gated_boundaries(&self) -> [(&'static str, &[Leak]); 1] {
+    /// span's endpoint moves with the pass that earns it.
+    pub(crate) fn gated_pane_relations(&self) -> [(&'static str, &[Leak]); 1] {
         [("post-inference → post-desugar", &self.desugar_leaks)]
     }
 }
@@ -837,27 +837,27 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId>
     acc
 }
 
-/// The boundary leak gate: **[`Leak::Unexplained`] and [`Leak::ParentUnknown`]
+/// The pane-relation leak gate: **[`Leak::Unexplained`] and [`Leak::ParentUnknown`]
 /// must be zero**.
 ///
 /// `Unexplained` is the capture gate — an output-pane node with no origin means
 /// the driver missed a mint. `ParentUnknown` is the record-integrity gate — a
-/// node's lineage stopping at an id the window has never heard of.
+/// node's lineage stopping at an id the fold has never heard of.
 ///
 /// [`Leak::Died`] is deliberately **not** gated. Nothing declares a fate under
-/// driver capture, so `Died` fires for every node that dies in the window — it
+/// driver capture, so `Died` fires for every node that dies across the fold — it
 /// is the death report, and asserting it empty would be unsatisfiable on any
 /// program that rewrites anything.
 ///
 /// Debug/test only, single code path (`cfg!`, not `#[cfg]`).
-fn gate_leaks(leaks: &[Leak], boundary: &str) {
+fn gate_leaks(leaks: &[Leak], relation: &str) {
     if !cfg!(any(debug_assertions, test)) {
         return;
     }
     let defects: Vec<&Leak> = leaks.iter().filter(|l| l.is_defect()).collect();
     assert!(
         defects.is_empty(),
-        "lineage capture defect at the {boundary} boundary \
+        "lineage capture defect across the {relation} pane relation \
          ({} of {} leaks; `Died` is the death report and is not gated): {defects:?}",
         defects.len(),
         leaks.len(),
@@ -944,7 +944,7 @@ pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
 //
 // Four environment variables steer what the recorder does. Each is named once
 // and read through exactly one accessor, because two of them interact: pane
-// capture and an audit window are alternative modes over *one* recorder session
+// capture and an audit span are alternative modes over *one* recorder session
 // (per-thread, non-reentrant), so the two switches have to agree on what "an
 // audit is running" means. A second `std::env::var` call on the same name is
 // how that agreement silently drifts.
@@ -954,10 +954,10 @@ pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
 /// against the same binary compiling the same programs.
 const LINEAGE_ENV: &str = "CAMBRA_LINEAGE";
 
-/// Names the [`LineageAudit`] window to open, e.g. `full`.
+/// Names the [`LineageAudit`] span to open, e.g. `full`.
 const LINEAGE_AUDIT_ENV: &str = "CAMBRA_LINEAGE_AUDIT";
 
-/// Gates the pane-boundary leak classes on **every** compile (`=1`), making the
+/// Gates the pane-relation leak classes on **every** compile (`=1`), making the
 /// gate's corpus whatever the caller compiles.
 const LINEAGE_GATE_ENV: &str = "CAMBRA_LINEAGE_GATE";
 
@@ -972,9 +972,9 @@ const LINEAGE_PREDICATES_ENV: &str = "CAMBRA_LINEAGE_PREDICATES";
 #[cfg(test)]
 const PERF_REPS_ENV: &str = "CAMBRA_PERF_REPS";
 
-/// The audit window named by [`LINEAGE_AUDIT_ENV`], if any. **Sole reader** of
+/// The audit span named by [`LINEAGE_AUDIT_ENV`], if any. **Sole reader** of
 /// that variable — see the section note above.
-fn lineage_audit_window() -> Option<String> {
+fn lineage_audit_span() -> Option<String> {
     std::env::var(LINEAGE_AUDIT_ENV).ok()
 }
 
@@ -988,7 +988,7 @@ fn lineage_audit_window() -> Option<String> {
 /// not — a recorded predicate rebuild's parents are input-tree predicate
 /// interiors, which the narrow set omits from the input side, so those edges
 /// dangle as [`Leak::ParentUnknown`] with nothing actually unrecorded. Defaulting
-/// to the narrow set made the plain invocation report ~166 windows of noise on
+/// to the narrow set made the plain invocation report ~166 folds of noise on
 /// the pipeline corpus and buried real defects in it.
 ///
 /// [`materialize_panes`]: CompiledProgram::materialize_panes
@@ -1002,17 +1002,17 @@ fn lineage_predicates_live() -> bool {
 /// The switch changes only whether a scope is opened; every recording hook is
 /// already a no-op outside one (`STEP_STACK` empty / no ambient pass).
 ///
-/// A [`LineageAudit`] window opens its own scope, so naming one turns pane
+/// A [`LineageAudit`] span opens its own scope, so naming one turns pane
 /// capture off.
 pub(crate) fn lineage_capture_enabled() -> bool {
-    !std::env::var(LINEAGE_ENV).is_ok_and(|v| v == "0") && lineage_audit_window().is_none()
+    !std::env::var(LINEAGE_ENV).is_ok_and(|v| v == "0") && lineage_audit_span().is_none()
 }
 
-/// Whether every compile folds its pane boundaries and gates the leak classes,
+/// Whether every compile folds its pane relations and gates the leak classes,
 /// rather than only the programs a test asks about.
 ///
 /// **What this buys.** The always-on gate is
-/// `pane_boundaries_fold_with_no_structural_leaks`, whose corpus is the handful
+/// `pane_relations_fold_with_no_structural_leaks`, whose corpus is the handful
 /// of programs listed in `corpus()`. That is a *sample*, and a recording gap in
 /// a shape the sample misses is invisible: the unrecorded
 /// `fold_induction_loop` call in `transact_phase` (a commit decision reading
@@ -1026,7 +1026,7 @@ pub(crate) fn lineage_capture_enabled() -> bool {
 /// **not** a substitute for the sampled gate, which stays always-on so a plain
 /// `cargo test` still fails on the common shapes.
 ///
-/// Requires capture: with `CAMBRA_LINEAGE=0`, or under an audit window (which
+/// Requires capture: with `CAMBRA_LINEAGE=0`, or under an audit span (which
 /// takes the pass scopes for itself), the table is empty and every output node
 /// would read as unexplained. Both are honoured rather than asserted, so a run
 /// can name one without also having to unset this.
@@ -1050,7 +1050,7 @@ fn recorded<R>(capture: bool, pass: Pass, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// A driver-capture audit over one pipeline window: install a pass recorder at
+/// A driver-capture audit over one span of the pipeline: install a pass recorder at
 /// the input pane, fold at the output pane, and print what the capture explains.
 ///
 /// Opt-in via `CAMBRA_LINEAGE_AUDIT=1` so the whole test suite can run either
@@ -1061,16 +1061,16 @@ fn recorded<R>(capture: bool, pass: Pass, f: impl FnOnce() -> R) -> R {
 /// separately from the classes that really are recording bugs
 /// ([`Leak::Unexplained`] — an output node no recording accounted for).
 struct LineageAudit {
-    window: &'static str,
+    span: &'static str,
     state: Option<(PassScope, std::collections::HashSet<NodeId>)>,
 }
 
 impl LineageAudit {
-    /// The `via` an audit window's rows carry. A window spans several passes
-    /// under one scope, so no single pass is the truthful answer; the tag is
-    /// nominal, and naming it once keeps the scope's tag and the window the fold
-    /// restricts by from disagreeing about which nominal pass it is.
-    const WINDOW_VIA: Pass = Pass::Planning;
+    /// The `via` an audit's rows carry. A span covers several passes under one
+    /// scope, so no single pass is the truthful answer; the tag is nominal, and
+    /// naming it once keeps the scope's tag and the passes the fold restricts by
+    /// from disagreeing about which nominal pass it is.
+    const AUDIT_VIA: Pass = Pass::Planning;
 
     /// The audit's live set: [`collect_main_tree_ids`]'s `walk_children` domain,
     /// or — when [`lineage_predicates_live`] says so — [`collect_tree_ids`]'s
@@ -1089,15 +1089,15 @@ impl LineageAudit {
         }
     }
 
-    /// Open the audit if [`lineage_audit_window`] names this `window`. Windows
-    /// are mutually exclusive because a pass scope is per-thread and
-    /// non-reentrant; naming them lets a run narrow the span to the passes under
-    /// study instead of the whole tail of the pipeline.
-    fn start(window: &str, name: &'static str, input: &Expr) -> Self {
-        let on = lineage_audit_window().is_some_and(|w| w == window);
+    /// Open the audit if [`lineage_audit_span`] names this `span`. Spans are
+    /// mutually exclusive because a pass scope is per-thread and non-reentrant;
+    /// naming them lets a run narrow the measurement to the passes under study
+    /// instead of the whole tail of the pipeline.
+    fn start(span: &str, name: &'static str, input: &Expr) -> Self {
+        let on = lineage_audit_span().is_some_and(|w| w == span);
         LineageAudit {
-            window: name,
-            state: on.then(|| (PassScope::enter(Self::WINDOW_VIA), Self::live_ids(input))),
+            span: name,
+            state: on.then(|| (PassScope::enter(Self::AUDIT_VIA), Self::live_ids(input))),
         }
     }
 
@@ -1113,7 +1113,7 @@ impl LineageAudit {
         let Some((rows, projection, leaks)) = crate::ccl::lineage::with_active_table(|table| {
             let (_map, projection, leaks) = collapse(
                 table,
-                &[Self::WINDOW_VIA],
+                &[Self::AUDIT_VIA],
                 &input_ids,
                 &output_ids,
                 &SourceProjection::new(),
@@ -1134,7 +1134,7 @@ impl LineageAudit {
         }
         eprintln!(
             "[lineage-audit {}] rows={rows} input={} output={} attributed={} leaks={counts:?}",
-            self.window,
+            self.span,
             input_ids.len(),
             output_ids.len(),
             projection.len(),
@@ -1264,13 +1264,13 @@ pub fn compile_program(
     // still-hole-typed tree. Its ids resolve against the `lowering_projection`
     // (the pre-mono originals). See `CompiledProgram::pre_inference_ir`.
     // A pane snapshot: the same nodes as the live tree, observed at a point in
-    // time, so it preserves ids. A freshening clone would hand the boundary a
+    // time, so it preserves ids. A freshening clone would hand the pane a
     // structurally identical program sharing no identity with the one it is meant
     // to snapshot, and these ids must resolve against the `lowering_projection`,
     // which is keyed by the originals.
     let pre_inference_ir = expr.clone_preserving_ids();
 
-    // Pass recording for the rows the two pane boundaries fold. One scope per
+    // Pass recording for the rows the two pane relations fold. One scope per
     // pass, opened and closed in place: a pass scope is per-thread and
     // non-reentrant, so the scopes are sequential, never nested.
     let capture_lineage = lineage_capture_enabled();
@@ -1376,18 +1376,17 @@ pub fn compile_program(
     // A pane snapshot; see `pre_inference_ir`.
     let post_inference_ir = expr.clone_preserving_ids();
 
-    // Driver-capture audit window: post-inference pane in, and out at the **last
+    // Driver-capture audit span: post-inference pane in, and out at the **last
     // instrumented pane** — currently `post-as-of-read`, covering inline,
     // transact, mut_elim, channelize and the as-of-read rewrite.
     //
-    // The endpoint is the window's whole point, so it is chosen rather than
-    // inherited. An audit measures what the recordings explain, so a window that
-    // runs past the last instrumented pass reports every node the uninstrumented
-    // tail mints as a defect — a number that cannot reach zero however correct
-    // the recording is, which makes the audit read as a broken gate instead of a
-    // measurement. `lambda_elim` is the next pass here and records nothing (it
-    // re-mints nearly every pass-through node), so the window stops in front of
-    // it.
+    // The endpoint is chosen rather than inherited. An audit measures what the
+    // recordings explain, so a span running past the last instrumented pass
+    // reports every node the uninstrumented tail mints as a defect — a number
+    // that cannot reach zero however correct the recording is, which makes the
+    // audit read as a broken gate instead of a measurement. `lambda_elim` is the
+    // next pass here and records nothing (it re-mints nearly every pass-through
+    // node), so the span stops in front of it.
     //
     // **Move this endpoint when a pass becomes instrumented, in the same commit
     // that instruments it** — to `post-lambda-elim` when the elim pass records,
@@ -1520,7 +1519,7 @@ pub fn compile_program(
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     assert_unique_node_ids(&desugared, "post-as-of-read");
     typecheck(&desugared).expect("as-of-read rewrite produced an ill-typed tree");
-    // The last instrumented pane: see the window's own note at `LineageAudit::start`.
+    // The last instrumented pane: see the span's own note at `LineageAudit::start`.
     audit.finish(&desugared);
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;
@@ -1544,7 +1543,7 @@ pub fn compile_program(
     debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
     typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
 
-    // Isolated pane pair over `planning::run` — the window containing
+    // Isolated pane pair over `planning::run` — the passes containing
     // `simplify`'s 13 rules and `wrap_with_iterate`.
     let audit_planning = LineageAudit::start("planning", "recognized..join-planned", &recognized);
     let join_planned = planning::run(recognized);
@@ -1668,8 +1667,8 @@ pub fn compile_program(
     // Every compile its own gate — see `lineage_gate_every_compile` for why this
     // is opt-in and what it covers that the sampled gate does not.
     if lineage_gate_every_compile() {
-        for (boundary, leaks) in program.materialize_panes().gated_boundaries() {
-            gate_leaks(leaks, boundary);
+        for (relation, leaks) in program.materialize_panes().gated_pane_relations() {
+            gate_leaks(leaks, relation);
         }
     }
 
@@ -1761,7 +1760,7 @@ mod tests {
         }
     }
 
-    /// Per-leak-class counts, for reporting a boundary.
+    /// Per-leak-class counts, for reporting a pane relation.
     #[derive(Default, Debug, PartialEq, Eq)]
     struct LeakCounts {
         unexplained: usize,
@@ -1796,34 +1795,34 @@ mod tests {
     }
 
     /// **Capture totality**, as a corpus-wide property rather than a per-pass
-    /// assertion: both pane boundaries materialize and fold over every corpus
+    /// assertion: both pane relations materialize and fold over every corpus
     /// program, every output-pane node has an origin (`Unexplained == 0`), and
     /// the structural classes are zero everywhere.
     ///
     /// The two invariants fail differently and are worth reading apart.
-    /// `structural == 0` says no node's lineage stops at an id the boundary
+    /// `structural == 0` says no node's lineage stops at an id the relation
     /// never heard of. `Unexplained == 0` says no rewrite went
     /// *unrecorded* — it is the gate the whole driver-capture design exists to
     /// pass, and the number a newly-added rewrite site breaks first.
     #[test]
-    fn pane_boundaries_fold_with_no_structural_leaks() {
+    fn pane_relations_fold_with_no_structural_leaks() {
         let mut totals = [LeakCounts::default(), LeakCounts::default()];
         for (name, code) in corpus() {
             let program = compile_ok(&code);
             let panes = program.materialize_panes();
-            for (i, (boundary, leaks)) in panes.boundaries().into_iter().enumerate() {
+            for (i, (relation, leaks)) in panes.pane_relations().into_iter().enumerate() {
                 let c = LeakCounts::tally(leaks);
                 assert_eq!(
                     c.structural(),
                     0,
-                    "{name}: structural leaks at the {boundary} boundary: {c:?}"
+                    "{name}: structural leaks across the {relation} pane relation: {c:?}"
                 );
                 assert_eq!(
                     c.unexplained, 0,
-                    "{name}: unexplained output nodes at the {boundary} boundary — a rewrite \
+                    "{name}: unexplained output nodes across the {relation} pane relation — a rewrite \
                      that mints with nothing recording: {c:?}"
                 );
-                eprintln!("[pane {name} / {boundary}] {c:?}");
+                eprintln!("[pane {name} / {relation}] {c:?}");
                 totals[i].add(&c);
             }
             // The panes are the thing being materialized: each projection must
@@ -1839,32 +1838,32 @@ mod tests {
     }
 
     /// Every pass that records rows in a normal compile belongs to exactly one
-    /// pane window, so no rewrite is folded twice and none is silently dropped.
+    /// pane relation, so no rewrite is folded twice and none is silently dropped.
     ///
-    /// [`MONO_WINDOW`] and [`DESUGAR_WINDOW`] are the only things that decide
-    /// which boundary a row reaches, so a pass that opens a scope without
-    /// joining a window would record rows nothing ever folds.
+    /// [`MONO_PASSES`] and [`DESUGAR_PASSES`] are the only things that decide
+    /// which pane relation a row reaches, so a pass that opens a scope without
+    /// joining neither would record rows nothing ever folds.
     #[test]
-    fn every_recorded_pass_belongs_to_exactly_one_pane_window() {
+    fn every_recorded_pass_belongs_to_exactly_one_pane_relation() {
         for (name, code) in corpus() {
             let program = compile_ok(&code);
             for p in program.lineage_table.recorded_passes() {
                 assert!(
-                    MONO_WINDOW.contains(&p) != DESUGAR_WINDOW.contains(&p),
-                    "{name}: {p:?} is in neither pane window, or in both",
+                    MONO_PASSES.contains(&p) != DESUGAR_PASSES.contains(&p),
+                    "{name}: {p:?} is in neither pane relation, or in both",
                 );
             }
         }
     }
 
-    /// The `program / boundary` pairs at which the pane relation is **not**
+    /// The `program / relation` pairs at which the pane relation is **not**
     /// vacuous — where some node's origin is another node, so the fold had to
     /// read a row. See
     /// [`the_pane_folds_derive_a_non_vacuous_lineage_relation`].
     /// Grew from seven entries to sixteen — a strict superset, every original
     /// retained — when monomorphization and transport-mode substitution started
     /// recording. `pre-inference → post-inference` in particular was vacuous on
-    /// eight programs because the only pass rewriting in that window, `Mono`,
+    /// eight programs because the only pass rewriting there, `Mono`,
     /// opened its recording *after* the clone that produced its nodes, so
     /// nothing captured.
     const EXERCISED_BOUNDARIES: &[&str] = &[
@@ -1889,11 +1888,11 @@ mod tests {
     /// **The pane relation is well-formed and non-vacuous** on every corpus
     /// program: every edge runs from an input-pane id to an output-pane id,
     /// every id present in both panes is its own dense self-edge, and the
-    /// boundaries where the fold had to read a *row* are exactly the ones
+    /// pane relations where the fold had to read a *row* are exactly the ones
     /// pinned above.
     ///
     /// The non-vacuity half is what this test is for. Fifteen of the
-    /// twenty-two corpus boundaries are pure identity: no pass inside them
+    /// twenty-two corpus relations are pure identity: no pass inside them
     /// minted, so the relation is the input pane's self-edges and holds for
     /// reasons that have nothing to do with the recording. A corpus edit that
     /// silently dropped the rewriting programs would otherwise leave a green
@@ -1908,7 +1907,7 @@ mod tests {
             let post_inf = collect_tree_ids(&program.post_inference_ir);
             let post_des = collect_tree_ids(&program.post_desugar_ir);
 
-            let boundaries: [(&str, &LineageMap<NodeId, NodeId>, _, _); 2] = [
+            let relations: [(&str, &LineageMap<NodeId, NodeId>, _, _); 2] = [
                 (
                     "pre-inference → post-inference",
                     &panes.mono_map,
@@ -1923,20 +1922,20 @@ mod tests {
                 ),
             ];
 
-            for (boundary, map, input_ids, output_ids) in boundaries {
+            for (relation, map, input_ids, output_ids) in relations {
                 let edges = map.edges();
                 assert!(
                     !edges.is_empty(),
-                    "{name}: the {boundary} boundary derived no edges at all",
+                    "{name}: the {relation} pane relation derived no edges at all",
                 );
                 for (u, d) in &edges {
                     assert!(
                         input_ids.contains(u),
-                        "{name}: {u:?} is an edge origin at {boundary} but not an input-pane id",
+                        "{name}: {u:?} is an edge origin at {relation} but not an input-pane id",
                     );
                     assert!(
                         output_ids.contains(&d.id),
-                        "{name}: {:?} is an edge target at {boundary} but not an output-pane id",
+                        "{name}: {:?} is an edge target at {relation} but not an output-pane id",
                         d.id,
                     );
                 }
@@ -1947,29 +1946,29 @@ mod tests {
                 for id in input_ids.intersection(output_ids) {
                     let self_edge = map.upstream(id).iter().find(|l| l.id == *id);
                     assert!(
-                        self_edge.is_some_and(|l| l.labels.descends()),
-                        "{name}: {id:?} survives {boundary} without a descent self-edge",
+                        self_edge.is_some_and(|l| l.labels.has_ancestry()),
+                        "{name}: {id:?} survives {relation} without an ancestry self-edge",
                     );
                 }
                 // A non-self edge is the only proof a row was consulted: a
-                // boundary whose passes rewrote nothing derives its whole
+                // relation whose passes rewrote nothing derives its whole
                 // relation from the two pane id sets.
                 if edges.iter().any(|(u, d)| *u != d.id) {
-                    exercised.push(format!("{name} / {boundary}"));
+                    exercised.push(format!("{name} / {relation}"));
                 }
             }
         }
         exercised.sort();
         assert_eq!(
             exercised, EXERCISED_BOUNDARIES,
-            "the boundaries at which the fold actually reads a row have changed",
+            "the pane relations at which the fold actually reads a row have changed",
         );
     }
 
-    /// The `program / boundary` pairs at which a **relatedness** edge reaches the
+    /// The `program / relation` pairs at which a **blame** edge reaches the
     /// pane relation — where a rewrite named blame and the fold labelled the
     /// edge it contributed. See
-    /// [`blame_reaches_the_pane_relation_as_relatedness`].
+    /// [`blame_reaches_the_pane_relation_labelled`].
     const RELATING_BOUNDARIES: &[&str] = &[
         "for_accumulator / post-inference → post-desugar",
         "transaction / post-inference → post-desugar",
@@ -1977,37 +1976,37 @@ mod tests {
 
     /// **Blame reaches the pane relation, labelled**: the `blame` column is
     /// closed transitively alongside `parents`, so a consumer receives the
-    /// relatedness edges and can render or prune them.
+    /// blame edges and can render or prune them.
     ///
-    /// Pinned as the set of boundaries where such an edge exists, for the same
+    /// Pinned as the set of pane relations where such an edge exists, for the same
     /// reason [`EXERCISED_BOUNDARIES`] is pinned: blame is named at four sites
-    /// in the compiler, two of them inside a pane window, and a corpus or
+    /// in the compiler, two of them inside a pane relation, and a corpus or
     /// recording edit that stopped exercising them would otherwise leave the
     /// labelled half of the relation untested.
     ///
-    /// A relatedness edge is *only* relatedness here: no corpus rewrite both
+    /// A blame edge is *only* blame here: no corpus rewrite both
     /// consumes a node and blames it, so nothing in the corpus pins the
     /// both-labels case — the fold tests in `lineage.rs` do.
     #[test]
-    fn blame_reaches_the_pane_relation_as_relatedness() {
+    fn blame_reaches_the_pane_relation_labelled() {
         let mut relating: Vec<String> = Vec::new();
         for (name, code) in corpus() {
             let program = compile_ok(&code);
             let panes = program.materialize_panes();
-            let boundaries = [
+            let relations = [
                 ("pre-inference → post-inference", &panes.mono_map),
                 ("post-inference → post-desugar", &panes.desugar_map),
             ];
-            for (boundary, map) in boundaries {
-                if map.edges().iter().any(|(_, d)| d.labels.relates()) {
-                    relating.push(format!("{name} / {boundary}"));
+            for (relation, map) in relations {
+                if map.edges().iter().any(|(_, d)| d.labels.has_blame()) {
+                    relating.push(format!("{name} / {relation}"));
                 }
             }
         }
         relating.sort();
         assert_eq!(
             relating, RELATING_BOUNDARIES,
-            "the boundaries at which blame contributes an edge have changed",
+            "the pane relations at which blame contributes an edge have changed",
         );
     }
 
@@ -2016,7 +2015,7 @@ mod tests {
     /// Everything else in the corpus is first-order, and mono mints nothing.
     const SPECIALIZING: &[&str] = &["generator_pipeline", "udf_chain"];
 
-    /// Monomorphization — the one pass inside the first pane boundary —
+    /// Monomorphization — the one pass inside the first pane relation —
     /// explains every node it produces, on first-order and specializing
     /// programs alike.
     ///
@@ -2050,7 +2049,7 @@ mod tests {
         }
     }
 
-    /// All four passes inside the second boundary explain what they produce.
+    /// All four passes inside the second relation explain what they produce.
     ///
     /// The interesting programs are the ones that drive a *whole-program*
     /// rewrite, where naming one node is least obviously applicable: a
@@ -2060,11 +2059,11 @@ mod tests {
     /// against the node each product stands in for — the `with begin():`
     /// statement, the register declaration, the `let d = Defer`.
     ///
-    /// Asserted with a non-vacuity guard for the same reason boundary 1 is: a
+    /// Asserted with a non-vacuity guard for the same reason relation 1 is: a
     /// program that reaches one of these passes must also kill nodes, so a
     /// regression that stopped running the pass cannot pass as capture.
     #[test]
-    fn the_second_pane_boundary_explains_every_node_its_passes_produce() {
+    fn the_second_pane_relation_explains_every_node_its_passes_produce() {
         /// Reaches `transact_phase` or `channelize` — the whole-program
         /// rewrites, and the last two passes to adopt the recorder.
         const WHOLE_PROGRAM_REWRITES: &[&str] = &["transaction", "feed_loop", "generator_pipeline"];
@@ -2085,12 +2084,12 @@ mod tests {
         }
     }
 
-    /// Deaths are the boundary difference and nothing else: the `Died` set at a
-    /// pane boundary is exactly `input_ids ∖ output_ids` on a real program, with
+    /// Deaths are the live-set difference and nothing else: the `Died` set across
+    /// a pane relation is exactly `input_ids ∖ output_ids` on a real program, with
     /// no pass having declared any of them. `for_accumulator` folds a mutation
     /// loop into a `LetRec`, so the difference is non-empty.
     #[test]
-    fn deaths_at_a_pane_boundary_are_the_set_difference() {
+    fn deaths_across_a_pane_relation_are_the_set_difference() {
         let program = compile_ok(include_str!(
             "../../tests/programs/for_accumulator/program.cambra"
         ));
@@ -2114,7 +2113,7 @@ mod tests {
 
     /// A pass that rewrites the program records its rewrites under its own pass
     /// tag — the tag being the one part of a row no recording site knows, and the
-    /// only thing that places a row in a pane window.
+    /// only thing that places a row in a pane relation.
     ///
     /// A pass that rewrites *nothing* on a given program records nothing, which
     /// is the preserve case and correct (most of the corpus preserves end to

@@ -120,7 +120,7 @@ pub enum Mapping {
 /// terms whose ids are outside the recorded id domain, so each such copy records
 /// a `Copy` against an origin the table never saw and the pane fold reports it as
 /// [`Leak::ParentUnknown`](crate::ccl::lineage::Leak::ParentUnknown). Measured on
-/// `generator_pipeline`: 200 of them at the first pane boundary.
+/// `generator_pipeline`: 200 of them across the first pane relation.
 ///
 /// [`as_expr_preserving`]: Mapping::as_expr_preserving
 impl Clone for Mapping {

@@ -989,20 +989,11 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         let TypedExprNode::For { target, iter, body } = effect.node else {
             unreachable!("guarded above")
         };
-        // Everything the fold builds — the decision-factored `LetRec` binding, its
-        // trailing reads, the feed hoists, and the per-accumulator views a commit
-        // decision reads `acc(r)` through — stands in for this statement, which
-        // leaves the tree entirely. So the statement is the slot.
-        //
-        // `blame` names the `For` rather than the `ExprStmt`, so the products
-        // resolve to the loop keyword's span rather than the statement's; blame ⊥
-        // consumption, so this asserts nothing about the `For`'s fate. Both
+        // The statement is the slot: everything the fold builds stands in for it,
+        // and it leaves the tree entirely. `blame` names the `For` so the products
+        // resolve to the loop keyword's span rather than the statement's. Both
         // choices mirror `mut_elim`'s `letrec.loop`, which records the *same*
-        // `fold_induction_loop` call for a loop that stays in that pass — the one
-        // difference being which statement is being folded away.
-        //
-        // Opened here rather than around the recursion below, so a second
-        // cross-domain loop attributes to its own statement.
+        // `fold_induction_loop` call for a loop that stays in that pass.
         let g = lineage::enter(
             stmt_id,
             "transact.cross_domain_fold",
@@ -2478,9 +2469,7 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
         //
         // Preserving instead would also be sound (only one of the two is ever
         // live), but it saved 20 ids over the whole pipeline suite — subtrees of
-        // 1 to 3 nodes — which does not pay for an opt-out. What matters is only
-        // that the copy is not an *unrecorded* mint, and a recording gets that as
-        // well as preserving does.
+        // 1 to 3 nodes — which does not pay for an opt-out.
         let _g = lineage::enter(
             expr.node_id(),
             "transact.key_init_stash",
