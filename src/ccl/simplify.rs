@@ -348,15 +348,15 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
     changed
 }
 
-/// Run one rewrite rule under a driver bracket ([`lineage::enter`](crate::ccl::lineage::enter))
+/// Run one rewrite rule under a recording ([`lineage::enter`](crate::ccl::lineage::enter))
 /// keyed on the node the rule is about to rewrite.
 ///
 /// This is the whole of simplify's provenance instrumentation: **one combinator,
 /// applied uniformly to all thirteen rules**, and no rule body changes at all.
-/// That is possible because a bracket declares nothing — it names the node in
+/// That is possible because a recording declares nothing — it names the node in
 /// the slot and lets the construction hooks report the rest. In particular:
 ///
-/// * A rule that does not fire mints nothing and the bracket is a **preserve**:
+/// * A rule that does not fire mints nothing and the recording is a **preserve**:
 ///   it records nothing, so wrapping every *attempt* rather than every *firing*
 ///   costs one push/pop and no log entry. Nothing here needs to know whether the
 ///   rule fired, which is why the `bool` return is not consulted.

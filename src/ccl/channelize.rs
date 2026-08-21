@@ -1141,7 +1141,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
 /// inlines the define value directly (define path).  All other nodes are
 /// recursed into structurally.
 fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
-    // One frame per node over the whole tree; grow on demand, as the other
+    // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || desugar_inner(expr, ctx))
 }
@@ -1218,7 +1218,7 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             let body_rewritten = desugar(current_body, ctx)?;
             // The cluster's whole product — each assembled channel, the
             // `Feed`-kind `LetRec` binding them, and the union machinery
-            // `combine_feed_values` mints — is bracketed on the **outermost**
+            // `combine_feed_values` mints — is recorded against the **outermost**
             // `let d = Defer` node it replaces. The inner defers of a cluster are
             // consumed by the same rewrite but are not named: they are absent
             // from the output tree, so the boundary difference reports them, and
@@ -1258,7 +1258,7 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 // `Machinery` — merging two defer scopes is plumbing that undoes an
                 // inlining artifact, not anything the user wrote.
                 //
-                // The recursion below runs outside the frame, so a nested lift
+                // The recursion below runs outside the recording, so a nested lift
                 // attributes to its own `let`.
                 let lift = {
                     let _g = lineage::enter(
@@ -2049,7 +2049,7 @@ fn extract_for_defer(
     in_inner_scope: bool,
 ) -> Result<Expr, DeferError> {
     // Grow the stack on demand, as `lambda_elim`'s two recursion entries do. This
-    // walk descends the whole tree in one frame per node, and the frame is large
+    // walk descends the whole tree in one stack frame per node, and the frame is large
     // (one `match` over every node kind, so it is sized for the union of all arms)
     // — deep enough trees overflow a test thread's default stack. Every level goes
     // through this wrapper, so each one checks the remaining headroom.

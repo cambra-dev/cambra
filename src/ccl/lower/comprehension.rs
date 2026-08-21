@@ -342,7 +342,7 @@ pub(super) fn lower_list_comp(
 
 /// Hand out a tree copy of `origin` for one arm of a fan-out. Every arm is a
 /// sibling, including the first: a fan-out places the same subtree under several
-/// arms and no arm is privileged. The copy-frame records each copy as a `Copy` of
+/// arms and no arm is privileged. The copy sink records each copy as a `Copy` of
 /// the origin, so every arm's attribution mirrors the original's.
 ///
 /// Keeping the first arm's ids was measured at 30 ids saved over the whole

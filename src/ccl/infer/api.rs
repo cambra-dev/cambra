@@ -1765,7 +1765,7 @@ mod tests {
             BinOpKind::Arithmetic(ArithmeticKind::Add),
             Expr::lit(Lit::Int(1)),
         );
-        // The blame is the innermost frame that saw the error — the `Var` node,
+        // The blame is the innermost rule that saw the error — the `Var` node,
         // not the enclosing `BinOp` that propagated it.
         let blamed = match &expr.node {
             crate::ccl::TypedExprNode::BinOp { left, .. } => left.node_id(),

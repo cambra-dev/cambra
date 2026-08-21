@@ -1405,7 +1405,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
         //
         // **Deriving** (the default): the original may survive on a type this
         // walk never reaches, so the rebuilt term is a genuinely new one. It
-        // freshens, bracketed on the source predicate's own root, which records
+        // freshens, recorded against the source predicate's own root, which records
         // it as derived from the term it was rebuilt from.
         let (pred, reported) = if self.is_replacing() {
             crate::ccl::lineage::preserving_ids(|| {

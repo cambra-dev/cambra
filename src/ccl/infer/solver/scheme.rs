@@ -422,9 +422,10 @@ fn freshen_watches(
 ///
 /// A sharing fix here has to keep one id-set per term: reusing one rebuilt `Rc`
 /// across the slots that shared an `Rc` going in is one term riding many slots,
-/// and returning the origin `Rc` when the freshen is vacuous is the same.
-/// Producing two *distinct* terms with equal ids is what nothing may do, and
-/// nothing yet checks.
+/// and returning the origin `Rc` when the freshen is vacuous is the same. Only
+/// producing two *distinct* terms with equal ids is forbidden — and it is
+/// checked: `context.rs`'s `distinct_predicate_terms_never_share_a_node_id`
+/// reports that as a `predicate-vs-predicate` collision.
 fn freshen_refinement_predicate(
     lim: Level,
     r: &Refinement,

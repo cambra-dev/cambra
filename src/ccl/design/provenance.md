@@ -12,16 +12,20 @@ the recorder, the passes' adoption of it, the always-on lowering projection, the
 ([The node table](#the-node-table-srcccllineagers)), and the pane-boundary fold
 over it — is in tree. Everything a **Planned** marker introduces is designed but
 not yet built: the inspector's consumption of the panes. A reader can tell the
-two apart by the marker alone; unmarked prose describes code you can go read. Adoption is complete through `post-desugar`: every pass inside
-the two pane boundaries brackets, and the gate holds at zero on both. It now
-extends further — `lambda_elim` and `planning` bracket too, though no pane
-boundary folds them yet. Operator conversion is the one pass below the span still
-unadopted; see
+two apart by the marker alone; unmarked prose describes code you can go read.
+
+Adoption is complete across the five passes the two pane boundaries span —
+`Mono`, `Inline`, `Transact`, `Letrec`, `Desugar` — and the gate holds at zero on
+both boundaries. Three further sites record without reaching any table in a
+normal build, because `compile_program` opens no `PassScope` around them:
+`simplify`, `planning/iterate`, and `transact_phase`'s as-of-read rewrite.
+`lambda_elim` records nothing at all, and operator conversion has no identity to
+record against; see
 [Known prerequisites for panes past `post-desugar`](#known-prerequisites-for-panes-past-post-desugar).
 
 ## Terms
 
-Five words do most of the work here, and two pairs of them are easy to run
+Six words do most of the work here, and two pairs of them are easy to run
 together. Pinned once, used consistently below.
 
 | term | what it is |
@@ -29,17 +33,18 @@ together. Pinned once, used consistently below.
 | **pane** | One of the three retained AST snapshots on `CompiledProgram`: `pre_inference_ir`, `post_inference_ir`, `post_desugar_ir`. A pane is a *thing the inspector displays*. There are three, and adding one costs a retained full-tree clone. |
 | **pane boundary** | The fold between two **adjacent panes** — `pre → post-inference` and `post-inference → post-desugar`. Produced by `materialize_panes`, which restricts the table by the boundary's passes. This is the **durable, gated** artifact: the leak classes are asserted here. |
 | **window** | A set of passes a fold restricts the table by, and by extension the `LineageAudit` measurement span that opens one at an arbitrary point and folds at another, reading the *live tree* at each end rather than a retained snapshot. An audit is env-selected, and a **measurement, never a gate**. |
-| **slot** | The node a bracket names — `lineage::enter(slot_id, …)` — read off the tree *before* the rewrite runs. Normally a main-tree node. A predicate interior *may* be one now that predicate ids are in the id domain, but work **on** a predicate is usually bracketed on the predicate's own root, and work that *produces* one on the main-tree node whose type will carry it. |
+| **recording** | The scope `lineage::enter` opens over one rewrite, held as a `FrameGuard`. Every node minted while it is the innermost open one takes the node it names as a parent. Prose here says "a recording" for the scope, "the recording site" for the code location, and "records against X"; the guard is the RAII value that closes it. |
+| **slot** | The node a recording names — `lineage::enter(slot_id, …)` — read off the tree *before* the rewrite runs. Normally a main-tree node. A predicate interior *may* be one now that predicate ids are in the id domain, but work **on** a predicate is usually recorded against the predicate's own root, and work that *produces* one against the main-tree node whose type will carry it. |
 | **predicate interior** | A `NodeId` carried by a `TypedExpr` inside a `Type::Refinement`'s predicate. Real ids from the same counter, and **in the id domain**: `collect_tree_ids` enumerates them, so the fold must *explain* them. It does **not** follow that they are unique — `assert_unique_node_ids` still walks the main tree only. See "Walking the ids". |
 
 The distinction that matters most: **a window may extend past the last pane, and
 it may not extend past the last instrumented pass.** A window's endpoint is not a
 pane and nothing in a normal build folds it, so a pass below `post_desugar_ir` can
-be fully bracketed and still contribute to no gate — the current state of
-`lambda_elim` and `planning`.
+record every rewrite and still contribute to no gate — the current state of
+`simplify` and `planning/iterate`.
 
 That freedom cuts both ways, so the endpoint is **chosen, and it is the window's
-whole point.** An audit measures what the brackets explain, so a window running
+whole point.** An audit measures what the recordings explain, so a window running
 past the last instrumented pass counts everything the uninstrumented tail mints as
 a defect: a number that cannot reach zero however correct the recording is, which
 makes the audit read as a broken gate rather than a measurement. The `full` window
@@ -52,7 +57,7 @@ compile fold its pane boundaries and gate the leak classes, so the gate's corpus
 becomes whatever the caller compiles — point it at the test suite and it covers
 every program there instead of the handful `context.rs`'s `corpus()` lists. That
 sample is what let two recording gaps live: `transact_phase` calling
-`mut_elim::fold_induction_loop` with no frame open, and `flatten_spine`'s
+`mut_elim::fold_induction_loop` with nothing recording, and `flatten_spine`'s
 value-position writer hoist. Both are shapes the eleven listed programs do not
 have. CI runs with it on; it costs about 4% of the test step.
 
@@ -105,8 +110,9 @@ same answer and no longer do:
 - **Uniqueness** — *may two live nodes share an id?* The main tree, and nothing
   else. `assert_unique_node_ids` walks children only, and deliberately: a
   predicate interior may legitimately alias a main-tree id at inline's blind
-  spot, so a predicate-inclusive uniqueness walk would false-fire. **Predicate
-  uniqueness is not asserted at all today.**
+  spot, so a predicate-inclusive uniqueness walk would false-fire. Uniqueness
+  *across distinct predicate terms* is asserted instead, by the corpus test
+  `distinct_predicate_terms_never_share_a_node_id`.
 
 Predicates were previously outside *both* domains — "carried, never checked" —
 and free to alias their source's ids. Being in the explanation domain is a
@@ -121,7 +127,7 @@ Three crossings, and each one has to record:
 1. **Entry** — a term is put *into* a predicate. Lowering's three
    `refined_data_fun` sites sweep the finished term through
    `LoweringContext::tag_predicate`; inference's `singleton_predicate` is
-   bracketed on the literal's own node, which is also the edge that finally links
+   recorded against the literal's own node, which is also the edge that links
    a singleton refinement back to the literal the user wrote.
 2. **Transformation** — a predicate is rewritten. The rewritten term *replaces*
    the original in its `Refinement`, so it is the same logical node.
@@ -142,12 +148,12 @@ tripwire asserting **multiset preservation** across uniquify's own `PredMemo`
 rebuilds. It is neither explanation nor uniqueness, and it deliberately does not
 dedup by `PredicateId`.
 
-**Open, and worth doing:** assert uniqueness *across distinct predicate terms* —
-dedup by `PredicateId` first, then require the ids of the deduped set to be
-unique. That is the uniqueness property predicates can actually satisfy: one term
-riding N slots is one term and shares its ids with itself legitimately, while two
-*different* predicate terms sharing an id is a real defect nothing currently
-catches.
+`distinct_predicate_terms_never_share_a_node_id` asserts the uniqueness property
+predicates can satisfy: dedup by `Rc` pointer first, then require the ids of the
+deduped set to be distinct. One term riding N slots is one term and shares its
+ids with itself legitimately, while two *different* predicate terms sharing an id
+is a defect. What it catches is a rebuild that preserves ids when the walk did not
+reach every occurrence.
 
 ### Duplication
 
@@ -177,8 +183,8 @@ Three shapes, and the choice between them is about what the copy *denotes*:
 
 - **`clone`** — duplication, and the default. The copy is a *sibling*: same
   value, distinct identity, `annot(p) = annot(o)`. Every re-minted node fires
-  `on_copy`, so an open frame rows the copy on the node it duplicated and no open
-  frame records nothing; no call site needs to know which.
+  `on_copy`, so an open recording rows the copy on the node it duplicated, and
+  with none open nothing is written. No call site needs to know which.
 - **`clone_preserving_ids`** — the copy *is the same node*, so it keeps its ids.
   Sound because the copy replaces or shadows its source: the two are never both
   reachable from one tree. Two shapes qualify — a snapshot taken for rollback or
@@ -187,8 +193,8 @@ Three shapes, and the choice between them is about what the copy *denotes*:
   is dropped.
 
   **Not a way to silence a leak.** An `Unexplained` or `ParentUnknown` means a
-  copy was made with no frame open, or against an origin the table never
-  recorded. That is a *recording* gap, and its fix is a bracket.
+  copy was made with nothing recording, or against an origin the table never
+  recorded. That is a *recording* gap, and the fix is to record around the copy.
 - **`clone_at`** — root-carry, for substitution. The replacement for a `Var(𝑥)`
   occurrence denotes what the occurrence denoted — the value of 𝑥 *at that
   position* — so the occurrence keeps its own id while the interior becomes a
@@ -245,7 +251,7 @@ a pass runs, every node it *produces* gets a row in the `LineageTable`:
 
 | column | what it holds |
 |---|---|
-| `parents` | the ids the rewrite consumed to produce this node — a bracket's slot, or a fusion's whole consumed set |
+| `parents` | the ids the rewrite consumed to produce this node: the node the recording named, or a fusion's whole consumed set |
 | `blame` | the upstream ids the node is *related to but did not consume* — **not** the same as `parents` |
 | `rule` | an interned `RewriteTag` — the `{via, nature, label}` triple |
 
@@ -312,22 +318,22 @@ folded entry verbatim). Its log is folded **once** at the lowering boundary by
 
 ### The recorder
 
-An ambient thread-local frame stack (`STEP_STACK`) + an installed sink,
-mirroring `infer_var::ACTIVE_ARENA`:
+An ambient thread-local stack of open recordings (`STEP_STACK`) plus an installed
+sink, mirroring `infer_var::ACTIVE_ARENA`:
 
-- `Expr::new` calls `on_mint`; the freshen helpers call `on_copy` — so a frame
-  open around a rewrite *captures* the births and copies in its dynamic extent
-  (innermost frame wins). Empty stack ⇒ recording off (a cheap emptiness check on
-  the construction hot path).
+- `Expr::new` calls `on_mint` and the freshen helpers call `on_copy`, so a
+  recording open around a rewrite *captures* the births and copies in its dynamic
+  extent, innermost first. An empty stack means recording is off, which costs one
+  emptiness check on the construction hot path.
 - `TableSession` installs the table for a **whole compile**; `PassScope` names
-  the pass a frame's rows are tagged with, for **one pass**. The two nest that
-  way because a row's key is a process-unique `NodeId` and needs no window to
-  disambiguate it, while a `RewriteTag` needs a pass and a frame cannot supply
-  one: a bracket site knows its `label` and `nature` but not which pass is
-  running, and the boundary that opens the scope knows exactly that.
+  the pass rows are tagged with, for **one pass**. The two nest that way because a
+  row's key is a process-unique `NodeId` and needs no window to disambiguate it,
+  while a `RewriteTag` needs a pass the recording site cannot supply: the site
+  knows its `label` and `nature` but not which pass is running, and the boundary
+  that opens the scope knows exactly that.
 - `LoweringSession` installs lowering's log instead, and is always-on.
 
-**A site declares nothing.** It brackets the node it is *about to rewrite*:
+**A site declares nothing.** It names the node it is *about to rewrite*:
 
 ```rust
 let _g = lineage::enter(slot_id, "inline.beta", Nature::Machinery);
@@ -335,14 +341,14 @@ let _g = lineage::enter(slot_id, "inline.beta", Nature::Machinery);
 
 `slot_id` is read off the node before the rewrite runs; every id minted while the
 guard is innermost gets a row naming `slot_id` as its parent. The pairing is
-**(id before, minted during)**, not (value in, value out), so the same bracket
-fits an `fn(Expr) -> Expr` rewrite and an `&mut Expr` one. A bracket that mints
+**(id before, minted during)**, not (value in, value out), so one recording fits
+an `fn(Expr) -> Expr` rewrite and an `&mut Expr` one alike. A recording that mints
 nothing writes nothing — that is the preserve case.
 
 Two escape hatches are **inherent methods on the guard**, so a site can only ever
-address the frame it holds (each debug-asserts it is the innermost open frame,
-turning a channel fired into a callee's frame or an enclosing recursion's into a
-loud failure rather than a silent misattribution):
+address the recording it holds (each debug-asserts it is the innermost open one,
+turning a channel fired into a callee's recording or an enclosing recursion's into
+a loud failure rather than a silent misattribution):
 
 - `also_consumes(id)` — genuine fusion (many:1), the only thing that puts a
   second parent on a row and the only place any id is named at record time.
@@ -352,45 +358,46 @@ loud failure rather than a silent misattribution):
   the whole tree, so `parents` alone is what recovers a source location for
   almost every node.
 
-`enter` is the only frame constructor a pass uses. The one frame with **no**
-origin is `copy_frame`, lowering's copy sink: uncurry's template-interior
-freshens and the compare-chain operand freshens duplicate nodes with no slot
-being rewritten, and each captured copy carries its own origin from the hook, so
-the frame needs none. A frame with no origin has nowhere to attach a mint or a
-consume, which `OpenStep::assert_copy_only` enforces.
+`enter` is the only constructor a pass uses. `copy_frame` is the one recording
+that names **no** node: uncurry's template-interior freshens and the compare-chain
+operand freshens duplicate nodes with no slot being rewritten, and each captured
+copy carries its own origin from the hook. A recording that names no node has
+nowhere to attach a mint or a consume, which `OpenStep::assert_copy_only`
+enforces.
 
-**Where frames are open today.** Lowering's copy frames, plus driver brackets in
-`infer/solve` (`specialize_use`, `coalesce_generalized_let`), `inline`
-(alias/udf/beta), `mut_elim` (`letrec.loop`, `letrec.bare_write`),
-`transact_phase` (strip, writer, commit record, history binding, key rebind,
-carrier, as-of read), `channelize` (the defer cluster), `simplify` (one combinator
-covering all 17 `&mut` rule sites, with no rule-body edits), `lambda_elim` (its
-two recursive entry points — the traversal keyed on the node in the slot, the
-abstraction walk keyed on the lambda body node — plus a relabel of the filter and
-value-`Case` arms), and every rewrite in `planning`: loop recognition (the
-`LetRec` in the slot, plus a finer bracket per continuation read), the group-by
-recognizer and the hash-join rewrite (each keyed on the term-tree site, never on
-the predicate the pattern is read out of), predicate compilation (keyed on the
-term node whose type slot holds the refinement), and the iterate/restrict chain.
+**Where recordings are open today.** Lowering's leaf appends and copy sinks, plus
+recordings inside the two pane windows: `infer/solve` (`mono.specialize`,
+`mono.coalesce_let`), `infer/emit` (`infer.lit_singleton`), `inline`
+(`inline.alias`, `inline.udf`, `inline.beta`), `mut_elim` (`letrec.loop`,
+`letrec.bare_write`, `letrec.hoist_writer_body`, `letrec.terminalize_write`),
+`transact_phase` (strip, unwrap block, writer, commit record, history binding,
+key rebind, key-init stash, carrier, the cross-domain and await-final rules), and
+`channelize` (`channelize.cluster`, `channelize.defer_lift`,
+`channelize.defer_collapse`). Two shared helpers record under whichever pass
+scope is open around them: `subst` (`subst.vacuous`, `subst.transport`,
+`subst.force_refinement`) and `ccl_utils`' `PredMemo::rebuild`
+(`predicate.rebuild`).
 
-`lambda_elim` and `planning` sit **below** `post_desugar_ir`, so no boundary
-folds their rows today: `compile_program` opens no `PassScope` around them and
-their brackets are inert in a normal build. They record only under a scope a
-caller opens, and **not** under `CAMBRA_LINEAGE_AUDIT=full`, which stops in front
-of `lambda_elim` (see "a window may not extend past the last instrumented pass").
-Reaching them needs the window that spans them — `CAMBRA_LINEAGE_AUDIT=planning`,
-`recognized..join-planned` — which is what the coverage figures below were
-measured with.
+Three sites record **below** `post_desugar_ir`, so no boundary folds their rows:
+`simplify` (one combinator covering all thirteen `&mut` rule invocations, with no
+rule-body edits), `planning/iterate`, and `transact_phase`'s as-of-read rewrite.
+`compile_program` opens no `PassScope` around any of them, so their recordings
+are inert in a normal build and land only under a window a caller opens.
+`CAMBRA_LINEAGE_AUDIT=full` (`post-inference..post-as-of-read`) covers the
+as-of-read rewrite; reaching `simplify` and `planning/iterate` needs
+`CAMBRA_LINEAGE_AUDIT=planning` (`recognized..join-planned`), which is what the
+coverage figures below were measured with. `lambda_elim` records nothing (see "a
+window may not extend past the last instrumented pass").
 
-### Where to put a bracket
+### Where to open a recording
 
-> **Bracket the node the product replaces, not the pass. One bracket per
-> rewrite, and split until every product has one.**
+> **Name the node the product replaces, not the pass. One recording per rewrite,
+> and split until every product has one.**
 
 Every pass instrumented so far reduces to one of two forms.
 
 **Rule-table pass → one wrapper combinator.** `simplify::ruled` wraps all
-fourteen rule invocations, with **no rule body edited at all**:
+thirteen rule invocations, with **no rule body edited at all**:
 
 ```rust
 fn ruled(label: RewriteLabel, expr: &mut Expr, rule: impl FnOnce(&mut Expr) -> bool) -> bool {
@@ -399,39 +406,36 @@ fn ruled(label: RewriteLabel, expr: &mut Expr, rule: impl FnOnce(&mut Expr) -> b
 }
 ```
 
-This works because a bracket declares nothing, so wrapping every *attempt* rather
-than every *firing* costs one push/pop when the rule declines. The `bool` is never
-consulted; nothing needs to know whether the rule fired.
+This works because a recording declares nothing, so wrapping every *attempt*
+rather than every *firing* costs one push and pop when the rule declines. The
+`bool` is never consulted: nothing needs to know whether the rule fired.
 
-**Recursive traversal → one bracket at each traversal entry.** `lambda_elim` has
-exactly two, one per mutually-recursive entry point, keyed on different things:
-`elim_lambdas_impl` on the node in the slot, `elim_lambda_impl` on the node being
-abstracted over. `planning::plan_loops` has one on the `LetRec` it recognizes.
-The bracket takes only an **id**, so a site that has already moved `expr.node`
-out can still bracket — read `expr.node_id()` before the destructure.
+**Recursive traversal → one recording at each traversal entry.**
+`planning::iterate` names the marker site it rewrites, and `transact_phase`'s
+fourteen recordings are one per rewrite it performs. A recording takes only an
+**id**, so a site that has already moved `expr.node` out can still open one —
+read `expr.node_id()` before the destructure.
 
 Three refinements the shapes above do not cover:
 
 - **A product spanning several nodes** — the transaction carrier is what a set of
   scattered `with begin():` blocks and register declarations collectively became.
   Parent it on the **outermost** node it replaces, never on a synthetic stand-in.
-- **A slot may be a node the pass itself just minted**, provided that node was
-  minted under a frame: it is then produced-in-window and the fold reaches the
-  original in two hops. Four arms of `lambda_elim` rely on this. The rule that
-  `slot_id` is read *before* the rewrite does not mean the slot must be an
-  input-pane node.
-- **One entry serving arms of different `Nature`** — open a **second frame on the
-  same origin** inside the arm. The two write disjoint sets of rows on one
-  parent, which is exactly what two rewrites attributed to one slot should look
-  like. Not a workaround; a frame carries one label and one nature for its whole
-  extent by design.
+- **The named node may be one the pass itself just minted**, provided it was
+  minted under a recording: it is then produced-in-window, and the fold reaches
+  the original in two hops. Reading `slot_id` *before* the rewrite does not
+  require it to be an input-pane node.
+- **One entry serving arms of different `Nature`** — open a **second recording on
+  the same node** inside the arm. The two write disjoint sets of rows on one
+  parent, which is what two rewrites attributed to one node should look like. A
+  recording carries one label and one nature for its whole extent by design.
 
 **And a caution about what the gate can tell you.** `Unexplained == 0` is a
-*coverage* property — was any frame open when a node was minted — not a
-correctness-of-slot property. Measured: replacing a pass's carefully placed
-brackets with a **single** `enter` on the program root scores identically on every
-leak class. Slots are placed correctly because the attribution *is* the product;
-the number will not tell you when they are wrong.
+*coverage* property — was anything recording when a node was minted — not a
+statement about where the recording pointed. Measured: replacing a pass's
+carefully placed recordings with a **single** `enter` on the program root scores
+identically on every leak class. Sites are placed correctly because the
+attribution *is* the product; the number will not tell you when they are wrong.
 
 `compile_program` opens one `PassScope` per pass — `Mono`, then `Inline`,
 `Transact`, `Letrec`, `Desugar` — inside the single `TableSession` that spans the
@@ -443,11 +447,12 @@ writes no rows, which is the preserve case and not a gap.
 
 The recording, keyed by the node it describes. `LineageTable` is
 `NodeId → {parents, blame, rule}`: one row per **produced** node, written by
-`OpenStep::flush_into_table` as each frame closes. `parents` are the ids the
-rewrite consumed (a bracket's slot; a fusion's whole consumed set), `blame` the
-second edge kind, and `rule` an interned `RewriteTag` — the `{via, nature,
-label}` triple is one value because a bracket site fixes all three at once, and
-there are on the order of thirty distinct triples in the compiler.
+`OpenStep::flush_into_table` as each guard drops. `parents` are the ids the
+rewrite consumed (the node the recording named; a fusion's whole consumed set),
+`blame` the second edge kind, and `rule` an interned `RewriteTag` — the `{via,
+nature, label}` triple is one value because the recording site and its enclosing
+`PassScope` settle all three before a row is written, and there are on the order
+of fifty distinct triples in the compiler.
 
 Four properties, each load-bearing:
 
@@ -465,9 +470,9 @@ Four properties, each load-bearing:
   per predicate node in the program.
 - **One table per compile, one pass scope per pass.** A row's key is
   process-unique, so no window is needed to disambiguate it. That is also why
-  the pass reaches the flush as an *ambient* fact: a frame knows its `label` and
-  `nature` but not which pass is running, so `PassScope::enter(pass)` carries it
-  for the scope's extent and the flush completes the tag from it.
+  the pass reaches the write as an *ambient* fact: a recording site knows its
+  `label` and `nature` but not which pass is running, so `PassScope::enter(pass)`
+  carries it for the scope's extent and the tag is completed from it.
 
 **There is deliberately no rewrite-kind column.** A 1:1 copy and a many:1 fusion
 differ only in a claim about the origins' *fate*, and driver capture already
@@ -547,9 +552,9 @@ reach it. A node's annotation lives in the commutative monoid of labelled root
 maps under union, which together with one row per id is what makes the result
 independent of the order the rows were written in.
 
-That is not a nicety: write order is **not** chronology, since a frame's rows are
-written when the frame *closes*, so an enclosing rewrite's rows land after the
-rows of the rewrites it contains.
+That is not a nicety: write order is **not** chronology, since rows are written
+when their guard drops, so an enclosing rewrite's rows land after the rows of the
+rewrites nested inside it.
 
 Two invariants make the fold a single ascending-`NodeId` sweep — no fixed point,
 no memoisation, no cycle guard:
@@ -580,7 +585,8 @@ one id's death" has no class at all — a fate claim is not something a row make
 and an id appearing in two rows' `parents` is an ordinary shared ancestor.
 
 `collapse_lowering` is **sequential**, and is the one fold that should be: its
-leaf entries are appended at construction rather than at frame close, so its log
+leaf entries are appended at construction rather than when a guard drops, so its
+log
 genuinely is chronology, and its last-tag-wins re-imaging (`lower_expr` re-tagging
 an arm's already-tagged root) is real semantics rather than an artifact. It also
 has no lineage to compose — lowering mints from scratch, so what would be a set
@@ -615,8 +621,9 @@ inspector's consumption of what it produces.
   drained before the first pass scope opens). It records at **leaf grain**:
   `tag_source` / `tag_image` / `tag_machinery` are thin shims appending a
   `LoweringStep::Leaf` (one id, anchored at the nearest real span). Ordinary
-  mints open **no** frame, so
-  `on_mint` stays a no-op on the hot path; frames open only where ambient `Copy`
+  mints record **nothing**, so
+  `on_mint` stays a no-op on the hot path; a recording opens only where ambient
+  `Copy`
   capture is needed — uncurry's template discharge and the chained-comparison
   operand freshens, whose interior re-mints land as `Copy` LoweringSteps
   mirroring their origins (`copy_frame`, which declares that shape and so has no
@@ -661,8 +668,9 @@ inspector's consumption of what it produces.
   At the lowering→pipeline handoff (before uniquify/inference, so the release
   `InferError` read timing is unchanged) `collapse_lowering` folds the log
   **once** into the always-on **lowering projection** (`NodeId →
-  SourceAttribution`, covering every `walk_children` node — refinement-predicate
-  interiors stay outside). This is the degenerate lowering case of `collapse`,
+  SourceAttribution`, covering every id `collect_tree_ids` enumerates,
+  refinement-predicate interiors included). This is the degenerate lowering case
+  of `collapse`,
   and the one fold that stays sequential: no input pane (leaves are pure
   insertions attributed from their literal anchor), no `LineageMap` output, no
   upstream attr (a copy mirrors its origin's already-folded entry), and no
@@ -711,34 +719,31 @@ boundary is an artifact of what has been built, not a statement about the design
 Three things block extending it, all acknowledged and none blocking the two panes
 that exist:
 
-- **`lambda_elim` re-mints** nearly every pass-through node, so any pane pair
-  spanning it is vacuous. It carries a `TODO(preserve)`, and `planning/groupby`
-  documents the same re-minting as load-bearing id-laundering, so the two
-  interact and neither can be fixed alone.
+- **`lambda_elim` records nothing, and re-mints** nearly every pass-through
+  node, so a pane pair spanning it would have no id correspondence to join on.
+  Its catch-all traversal arm carries a `TODO(preserve)`, and `planning/groupby`
+  relies on that re-minting to launder predicate-interior ids it lifts out of a
+  type — `groupby_recognition_lifts_the_key_without_aliasing` pins the reliance —
+  so a preserve there owes `groupby` an explicit freshen.
 - **Operator conversion has no identity.** `TileOperator` carries none and there
   is no `OperatorId`, so a pane after it has nothing to resolve against.
-- **The predicate domain is unrecorded.** `PredMemo::rebuild` bare-clones and
-  fires no hook, so a predicate interior's id is carried but never produced under
-  a frame. That is what a *crossing* out of the domain runs into, and it is the
-  whole of the residue at a window spanning planning: over the 11-program corpus
-  the residue is 1184 `ParentUnknown` edges and nothing else, and every one of
-  those unknown parents is a predicate-interior id of the input tree. (Measured
-  at `post-inference..join-planned`, when that was `full`'s span; the count is
-  from before the endpoint moved and has not been re-taken.)
-  Three sites cross: `planning/iterate`'s `fn_of_bare_predicate` lift, the
-  group-by key extraction, and the hash-join key morphisms. Each brackets on its
-  term-tree site — which is the right slot, a predicate interior being nothing a
-  pane enumerates — but the `on_copy` hook reports the *origin it freshened*, and
-  no channel lets a frame re-root a captured copy onto its own slot.
+- **Planning does not record what it raises out of the predicate domain.** Three
+  sites cross: `planning/iterate`'s `fn_of_bare_predicate` lift, the group-by key
+  extraction, and the hash-join key morphisms. Each would record against its term-tree
+  site — the right slot, a predicate interior being nothing a pane enumerates —
+  but the `on_copy` hook reports the *origin it freshened*, and no channel re-roots
+  a captured copy onto the node the site named. Only `planning/iterate` records at
+  all, and no pass scope covers it.
 
-  Admitting predicate interiors to the live set is what closes it: with the
-  window's live set widened (`CAMBRA_LINEAGE_PREDICATES=1`), the same corpus
-  scores zero on every gated class for every program, with the projection
-  covering every output node. So for *this* window
-  the ordering constraint no longer holds — the recording is total and the
-  narrow live set is what makes it read as a leak. The measurement says nothing
-  about the two pane boundaries, whose passes rebuild predicates through
-  `PredMemo` and would still need the hook.
+  Measured at `post-inference..join-planned`, when that was `full`'s span: over
+  the 11-program corpus the residue was 1184 `ParentUnknown` edges and nothing
+  else, every unknown parent a predicate-interior id of the input tree, and
+  widening the window's live set (`CAMBRA_LINEAGE_PREDICATES=1`) took every gated
+  class to zero. (The count is from before the endpoint moved and has not been
+  re-taken.) That says the recording is total for the window and the narrow live
+  set is what makes the crossing read as a leak. It says nothing about the two
+  pane boundaries, whose passes rebuild predicates through `PredMemo` and are
+  recorded there.
 
 ## Planned — inspector consumers (`src/inspector_model/`)
 

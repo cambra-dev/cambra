@@ -394,14 +394,20 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     let Some(domain_ty) = expr.ty.domain() else {
         return;
     };
-    // Bracket the site being wrapped. Everything the chain mints — the
+    // Record against the site being wrapped. Everything the chain mints — the
     // `iterate` head, one `restrict` per refinement layer, the enclosing
     // `Compose` — attaches to this node as its parent, and the predicate
     // `fresh_copy` below lands as a `Copy` of the predicate term it lifts out of
     // the type.
     //
-    // The bracket opens *after* the two early-returns above: an aborted attempt
-    // must not leave a frame holding whatever the abandoned work minted.
+    // These rows reach no table in a normal compile: `compile_program` calls
+    // `planning::run` outside every pass scope it opens, so they land only under
+    // an audit window (`CAMBRA_LINEAGE_AUDIT=planning`, `recognized..join-planned`
+    // — `full` stops at `post-as-of-read`, in front of `lambda_elim`).
+    //
+    // The recording opens *after* the two early-returns above: an aborted attempt
+    // must not leave an open recording holding whatever the abandoned work
+    // minted.
     let _g = lineage::enter(
         expr.node_id(),
         "planning.iterate",
@@ -470,10 +476,10 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
         // The body's own `Compose` is dissolved and its elements spliced into
         // the new chain. Those elements keep their ids and become children, so
         // the only node that vanishes is the `Compose` itself — which is the
-        // node this frame brackets (`body` is `expr`, taken above). Its fate is
+        // node this recording named (`body` is `expr`, taken above). Its fate is
         // the boundary's live-set difference, so there is nothing to declare:
-        // the escape hatch is for a node the driver *cannot* see, and this one
-        // is the slot.
+        // `FrameGuard::also_consumes` exists for a node the construction hooks
+        // *cannot* see, and this one is the named slot.
         TypedExprNode::Compose(existing) => elts.extend(existing),
         _ => elts.push(body),
     }

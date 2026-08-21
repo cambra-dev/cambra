@@ -374,7 +374,7 @@ fn flatten_spine(mut e: Expr) -> Expr {
         // binding is plumbing that restores the flat-spine invariant rather than
         // anything the user wrote.
         //
-        // The recursion is outside the frame, so a nested hoist attributes to its
+        // The recursion is outside the recording, so a nested hoist attributes to its
         // own `Let`.
         let hoisted = {
             let _g = lineage::enter(
@@ -428,7 +428,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             body: loop_body,
         } = effect.node
         {
-            // The loop → causal `LetRec` rewrite, bracketed on the statement node
+            // The loop → causal `LetRec` rewrite, recorded against the statement node
             // it rewrites. Everything the transform mints — the carrier `LetRec`,
             // its histories, guards and decision scaffolding — attaches to
             // `stmt_id` as its parent; everything it carries through (the

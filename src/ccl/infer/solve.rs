@@ -1076,7 +1076,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // for its own extent, so an error is blamed on the node that raised it
     // rather than on an ancestor. Mirrors `emit_node` / `check_node`.
     let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
-    // One frame per node over the whole tree; grow on demand, as the other
+    // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
         coalesce_node_inner(expr, level, ctx)
@@ -1796,30 +1796,31 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // `solver::freshen_expr_type_slots` / `freshen_above`), so the clone's
     // predicates are proper freshen instances sharing no live inference state
     // with the definition — and no mutable state to keep in sync with it.
-    // Sink for the clone's `on_copy` pairs. `freshen_clone_node_ids` below re-mints
-    // every node in the clone and each re-mint fires `on_copy(old, new)` — complete
-    // parentage on its own. What the hook needs is somewhere to flush to: a session
-    // installs the log, but only an open *frame* captures. Bracketing on the use
-    // site gives that, plus the label and nature a record needs; the pairs keep
-    // their own origins, because copies flush as per-origin `Op::Copy` steps rather
-    // than inheriting the frame's. The use site is already the node this rewrite is
-    // performed for, and is already what a failed pin blames.
+    //
+    // Sink for the clone's `on_copy` pairs. The hook needs somewhere to write to:
+    // an installed table alone captures nothing, only an open recording does.
+    // Naming the use site here supplies that, plus the label and nature a row
+    // needs. Each captured pair keeps its own origin, because copies are written
+    // as per-origin steps rather than inheriting the named node. The use site is
+    // already the node this rewrite is performed for, and is already what a failed
+    // pin blames.
     let _spec = crate::ccl::lineage::enter(
         use_expr.node_id(),
         "mono.specialize",
         crate::ccl::lineage::Nature::Expansion,
     );
-    // The clone must come *after* the frame opens. `Clone` freshens, so
-    // `frame.def.clone()` is what fires `on_copy` for every node in the
-    // specialization — complete parentage on its own, but only an open frame
-    // captures it. Entered afterwards, the frame watches every pair fall on the
-    // floor and the whole specialization folds as `Unexplained`; measured at 28
-    // such nodes on `generator_pipeline` before this ordering was fixed.
+    // The clone must come *after* the recording opens. `Clone` re-mints every
+    // `NodeId` in the copy, so N specializations cannot collide on one id, and
+    // each re-mint fires `on_copy(origin, fresh)` — complete parentage on its
+    // own, but only an open recording captures it. Cloning first leaves every pair
+    // uncaptured and the whole specialization folds as `Unexplained`; measured at
+    // 28 such nodes on `generator_pipeline` before this ordering was fixed.
     //
-    // A freshened, independently-identified copy of the definition: N
-    // specializations cannot collide on one id. It covers the `walk_children`
-    // domain only — predicate-embedded ids, reachable through type slots behind
-    // an `Rc`, are outside that domain and stay aliased.
+    // This clone re-mints the `walk_children` domain only: a predicate rides its
+    // type slot behind an `Rc` that `Type`'s `Clone` shares.
+    // `freshen_expr_type_slots` below re-mints those interiors separately,
+    // through `freshen_refinement_predicate`, and its copies are captured by this
+    // same recording.
     let mut clone = frame.def.clone();
     let mut fresh = FreshenCache::new();
     // Quantified channel-domain names must instantiate to the SAME names the
@@ -1845,7 +1846,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         .and_then(|()| constrain_subtype(&use_expr.ty, &clone.ty, &mut cache));
     if let Err(e) = pinned {
         // Blamed on the use site, which is the node whose demanded type the pin
-        // failed to satisfy (and the node whose frame would claim it anyway).
+        // failed to satisfy, and the node this specialization's recording names.
         ctx.errors.push(LocatedInferError {
             error: map_constrain_err(e, "monomorphization specialization"),
             node_id: use_expr.node_id(),
@@ -1969,12 +1970,12 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // unobservable today and what fixes it.
     //
     // The chain replaces the generalized `let`, whose id does not survive: each
-    // layer is a fresh node, so without a frame every one of them is an output
-    // node with no origin. The node the chain stands for is the generalized
-    // `let` itself, so that is what the layers copy from — one origin, K
-    // products, which is exactly what the body demanded of the binding. Opened
-    // here rather than around the body walk above: a frame there would adopt
-    // every node the body's own rewrites mint.
+    // layer is a fresh node, so with no recording open every one of them is an
+    // output node with no origin. The node the chain stands for is the
+    // generalized `let` itself, so that is what the layers copy from — one
+    // origin, K products, matching what the body demanded of the binding. The
+    // recording opens here rather than around the body walk above, because one
+    // there would adopt every node the body's own rewrites mint.
     let _chain = crate::ccl::lineage::enter(
         expr.node_id(),
         "mono.coalesce_let",

@@ -464,7 +464,7 @@ pub(super) fn lower_compare(
 
     // Build one BinOp per (op, adjacent-operand-pair). Each middle operand is
     // placed in two pairs, and no placement is privileged, so every placement is a
-    // freshened copy taken inside a lowering copy-frame: each re-minted node lands
+    // freshened copy taken inside a lowering copy sink: each re-minted node lands
     // as a `Copy` step mirroring the original operand's (Source) image, which is
     // the attribution wanted for a duplicated operand.
     let operand = |i: usize| {
@@ -621,7 +621,7 @@ mod tests {
     /// Regression: a chained comparison shares each middle operand between two
     /// adjacent pairs. A bare clone would put the same `NodeId`s in the tree
     /// twice, tripping `assert_unique_node_ids` at the `"post-lowering"`
-    /// boundary. The second use is freshened inside a lowering copy-frame; the tree must be
+    /// boundary. The second use is freshened inside a lowering copy sink; the tree must be
     /// duplicate-free, and the lowering fold must explain every node with no leak
     /// (the freshened copy resolves as a `Copy` mirroring its origin's image).
     #[test]
