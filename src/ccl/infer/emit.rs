@@ -600,6 +600,11 @@ pub(super) fn emit_lambda<C: Typing>(
     recorded: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
+    // User annotation on the param might contain a predicate, so we
+    // call emit_annotation_predicates on it.
+    if let Some(annotation) = &mut param.user_annotation {
+        emit_annotation_predicates(annotation, ctx)?;
+    }
     // The parameter binds at its **declared** type when there is one, and at its
     // slot otherwise. Normalizing does the work of both annotation forms with no
     // dispatch here:

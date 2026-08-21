@@ -141,3 +141,179 @@ sum_up(x)
         "Annotation mismatch: annotated as {Int | __elem >= __arg_tuple_0.0}, but inferred as Int",
     )
 }
+
+// The refinement body in the output type of `test` should be well
+// typed, refering only to `x` which is in its scope.
+//
+// Currently the test still fails afterward, since `x + 1` does not
+// get refined.
+#[test]
+fn pi_type_scope() {
+    check_compile_error(
+        "
+def test(x: Int) => {Int where _ > x}:
+    x + 1
+
+()
+",
+        "Annotation mismatch: annotated as {Int | __elem > x}, but inferred as Int",
+    )
+}
+
+// The refinement body in the output type of `test` should fail to
+// type, since it refers to `y` which is unbound.
+#[test]
+fn type_scope_neg() {
+    check_compile_error(
+        "
+def test(x: Int) => {Int where _ > y}:
+    x + 1
+
+()
+",
+        "type inference: Unbound variable: 'y'",
+    )
+}
+
+// The refinement body in the output type of `test` should be well
+// typed, refering to `x` which is in its scope from the input
+// argument, and to `y` which is in the outer scope. The body of `x`'s
+// refinement can also refer to `y`.
+//
+// Currently the test still fails afterward, since `x + 3` does not
+// get refined.
+#[test]
+fn type_scope_outer() {
+    check_compile_error(
+        "
+y = 3
+
+def test(x: {{Int where _ != y + y} where _ != y}) => {Int where _ > y + x}:
+    x + 3
+
+()
+",
+        "Annotation mismatch: annotated as {Int | __elem > y + x}, but inferred as Int",
+    )
+}
+
+#[test]
+fn type_refined_input_only1() {
+    check_scalar(
+        "
+def f(x: {Int where True}) => Int:
+    x
+()
+",
+        Value::Unit,
+    )
+}
+
+#[test]
+fn type_refined_input_only2() {
+    check_scalar(
+        "
+def f(x: {Int where _ >= _}) => Int:
+    x
+()
+",
+        Value::Unit,
+    )
+}
+
+#[test]
+fn type_refined_input_only3() {
+    check_scalar(
+        "
+def f(y: Int, x: {Int where _ == _}):
+    x
+()
+",
+        Value::Unit,
+    )
+}
+
+#[test]
+fn type_refined_input_only4() {
+    check_scalar(
+        "
+def f(x: {Int where _ == _}):
+    x
+()
+",
+        Value::Unit,
+    )
+}
+
+// This should succeed eventually, but fails for now since refinements
+// are only compared by equality.
+#[test]
+fn type_refined_input_output() {
+    check_compile_error(
+        "
+def f(x: {Int where _ == _}) => {Int where _ == x}:
+    x
+()
+",
+        "Annotation mismatch: annotated as {Int | __elem == x}, but inferred as {Int | __elem == __elem}",
+    )
+}
+
+// This should succeed eventually, but fails for now since refinements
+// are only compared by equality.
+#[test]
+fn type_refined_output() {
+    check_compile_error(
+        "
+def f(x: Int) => {Int where _ == x}:
+    x
+()
+",
+        "Annotation mismatch: annotated as {Int | __elem == x}, but inferred as Int",
+    )
+}
+
+// The refinement body for `x` should fail to typecheck, since it
+// should not be able to refer to itself by `x`, only by `_`.
+#[test]
+fn type_scope_self() {
+    check_compile_error(
+        "
+def test(x: {Int where x >= 1}) => Int:
+    x + 1
+
+()
+",
+        "type inference: Unbound variable: 'x'",
+    )
+}
+
+// The refinement body for `x` should fail to typecheck, since the `x`
+// inside is refering to the outer scope `x`, which is a `String`.
+#[test]
+fn type_scope_outer_shadow() {
+    check_compile_error(
+        "
+x = \"Hello\"
+
+def test(x: {Int where _ >= x}) => Int:
+    x + 1
+
+()
+",
+        "No Orderable instance for BinOp: operand 2 is String",
+    )
+}
+
+#[test]
+fn type_binop_mismatch() {
+    check_compile_error(
+        "
+def test(a: String, b: Int):
+    a + b
+
+()
+",
+        "No Addable instance for BinOp: operand 2 is Int, but the only type accepted there is String",
+    )
+}
