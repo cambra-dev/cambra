@@ -3,7 +3,9 @@ use log::trace;
 use crate::{
     ccl::{
         AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
-        Type, TypedExprNode, V_COMMIT, WriterSite, ccl_utils::is_trivially_true_predicate,
+        Type, TypedExprNode, V_COMMIT, WriterSite,
+        ccl_utils::{free_names, is_trivially_true_predicate},
+        content_hash::{ContentHash, resolved_hash},
         symbolic::symbolic,
     },
     interpreter::{
@@ -23,8 +25,8 @@ use crate::{
         // node-field carrier imported from `ccl` above).
         commit_operator::{
             AsOf, AsOfField, BodyInputBuffer, BodyInputSource, CommitOperator, InductionStore,
-            StoreDenseRead, StoreFinalRead, StoreValueStream, TransactWriter as CommitWriter,
-            WriterBuffer,
+            StoreDenseRead, StoreFinalRead, StoreState, StoreValueStream,
+            TransactWriter as CommitWriter, WriterBuffer,
         },
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut, Filter,
@@ -37,7 +39,11 @@ use crate::{
     },
     util::ScopeStack,
 };
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 /// Converts a λ-eliminated CCL expression into an operator graph.
 ///
@@ -117,16 +123,13 @@ pub fn convert_record_fields_to_operators(
                 domain,
             } = &bound_expr.node
             {
-                let info = build_transact_store(keys, writers, domain, ctx)?;
-                ctx.register_store(binding.name.clone(), info);
+                ctx.bind_store(&binding.name, bound_expr, keys, writers, domain)?;
                 return convert_record_fields_to_operators(body, ctx);
             }
-            let bound_op = convert_impl(bound_expr, None, ctx)?;
-            let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
             // No surrounding iteration here (this entry point compiles a
             // Let* Record* chain from the top); every binding is free.
-            scope.bind(&binding.name, fan_out, BindingKind::Free);
+            scope.bind_let(&binding.name, bound_expr, None)?;
             convert_record_fields_to_operators(body, &mut scope)
         }
         TypedExprNode::Record(fields) => fields
@@ -240,6 +243,7 @@ enum StoreReadKind {
 /// How to read one key (variable) of a transactional store. The scalar-read
 /// reduction to the current/final value (`final_or_default` → `ExtractFinal`) is
 /// expressed in the CCL, not here.
+#[derive(Clone)]
 struct KeyReadInfo {
     /// The runtime key the variable's value lives under in the commit store map
     /// (`commit` stores only; `Value::Unit` for induction stores).
@@ -261,6 +265,7 @@ struct KeyReadInfo {
 /// per-variable read (`__reg.k`) can branch the shared fan and project key
 /// `k`. The scalar-read reduction (`final_or_default` → `ExtractFinal`) is
 /// expressed in the CCL, not here.
+#[derive(Clone)]
 struct StoreReadInfo {
     /// The cyclic store fan — a [`FanOut`] over the store body stream; every
     /// read is a branch of this one fan.
@@ -273,6 +278,13 @@ struct StoreReadInfo {
     /// read enumerates (its [`StoreDenseRead`] trigger). `None` for a `commit` or
     /// dense `Induction` store.
     induction_extent: Option<Extent>,
+    /// The store's carried keys and their current values, tracking the store as
+    /// it runs, so a version replacing this one can resume the variables it
+    /// keeps, paired with the [`store_scope`] that names them across versions.
+    ///
+    /// `None` for a store that publishes no state, or one whose loop is not over
+    /// a data source and so has no name to resume under.
+    state: Option<(String, StoreState)>,
 }
 
 /// Compilation context for tile compilation.
@@ -285,7 +297,54 @@ pub struct OpConversionContext {
     /// Variable bindings in scope, innermost scope last.  Each binding
     /// carries a [`BindingKind`] so [`TypedExprNode::Var`] lookups can
     /// dispatch on it without inspecting tile-level types.
-    scopes: ScopeStack<Name, (Rc<FanOut>, BindingKind)>,
+    scopes: ScopeStack<Name, LetBinding>,
+    /// The operators a previous version of this program built, by the identity
+    /// of the term each computes. Consulted at every `Let` binding; empty for
+    /// the first version. See [`OpConversionContext::bind_let`].
+    inherited: HashMap<ContentHash, Rc<FanOut>>,
+    /// The operators this version binds, by the same identity — what the next
+    /// version inherits ([`OpConversionContext::into_inheritance`]).
+    minted: HashMap<ContentHash, Rc<FanOut>>,
+    /// The stores a previous version built, by the identity of the `Transact`
+    /// term each realizes. A store carries the mutable state of the program, so
+    /// reusing one is what lets an accumulator outlive an update.
+    inherited_stores: HashMap<ContentHash, StoreReadInfo>,
+    /// The stores this version built, offered to the next.
+    minted_stores: HashMap<ContentHash, StoreReadInfo>,
+    /// The value each mutable variable held in the version being replaced, by
+    /// runtime key — what a rebuilt store seeds from. Empty for a first
+    /// compilation. See [`Inheritance::mutable_state`].
+    inherited_state: HashMap<(String, Value), Value>,
+    /// The class token of each store in [`transactional_stores`], on the same
+    /// footing as a [`LetBinding::class`].
+    ///
+    /// A store is a binding — `let __reg = Transact{…}` — and every read of a
+    /// mutable variable is a projection `__reg.k` off it. Without a class here,
+    /// `__reg` is free in every such term and
+    /// [`resolved_hash`] falls back to hashing the bare spelling, so a term
+    /// reading a store hashes the same however the store's recurrence was
+    /// edited, and its operator is reused against a store that no longer
+    /// computes what it did.
+    ///
+    /// [`transactional_stores`]: OpConversionContext::transactional_stores
+    store_classes: HashMap<Name, u64>,
+    /// The bindings this compilation built rather than adopted, by binder name.
+    ///
+    /// What makes reuse hereditary. A term is eligible for reuse only when none
+    /// of the names free in it is here, so an adopted operator is never left
+    /// reading a subgraph this compilation rebuilt. Checking the names rather
+    /// than folding "was it rebuilt" into the class is what lets the class stay
+    /// stable across compilations.
+    ///
+    /// A binding is in here whenever its operator is new, which covers more than
+    /// an edited term: a binding under an iteration is always rebuilt, and so is
+    /// one the previous version did not have.
+    rebuilt: HashSet<Name>,
+    /// How many `Let` bindings this compilation took from [`inherited`] rather
+    /// than building, against how many it bound in total.
+    ///
+    /// [`inherited`]: OpConversionContext::inherited
+    reuse_tally: (usize, usize),
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
     /// Transactional stores in scope, keyed by their `__reg` binder. A
@@ -294,6 +353,42 @@ pub struct OpConversionContext {
     /// store fan (see [`StoreReadInfo`]). Names are α-unique, so a flat
     /// (unscoped) map suffices.
     transactional_stores: HashMap<Name, StoreReadInfo>,
+}
+
+/// What one compilation hands the version that replaces it: the operator behind
+/// each `Let` binding it bound and each store it built, by the identity of the
+/// term realized.
+#[derive(Default)]
+pub struct Inheritance {
+    operators: HashMap<ContentHash, Rc<FanOut>>,
+    stores: HashMap<ContentHash, StoreReadInfo>,
+    /// The value each mutable variable held when the version was retired, by the
+    /// variable's runtime key.
+    ///
+    /// Keyed by variable rather than by store, because that is what survives an
+    /// edit: a store is rebuilt whenever its recurrence changes, while the
+    /// variables it carries keep their names ([`Name::field_key`] is the plain
+    /// spelling). A rebuilt store seeds each variable it still declares from
+    /// here, so editing a loop changes what happens next without discarding what
+    /// the loop had accumulated.
+    mutable_state: HashMap<(String, Value), Value>,
+}
+
+/// One `Let` binding in scope during conversion.
+pub(crate) struct LetBinding {
+    /// The fan-out every use of the binding branches off.
+    pub(crate) fan: Rc<FanOut>,
+    /// Whether the binding was compiled inside an iteration scope.
+    pub(crate) kind: BindingKind,
+    /// The token a term free in this binding hashes to — the identity hash of
+    /// the term this binding computes, whether or not its operator was rebuilt.
+    ///
+    /// Naming a binding by what it computes is what makes two compilations of
+    /// one source agree, so an unchanged program reuses on its first update
+    /// rather than settling in over several. Whether the operator behind the
+    /// binding is still the previous version's is a separate question, answered
+    /// by [`rebuilt`](OpConversionContext::rebuilt).
+    class: u64,
 }
 
 /// RAII scope guard for [`TileCompileContext`].
@@ -363,24 +458,210 @@ impl OpConversionContext {
         TileCompileContextGuard { ctx: self }
     }
 
-    /// Bind `name` to `binding` in the innermost scope.
-    ///
-    /// `kind` records whether the binding was compiled inside an iteration
-    /// scope ([`BindingKind::Aligned`]) or outside one ([`BindingKind::Free`]);
-    /// [`Self::lookup`] returns this alongside the [`FanOut`] so the
-    /// [`TypedExprNode::Var`] arm can dispatch without inspecting tile types.
-    pub(crate) fn bind(&mut self, name: &Name, binding: Rc<FanOut>, kind: BindingKind) {
-        self.scopes.bind(name.clone(), (binding, kind));
-    }
-
     /// Look up `name` from innermost scope outward.
-    pub(crate) fn lookup(&self, name: &Name) -> Option<&(Rc<FanOut>, BindingKind)> {
+    pub(crate) fn lookup(&self, name: &Name) -> Option<&LetBinding> {
         self.scopes.lookup(name)
     }
 
-    /// Register a built transactional store under its `__reg` binder.
-    fn register_store(&mut self, name: Name, info: StoreReadInfo) {
-        self.transactional_stores.insert(name, info);
+    /// Whether an operator for `bound_expr` may be adopted from the previous
+    /// version — that is, whether every binding it reads is still that version's.
+    ///
+    /// See [`rebuilt`](Self::rebuilt). Bindings are bound in dependency order, so
+    /// checking the names free in one term is transitive: a binding that reads a
+    /// rebuilt one is itself recorded as rebuilt.
+    fn reads_only_adopted(&self, bound_expr: &Expr) -> bool {
+        self.rebuilt.is_empty()
+            || free_names(bound_expr)
+                .iter()
+                .all(|name| !self.rebuilt.contains(name))
+    }
+
+    /// The class tokens of every binding in scope, innermost last — the scope
+    /// [`resolved_hash`] resolves a term's free variables against.
+    ///
+    /// Stores come first, so a `Let` binder shadowing a store name resolves to
+    /// the binder. Their names are α-unique, so the two sets are disjoint in
+    /// practice and the order only fixes a tie that cannot arise.
+    fn binder_classes(&self) -> Vec<(&Name, u64)> {
+        self.store_classes
+            .iter()
+            .map(|(name, class)| (name, *class))
+            .chain(
+                self.scopes
+                    .iter_bindings()
+                    .map(|(name, binding)| (name, binding.class)),
+            )
+            .collect()
+    }
+
+    /// Build the store `bound_expr` describes, or adopt the one a previous
+    /// version built for the same `Transact` term, and register it under `name`.
+    ///
+    /// The store-shaped counterpart of [`bind_let`](Self::bind_let), and reuse
+    /// matters more here than anywhere else: the store *is* the program's
+    /// mutable state, so adopting one is what carries an accumulator across an
+    /// update. Its class follows the same rule — the term's identity when
+    /// adopted, a value unique to this compilation when rebuilt — so a term
+    /// reading a rebuilt store cannot be mistaken for one reading its
+    /// predecessor.
+    fn bind_store(
+        &mut self,
+        name: &Name,
+        bound_expr: &Expr,
+        keys: &[TransactKey],
+        writers: &[WriterSite],
+        domain: &Type,
+    ) -> Result<(), ConversionError> {
+        let identity = resolved_hash(bound_expr, &self.binder_classes());
+        self.reuse_tally.1 += 1;
+
+        let adoptable = self
+            .reads_only_adopted(bound_expr)
+            .then(|| self.inherited_stores.get(&identity).cloned())
+            .flatten();
+        let info = match adoptable {
+            Some(info) => {
+                self.reuse_tally.0 += 1;
+                trace!("reusing store for binding {name}");
+                info
+            }
+            None => {
+                trace!("building store for binding {name}");
+                self.rebuilt.insert(name.clone());
+                build_transact_store(keys, writers, domain, self)?
+            }
+        };
+        self.minted_stores.insert(identity, info.clone());
+        self.store_classes.insert(name.clone(), identity.0);
+        self.transactional_stores.insert(name.clone(), info);
+        Ok(())
+    }
+
+    /// Compile `bound_expr` into the fan-out its uses branch off, reusing the
+    /// operator a previous version built for the same computation where there is
+    /// one, and bind it to `name`.
+    ///
+    /// A `Let` is the reuse boundary because it is already the sharing boundary:
+    /// the fan-out and [`Memo`] a binding compiles to are what let several uses
+    /// draw on one operator, and a new version's use is just one more. A late
+    /// branch does not re-subscribe upstream — it pulls the same `MemoProducer`,
+    /// whose cache is cumulative — so a reused operator hands the new version
+    /// everything it has accumulated.
+    ///
+    /// Reuse is declined for a binding compiled under an iteration
+    /// ([`BindingKind::Aligned`]). Such an operator is parameterized by the
+    /// iteration input threaded into it, which is not part of the term and so
+    /// not part of its identity; reusing it would keep the input the previous
+    /// version supplied.
+    fn bind_let(
+        &mut self,
+        name: &Name,
+        bound_expr: &Expr,
+        bound_input: Option<Box<dyn TileOperator>>,
+    ) -> Result<(), ConversionError> {
+        let kind = if bound_input.is_some() {
+            BindingKind::Aligned
+        } else {
+            BindingKind::Free
+        };
+        // The class names what the binding computes, so it is taken for every
+        // binding — including an `Aligned` one, whose operator is never adopted
+        // but whose readers still need a stable name for it.
+        let identity = resolved_hash(bound_expr, &self.binder_classes());
+
+        self.reuse_tally.1 += 1;
+        let adoptable = (kind == BindingKind::Free && self.reads_only_adopted(bound_expr))
+            .then(|| self.inherited.get(&identity).cloned())
+            .flatten();
+        if let Some(fan) = adoptable {
+            self.reuse_tally.0 += 1;
+            trace!("reusing operator for binding {name}");
+            self.minted.insert(identity, fan.clone());
+            self.scopes.bind(
+                name.clone(),
+                LetBinding {
+                    fan,
+                    kind,
+                    class: identity.0,
+                },
+            );
+            return Ok(());
+        }
+
+        // `bound_expr` is compiled unconditionally — whether or not the body
+        // references the binding.  This is why `planning` must make every
+        // function-typed bound expr iteration-bearing: an unused,
+        // non-iteration-bearing function-typed binding would otherwise reach an
+        // `input=None` arm here and error.  It also means a dead iterable
+        // binding is materialised rather than dropped; #232 tracks making
+        // iteration use-driven (lazy `Let` compilation / DCE) so this eager
+        // compile is no longer forced.
+        trace!("building operator for binding {name}");
+        self.rebuilt.insert(name.clone());
+        let bound_op = convert_impl(bound_expr, bound_input, self)?;
+        let fan = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
+        // An `Aligned` operator is offered to the next version even though it
+        // will not be adopted: the offer is keyed by the term, and declining is
+        // the reader's decision, made at the point of adoption.
+        self.minted.insert(identity, fan.clone());
+        self.scopes.bind(
+            name.clone(),
+            LetBinding {
+                fan,
+                kind,
+                class: identity.0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Offer the operators this compilation bound to the version that replaces
+    /// it, retiring the subscriptions the replaced version made against them.
+    ///
+    /// Call after dropping the operator graph these fan-outs were wired into.
+    /// Each is reopened for the branches the next version takes
+    /// ([`FanOut::reopen`]); the subscriptions of the version being replaced
+    /// need no unwinding, since a subscription lasts exactly as long as the
+    /// producer it handed out.
+    pub fn into_inheritance(self) -> Inheritance {
+        for fan in self.minted.values() {
+            fan.reopen();
+        }
+        for info in self.minted_stores.values() {
+            info.fan.reopen();
+        }
+        // A store that was itself adopted keeps running and republishes its own
+        // state, so collecting every minted store is correct whether it was built
+        // or adopted.
+        let mut mutable_state = HashMap::new();
+        for info in self.minted_stores.values() {
+            if let Some((scope, state)) = &info.state {
+                mutable_state.extend(
+                    state
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| ((scope.clone(), k.clone()), v.clone())),
+                );
+            }
+        }
+        Inheritance {
+            operators: self.minted,
+            stores: self.minted_stores,
+            mutable_state,
+        }
+    }
+
+    /// Seed this context with what a previous version bound.
+    pub fn inherit(&mut self, inheritance: Inheritance) {
+        self.inherited = inheritance.operators;
+        self.inherited_stores = inheritance.stores;
+        self.inherited_state = inheritance.mutable_state;
+    }
+
+    /// How many `Let` bindings this compilation reused, against how many it
+    /// bound. `(0, n)` for a first compilation, which inherits nothing.
+    pub fn reuse_tally(&self) -> (usize, usize) {
+        self.reuse_tally
     }
 
     /// Look up a transactional store by its `__reg` binder.
@@ -557,8 +838,7 @@ fn convert_impl_inner(
                 domain,
             } = &bound_expr.node
             {
-                let info = build_transact_store(keys, writers, domain, ctx)?;
-                ctx.register_store(binding.name.clone(), info);
+                ctx.bind_store(&binding.name, bound_expr, keys, writers, domain)?;
                 return convert_impl(body, input, ctx);
             }
             let (bound_input, body_input) = match input {
@@ -575,23 +855,8 @@ fn convert_impl_inner(
             // than re-apply via `MapResult`.  A free binding (no input)
             // is a standalone function; references under an iteration must
             // wrap it in `MapResult` to look up at each position.
-            let kind = if bound_input.is_some() {
-                BindingKind::Aligned
-            } else {
-                BindingKind::Free
-            };
-            // `bound_expr` is compiled unconditionally — whether or not
-            // `body` references the binding.  This is why `planning` must
-            // make every function-typed bound expr iteration-bearing: an
-            // unused, non-iteration-bearing function-typed binding would
-            // otherwise reach an `input=None` arm here and error.  It also
-            // means a dead iterable binding is materialised rather than
-            // dropped; #232 tracks making iteration use-driven (lazy `Let`
-            // compilation / DCE) so this eager compile is no longer forced.
-            let bound_op = convert_impl(bound_expr, bound_input, ctx)?;
-            let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
-            scope.bind(&binding.name, fan_out, kind);
+            scope.bind_let(&binding.name, bound_expr, bound_input)?;
             convert_impl(body, body_input, &mut scope)
         }
 
@@ -1088,9 +1353,9 @@ fn convert_impl_inner(
         }
 
         TypedExprNode::Var(name) => {
-            if let Some((fan_out, kind)) = ctx.lookup(name) {
-                let kind = *kind;
-                let op = fan_out.branch();
+            if let Some(binding) = ctx.lookup(name) {
+                let kind = binding.kind;
+                let op = binding.fan.branch();
                 // Aligned bindings already vary in lockstep with the
                 // surrounding iteration — return the FanOut branch directly.
                 // Free bindings are standalone functions; under an
@@ -1627,7 +1892,29 @@ fn build_commit_store(
         keys: keys_map,
         kind: StoreReadKind::Commit,
         induction_extent: None,
+        // A commit store's engine does not publish its state, so a replacement
+        // cannot resume a transactional variable yet.
+        state: None,
     })
+}
+
+/// What names a store's carried variables across versions: the data source its
+/// loop iterates.
+///
+/// A variable's own key does not, because the label planning gives an
+/// accumulator is its position within its store (`acc0`, `acc1`), so two loops
+/// each carrying one variable both call it `acc0`. The source a loop reads is
+/// the part of it an edit to its body leaves alone, which is exactly the
+/// condition under which resuming is wanted.
+///
+/// `None` for a loop over anything but a data source — a list loop runs to
+/// completion rather than carrying state across an update.
+fn store_scope(w: &WriterSite) -> Option<String> {
+    let domain = w.source.ty.domain()?;
+    match crate::ccl::ccl_utils::strip_refinements(&domain) {
+        Type::DataSource(name) => Some(name),
+        _ => None,
+    }
 }
 
 /// Build an induction-domain store (a `mut` loop). Every induction store — plain,
@@ -1685,6 +1972,7 @@ fn build_induction_store_single(
 ) -> Result<StoreReadInfo, ConversionError> {
     let key_extent = Extent::Base(BaseType::String);
     let runtime_key = |n: &Name| Value::String(n.field_key().into());
+    let scope = store_scope(w);
 
     // Each accumulator becomes a mutable variable key: its init op (the fold default, read
     // once at subscribe) plus a dense-read entry carrying the init as the
@@ -1699,7 +1987,22 @@ fn build_induction_store_single(
         if !value_extents.contains(&value_extent) {
             value_extents.push(value_extent.clone());
         }
-        init_ops.push((rk.clone(), convert_impl(&k.init, None, ctx)?));
+        // A variable the replaced version was carrying resumes from the value it
+        // held; one this version introduces starts from the init it declares.
+        // Rebuilding a store therefore changes what the loop does next without
+        // discarding what it had accumulated, which is what distinguishes
+        // swapping the logic from recomputing the program.
+        let carried = scope
+            .as_ref()
+            .and_then(|s| ctx.inherited_state.get(&(s.clone(), rk.clone())));
+        let init_op: Box<dyn TileOperator> = match carried {
+            Some(carried) => {
+                trace!("resuming {field} from the retired version's value");
+                Box::new(Constant::new(carried.clone(), value_extent.clone()))
+            }
+            None => convert_impl(&k.init, None, ctx)?,
+        };
+        init_ops.push((rk.clone(), init_op));
         keys_map.insert(
             field,
             KeyReadInfo {
@@ -1798,12 +2101,14 @@ fn build_induction_store_single(
     // A non-cyclic fan: unlike a commit store, no writer reads this store back
     // (the driver folds the accumulator out of its own engine), so the only
     // consumers are the downstream `__reg.k` dense reads.
+    let state = scope.map(|s| (s, store.state()));
     let fan = Rc::new(FanOut::new(Box::new(store)));
     Ok(StoreReadInfo {
         fan,
         keys: keys_map,
         kind: StoreReadKind::InductionChangelog,
         induction_extent: Some(induction_extent),
+        state,
     })
 }
 

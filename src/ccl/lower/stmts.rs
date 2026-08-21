@@ -439,20 +439,8 @@ pub(super) fn lower_middle_stmt(
                     format!("http_serve port must be a u16, got {port:?}"),
                 )
             })?;
-            // Share one tiny_http::Server per port across all http_serve routes.
-            if let std::collections::hash_map::Entry::Vacant(e) = ctx.shared_servers.entry(port_u16)
-            {
-                let server = SharedHttpServer::new(port_u16).map_err(|e| {
-                    LoweringError::unsupported(
-                        value.span,
-                        format!("http_serve: failed to bind port {port_u16}: {e}"),
-                    )
-                })?;
-                e.insert(Arc::new(server));
-            }
-            let server = ctx.shared_servers[&port_u16].clone();
             let source_name = http_requests_source_name(&port, &method, &path);
-            if ctx.sources.contains_key(&source_name) {
+            if !ctx.http_routes_this_pass.insert(source_name.clone()) {
                 return Err(LoweringError::unsupported(
                     value.span,
                     format!(
@@ -460,14 +448,52 @@ pub(super) fn lower_middle_stmt(
                     ),
                 ));
             }
-            let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
-                &server,
-                method.clone(),
-                path.clone(),
-                source_name.clone(),
-            )));
-            let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
-            ctx.sources.insert(source_name.clone(), source_obj);
+            // Bind an already-open route, or open a new one. A route the
+            // endpoint registry already holds is *inherited*: reusing its
+            // `HttpServerDataSource` keeps the listener, the routing-table entry
+            // and the requests buffered behind it, which is what lets a
+            // replacement version of the program pick up where this one left
+            // off. Only the open path constructs anything, so it is the only
+            // path a frozen endpoint set forbids.
+            let sink: Arc<dyn DataSink> = match ctx.http_route_sinks.get(&source_name) {
+                Some(existing) => existing.clone(),
+                None if ctx.endpoints_frozen => {
+                    return Err(LoweringError::unsupported(
+                        value.span,
+                        format!(
+                            "http_serve opens a new endpoint (port={port}, method={method}, \
+                             path={path}) the running program does not have; an update may \
+                             only change the logic between existing sources and sinks"
+                        ),
+                    ));
+                }
+                None => {
+                    // Share one tiny_http::Server per port across all http_serve routes.
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        ctx.shared_servers.entry(port_u16)
+                    {
+                        let server = SharedHttpServer::new(port_u16).map_err(|e| {
+                            LoweringError::unsupported(
+                                value.span,
+                                format!("http_serve: failed to bind port {port_u16}: {e}"),
+                            )
+                        })?;
+                        e.insert(Arc::new(server));
+                    }
+                    let server = ctx.shared_servers[&port_u16].clone();
+                    let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
+                        &server,
+                        method.clone(),
+                        path.clone(),
+                        source_name.clone(),
+                    )));
+                    let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
+                    ctx.sources.insert(source_name.clone(), source_obj);
+                    ctx.http_route_sinks
+                        .insert(source_name.clone(), sink.clone());
+                    sink
+                }
+            };
             let requests_expr = ctx.tag_machinery(
                 Expr::new(TypedExprNode::Source(source_name.clone())),
                 stmt.span,

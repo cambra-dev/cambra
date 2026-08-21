@@ -74,11 +74,12 @@ use std::{
 };
 
 use cambra::{
-    ccl::context::{CompileResultExt, GlobalContext, compile_program},
+    ccl::context::{CompileResultExt, Endpoints, GlobalContext, compile_program},
     interpreter::{
         ColumnValue, Consumer, FuncBinding, Tile, Value, bindings_are_list,
         tile_operators::scalar_tile_to_column_value,
     },
+    live_program::LiveProgram,
 };
 
 // ---------------------------------------------------------------------------
@@ -243,6 +244,19 @@ pub fn compile_sink(source: &str) -> GlobalContext {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let _ = compile_program(&mut ctx, source, consumer).unwrap_or_render("<test>", source);
     ctx
+}
+
+/// Start `source` as a [`LiveProgram`], for a test that replaces it with
+/// another version.
+///
+/// [`compile_sink`] is the right helper when a test only runs one version. This
+/// one hands back the program, which [`LiveProgram::update`] needs and which the
+/// caller must keep alive alongside the context.
+pub fn start_sink(source: &str) -> (GlobalContext, LiveProgram) {
+    let mut ctx = GlobalContext::default();
+    let program = LiveProgram::start(&mut ctx, source, Endpoints::Open, &|| Box::new(|| {}))
+        .unwrap_or_render("<test>", source);
+    (ctx, program)
 }
 
 /// Port allocation for the `{PORT}` placeholder in sink programs.  Lives in the

@@ -88,6 +88,24 @@ cargo run -- --inspect tests/programs/inner_join/program.cambra
 
 The inspector defaults to port 8080 (`--inspect=9090` to change it). After the program finishes, the process stays alive so you can browse `http://localhost:<port>`; Ctrl+C to exit.
 
+### Control port
+
+Pass `--control` to let a running program be diffed against, and replaced by, a new version of its source. Both endpoints take the new source as the query string or the request body:
+
+```bash
+cargo run -- --control tests/programs/http_greeter/program.cambra
+
+# in another terminal, with the edited program in v2.cambra:
+curl --data-binary @v2.cambra localhost:8081/diff
+curl --data-binary @v2.cambra localhost:8081/update
+```
+
+`/diff` reports how the two versions differ and changes nothing. `/update` replaces the program in place: sockets stay open, and every binding whose computation is unchanged keeps running with what it has accumulated. An edit to a mutating loop rebuilds that loop's store, and the entries it had are re-derived from the requests its source still holds. Add `stage=<name>&` before the source to diff somewhere other than the default (`lowered`, `inferred`, `inlined`, `channelized`, `lambda-elim`, `planned`).
+
+An update may only change the logic between the sources and sinks the program already has; a version that opens a new one is rejected and the running program is left serving. See [live-update.md](src/ccl/design/live-update.md).
+
+The control port defaults to 8081 (`--control=9090` to change it).
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
