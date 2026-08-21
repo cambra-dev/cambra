@@ -88,7 +88,7 @@ use crate::ccl::{
 /// Recognize a **fed-out mutable variable read** and rewrite it to an as-of join, *before*
 /// lambda elimination. Run after `channelize`.
 ///
-/// After defer-desugaring, a read-only reply is a chain of mutable variable reads feeding a
+/// After channelization, a read-only reply is a chain of mutable variable reads feeding a
 /// broadcast over a reading loop:
 /// `let k₁ = final_or_default((balance.f₁, _)) in … let kₙ = … in trigger ≫ (λ r → e)`,
 /// where `e` reads the `kᵢ` and `mutable variable` is a commit log (`Txn`, a non-enumerable
@@ -2523,7 +2523,7 @@ fn apply_ty(arg: Expr, func: Expr, ty: Type) -> Expr {
 /// A `Builtin(b)` node stamped with its recorded type. The transaction
 /// oracle/guard builtins ([`Builtin::BeginTxn`] / [`Builtin::GetPrevTxn`]) are
 /// minted here, **post-inference**, so their type is not inferred: the CHECK-mode
-/// `typecheck` between this phase and desugar trusts the recorded type set here,
+/// `typecheck` between this phase and channelize trusts the recorded type set here,
 /// and `recognize` consumes them before op-conversion. `BeginTxn` has no
 /// inference scheme at all; `GetPrevTxn` does carry one (its guard-accessor
 /// scheme, symmetric with the induction `GetPrevSeq`), but the current pipeline

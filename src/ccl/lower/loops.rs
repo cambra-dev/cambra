@@ -41,7 +41,7 @@ fn stmt_has_yield(stmt: &Spanned<ChlStmt>) -> bool {
 /// (checked recursively through `if` guards and nested `for` loops), mirroring
 /// [`for_body_has_yield`].
 ///
-/// Used to keep a feed-bearing side-effect loop on the `Compose`/`desugar`
+/// Used to keep a feed-bearing side-effect loop on the `Compose`/`channelize`
 /// path: only a loop with neither a feed nor a yield (a bare-effect body such
 /// as `for x: bump(cnt)`, whose only possible effect is a hidden mutable write
 /// inside a call) is routed to the direct-mirror `For` marker.
@@ -738,7 +738,7 @@ pub(super) fn find_nested_mutation_var(
 /// `bump(cnt)`) becomes a side-effect `ExprStmt`, and their embedded reads
 /// stay bare `Var`s. The phase threads the recurrence, the read-your-writes
 /// shadowing, and hoists each in-loop feed to an ordinary feed of the loop's
-/// history for desugar to route. Other assignments are per-iteration `Let`s.
+/// history for channelize to route. Other assignments are per-iteration `Let`s.
 ///
 /// `acc_names` may be empty: a bare-effect loop (`for x: bump(cnt)`) has no
 /// *visible* accumulator, since the write is hidden inside a call and only

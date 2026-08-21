@@ -2297,7 +2297,7 @@ mod tests {
     fn elim_and_typecheck(binder: &str, binder_ty: Type, body: Expr) -> String {
         let result = run(Expr::lambda(binder, binder_ty, body)).expect("lambda elimination");
         assert_eq!(
-            crate::ccl::infer::check_pre_desugar(&result),
+            crate::ccl::infer::check_pre_channelize(&result),
             Ok(()),
             "the eliminated form must typecheck: {}",
             crate::ccl::symbolic::symbolic_typed(&result)

@@ -338,7 +338,7 @@ pub fn apply_function(expr: Expr, function: Expr, output_ty: Type) -> Expr {
 /// where its own guard holds and no earlier arm's did. `prior` holds `g₀ … gᵢ₋₁`
 /// in order; `guard` is `gᵢ`. Every guard is a `Bool`-typed expression over the
 /// same element, so the synthesized conjunction is `Bool` too — typed here
-/// because the callers (post-inference desugar, lambda elimination, the
+/// because the callers (post-inference channelize, lambda elimination, the
 /// transaction path walk) must be type-preserving.
 ///
 /// Shared by [`crate::ccl::channelize`] (feed fan-out), [`crate::ccl::lambda_elim`]

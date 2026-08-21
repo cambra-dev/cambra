@@ -35,7 +35,7 @@
 //!   one keeps sharing the source's `Rc` (pointer-equal, so the source context
 //!   stays intact and the common case allocates nothing).
 //! * **In-place rewrite** ([`Subst::rewrite_expr`]) mutates the *term tree* the
-//!   caller owns (lambda elimination, inlining, defer desugaring, lowering's
+//!   caller owns (lambda elimination, inlining, channelization, lowering's
 //!   uncurrying, and the mutability-elimination phases' read-your-writes
 //!   environments — see [`Subst::discharge_env_in_place`]). A predicate the
 //!   substitution actually touches is rebuilt as a
@@ -526,11 +526,11 @@ impl Subst {
             },
 
             // The target name is a *use* of the defer-handle binder (these
-            // nodes exist only pre-desugar; transport runs during inference,
+            // nodes exist only pre-channelize; transport runs during inference,
             // but the uniform engine handles them for the pre-inference
             // ports). A var-shaped mapping renames the handle; a discharge
             // to a non-variable term has no Feed/Define shape to land in, so
-            // the stale handle is kept for desugar's own
+            // the stale handle is kept for channelize's own
             // `UnboundDeferHandle` boundary to report (feeding a lambda
             // parameter is user-reachable: `\d, v -> d << v`).
             Feed { name, value } => {
@@ -705,7 +705,7 @@ impl Subst {
     /// Discharge `binder ↦ term` over `e` **in place**, cloning `term` only
     /// when `binder` actually occurs free in `e`. A vacuous substitution
     /// costs one [`is_free`] walk and **no clone** — the pass-level callers
-    /// (lambda elimination, defer desugaring, lowering's uncurrying)
+    /// (lambda elimination, channelization, lowering's uncurrying)
     /// substitute into many subtrees that never mention the binder, so
     /// cloning `term` for those would be pure waste.
     pub fn discharge_in_place(e: &mut TypedExpr, binder: &Name, term: &TypedExpr) {
@@ -1891,7 +1891,7 @@ mod rewrite_tests {
     }
 
     // Feed/Define handles rename through var-shaped mappings and survive a
-    // non-variable discharge for desugar's own boundary to diagnose.
+    // non-variable discharge for channelize's own boundary to diagnose.
     #[test]
     fn rewrite_renames_feed_handles() {
         let mut e = TypedExpr::feed("d", var("d"));

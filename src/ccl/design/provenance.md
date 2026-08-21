@@ -15,13 +15,13 @@ the inspector's consumption of the panes. A reader can tell the two apart by the
 marker alone; unmarked prose describes code you can go read.
 
 Adoption is complete across the five passes the two pane relations span — `Mono`,
-`Inline`, `Transact`, `Letrec`, `Desugar` — and the gate holds at zero on both.
+`Inline`, `Transact`, `Letrec`, `Channelize` — and the gate holds at zero on both.
 Three further sites record without reaching any table in a normal build, because
 `compile_program` opens no `PassScope` around them: `simplify`,
 `planning/iterate`, and `transact_phase`'s as-of-read rewrite. `lambda_elim`
 records nothing at all, and operator conversion has no identity to record
 against; see
-[Known prerequisites for panes past `post-desugar`](#known-prerequisites-for-panes-past-post-desugar).
+[Known prerequisites for panes past `post-channelize`](#known-prerequisites-for-panes-past-post-channelize).
 
 ## Mechanism at a glance
 
@@ -110,7 +110,7 @@ it ahead reintroduces the unreachable zero.
   `Default`/`mem::take` throwaways (ignored by the recorder; `assert_unique_node_ids`
   backstops that it never persists into a checked tree).
 - **`Pass`** — the compiler stage that produced/rewrote a node (`Lower`,
-  `Uniquify`, `Inline`, `Desugar`, `Transact`, `Letrec`, `Mono`, `LambdaElim`,
+  `Uniquify`, `Inline`, `Channelize`, `Transact`, `Letrec`, `Mono`, `LambdaElim`,
   `Planning`). It lives in the lineage *data* (each row's `via`), never in a
   type.
 
@@ -189,7 +189,7 @@ still what makes an id an *identity* rather than a label; it is just no longer
 the call site's job to remember.
 
 `assert_unique_node_ids` enforces it at every pass boundary in `compile_program`
-— post-lowering, -inline, -transact, -letrec-run, -desugar, -as-of-read,
+— post-lowering, -inline, -transact, -letrec-run, -channelize, -as-of-read,
 -lambda-elim, -planning — gated on `cfg!(any(debug_assertions, test))`. The walk
 is `O(nodes)` per pass boundary and buys nothing in a release compile, where the
 fold's leak classes cover the same ground. The check is a tree invariant and
@@ -399,7 +399,7 @@ scope is open around them: `subst` (`subst.vacuous`, `subst.transport`,
 `subst.force_refinement`) and `ccl_utils`' `PredMemo::rebuild`
 (`predicate.rebuild`).
 
-Three sites record **below** `post_desugar_ir`, so no pane relation folds their
+Three sites record **below** `post_channelize_ir`, so no pane relation folds their
 rows:
 `simplify` (one combinator covering all thirteen `&mut` rule invocations, with no
 rule-body edits), `planning/iterate`, and `transact_phase`'s as-of-read rewrite.
@@ -460,7 +460,7 @@ identically on every leak class. Sites are placed correctly because the
 attribution *is* the product; the number will not tell you when they are wrong.
 
 `compile_program` opens one `PassScope` per pass — `Mono`, then `Inline`,
-`Transact`, `Letrec`, `Desugar` — inside the single `TableSession` that spans the
+`Transact`, `Letrec`, `Channelize` — inside the single `TableSession` that spans the
 whole compile, and retains the drained table as
 `CompiledProgram::lineage_table`. A pass that rewrites nothing on a given program
 writes no rows, which is the preserve case and not a gap.
@@ -516,7 +516,7 @@ Predicate interiors are rows like any other. Lowering's projection covers every
 id `collect_tree_ids` enumerates, and `PredMemo::rebuild` records a derived
 predicate against the one it was built from. What is **not** recorded is planning
 raising a predicate back into the main tree; see
-[Known prerequisites for panes past `post-desugar`](#known-prerequisites-for-panes-past-post-desugar).
+[Known prerequisites for panes past `post-channelize`](#known-prerequisites-for-panes-past-post-channelize).
 
 ### The collapse
 
@@ -713,8 +713,8 @@ inspector's consumption of what it produces.
   mutated incrementally.
 - **Materialization (cold, inspector-only).** `CompiledProgram::materialize_panes`
   folds `lineage_table` across the two pane relations, restricting it by pass:
-  `MONO_WINDOW` bridges pre → post-inference; `DESUGAR_WINDOW` (Inline, Transact,
-  Letrec, Desugar) bridges post-inference → post-desugar. It returns the three per-pane
+  `MONO_WINDOW` bridges pre → post-inference; `CHANNELIZE_PASSES` (Inline, Transact,
+  Letrec, Channelize) bridges post-inference → post-channelize. It returns the three per-pane
   `SourceProjection`s, the two pane-pair `LineageMap`s, and each relation's leak
   vector. There is no catch-all bridge: a node is explained by a recorded row or
   it is not explained at all, and the gate is what says which. Materialization
@@ -732,7 +732,7 @@ inspector's consumption of what it produces.
   every output-pane node has an origin — and the corpus test asserts it as a
   property rather than pinning a residue count.
 
-## Known prerequisites for panes past `post-desugar`
+## Known prerequisites for panes past `post-channelize`
 
 A pane may be issued at **any** point during compilation — the current adoption
 point is an artifact of what has been built, not a statement about the design.

@@ -124,7 +124,7 @@ fn distinct_predicate_terms(expr: &Expr) -> Vec<Vec<crate::ccl::provenance::Node
 }
 
 /// α-uniquify every binder in `expr` (see module docs). Runs once per
-/// program, immediately after lowering and before defer desugaring.
+/// program, immediately after lowering and before channelization.
 pub fn run(mut expr: Expr) -> Expr {
     // Snapshot every node's `NodeId` before the rename so we can assert
     // it survives unchanged (collected only under debug_assertions).

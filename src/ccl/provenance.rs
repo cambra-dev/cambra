@@ -4,7 +4,7 @@
 //!
 //! Cambra lowers source through a chain of passes, and [`Pass`] tags the one
 //! that produced a node. In pipeline order those are `Lower`, `Uniquify`,
-//! `Mono` (inside inference), `Inline`, `Transact`, `Letrec`, `Desugar`,
+//! `Mono` (inside inference), `Inline`, `Transact`, `Letrec`, `Channelize`,
 //! `LambdaElim`, `Planning` — the order `compile_program` runs them in
 //! (`crate::ccl::context`). Every IR expression node carries a stable
 //! [`NodeId`] so its identity survives across those passes, and each rewrite
@@ -104,7 +104,7 @@ impl serde::Serialize for NodeId {
 /// Minimal on purpose: only the stages that *mint or restructure* expression
 /// nodes (and therefore need to record why a node exists) appear here.
 ///
-/// **Declaration order is not pipeline order**: `Desugar` is declared ahead of
+/// **Declaration order is not pipeline order**: `Channelize` is declared ahead of
 /// `Transact` and `Letrec`, which run before it. The derived [`Ord`] is for map
 /// keys, and nothing sorts passes by it — the pipeline order is the one in the
 /// module docs.
@@ -124,28 +124,28 @@ pub enum Pass {
     /// record. The variant exists so the axis covers every pass.
     Uniquify,
     /// UDF inlining + beta-reduction ([`crate::ccl::inline`]): the pass that
-    /// runs between the post-inference and post-desugar snapshots. Mostly
+    /// runs between the post-inference and post-channelize snapshots. Mostly
     /// id-preserving (a rebuilt node carries its input id); its genuine
     /// deviations are the fan-out clones at multi-use call sites (`Copy`s) and
     /// the wrappers/redexes it drops (`Transform` discards).
     Inline,
-    /// Defer desugaring ([`crate::ccl::channelize`]): channelizing
+    /// Channelization ([`crate::ccl::channelize`]): channelizing
     /// `Defer`/`Feed`/`Define` into collection unions and contribution records.
     /// Mostly a 1:1 transform (ids preserved), but its channelization machinery
     /// synthesizes new nodes (channel unions, contribution records, floated
-    /// lambdas, DI wrappers) that are tagged `{via: Desugar, nature: Machinery}`.
-    Desugar,
+    /// lambdas, DI wrappers) that are tagged `{via: Channelize, nature: Machinery}`.
+    Channelize,
     /// The transaction slice of the unified mutability phase
     /// ([`crate::ccl::transact_phase::run`]): stripping `with begin():` writer
     /// sites and assembling the `get_prev_txn`-guarded `LetRec` (histories,
-    /// commit records, taps). Runs between the post-inference and post-desugar
-    /// snapshots (after `Inline`, before `Desugar`).
+    /// commit records, taps). Runs between the post-inference and post-channelize
+    /// snapshots (after `Inline`, before `Channelize`).
     Transact,
     /// The induction slice of the unified mutability phase
     /// ([`crate::ccl::mut_elim::run`]): folding direct-mirror `For`/`MutWrite`
     /// loops into guarded `LetRec` induction histories. Runs between the
-    /// post-inference and post-desugar snapshots (after `Transact`, before
-    /// `Desugar`).
+    /// post-inference and post-channelize snapshots (after `Transact`, before
+    /// `Channelize`).
     Letrec,
     /// Monomorphization: cloning a generalized definition's subtree once per
     /// distinct resolved type (during inference).

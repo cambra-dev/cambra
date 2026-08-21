@@ -291,7 +291,7 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
 ///
 /// The `Let`-hoist is gated on `spine_writes_mut`: only a genuine writer body
 /// is reassociated. `Feed`/`Define`-headed `ExprStmt` chains keep their nesting
-/// — desugar collects feeds outermost-first, so reassociating them would
+/// — channelize collects feeds outermost-first, so reassociating them would
 /// reorder channel contributions — and a pure `Let` (e.g. a join subplan) holds
 /// no `MutWrite` on its spine, so it is left undisturbed. After this pass the
 /// only `MutWrite`s in the tree are `ExprStmt` effects, so `rewrite` and
@@ -556,7 +556,7 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
 /// fresh record field carrying its per-iteration value, and that value
 /// (already resolved in the read-your-writes environment at the feed site).
 /// The loop's history binding computes the field alongside the recurrence;
-/// the phase hoists `Feed(defer, __hist ▷ .field)` out of the loop so desugar
+/// the phase hoists `Feed(defer, __hist ▷ .field)` out of the loop so channelize
 /// routes it as an ordinary channel contribution.
 struct FeedSite {
     defer: Name,
@@ -1051,7 +1051,7 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
          `with begin():` block, so a `For` here always carries a feed"
     );
     let mut body_out = rewrite(cont);
-    // Emit in reverse so the first source feed ends up outermost — desugar
+    // Emit in reverse so the first source feed ends up outermost — channelize
     // collects feeds outermost-first into the channel union, preserving source
     // order (mirrors the accumulator path's hoist ordering).
     for (defer, value) in feeds.into_iter().rev() {
@@ -1891,7 +1891,7 @@ mod tests {
     ///
     /// Unit-test form at the letrec boundary (the plan's RT-4b fallback): the
     /// bare-writer `MutWrite` is consumed by the loop rewrite and does not survive
-    /// into `post_desugar_ir` as a span-indexable `MutWrite`, so id preservation
+    /// into `post_channelize_ir` as a span-indexable `MutWrite`, so id preservation
     /// through the phase is asserted directly here.
     #[test]
     fn flatten_spine_bare_writer_preserves_id() {

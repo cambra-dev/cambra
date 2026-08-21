@@ -107,7 +107,7 @@ pub enum Nature {
     /// `"lower.image"` label instead.
     Source,
     /// Faithful expansion of a source construct (an inlined UDF body, a
-    /// transaction's writer, a desugared defer cluster). Recorded by passes,
+    /// transaction's writer, a channelized defer cluster). Recorded by passes,
     /// never by lowering, whose expansions carry `Machinery` with a per-rule
     /// label.
     Expansion,
@@ -609,7 +609,7 @@ fn row_hops(table: &LineageTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
 /// whose row lies outside `passes` is, to this relation, an ordinary un-produced
 /// id** — an input-pane node if the input pane holds it, and unknown otherwise.
 /// Without that restriction a `Mono`-produced input-pane id would resolve
-/// straight past the post-desugar pane it is supposed to bottom out in.
+/// straight past the post-channelize pane it is supposed to bottom out in.
 ///
 /// `input_ids` / `output_ids` are the two pane snapshots; `upstream_attr` is the
 /// input pane's already-resolved projection, which untouched ids inherit
