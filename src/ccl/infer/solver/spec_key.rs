@@ -308,11 +308,11 @@ struct KeyCtx {
     /// key `compact_type`'s cycle guard uses, and for the same reason: a variable
     /// legitimately appears at both polarities in one type.
     visiting: HashSet<(InferVarId, bool)>,
-    /// Completed keys per `(variable, polarity, enclosing frames)`, for
+    /// Completed keys per `(variable, polarity, enclosing binders)`, for
     /// variables reached under the identity substitution.
     ///
     /// Sound because a variable's directed key depends only on the variable, the
-    /// direction, and the frames the refinement-closing runs against — not otherwise
+    /// direction, and the binders the refinement-closing runs against — not otherwise
     /// on the position it was reached from. A variable reached under a
     /// *non-identity* substitution bypasses the memo: the substitution
     /// rewrites the predicates the walk materializes, so that result *is*
@@ -323,11 +323,12 @@ struct KeyCtx {
     /// back-edge would have contributed — so it must not be memoized. Comparing
     /// the counter before and after a variable's expansion is what detects that.
     truncations: usize,
-    /// The `Fun` frames the walk is inside of, innermost last (`None` for an
-    /// unnamed arrow — it still counts as a crossing), exactly as
-    /// `compact_go` threads them (the sibling-walk contract).
-    frames: Vec<Option<Name>>,
-    /// Closes each refinement against [`frames`](KeyCtx::frames) as it lands in
+    /// The binders of the `Fun`s the walk is inside of, innermost last (`None`
+    /// for an unnamed one — it still counts as a crossing), exactly as
+    /// `compact_go` threads them — the two walks must agree, or a key and a
+    /// compacted type would close one refinement two ways.
+    enclosing: Vec<Option<Name>>,
+    /// Closes each refinement against [`enclosing`](KeyCtx::enclosing) as it lands in
     /// the view (`src/ccl/design/type-inference.md`, "Where the conversions
     /// run"), so a key's refinement set is index-spelled — two α-variant
     /// instantiations key together, which is what lets the memo share their
@@ -346,7 +347,7 @@ pub fn spec_key(ty: &Type) -> SpecKey {
         visiting: HashSet::new(),
         memo: HashMap::new(),
         truncations: 0,
-        frames: Vec::new(),
+        enclosing: Vec::new(),
         closer: ClaimCloser::default(),
     };
     // One walk-wide `ctx` for both reads: its memo is keyed by polarity, so the
@@ -393,7 +394,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let r = subst_acc.force_refinement(r);
             // Landing closes, as in `compact_go`: the key stores the
             // index-spelled claim, so α-variant instantiations key together.
-            let r = ctx.closer.close(&ctx.frames, &r);
+            let r = ctx.closer.close(&ctx.enclosing, &r);
             if !k.refinements.contains(&r) {
                 k.refinements.push(r);
             }
@@ -415,11 +416,10 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 Some(b) => subst_acc.shadow(b),
                 None => subst_acc.clone(),
             };
-            // Entering the codomain crosses this arrow's frame, as in
-            // `compact_go`.
-            ctx.frames.push(name.clone());
+            // Entering the codomain crosses this function, as in `compact_go`.
+            ctx.enclosing.push(name.clone());
             let cod = key_go(codomain, pol, &cod_acc, ctx);
-            ctx.frames.pop();
+            ctx.enclosing.pop();
             // Resolved through `KindMerge::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
             // so keying on it would split every use; its pins are the answer, and
@@ -489,7 +489,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // opposite-polarity fallback either — the dual read subsumes it.
         Type::Infer(state) => {
             let visit_key = (state.uid, pol);
-            let memo_key = (state.uid, pol, ctx.frames.clone());
+            let memo_key = (state.uid, pol, ctx.enclosing.clone());
             let memoizable = subst_acc.is_id();
             if memoizable && let Some(k) = ctx.memo.get(&memo_key) {
                 return k.clone();
@@ -832,7 +832,7 @@ mod tests {
             visiting: HashSet::new(),
             memo: HashMap::new(),
             truncations: 0,
-            frames: Vec::new(),
+            enclosing: Vec::new(),
             closer: ClaimCloser::default(),
         }
     }
@@ -904,7 +904,7 @@ mod claim_closing_tests {
             spec_key(&nested("x")),
             "the key must not conflate the inner and outer Pi binders"
         );
-        // A free name that is *no* frame's binder stays a name and stays
+        // A free name that binds to no enclosing function stays a name and stays
         // distinct from every index: distinct enclosing binders outside the
         // walked type key apart too.
         let free = Type::Refinement(

@@ -138,7 +138,7 @@ pub(crate) mod test_helpers {
     use crate::ccl::{FieldKey, Refinement, Type};
 
     /// The dependent refinement `__elem == <name>` — a predicate referencing an
-    /// enclosing Pi binder by (raw) name, the mid-solve coordinate.
+    /// enclosing Pi binder by (raw) name, the mid-solve form.
     pub(crate) fn dep_pred(name: &str) -> Rc<crate::ccl::TypedExpr> {
         use crate::ccl::{BinOpKind, CompareKind, Name, TypedExpr};
         Rc::new(TypedExpr::binop(

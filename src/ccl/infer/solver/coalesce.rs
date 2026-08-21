@@ -159,14 +159,14 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         }
         // Strip the Pi binder unless the codomain actually depends on it
         // (design §3.2 / O10): keeps ordinary functions `name: None` while a
-        // genuinely dependent codomain keeps its binder. Either coordinate
-        // counts (`subst::codomain_depends_on`) — the kept name slot is what
-        // lets descent and application open the frame later, so dropping it on
-        // a codomain that references the frame strands the reference.
+        // genuinely dependent codomain keeps its binder. Closed or name-spelled
+        // both count (`subst::codomain_depends_on`) — the kept name slot is what
+        // lets descent and application open the function later, so dropping it
+        // on a codomain that references it strands the reference.
         debug_assert!(
-            cf.name.is_some() || !crate::ccl::subst::references_outermost_frame(&c),
-            "an index is only ever assigned pointing at a *named* frame, so an \
-             unnamed arrow's codomain cannot reference it",
+            cf.name.is_some() || !crate::ccl::subst::references_enclosing_function(&c),
+            "an index is only ever assigned pointing at a *named* function, so an \
+             unnamed function's codomain cannot reference it",
         );
         let kept_name = cf
             .name

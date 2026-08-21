@@ -770,9 +770,9 @@ pub(super) fn emit_cast<C: Typing>(
         _ => None,
     };
     // Construction closes (see `Type::pi`): re-viewing the value at the
-    // target rebuilds an arrow around the value's codomain, so references to
+    // target rebuilds a function around the value's codomain, so references to
     // the preserved binder close here. Idempotent when `v` came out of a
-    // closed arrow (its references are already indices).
+    // closed function (its references are already indices).
     let v = match &name {
         Some(k) => crate::ccl::subst::close_pi_binder(k, &v),
         None => v,
@@ -1908,7 +1908,7 @@ pub(super) fn emit_compose<C: Typing>(
     };
     // Construction closes: the chain's codomain was opened at the binder for the
     // adjacency above, so assembling the Pi puts the reference back in the index
-    // coordinate every stored type is in.
+    // form every stored type is in.
     Ok(match last_name {
         Some(b) => Type::pi_kinded(b, first_dom, prev_cod, kind),
         None => Type::Fun {

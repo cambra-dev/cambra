@@ -1726,9 +1726,10 @@ apply0(groups)
 
 /// An undischarged group-by partition stores the key reference as a de Bruijn
 /// index and renders it as the key binder's name. The two spellings are the
-/// coordinate's contract end to end: identity is decided on the index, and the
-/// reader sees the name (`src/ccl/design/type-inference.md`, "The coordinate is
-/// locally nameless" and "Rendering opens what it descended through").
+/// representation's contract end to end: identity is decided on the index, and
+/// the reader sees the name (`src/ccl/design/type-inference.md`, "A binder
+/// reference is stored in one of two forms" and "Rendering opens what it
+/// descended through").
 #[test]
 fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
     let ty = infer_program("groupby([1, 2, 3], \\x -> x)");
@@ -1741,7 +1742,7 @@ fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
         panic!("a group-by is a dependent function from key to partition, got {ty}");
     };
     let Type::Fun { domain: dom, .. } = &**codomain else {
-        panic!("expected the partition function inside the key arrow, got {ty}");
+        panic!("expected the partition function inside the key function, got {ty}");
     };
     let Type::Refinement(_, r) = &**dom else {
         panic!("expected a refined partition domain, got {ty}");
@@ -1777,7 +1778,7 @@ fn test_groupby_partition_stores_an_index_and_renders_the_binder() {
     let refinement = dom.to_string();
     assert!(
         !refinement.contains('#'),
-        "a refinement rendered detached from its arrow still spells the binder, \
+        "a refinement rendered detached from its function still spells the binder, \
          off the reference's own hint: {refinement}"
     );
 }
@@ -3369,7 +3370,7 @@ fn a_refinement_referencing_no_binder_types_through() {
 
 /// Two α-variant dependent refinements share a position. Both definitions are
 /// identical character for character, so their refinements differ only in binder
-/// identity — the enclosing arrow's reference lands as an index, and the term
+/// identity — the enclosing function's reference lands as an index, and the term
 /// lambda the filter introduces carries a per-lowering uid — and a join at one
 /// position sees one refinement.
 ///

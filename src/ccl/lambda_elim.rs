@@ -782,9 +782,9 @@ fn elim_lambda_impl(
         // depends on `param`, the kind always, since the caller is the one that
         // knows whether this morphism denotes a collection. Attaching the
         // binder closes the codomain (`Type::pi_kinded`), which is what keeps this
-        // arrow in the same coordinate as the recorded type it replaces.
+        // function in the same form as the recorded type it replaces.
         //
-        // The dependence test admits either coordinate
+        // The dependence test admits closed or name-spelled
         // (`subst::codomain_depends_on`), like coalesce's: a `body_ty` whose
         // claim landed closed references `param` as an index, and a name-only
         // test would drop the binder and strand it.
@@ -936,7 +936,7 @@ fn elim_lambda_impl(
             let pair = zip_pair(elim_arg, elim_fn);
             // apply: Tuple([B, B→C]) → C; its domain is the codomain of pair.
             // The transformer sits under the pair's binder, so its domain speaks
-            // the open coordinate `body_ty` is already in.
+            // the opened form `body_ty` is already in.
             let apply_ty = match &pair.ty {
                 Type::Fun { codomain: cod, .. } => {
                     fun_ty_or_hole(&crate::ccl::subst::open_codomain(&pair.ty, cod), &body_ty)

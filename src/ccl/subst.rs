@@ -198,7 +198,7 @@ impl Mapping {
 }
 
 /// A [`Subst`] domain is free names. A [`Name::PiBound`] is a *bound* reference
-/// to an enclosing arrow, so nothing substitutes for one: the conversions in
+/// to an enclosing function, so nothing substitutes for one: the conversions in
 /// this module remove it, at a binder crossing or at an application. The
 /// invariant is stated in [`Name::PiBound`]'s docs and asserted here, at the two
 /// constructors that build a domain.
@@ -206,7 +206,7 @@ fn debug_assert_no_pi_bound(binder: &Name) {
     debug_assert!(
         binder.pi_bound_index().is_none(),
         "a `PiBound` is never a substitution's domain binder: it is bound by an \
-         arrow the type carries, and `open_pi_binder` is what removes it",
+         function the type carries, and `open_pi_binder` is what removes it",
     );
 }
 
@@ -1362,7 +1362,7 @@ fn collect_expr_fv(
     collect_type_fv(&e.ty, bound, visited, out);
     for_each_scoped_item(e, &mut |item| match item {
         ScopedItem::VarRef(n) => {
-            // A `PiBound` is a bound reference to an arrow of the enclosing
+            // A `PiBound` is a bound reference to a function of the enclosing
             // type, not a free name — it is never free and never in a context.
             if n.pi_bound_index().is_none() && !bound.contains(n) {
                 out.insert(n.clone());
@@ -1388,21 +1388,21 @@ pub fn well_formed(ty: &Type, ctx: &BTreeSet<Binder>) -> bool {
     type_free_vars(ty).is_subset(ctx)
 }
 
-// ---- the locally-nameless coordinate: closing and opening a Pi binder ----
+// ---- locally nameless: closing and opening a Pi binder ----
 
 /// Close `binder`'s free references in `ty` into de Bruijn indices
 /// ([`Name::PiBound`]) — the abstraction half of the locally-nameless
-/// coordinate (see `src/ccl/design/type-inference.md`, "The coordinate is
-/// locally nameless"). An index counts the `Fun` codomains crossed between
-/// the reference and the arrow that binds it, named and unnamed frames alike
-/// (so the coordinate survives `Type::without_pi_names`): a reference in the
-/// constructed arrow's immediate codomain closes at `#0`, one per crossed
+/// representation (see `src/ccl/design/type-inference.md`, "A binder reference
+/// is stored in one of two forms"). An index counts the `Fun` codomains crossed
+/// between the reference and the function that binds it, named and unnamed
+/// alike (so it survives `Type::without_pi_names`): a reference in the
+/// constructed function's immediate codomain closes at `#0`, one per crossed
 /// codomain deeper.
 ///
-/// Arrow construction owns closing: it runs over the codomain a dependent
-/// arrow is built around, so a constructed `Type::Fun` never carries a free
+/// Function construction owns closing: it runs over the codomain a dependent
+/// function is built around, so a constructed `Type::Fun` never carries a free
 /// name for its own binder. Indices already present are left alone — they
-/// are bound by arrows *inside* `ty`, strictly closer than the frame being
+/// are bound by functions *inside* `ty`, strictly closer than the one being
 /// created — so closing composes bottom-up across nested constructions and
 /// is the identity on an already-closed type.
 ///
@@ -1413,7 +1413,7 @@ pub fn well_formed(ty: &Type, ctx: &BTreeSet<Binder>) -> bool {
 pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
     // A codomain with no free occurrence of the binder has nothing to close,
     // and every construction site runs this — including the rebuild helpers
-    // (`Type::fun_like`, `emit_cast`) whose codomains come out of arrows that
+    // (`Type::fun_like`, `emit_cast`) whose codomains come out of functions that
     // closed already. Answering from a borrowing scan keeps those off the
     // clone-and-walk path. The scan covers what the walk covers: predicates,
     // their interior type slots, and interior term binders' shadowing.
@@ -1425,54 +1425,54 @@ pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
     debug_assert!(
         binder.pi_bound_index().is_none(),
         "a `PiBound` is a reference, never a binder, so nothing abstracts over \
-         one: closing at one would rewrite references to an unrelated frame",
+         one: closing at one would rewrite references to an unrelated function",
     );
     if !crate::ccl::ccl_utils::is_free_in_type(binder, ty) {
         return ty.clone();
     }
-    let frames = [Some(binder.clone())];
+    let enclosing = [Some(binder.clone())];
     let mut out = ty.clone();
-    PiWalk::new(PiMode::Close(&frames)).ty(&mut out, 0);
+    PiWalk::new(PiMode::Close(&enclosing)).ty(&mut out, 0);
     out
 }
 
-/// Open the frame of an arrow whose codomain `ty` was just extracted from
-/// it: every [`Name::PiBound`] reference to that arrow — index equal to the
+/// Open the function whose codomain `ty` was just extracted from
+/// it: every [`Name::PiBound`] reference to it — index equal to the
 /// codomains crossed to reach the reference — becomes `target`. The two
 /// replacement species are the two opening sites (see
 /// `src/ccl/design/type-inference.md`, "Where the conversions run"):
 /// a [`Mapping::Rename`] opens at a name (descent under the binder — the
 /// reference becomes a free `Var` closed against the reader's telescope),
 /// a [`Mapping::Discharge`] opens at the argument (application — β). Indices
-/// bound by arrows inside `ty` are strictly smaller at their references and
+/// bound by functions inside `ty` are strictly smaller at their references and
 /// stay untouched; no index shifts, because opening only ever removes the
-/// outermost frame.
+/// enclosing function.
 pub fn open_pi_binder(target: &Mapping, ty: &Type) -> Type {
     let mut out = ty.clone();
     PiWalk::new(PiMode::Open(target)).ty(&mut out, 0);
     out
 }
 
-/// A morphism's `codomain` in the coordinate its *consumer* speaks: descent
+/// A morphism's `codomain` in the form its *consumer* speaks: descent
 /// under a dependent morphism's binder, where its own reference to that binder
 /// is the free name rather than an index
 /// (`src/ccl/design/type-inference.md`, "Where the conversions run").
 ///
 /// The rebuild passes all reach for this at the same shape — a chain adjacency,
-/// an application's transformer arrow, a recognizer matching a family's
+/// an application's transformer function, a recognizer matching a family's
 /// predicate — each holding the morphism and the codomain it just read off it.
 /// A non-dependent morphism and an index-free codomain pass through untouched,
 /// so a caller with nothing to open pays a scan.
 pub fn open_codomain(morphism: &Type, codomain: &Type) -> Type {
     match morphism.peel_refinements() {
-        Type::Fun { name: Some(b), .. } if references_outermost_frame(codomain) => {
+        Type::Fun { name: Some(b), .. } if references_enclosing_function(codomain) => {
             open_pi_binder(&Mapping::Rename(b.clone()), codomain)
         }
         _ => {
             debug_assert!(
                 !matches!(morphism.peel_refinements(), Type::Fun { name: None, .. })
-                    || !references_outermost_frame(codomain),
-                "an unnamed arrow's codomain references the arrow: the index has no \
+                    || !references_enclosing_function(codomain),
+                "an unnamed function's codomain references it: the index has no \
                  binder to open at, so nothing downstream can resolve it",
             );
             codomain.clone()
@@ -1482,8 +1482,8 @@ pub fn open_codomain(morphism: &Type, codomain: &Type) -> Type {
 
 /// Which conversion a [`PiWalk`] performs.
 enum PiMode<'a> {
-    /// `Var(n)` where `n` names a frame becomes `Var(PiBound(k))`, `k` the
-    /// codomain crossings between the reference and that frame: the frame's
+    /// `Var(n)` where `n` names an enclosing function becomes `Var(PiBound(k))`,
+    /// `k` the codomain crossings between the reference and it: that function's
     /// distance in the stack (innermost last, unnamed crossings as `None`)
     /// plus the crossings walked inside the converted structure itself.
     Close(&'a [Option<Name>]),
@@ -1510,7 +1510,7 @@ struct PiWalk<'a> {
     memo: HashMap<(PredicateId, u32), Rc<TypedExpr>>,
     /// Term binders a predicate's interior introduces, innermost last. A
     /// reference to one of these is bound by the predicate's own lambda, not
-    /// by an enclosing arrow, so closing leaves it alone
+    /// by an enclosing function, so closing leaves it alone
     /// (`src/ccl/design/type-inference.md`, "Interior term binders stay
     /// named, and compare by position").
     shadowed: Vec<Name>,
@@ -1529,7 +1529,7 @@ impl<'a> PiWalk<'a> {
     fn ty(&mut self, ty: &mut Type, depth: u32) {
         match ty {
             // No structural children. An `Infer`'s bounds are the live
-            // graph's, in the solver's name coordinate — a construction-time
+            // graph's, name-spelled — a construction-time
             // conversion must not reach through and rewrite them.
             Type::Base(_)
             | Type::UIntRange(_)
@@ -1610,14 +1610,14 @@ impl<'a> PiWalk<'a> {
 
     fn expr(&mut self, e: &mut TypedExpr, depth: u32) {
         match &self.mode {
-            PiMode::Close(frames) => {
+            PiMode::Close(enclosing) => {
                 if let TypedExprNode::Var(n) = &e.node
                     && !self.shadowed.contains(n)
-                    && let Some(dist) = frames.iter().rev().position(|f| f.as_ref() == Some(n))
+                    && let Some(dist) = enclosing.iter().rev().position(|f| f.as_ref() == Some(n))
                 {
                     // The spelling rides along as the reference's display
                     // hint: a diagnostic that blames this claim detached from
-                    // its arrow has no arrow to read a name off.
+                    // its function has none to read a name off.
                     e.node = TypedExprNode::Var(Name::pi_bound(dist as u32 + depth, n));
                     self.changed += 1;
                     // Fall through: the occurrence's type slot may itself
@@ -1635,7 +1635,7 @@ impl<'a> PiWalk<'a> {
                     // term, whose own indices are relative to wherever it was
                     // written and must not be read against this depth. A
                     // `Rename` keeps the occurrence's type slot, which is
-                    // still in the pre-opening coordinate, so that slot is
+                    // not yet opened, so that slot is
                     // converted and the term below it is a bare `Var`.
                     if matches!(target, Mapping::Rename(_)) {
                         self.ty(&mut e.ty, depth);
@@ -1646,7 +1646,7 @@ impl<'a> PiWalk<'a> {
         }
         e.walk_type_slots_mut(|t| self.ty(t, depth));
         // Children under the binders that scope over them: a term binder a
-        // predicate introduces shadows a frame that shares its name, and its
+        // predicate introduces shadows an enclosing function that shares its name, and its
         // references are its own.
         let base = self.shadowed.len();
         for_each_scoped_item_mut(e, &mut |item| match item {
@@ -1666,13 +1666,13 @@ impl<'a> PiWalk<'a> {
     }
 }
 
-/// Does `ty` reference the arrow frame it was just extracted from — a
+/// Does `ty` reference the function it was just extracted from — a
 /// [`Name::PiBound`] whose index equals the codomain crossings to reach it?
 /// This is the dependence test that drives **opening**: descent and
 /// application convert exactly the references this finds. A site deciding
-/// whether to *keep* an arrow's binder wants [`codomain_depends_on`], which
-/// also admits a codomain still in the name coordinate.
-pub fn references_outermost_frame(ty: &Type) -> bool {
+/// whether to *keep* a function's binder wants [`codomain_depends_on`], which
+/// also admits a name-spelled codomain.
+pub fn references_enclosing_function(ty: &Type) -> bool {
     fn ty_scan(ty: &Type, depth: u32, visited: &mut BTreeSet<(PredicateId, u32)>) -> bool {
         match ty {
             Type::Base(_)
@@ -1719,50 +1719,50 @@ pub fn references_outermost_frame(ty: &Type) -> bool {
     ty_scan(ty, 0, &mut BTreeSet::new())
 }
 
-/// Does `codomain`, just extracted from an arrow binding `binder`, depend on
-/// that arrow — in either coordinate? A closed codomain references the frame by
-/// index ([`references_outermost_frame`]) and one still in the name coordinate
-/// references `binder` by name; a site that keeps or drops the arrow's binder
+/// Does `codomain`, just extracted from a function binding `binder`, depend on
+/// that function — closed or name-spelled? A closed codomain references it by
+/// index ([`references_enclosing_function`]) and a name-spelled one
+/// references `binder` by name; a site that keeps or drops the function's binder
 /// slot has to admit both, because the slot is what a later descent or
-/// application opens the frame at and dropping it strands the reference.
+/// application opens the function at and dropping it strands the reference.
 ///
-/// The two callers are the two places an arrow is rebuilt around a codomain
+/// The two callers are the two places a function is rebuilt around a codomain
 /// computed elsewhere: `coalesce_compact_go` assembling a `Fun` from a compact
 /// view, and `lambda_elim` re-attaching an eliminated lambda's Pi.
 pub fn codomain_depends_on(binder: &Name, codomain: &Type) -> bool {
-    references_outermost_frame(codomain) || type_free_vars(codomain).contains(binder)
+    references_enclosing_function(codomain) || type_free_vars(codomain).contains(binder)
 }
 
 /// Closes refinements as they land in a compact/key view (see
 /// `src/ccl/design/type-inference.md`, "Where the conversions run"): a refinement's
-/// free references to the walk's enclosing frames become indices, one
+/// free references to the functions the walk is inside of become indices, one
 /// conversion after the substitution forcing at the same two arms. Memoized on
-/// (predicate identity, frame stack) so occurrences that entered a view
+/// (predicate identity, enclosing binders) so occurrences that entered a view
 /// sharing one predicate `Rc` leave sharing one `Rc` — the planning-cost
 /// concern of [`crate::ccl::Refinement::predicate`] — and so the common
-/// frame-free claim is returned shared without a walk.
+/// claim referencing none of them is returned shared without a walk.
 #[derive(Default)]
 pub(crate) struct ClaimCloser {
     memo: HashMap<(PredicateId, Vec<Option<Name>>), crate::ccl::Refinement>,
 }
 
 impl ClaimCloser {
-    /// Close `r` against `frames` (innermost frame last, unnamed codomain
-    /// crossings as `None`). A refinement referencing none of the frames keeps its
+    /// Close `r` against `enclosing` (innermost last, unnamed codomain
+    /// crossings as `None`). A refinement referencing none of them keeps its
     /// predicate `Rc`.
     pub(crate) fn close(
         &mut self,
-        frames: &[Option<Name>],
+        enclosing: &[Option<Name>],
         r: &crate::ccl::Refinement,
     ) -> crate::ccl::Refinement {
-        if frames.iter().all(Option::is_none) {
+        if enclosing.iter().all(Option::is_none) {
             return r.clone();
         }
-        let key = (r.predicate_id(), frames.to_vec());
+        let key = (r.predicate_id(), enclosing.to_vec());
         if let Some(done) = self.memo.get(&key) {
             return done.clone();
         }
-        let mut walk = PiWalk::new(PiMode::Close(frames));
+        let mut walk = PiWalk::new(PiMode::Close(enclosing));
         let mut out = r.clone();
         walk.refinement(&mut out, 0);
         self.memo.insert(key, out.clone());
@@ -1993,9 +1993,9 @@ mod tests {
     }
 
     // A binder's own references are out of a discharge's reach, by one of
-    // two mechanisms depending on the coordinate: a *constructed* arrow
+    // two mechanisms, depending on how the function was built: a *constructed* one
     // (`Type::pi`) closed them into indices, which no name-keyed
-    // substitution maps; a name-based arrow (the mid-solve form, built
+    // substitution maps; a name-based one (the mid-solve form, built
     // field-wise) shadows the discharge under the binder instead.
     #[test]
     fn apply_type_shadows_pi_binder() {
@@ -2462,7 +2462,7 @@ mod rewrite_tests {
 }
 
 #[cfg(test)]
-mod pi_coordinate_tests {
+mod locally_nameless_tests {
     use super::*;
     use crate::ccl::{BaseType, Lit, Refinement};
 
@@ -2486,9 +2486,9 @@ mod pi_coordinate_tests {
 
     /// The worked example from `type-inference.md`, "Freshening and
     /// `SpecKey`": closing the outer binder of
-    /// `(i: {Int | k}) ⇒ {Int | k}` assigns `#0` in the inner arrow's domain
-    /// (only the outer frame is in scope there) and `#1` in its codomain
-    /// (the inner frame is crossed).
+    /// `(i: {Int | k}) ⇒ {Int | k}` assigns `#0` in the inner function's domain
+    /// (only the outer binder is in scope there) and `#1` in its codomain
+    /// (the inner function is crossed).
     #[test]
     fn closing_counts_codomain_crossings_only() {
         let k = Name::fresh("k");
@@ -2502,7 +2502,7 @@ mod pi_coordinate_tests {
             domain, codomain, ..
         } = &closed
         else {
-            panic!("closing preserves the arrow");
+            panic!("closing preserves the function");
         };
         assert!(is_pi_bound(predicate_of(domain), 0));
         assert!(is_pi_bound(predicate_of(codomain), 1));
@@ -2559,7 +2559,7 @@ mod pi_coordinate_tests {
             &closed,
         );
         let Type::Fun { domain, .. } = &applied else {
-            panic!("opening preserves the arrow");
+            panic!("opening preserves the function");
         };
         assert_eq!(
             predicate_of(domain).node,
@@ -2569,20 +2569,20 @@ mod pi_coordinate_tests {
     }
 
     /// Closing composes bottom-up: the inner construction's indices are
-    /// strictly closer than the frame the outer construction creates, so the
+    /// strictly closer than the function the outer construction creates, so the
     /// outer close leaves them alone.
     #[test]
     fn nested_constructions_compose() {
         let k = Name::fresh("k");
         let i = Name::fresh("i");
         // Construction closes the codomain being wrapped: close `i`'s
-        // references, then build the arrow around the result…
+        // references, then build the function around the result…
         let inner_closed = Type::pi(
             i.clone(),
             int(),
             close_pi_binder(&i, &refined(TypedExpr::var(i.clone()))),
         );
-        // …then put a `k` reference beside the finished inner arrow and run
+        // …then put a `k` reference beside the finished inner function and run
         // the outer construction's close over that codomain.
         let cod = Type::Tuple(vec![inner_closed, refined(TypedExpr::var(k.clone()))]);
         let closed = close_pi_binder(&k, &cod);
@@ -2590,11 +2590,11 @@ mod pi_coordinate_tests {
             panic!("closing preserves the tuple");
         };
         let Type::Fun { codomain, .. } = &ts[0] else {
-            panic!("closing preserves the arrow");
+            panic!("closing preserves the function");
         };
         assert!(
             is_pi_bound(predicate_of(codomain), 0),
-            "the inner arrow's own index is untouched by the outer close",
+            "the inner function's own index is untouched by the outer close",
         );
         assert!(is_pi_bound(predicate_of(&ts[1]), 0));
     }
@@ -2629,9 +2629,9 @@ mod pi_coordinate_tests {
         );
     }
 
-    /// A term binder inside a predicate shadows the arrow being closed: the
+    /// A term binder inside a predicate shadows the function being closed: the
     /// references it binds stay names, because they are its and not the
-    /// arrow's. Uniquification keeps the two spellings apart in a compiled
+    /// function's. Uniquification keeps the two spellings apart in a compiled
     /// program, so this is what makes closing correct without depending on
     /// that convention (`src/ccl/design/type-inference.md`, "Interior term
     /// binders stay named, and compare by position").
@@ -2645,7 +2645,7 @@ mod pi_coordinate_tests {
             TypedExpr::var(k.clone()),
         ));
         assert_eq!(close_pi_binder(&k, &shadowing), shadowing);
-        // The arrow's own reference beside it still closes, so the shadow is
+        // The function's own reference beside it still closes, so the shadow is
         // scoped to the lambda rather than disabling the walk.
         let both = Type::Tuple(vec![shadowing, refined(TypedExpr::var(k.clone()))]);
         let Type::Tuple(ts) = close_pi_binder(&k, &both) else {
@@ -2662,12 +2662,12 @@ mod pi_coordinate_tests {
     fn the_dependence_test_is_per_position_not_per_predicate() {
         let shared = Rc::new(TypedExpr::var(Name::pi_bound_bare(0)));
         let slot = || Type::Refinement(Box::new(int()), Refinement::sharing(&shared));
-        // Under an arrow the index is one crossing short of the outermost
-        // frame, so that position does not reference it; beside the arrow it
+        // Under a function the index is one crossing short of the enclosing
+        // one, so that position does not reference it; beside the function it
         // does.
         let under = Type::fun(int(), slot());
-        assert!(!references_outermost_frame(&under));
-        assert!(references_outermost_frame(&Type::Tuple(vec![
+        assert!(!references_enclosing_function(&under));
+        assert!(references_enclosing_function(&Type::Tuple(vec![
             under,
             slot()
         ])));

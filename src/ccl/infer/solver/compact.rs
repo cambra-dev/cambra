@@ -636,7 +636,7 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         recursive: HashMap::new(),
         rec_vars: BTreeMap::new(),
         collapse,
-        frames: Vec::new(),
+        enclosing: Vec::new(),
         closer: ClaimCloser::default(),
     };
     let term = compact_go(ty, true, &Subst::id(), None, &mut st);
@@ -716,16 +716,16 @@ struct CompactState {
     /// Whether the opposite-polarity collapse may fire at all on this walk.
     /// False for [`compact_type_polarity_only`]; see [`fallback_allowed`].
     collapse: bool,
-    /// The `Fun` frames the walk is inside of, innermost last (`None` for an
-    /// unnamed arrow — it still counts as a crossing). Pushed entering a
+    /// The binders of the `Fun`s the walk is inside of, innermost last (`None`
+    /// for an unnamed one — it still counts as a crossing). Pushed entering a
     /// codomain, never a domain: a binder scopes over its codomain only. This
-    /// is the refinement-closing coordinate — see [`CompactState::closer`].
-    frames: Vec<Option<Name>>,
-    /// Closes each refinement against [`frames`](CompactState::frames) as it lands
+    /// is what a refinement closes against — see [`CompactState::closer`].
+    enclosing: Vec<Option<Name>>,
+    /// Closes each refinement against [`enclosing`](CompactState::enclosing) as it lands
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run"):
     /// references to enclosing binders become indices *before*
     /// `merge_refinements` compares refinements, so a closed cast and a live
-    /// emitted arrow meeting at one variable spell one refinement one way.
+    /// emitted function meeting at one variable spell one refinement one way.
     closer: ClaimCloser,
 }
 
@@ -788,7 +788,7 @@ fn compact_go(
             let r = subst_acc.force_refinement(r);
             // Landing closes: references to the walk's enclosing binders
             // become indices before the refinement is compared or stored.
-            let r = st.closer.close(&st.frames, &r);
+            let r = st.closer.close(&st.enclosing, &r);
             if !ct.refinements.contains(&r) {
                 ct.refinements.push(r);
             }
@@ -814,11 +814,11 @@ fn compact_go(
                 Some(b) => subst_acc.shadow(b),
                 None => subst_acc.clone(),
             };
-            // Entering the codomain crosses this arrow's frame — named or
-            // not, it deepens the refinement-closing coordinate.
-            st.frames.push(name.clone());
+            // Entering the codomain crosses this function — named or not, it
+            // deepens what a refinement landing below closes against.
+            st.enclosing.push(name.clone());
             let cod = compact_go(c, pol, &cod_acc, None, st);
-            st.frames.pop();
+            st.enclosing.pop();
             CompactType {
                 fun: Some(CompactFun {
                     name: name.clone(),
@@ -1345,9 +1345,9 @@ mod claim_closing_tests {
     /// **Acceptance: landing-close keeps distinct enclosing binders
     /// distinct.** A predicate referencing the *inner* binder denotes a
     /// different type from one referencing the *outer*, and the two must not
-    /// compact alike — the failure that conflates them is the silent
-    /// wrong-sharing class (two uses sharing a specialization resolved
-    /// against the other's argument).
+    /// compact alike. Conflating them shares a specialization silently: two
+    /// uses reach one clone whose interior was resolved against the other's
+    /// argument.
     #[test]
     fn closing_keeps_distinct_binders_distinct() {
         let nested = |referenced: &str| Type::Fun {
