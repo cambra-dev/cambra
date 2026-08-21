@@ -29,6 +29,8 @@ on between them.
 > the operation layer is, throughout. Where a `[Planned]` feature has an interim behavior in
 > today's code, that is tagged `[Interim]`: an unfinished state on the path to the design,
 > not a shim to remove.
+> A section tagged `[Partly implemented]` states which of its operators exist and
+> which do not, in the section itself.
 > A section tagged `[Decided]` records a choice among alternatives, so its
 > mechanism is built and the section says why this one and not the others.
 
@@ -391,12 +393,31 @@ discharge resolves it with no witness at all.
 
 ## Lookup: membership discharge
 
-> **[Planned]** — no lookup path exists today. `c[k]` lowers as the lookup `c(k)`
-> (`lower_subscript`), but no rule discharges the index's membership, so it is a type
-> error at the `Apply` for every index. The surface operators — proven `c[k] : 𝑇`
-> and checked `c[k]? : Option(𝑇)` — are specified in
-> [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access). This section is the **discharge
-> mechanic** they rest on: the single rule that decides which one type-checks.
+> **[Partly implemented]** — the two surface operators, proven `c[k] : 𝑇` and checked
+> `c[k]? : Option(𝑇)`, are specified in
+> [chl-spec §3.9](../../../docs/chl-spec.md#39-subscript-and-attribute-access).
+>
+> **`c[k]?` types today** for a keyed collection whose type is known at the lookup:
+> `Option(𝑉)`, with the key's base type checked and the Pi binder discharged
+> ([`Builtin::LookupChecked`]). It is *application with the membership refinement
+> dropped*, which is why it needs no discharge — dropping the refinement is precisely
+> declining to ask the question this section answers.
+>
+> **`c[k]` is still rejected**, with a hint naming `c[k]?`, and that is the design: a bare
+> key carries no proof. What is missing is not a rule but a *source* — no expression yields
+> a key that carries its collection's key domain, because iteration binds the codomain
+> ([Interim](#iterating-a-setmap-binds-the-codomain-not-the-keys-interim)). The proven
+> operator therefore lands with `keys` / entry iteration, not before it.
+>
+> Note what a range domain costs here. A keyed domain is a *refinement*
+> `{𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`, so a key interoperates with `𝐾` by refinement
+> drop and the discharge has ordinary machinery to work with. A range domain is the
+> primitive `UIntRange(𝑛)`, which relates only by **equality** — no refined integer is a
+> `UIntRange` — so there is no rule by which `{𝑖 | 𝑖 < 𝑛}` could discharge against it. The
+> uniformity claimed below is therefore a claim about the *rule*, not yet about the
+> representation: realizing it for ranges means either a subtyping arm relating the two or
+> making a range domain a refinement like the keyed one. Deciding that is part of this
+> step, not a detail of it.
 
 Lookup is uniform across ranges and keys: `𝑐[𝑥]` is well-typed when `𝑥`'s type
 proves `𝑥 ∈ dom(𝑐)`, and its result totality is *whether that proof
@@ -422,11 +443,85 @@ discharges*.
 The range case is the same rule: `arr[𝑖]` is `: 𝑇` when `{𝑖 | 𝑖 < 𝑛}` discharges (an
 `Array` index, a comprehension index), and `lst[𝑖]?` is `: Option(𝑇)` where the bound
 cannot be discharged (a `List` of unknown length, where bare `lst[𝑖]` is a type error).
-So one discharge mechanic covers all four kinds rather than one per kind.
+So one discharge mechanic covers all four kinds rather than one per kind. Neither
+*discharge* exists today, so this is new — but `[]` itself already lowers as application,
+and a tuple is projected with `.0` and is not a lookup at all.
 
 `Option` is the tagged variant `some(𝑣) | none`, matched with `match`, over the existing
 `Variant` / `VariantProject` / `VariantWrap` CCL nodes. The surface `match` / `some` /
 `none` are shared with `txn_kv` and are not collection-specific.
+
+### `𝑐[𝑘]?` is application modulo membership
+
+**`𝑐[𝑘]?` types today** as `Option(𝑉)`, and the rule is *application with the membership
+refinement dropped*: the key's base type is still checked and the Pi binder is still
+discharged, so a group-by lookup's partition predicate reflects the key it was looked up
+at ([`Builtin::LookupChecked`], `checked_lookup_is_application_modulo_membership`). The
+proven form is the same edge without the drop, which is what makes the two one mechanic.
+Only the **key-domain refinement** is dropped — a restricted map's `valid(𝑘)` stays an
+obligation, because `Option` answers "is this key present", never "is this key
+admissible".
+
+Three boundaries remain, each a decision rather than a missing case
+(`checked_lookup_boundaries`): a **range** domain has no membership refinement to strip
+(the representation question above); a **parameter** target is unresolved where the
+relaxation runs, so it needs the application re-derived at coalesce as the higher-order
+dependent `apply` is; and consuming an `Option` needs surface **`match`**, which has since
+landed. What the six end-to-end value cases in `tests/compilation_pipeline/misc.rs` wait on
+is the compilation below, not a runtime presence test — they still assert a bare `g(k)`
+succeeding, so they are restated against `g[k]?` rather than un-ignored.
+
+### How `𝑐[𝑘]?` compiles [Planned]
+
+**Relaxed application, and no operator of its own.** `𝑐[𝑘]?` compiles as the ordinary
+application of `𝑐` to `𝑘` — the same operator chain a proven lookup gets — because
+application at the operator level is *already curried*: op-conversion's `Apply` arm
+converts the argument into an operator and hands it to the function as its **input**, so a
+`Var` bound to a collection becomes `MapResult(input, 𝑐)` and is applied pointwise.
+
+That is what makes the key's arity a non-question. A literal key is a one-row input stream
+and a key drawn from an iteration is a column, and `MapResult` is the same operator for
+both.
+
+```
+key_stream                     SealedFunction(𝐷 → Scalar(𝐾))   -- one row for a literal key,
+                                                                  the iteration domain otherwise
+MapResult(key_stream, 𝑐)       SealedFunction(𝐷 → (𝐼 → 𝑉))     -- the group per key
+MapAggregate                   SealedFunction(𝐾 → Aggregation) -- when an aggregate consumes it
+MapExtractAggregate            SealedFunction(𝐾 → Scalar)
+ExtractFinal(source, default)  Scalar(𝑇)                       -- the `none` arm
+```
+
+**Absence is the empty tile, not a tag.** A lookup at a key the collection does not have
+produces no row, and every operator that has to notice already reads absence that way:
+`ExtractFinal` emits its default when the source is terminal having emitted zero values,
+`VariantProject` answers an absent tag with an empty projection rather than an error, and
+`UnionOperator` keeps the arms apart in its *domain*, which is what `final_or_default`
+dispatches on. So [`Builtin::CollectionContains`] needs no runtime: it is the type-level
+name for the key set, and the key set is already the domain of the `Converse` the
+group-by lowering produces.
+
+**A pair is the wrong argument shape**, which is what the lowering emits today —
+`(collection, key) ▷ lookup?`, chosen so the builtin stays a unary application and inference
+reaches it through the ordinary `Apply` arm. It has no runtime reading. A tuple in value
+position is `zip` (`FanIn`), which zips columns over a *shared* domain, so a collection
+beside a scalar key is not one; and once the key varies, the pair would need the collection
+lifted to a column whose every cell is a whole collection. Op-conversion therefore reaches
+the generic tuple path and fails on the tiling mismatch. Emitting relaxed application
+instead removes the encoding rather than teaching the tuple path to build a shape the
+runtime does not have.
+
+**One boundary to decide first.** Reading absence off the empty tile conflates "the key is
+missing" with "the key is present and its collection is empty". For a group-by they
+coincide, since a key exists exactly when its group has rows. A `Map(𝐾, Collection(𝑉))`
+that can store an empty collection separates them, and that is the case wanting a presence
+bit rather than emptiness.
+
+The `none` arm is pinned above only for a scalar result at a single key, where
+`ExtractFinal`'s default is exactly it. Per-key, the same dispatch is the C-form a scalar
+`match` already compiles to ([lowering.md](lowering.md#a-scalar-match-is-the-c-form-gated-by-tag)) —
+two legs joined by `UnionOperator` with `final_or_default` selecting. That composition is
+read off the operators rather than measured.
 
 ### Prerequisite: the proof has to survive being consumed
 

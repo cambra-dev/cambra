@@ -781,6 +781,16 @@ pub(super) fn emit_apply<C: Typing>(
     argument: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
+    // The **checked** lookup `c[k]?`, intercepted rather than given a scheme: the
+    // collection's codomain may mention its key binder, so the result type has to be
+    // built by discharging that binder rather than read off a flat one.
+    if matches!(
+        &function.node,
+        TypedExprNode::Builtin(crate::ccl::Builtin::LookupChecked)
+    ) {
+        let arg_ty = ctx.subexpr(argument)?;
+        return emit_lookup_checked(function, argument, arg_ty, ctx);
+    }
     let raw_arg_ty = ctx.subexpr(argument)?;
     let fn_ty = ctx.subexpr(function)?;
     // **The one position where a mutable variable's handle survives.** If the parameter is a
@@ -836,6 +846,134 @@ pub(super) fn emit_apply<C: Typing>(
     // edges, is recovered structurally at coalesce
     // (`specialize_projection_domain` / `specialize_lambda_domain`).
     ctx.apply(&fn_ty, &arg_ty, argument, &|| "Apply".to_string())
+}
+
+/// Type the **checked lookup** `c[k]?` as `Option(𝑉[𝑘 ↦ key])` from
+/// `c : (𝑘: 𝐷) ⤇ 𝑉` and `key : 𝐾`.
+///
+/// The whole rule is *application with the membership refinement dropped*. Reading it
+/// that way is what keeps the two lookup operators one mechanic: `c[k]` is this same
+/// edge without the drop, and both inherit the base-type check and the Pi discharge
+/// from [`Typing::apply`] rather than restating them.
+///
+/// So the only thing written here is the relaxation, and it is deliberately narrow.
+/// [`membership_relaxed_domain`] strips the **membership refinement** and nothing else: a
+/// key whose presence is unknown is exactly what `Option` reports, whereas a key that
+/// fails a *filter* on the domain (`{𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains) ∧ valid(𝑘)}` — a restricted map) is not a
+/// missing key but an inadmissible one, and dropping that would answer `none` to a
+/// question the program got wrong.
+///
+/// A domain with no membership refinement to drop is left alone, so the argument edge
+/// runs unrelaxed and rejects. That is the honest state for a **range** domain today:
+/// `UIntRange(𝑛)` is a primitive relating only by equality rather than a refinement over
+/// an index type, so no integer can discharge against it and `lst[𝑖]?` has nothing to
+/// relax. Closing that is the representation question in
+/// `src/ccl/design/collections.md`, "Lookup: membership discharge" — not a missing case
+/// here.
+fn emit_lookup_checked<C: Typing>(
+    function: &mut Expr,
+    argument: &Expr,
+    arg_ty: Type,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    // Lowering passes `(collection, key)` as a pair, so both arrive through one
+    // argument position and the builtin stays a plain unary application.
+    let Type::Tuple(parts) = arg_ty.peel_refinements() else {
+        return Err(ctx.raise(InferError::ExpectedFunction {
+            found: arg_ty.clone(),
+            at: "checked lookup argument".to_string(),
+        }));
+    };
+    let [coll_ty, key_ty] = parts.as_slice() else {
+        return Err(ctx.raise(InferError::Unsupported(format!(
+            "checked lookup takes a (collection, key) pair, got {arg_ty}"
+        ))));
+    };
+    let relaxed = membership_relaxed_domain(coll_ty)
+        .ok_or_else(|| {
+            // A target whose type is still an inference **variable** lands here. That is not
+            // a malformed program — `def f(m: Map(K, V)): m[k]?` is the natural shape — but
+            // the relaxation is structural, so it needs the domain, and a use of a binder
+            // carries the binder's variable rather than its annotation. Resolving it means
+            // re-deriving this application at coalesce, where the collection's type is
+            // known, exactly as the higher-order dependent `apply` does. Until then say so,
+            // rather than reporting the shape mismatch a bare `ExpectedFunction` would.
+            if matches!(coll_ty, Type::Infer(_) | Type::Hole) {
+                return InferError::Unsupported(format!(
+                    "checked lookup `c[k]?` needs the collection's type at this point, but \
+                 `{coll_ty}` is not resolved yet. Looking up through a *parameter* is not \
+                 supported yet — bind the collection with `=` in the same scope, or \
+                 iterate it instead"
+                ));
+            }
+            InferError::ExpectedFunction {
+                found: coll_ty.clone(),
+                at: "checked lookup target".to_string(),
+            }
+        })
+        .map_err(|e| ctx.raise(e))?;
+    // The **key expression**, not the pair. A dependent application discharges the Pi
+    // binder to the argument *term*, so handing over the pair would substitute
+    // `(collection, key)` where the codomain expects the key — leaving the binder free
+    // and tripping the scope-validity guard rather than failing quietly.
+    let TypedExprNode::Tuple(parts) = &argument.node else {
+        return Err(ctx.raise(InferError::Unsupported(
+            "checked lookup expects a literal (collection, key) pair".to_string(),
+        )));
+    };
+    let [_, key_expr] = parts.as_slice() else {
+        return Err(ctx.raise(InferError::Unsupported(
+            "checked lookup expects exactly a collection and a key".to_string(),
+        )));
+    };
+    let value = ctx.apply(&relaxed, key_ty, key_expr, &|| "checked lookup".to_string())?;
+    let result = Type::option_of(value);
+    // Stamp the builtin with the concrete instance at this site, as `reify` does, so
+    // later passes read a consistent type off the node.
+    function.ty = Type::fun(arg_ty, result.clone());
+    Ok(result)
+}
+
+/// `collection`'s type with the **membership refinement** stripped from its domain — the one
+/// relaxation a checked lookup makes ([`emit_lookup_checked`]). `None` when the target is
+/// not a collection at all.
+///
+/// A `Σ`-typed target (an *abstract* `Map(𝐾, 𝑉)` annotation, not a concrete keyed
+/// collection) relaxes to its kind's key **parameter**: the kind is what says "some key
+/// domain over `𝐾`", so `𝐾` is precisely the base a key must satisfy, and no member of
+/// the kind has been named to strip a token from.
+fn membership_relaxed_domain(collection: &Type) -> Option<Type> {
+    let (name, domain, codomain) = match collection.peel_refinements() {
+        Type::Fun {
+            name,
+            domain,
+            codomain,
+            ..
+        } => (name.clone(), domain.as_ref().clone(), codomain.as_ref()),
+        Type::Sigma(s) => {
+            let crate::ccl::ty::TypeKind::Keyed(key) = s.kind() else {
+                return None;
+            };
+            // The **factored** form is the one with an element type to relax to. An
+            // unfactored sum's body is the bare witness, so it names no codomain here
+            // and there is nothing to build a relaxed collection type out of.
+            let (binder, cod) = s.body_residue()?;
+            (binder.clone(), (**key).clone(), cod)
+        }
+        _ => return None,
+    };
+    // Strip the **membership** layer only. `keyed_domain_key` recognizes exactly the
+    // `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}` shape, so an ordinary refined domain is
+    // untouched and its refinement still has to be discharged by the argument.
+    let base = crate::ccl::ty::keyed_domain_key(&domain)
+        .cloned()
+        .unwrap_or(domain);
+    Some(Type::Fun {
+        name,
+        kind: FunKind::Data,
+        domain: Box::new(base),
+        codomain: Box::new(codomain.clone()),
+    })
 }
 
 /// Record an operator's single obligation and give back its result type.

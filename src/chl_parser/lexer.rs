@@ -158,6 +158,10 @@ pub enum Token {
     LBracket,
     #[token("]")]
     RBracket,
+    /// The **checked**-lookup suffix, only meaningful directly after a `]`
+    /// (`c[k]?`, `docs/chl-spec.md`, "3.9 Subscript and attribute access").
+    #[token("?")]
+    Question,
     #[token("{")]
     LBrace,
     #[token("}")]
@@ -268,6 +272,7 @@ impl fmt::Display for Token {
             Token::RParen => ")",
             Token::LBracket => "[",
             Token::RBracket => "]",
+            Token::Question => "?",
             Token::LBrace => "{",
             Token::RBrace => "}",
             Token::Comma => ",",

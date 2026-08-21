@@ -1397,7 +1397,7 @@ pub mod witness_ctx {
 /// related to it ([`KindObligations`]): the shape decides containment, and the key type
 /// rides out as an obligation, so a still-open key type is pinned rather than silently
 /// ignored.
-fn keyed_domain_key(domain: &Type) -> Option<&Type> {
+pub(crate) fn keyed_domain_key(domain: &Type) -> Option<&Type> {
     let Type::Refinement(base, r) = domain else {
         return None;
     };

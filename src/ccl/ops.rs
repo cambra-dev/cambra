@@ -634,6 +634,34 @@ pub enum Builtin {
     /// (`debug_assert_no_unexecutable_atoms`) instead of relying on no code path
     /// picking the predicate up. See `src/ccl/design/collections.md`.
     CollectionContains,
+
+    /// `lookup? : ((𝑘: 𝐷) ⤇ 𝑉, 𝐾) → Option(𝑉[𝑘 ↦ key])` — the **checked** lookup
+    /// `c[k]?`, the surface operator for evaluating a finite function at a point that
+    /// is *not known to be in its domain* (`docs/chl-spec.md`, "3.9 Subscript and
+    /// attribute access").
+    ///
+    /// It is **not a second application rule.** `c[k]?` is `c(k)` with one thing
+    /// relaxed — the domain's *membership* refinement is dropped before the argument
+    /// edge runs — and the result wrapped in `Option`. Everything else is ordinary
+    /// dependent application: the key is still checked against the domain's base type
+    /// (so an `Int` key never reaches a `String`-keyed map), and the Pi binder is still
+    /// discharged to the argument, so a group-by lookup's partition predicate reflects
+    /// the key it was looked up at. The proven operator `c[k]` is the same edge
+    /// *without* the drop, which is why the two are one mechanic and not one rule per
+    /// collection kind (`src/ccl/design/collections.md`, "Lookup: membership
+    /// discharge").
+    ///
+    /// Only the **membership** refinement is dropped — the one naming the key morphism —
+    /// never an
+    /// arbitrary one. A restricted map's `{𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains) ∧ valid(𝑘)}` keeps `valid(𝑘)` as a
+    /// genuine obligation: not knowing whether a key is *present* is what `Option`
+    /// answers, and it says nothing about whether the key was *admissible*.
+    ///
+    /// Typed by a dedicated arm in [`emit_apply`](crate::ccl::infer) rather than by a
+    /// scheme: the codomain may mention the key binder — a group-by's group is refined by
+    /// the key it was looked up at — and a flat scheme `((𝑘: 𝐷) ⤇ 𝑉, 𝐾) → Option(𝑉)`
+    /// decomposes that codomain out of the binder's scope.
+    LookupChecked,
 }
 
 impl Builtin {
@@ -677,6 +705,7 @@ impl Builtin {
             Self::VariantProject(_) => "variant_project",
             Self::VariantWrap(_) => "variant_wrap",
             Self::CollectionContains => "collection_contains",
+            Self::LookupChecked => "lookup?",
         }
     }
 
