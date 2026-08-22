@@ -19,7 +19,7 @@
 // (`coalesce_node` ↔ `specialize_use`) over one shared [`CoalesceCtx`], so they
 // live in a single module.
 
-use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::read_through;
 use crate::ccl::infer::solver::{
@@ -1539,19 +1539,26 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // (`specialize_lambda_domain`).
     refresh_lambda_param_slot(expr);
 
-    // A `Cast`'s `target` is the inferred cast type — exactly `expr.ty`. Point
-    // it at the fully-resolved `expr.ty` (sharing the resolved refinement `Rc`),
-    // so the cast's domain refinement carries a concrete base (lowering left it
-    // a `Hole`) and shares one predicate term with the result. Planning then
-    // compiles that one predicate once and the post-inference check reconstructs
-    // the cast from a `target` that matches what the producer supplies. (The
-    // pre-materialization `coalesce_type_predicates(target)` in the `Cast` arm
-    // resolved the predicate in scope — e.g. a generalized use inside it — but
-    // against the lowered `Hole` base; this overwrite installs the concrete one.)
+    // A `Cast`'s `target` and its `expr.ty` converge on the **canonical cast
+    // type**: the coalesced view's *shape and bases*, carrying the refinements the
+    // *term* determines — the value's own domain refinements plus the target's born
+    // refinements (see `canonical_cast_ty`). Both slots share one `Type`, so
+    // planning compiles one predicate term and the post-inference check
+    // reconstructs the cast from a `target` that matches the recorded type.
     if matches!(expr.node, TypedExprNode::Cast { .. }) {
-        let cast_ty = expr.ty.clone();
-        if let TypedExprNode::Cast { target, .. } = &mut expr.node {
-            *target = cast_ty;
+        let view = expr.ty.clone();
+        if let TypedExprNode::Cast { value, target } = &mut expr.node {
+            // The *target* keeps exactly its born refinements (the assertion); the
+            // node *type* is the value's refinements joined with them (what the
+            // assertion yields on this value). Keeping the two distinct is
+            // load-bearing for the post-inference check, which recomputes the
+            // type as value-refinements ∪ target-refinements: a target that also carried
+            // the value's refinements would double-book them, and any divergence
+            // between the value's copy and the target's copy of one refinement
+            // would surface as a duplicated refinement in the recomputation.
+            let born = std::mem::replace(target, Type::Hole);
+            *target = canonical_cast_ty(&born, None, view.clone());
+            expr.ty = canonical_cast_ty(&born, Some(&value.ty), view);
         }
     }
 }
