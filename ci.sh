@@ -48,6 +48,33 @@ ci_clippy_lib() { cargo clippy --lib -- -D warnings; }
 # argument as `ci_clippy_serde`: a configuration nothing runs is a
 # configuration that rots.
 ci_test() { cargo test -q ${DEEP_TYPECHECK:+--features deep-typecheck}; }
+# The formal model (`formal/`): building it is what elaborates every theorem,
+# evaluates every `#guard`, and checks every headline result's axiom list
+# (`CclFormal/Axioms.lean`) in the Lean development, and the differential tests
+# then diff the model's verdicts against the solver's. Those tests skip
+# themselves when the oracle binary is absent, so without this gate nothing
+# notices the model drifting from the solver — the same rot argument as
+# `ci_clippy_serde`, and the drift is silent in both directions. A machine with
+# no Lean toolchain skips, loudly; under CI a missing toolchain is a broken gate
+# rather than a local convenience, so it fails instead.
+ci_formal() {
+  if ! command -v lake >/dev/null 2>&1; then
+    if [[ -n "${CI:-}" ]]; then
+      echo "ci_formal: no Lean toolchain (lake) under CI — this gate would be a no-op" >&2
+      return 1
+    fi
+    echo "ci_formal: no Lean toolchain (lake) — formal model not checked" >&2
+    return 0
+  fi
+  (cd formal && lake build) || return 1
+  # `ci_all` runs the suite next, so the differential tests ride that run rather
+  # than a second one. A bare `./ci.sh formal` still wants its own.
+  #
+  # `--nocapture` so each oracle's case count reaches the log. Without it a run
+  # that compared nothing is indistinguishable from one that compared
+  # everything: the test line reports neither.
+  cargo test -q --test differential_oracle -- --nocapture
+}
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc --no-deps
@@ -129,6 +156,12 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_doc || failed=1
+  # Before `ci_test`, so the oracle binary exists by the time the suite runs:
+  # the differential tests skip themselves without it, and a skip in the middle
+  # of the gate is the failure mode this step exists to remove.
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_formal || failed=1
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_test || failed=1

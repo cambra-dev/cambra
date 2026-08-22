@@ -463,6 +463,18 @@ impl CompactType {
         }
     }
 
+    /// [`CompactType::merge`], reachable from the integration tests.
+    ///
+    /// The merge is `pub(super)` because it is the bound fold's step and nothing
+    /// outside the solver has a bound list to fold; `tests/differential_oracle.rs`
+    /// folds one anyway, to diff each step against the model's `merge`. The
+    /// feature gate adds this door rather than widening the merge's own
+    /// visibility, so the production configuration is the ungated one.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn merge_bounds(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
+        Self::merge(pol, lhs, rhs)
+    }
+
     /// Merge two CompactTypes at the given polarity.
     ///
     /// - `vars`, `atoms`: union (always).
@@ -775,6 +787,34 @@ impl ParentPath<'_> {
     }
 }
 
+/// Whether any refinement in this position's own set references `binder` by *name*.
+///
+/// The negation is the compaction boundary's form of **landing closes**: a refinement
+/// referencing its function's binder has that reference converted to an index
+/// (`Name::PiBound`) when it lands, so the function's spelling carries no refinement
+/// identity afterwards. Two consequences rest on it — `CompactFun::merge` may keep
+/// either side's binder name (`a.name.or(b.name)`) without changing what the merged
+/// refinements mean, and `coalesce_compact_go` can decide whether to keep the binder from
+/// the codomain alone. A refinement referencing some *other* free name is unaffected and
+/// stays free; only the function's own binder is at stake.
+///
+/// Not recursive: a nested function rebinding the same spelling is a different
+/// binder, and its refinements land against it instead.
+fn refinements_name_binder(ct: &CompactType, binder: &Name) -> bool {
+    // `count_free` is the shared free-occurrence walk: it covers every node kind,
+    // and it respects shadowing. Both matter. A reference reached through an
+    // `Apply`, a `Proj`, or a `Cast` is the common shape (`__elem.a == x` is a
+    // `BinOp` over an `Apply` of a `Proj`), so a walk naming the kinds it
+    // descends under-approximates and this assertion passes vacuously wherever
+    // it is wrong. And a predicate that binds the same spelling itself — a
+    // filter's `λ x → …` under a function whose Pi binder is also `x` — holds no
+    // *free* reference to the binder, which is what the invariant is about.
+    ct.refinements.as_ref().is_some_and(|set| {
+        set.iter()
+            .any(|r| crate::ccl::ccl_utils::count_free(binder, &r.predicate) > 0)
+    })
+}
+
 /// Whether the opposite-polarity fallback may fire at the variable currently
 /// being walked, given the chain that reached it.
 ///
@@ -917,6 +957,12 @@ fn compact_go(
             st.scope.enter(name.clone());
             let cod = compact_go(c, pol, &cod_acc, None, st);
             st.scope.exit();
+            debug_assert!(
+                name.as_ref()
+                    .is_none_or(|binder| !refinements_name_binder(&cod, binder)),
+                "landing closes: a function's own refinement must reference its binder by index, \
+                 not by name"
+            );
             CompactType {
                 fun: Some(CompactFun {
                     name: name.clone(),
@@ -1172,6 +1218,37 @@ fn compact_go(
 mod tests {
     use super::*;
     use crate::ccl::infer::solver::{CoalesceError, coalesce_compact};
+    use crate::ccl::{BaseType, Refinement, TypedExpr};
+
+    /// The landing-closes check asks whether a refinement holds a **free**
+    /// reference to the function's binder. A predicate that binds the same
+    /// spelling itself holds none, so the check must not fire on it — the
+    /// distinction a walk without a scope cannot make.
+    #[test]
+    fn a_predicate_binding_the_binder_s_spelling_holds_no_free_reference() {
+        let binder = Name::raw("x");
+        // `λ x → x`: the reference resolves to the predicate's own binder.
+        let refined = |p: TypedExpr| CompactType {
+            refinements: Some(RefinementSet::from_iter([Refinement::born(Rc::new(p))])),
+            ..Default::default()
+        };
+        let shadowed = refined(TypedExpr::lambda(
+            binder.clone(),
+            Type::Base(BaseType::Int),
+            TypedExpr::var(binder.clone()),
+        ));
+        assert!(
+            !refinements_name_binder(&shadowed, &binder),
+            "a binder the predicate introduces is not a reference to the function's"
+        );
+
+        // The same spelling, unbound: a genuine free reference.
+        let free = refined(TypedExpr::var(binder.clone()));
+        assert!(
+            refinements_name_binder(&free, &binder),
+            "a free reference by name is what the invariant forbids"
+        );
+    }
 
     /// Compact merge at positive polarity unions tags.
     #[test]
@@ -1555,7 +1632,7 @@ mod refinement_closing_tests {
         assert_eq!(
             a.without_pi_names(),
             b.without_pi_names(),
-            "α-variant bound merge must be arrival-order-independent"
+            "an α-variant merge must be arrival-order-independent"
         );
         // The α-copies collapsed: one refinement, spelled as the index, nothing
         // dangling.
