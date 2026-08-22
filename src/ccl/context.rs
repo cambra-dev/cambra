@@ -698,6 +698,180 @@ pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
     );
 }
 
+/// A pipeline stage a program can be compiled to for diffing; the differ
+/// ([`crate::ccl::diff`]) accepts an [`Expr`] at any of them. See
+/// `src/ccl/design/diffing.md`, "Which stage to diff".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileStage {
+    /// Lowered CCL: `Raw` names, pre-α-uniquification, pre-inference. Closest
+    /// to source; most node types are still `Type::Hole`.
+    Lowered,
+    /// Type-inferred CCL: α-uniquified, every node annotated with its resolved
+    /// type — reflects type-level differences a `Lowered` diff cannot see.
+    /// Still carries the transient surface nodes (`Defer`/`Feed`/`For`/
+    /// `Begin`) and their `History` types, which the mutability and
+    /// channelization phases below this stage erase.
+    Inferred,
+    /// Type-inferred, then **UDF-inlined**: every call to a user-defined
+    /// function is replaced by its beta-reduced body, so function boundaries
+    /// stop being part of the program's identity.
+    ///
+    /// This is the pipeline's own [`inline`] pass used as a normalization, and
+    /// it is a deliberate trade, not a strict improvement. Extracting a
+    /// subexpression into a `def` (or inlining one back) becomes invisible —
+    /// the two versions compile to the same tree. In exchange, an edit *inside*
+    /// a function called `n` times is reported `n` times, because the body it
+    /// changed now appears `n` times. Pick this stage when refactoring across
+    /// function boundaries is the noise you want gone; pick [`Inferred`] when
+    /// locality inside shared helpers matters more.
+    ///
+    /// That last recommendation is weaker than it sounds. Monomorphization runs
+    /// inside `infer`, so [`Inferred`] has *already* cloned a definition once
+    /// per distinct instantiation identity: two calls that key apart — literal
+    /// arguments do, since a `SpecKey` sees their singletons — are two bodies
+    /// before inlining is even reached. `Inferred` preserves locality across
+    /// call sites that share a specialization, not across call sites generally.
+    /// Measured both ways in `src/ccl/design/diffing.md`, "How much to
+    /// normalize".
+    ///
+    /// [`Inferred`]: CompileStage::Inferred
+    Inlined,
+    /// Mutability eliminated: `with begin():` blocks and mutation loops have
+    /// become causal `LetRec` recurrences over their sequencing domain, and
+    /// feeds have been routed into channels. `For`/`MutWrite`/`Begin`/`Defer`
+    /// are gone.
+    Channelized,
+    /// Point-free: lambdas replaced by combinators, so binders no longer appear
+    /// in the term at all.
+    LambdaElim,
+    /// Recurrences lowered onto the `Transact` carrier and joins planned — the
+    /// shape operator conversion consumes. The last stage before the tile
+    /// graph, and the one where compute sharing is decided.
+    Planned,
+}
+
+/// Compile `code` to the given [`CompileStage`], ready to pass to
+/// [`crate::ccl::diff::diff`]. Sources — the pre-registered `stdin()` and any
+/// discovered during lowering — are registered for inference, so the result is
+/// reachable end-to-end from source.
+///
+/// Pair two results for a program diff (each tree must outlive the borrow), or
+/// use [`crate::ccl::diff::diff_programs`] for the common case:
+/// ```ignore
+/// let (a, b) = (compile_to(s1, CompileStage::Inferred)?, compile_to(s2, CompileStage::Inferred)?);
+/// let d = crate::ccl::diff::diff(&a, &b);
+/// ```
+///
+/// The prefix here mirrors [`compile_program`]'s frontend, stopping at the
+/// requested stage rather than continuing to the operator graph.
+///
+/// Choosing a stage is choosing how much of the compiler's own rewriting to
+/// diff through, and it is a trade in both directions — a later stage
+/// normalizes more away but spreads a single edit over more of the tree. See
+/// [`CompileStage`] and `src/ccl/design/diffing.md`, "How much to normalize".
+///
+/// The transaction, mutability and channelization phases are not separately
+/// selectable: they are one rewrite of the user's loops and feeds into `LetRec`
+/// recurrences, and stopping between them exposes a half-rewritten tree no
+/// consumer wants. [`Channelized`] is the point where that rewrite is complete.
+///
+/// [`Channelized`]: CompileStage::Channelized
+pub fn compile_to(code: &str, stage: CompileStage) -> Result<Expr, Vec<CompileError>> {
+    let mut ctx = GlobalContext::new();
+    let mut errors: Vec<CompileError> = Vec::new();
+
+    let parse_result = chl_parser::parse_module(code);
+    errors.extend(parse_result.errors.into_iter().map(CompileError::Parse));
+    let Some(module) = parse_result.value else {
+        return Err(errors);
+    };
+    if module.body.is_empty() {
+        errors.push(CompileError::Lower(LoweringError::unsupported(
+            chl_parser::ast::Span::new(0, code.len()),
+            "empty program: file contains no top-level statements",
+        )));
+        return Err(errors);
+    }
+
+    let lower_result = lower_stmts(&module.body, ctx.lowering_ctx());
+    errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
+    let Some(mut expr) = lower_result.value else {
+        return Err(errors);
+    };
+    // `Error` placeholders make the tree unfit for inference (and meaningless
+    // to diff), so bail on any earlier-stage error even at the `Lowered` stage.
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    if stage == CompileStage::Lowered {
+        return Ok(expr);
+    }
+
+    expr = uniquify::run(expr);
+    for (_name, source) in ctx.lowering_ctx().take_sources() {
+        let name = source.borrow().get_id().to_string();
+        let output_type = source.borrow().output_type();
+        // The source's data-function type is constructed inside
+        // `register_source_type` from the element type — the `Data` kind is
+        // intrinsic, not stamped here.
+        ctx.inference_ctx().register_source_type(&name, output_type);
+    }
+    // No lowering projection is threaded here — this entry point exists to hand a
+    // tree to the differ, not to render diagnostics — so an inference error keeps
+    // its blame node but degrades to a span-less `CompileError`.
+    if let Err(errors) = infer(&mut expr, ctx.inference_ctx()) {
+        return Err(errors
+            .into_iter()
+            .map(|located| CompileError::Infer {
+                error: located.error,
+                span: None,
+            })
+            .collect());
+    }
+    if stage == CompileStage::Inferred {
+        return Ok(expr);
+    }
+
+    let expr = inline::inline_capability_lambdas(expr);
+    if stage == CompileStage::Inlined {
+        return Ok(expr);
+    }
+
+    // The staged path exists to hand the differ a tree the real pipeline would
+    // also have produced, so it runs the transact phase's rejection checks too:
+    // a program `compile_program` refuses must not yield a stage snapshot here.
+    let txn_mut_vars = transact_phase::collect_txn_mut_vars(&expr);
+    transact_phase::check_no_nested_transactions(&expr, &txn_mut_vars)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    transact_phase::check_no_induction_only_transactions(&expr, &txn_mut_vars)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    transact_phase::check_no_guarded_induction_write_in_block(&expr, &txn_mut_vars)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    transact_phase::check_await_final_linearity(&expr)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    let expr = transact_phase::run(expr, &txn_mut_vars)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    let expr = mut_elim::run(expr);
+    let mut expr = channelize::run(expr).errs()?;
+    transact_phase::rewrite_as_of_reads(&mut expr)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    if stage == CompileStage::Channelized {
+        return Ok(expr);
+    }
+
+    let expr = lambda_elim::run(expr).errs()?;
+    if stage == CompileStage::LambdaElim {
+        return Ok(expr);
+    }
+
+    debug_assert_eq!(
+        stage,
+        CompileStage::Planned,
+        "every CompileStage must be handled before this point",
+    );
+    Ok(planning::run(planning::plan_loops(expr)))
+}
+
 /// Compile a CHL program and return its operator graph plus subscribed outputs.
 ///
 /// Returns a [`CompiledProgram`] whose `outputs` vector contains one entry
