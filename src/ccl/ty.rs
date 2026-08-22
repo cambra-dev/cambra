@@ -983,11 +983,11 @@ impl TypeKind {
     /// A *superset* of [`listed`](Self::listed), and the distinction is not
     /// cosmetic. Listed domains are the kind's *members*, compared by value and
     /// placed in the domain lattice. A described kind lists no members but may still
-    /// be **parameterized** by a type that is not one of its domains — the key type
-    /// of a keyed kind is the standing example: its members are refinements
-    /// `{𝐾 | tok}`, not `𝐾` itself, so `𝐾` is a child to be traversed and never a
-    /// domain to be matched. Conflating the two silently drops such a type from every
-    /// traversal.
+    /// be **parameterized** by a type that is not one of its domains: a parameter is a
+    /// child to be traversed and never a domain to be matched, and conflating the two
+    /// silently drops such a type from every traversal. No variant here is parameterized
+    /// yet, so the two coincide today; the method exists so that adding one cannot quietly
+    /// skip substitution, freshening, extrusion and structural comparison.
     pub fn children(&self) -> &[Type] {
         match self {
             TypeKind::Enumerated(domains) => domains,

@@ -55,7 +55,8 @@ not coincide: a `Set(𝐾)` is structurally a collection of `unit` and iterates 
 > (`Array`), `UIntRanges` (`List`), `Keyed(𝐾)` (`Set`/`Map`) and `Any` (`Collection`),
 > so `Set` versus `Map` is the one pair it cannot tell apart — they share a kind and its
 > key parameter and differ only in a codomain that is `unit` for one. A nominal head
-> makes that difference readable from the type, where `{𝐾 | tok} ⤇ unit` cannot say it.
+> makes that difference readable from the type; a `Keyed(𝐾)` domain paired with a `unit`
+> codomain cannot say it.
 > Nothing in [`Type`] carries a collection kind today, so this states an intent rather
 > than an implemented property.
 >

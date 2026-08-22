@@ -1680,8 +1680,7 @@ changes that. So the constraint attaches to a variable, never to an arbitrary ty
 The claim is conditional on (1) above, so it ends if `admits` stops being writable.
 
 `Set(𝐾)` versus `Map(𝐾, unit)` is a genuine failure of (1): with the kind unrepresented
-they are the same type, and no inspection of the shared domain `{𝐾 | tok}` distinguishes
-them. What that costs the solver depends on where the distinction goes. Putting it **in the
+they are the same type, and no inspection of the domain they share distinguishes them. What that costs the solver depends on where the distinction goes. Putting it **in the
 kind** trips both conditions — membership stays undecidable and positions remain that must
 infer it — so it forces a kind inference variable with bounds and coalesce-time resolution,
 for the same reason [`FunKindVar`] has them. A **provenance stamp** like [`FunKind`]'s fails
