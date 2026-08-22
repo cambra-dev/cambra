@@ -20,9 +20,9 @@
 //!
 //! [`crate::ccl::planning::plan_loops`] runs **after `lambda_elim`**, on the group's point-free
 //! normal form, and lowers each group onto the domain-parameterized
-//! [`TypedExprNode::Transact`] carrier (`let __reg = Transact{…} in …`),
-//! whose induction domain op-conversion compiles to the `Recurse` recurrence
-//! (the `Txn` domain, to the commit operator).
+//! [`TypedExprNode::Transact`] carrier (`let __hist = Transact{…} in …`),
+//! whose induction domain op-conversion compiles to the changelog induction
+//! store (the `Txn` domain, to the commit operator).
 //!
 //! **Why one `LetRec` travels post-elim, and why `Transact` still exists.**
 //! Recognition anchors on the guard builtins (`get_prev_seq` / `get_prev_txn`
@@ -681,10 +681,10 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     // Every reference to an accumulator is either in the loop (a read-your-writes
     // read) or downstream of it (the trailing final read), so these two trees
     // carry every `Mut(V, D)` this loop's mutable variables have.
-    let reg_vtys = mut_var_value_tys([&loop_body, &cont]);
+    let value_tys = mut_var_value_tys([&loop_body, &cont]);
     // Accumulators in first-write order, with their value types.
     let mut accs: Vec<(Name, Type)> = Vec::new();
-    collect_writes(&loop_body, &reg_vtys, &mut accs);
+    collect_writes(&loop_body, &value_tys, &mut accs);
     if accs.is_empty() {
         // A loop with no accumulator. If its body feeds — a stateless generator,
         // or a `with begin():` read-only transaction (`for r in iter: with
@@ -736,7 +736,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     // Fold the accumulators into a decision-factored history binding, then wrap it
     // in a nested `LetRec`: re-point the continuation's trailing reads at the
     // extracted finals, recurse into it, prepend the reads, and hoist the feeds.
-    let fold = fold_induction_loop(&target, &iter, loop_body, &reg_vtys);
+    let fold = fold_induction_loop(&target, &iter, loop_body, &value_tys);
     let mut cont = cont;
     for (acc, x_final) in &fold.renames {
         rename_uses(&mut cont, acc, x_final);
@@ -801,17 +801,17 @@ impl InductionFold {
 /// See [`InductionFold`]. Caller must guard on a non-empty accumulator set
 /// (an accumulator-free loop is a feed-only/no-op loop, handled separately).
 ///
-/// `reg_vtys` supplies each accumulator's value type ([`mut_var_value_tys`]);
+/// `value_tys` supplies each accumulator's value type ([`mut_var_value_tys`]);
 /// the caller builds it over the widest tree it holds, so that a mutable variable read
 /// only *downstream* of the loop still contributes its `Mut(V, D)`.
 pub(crate) fn fold_induction_loop(
     target: &TypedBinding,
     iter: &Expr,
     loop_body: Expr,
-    reg_vtys: &HashMap<Name, Type>,
+    value_tys: &HashMap<Name, Type>,
 ) -> InductionFold {
     let mut accs: Vec<(Name, Type)> = Vec::new();
-    collect_writes(&loop_body, reg_vtys, &mut accs);
+    collect_writes(&loop_body, value_tys, &mut accs);
     assert!(
         !accs.is_empty(),
         "fold_induction_loop: caller must guard on a non-empty accumulator set"
@@ -983,7 +983,7 @@ pub(crate) fn fold_induction_loop(
 /// no history binding and no letrec.
 ///
 /// When `value` is a read of a transactional mutable variable (a `Var` `transact_phase`
-/// rebound to `as_of_read(__reg.k)`, constant in `target`), the map broadcasts that
+/// rebound to `as_of_read(__hist.k)`, constant in `target`), the map broadcasts that
 /// as-of read to every loop position; `transact_phase::rewrite_as_of_reads`
 /// (post-`channelize`, pre-lambda-elim) then pairs it with this loop as its trigger,
 /// which is where the outer-indexed as-of join gets the position it reads at.
@@ -1086,7 +1086,7 @@ pub(crate) fn mut_var_value_tys<'a>(
 }
 
 /// Collect `MutWrite` targets in first-write order with their value types, taken
-/// from `reg_vtys` — the join inference recorded on the mutable variable's `Mut(V, D)`.
+/// from `value_tys` — the join inference recorded on the mutable variable's `Mut(V, D)`.
 ///
 /// A mutable variable with no entry is one no reference types as a `Mut`: either nothing
 /// reads it (only writes mention it, so its value type is unobservable), or the
@@ -1095,17 +1095,17 @@ pub(crate) fn mut_var_value_tys<'a>(
 /// mutable variable takes no refinement from any single contribution, and an unstripped
 /// one would be a refinement acquired by erasure rather than by `cast`
 /// (`src/ccl/design/type-inference.md`, "Refinements on the lattice").
-fn collect_writes(expr: &Expr, reg_vtys: &HashMap<Name, Type>, out: &mut Vec<(Name, Type)>) {
+fn collect_writes(expr: &Expr, value_tys: &HashMap<Name, Type>, out: &mut Vec<(Name, Type)>) {
     if let TypedExprNode::MutWrite { name, value } = &expr.node
         && !out.iter().any(|(n, _)| n == name)
     {
-        let vty = reg_vtys
+        let vty = value_tys
             .get(name)
             .cloned()
             .unwrap_or_else(|| strip_refinements(&value.ty));
         out.push((name.clone(), vty));
     }
-    expr.walk_children(|c| collect_writes(c, reg_vtys, out));
+    expr.walk_children(|c| collect_writes(c, value_tys, out));
 }
 
 /// Whether `expr` contains a `Feed` marker (backs the no-op-loop invariant
@@ -1240,8 +1240,8 @@ fn transform_chain(
         // unchanged value is a no-op — the conditional change rides the *values*
         // (each value-`Case` compiles via the C-form at `lambda_elim`), not a
         // per-position commit gate. One writer over the full source, so no
-        // restricted per-leg sources and no cyclic desync — the changelog
-        // (`InductionStore`) realization the dense multi-leg `Recurse` replaced.
+        // restricted per-leg sources and no cyclic desync, which a multi-leg
+        // realization over per-leg restricted sources could not avoid.
         TypedExprNode::ExprStmt { expr: effect, body }
             if matches!(
                 &effect.node,
@@ -1473,10 +1473,10 @@ fn decision_writes(dec: &Expr) -> Vec<Expr> {
 ///   (`⧺ⱼ wⱼᵢ ↾ π̂ⱼ`), so a **partial op** (`//`, `%`) in a write value is only
 ///   evaluated at the positions its guard admits — never at a carried position.
 ///
-/// Carry-completeness is also what makes the dense `Recurse` path correct for an
-/// **async source**: that path cycles on `.writes` (not `` `commit ``), and `writes`
-/// now carries `snapshotᵢ` (the previous accumulator) wherever no guard fires, so
-/// the guard is honored by the value rather than silently dropped.
+/// Carry-completeness is also what makes a **`.writes`-cycling** realization correct
+/// for an **async source**: `writes` carries `snapshotᵢ` (the previous accumulator)
+/// wherever no guard fires, so the guard is honored by the value rather than
+/// silently dropped.
 fn conditional_decision(
     writing: Vec<(Expr, Vec<Expr>)>,
     carry: Vec<Expr>,
@@ -1789,10 +1789,10 @@ mod tests {
     }
 
     /// Recognition lowers the group onto the domain-parameterized `Transact`
-    /// carrier: `let __reg = transact (x = x) { [x]⇒[x] over … do λ __p → …
-    /// `commit(⟨writes: (x)⟩) | `abort } in (__reg.x, x) ▷ final_or_default``, with
+    /// carrier: `let __hist = transact (x = x) { [x]⇒[x] over … do λ __p → …
+    /// `commit(⟨writes: (x)⟩) | `abort } in (__hist.x, x) ▷ final_or_default``, with
     /// the key `init` read from the pre-loop binding and each accumulator read
-    /// rewritten to a variable-record projection.
+    /// rewritten to a history-record projection.
     #[test]
     fn recognition_builds_the_transact_carrier() {
         let (tree, _, _) = direct_mirror_sum();
@@ -1814,8 +1814,8 @@ mod tests {
             "writer body must terminate in a `` `commit(⟨writes⟩) | `abort `` decision: {s}"
         );
         assert!(
-            s.contains("__reg.") && s.contains("final_or_default"),
-            "trailing read must project the mutable variable record and reduce it: {s}"
+            s.contains("__hist.") && s.contains("final_or_default"),
+            "trailing read must project the history record and reduce it: {s}"
         );
     }
 

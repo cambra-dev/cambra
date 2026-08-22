@@ -750,7 +750,7 @@ pub enum Type {
     /// reference) and the passes that erase it — the unified phase
     /// (`transact_phase` / `mut_elim`) for `Overwrite` histories, `channelize`
     /// for `Feed` ones. Both erase it to a bare `Type::Fun`; no pass downstream
-    /// may observe a `History` (a survivor at the strict wall is a compiler bug —
+    /// may observe a `History` (a survivor at the strict `typecheck` is a compiler bug —
     /// see `collect_type_errors`). See src/ccl/design/mutability.md.
     History {
         /// The type of the history's value (a position's cell / element). Read

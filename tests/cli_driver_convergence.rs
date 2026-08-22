@@ -1,5 +1,5 @@
 //! The CLI driver contract: a notification-gated drive loop (as in
-//! `src/main.rs`) must converge a mutation-loop accumulator, whose `Recurse`
+//! `src/main.rs`) must converge a mutation-loop accumulator, whose store/drive
 //! cycle advances one position per pull and requests its own re-pull through the
 //! scheduler's deferred-wakeup queue.
 //!
@@ -88,8 +88,9 @@ fn drive_scalar_int(code: &str) -> i64 {
 }
 
 /// The reported bug: a finite induction accumulator must converge through the
-/// notification-gated driver. Its `Recurse` cycle self-requests re-pulls until
-/// terminal; before the wakeup queue this spun forever.
+/// notification-gated driver. Its store/drive cycle self-requests re-pulls until
+/// terminal — without the wakeup queue nothing would re-pull it, since a
+/// non-terminal tile alone does not make the driver come back.
 #[test]
 fn accumulator_converges_via_notification_gated_driver() {
     assert_eq!(

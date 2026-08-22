@@ -15,7 +15,7 @@
 //!   *writer input* (a stream of proposals), drains it into the engine on each
 //!   `get`, and renders the store tile. The writer input is wired through a
 //!   `writer_input_setter` so that, in a cyclic graph, the writer can read the
-//!   store back (the operator's own output) before proposing — the `Recurse`
+//!   store back (the operator's own output) before proposing — the cyclic-`FanOut`
 //!   feedback idiom. The store the writer reads carries a watermark, and the
 //!   writer reports the timestamp it observed as its proposal's snapshot.
 //!
@@ -1402,7 +1402,7 @@ impl TileProducer for InductionStoreProducer {
                 // the commit gate), so a fired tap always rides an appended change.
                 // Layout invariant (as on the transaction side): `write_keys` =
                 // carry keys ++ tap keys, so the subtraction never underflows —
-                // a break would wrap `n_reg` to a huge value in release and
+                // a break would wrap `n_carry` to a huge value in release and
                 // mis-index `tap_fired`.
                 debug_assert!(
                     self.write_keys.len() >= self.tap_fields.len(),
@@ -1410,14 +1410,14 @@ impl TileProducer for InductionStoreProducer {
                     self.tap_fields.len(),
                     self.write_keys.len()
                 );
-                let n_reg = self.write_keys.len() - self.tap_fields.len();
+                let n_carry = self.write_keys.len() - self.tap_fields.len();
                 Some(
                     self.write_keys
                         .iter()
                         .cloned()
                         .zip(writes)
                         .enumerate()
-                        .filter(|(i, _)| *i < n_reg || tap_fired[*i - n_reg])
+                        .filter(|(i, _)| *i < n_carry || tap_fired[*i - n_carry])
                         .map(|(_, kv)| kv)
                         .collect(),
                 )
@@ -2179,9 +2179,9 @@ impl TileProducer for StoreDenseReadProducer {
 /// it never changes; later commits only affect *later* trigger positions. The
 /// different-value-per-request behaviour comes from `B` being a multi-position
 /// domain — each position an immutable snapshot — not from a scalar that mutates
-/// (which the immutability invariant forbids). It is the dual of the commit
-/// `Recurse`: `Recurse` latches a private accumulator per *source* step; `AsOf`
-/// latches the store's current value per *trigger* step.
+/// (which the immutability invariant forbids). It is the dual of a store's own
+/// drive: a drive latches an accumulator per *source* step; `AsOf` latches the
+/// store's current value per *trigger* step.
 /// One field of a multi-variable [`AsOf`] snapshot: the record field the reply
 /// projects (`snap.field`), the store's runtime key it samples, and its value
 /// extent.
@@ -2503,8 +2503,8 @@ impl TileProducer for AsOfProducer {
                     Predicate::LessThanEq(Value::UInt(f - 1)),
                 )));
         }
-        // Terminality gate. With the producer-side drive-to-fixpoint retired, this
-        // reader samples one watermark per pull and relies on being re-pulled (via the
+        // Terminality gate. This reader samples one watermark per pull — it does not
+        // drive the store to a fixpoint itself — and relies on being re-pulled (via the
         // writer's wakeup fanning through the cyclic `FanOut`) to converge. So it must stay
         // **non-terminal** until the store itself is terminal, or it could report "done"
         // while the store is still committing and freeze a store no other consumer drives.
@@ -3851,21 +3851,21 @@ impl TileProducer for TransactWriterProducer {
                     // over-fire on a sibling route's commit.
                     // Layout invariant: `write_keys` = carry keys ++ tap keys, so
                     // the subtraction never underflows. Assert it — a break would wrap
-                    // `n_reg` to a huge value in release and mis-index `tap_fired`.
+                    // `n_carry` to a huge value in release and mis-index `tap_fired`.
                     debug_assert!(
                         self.write_keys.len() >= self.tap_fields.len(),
                         "commit operator: tap fields ({}) exceed write keys ({})",
                         self.tap_fields.len(),
                         self.write_keys.len()
                     );
-                    let n_reg = self.write_keys.len() - self.tap_fields.len();
+                    let n_carry = self.write_keys.len() - self.tap_fields.len();
                     let writes: HashMap<Value, Value> = self
                         .write_keys
                         .iter()
                         .cloned()
                         .zip(new)
                         .enumerate()
-                        .filter(|(i, _)| *i < n_reg || tap_fired[*i - n_reg])
+                        .filter(|(i, _)| *i < n_carry || tap_fired[*i - n_carry])
                         .map(|(_, kv)| kv)
                         .collect();
                     // Re-proposing this item at a new frontier supersedes its
@@ -3909,7 +3909,7 @@ impl TileProducer for TransactWriterProducer {
                     }
                     // Otherwise the decision is **not ready**: it reads a broadcast
                     // cross-loop accumulator final still converging — its
-                    // `ExtractFinal` is empty until the sibling loop's `Recurse`
+                    // `ExtractFinal` is empty until the sibling loop's own cycle
                     // drains, one position per body pull. Leaving `last_decided_pos`
                     // unset is the whole handling: this position stays undecided, so
                     // nothing acks the drive row, so the drive's item cursor does not
@@ -4439,8 +4439,7 @@ mod tests {
 
     /// The dense read of a plain (unconditional) accumulator: every position
     /// writes, so `acc := 10; acc += i` over `[1,2,3]` reads `[11, 13, 16]` — a
-    /// dense function with no carries, exactly as the retired `.writes.(index)`
-    /// projection produced.
+    /// dense function with no carries.
     #[test]
     fn dense_read_unconditional_accumulator() {
         assert_eq!(dense_read(&[1, 2, 3], i64::MIN, 10), vec![11, 13, 16]);
@@ -4753,7 +4752,9 @@ mod tests {
     }
 
     /// Repeated writes to one key, each reading the prior commit: every attempt
-    /// commits, the timestamp domain stays dense (the `Recurse` degeneration).
+    /// commits, so the timestamp domain stays dense — the uncontended degeneration
+    /// of allocate-on-commit, where the tick sequence has no gaps because nothing
+    /// ever goes stale.
     #[test]
     fn repeated_writes_to_one_key_are_dense() {
         let mut e = CommitEngine::new(balances(&[("n", 0)]));

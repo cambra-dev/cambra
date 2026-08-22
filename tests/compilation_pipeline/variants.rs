@@ -979,15 +979,15 @@ fn test_pipe_is_still_logical_or(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-/// A **variant-valued mutable register**.
+/// A **variant-valued mutable variable**.
 ///
-/// A register's seed and its writes are *alternatives at one position*, exactly as a
-/// conditional's arms are, so the register's value space is their **join** — and
-/// every emission has to be built at that joined space rather than at the width of
-/// whichever alternative occurred. A `` `none `` seed with `` `some `` writes is the two-tag
-/// sum with the arm that did not occur left empty; building a column from the
-/// surviving value alone would carry only its own tag and fail to conform to the
-/// register's own tiling.
+/// A mutable variable's seed and its writes are *alternatives at one position*,
+/// exactly as a conditional's arms are, so the variable's value space is their
+/// **join** — and every emission has to be built at that joined space rather than at
+/// the width of whichever alternative occurred. A `` `none `` seed with `` `some ``
+/// writes is the two-tag sum with the arm that did not occur left empty; building a
+/// column from the surviving value alone would carry only its own tag and fail to
+/// conform to the variable's own tiling.
 ///
 /// The variant elimination stack covers that law at the `ExtractFinal` boundary (its
 /// two emission paths *are* the seed and the writes). These are the surface
@@ -1034,7 +1034,7 @@ for i in [1, 2, 3]:
 acc",
     union("none", Value::Unit)
 )]
-// No annotation: the register's variant type is inferred from seed and writes.
+// No annotation: the variable's variant type is inferred from seed and writes.
 #[case(
     r"
 acc := `some(0)
@@ -1052,7 +1052,7 @@ for i in [1, 2, 3]:
 acc",
     union("some", Value::Int(3))
 )]
-fn test_variant_valued_register(#[case] code: &str, #[case] expected: Value) {
+fn test_variant_valued_mut_var(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 

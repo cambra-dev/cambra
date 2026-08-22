@@ -996,7 +996,7 @@ fn a_never_called_function_over_a_source_is_typechecked(
 }
 
 /// Deadness is the absence of a *demand*, not of a specialization: a use can be
-/// reached and still mutable variable nothing. Registering nothing is what the memo records,
+/// reached and still register nothing. Registering nothing is what the memo records,
 /// so reading deadness off the memo walks the definition of a binding that is very
 /// much used — reporting its body's defect a second time, from its own nodes.
 ///
@@ -2629,7 +2629,7 @@ mod binder_slot_records_the_bound_at_type {
     /// A bare `_` declares nothing, so `b: _ = a` binds exactly where `b = a`
     /// does: at the mutable variable's *value*. Such an initializer reads through before
     /// any annotation is consulted, so `_` needs no special handling — and a `Let`
-    /// cannot bind a register at all.
+    /// cannot bind a mutable variable at all.
     #[test]
     fn a_let_never_binds_a_mut_var() {
         for code in [

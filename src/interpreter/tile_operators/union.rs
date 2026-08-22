@@ -75,7 +75,7 @@ impl UnionOperator {
             codomains[0].clone()
         } else {
             // Differing arms get merged into one column, so each must fit in one:
-            // a `Scalar`, or a `Record` of them — a compound register's arms are
+            // a `Scalar`, or a `Record` of them — a compound mutable variable's arms are
             // the latter and disagree on *layout* (a constructed tuple arrives as
             // a record of columns, the carried snapshot as one column of record
             // values), which `flat_merge` reconciles by rebuilding the column at

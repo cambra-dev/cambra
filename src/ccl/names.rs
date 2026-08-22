@@ -218,7 +218,7 @@ impl Name {
     /// Unlike [`base`](Self::base) it folds the `uid` in, so two distinct
     /// binders sharing a spelling (e.g. accumulators in sibling loops) get
     /// distinct keys. A variable read of a mutable variable key projects this field of
-    /// the mutable variable record (`__reg.field_key`).
+    /// the history record (`__hist.field_key`).
     pub fn field_key(&self) -> String {
         match self {
             Name::Raw(s) => s.clone(),

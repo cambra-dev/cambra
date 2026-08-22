@@ -980,8 +980,8 @@ pub fn compile_program(
     // inlining (so cross-function writers land at their call sites) and
     // *before* channelize, so a per-iteration feed inside a loop is
     // hoisted to an ordinary feed of the loop's history for desugar to route.
-    // The tree still carries Defer/Feed here, so the walls are the relaxed
-    // pre-desugar check.
+    // The tree still carries Defer/Feed here, so the check is the relaxed
+    // pre-desugar one.
     let phase_out = mut_elim::run(expr);
     assert_unique_node_ids(&phase_out, "post-letrec-run");
     debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));

@@ -1060,7 +1060,7 @@ pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
                     out.insert(n.clone());
                 }
             }
-            // A key label names a field of the mutable variable record the node denotes, not a
+            // A key label names a field of the history record the node denotes, not a
             // variable use — the same exclusion `count_free_in_value` makes.
             ScopedItem::KeyRef(_) => {}
             ScopedItem::Child { expr, binders } => {

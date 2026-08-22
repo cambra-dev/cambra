@@ -31,7 +31,8 @@ struct FanOutReentrancy {
     cached_tile: Tile,
     /// Re-entrancy guard for the inner subscribe path.  `FanOutBranch::subscribe`
     /// of one branch can transitively trigger `subscribe` on a sibling
-    /// (e.g. the loop body's `acc_var` reads close back through `Recurse`).
+    /// (e.g. an induction loop's drive subscribes to its store branch while
+    /// the store is subscribing the body that reads the drive).
     /// The re-entrant call sees this set, skips the inner subscribe (the
     /// outer call is doing it), and just returns a `FanOutProducer`.
     subscribing_inner: bool,

@@ -318,7 +318,7 @@ the re-entrant clone walk truncates the scope stack, which a depth cannot surviv
 **Deadness is the absence of a demand, not of a specialization.** The two come apart
 in both directions — a use whose instantiation fails to resolve reports and returns
 before minting anything, and a use inside a discarded subtree deliberately does not
-mutable variable — so `specs.is_empty()` cannot decide this. `SpecializeFrame::demanded`,
+register — so `specs.is_empty()` cannot decide this. `SpecializeFrame::demanded`,
 set on entry to `specialize_use`, is what does. Reading the memo instead re-walks the
 definition of a binding whose uses merely *failed*, which reports that body's conflict
 a second time from its own nodes: one defect, four diagnostics.
@@ -335,9 +335,9 @@ nothing calls — so the specialization blowup documented under
 `SpecializeFrame::specs`, "The remaining gap" (one clone per distinct argument
 tuple, compounding through a call chain) is now reachable from code no one calls,
 where before dead code cost nothing. Two things keep that bounded rather than
-multiplied. A use inside the discarded subtree still *mutable variables* its
+multiplied. A use inside the discarded subtree still *registers* its
 specialization, so the memo shares clones exactly as a live use does — declining to
-mutable variable instead made every dead use re-clone its callee, which measured ~5× the
+register instead made every dead use re-clone its callee, which measured ~5× the
 shared cost at a call-chain depth of six; splice-liveness is decided separately, at
 the rebuild (`Specialization::referenced`). And a dead definition nested inside a
 *live* generalized one is walked once per clone of its enclosing binding — which is
@@ -777,7 +777,7 @@ The shared variant keeps the overwrite/feed operator discipline **on the type**:
 
 Invariance has no MLsub-blessed polar story, so the two polarity-sensitive mechanisms treat it specially:
 
-* **Extrusion** (`extrude_invariant`): a history's `value`/`domain` variables crossing a level boundary each get a *single* fresh proxy linked to the original by **both** a lower and an upper bound (an equality link through the standard lower×upper closure), instead of the polar one-way link. The proxy mutable variables under both `ExtrudeCache` polarity keys.
+* **Extrusion** (`extrude_invariant`): a history's `value`/`domain` variables crossing a level boundary each get a *single* fresh proxy linked to the original by **both** a lower and an upper bound (an equality link through the standard lower×upper closure), instead of the polar one-way link. The proxy registers under both `ExtrudeCache` polarity keys.
 * **Compaction/coalesce**: the two children occupy a dedicated `CompactType::history_slot` (carrying the `kind`), recursing at the **same polarity** — by compaction time the constraint-level invariance has already propagated both directions, so this is materialization only, not a second polarity analysis. `simplify_type` walks the slot at the same polarity; refinement/co-occurrence behavior is unchanged.
 * **Transparent read at joins** (`dissolve_read_feeds`): rule 2 covers a feed handle meeting a concrete consumer *directly*, but a read can also meet other contributions through a shared join variable (`x + 1` flows `Feed(Int)` and `Int` into the binop's `∀α.(α,α)→α`). At coalesce, a position carrying a `Feed`-kind `history_slot` **alongside** non-feed contributions dissolves the handle into its channel before the contribution count; a feed handle alone (or two handles merged) keeps its constructor. Feeding-then-scalar-reading still errors correctly: the dissolved channel is `Fun(?, T)`, which genuinely collides with a scalar.
 
