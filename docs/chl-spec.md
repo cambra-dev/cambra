@@ -2736,14 +2736,12 @@ are all finite settles while other variables — including ones `x` shares a blo
 with — are still being written by a live source. If no block writes `x` at all,
 or every transaction denies, the await is `x`'s initializer.
 
-> **Current limitation.** The implementation is coarser: variables that some
-> `with begin():` block mentions together report completion as a group. Two
-> consequences, both defects against this section rather than intended
-> restrictions. `await_final(x)` does not settle while a variable `x` shares a
-> block with still has a live writer. And the cycle rule above is enforced against
-> that group, so a writer of a *store-mate* of `x` may not depend on
-> `await_final(x)` either, though no block writing `x` follows the await.
-> Variables that no block relates are unaffected by either.
+> **Current limitation.** The *rejection* rule is enforced slightly wider than
+> it is stated: a block's dependency on an `await_final` is refused when the
+> awaited variable merely shares a block with one the dependent block writes,
+> not only when that block writes the awaited variable itself. Reaching a
+> wrongly-refused program takes a dependency that comes back into a related
+> variable, and the refusal is a compile error, never a wrong answer.
 
 ### 8.7 Direction [Decided]: transactions as contextual parameters
 
