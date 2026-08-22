@@ -19,6 +19,7 @@ mod fanout;
 mod filter_and_aggregate;
 mod for_accumulator;
 mod generator_pipeline;
+mod groupby_filtered_rollup;
 mod groupby_rollup;
 mod http_accumulator;
 mod http_counter;

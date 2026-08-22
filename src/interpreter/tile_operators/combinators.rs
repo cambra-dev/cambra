@@ -666,6 +666,154 @@ impl TileProducer for FilterProducer {
     }
 }
 
+/// Filters the **inner collections** of a curried function, one outer key at a time.
+///
+/// [`Filter`] and [`Restrict`] both narrow a [`Tiling::SealedFunction`]'s single
+/// domain. Neither reaches inside a [`Tiling::CurriedFunction`], where the domain
+/// that a predicate selects on is `domain2` — the per-key collection — and the
+/// surviving rows differ from key to key. A per-group filter (`sum([s.amount for s
+/// in g if s.qty > 2])` over a `groupby`) is that shape: the refinement rides the
+/// inner collection's domain, under the outer key's binder.
+///
+/// The predicate produces a `CurriedFunction` of `Bool` over the same keys and
+/// inner domain as the input, so its flattened codomain is the mask directly —
+/// row `i` of `domain2` survives iff the predicate's row `i` is `true`. The CSR
+/// layout is what makes this one masked pass rather than a per-key loop: `offsets`
+/// and `domain1` are untouched, and [`Tile::retain`] rebuilds `offsets` for the
+/// surviving rows.
+pub struct MapFilter {
+    /// Output tiling, equal to the input's — filtering removes rows, not structure.
+    tiling: Tiling,
+    /// The curried-function input whose inner collections are filtered.
+    input: Box<dyn TileOperator>,
+    /// A `Bool`-codomain curried function over the input's keys and inner domain.
+    predicate: Box<dyn TileOperator>,
+}
+
+impl MapFilter {
+    /// Create a `MapFilter` retaining the inner-collection rows where `predicate` holds.
+    ///
+    /// Panics unless both operands are curried functions: the whole point of this
+    /// operator is the inner domain, and a `SealedFunction` has no inner domain to
+    /// filter (use [`Filter`] or [`Restrict`]).
+    pub fn new(input: Box<dyn TileOperator>, predicate: Box<dyn TileOperator>) -> Self {
+        let tiling = input.tiling().clone();
+        assert!(
+            matches!(tiling, Tiling::CurriedFunction { .. }),
+            "MapFilter expects a CurriedFunction input, got {tiling:?}"
+        );
+        assert!(
+            matches!(predicate.tiling(), Tiling::CurriedFunction { .. }),
+            "MapFilter expects a CurriedFunction predicate, got {:?}",
+            predicate.tiling()
+        );
+        Self {
+            tiling,
+            input,
+            predicate,
+        }
+    }
+}
+
+impl TileOperator for MapFilter {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+            .child("predicate", self.predicate.inspect(opts))
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        mut consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let consumer_wrapper = Rc::new(RefCell::new(move || {
+            consumer.notify();
+        }));
+        let predicate_producer = self.predicate.subscribe(
+            self.predicate.tiling().universal_guard(),
+            Box::new(consumer_wrapper.clone()),
+            scheduler,
+        );
+        let input_producer = self.input.subscribe(
+            self.input.tiling().universal_guard(),
+            Box::new(consumer_wrapper.clone()),
+            scheduler,
+        );
+        Box::new(MapFilterProducer {
+            base: ProducerBase::new(MapFilterProducer::alloc_id(), &self.tiling),
+            input: input_producer,
+            predicate: predicate_producer,
+        })
+    }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        self.input.result_correlation()
+    }
+}
+
+struct MapFilterProducer {
+    base: ProducerBase,
+    input: Box<dyn TileProducer>,
+    predicate: Box<dyn TileProducer>,
+}
+
+impl TileProducer for MapFilterProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+            .child("predicate", self.predicate.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let pred_guard = self.predicate.tiling().universal_guard();
+        let input_guard = self.input.tiling().universal_guard();
+        let predicate_result = self.predicate.get(pred_guard);
+        let mut input_result = self.input.get(input_guard);
+
+        let Tile::CurriedFunction {
+            codomain: pred_rows,
+            domain2: pred_domain2,
+            ..
+        } = predicate_result
+        else {
+            panic!("MapFilter predicate produced {predicate_result:?}, expected a CurriedFunction");
+        };
+        let Tile::CurriedFunction {
+            domain2: input_domain2,
+            ..
+        } = &input_result
+        else {
+            panic!("MapFilter input produced {input_result:?}, expected a CurriedFunction");
+        };
+        // The mask is positional over the flattened rows, so the two sides must be
+        // the same flattening of the same keys. They share an upstream `FanOut`, so
+        // a mismatch is a planning bug rather than a data-dependent case.
+        debug_assert_eq!(
+            &pred_domain2, input_domain2,
+            "MapFilter predicate and input must flatten the same inner domains"
+        );
+        let mask = pred_rows
+            .as_bitvec()
+            .unwrap_or_else(|| panic!("MapFilter predicate codomain is not boolean"));
+        input_result.retain(mask);
+        input_result
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // Both sides read the same upstream collection, so they release together —
+        // releasing one leaves the other's `FanOut` guard stale, which re-delivers
+        // consumed rows on the next `get`. Same coupling as [`Filter`].
+        self.predicate.release(obsolete_guard.clone());
+        self.input.release(obsolete_guard);
+    }
+}
+
 /// Applies a boolean predicate function to its own domain, producing an identity
 /// function over the surviving elements.
 ///
