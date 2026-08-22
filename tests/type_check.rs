@@ -3285,6 +3285,42 @@ fn joining_a_capability_with_a_collection_is_a_kind_conflict() {
     );
 }
 
+/// Two products with no shared field are incompatible bounds: a positive join
+/// intersects field sets, and the empty result is not `Unit` — unit is a base
+/// type that a product reaches only through an operation that says so
+/// (`docs/chl-spec.md`, "6.6 The empty product is unit"). Answering `Unit` here
+/// dropped every field with nothing in the program marking the loss.
+#[test]
+fn products_sharing_no_field_are_incompatible_bounds() {
+    let errs = infer_program_err(indoc! {r#"
+        c = True
+        (a=1) if c else (b=2)
+    "#});
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            InferError::IncompatibleBounds { polarity: true, conflicting, .. }
+                if conflicting.contains("sharing no field")
+        )),
+        "expected an incompatible-bounds rejection; got {errs:?}"
+    );
+}
+
+/// The companion: a *non-empty* intersection still joins fieldwise, so the
+/// rejection above is about the empty case and not about products at a join.
+#[test]
+fn products_sharing_a_field_join_on_it() {
+    let t = infer_program(indoc! {r#"
+        c = True
+        (a=1, b=2) if c else (a=3, d=4)
+    "#});
+    let rendered = format!("{t}");
+    assert!(
+        rendered.contains("a:") && !rendered.contains("b:") && !rendered.contains("d:"),
+        "the join keeps the shared field and drops the rest; got {rendered}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // User-written refinements: a refinement's reference to an enclosing binder
 // ---------------------------------------------------------------------------
