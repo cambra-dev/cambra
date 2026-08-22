@@ -24,12 +24,15 @@ Concretely:
   reads the prev-acc directly from a `Rc<RefCell<...>>` instead of
   through `get`") is a violation, even if it works on the test cases at
   hand.  Cyclic graphs go through `FanOut::new_cyclic` and the
-  re-entrancy machinery on `FanOutShared` — see
-  [`Recurse`]'s docs for the contract — but the data on the wire is
-  still a [`Tile`].
-- Constructor-time wiring (e.g., `Recurse::recursive_input_setter`)
-  passes `TileOperator` handles, not raw values.  The operator graph is
-  static; values flow through it at `get` time.
+  re-entrancy machinery on `FanOutShared` — see [`FanOutReentrancy`]'s
+  docs for the contract — but the data on the wire is still a [`Tile`].
+  A cyclic pull is served the fan's cached snapshot rather than
+  re-entering the inner producer, which is why such a cycle advances one
+  step per outer pull.
+- Constructor-time wiring (a [`CycleSlot`], filled through its
+  `setter` once the rest of the cycle exists) passes `TileOperator`
+  handles, not raw values.  The operator graph is static; values flow
+  through it at `get` time.
 - Side effects (I/O, sinks, notifications) live at the boundary —
   `compile_program` wires a `SinkConsumer` to the final operator, and
   `Scheduler::check_for_notifications` drives them.  Operators
@@ -37,6 +40,38 @@ Concretely:
 
 If you find yourself reaching for a back-channel to avoid a tile
 shape that's awkward to express, fix the tile shape instead.
+
+**This rule is gated**, because a back channel is invisible to the
+producer graph and green on every test, so prose alone cannot catch one.
+`./ci.sh shared_state` flags shared mutable state in this directory
+unless its inner type is a known-legitimate kind (a notification handle,
+a late-wired operator slot, a fan-out's own branch state, an external
+source handle) or the site carries a justification:
+
+```rust
+// shared-state-ok: <why this is not an operator-to-operator back channel>
+some_field: Rc<RefCell<Whatever>>,
+```
+
+Test code (`#[cfg(test)]`) is not scanned.  `#[cfg(any(test, feature =
+"test-helpers"))]` *is* — that configuration compiles into a real library
+build, so it is production code that tests also use.
+
+Every justified site is listed in `EXPECTED_EXCEPTIONS` in
+`.github/scripts/shared-state/check_shared_state.py`, and the build fails
+on any addition or removal.  Adding one therefore means editing the
+checker, which is where the question belongs: is the exception necessary,
+or is there a tile shape that removes the need for it?  If the reason
+names a *kind* that will recur, add it to `ALLOWED_INNER` rather than
+repeating the annotation.
+
+The check is shallow by construction — it cannot prove the absence of a
+back channel, only make the easy way to build one impossible to add
+silently.
+
+For the legitimate cycle case, reach for `CycleSlot` (`tile_operators`)
+rather than hand-rolling the cell: it holds an *operator*, is filled once
+after construction, and is what the gate's allowlist recognises.
 
 
 ## Core invariant: known data inside a Tile is immutable

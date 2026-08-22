@@ -30,6 +30,7 @@ use crate::{
 
 mod aggregate;
 mod combinators;
+mod cycle_slot;
 mod extract_final;
 mod fan;
 mod fanout;
@@ -42,6 +43,7 @@ mod union;
 
 pub use aggregate::*;
 pub use combinators::*;
+pub use cycle_slot::*;
 pub use extract_final::*;
 pub use fan::*;
 pub use fanout::*;
@@ -118,6 +120,9 @@ pub trait TileOperator {
 ///
 /// Each key is the display name of a producer (e.g. `"MapApply"`, `"Memo"`),
 /// and the value is the next ID to assign.  IDs start at 1.
+// shared-state-ok: an ID allocator. What crosses it is a name, never a value: no
+// operator reads anything another operator computed, so the producer graph still
+// describes the whole dataflow.
 static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLock::new();
 
 /// Common identity and tiling state shared by every [`TileProducer`].
