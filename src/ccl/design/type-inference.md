@@ -574,7 +574,7 @@ from the original split's shape, not this one — and that measurement is what
 decides between fixing the producer (memoize the rebuild, or keep the origin `Rc`
 when the freshen is vacuous) and narrowing the invariant to "preserved through
 inference, deliberately re-split at instantiation". Tracked as an open decision
-in the `lineage-design` note under projects/program-inspector in the internal
+in the `provenance-design` note under projects/program-inspector in the internal
 vault.
 
 A pass reaches predicates through **every type slot a node carries**, not just

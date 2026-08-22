@@ -1216,8 +1216,8 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
             // non-clustered defers (inner `let d = Defer in ...`
             // separated from this cluster by other lets).
             let body_rewritten = channelize_expr(current_body, ctx)?;
-            // The **outermost** `let d = Defer` is the slot: the cluster's whole
-            // product replaces it. A cluster's inner defers are consumed too but
+            // The recording names the **outermost** `let d = Defer`: the cluster's
+            // whole product replaces it. A cluster's inner defers are consumed too but
             // are not named, because naming them would assert they die, and a
             // defer whose handle survives in a type does not.
             let _g =
@@ -1247,7 +1247,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
                 // The lift *mints*: `channelize_substitute` replaces the inner
                 // scope's trailing `Var` with the outer body, and any `ExprStmt`
                 // prefix is rebuilt onto the lifted spine. Those products stand in
-                // for this `let`, which the lift consumes, so it is the slot.
+                // for this `let`, which the lift consumes, so the recording names it.
                 // `Machinery` — merging two defer scopes is plumbing that undoes an
                 // inlining artifact, not anything the user wrote.
                 //
@@ -1299,7 +1299,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
                 // This arm rebuilds: it copies the inner scope out of the
                 // borrowed tree and splices the outer body into its tail, so the
                 // collapsed `let` and both copies are new nodes standing in for
-                // this `let`. Same slot and same reason as the lift above.
+                // this `let`. Same parent and same reason as the lift above.
                 let _g = provenance::enter(
                     node_id,
                     "channelize.defer_collapse",

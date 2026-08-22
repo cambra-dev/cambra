@@ -1798,8 +1798,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // with the definition — and no mutable state to keep in sync with it.
     //
     // Sink for the clone's `on_copy` pairs, which each keep their own origin
-    // rather than inheriting the slot. The use site is the slot: it is the node
-    // this rewrite is performed for, and already what a failed pin blames.
+    // rather than inheriting the parent. The recording names the use site: it is the
+    // node this rewrite is performed for, and already what a failed pin blames.
     let _spec = crate::ccl::provenance::enter(
         use_expr.node_id(),
         "mono.specialize",
@@ -1809,7 +1809,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // `NodeId` in the copy, so N specializations cannot collide on one id, and
     // each re-mint fires `on_copy(origin, fresh)` — complete parentage on its
     // own, but only an open recording captures it. Cloning first leaves every pair
-    // uncaptured and the whole specialization folds as `Unexplained`; measured at
+    // uncaptured and the whole specialization folds as `Unrecorded`; measured at
     // 28 such nodes on `generator_pipeline` before this ordering was fixed.
     //
     // This clone re-mints the `walk_children` domain only: a predicate rides its
@@ -1965,7 +1965,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // "Typechecking a never-called definition", for why that dangling reference is
     // unobservable today and what fixes it.
     //
-    // The generalized `let` is the slot: the chain of K specialized layers
+    // The recording names the generalized `let`: the chain of K specialized layers
     // replaces it, one origin and K products.
     let _chain = crate::ccl::provenance::enter(
         expr.node_id(),

@@ -370,7 +370,7 @@ fn flatten_spine(mut e: Expr) -> Expr {
         // splices `let y = ⟨terminal⟩` into the body's terminal position and
         // wraps the lifted write in a statement, so it *mints* — the `ExprStmt`,
         // the spliced `let`, and its `unit` value. They stand in for the `Let`
-        // being hoisted, so that is the slot. `Machinery`, because the spliced
+        // being hoisted, so the recording names it. `Machinery`, because the spliced
         // binding is plumbing that restores the flat-spine invariant rather than
         // anything the user wrote.
         //
@@ -391,7 +391,7 @@ fn flatten_spine(mut e: Expr) -> Expr {
     if is_mut_write(&e) {
         // The write keeps its own id and becomes the effect; the `ExprStmt` and
         // the `unit` body are new, and they exist to put this write in statement
-        // position. So the write is the slot.
+        // position. So the recording names the write.
         let write_id = e.node_id();
         let terminalized = {
             let _g = provenance::enter(
@@ -428,7 +428,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             body: loop_body,
         } = effect.node
         {
-            // The statement is the slot: the causal `LetRec` replaces it.
+            // The recording names the statement: the causal `LetRec` replaces it.
             //
             // There is deliberately no drop-path test. Whether the whole loop
             // vanishes — no accumulator, no feed, e.g. a transaction-emptied
@@ -1645,23 +1645,9 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
             body,
         } => {
             let new_body = attach_feed_fields(*body, feeds);
-            let ty = new_body.ty.clone();
-            // The same logical `Let` with its feed fields attached, so it keeps
-            // its own id rather than minting a replacement. `preserve` builds it
-            // at that id directly; `Expr::let_in(..).re_root(id)` used to mint one
-            // and overwrite it, which fires `on_mint` for an id no node ends up
-            // carrying — the phantom birth `preserve` exists to make
-            // unrepresentable.
-            let mut e = Expr::preserve(
-                node_id,
-                TypedExprNode::Let {
-                    binding,
-                    bound_expr,
-                    body: Box::new(new_body),
-                },
-            );
-            e.ty = ty;
-            e
+            // The same logical `Let` with its feed fields attached, so it keeps its
+            // own id rather than minting a replacement.
+            Expr::let_in_preserving(node_id, binding, *bound_expr, new_body)
         }
         TypedExprNode::Record(fields) => {
             let bool_ty = Type::Base(BaseType::Bool);

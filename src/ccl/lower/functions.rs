@@ -205,7 +205,7 @@ pub(super) fn uncurry_params(
         // replaces it — so that one id is tagged and then carried by nothing.
         // Harmless in the product (the projection is filtered to the output tree,
         // so the entry drops out), and the reason there is no produced-side leak
-        // class: see `design/provenance.md`, "The collapse".
+        // class: see `design/provenance.md`, "The fold".
         let var = ctx.tag_machinery(Expr::var(&tuple_name), fn_span, up);
         let idx = ctx.tag_machinery(Expr::proj_index(i), fn_span, up);
         let proj = ctx.tag_machinery(Expr::apply(var, idx), fn_span, up);
@@ -444,9 +444,7 @@ in add"
     fn uncurry_projection_roots_carry_occurrence_spans() {
         use crate::ccl::TypedExprNode;
         use crate::ccl::provenance::NodeId;
-        use crate::ccl::provenance::{
-            LoweringSession, Nature, SourceProjection, collapse_lowering,
-        };
+        use crate::ccl::provenance::{LoweringSession, Nature, SourceProjection, fold_lowering};
         use crate::chl_parser::ast::Span;
         use std::collections::HashSet;
 
@@ -471,7 +469,7 @@ in add"
             e.walk_children(|c| all_ids(c, acc));
         }
         all_ids(&ccl, &mut ids);
-        let (projection, leaks) = collapse_lowering(&log, &ids);
+        let (projection, leaks) = fold_lowering(&log, &ids);
         assert!(leaks.is_empty(), "lowering fold is leak-free: {leaks:?}");
 
         // Collect the source span each uncurry-projection ROOT carries. A

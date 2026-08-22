@@ -396,7 +396,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                     argument.ty
                 );
                 // Beta reduction, recorded against the `Apply` node it
-                // collapses. It needs no `FrameGuard::also_consumes`: the
+                // collapses. It needs no `RecordingGuard::also_consumes`: the
                 // `Apply` and the `Lambda` both vanish, and neither has to be
                 // named, because the boundary difference reports both. The
                 // promoted `body` keeps its own id and is its own self-edge, and

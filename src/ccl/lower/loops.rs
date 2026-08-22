@@ -810,7 +810,7 @@ fn lower_loop_body_chain(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // Every node this chain mints is recorded: an unrecorded lowering mint is a
-    // `Leak::Unexplained` at the lowering boundary. A statement's own image gets
+    // `Leak::Unrecorded` at the lowering boundary. A statement's own image gets
     // `tag_image`; the `ExprStmt` that sequences one statement before the rest is
     // manufactured plumbing (`src/ccl/design/provenance.md`, "The seam
     // (`src/ccl/context.rs`)").

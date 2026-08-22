@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn chained_compare_freshens_shared_operands() {
         use crate::ccl::context::{assert_unique_node_ids, collect_tree_ids};
-        use crate::ccl::provenance::{LoweringSession, collapse_lowering};
+        use crate::ccl::provenance::{LoweringSession, fold_lowering};
 
         let expr = parse_expr("1 < x < 3");
         let mut ctx = LoweringContext::default();
@@ -642,7 +642,7 @@ mod tests {
         // The lowering fold explains every tree node (the freshened
         // middle-operand copy included) with no leak — the successor to the
         // retired per-node coverage check.
-        let (projection, leaks) = collapse_lowering(&log, &seen);
+        let (projection, leaks) = fold_lowering(&log, &seen);
         assert!(leaks.is_empty(), "lowering fold is leak-free: {leaks:?}");
         for id in &seen {
             assert!(

@@ -273,7 +273,7 @@ mod tests {
     /// tree, and the lifted copy must not carry ids that are still live
     /// elsewhere. Today `lambda_elim::run` provides that by rebuilding the term;
     /// this pins the *property* rather than the mechanism, so an elim that
-    /// started preserving ids fails here instead of at a pane relation.
+    /// started preserving ids fails here instead of at a pane pair's fold.
     #[test]
     fn groupby_recognition_lifts_the_key_without_aliasing() {
         let key = var("key").with_ty(fun_ty(int_ty(), int_ty()));

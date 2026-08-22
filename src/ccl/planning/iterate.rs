@@ -394,7 +394,7 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     let Some(domain_ty) = expr.ty.domain() else {
         return;
     };
-    // The site being wrapped is the slot. The predicate `fresh_copy` below lands
+    // The recording names the site being wrapped. The predicate `fresh_copy` below lands
     // as a `Copy` of the term it lifts out of the type.
     //
     // These rows reach no table in a normal compile: `compile_program` calls
@@ -470,8 +470,8 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
         // the only node that vanishes is the `Compose` itself — which is the
         // node this recording named (`body` is `expr`, taken above). Its fate is
         // the boundary's live-set difference, so there is nothing to declare:
-        // `FrameGuard::also_consumes` exists for a node the construction hooks
-        // *cannot* see, and this one is the named slot.
+        // `RecordingGuard::also_consumes` exists for a node the construction hooks
+        // *cannot* see, and this one is the node the recording named.
         TypedExprNode::Compose(existing) => elts.extend(existing),
         _ => elts.push(body),
     }

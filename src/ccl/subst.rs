@@ -82,16 +82,12 @@ pub enum Mapping {
     /// `binder ↦ term` — plug a term in for the binder. No inverse.
     /// (Boxed: a term is much larger than a binder name.)
     ///
-    /// **Considered and deferred: `Rc<TypedExpr>`.** The payload is a
-    /// *template* — never a tree node, cloned afresh at every read
-    /// ([`Mapping::as_expr`]) — so sharing it is sound, and the solver copies
-    /// substitutions constantly (`Bound::render_subst`, [`Subst::then`],
-    /// `compact`, `constrain`). With a `Box`, every one of those ~28 sites deep-
-    /// copies the payload tree; with an `Rc` they are refcount bumps. That cost
-    /// is **pre-existing** — the derived `Clone` paid it too — so it is an
-    /// improvement over both arms rather than anything the freshening `Clone`
-    /// introduced, and it wants its own before/after rather than riding along
-    /// here.
+    /// **Considered and deferred: `Rc<TypedExpr>`.** The payload is a template,
+    /// never a tree node and cloned afresh at every read ([`Mapping::as_expr`]),
+    /// so sharing it is sound. The solver copies substitutions constantly
+    /// (`Bound::render_subst`, [`Subst::then`], `compact`, `constrain`): with a
+    /// `Box` each of those ~28 sites deep-copies the payload tree, with an `Rc`
+    /// they are refcount bumps.
     ///
     /// One trap if it is ever done: [`Subst::for_each_discharge_term_mut`] would
     /// become `Rc::make_mut`, which copies out through `TypedExpr`'s freshening
@@ -113,14 +109,13 @@ pub enum Mapping {
 /// So copying the map itself must mint nothing: the template is never in a tree,
 /// and no two nodes can end up sharing an id because of it.
 ///
-/// Without this, the derived `Clone` inherits the freshening and every `Subst`
-/// copy re-mints its payloads. That is not merely wasteful. The solver copies
-/// substitutions constantly — `Bound::render_subst`, [`Subst::then`],
-/// `compact`, `constrain` — and a bound edge's payloads are **type-domain**
+/// Without this, every `Subst` copy inherits the freshening and re-mints its
+/// payloads. The solver copies substitutions constantly — `Bound::render_subst`,
+/// [`Subst::then`], `compact`, `constrain` — and a bound edge's payloads are **type-domain**
 /// terms whose ids are outside the recorded id domain, so each such copy records
 /// a `Copy` against an origin the table never saw and the pane fold reports it as
-/// [`Leak::ParentUnknown`](crate::ccl::provenance::Leak::ParentUnknown). Measured on
-/// `generator_pipeline`: 200 of them across the first pane relation.
+/// [`Leak::DanglingParent`](crate::ccl::provenance::Leak::DanglingParent). Measured on
+/// `generator_pipeline`: 200 of them between the first two panes.
 ///
 /// [`as_expr_preserving`]: Mapping::as_expr_preserving
 impl Clone for Mapping {
@@ -471,7 +466,7 @@ impl Subst {
         // just had to be fixed for.
         //
         // Recording rather than simply freshening is the load-bearing half —
-        // unbracketed, these produced 50 `ParentUnknown` on `inner_join`.
+        // unbracketed, these produced 50 `DanglingParent` on `inner_join`.
         if self.is_id() {
             let _g = crate::ccl::provenance::enter(
                 e.node_id(),
@@ -785,21 +780,6 @@ impl Subst {
             // construction.
             let occurrence_ty = e.ty.clone();
             *e = repl.as_expr_preserving(e.node_id, &occurrence_ty);
-            if !matches!(e.node, TypedExprNode::Var(_)) {
-                // Compound replacement. `Clone` freshens, so the replacement's
-                // interior arrives already distinct from the template — what the
-                // old `freshen_interior_node_ids()` call did explicitly. Type
-                // slots are out of the id domain, so the predicate `Rc`s the
-                // clone shares with its source stay shared.
-                //
-                // The root is the one place this costs anything: the clone mints
-                // an id for it and the carry above immediately discards that id
-                // in favour of the occurrence's. So the occurrence stays in the
-                // live set (the carry precedes nothing that could displace it),
-                // and what is stranded is a single minted id that folds as a
-                // death rather than a defect — one row and one id per
-                // substituted occurrence, no extra hop.
-            }
             return;
         }
         // *Every* type slot the node carries, not just `ty` and the annotation: a
@@ -1051,8 +1031,8 @@ impl Subst {
         // predicate terms, which nothing catches because predicate uniqueness is
         // not asserted; measured at 53 such collisions on `inner_join` alone.
         //
-        // The slot is the source predicate's own root, so the rewritten term rows
-        // as derived from the term it was substituted out of.
+        // The recording names the source predicate's own root, so the rewritten term
+        // rows as derived from the term it was substituted out of.
         let new_pred = {
             let _g = crate::ccl::provenance::enter(
                 r.predicate.node_id(),

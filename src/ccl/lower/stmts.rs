@@ -1938,7 +1938,7 @@ x";
     fn lowering_tags_nodes_with_source_spans() {
         use crate::ccl::TypedExprNode;
         use crate::ccl::provenance::NodeId;
-        use crate::ccl::provenance::{LoweringSession, Nature, collapse_lowering};
+        use crate::ccl::provenance::{LoweringSession, Nature, fold_lowering};
         use crate::chl_parser::ast::Span;
         use std::collections::HashSet;
 
@@ -1965,7 +1965,7 @@ x";
             e.walk_children(|c| ids(c, acc));
         }
         ids(&lowered, &mut output_ids);
-        let (seed, leaks) = collapse_lowering(&log, &output_ids);
+        let (seed, leaks) = fold_lowering(&log, &output_ids);
         assert!(leaks.is_empty(), "lowering fold is leak-free: {leaks:?}");
 
         // Root node is the `let x = 1 in (x + 2)` binding, tagged with the

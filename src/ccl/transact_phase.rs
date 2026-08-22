@@ -149,7 +149,7 @@ fn rewrite_as_of_reads_go(expr: &mut Expr) {
     // single-variable rewrite in isolation (which would strand the outer reads
     // unresolved).
     //
-    // The slot is that outermost `let`, because the whole chain it heads is what
+    // The recording names that outermost `let`, because the whole chain it heads is what
     // the as-of join replaces: the `zip`/`as_of` scaffolding, the rebuilt reply
     // lambda, and the snapshot projections all stand in for it, and the inner
     // `let`s of the chain die with it (deaths are the boundary difference, so
@@ -571,12 +571,12 @@ fn mut_var_value_ty(ty: &Type) -> Type {
 
 /// A stripped `with begin():` writer site, before its decision body is built.
 struct RawSite {
-    /// The statement node the `with begin():` block was stripped from — the
-    /// recording slot every node built for this site parents on. Carried on the
+    /// The statement node the `with begin():` block was stripped from — the node
+    /// every node built for this site parents on. Carried on the
     /// site rather than re-derived because the block is *disassembled* on the way
     /// to a writer: by [`build_writer`] the `Begin` and its `ExprStmt` are gone,
     /// and the decision body is the only surviving piece.
-    slot: NodeId,
+    parent: NodeId,
     /// The loop item binder (`for r in xs`); the synthetic singleton binder for a
     /// standalone transaction.
     target: TypedBinding,
@@ -630,7 +630,7 @@ struct FeedSite {
 /// them before the store is planned.
 ///
 /// Each writer travels with the [`NodeId`] of the `with begin():` statement its
-/// block was stripped from — the site's recording slot, which rides beside
+/// block was stripped from — the node its products parent on, which rides beside
 /// [`WriterSite`] rather than on it because that type is shared IR that planning
 /// rebuilds from a `Transact` carrier. `site_feeds[j]` holds site `j`'s feeds, so
 /// the two vectors stay index-parallel.
@@ -706,7 +706,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     }
 
     // Each key's tick-0 `init`, located at its `let` binding (the value type is
-    // the init's type — the snapshot/write element type of that register).
+    // the init's type — the snapshot/write element type of that mutable variable).
     let mut key_init: HashMap<Name, MutVarDecl> = HashMap::new();
     collect_key_inits(&stripped, &key_names, &mut key_init);
     for k in &key_names {
@@ -799,20 +799,20 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     // (parallel to `writers`) so each tap binding reads its own commit-record stream.
     let mut feed_counter = 0usize;
     // Each writer travels with the statement node its block was stripped from, so
-    // `plan_store` can parent that site's commit record on it. The slot rides
+    // `plan_store` can parent that site's commit record on it. The parent rides
     // beside `WriterSite` rather than on it: `WriterSite` is shared IR that
-    // planning rebuilds from a `Transact` carrier, and a recording slot is not a
-    // fact about the carrier.
+    // planning rebuilds from a `Transact` carrier, and what a recording names is
+    // not a fact about the carrier.
     let mut per_store: Vec<StoreWriters> = (0..groups.len())
         .map(|_| (Vec::new(), Vec::new()))
         .collect();
     for s in sites {
         let store = store_of(&s);
-        let slot = s.slot;
-        let g = provenance::enter(slot, "transact.writer", provenance::Nature::Expansion);
+        let parent = s.parent;
+        let g = provenance::enter(parent, "transact.writer", provenance::Nature::Expansion);
         let (writer, feeds) = build_writer(s, &key_init, &mut feed_counter, &cross.acc_views);
         drop(g);
-        per_store[store].0.push((slot, writer));
+        per_store[store].0.push((parent, writer));
         per_store[store].1.push(feeds);
     }
 
@@ -923,12 +923,12 @@ fn partition_keys(
 struct CrossDomain {
     bindings: Vec<(TypedBinding, Expr)>,
     /// The `ExprStmt` each `bindings` entry was folded out of, index-parallel
-    /// with it — the recording slot for the letrec [`wrap_cross_domain`] builds
+    /// with it — the parent for the letrec [`wrap_cross_domain`] builds
     /// around that binding. It rides beside `bindings` rather than inside for
-    /// the same reason a writer's slot rides beside its `WriterSite`: the
-    /// binding is IR that recognition rebuilds, and a slot is not a fact about
-    /// it.
-    slots: Vec<NodeId>,
+    /// the same reason a writer's parent rides beside its `WriterSite`: the
+    /// binding is IR that recognition rebuilds, and what a recording names is not
+    /// a fact about it.
+    parents: Vec<NodeId>,
     reads: Vec<(TypedBinding, Expr)>,
     feeds: Vec<(Name, Expr)>,
     acc_views: HashMap<Name, CrossAcc>,
@@ -989,7 +989,7 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         let TypedExprNode::For { target, iter, body } = effect.node else {
             unreachable!("guarded above")
         };
-        // The statement is the slot: everything the fold builds stands in for it,
+        // The recording names the statement: everything the fold builds stands in for it,
         // and it leaves the tree entirely. `blame` names the `For` so the products
         // resolve to the loop keyword's span rather than the statement's. Both
         // choices mirror `mut_elim`'s `letrec.loop`, which records the *same*
@@ -1029,7 +1029,7 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
             rename_var_uses(&mut cont, acc, x_final);
         }
         out.bindings.push(fold.binding);
-        out.slots.push(stmt_id);
+        out.parents.push(stmt_id);
         out.reads.extend(fold.reads);
         out.feeds.extend(fold.feed_views);
         return fold_cross_domain_loops(cont, cross_reads, out);
@@ -1122,7 +1122,7 @@ fn strip(
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
         && matches!(&effect.node, TypedExprNode::Begin { .. })
     {
-        // The statement node the block hangs off — the slot for everything this
+        // The statement node the block hangs off — the parent for everything this
         // strip and the writer build downstream of it mint. The `Begin` marker
         // is the blamed node, so products resolve to the `with` keyword's span
         // rather than the enclosing statement's.
@@ -1155,13 +1155,13 @@ fn strip(
                 // wrappers `prepend_effects` mints for the lifted induction
                 // writes, and whatever `partition_block` rebuilds. The block
                 // itself is *not* consumed here — it travels on the site and is
-                // disassembled by `build_writer` under this same slot.
+                // disassembled by `build_writer` under this same parent.
                 let g = provenance::enter(stmt_id, "transact.strip", provenance::Nature::Expansion);
                 g.blame(&[begin_id]);
                 let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
                 let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
                 out.sites.push(RawSite {
-                    slot: stmt_id,
+                    parent: stmt_id,
                     target: target.clone(),
                     // The enclosing `For` keeps its `iter` in the stripped tree while
                     // the site carries the same expression into the writer's source,
@@ -1786,7 +1786,7 @@ fn resolve_writer_free_awaits(e: &mut Expr, written_keys: &[Name]) {
             && let Some(seed) = seeds.get(reg)
         {
             // The marker node is what the seed stands in for, and it is user-written
-            // (`await_final(x)` is source text), so it is the slot. The key's
+            // (`await_final(x)` is source text), so the recording names it. The key's
             // `MutDecl` stays on the spine here — this is the writer-free case — so
             // the seed's original is still live and the copy must freshen.
             let _g = provenance::enter(
@@ -1978,7 +1978,7 @@ fn build_writer(
         key_init
             .get(k)
             .map(|d| mut_var_value_ty(&d.init.ty))
-            .expect("transact_phase: footprint key must be a register key")
+            .expect("transact_phase: footprint key must be a mutable variable key")
     };
     let read_tys: Vec<Type> = site.read_keys.iter().map(value_ty).collect();
     let orig_item_ty = site
@@ -2443,11 +2443,11 @@ fn and_path(path: &Expr, guard: &Expr) -> Expr {
     e
 }
 
-/// A register key's `let` declaration, as the phase folds it away.
+/// A mutable variable key's `let` declaration, as the phase folds it away.
 struct MutVarDecl {
-    /// The `let` node that declared the register. [`walk_spine`] **drops** it —
+    /// The `let` node that declared the key. [`walk_spine`] **drops** it —
     /// the key's history binding is what stands in its place — so it is the
-    /// recording slot for everything built for this key.
+    /// parent for everything built for this key.
     decl: NodeId,
     /// The tick-0 initial value, which carries the key's value type (its `.ty`).
     /// It reaches the output **once**, as the `get_prev_txn` default: the
@@ -2458,18 +2458,18 @@ struct MutVarDecl {
     init: Expr,
 }
 
-/// Locate each register key's `let` binding and record it (keeping the outermost
+/// Locate each mutable variable key's `let` binding and record it (keeping the outermost
 /// when a key is bound more than once).
 fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarDecl>) {
     if let TypedExprNode::MutDecl { binding, init, .. } = &expr.node
         && keys.contains(&binding.name)
         && !out.contains_key(&binding.name)
     {
-        // Stash the register's init so a later stage can place it: `walk_spine`
-        // drops this whole `MutDecl` for a register key, so the original is gone
-        // by then. The copy freshens and is **recorded** against the `MutDecl`
-        // it is taken from — the same node the stash already carries as `decl`,
-        // and the one the register's later scaffolding is attributed to.
+        // Stash the key's init so a later stage can place it: `walk_spine`
+        // drops this whole `MutDecl` for a mutable variable key, so the original
+        // is gone by then. The copy freshens and is **recorded** against the
+        // `MutDecl` it is taken from — the same node the stash already carries as
+        // `decl`, and the one the key's later scaffolding is attributed to.
         //
         // Preserving instead would also be sound (only one of the two is ever
         // live), but it saved 20 ids over the whole pipeline suite — subtrees of
@@ -2711,7 +2711,7 @@ fn plan_store(
         key_init
             .get(k)
             .map(|d| mut_var_value_ty(&d.init.ty))
-            .expect("transact_phase: footprint key must be a register key")
+            .expect("transact_phase: footprint key must be a mutable variable key")
     };
 
     // --- commit-record + tap bindings, one commit binding per writer site ---
@@ -2725,13 +2725,13 @@ fn plan_store(
     let mut site_decision_ty: Vec<Type> = Vec::with_capacity(writers.len());
     let mut site_write_keys: Vec<Vec<Name>> = Vec::with_capacity(writers.len());
 
-    for (j, ((slot, w), feeds)) in writers.into_iter().zip(site_feeds).enumerate() {
+    for (j, ((parent, w), feeds)) in writers.into_iter().zip(site_feeds).enumerate() {
         // This site's commit record, its tap bindings, and the snapshot
         // scaffolding around the writer body all belong to the `with begin():`
         // statement they were built for. The writer `body` passes through
         // verbatim and keeps its own ids.
         let _g = provenance::enter(
-            slot,
+            parent,
             "transact.commit_record",
             provenance::Nature::Expansion,
         );
@@ -2860,7 +2860,7 @@ fn plan_store(
     let mut hist_bindings: Vec<(TypedBinding, Expr)> = Vec::with_capacity(key_names.len());
     for k in &key_names {
         // The key's history binding stands in for its `let` declaration, which
-        // `walk_spine` drops — so that `let` is the slot, and the merged per-key
+        // `walk_spine` drops — so the recording names that `let`, and the merged per-key
         // commit view, the `get_prev_txn` application and the wrapping lambda all
         // parent on it.
         let _g = provenance::enter(
@@ -2873,7 +2873,7 @@ fn plan_store(
         let t = Name::fresh("__t");
         // The init's one placement in the output, as this `get_prev_txn`
         // default. The `let` that held the original is dropped by `walk_spine`,
-        // so this copy stands in for it and rows on the same slot.
+        // so this copy stands in for it and rows on the same parent.
         let init = key_init.get(k).expect("key init present").init.clone();
         // The `get_prev_txn` history slot — the design's denotation: the
         // `⧺`-merged **per-key commit views** of every site writing this key
@@ -3047,7 +3047,7 @@ impl StorePlan {
     /// first key's dropped `MutDecl` is the honest answer anyway: it is a real node
     /// this phase removed rather than a stand-in, and it is where a reader asking
     /// where the transaction structure came from should land.
-    fn carrier_slot(&self, key_init: &HashMap<Name, MutVarDecl>, tail: &Expr) -> NodeId {
+    fn carrier_parent(&self, key_init: &HashMap<Name, MutVarDecl>, tail: &Expr) -> NodeId {
         self.key_names
             .first()
             .map(|k| key_init[k].decl)
@@ -3195,7 +3195,7 @@ fn walk_spine(
                     .map(|(b, e)| (b.clone(), e.clone_preserving_ids()))
                     .collect();
                 let _g = provenance::enter(
-                    store.carrier_slot(key_init, &inner),
+                    store.carrier_parent(key_init, &inner),
                     "transact.carrier",
                     provenance::Nature::Expansion,
                 );
@@ -3348,7 +3348,7 @@ fn resolve_await_finals(
         && hist.contains_key(reg)
     {
         // The marker is user-written source text, and the terminal read is what it
-        // becomes, so the marker node is the slot. Its `Var(x)` operand dies with
+        // becomes, so the recording names the marker node. Its `Var(x)` operand dies with
         // it — the read names the history binding, not the key — which the boundary
         // difference reports without anything having to declare it.
         let _g = provenance::enter(
@@ -3409,25 +3409,25 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
     }
     let CrossDomain {
         bindings,
-        slots,
+        parents,
         reads,
         feeds,
         ..
     } = cross;
     debug_assert_eq!(
         bindings.len(),
-        slots.len(),
+        parents.len(),
         "a folded cross-domain binding must carry the statement it came from"
     );
     let mut inner = txn_letrec;
     {
         // The group-level wrappers — each trailing final read and the feed hoists
         // — sit in the shared body inside *every* folded loop's letrec, so no
-        // single loop is their slot. The outermost folded statement is, by the
-        // argument [`StorePlan::carrier_slot`] makes for the store carrier: it is
+        // single loop can be their parent. The outermost folded statement is, by the
+        // argument [`StorePlan::carrier_parent`] makes for the store carrier: it is
         // a real node this phase removed, and it is the first of the statements
         // this group collectively replaced.
-        let outermost = slots.first().copied().unwrap_or_else(|| inner.node_id());
+        let outermost = parents.first().copied().unwrap_or_else(|| inner.node_id());
         let _g = provenance::enter(
             outermost,
             "transact.cross_domain_body",
@@ -3439,11 +3439,11 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
         inner = hoist_feeds(inner, feeds);
     }
     // One single-binding letrec per folded loop, each parented on the statement
-    // that loop was folded out of — the same slot `transact.cross_domain_fold`
+    // that loop was folded out of — the same node `transact.cross_domain_fold`
     // recorded its binding against, so the carrier and its contents agree.
-    for ((b, def), slot) in bindings.into_iter().zip(slots).rev() {
+    for ((b, def), parent) in bindings.into_iter().zip(parents).rev() {
         let _g = provenance::enter(
-            slot,
+            parent,
             "transact.cross_domain_group",
             provenance::Nature::Expansion,
         );
@@ -3469,7 +3469,7 @@ mod tests {
         RawSite {
             // A placeholder like the rest: the partition reads footprints only, and
             // nothing here records.
-            slot: unit.node_id(),
+            parent: unit.node_id(),
             target: binding(Name::fresh("__r"), Type::Base(BaseType::Unit)),
             source: unit.clone(),
             block: unit,

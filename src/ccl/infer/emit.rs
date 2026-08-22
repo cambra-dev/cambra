@@ -74,8 +74,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // predicate is a pure function of the literal value, memoized per
             // pass, so it is born the first time each distinct value is seen.
             //
-            // The literal's own node is the slot, which is the edge
-            // `predicate-lineage-report` records as missing: nothing used to link
+            // The recording names the literal's own node, which is the edge
+            // `predicate-domain-report` records as missing: nothing used to link
             // a singleton refinement back to the literal the user wrote.
             let _g = crate::ccl::provenance::enter(
                 node_id,

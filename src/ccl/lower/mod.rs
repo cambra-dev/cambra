@@ -525,7 +525,7 @@ impl LoweringContext {
     /// recorded — in the main tree, plus the nodes minted and copied to join them
     /// up. Sealed into a `Refinement` it lives in a *type slot*, outside the
     /// `walk_children` domain, so those assembly nodes have no leaf of their own
-    /// and the widened `collect_tree_ids` would report them `Unexplained`.
+    /// and the widened `collect_tree_ids` would report them `Unrecorded`.
     ///
     /// Call this on the predicate **immediately before** handing it to
     /// `ccl_utils::refined_data_fun`, which is the single point a lowering
@@ -719,7 +719,7 @@ pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String
 /// [`LoweringContext::tag_machinery`] for manufactured plumbing. **That choice is
 /// per-rule judgment, not a rule** — `tag_image`'s docs state what it does and
 /// does not guarantee. Whichever of them lands at the root is re-tagged here.
-/// [`collapse_lowering`](crate::ccl::provenance::collapse_lowering)'s leak taxonomy
+/// [`fold_lowering`](crate::ccl::provenance::fold_lowering)'s leak taxonomy
 /// enforces full coverage of the lowered tree either way.
 pub fn lower_expr(
     expr: &Spanned<ChlExpr>,
