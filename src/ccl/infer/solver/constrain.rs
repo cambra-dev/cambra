@@ -20,7 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::ty::FunKind;
+use crate::ccl::ty::{FunKind, FunKindVar, KindPin};
 use crate::ccl::{
     BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, RefinementSet,
     Type,
@@ -283,17 +283,28 @@ fn constrain_kind(k0: &FunKind, k1: &FunKind) -> Result<bool, ()> {
         // would make typing depend on constraint order; each is pinned by the
         // concrete kind that reaches it, if one does. See [`FunKindVar`].
         //
-        // Carrying nothing is only sound while the two sides agree, since a pin
-        // on one side would otherwise be dropped. No program in the suite reaches
-        // this arm at all, so the guard is what would notice one starting to: it
-        // catches a disagreement already present, not one a later pin creates.
+        // Both sides end at the **join** of the two pins. The edge relates the two
+        // kinds, so a pin already carried by one is carried by both, and recording
+        // nothing drops it — no program in the suite reaches this arm with the two
+        // sides differently pinned, but `merging_bounds_is_independent_of_their_arrival_order`
+        // does, and the dropped pin was its first finding. Routing through
+        // `pin_compute`/`pin_data` keeps the absorption law in one place: a pin is
+        // idempotent where the two agree and yields `KindPin::Conflict` where they
+        // disagree, exactly as on a concrete edge. Both pins are read before either
+        // is written, so the join does not depend on which side is applied first.
         (Var(a), Var(b)) => {
-            debug_assert_eq!(
-                a.pin(),
-                b.pin(),
-                "a var-var kind edge relates two differently-pinned kinds, so this \
-                 arm would drop one side's pin"
-            );
+            let carry = |pin: KindPin, onto: &FunKindVar| match pin {
+                KindPin::Unpinned => {}
+                KindPin::Compute => onto.pin_compute(),
+                KindPin::Data => onto.pin_data(),
+                KindPin::Conflict => {
+                    onto.pin_compute();
+                    onto.pin_data();
+                }
+            };
+            let (pin_a, pin_b) = (a.pin(), b.pin());
+            carry(pin_b, a);
+            carry(pin_a, b);
             Ok(false)
         }
     }
@@ -2511,6 +2522,83 @@ mod tests {
             ),
             Err(ConstrainError::KindMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn a_var_var_kind_edge_carries_each_side_s_pin_to_the_other() {
+        // The edge relates the two kinds, so a pin one side already carries is a
+        // pin both carry. Recording nothing dropped it, and which side kept its
+        // pin then depended on which bound arrived first.
+        let fun_over = |kind: FunKind| Type::Fun {
+            name: None,
+            kind,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(prim(BaseType::Int)),
+        };
+        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        let mut cache = ConstrainCache::new();
+        // Pin `a` to compute, leaving `b` unpinned.
+        constrain_subtype(
+            &fun_over(FunKind::Var(Rc::clone(&a))),
+            &fun_over(FunKind::Compute),
+            &mut cache,
+        )
+        .expect("a var meeting Compute records the pin");
+        assert_eq!(a.pin(), KindPin::Compute);
+        assert_eq!(b.pin(), KindPin::Unpinned);
+
+        // The var-var edge carries it across, in the direction the unpinned side
+        // is on — and symmetrically, so neither order loses information.
+        constrain_subtype(
+            &fun_over(FunKind::Var(Rc::clone(&b))),
+            &fun_over(FunKind::Var(Rc::clone(&a))),
+            &mut cache,
+        )
+        .expect("a var-var kind edge is never a rejection");
+        assert_eq!(
+            b.pin(),
+            KindPin::Compute,
+            "the unpinned side takes the other's pin"
+        );
+        assert_eq!(
+            a.pin(),
+            KindPin::Compute,
+            "and the pinned side is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_var_var_kind_edge_between_disagreeing_pins_is_a_conflict() {
+        // Absorption, not arbitration: holding both points is `Conflict`, exactly
+        // as on a concrete edge, and coalesce reports it.
+        let fun_over = |kind: FunKind| Type::Fun {
+            name: None,
+            kind,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(prim(BaseType::Int)),
+        };
+        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(
+            &fun_over(FunKind::Var(Rc::clone(&a))),
+            &fun_over(FunKind::Compute),
+            &mut cache,
+        )
+        .unwrap();
+        constrain_subtype(
+            &fun_over(FunKind::Var(Rc::clone(&b))),
+            &fun_over(FunKind::Data),
+            &mut cache,
+        )
+        .unwrap();
+        constrain_subtype(
+            &fun_over(FunKind::Var(Rc::clone(&a))),
+            &fun_over(FunKind::Var(Rc::clone(&b))),
+            &mut cache,
+        )
+        .expect("the edge records the join; the rejection is coalesce's");
+        assert_eq!(a.pin(), KindPin::Conflict);
+        assert_eq!(b.pin(), KindPin::Conflict);
     }
 
     #[test]
