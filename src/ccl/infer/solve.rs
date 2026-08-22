@@ -139,6 +139,8 @@ pub(super) struct CoalesceCtx {
     /// so the blame is per error, stamped at the raise site from
     /// [`current_node`](Self::current_node).
     errors: Vec<LocatedInferError>,
+    /// Enclosing lambda-parameter names; see [`CoalesceCtx::is_lambda_param`].
+    lambda_params: Vec<Name>,
     /// Pass-scoped predicate-rewrite memo: keeps every refinement occurrence
     /// that entered the coalesce walk sharing one predicate `Rc` sharing a
     /// single coalesced `Rc` on the way out, instead of splitting into one
@@ -175,6 +177,19 @@ impl CoalesceCtx {
     /// counterpart of [`Typing::raise`](super::typing::Typing::raise).
     fn push_error(&mut self, error: InferError, label: String) {
         push_coalesce_err(&mut self.errors, error, label, self.current_node);
+    }
+
+    /// Whether `name` is an enclosing **lambda parameter**. Only that binder's slot is
+    /// authoritative over its uses: its type is fixed by the contravariant domain of the
+    /// arrow it binds, which a standalone read of the shared variable cannot see. A `let`
+    /// binding is the other way round — an annotated one is resolved *by* its uses — so a
+    /// use of one keeps its own read.
+    ///
+    /// Being a lambda parameter is *necessary* but not sufficient for the slot to take
+    /// over: the use also has to have hit the specific failure the lost context causes.
+    /// See the read at the end of [`coalesce_node`].
+    fn is_lambda_param(&self, name: &Name) -> bool {
+        self.lambda_params.iter().any(|n| n == name)
     }
 
     /// Log one read for [`assert_reads_stable`] (debug builds; free in
@@ -404,6 +419,27 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 && xs.iter().zip(ys).all(|((kx, x), (ky, y))| {
                     kx == ky && types_agree_modulo_unread(x, y, refinements)
                 })
+        }
+        // The anonymous type-witness reference agrees with itself.
+        (Type::WitnessRef(_), Type::WitnessRef(_)) => true,
+        // Two Sigmas agree iff their witness kinds (type children agreeing
+        // pairwise) and bodies agree.
+        (Type::Sigma(a), Type::Sigma(b)) => {
+            // Listed domains agree pairwise (in order — a sum's listing order is a
+            // materialization contract); a described kind agrees only with the same
+            // description, having no children to recurse into.
+            let kinds_agree = match (a.kind().listed(), b.kind().listed()) {
+                (Some(xs), Some(ys)) => {
+                    xs.len() == ys.len()
+                        && xs
+                            .iter()
+                            .zip(ys)
+                            .all(|(x, y)| types_agree_modulo_unread(x, y, refinements))
+                }
+                (None, None) => a.kind() == b.kind(),
+                _ => false,
+            };
+            kinds_agree && types_agree_modulo_unread(&a.body, &b.body, refinements)
         }
         _ => false,
     }
@@ -843,6 +879,7 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
         current_node: expr.node_id(),
+        lambda_params: Vec::new(),
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
         discarding: false,
@@ -891,6 +928,51 @@ pub(super) fn check_scope_valid(
     scope: &std::collections::BTreeSet<Name>,
     errors: &mut Vec<LocatedInferError>,
 ) {
+    check_scope_valid_go(expr, scope, &[], errors)
+}
+
+/// Every witness binder `ty` **binds** — the binders of the sums occurring in it.
+///
+/// A sum binds its witness over its own body, and over the subtree of the node it types:
+/// the consumer's result is `Σ 𝑤 ∈ 𝐾. 𝑊`, and the index term inside that consumer refers to
+/// `𝑤`. So a comprehension's `__iter_record` is *not* ill-scoped for naming the witness its
+/// source introduced — it is the consuming rule's `Γ, 𝑤 :: 𝐾 ⊢ 𝑓 : 𝐵[𝑤] ⇒ 𝑊` seen from
+/// the term side.
+#[cfg(debug_assertions)]
+fn witness_binders_bound_by(ty: &Type, out: &mut Vec<crate::ccl::infer_var::WitnessBinderId>) {
+    if let Type::Sigma(s) = ty {
+        out.push(s.binder());
+    }
+    ty.walk_children(|c| witness_binders_bound_by(c, out));
+}
+
+#[cfg(debug_assertions)]
+fn check_scope_valid_go(
+    expr: &Expr,
+    scope: &std::collections::BTreeSet<Name>,
+    witnesses: &[crate::ccl::infer_var::WitnessBinderId],
+    errors: &mut Vec<LocatedInferError>,
+) {
+    // **The witness half of the same well-formedness.** A witness reference is legal only
+    // under a binder — one an enclosing sum introduced, or one this node's own type
+    // introduces for its subtree. Checking it here rather than per materialized type is
+    // what lets it be a real scope test: coalesce runs bottom-up, so at the point a type is
+    // built nothing knows what binds it from outside, and the check there could only ask
+    // about the *shape* of the type in hand.
+    if crate::ccl::ty::has_free_witness_ref(&expr.ty, witnesses) {
+        errors.push(LocatedInferError {
+            error: InferError::ScopeViolation {
+                at: symbolic(expr),
+                ty: expr.ty.clone(),
+                unbound: vec!["a witness reference free in its node's type".to_string()],
+            },
+            node_id: expr.node_id(),
+        });
+    }
+    let mut witnesses = witnesses.to_vec();
+    witness_binders_bound_by(&expr.ty, &mut witnesses);
+    let witnesses = &witnesses[..];
+
     let free = crate::ccl::subst::type_free_vars(&expr.ty);
     if !free.is_subset(scope) {
         errors.push(LocatedInferError {
@@ -906,32 +988,32 @@ pub(super) fn check_scope_valid(
         TypedExprNode::Lambda { param, body, .. } => {
             let mut s = scope.clone();
             s.insert(param.name.clone());
-            check_scope_valid(body, &s, errors);
+            check_scope_valid_go(body, &s, witnesses, errors);
         }
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
-            check_scope_valid(bound_expr, scope, errors);
+            check_scope_valid_go(bound_expr, scope, witnesses, errors);
             let mut s = scope.clone();
             s.insert(binding.name.clone());
-            check_scope_valid(body, &s, errors);
+            check_scope_valid_go(body, &s, witnesses, errors);
         }
         TypedExprNode::Case {
             scrutinee,
             branches,
         } => {
             if let Some(sc) = scrutinee {
-                check_scope_valid(sc, scope, errors);
+                check_scope_valid_go(sc, scope, witnesses, errors);
             }
             for b in branches {
                 let mut s = scope.clone();
                 if let Some(p) = &b.pattern {
                     s.insert(p.binding.name.clone());
                 }
-                check_scope_valid(&b.guard, &s, errors);
-                check_scope_valid(&b.body, &s, errors);
+                check_scope_valid_go(&b.guard, &s, witnesses, errors);
+                check_scope_valid_go(&b.body, &s, witnesses, errors);
             }
         }
         // Mutual recursion: the whole group is in scope in every binding
@@ -940,17 +1022,17 @@ pub(super) fn check_scope_valid(
             let mut s = scope.clone();
             s.extend(bindings.iter().map(|(b, _)| b.name.clone()));
             for (_, def) in bindings {
-                check_scope_valid(def, &s, errors);
+                check_scope_valid_go(def, &s, witnesses, errors);
             }
-            check_scope_valid(body, &s, errors);
+            check_scope_valid_go(body, &s, witnesses, errors);
         }
         TypedExprNode::For { target, iter, body } => {
-            check_scope_valid(iter, scope, errors);
+            check_scope_valid_go(iter, scope, witnesses, errors);
             let mut s = scope.clone();
             s.insert(target.name.clone());
-            check_scope_valid(body, &s, errors);
+            check_scope_valid_go(body, &s, witnesses, errors);
         }
-        _ => expr.walk_children(|c| check_scope_valid(c, scope, errors)),
+        _ => expr.walk_children(|c| check_scope_valid_go(c, scope, witnesses, errors)),
     }
 }
 
@@ -1168,6 +1250,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_node(value, level, ctx);
             coalesce_type_predicates(target, level, ctx);
         }
+        // Born after inference, so nothing here resolves — but its child is an ordinary
+        // term and still needs the walk.
+        TypedExprNode::Realize(value) => coalesce_node(value, level, ctx),
         TypedExprNode::BinOp { left, right, .. } => {
             coalesce_node(left, level, ctx);
             coalesce_node(right, level, ctx);
@@ -1175,7 +1260,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::UnaryOp(_, inner) => coalesce_node(inner, level, ctx),
         TypedExprNode::Lambda { param, body } => {
             let param_name = param.name.clone();
+            ctx.lambda_params.push(param_name.clone());
             with_shadows(ctx, [param_name], |ctx| coalesce_node(body, level, ctx));
+            ctx.lambda_params.pop();
             // `param.ty` is resolved from the lambda's coalesced domain in
             // the end-of-function block (it can't be coalesced standalone:
             // body-usage refinements are negative-polarity upper-bound
@@ -1431,6 +1518,46 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // Refinements ride the lattice as refinements, so a refined
     // domain coalesces straight onto `expr.ty` here — downstream passes
     // (`lambda_elim` included) read it from the type.
+    // A **use of a binder** carries the binder's own inference variable, and a binder's
+    // type cannot be coalesced standalone: the facts that determine it are
+    // negative-polarity upper bounds, which only materialize in the *contravariant domain
+    // position* of the enclosing arrow (the same reason `refresh_lambda_param_slot` derives
+    // `param.ty` from the coalesced domain instead of resolving the slot). Reading it here
+    // would resolve the same variable in a position that has lost that context — and for a
+    // data-function domain the loss is not merely imprecision: the candidate domains of a
+    // conditional collection are *alternatives* only when read as a domain, and collide as
+    // an untagged sum when read bare.
+    //
+    // The read still *happens*, because it is load-bearing elsewhere: a parent's structural
+    // recovery of a contravariant domain (`specialize_projection_domain`,
+    // `specialize_lambda_domain`) reads it, so a record-typed parameter's uses are how a
+    // projection's domain is recovered at all. So the binder takes over only for the
+    // failure that *is* the collision above: a positive-polarity `IncompatibleBounds`,
+    // which is what an untagged join of alternatives looks like from a bare position. The
+    // use is then left var-laden, and the parameter slot is what downstream reads.
+    //
+    // Note the standing gap: the pass that used to stamp such a use from its binder
+    // (a whole-tree predicate re-stamp, retired once substitution stopped discarding
+    // types) is gone, so nothing fills the slot afterwards — if this branch ever fires,
+    // the use reaches the post-inference wall var-laden and is reported there. It does
+    // not fire today: no test in the suite reaches it. Whoever makes it reachable owns
+    // giving the use a type at the point of the yield.
+    //
+    // Any *other* coalesce failure here is reported as usual — the narrow condition is
+    // what keeps this from swallowing unrelated errors. Note that yielding to the binder
+    // is not itself a claim that the type resolves: where the collision is genuine (arms
+    // whose *element* types disagree), the parameter slot fails too and the error surfaces
+    // from there instead. Deferring says which position owns the answer, not that there is
+    // one.
+    if let TypedExprNode::Var(name) = &expr.node
+        && ctx.is_lambda_param(name)
+        && matches!(
+            resolve_var_type(&expr.ty),
+            Err(CoalesceError::IncompatibleBounds { polarity: true, .. })
+        )
+    {
+        return;
+    }
     let label = symbolic(expr);
     match resolve_var_type(&expr.ty) {
         Ok(ty) => {
@@ -1630,10 +1757,18 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
             coalesce_type_predicates(value, level, ctx);
             coalesce_type_predicates(domain, level, ctx);
         }
+        Type::Sigma(s) => {
+            s.witness
+                .types_mut()
+                .iter_mut()
+                .for_each(|t| coalesce_type_predicates(t, level, ctx));
+            coalesce_type_predicates(&mut s.body, level, ctx);
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::WitnessRef(_)
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
@@ -2202,11 +2337,17 @@ pub(super) fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
 /// coalescing the slot var standalone — is what preserves body-usage
 /// refinements, which are negative-polarity facts visible only in the
 /// contravariant domain. No-op for non-lambdas and unresolved function types.
+///
+/// Read through [`Type::domain`], so a **Σ-typed** lambda is covered: a comprehension over
+/// a conditional collection is a morphism `Σ 𝜎 ∈ 𝐾. 𝜎 ⤇ 𝑉`, and its binder's type is that
+/// sum's domain — the witness — exactly as an ordinary lambda's is its arrow's. Matching
+/// `Type::Fun` alone left the slot an unresolved variable, which surfaces as an
+/// `UnresolvedInfer` on `__iter_record` rather than as anything about sums.
 fn refresh_lambda_param_slot(expr: &mut Expr) {
     if let TypedExprNode::Lambda { param, .. } = &mut expr.node
-        && let Type::Fun { domain: dom, .. } = &expr.ty
+        && let Some(dom) = expr.ty.domain()
     {
-        param.ty = (**dom).clone();
+        param.ty = dom;
     }
 }
 

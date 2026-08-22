@@ -202,7 +202,7 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 Types (from `Display for Type` in `src/ccl/mod.rs`):
 
 - **Function**: `(T ⇒ U)` for a compute function; `(T ⤇ U)` (plain-text `|=>`) for a data function (the domain is the data map, joins must be lossless). Lowering picks the kind from the CHL construct (see `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions"); only a function parameter or a freshened scheme carries a `FunKind::Var`, pinned by the value that reaches it. `Display` renders it live: a data collection shows `⤇`, a capability (and an unpinned kind var) `⇒`. A comprehension over a **let-bound** collection source resolves to `⤇` just like one over a literal source (`let x = [1,2,3] in [y + 10 for y in x]` is `⤇`) — its domain is a data collection.
-- **Sigma** (in-flight, same stack): `Σ{D0, D1} ⤇ V` — a data function whose domain is exactly one of the listed choices; with a live witness binder, `(Σ n ∈ {D0, D1}. n ⤇ V)`.
+- **Sigma**: a value whose type is a dependent sum. `Display for Type` writes the binder — `Σ σ ∈ K. body` — and so should you; see the Σ entry under *Symbolic notation for types and terms* below. A witness reference renders `σ`, bound or free alike; binder ids are off by default and `CCL_SHOW_BINDERS=1` turns them on (`σ@n`, `Σ σ@n ∈ K. body`) for the case that is about identity.
 - **Refinement**: `{T | predicate}` — predicate is rendered via `symbolic`. A **singleton** (a base refined by exactly `__elem == <lit>`) renders `T@lit`: `{Int | __elem == 7}` is `Int@7`.
 - **UIntRange**: `[0, N]`, or `∅` when empty.
 - **Hole**: `_`.
@@ -228,7 +228,8 @@ Use the symbolic forms below in prose and inline pseudo-code (not in fenced code
 
 - **Function type with named binder** (`Type::Fun` with `name: Some(_)`): `(𝑥: 𝐴) ⇒ 𝐵`. `𝑥` is bound in `𝐵`.
 - **Function type with no named binder** (`Type::Fun` with `name: None`): `𝐴 ⇒ 𝐵`.
-- **Data function type** (`FunKind::Data`, rendered live): `𝐴 ⤇ 𝐵`, named-binder form `(𝑥: 𝐴) ⤇ 𝐵` — same associativity as `⇒`; the bar reads "the domain is the data". **Σ type** (formation live; witness binder still dormant): `Σ 𝑛 ∈ {𝐷₀, 𝐷₁}. 𝑛 ⤇ 𝑉` — a dependent sum over candidate domains; anonymous-witness shorthand `Σ{𝐷₀, 𝐷₁} ⤇ 𝑉`.
+- **Data function type** (`FunKind::Data`, rendered live): `𝐴 ⤇ 𝐵`, named-binder form `(𝑥: 𝐴) ⤇ 𝐵` — same associativity as `⇒`; the bar reads "the domain is the data".
+- **Σ type**: **always write the binder.** `Σ 𝐷 ∈ {𝐷₀, 𝐷₁}. 𝐷 ⤇ 𝑉` for a sum over candidate *domains* (the factored form — a collection), and `Σ 𝑇 ∈ {𝑇₀, 𝑇₁}. 𝑇` for a sum over whole *types* (what `box` builds). A described witness kind names the kind in binder position: `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ 𝑇`. Do **not** use an anonymous shorthand (`Σ{𝐷₀, 𝐷₁} ⤇ 𝑉`) or a lattice-operator spelling (`⨆{𝑇ᵢ}`) — the binder is what makes it readable which position the witness occupies, and that is the whole distinction between the two forms.
 - **Refinement type**: `{𝑥: 𝑇 | 𝑝(𝑥)}` — standard subset-type notation.
 - **Lambda** (term): `λ 𝑥 → body`. The `→` after the binder separates the parameter from the body.
 - **Forward apply** (term level): `𝑎 ▷ 𝑓` means `𝑓(𝑎)`.

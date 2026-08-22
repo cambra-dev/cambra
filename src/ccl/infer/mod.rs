@@ -87,6 +87,8 @@ mod typing;
 // pass: feed reads type concretely via their rigid `ChanDom` channel domains,
 // which `crate::ccl::channelize` erases by substitution — no post-channelize
 // re-typing.)
+#[cfg(debug_assertions)]
+pub use api::debug_assert_no_free_witness;
 pub use api::*;
 pub use check::check;
 pub use schemes::OperatorSchemes;
@@ -188,6 +190,12 @@ fn blame_node_for_place(
             Type::Tuple(elems) => elems.iter().any(|t| mentions(t, uid)),
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
             Type::Variant(arms, _) => arms.iter().any(|(_, t)| mentions(t, uid)),
+            // A sum's candidates and body are ordinary types and can name the variable;
+            // a witness reference carries identity alone, so there is nothing to read.
+            Type::Sigma(s) => {
+                s.witness.types().iter().any(|t| mentions(t, uid)) || mentions(&s.body, uid)
+            }
+            Type::WitnessRef(_) => false,
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -306,8 +314,9 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             ctx: format!(
                 "collection domain conflict at {ctx_label} (a collection's domain is \
                  its data, so a join may not narrow it — two collections over distinct \
-                 domains have no common data-function type, and their lossless join is \
-                 a dependent sum over the candidate domains)"
+                 domains have no common type. Wrap each arm in `box` to keep both \
+                 domains: `box(…) if c else box(…)` has the dependent-sum type they \
+                 share, and consuming it distributes over the arms)"
             ),
             found: Box::new(coalesce_for_error(&lhs)),
             expected: Some(Box::new(coalesce_for_error(&rhs))),
@@ -329,6 +338,19 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             origin: ctx_label.to_string(),
             context: vec![],
         },
+        // A kinding failure *is* an annotation mismatch: the user wrote a collection
+        // kind and the value's domain does not inhabit it. Reported with the same
+        // `ctx` a constraint-time collection mismatch uses, because the two differ
+        // only in when the shape became known.
+        // The *kind* is the demand, rendered as the sum it classifies — the form the
+        // annotation was written as — and the resolved domain is what failed it.
+        CoalesceError::KindMismatch { resolved, kind } => InferError::TypeMismatch {
+            found: resolved,
+            expected: Some(Box::new(Type::Sigma(Box::new(
+                crate::ccl::ty::SigmaType::over(kind, None, Type::Hole),
+            )))),
+            ctx: "collection annotation".to_string(),
+        },
         CoalesceError::UnresolvedPartial { kind, details } => InferError::UnresolvedPartial {
             kind: format!("{:?} ({})", kind, details),
             at: ctx_label.to_string(),
@@ -339,7 +361,10 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
         )),
         CoalesceError::DomainJoinConflict { details } => InferError::Unsupported(format!(
             "collection domain conflict at {}: {} \
-             (a collection's domain is its data, so a join may not narrow it)",
+             (two constraints on this collection's domain have no common answer, and \
+             narrowing to one would drop rows. If these are the arms of a conditional, \
+             wrap each *arm* in `box` to keep both domains — boxing a collection inside an \
+             arm and then filtering it leaves the arms over different domains still)",
             ctx_label, details
         )),
         CoalesceError::KindConflict { details } => InferError::Unsupported(format!(
@@ -563,6 +588,13 @@ pub(crate) fn run(
             return Err(scope_errors);
         }
     }
+    // The witness counterpart of the scope check above, and here rather than only at the
+    // pipeline's stage boundaries because *this* is where the close happens: a witness
+    // that materialization left with no binder is a defect of the pass that just ran, and
+    // a caller who only infers (a type-level test, a REPL) is exactly as entitled to catch
+    // it as one who goes on to compile.
+    #[cfg(debug_assertions)]
+    debug_assert_no_free_witness(expr, "post-inference");
     Ok(expr.ty.clone())
 }
 

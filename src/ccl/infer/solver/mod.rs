@@ -96,6 +96,18 @@ pub fn type_level(ty: &Type) -> Level {
         // instantiation), which reads it directly and is exempted from the
         // `type_level` short-circuit.
         Type::ChanDom(..) => 0,
+        // The witness's type children and the body carry the sum's inference
+        // vars; a witness reference is a leaf (level 0) — naming its binder gives it no
+        // solver content.
+        Type::Sigma(s) => s
+            .witness
+            .types()
+            .iter()
+            .map(type_level)
+            .max()
+            .unwrap_or(0)
+            .max(type_level(&s.body)),
+        Type::WitnessRef(_) => 0,
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)

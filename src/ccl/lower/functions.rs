@@ -53,7 +53,7 @@ fn mut_param_history_type(
         Some(Ok((value, is_txn))) => Some(Ok((
             Type::History {
                 value: Box::new(value),
-                domain: Box::new(Type::Hole),
+                domain: Box::new(if is_txn { Type::Txn } else { Type::Hole }),
                 kind: crate::ccl::HistoryKind::Overwrite,
             },
             is_txn,

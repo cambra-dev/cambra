@@ -969,9 +969,20 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 Type::History { value, .. } => {
                     descend(value, &path, Step::HistoryValue, &mut frontier)
                 }
+                // A sum's body is the collection the place holds, so the arrow rule
+                // applies to it — reached by recursing on the body rather than by a rule
+                // of its own. Its candidates are *domains*, excluded for the same reason
+                // an arrow's domain is.
+                Type::Sigma(s) => {
+                    if let Type::Fun { codomain, .. } = s.body.peel_refinements() {
+                        descend(codomain, &path, Step::Result, &mut frontier);
+                    }
+                }
                 // Leaves: nothing inside to constrain. `Base`/`UIntRange` are concrete,
-                // and the rest are placeholders or nullary carriers.
-                Type::Base(_)
+                // and the rest are placeholders or nullary carriers. A witness reference
+                // names a binder and holds no type.
+                Type::WitnessRef(_)
+                | Type::Base(_)
                 | Type::UIntRange(_)
                 | Type::Hole
                 | Type::SharedHole(_)

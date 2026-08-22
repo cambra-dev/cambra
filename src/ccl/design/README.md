@@ -29,6 +29,8 @@ CHL source
 | [type-inference.md](type-inference.md) | Cambra's inference algorithm: the two-pass emit → coalesce engine (`ccl/infer/`), the constraint solver (`ccl/infer/solver/`), let-polymorphism, dependent Pi types and refinements, and post-inference validation. |
 | [lowering.md](lowering.md) | CHL → CCL lowering: how comprehensions, lambdas, `def`s, and generators become CCL shapes, and the surface syntax of the deferred-collection operators. |
 | [optimization.md](optimization.md) | The optimization/compilation passes: inlining, lambda elimination, join/aggregate planning, algebraic simplification, and conversion to tile operators. |
+| [mutability.md](mutability.md) | The unified history model: mutable variables, transactions, and feeds as functions over a sequencing domain, eliminated into a causal `LetRec`; the `Mut`/`Feed`/`Txn` types and the loop/commit engines. |
+| [collections.md](collections.md) | Collections as data functions `𝐷 ⤇ 𝑉`: the five surface types as domain shapes, the referenceable opaque domain (Σ-witness activation) behind maps/sets and runtime-length lists, membership-discharge lookup, keyed feeds, and mutable collections. |
 | [provenance.md](provenance.md) | How a node keeps its link to the source the user wrote across the whole pipeline: the `NodeId`/`Pass` identity primitives, the `RewriteStep` lineage model and its collapse, the recorder, the always-on lowering projection release diagnostics read, and what the inspector consumes. |
 
 Provenance is the one cross-cutting concern in the table: every pass above both

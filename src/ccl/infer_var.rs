@@ -31,6 +31,45 @@ impl fmt::Display for InferVarId {
     }
 }
 
+/// Identity of a **Σ's own binder** — what its [`crate::ccl::Type::WitnessRef`]
+/// occurrences point back at.
+///
+/// A binder needs an identity for the same reason a Pi binder has a `Name`: when a pass
+/// decomposes a Σ-typed term, the witness occurrences scatter across the pieces, and
+/// *which binder they belong to* has to survive that. Anonymity can only express it by
+/// nesting position, which does not survive a term being taken apart.
+///
+/// Globally unique, and preserved by every copy — the same Barendregt discipline
+/// `uniquify` gives term binders, and what makes derived structural equality still work
+/// for two types descending from one derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WitnessBinderId(pub(crate) u32);
+
+impl fmt::Display for WitnessBinderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl WitnessBinderId {
+    /// The id a witness occurrence carries while it is still in the **anonymous** compact
+    /// world, where `AtomKey::Witness` is a nullary atom with no binder to point at.
+    ///
+    /// Only materialization knows which sum is being closed, so it is materialization that
+    /// rebinds these to the sum's real binder. One escaping is a bug, and the free-witness
+    /// check is what reports it — an `UNBOUND` occurrence is by definition not bound by any
+    /// enclosing sum.
+    pub(crate) const UNBOUND: WitnessBinderId = WitnessBinderId(u32::MAX);
+}
+
+/// Global counter for [`WitnessBinderId`] allocation.
+static WITNESS_BINDER_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate a fresh, globally-unique [`WitnessBinderId`] — one per Σ built.
+pub fn fresh_witness_binder_id() -> WitnessBinderId {
+    WitnessBinderId(WITNESS_BINDER_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Global counter for [`InferVarId`] allocation.
 static INFER_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -212,6 +251,33 @@ impl Bound {
 pub struct InferBounds {
     lower: Rc<Vec<Bound>>,
     upper: Rc<Vec<Bound>>,
+    /// **Kinding** constraints — `α :: 𝐾`, the kinds whatever this variable resolves
+    /// to must inhabit.
+    ///
+    /// A third kind of constraint rather than a bound, because it is not a relation to
+    /// a type: no `T` satisfies "`α <: T` iff `α` is a range". It is what a
+    /// [`TypeKind`](crate::ccl::ty::TypeKind) membership predicate needs and cannot get
+    /// while the variable has no shape, so it is recorded here and read once the
+    /// variable's position resolves.
+    ///
+    /// Unlike `lower`/`upper` these are **not polar** — a kinding constraint asserts
+    /// something about the eventual resolution, which is the same fact at either
+    /// position — so merging two variables' constraints is a plain conjunction and
+    /// extrusion carries them at both polarities.
+    pub kinds: Vec<crate::ccl::ty::TypeKind>,
+    /// The **witness** this variable's value is quantified over, once something has
+    /// needed to name it.
+    ///
+    /// A variable whose lower bounds are dependent sums holds one sum-typed value: the
+    /// conditional that built it made *one* choice, whatever number of arms describe it.
+    /// So the sums among its bounds are descriptions of a single witness, and this is that
+    /// witness's identity. See [`InferVar::witness_binder`] for how it is chosen.
+    ///
+    /// A fourth kind of constraint, non-polar for the same reason `kinds` is — which
+    /// sum a position is quantified over is one fact at either polarity — and
+    /// **sticky**: once chosen it never changes, which is what lets an edge drawn early
+    /// name the same witness an edge drawn late does.
+    pub witness: Option<WitnessBinderId>,
 }
 
 thread_local! {
@@ -229,6 +295,8 @@ impl Default for InferBounds {
         NO_BOUNDS.with(|empty| InferBounds {
             lower: Rc::clone(empty),
             upper: Rc::clone(empty),
+            kinds: Vec::new(),
+            witness: None,
         })
     }
 }
@@ -390,6 +458,28 @@ impl InferVar {
             }
         });
         var
+    }
+
+    /// The witness this variable's value is quantified over — chosen on first demand and
+    /// kept.
+    ///
+    /// `sums` are the binders of the dependent sums currently among its lower bounds.
+    /// **Unanimous ones are adopted; a disagreement mints.** Both halves are the same
+    /// rule read from either side: a variable that is merely *carrying* one sum onward must
+    /// not rename it, or the value and its consumers would name different witnesses; a
+    /// variable at which several sums *meet* holds a new choice —
+    /// which arm the conditional took — that none of its inputs is, so it gets its own
+    /// name rather than borrowing an input's. Borrowing is what conflates two conditionals
+    /// that merely share an arm.
+    ///
+    /// Sticky, so the answer does not depend on how many bounds had arrived when the first
+    /// consumer asked.
+    pub fn witness_binder(&self, sums: &[WitnessBinderId]) -> WitnessBinderId {
+        let mut b = self.bounds.borrow_mut();
+        *b.witness.get_or_insert_with(|| match sums {
+            [sole, rest @ ..] if rest.iter().all(|w| w == sole) => *sole,
+            _ => fresh_witness_binder_id(),
+        })
     }
 }
 
