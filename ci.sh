@@ -48,6 +48,26 @@ ci_clippy_lib() { cargo clippy --lib -- -D warnings; }
 # argument as `ci_clippy_serde`: a configuration nothing runs is a
 # configuration that rots.
 ci_test() { cargo test -q ${DEEP_TYPECHECK:+--features deep-typecheck}; }
+# The formal model (`formal/`): building it is what elaborates every theorem and
+# evaluates every `#guard` in the Lean development, and the differential tests
+# then diff the model's verdicts against the solver's. Those tests skip
+# themselves when the oracle binary is absent, so without this gate nothing
+# notices the model drifting from the solver — the same rot argument as
+# `ci_clippy_serde`, and the drift is silent in both directions. A machine with
+# no Lean toolchain skips, loudly; under CI a missing toolchain is a broken gate
+# rather than a local convenience, so it fails instead.
+ci_formal() {
+  if ! command -v lake >/dev/null 2>&1; then
+    if [[ -n "${CI:-}" ]]; then
+      echo "ci_formal: no Lean toolchain (lake) under CI — this gate would be a no-op" >&2
+      return 1
+    fi
+    echo "ci_formal: no Lean toolchain (lake) — formal model not checked" >&2
+    return 0
+  fi
+  (cd formal && lake build) || return 1
+  cargo test -q --test differential_oracle
+}
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc --no-deps
@@ -120,6 +140,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_test || failed=1
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_formal || failed=1
   exit "${failed}"
 }
 
