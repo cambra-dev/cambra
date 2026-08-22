@@ -229,9 +229,9 @@ impl Name {
     /// two compilations of one source disagree. That made program diffing at
     /// and below loop planning unusable — see `src/ccl/design/diffing.md`.
     ///
-    /// The per-record uniqueness this relies on holds by construction: a key
-    /// spelling is either the user's own variable name, distinct within its
-    /// block, or a label planning mints indexed by position (`acc0`, `acc1`).
+    /// The per-record uniqueness this relies on holds by construction: every key
+    /// spelling is the user's own variable name, distinct within the block or
+    /// loop that declares it.
     pub fn field_key(&self) -> String {
         self.base().to_string()
     }

@@ -161,9 +161,8 @@ The label has no need of a uid. It must be distinct only among the keys of one
 mutable variable record: every consumer resolves it against a `keys_map` built
 per `Transact` node, so accumulators in sibling loops live in different records
 and cannot collide. `field_key` is therefore the plain spelling, and that
-distinctness holds by construction — a key is either the user's own variable
-name, distinct within its block, or a label planning mints indexed by position
-(`acc0`, `acc1`).
+distinctness holds by construction — a key is the user's own variable name,
+distinct within the block or loop that declares it.
 
 The general rule this leaves: **a name rendered into a string is an identity the
 hash cannot normalize**, so a pass that needs a label should derive it from

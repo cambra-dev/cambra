@@ -1974,21 +1974,28 @@ fn build_writer(
     );
     let commit = crate::ccl::ccl_utils::disjoin(commit_paths, true, &Type::Base(BaseType::Bool));
 
-    // The decision `writes` is a positional tuple over `write_keys`, matching
-    // `emit_transact_writer` (a single write is a one-element tuple). A write key
-    // never assigned in the block keeps its snapshot (unchanged).
+    // The decision `writes` is keyed by the variables written, matching
+    // `emit_transact_writer`. A write key never assigned in the block keeps its
+    // snapshot (unchanged).
     let write_tys: Vec<Type> = site.write_keys.iter().map(value_ty).collect();
-    let write_vals: Vec<Expr> = site
+    let write_fields: Vec<(String, Expr)> = site
         .write_keys
         .iter()
         .map(|wk| {
-            env.get(wk).cloned().unwrap_or_else(|| {
+            let val = env.get(wk).cloned().unwrap_or_else(|| {
                 panic!("transact_phase: write key `{wk}` never assigned in its block")
-            })
+            });
+            (wk.field_key(), val)
         })
         .collect();
-    let mut writes = Expr::tuple(write_vals);
-    writes.ty = Type::Tuple(write_tys.clone());
+    let mut writes = Expr::new(TypedExprNode::Record(write_fields));
+    writes.ty = Type::Record(
+        site.write_keys
+            .iter()
+            .map(|wk| wk.field_key())
+            .zip(write_tys.clone())
+            .collect(),
+    );
 
     // Decision record `{commit, writes, to_<defer>*}` — built by the shared
     // `writer_decision_record` (the one place the tap/`__fire` encoding lives, so
@@ -2452,7 +2459,7 @@ fn per_key_view(
     dom: &Type,
     rec_ty: &Type,
     decision_ty: &Type,
-    idx: usize,
+    key: &str,
     value_ty: &Type,
     view_rec_ty: &Type,
 ) -> Expr {
@@ -2472,8 +2479,8 @@ fn per_key_view(
     ]);
     time_view.ty = Type::fun(dom.clone(), Type::Txn);
 
-    // write leg: commits_j ≫ .decision ≫ variant_project(`commit) ≫ .writes ≫ .idx.
-    let mut iproj = Expr::proj_index(idx);
+    // write leg: commits_j ≫ .decision ≫ variant_project(`commit) ≫ .writes ≫ .key.
+    let mut iproj = Expr::proj_field(key);
     iproj.ty = Type::fun(writes_ty.clone(), value_ty.clone());
     let mut write_view = Expr::compose(vec![
         tvar(commits_j, commits_ty),
@@ -2741,13 +2748,13 @@ fn plan_store(
             Some(sites) => {
                 let taps: Vec<Expr> = sites
                     .iter()
-                    .map(|&(j, idx)| {
+                    .map(|&(j, _idx)| {
                         per_key_view(
                             &commits[j],
                             &site_dom[j],
                             &commit_rec_ty[j],
                             &site_decision_ty[j],
-                            idx,
+                            &k.field_key(),
                             &v,
                             &view_rec_ty,
                         )

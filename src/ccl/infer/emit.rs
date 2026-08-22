@@ -1882,10 +1882,10 @@ fn emit_transact_writer<C: Typing>(
     }
     let body_dom = accumulator_body_domain(snaps, item);
 
-    // Body codomain: `{commit: Bool, writes: Tuple(new_j…)}`, with `new_j` a
-    // fresh var bounded above by `write_keys[j]`'s value type. `writes` is a
-    // positional tuple built directly (not via `product`, whose empty case
-    // collapses to `Record([])`): even a single-key write set is `Tuple([_])`.
+    // Body codomain: `{commit: Bool, writes: {k_j: new_j…}}`, with `new_j` a
+    // fresh var bounded above by `write_keys[j]`'s value type. The write set is
+    // keyed by the variable written, so a slot carries which variable it belongs
+    // to all the way to the store — see `src/ccl/design/mutability.md`.
     let mut new_tys: Vec<Type> = Vec::with_capacity(writer.write_keys.len());
     let mut news: Vec<(Type, Type)> = Vec::with_capacity(writer.write_keys.len());
     for wk in &writer.write_keys {
@@ -1908,7 +1908,14 @@ fn emit_transact_writer<C: Typing>(
     let mut payload: BTreeMap<FieldKey, Type> = BTreeMap::new();
     payload.insert(
         FieldKey::Name(SmolStr::from(crate::ccl::F_WRITES)),
-        Type::Tuple(new_tys),
+        Type::Record(
+            writer
+                .write_keys
+                .iter()
+                .map(|wk| wk.field_key())
+                .zip(new_tys)
+                .collect(),
+        ),
     );
     let decision_codom = Type::variant(vec![
         (FieldKey::Name(SmolStr::from(V_COMMIT)), product(payload)),
