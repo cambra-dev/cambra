@@ -243,7 +243,7 @@ enum StoreReadKind {
     /// changelog: a read is a [`StoreDenseRead`] folding the changelog at every
     /// position of the loop extent (`StoreReadInfo::induction_extent`) into the
     /// dense history `D ⇀ V` — the changelog counterpart of `Induction`'s
-    /// `.writes.(index)`, serving both scalar-final and co-iterated reads.
+    /// `__hist.k`, serving both scalar-final and co-iterated reads.
     InductionChangelog,
 }
 
@@ -257,9 +257,6 @@ struct KeyReadInfo {
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
     value_extent: Extent,
-    /// The key's position in the writer's `writes` tuple: `__hist.k` projects
-    /// `.writes.(index)` off the store body stream (`Induction` stores).
-    index: usize,
     /// Whether the key's value carries forward across commit ticks that don't
     /// write it (`commit` stores): `true` for a mutable variable (persistent value),
     /// `false` for a reply tap (a per-commit event). See
@@ -1557,7 +1554,6 @@ fn build_commit_store(
             KeyReadInfo {
                 runtime_key,
                 value_extent: key_value_extent,
-                index: 0,            // unused for `commit` reads (keyed by `runtime_key`)
                 carry_forward: true, // mutable variable: value persists across commits
             },
         );
@@ -1657,7 +1653,6 @@ fn build_commit_store(
                 KeyReadInfo {
                     runtime_key: Value::String(field.clone().into()),
                     value_extent: tap_value_extent,
-                    index: 0, // unused for `commit` reads (keyed by `runtime_key`)
                     // A reply tap is a per-commit event, not a persistent value:
                     // emit it only at the tick that wrote it, so two writers'
                     // taps to one defer don't smear across the shared clock.
@@ -1783,14 +1778,13 @@ fn build_induction_store_single(
             KeyReadInfo {
                 runtime_key: rk,
                 value_extent,
-                index: 0, // unused: dense reads fold by runtime_key
                 carry_forward: true, // an accumulator persists across positions
-                          // A literal init is the leading-carry fold default. A
-                          // *conditional* single-writer loop does have leading carries
-                          // (positions before the first committing write); those read the
-                          // accumulator's seed, supplied by the tick-0 init in
-                          // `CommitEngine::new(inits)` — not this default, which anchors a
-                          // computed-init empty fold.
+                                     // A literal init is the leading-carry fold default. A
+                                     // *conditional* single-writer loop does have leading carries
+                                     // (positions before the first committing write); those read the
+                                     // accumulator's seed, supplied by the tick-0 init in
+                                     // `CommitEngine::new(inits)` — not this default, which anchors a
+                                     // computed-init empty fold.
             },
         );
     }
@@ -1862,7 +1856,6 @@ fn build_induction_store_single(
             KeyReadInfo {
                 runtime_key: Value::String(field.clone().into()),
                 value_extent: tap_value_extent,
-                index: 0,             // unused: dense reads fold by runtime_key
                 carry_forward: false, // a tap fires only at its own position
             },
         );
@@ -2040,7 +2033,6 @@ fn convert_store_read(
             (
                 k.runtime_key.clone(),
                 k.value_extent.clone(),
-                k.index,
                 k.carry_forward,
             )
         });
@@ -2061,14 +2053,9 @@ fn convert_store_read(
         // does — which is what makes `await_final(x)` independent of a store-mate
         // still committing. `final_or_default(stream, init)` then reduces it with
         // `ExtractFinal`, supplying the seed when the key was never written.
-        (StoreReadKind::Commit, Some((runtime_key, value_extent, _, carry_forward))) => {
-            Ok(Box::new(StoreValueStream::new(
-                fan.branch(),
-                runtime_key,
-                value_extent,
-                carry_forward,
-            )))
-        }
+        (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward))) => Ok(Box::new(
+            StoreValueStream::new(fan.branch(), runtime_key, value_extent, carry_forward),
+        )),
         // An `InductionChangelog` key read off the changelog, folded at every
         // position of the loop extent via [`StoreDenseRead`] (an `IterateExtent(D)`
         // trigger + the store branch). An **accumulator** (`carry_forward: true`)
@@ -2079,10 +2066,7 @@ fn convert_store_read(
         // per-position value stream: only the positions where the tap fired
         // (its value present in that position's changelog delta), keyed by loop
         // position — the same `Fun(D, V)` the sink reads.
-        (
-            StoreReadKind::InductionChangelog,
-            Some((runtime_key, value_extent, _, carry_forward)),
-        ) => {
+        (StoreReadKind::InductionChangelog, Some((runtime_key, value_extent, carry_forward))) => {
             let extent = induction_extent.ok_or_else(|| {
                 ConversionError::Unsupported(format!(
                     "induction-changelog store {store_name} has no loop extent"

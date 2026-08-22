@@ -1389,7 +1389,7 @@ impl TileProducer for InductionStoreProducer {
         let started_at = self.processed();
         while let Some(pos) = next_decided_position(&body_tile, self.processed()) {
             let Some((commit, writes, tap_fired)) =
-                body_decision_at(&body_tile, pos, &self.tap_fields)
+                body_decision_at(&body_tile, pos, &self.write_keys, &self.tap_fields)
             else {
                 break;
             };
@@ -3409,6 +3409,7 @@ fn next_decided_position(tile: &Tile, pos: usize) -> Option<usize> {
 fn body_decision_at(
     tile: &Tile,
     pos: usize,
+    write_keys: &[Value],
     tap_fields: &[String],
 ) -> Option<(bool, Vec<Value>, Vec<bool>)> {
     let Tile::SealedFunction {
@@ -3435,20 +3436,21 @@ fn body_decision_at(
     let Value::Record(payload) = *inner else {
         return None;
     };
-    // The write set is the writes tuple `(_0, …, _{w-1})` in index order, followed
-    // by each reply tap's value — the order the caller's `write_keys` aligns with
-    // (carries then taps).
+    // The write set is keyed by the variable written, so it is read back in
+    // `write_keys` order — the order the caller aligns with (carries then taps).
+    // Each entry may itself be record-valued (a store holding a record).
     let mut writes = Vec::with_capacity(tap_fields.len());
     match payload.get(F_WRITES)? {
-        // The normal case: the writes tuple is a record `{_0, …, _{w-1}}`. Each
-        // entry may itself be record-valued (a store holding a record).
         Value::Record(writes_rec) => {
-            for j in 0..writes_rec.len() {
-                writes.push(writes_rec.get(&tuple_field(j))?.clone());
+            for key in write_keys.iter().take(writes_rec.len()) {
+                let Value::String(name) = key else {
+                    return None;
+                };
+                writes.push(writes_rec.get(name.as_str())?.clone());
             }
         }
-        // A read-only transaction's empty writes tuple `()` lowers to a unit
-        // value (not a record): zero carry writes, only taps contribute.
+        // A read-only transaction's empty write set lowers to a unit value (not
+        // a record): zero carry writes, only taps contribute.
         Value::Unit => {}
         _ => return None,
     }
@@ -3874,7 +3876,7 @@ impl TileProducer for TransactWriterProducer {
             && Some(pos) != self.last_decided_pos
             && let Some(frontier) = snapshot
         {
-            match body_decision_at(&body_tile, pos, &self.tap_fields) {
+            match body_decision_at(&body_tile, pos, &self.write_keys, &self.tap_fields) {
                 // Grant: propose the write set; the operator decides whether it
                 // commits — its ack releases the driver row, which is what advances
                 // the driver past this item — or is stale, leaving the item to be
@@ -4151,11 +4153,14 @@ mod tests {
         }
     }
 
-    /// The `commit` payload extent for a single-key writer: `{writes: {_0: value}}`.
-    fn commit_payload_extent() -> Extent {
+    /// The `commit` payload extent for a single-key writer: `{writes: {acc: value}}`.
+    ///
+    /// The write set is keyed by the variable written, so these fixtures name
+    /// the key the same way the CCL side does.
+    fn commit_payload_extent(key: &str) -> Extent {
         Extent::Record(HashMap::from([(
             F_WRITES.to_string(),
-            Extent::Record(HashMap::from([(tuple_field(0), value_extent())])),
+            Extent::Record(HashMap::from([(key.to_string(), value_extent())])),
         )]))
     }
 
@@ -4169,15 +4174,11 @@ mod tests {
         ]))
     }
 
-    /// A `` `commit({writes: {_0, _1, …}}) `` decision value from its per-key write values.
-    fn commit_value(writes: Vec<Value>) -> Value {
-        let writes_rec = Value::Record(
-            writes
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| (tuple_field(i), v))
-                .collect(),
-        );
+    /// A `` `commit({writes: {key: write}}) `` decision value. The write set is
+    /// keyed by the variable written, so a fixture names its key the same way
+    /// the writer consuming the decision does.
+    fn commit_value(key: &str, write: Value) -> Value {
+        let writes_rec = Value::Record(HashMap::from([(key.to_string(), write)]));
         Value::Union {
             tag: FieldKey::Name(V_COMMIT.into()),
             inner: Box::new(Value::Record(HashMap::from([(
@@ -4207,25 +4208,30 @@ mod tests {
     struct AddIfBody {
         input: Box<dyn TileOperator>,
         tiling: Tiling,
+        /// The accumulator this body writes. The write set is keyed by the
+        /// variable written, so a fixture has to name its key the same way the
+        /// writer that consumes the decision does.
+        key: String,
         /// The guard threshold: `commit` iff `item > threshold` (`i64::MIN` ⇒ an
         /// unconditional loop, `commit` everywhere).
         threshold: i64,
     }
 
     impl AddIfBody {
-        fn new(input: Box<dyn TileOperator>, threshold: i64) -> Self {
+        fn new(input: Box<dyn TileOperator>, threshold: i64, key: &str) -> Self {
             let tiling = Tiling::SealedFunction {
                 domain: Extent::Base(BaseType::UInt),
                 // Decision variant `` {`commit{{writes: {_0}}} | `abort} `` — a
                 // `Scalar(Union)` codomain (commit=0, abort=1).
                 codomain: Box::new(Tiling::Scalar(decision_union_extent(
-                    commit_payload_extent(),
+                    commit_payload_extent(key),
                 ))),
             };
             Self {
                 input,
                 tiling,
                 threshold,
+                key: key.to_string(),
             }
         }
     }
@@ -4244,6 +4250,7 @@ mod tests {
                 self.input
                     .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
             Box::new(AddIfBodyProducer {
+                key: self.key.clone(),
                 base: ProducerBase::new(AddIfBodyProducer::alloc_id(), &self.tiling),
                 input,
                 threshold: self.threshold,
@@ -4255,6 +4262,7 @@ mod tests {
         base: ProducerBase,
         input: Box<dyn TileProducer>,
         threshold: i64,
+        key: String,
     }
 
     impl TileProducer for AddIfBodyProducer {
@@ -4283,7 +4291,7 @@ mod tests {
                     panic!("AddIfBody prev/item are Ints");
                 };
                 rows.push(if i > self.threshold {
-                    commit_value(vec![int(p + i)])
+                    commit_value(&self.key, int(p + i))
                 } else {
                     abort_value()
                 });
@@ -4292,7 +4300,7 @@ mod tests {
                 domain,
                 codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
                     rows,
-                    &decision_union_extent(commit_payload_extent()),
+                    &decision_union_extent(commit_payload_extent(&self.key)),
                 ))),
                 // A per-position decision map: the decision stream is final
                 // exactly when its input is, as a compiled body's operator chain
@@ -4332,7 +4340,7 @@ mod tests {
             vec![value_extent()],
             value_extent(),
         );
-        set_body(Box::new(AddIfBody::new(Box::new(driver), threshold)));
+        set_body(Box::new(AddIfBody::new(Box::new(driver), threshold, "acc")));
         (fan, acc)
     }
 
@@ -5425,7 +5433,7 @@ mod tests {
             // release intersection. Without it the intersection would be the
             // writer's ack alone, and a superseded row could not be reclaimed
             // before its item finished.
-            let body = AddIfBody::new(Box::new(Memo::new(driver_fan.branch())), i64::MIN);
+            let body = AddIfBody::new(Box::new(Memo::new(driver_fan.branch())), i64::MIN, "pool");
             set_writer(Box::new(TransactWriter::new(
                 store_fan.branch(),
                 Box::new(body),
