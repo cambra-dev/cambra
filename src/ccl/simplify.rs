@@ -40,16 +40,16 @@
 //! | Literal tuple projection | `(e₀, …, eₙ).i` | `eᵢ` | ✗ (drops siblings) |
 //! | CCC universal | `⟨.1, .0 ≫ curry(f)⟩ ≫ apply` | `f` | ✗ (drops structure) |
 //! | Exponential beta | `⟨g, curry(h)⟩ ≫ apply` | `⟨id, g⟩ ≫ h` | ✗ (restructures) |
-//! | Exponential eta | `curry(⟨.1, .0 ≫ f⟩ ≫ apply)` | `f` | ✗ (drops structure) |
+//! | Exponential eta | `curry(⟨.1, .0 ≫ f⟩ ≫ apply ≫ g)` | `f ≫ map(g)` | ✗ (drops structure) |
 //! | Const-apply | `⟨f, const(g)⟩ ≫ apply` | `f ≫ g` | ✗ (drops `const` wrap) |
 //! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` | ✗ (collapses) |
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` | ✓ |
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
 //! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
 
-use crate::ccl::ccl_utils::{PredMemo, is_builtin, walk_refined_predicates_mut};
+use crate::ccl::ccl_utils::{PredMemo, apply_primitive, is_builtin, walk_refined_predicates_mut};
 use crate::ccl::infer::debug_typecheck;
-use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
+use crate::ccl::lambda_elim::{id, zip_pair};
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
     ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, Lit, ProjKey, Type, TypedExpr,
@@ -270,6 +270,8 @@ fn try_string_add_to_concat(expr: &mut Expr) -> bool {
 /// Note: `curry_compose` (`curry(f ≫ g) ⟹ curry(f) ≫ map(g)`) is intentionally
 /// omitted. Splitting a curry prevents `exponential_beta` from recognising the
 /// `curry(h)` right-arm of a zip in multi-generator comprehension contexts.
+/// [`try_exponential_eta`] fires its composite with eta instead, which discharges
+/// the curry rather than splitting it.
 ///
 /// Returns `true` if any rule fired.
 fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool {
@@ -395,6 +397,39 @@ fn is_id(expr: &Expr) -> bool {
 /// Returns `true` if `expr` is `Proj(Index(n))` for the given `n`.
 fn is_proj_idx(expr: &Expr, n: usize) -> bool {
     matches!(&expr.node, TypedExprNode::Proj(ProjKey::Index(m)) if *m == n)
+}
+
+/// Returns `true` if `expr` is the second arm of an exponential-eta zip: `.0`,
+/// or `.0 ≫ 𝑓` for one morphism 𝑓.
+///
+/// The arm carries the curried function into `apply`. A bare projection carries
+/// it unchanged (`𝑓 = id`); see [`try_exponential_eta`].
+fn is_eta_apply_arm(expr: &Expr) -> bool {
+    is_proj_idx(expr, 0) || as_compose(expr).is_some_and(|(proj0, _)| is_proj_idx(proj0, 0))
+}
+
+/// Collapse a non-empty morphism list into one expression: the element itself
+/// when there is one, otherwise their composition typed
+/// `first.domain ⇒ last.codomain` at `first`'s kind, which the chain spans.
+fn collapse_compose(mut elts: Vec<Expr>) -> Expr {
+    debug_assert!(
+        !elts.is_empty(),
+        "collapse_compose needs at least one morphism"
+    );
+    if elts.len() == 1 {
+        return elts.pop().unwrap();
+    }
+    let ty = match (
+        elts.first().map(|e| e.ty.clone()),
+        elts.last().and_then(|e| e.ty.codomain()),
+    ) {
+        (Some(head), Some(codomain)) => match head.domain() {
+            Some(domain) => Type::fun_like_or_hole(&head, &domain, &codomain),
+            None => Type::Hole,
+        },
+        _ => Type::Hole,
+    };
+    Expr::compose(elts).with_ty(ty)
 }
 
 /// Split a [`TypedExprNode::Compose`] into `(prefix, last)` if it has ≥ 2 elements.
@@ -562,7 +597,7 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
                 },
                 _ => Type::Hole,
             };
-            let const_var_ty = fun_ty_or_hole(&g.ty, &new_const_ty);
+            let const_var_ty = Type::compute_fun_or_hole(&g.ty, &new_const_ty);
             let const_var = Expr::builtin(Builtin::Const).with_ty(const_var_ty);
             let new_const = Expr::apply(g.clone(), const_var).with_ty(new_const_ty);
             vec![new_const]
@@ -966,23 +1001,39 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
     )
 }
 
-/// Exponential eta: `curry(⟨.1, .0 ≫ f⟩ ≫ apply)  ⟹  f`
+/// Exponential eta: `curry(⟨.1, .0 ≫ 𝑓⟩ ≫ apply ≫ 𝑔)  ⟹  𝑓 ≫ map(𝑔)`
 ///
-/// Matches when the inner compose ends with `⟨.1, .0 ≫ f⟩` then `apply`
-/// (i.e. those are the last two elements of an n-ary inner compose).
-/// Any prefix elements before the matched pair disqualify the rule, since
-/// the full inner compose must be exactly `zip ≫ apply`.
+/// The inner compose must begin with `⟨.1, .0 ≫ 𝑓⟩` then `apply`; any element
+/// before the zip disqualifies the rule. Both morphisms are optional — a bare
+/// `.0` arm is `𝑓 = id`, an empty suffix is `𝑔 = id` — so the rule also covers
+/// the degenerate forms `curry(⟨.1, .0 ≫ 𝑓⟩ ≫ apply) ⟹ 𝑓` and
+/// `curry(⟨.1, .0⟩ ≫ apply) ⟹ id`.
+///
+/// 𝑔 leaves the curry as `map(𝑔)`, the internal hom's action on 𝑔
+/// (`map(𝑔)(k) = k ≫ 𝑔`), post-composed onto the curried function's result. The
+/// suffix and the curry go in one rewrite, which is what makes the rule safe: the
+/// standalone split `curry(𝑓 ≫ 𝑔) ⟹ curry(𝑓) ≫ map(𝑔)` is omitted from the rule
+/// set (see [`apply_simplification_rules`]) because a residual `curry` in a zip arm
+/// is what [`try_exponential_beta`] matches on, and here no curry survives.
+///
+/// A projecting inner comprehension over a group (`sum([s.amount for s in g])`)
+/// reaches operator conversion only through this rule: λ-elimination closes the
+/// inner lambda over both binders and re-splits it with `curry`, for which
+/// operator conversion has no arm.
 fn try_exponential_eta(expr: &mut Expr) -> bool {
     let matched = as_curry(expr).is_some_and(|uncurried| {
-        as_compose(uncurried).is_some_and(|(zip, ap)| {
-            is_builtin(ap, Builtin::Apply)
-                && as_zip(zip).is_some_and(|(proj1, proj0f)| {
-                    is_proj_idx(proj1, 1)
-                        && as_compose(proj0f).is_some_and(|(proj0, _)| is_proj_idx(proj0, 0))
-                })
-        })
+        let TypedExprNode::Compose(elts) = &uncurried.node else {
+            return false;
+        };
+        let [zip, ap, ..] = elts.as_slice() else {
+            return false;
+        };
+        is_builtin(ap, Builtin::Apply)
+            && as_zip(zip)
+                .is_some_and(|(proj1, proj0f)| is_proj_idx(proj1, 1) && is_eta_apply_arm(proj0f))
     });
     if matched {
+        let curry_ty = expr.ty.clone();
         let TypedExpr {
             node: TypedExprNode::Apply {
                 argument: inner, ..
@@ -999,6 +1050,8 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
         else {
             unreachable!()
         };
+        // `𝑔`: everything the curried function's result flows through.
+        let suffix = inner_elts.split_off(2);
         let _apply = inner_elts.pop().unwrap();
         let zip_node = inner_elts.pop().unwrap();
         let TypedExpr {
@@ -1015,15 +1068,35 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
         else {
             unreachable!()
         };
-        let TypedExpr {
-            node: TypedExprNode::Compose(mut compose_elts),
-            ..
-        } = elts.swap_remove(1)
-        else {
-            unreachable!()
+        // `𝑓`: the `.0` arm with its projection dropped, absent for a bare `.0`.
+        let f = match elts.swap_remove(1).node {
+            TypedExprNode::Compose(mut compose_elts) => Some(compose_elts.pop().unwrap()),
+            _ => None,
         };
-        let f = compose_elts.pop().unwrap();
-        *expr = f;
+        // With 𝑓 absent the `.0` arm hands `apply` the curry's argument unchanged,
+        // so `map(𝑔)` is the whole replacement and carries the curry's arrow as it
+        // stands — rebuilding it would drop the Pi binder a dependent refinement
+        // needs and mint the kind bare. With 𝑓 present the map node is a minted
+        // element behind 𝑓, spanning 𝑓's codomain at 𝑓's kind, and the curry's arrow
+        // rides the compose that replaces the node.
+        let mapped = (!suffix.is_empty()).then(|| {
+            let map_ty = match &f {
+                None => curry_ty.clone(),
+                Some(f) => match (f.ty.codomain(), curry_ty.codomain()) {
+                    (Some(domain), Some(codomain)) => {
+                        Type::fun_like_or_hole(&f.ty, &domain, &codomain)
+                    }
+                    _ => Type::Hole,
+                },
+            };
+            apply_primitive(collapse_compose(suffix), Builtin::Map, map_ty)
+        });
+        *expr = match (f, mapped) {
+            (Some(f), Some(mapped)) => Expr::compose(vec![f, mapped]).with_ty(curry_ty),
+            (Some(f), None) => f,
+            (None, Some(mapped)) => mapped,
+            (None, None) => id().with_ty(curry_ty),
+        };
         return true;
     }
     false
@@ -1074,7 +1147,7 @@ mod tests {
         apply_primitive, make_iterate, make_restrict, trivially_true_predicate,
     };
     use crate::ccl::lambda_elim::{curry_at, zip_pair};
-    use crate::ccl::{BaseType, Expr};
+    use crate::ccl::{BaseType, Expr, Name};
 
     fn var(s: &str) -> Expr {
         Expr::var(s)
@@ -1598,6 +1671,161 @@ mod tests {
         let expr = Expr::apply(inner_compose, curry_var).with_ty(f_ty.clone());
 
         assert_eq!(simplify(expr), f);
+    }
+
+    /// Exponential eta carrying only the suffix: `curry(⟨.1, .0⟩ ≫ apply ≫ g)  ⟹  map(g)`
+    ///
+    /// The projecting-inner-comprehension shape (`sum([s.amount for s in g])`):
+    /// the group is applied to its own index and the element projected, so the
+    /// curried function is post-composition over the group.
+    #[test]
+    fn simplify_exponential_eta_suffix_only() {
+        let b_ty = int_ty();
+        let c_ty = Type::Base(BaseType::String);
+        let c2_ty = Type::Base(BaseType::Bool);
+        // The collection the curried function closes over.
+        let a_ty = fun_ty(b_ty.clone(), c_ty.clone());
+
+        let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p1 = Expr::proj_index(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
+        let p0 = Expr::proj_index(0).with_ty(fun_ty(ab_tup_ty.clone(), a_ty.clone()));
+
+        let zip = zip_pair(p1, p0);
+        let apply = Expr::builtin(Builtin::Apply).with_ty(fun_ty(
+            Type::Tuple(vec![b_ty.clone(), a_ty.clone()]),
+            c_ty.clone(),
+        ));
+        let g = var("g").with_ty(fun_ty(c_ty, c2_ty.clone()));
+        let inner_compose = typed_compose(vec![zip, apply, g.clone()]);
+
+        let curry_ty = fun_ty(a_ty, fun_ty(b_ty, c2_ty));
+        let expr = curry_at(inner_compose, curry_ty.clone());
+
+        assert_eq!(
+            simplify(expr),
+            apply_primitive(g, Builtin::Map, curry_ty),
+            "the suffix must leave the curry as map(g)"
+        );
+    }
+
+    /// Exponential eta carrying both morphisms:
+    /// `curry(⟨.1, .0 ≫ f⟩ ≫ apply ≫ g)  ⟹  f ≫ map(g)`
+    #[test]
+    fn simplify_exponential_eta_prefix_and_suffix() {
+        let a_ty = Type::Base(BaseType::String);
+        let b_ty = int_ty();
+        let c_ty = Type::Base(BaseType::Bool);
+        let c2_ty = int_ty();
+        let bc_ty = fun_ty(b_ty.clone(), c_ty.clone());
+        let f = var("f").with_ty(fun_ty(a_ty.clone(), bc_ty.clone()));
+        let g = var("g").with_ty(fun_ty(c_ty.clone(), c2_ty.clone()));
+
+        let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p1 = Expr::proj_index(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
+        let p0 = Expr::proj_index(0).with_ty(fun_ty(ab_tup_ty.clone(), a_ty.clone()));
+
+        let zip = zip_pair(p1, typed_compose2(p0, f.clone()));
+        let apply = Expr::builtin(Builtin::Apply)
+            .with_ty(fun_ty(Type::Tuple(vec![b_ty.clone(), bc_ty.clone()]), c_ty));
+        let inner_compose = typed_compose(vec![zip, apply, g.clone()]);
+
+        let bc2_ty = fun_ty(b_ty, c2_ty);
+        let curry_ty = fun_ty(a_ty, bc2_ty.clone());
+        let expr = curry_at(inner_compose, curry_ty.clone());
+
+        let mapped = apply_primitive(g, Builtin::Map, fun_ty(bc_ty, bc2_ty));
+        assert_eq!(simplify(expr), typed_compose2(f, mapped));
+    }
+
+    /// Exponential eta carrying neither morphism: `curry(⟨.1, .0⟩ ≫ apply)  ⟹  id`
+    #[test]
+    fn simplify_exponential_eta_identity() {
+        let b_ty = int_ty();
+        let c_ty = Type::Base(BaseType::String);
+        let a_ty = fun_ty(b_ty.clone(), c_ty.clone());
+
+        let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p1 = Expr::proj_index(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
+        let p0 = Expr::proj_index(0).with_ty(fun_ty(ab_tup_ty.clone(), a_ty.clone()));
+
+        let zip = zip_pair(p1, p0);
+        let apply = Expr::builtin(Builtin::Apply)
+            .with_ty(fun_ty(Type::Tuple(vec![b_ty.clone(), a_ty.clone()]), c_ty));
+        let inner_compose = typed_compose2(zip, apply);
+
+        let curry_ty = fun_ty(a_ty.clone(), a_ty);
+        let expr = curry_at(inner_compose, curry_ty.clone());
+
+        assert_eq!(simplify(expr), id().with_ty(curry_ty));
+    }
+
+    /// The rewrite carries the curry's arrow rather than rebuilding it: a Pi binder
+    /// and a `Data` kind on it survive.
+    ///
+    /// Rebuilding the arrow from its parts mints `FunKind::Compute` and drops the
+    /// binder, which reads a collection as a capability and unbinds a dependent
+    /// refinement's key. Both arms of the rule are covered — with 𝑓 absent the
+    /// `map` node carries the arrow itself, with 𝑓 present the compose does.
+    #[test]
+    fn simplify_exponential_eta_carries_the_curry_arrow() {
+        let b_ty = int_ty();
+        let c_ty = Type::Base(BaseType::String);
+        let c2_ty = Type::Base(BaseType::Bool);
+        let a_ty = Type::data_fun(b_ty.clone(), c_ty.clone());
+        let g = var("g").with_ty(fun_ty(c_ty.clone(), c2_ty.clone()));
+
+        let eta_body = |arm: Expr, tuple_ty: Type| {
+            let p1 = Expr::proj_index(1).with_ty(fun_ty(tuple_ty, b_ty.clone()));
+            let apply = Expr::builtin(Builtin::Apply).with_ty(fun_ty(
+                Type::Tuple(vec![b_ty.clone(), a_ty.clone()]),
+                c_ty.clone(),
+            ));
+            typed_compose(vec![zip_pair(p1, arm), apply, g.clone()])
+        };
+        // `(k: A) ⤇ (B ⤇ Bool)` — a named, data-kinded curry arrow.
+        let curry_ty = |domain: Type| Type::Fun {
+            name: Some(Name::from("k")),
+            kind: FunKind::Data,
+            domain: Box::new(domain),
+            codomain: Box::new(Type::data_fun(b_ty.clone(), c2_ty.clone())),
+        };
+
+        // 𝑓 absent: the bare `.0` arm.
+        let bare_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let bare_ty = curry_ty(a_ty.clone());
+        let bare = curry_at(
+            eta_body(
+                Expr::proj_index(0).with_ty(fun_ty(bare_tup_ty.clone(), a_ty.clone())),
+                bare_tup_ty,
+            ),
+            bare_ty.clone(),
+        );
+        assert_eq!(
+            simplify(bare).ty,
+            bare_ty,
+            "𝑓 absent: map must carry the arrow"
+        );
+
+        // 𝑓 present: the `.0 ≫ 𝑓` arm, over a domain of its own.
+        let f_dom = Type::data_fun(b_ty.clone(), Type::Base(BaseType::Int));
+        let f_tup_ty = Type::Tuple(vec![f_dom.clone(), int_ty()]);
+        let f = var("f").with_ty(Type::data_fun(f_dom.clone(), a_ty.clone()));
+        let prefixed_ty = curry_ty(f_dom);
+        let prefixed = curry_at(
+            eta_body(
+                typed_compose2(
+                    Expr::proj_index(0).with_ty(fun_ty(f_tup_ty.clone(), f.ty.domain().unwrap())),
+                    f,
+                ),
+                f_tup_ty,
+            ),
+            prefixed_ty.clone(),
+        );
+        assert_eq!(
+            simplify(prefixed).ty,
+            prefixed_ty,
+            "𝑓 present: the compose must carry the arrow"
+        );
     }
 
     /// CCC universal: `⟨.1, .0 ≫ curry(f)⟩ ≫ apply  ⟹  f`

@@ -79,9 +79,9 @@
 //!   design (including wire serialization for bare non-String responses —
 //!   /stats answers with the revenue map itself), and no isolating program
 //!   yet.
-//! - `groupby` through operator conversion (`curry`) — `groupby_rollup`;
-//!   /stats additionally needs `k -> g` entry-pair iteration of the keyed
-//!   result and a map comprehension (`[k -> v for …]`).
+//! - `k -> g` entry-pair iteration of a keyed `groupby` result and a map
+//!   comprehension (`[k -> v for …]`), which /stats needs on top of the
+//!   rollup `groupby_rollup` covers.
 //! - Record terms `(f=v)` — `reachability`.
 //! - `Feed(...)` annotations — `fanout`.
 //! - Version dispatch across a branch point — no isolating program yet
