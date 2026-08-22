@@ -241,11 +241,11 @@ mutable variable record: every consumer resolves it against a `keys_map` built
 per `Transact` node, so accumulators in sibling loops live in different records
 and cannot collide. `field_key` is therefore the plain spelling. That leaves the
 distinctness as a property of spellings rather than of construction — a key is
-the user's own variable name, distinct within its block; a label planning mints
-indexed by position (`acc0`, `acc1`); or a writer's reply tap (`to_<base>_<n>`),
-which shares the record with both — so each site that builds a record from these
-labels asserts it in debug (`register_record` in `planning/loops.rs`, the two
-`keys_map` inserts in `interpreter/operator_conversion.rs`).
+the user's own variable name, distinct within the block or loop that declares
+it, or a writer's reply tap (`to_<base>_<n>`), which shares the record with them
+— so each site that builds a record from these labels asserts it in debug
+(`register_record` in `planning/loops.rs`, the two `keys_map` inserts in
+`interpreter/operator_conversion.rs`).
 
 The general rule this leaves: **a name rendered into a string is an identity the
 hash cannot normalize**, so a pass that needs a label derives it from something

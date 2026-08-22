@@ -603,8 +603,8 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         matches!(which, Builtin::GetPrevSeq),
         "letrec recognition: induction history causal by get_prev_txn"
     );
-    let TypedExprNode::Tuple(inits) = defaults.node else {
-        panic!("letrec recognition: guard defaults are not the tupled inits");
+    let TypedExprNode::Record(inits) = defaults.node else {
+        panic!("letrec recognition: guard defaults are not the accumulators' inits record");
     };
 
     let (prev_slots, source, writer_body) = split_decision_compose(*applied, &decision_ty);
@@ -621,18 +621,16 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         })
         .collect();
 
-    // One mutable variable key per accumulator. Every read is positional
-    // (`__hist ≫ .writes ≫ .i`), so these names carry no meaning beyond
-    // labelling the mutable variable record — but the label still has to be
-    // distinct *within* that record, and `field_key` is the plain spelling. So
-    // index by position: a shared `"acc"` base would collapse two accumulators
-    // onto one field, and position is the one distinguisher that is also stable
-    // across compilations, which uid-free labels require.
+    // One mutable variable key per accumulator, under the name the program gave
+    // it. `mut_elim` labels the write set by `field_key`, so the accumulators
+    // arrive named and stay named: a read is `__hist ≫ .writes ≫ .acc`, the
+    // mutable variable record is keyed the same way, and two compilations of one
+    // program agree on which slot is which variable — which is what lets a
+    // replacement version resume an accumulator rather than guess by position.
     let keys: Vec<TransactKey> = inits
         .into_iter()
-        .enumerate()
-        .map(|(i, init)| TransactKey {
-            name: Name::fresh(format!("acc{i}")),
+        .map(|(label, init)| TransactKey {
+            name: Name::fresh(label),
             init,
         })
         .collect();
@@ -727,13 +725,22 @@ fn rewrite_hist_reads(
         // elements the prefix covered (the `variant_project` step included).
         let replacement: Option<(Expr, usize)> =
             match (elts.get(2).map(|x| &x.node), elts.get(3).map(|x| &x.node)) {
+                // An accumulator read `` __hist ≫ variant_project(`commit) ≫
+                // .writes ≫ .acc ``. Both projections are named now that the
+                // write set is keyed by accumulator, so `.writes` on the outer
+                // one is what tells this from a tap read.
                 (
                     Some(TypedExprNode::Proj(ProjKey::Field(f))),
-                    Some(TypedExprNode::Proj(ProjKey::Index(i))),
+                    Some(TypedExprNode::Proj(ProjKey::Field(acc))),
                 ) if f == F_WRITES => {
-                    let field = keys[*i].name.field_key();
-                    let field_ty = Type::fun(domain_ty.clone(), acc_tys[*i].clone());
-                    Some((reg_field_read(reg, reg_ty, field, field_ty), 4))
+                    let i = keys
+                        .iter()
+                        .position(|k| k.name.field_key() == *acc)
+                        .unwrap_or_else(|| {
+                            panic!("letrec recognition: `.writes ≫ .{acc}` names no accumulator")
+                        });
+                    let field_ty = Type::fun(domain_ty.clone(), acc_tys[i].clone());
+                    Some((reg_field_read(reg, reg_ty, acc.clone(), field_ty), 4))
                 }
                 (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
                     // A tap read ``__hist ≫ variant_project(`commit) ≫ .to_<feed>``:
