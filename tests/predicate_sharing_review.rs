@@ -25,12 +25,12 @@ fn gt(l: TypedExpr, r: TypedExpr) -> TypedExpr {
 }
 /// `{_ | pred}`, a second occurrence of an existing predicate term.
 fn refined(pred: &Rc<TypedExpr>) -> Type {
-    Type::Refinement(Box::new(Type::Hole), Refinement::sharing(pred))
+    Type::refined_one(Type::Hole, Refinement::sharing(pred))
 }
 /// The predicate term of a `{_ | p}`.
 fn predicate_of(ty: &Type) -> &Rc<TypedExpr> {
-    let Type::Refinement(_, r) = ty else {
-        panic!("expected a refinement, got {ty}");
+    let [r] = ty.refinements() else {
+        panic!("expected exactly one refinement, got {ty}");
     };
     &r.predicate
 }

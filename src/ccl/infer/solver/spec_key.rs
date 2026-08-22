@@ -382,14 +382,16 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // dependent-application discharge lands in the key as the predicate the
         // clone will actually carry — that is use-specific information, and two
         // uses discharging different arguments *should* key apart.
-        Type::Refinement(inner, r) => {
+        Type::Refinement(inner, refinements) => {
             let mut k = key_go(inner, pol, subst_acc, ctx);
-            let r = subst_acc.force_refinement(r);
-            // Landing closes, as in `compact_go`: the key stores the
-            // index-spelled refinement, so α-variant instantiations key together.
-            let r = ctx.scope.close(&r);
-            if !k.refinements.contains(&r) {
-                k.refinements.push(r);
+            for r in refinements {
+                let r = subst_acc.force_refinement(r);
+                // Landing closes, as in `compact_go`: the key stores the
+                // index-spelled refinement, so α-variant instantiations key together.
+                let r = ctx.scope.close(&r);
+                if !k.refinements.contains(&r) {
+                    k.refinements.push(r);
+                }
             }
             k
         }
@@ -570,14 +572,8 @@ mod tests {
 
     #[test]
     fn refinement_sets_compare_order_insensitively() {
-        let a = Type::Refinement(
-            Box::new(Type::Refinement(Box::new(int()), refined(1))),
-            refined(2),
-        );
-        let b = Type::Refinement(
-            Box::new(Type::Refinement(Box::new(int()), refined(2))),
-            refined(1),
-        );
+        let a = Type::refined_one(Type::refined_one(int(), refined(1)), refined(2));
+        let b = Type::refined_one(Type::refined_one(int(), refined(2)), refined(1));
         assert_eq!(spec_key(&a), spec_key(&b));
     }
 
@@ -842,8 +838,8 @@ mod refinement_closing_tests {
             name: Some(Name::raw(binder)),
             kind: FunKind::Data,
             domain: Box::new(Type::UIntRange(3)),
-            codomain: Box::new(Type::Refinement(
-                Box::new(Type::Base(crate::ccl::BaseType::Int)),
+            codomain: Box::new(Type::refined_one(
+                Type::Base(crate::ccl::BaseType::Int),
                 Refinement::born(dep_pred(binder)),
             )),
         }
@@ -885,8 +881,8 @@ mod refinement_closing_tests {
                 name: Some(Name::raw("y")),
                 kind: FunKind::Data,
                 domain: Box::new(Type::UIntRange(4)),
-                codomain: Box::new(Type::Refinement(
-                    Box::new(Type::Base(crate::ccl::BaseType::Int)),
+                codomain: Box::new(Type::refined_one(
+                    Type::Base(crate::ccl::BaseType::Int),
                     Refinement::born(dep_pred(referenced)),
                 )),
             }),
@@ -899,8 +895,8 @@ mod refinement_closing_tests {
         // A free name that binds to no enclosing function stays a name and stays
         // distinct from every index: distinct enclosing binders outside the
         // walked type key apart too.
-        let free = Type::Refinement(
-            Box::new(Type::Base(crate::ccl::BaseType::Int)),
+        let free = Type::refined_one(
+            Type::Base(crate::ccl::BaseType::Int),
             Refinement::born(dep_pred("outer")),
         );
         let bound = {

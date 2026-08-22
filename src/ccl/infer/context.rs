@@ -253,10 +253,9 @@ impl InferCtx {
             // Refinements ride the lattice: keep the wrapper, normalize the
             // inner (so a `Refinement(Hole, r)` source annotation becomes
             // `Refinement(?fresh, r)` rather than losing the refinement).
-            Type::Refinement(inner, r) => Type::Refinement(
-                Box::new(self.normalize_annotation_in(inner, telescope)),
-                r.clone(),
-            ),
+            Type::Refinement(inner, r) => {
+                Type::refined(self.normalize_annotation_in(inner, telescope), r.clone())
+            }
             // Structural types are already solver-ready; recurse to
             // normalize any nested holes/refinements. A named function's binder
             // is in scope in its codomain — the annotation's own Pi
@@ -330,7 +329,7 @@ impl InferCtx {
             // `unit`: a singleton adds nothing to a one-inhabitant base.
             return base;
         };
-        Type::Refinement(Box::new(base), Refinement::sharing(&predicate))
+        Type::refined_one(base, Refinement::sharing(&predicate))
     }
 }
 

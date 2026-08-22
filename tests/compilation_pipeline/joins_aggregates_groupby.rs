@@ -303,7 +303,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
-    "iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(cast([1, 2, 3])):({{[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} | __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
+    "iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(cast([1, 2, 3])):({[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt), __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
     make_int_list(&[1])
 )]
 #[case(

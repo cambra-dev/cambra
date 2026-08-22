@@ -66,7 +66,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 /// conversion as the `input` argument.  Iteration is never inserted implicitly here — every
 /// iteration site is explicitly marked by a chain-head `Apply(predicate, Builtin::Iterate)`
 /// emitted by [`crate::ccl::planning`]'s `insert_iterate_markers` pass (plus zero or more
-/// `Apply(p, Builtin::Restrict)` mid-chain filters per refinement layer).  This module compiles
+/// `Apply(p, Builtin::Restrict)` mid-chain filters, one per refinement).  This module compiles
 /// `Iterate` to an `IterateExtent` tile (plus a `Restrict` filter when the predicate is
 /// non-trivial) and `Restrict` to a `Restrict` tile over the upstream input.  Arms that
 /// previously fell back to an implicit iteration when `input=None` now error out — a planner bug,

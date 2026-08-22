@@ -22,7 +22,8 @@ use smol_str::SmolStr;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
-    BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, Type,
+    BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, RefinementSet,
+    Type,
 };
 
 use super::traits::{Trait, link_watches, notify_lower};
@@ -1018,8 +1019,8 @@ fn constrain_go_impl(
         // refinement on a concrete value is an explicit `Restrict`, not
         // subsumption.
         (Type::Refinement(..), _) | (_, Type::Refinement(..)) => {
-            let (lbase, lrefs) = peel_refinements(lhs);
-            let (rbase, rrefs) = peel_refinements(rhs);
+            let (lbase, lrefs) = (lhs.peel_refinements(), lhs.refinements());
+            let (rbase, rrefs) = (rhs.peel_refinements(), rhs.refinements());
             // The refinements rhs requires that no transported lhs layer
             // matches (by `Refinement`'s structural `PartialEq`). Each side's
             // refinements are forced through its own morphism into the ambient frame
@@ -1028,10 +1029,10 @@ fn constrain_go_impl(
             // carries `sr` for them.
             let lrefs_in_ambient: Vec<Refinement> =
                 lrefs.iter().map(|l| sl.force_refinement(l)).collect();
-            let deficit: Vec<&Refinement> = rrefs
+            let deficit: RefinementSet = rrefs
                 .iter()
-                .copied()
                 .filter(|r| !lrefs_in_ambient.contains(&sr.force_refinement(r)))
+                .cloned()
                 .collect();
             if deficit.is_empty() {
                 // lhs's explicit layers already supply every refinement rhs requires.
@@ -1040,7 +1041,7 @@ fn constrain_go_impl(
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
                 // resolves to a concrete base lacking those refinements.
-                let demanded = wrap_refinements(rbase, &deficit);
+                let demanded = Type::refined(rbase.clone(), deficit);
                 constrain_go(lbase, &demanded, sl, sr, cache)
             } else {
                 Err(ConstrainError::Mismatch {
@@ -1055,30 +1056,6 @@ fn constrain_go_impl(
             rhs: rhs.clone(),
         }),
     }
-}
-
-/// Peel all outer [`Type::Refinement`] layers, returning the bare base type
-/// and the refinements carried by the peeled layers (outermost first).
-fn peel_refinements(ty: &Type) -> (&Type, Vec<&Refinement>) {
-    let mut refs = Vec::new();
-    let mut cur = ty;
-    while let Type::Refinement(inner, r) = cur {
-        refs.push(r);
-        cur = inner;
-    }
-    (cur, refs)
-}
-
-/// Re-wrap `base` in the given [`Type::Refinement`] layers (passed
-/// outermost-first), preserving their order.
-///
-/// Used by [`constrain_subtype`]'s refinement arm to rebuild the deficit
-/// refinement `{rbase | S₂ \ S₁}` from the rhs's own layers, so the kept refinements
-/// retain their real [`crate::ccl::Refinement`] payloads (predicate `Rc`s).
-fn wrap_refinements(base: &Type, refs: &[&Refinement]) -> Type {
-    refs.iter().rev().fold(base.clone(), |acc, r| {
-        Type::Refinement(Box::new(acc), (*r).clone())
-    })
 }
 
 /// Give an extrusion proxy the same trait obligations as the variable it
@@ -1161,10 +1138,9 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 .collect(),
             *openness,
         ),
-        Type::Refinement(inner, r) => Type::Refinement(
-            Box::new(extrude(inner, pol, target_level, cache)),
-            r.clone(),
-        ),
+        Type::Refinement(inner, r) => {
+            Type::refined(extrude(inner, pol, target_level, cache), r.clone())
+        }
         // Invariant payload: polarity is meaningless under invariance, so
         // both children are extruded with two-way proxies (a history is read
         // *and* written) instead of the polar one-way approximation below.
@@ -1402,7 +1378,8 @@ mod tests {
                     TypedExpr::var(Name::elem()),
                     BinOpKind::Compare(CompareKind::Equals),
                     TypedExpr::var(referenced.clone()),
-                ))),
+                )))
+                .into(),
             )
         };
         // Construction closes the reference into `#0`.
@@ -1505,8 +1482,8 @@ mod tests {
         // (`Refinement: PartialEq`).
         use crate::ccl::{Lit, TypedExpr};
         let mk = || {
-            Type::Refinement(
-                Box::new(prim(BaseType::Int)),
+            Type::refined_one(
+                prim(BaseType::Int),
                 Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
             )
         };
@@ -1525,8 +1502,8 @@ mod tests {
         // not one of them.
         use crate::ccl::{Lit, TypedExpr};
         let refined_dom = || {
-            Type::Refinement(
-                Box::new(Type::UIntRange(3)),
+            Type::refined_one(
+                Type::UIntRange(3),
                 Refinement {
                     predicate: Rc::new(TypedExpr::lit(Lit::Bool(true))),
                 },
@@ -1611,8 +1588,8 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mk = || {
-            Type::Refinement(
-                Box::new(prim(BaseType::Int)),
+            Type::refined_one(
+                prim(BaseType::Int),
                 Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
             )
         };
@@ -1639,8 +1616,8 @@ mod tests {
         );
 
         // A structurally *different* predicate must not collapse into it.
-        let c = Type::Refinement(
-            Box::new(prim(BaseType::Int)),
+        let c = Type::refined_one(
+            prim(BaseType::Int),
             Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(false)))),
         );
         assert_ne!(a, c, "distinct predicates must stay distinct");
@@ -2218,8 +2195,8 @@ mod tests {
         let Type::Fun { domain, .. } = ty else {
             panic!("expected fun, got {ty}");
         };
-        let Type::Refinement(_, r) = domain.as_ref() else {
-            panic!("expected refined domain, got {domain}");
+        let [r] = domain.refinements() else {
+            panic!("expected a singly-refined domain, got {domain}");
         };
         crate::ccl::symbolic::symbolic(&r.predicate)
     }
@@ -2238,10 +2215,7 @@ mod tests {
             "k",
             prim(BaseType::Int),
             Type::fun(
-                Type::Refinement(
-                    Box::new(prim(BaseType::Int)),
-                    gt_refinement(TypedExpr::var("k")),
-                ),
+                Type::refined_one(prim(BaseType::Int), gt_refinement(TypedExpr::var("k"))),
                 prim(BaseType::Int),
             ),
         );
@@ -2272,10 +2246,7 @@ mod tests {
             "k",
             prim(BaseType::Int),
             Type::fun(
-                Type::Refinement(
-                    Box::new(prim(BaseType::Int)),
-                    gt_refinement(TypedExpr::var("k")),
-                ),
+                Type::refined_one(prim(BaseType::Int), gt_refinement(TypedExpr::var("k"))),
                 prim(BaseType::Int),
             ),
         );
@@ -2312,10 +2283,7 @@ mod tests {
             "k",
             prim(BaseType::Int),
             Type::fun(
-                Type::Refinement(
-                    Box::new(prim(BaseType::Int)),
-                    gt_refinement(TypedExpr::var("k")),
-                ),
+                Type::refined_one(prim(BaseType::Int), gt_refinement(TypedExpr::var("k"))),
                 prim(BaseType::Int),
             ),
         )

@@ -7,6 +7,7 @@
 //! [`emit_groupby`].
 
 use super::*;
+use crate::ccl::Refinement;
 use crate::ccl::ty::FunKind;
 
 /// Recognize group-by sites and rewrite them to the bucketize chain.
@@ -143,29 +144,19 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     else {
         return None;
     };
-    let Type::Refinement(idx_ty, refinement) = refined_dom.as_ref() else {
+    let Type::Refinement(idx_ty, refinements) = refined_dom.as_ref() else {
         return None;
     };
-    // The bare predicate binds the implicit REFINEMENT_BINDER as the element:
-    //   pred = (__elem ▷ c ▷ key) == <key binder>
-    let pred = &*refinement.predicate;
-    let TypedExprNode::BinOp {
-        left,
-        op: BinOpKind::Compare(CompareKind::Equals),
-        right,
-    } = &pred.node
-    else {
-        return None;
-    };
-    // Identify which side is the element-extraction `__elem ▷ c ▷ key` and which
-    // is the free key binder (a `Var` not bound by the element).
-    let extract = if side_extracts_element(left) && is_free_var(right) {
-        left
-    } else if side_extracts_element(right) && is_free_var(left) {
-        right
-    } else {
-        return None;
-    };
+    // Find the refinement that *is* the grouping equation, by its shape. The domain
+    // may carry other refinements (an ordinary filter on the grouped collection);
+    // they are not this rewrite's to consume, so they ride along on the index
+    // type below. Nothing distinguishes the grouping refinement positionally — the
+    // set is unordered — which is exactly why the recognizer asks what a refinement
+    // *says* rather than where it sits.
+    let (key_eq, extract) = refinements
+        .iter()
+        .enumerate()
+        .find_map(|(i, r)| groupby_key_extraction(r).map(|e| (i, e)))?;
     // extract = r ▷ c ▷ key = Apply { argument: Apply { argument: Var(r), .. }, function: key }
     let TypedExprNode::Apply {
         function: key_expr,
@@ -198,7 +189,17 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     // safe; `groupby_recognition_lifts_the_key_without_aliasing` pins the property
     // rather than the mechanism.
     let key_pf = lambda_elim::run((**key_expr).clone()).ok()?;
-    let value_idx_ty = (**idx_ty).clone();
+    // Every refinement except the consumed grouping equation stays on the index
+    // domain — dropping them here would silently discard a filter.
+    let value_idx_ty = Type::refined(
+        (**idx_ty).clone(),
+        refinements
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != key_eq)
+            .map(|(_, r)| r.clone())
+            .collect(),
+    );
     let keys =
         compose((**c).clone(), key_pf).with_ty(Type::fun(value_idx_ty.clone(), (**key_ty).clone()));
     let grouped_values = emit_groupby(
@@ -211,6 +212,29 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     );
 
     Some(grouped_values)
+}
+
+/// Read a refinement as a group-by key equation, yielding its element-extraction
+/// side: the bare predicate binds the implicit `REFINEMENT_BINDER` as the
+/// element, so the grouping refinement reads `(__elem ▷ c ▷ key) == <key binder>` —
+/// one side extracting from the element, the other a free key binder.
+fn groupby_key_extraction(r: &Refinement) -> Option<&Expr> {
+    let TypedExprNode::BinOp {
+        left,
+        op: BinOpKind::Compare(CompareKind::Equals),
+        right,
+    } = &r.predicate.node
+    else {
+        return None;
+    };
+    let (left, right) = (left.as_ref(), right.as_ref());
+    if side_extracts_element(left) && is_free_var(right) {
+        Some(left)
+    } else if side_extracts_element(right) && is_free_var(left) {
+        Some(right)
+    } else {
+        None
+    }
 }
 
 /// Is `e` the element-extraction `__elem ▷ c ▷ key` — an application whose

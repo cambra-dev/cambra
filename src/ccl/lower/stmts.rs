@@ -1162,11 +1162,16 @@ pub(super) fn lower_type_expr(
         // `Bool` term with `__elem` free — the same shape a singleton or a
         // `groupby` refinement carries. Discharge of the predicate is the
         // solver's structural refinement subsumption; this only builds the type.
+        //
+        // A written base that is itself a refinement (`{{Int where p} where q}`)
+        // merges into one set rather than nesting: the two predicates restrict
+        // the same element, so the nesting the source spells carries nothing the
+        // set does not.
         ChlExpr::BraceRefinement { base, predicate } => {
             let base_ty = lower_type_expr(base, ctx)?;
             let pred = ctx.with_in_refinement_predicate(|ctx| lower_expr(predicate, ctx))?;
-            Ok(Type::Refinement(
-                Box::new(base_ty),
+            Ok(Type::refined_one(
+                base_ty,
                 crate::ccl::Refinement::born(Rc::new(pred)),
             ))
         }
@@ -1894,10 +1899,12 @@ x";
     // Nested refinement: both levels' `_` resolve to `__elem`, and the
     // save/restore of `in_refinement_predicate` around the inner annotation
     // keeps the flag from leaking — the outer `_` still lowers to `__elem`
-    // after the inner predicate closes.
+    // after the inner predicate closes. The two written levels land as one
+    // refinement set: both predicates restrict the same element, so the source's
+    // nesting carries nothing the set does not.
     #[case(
         "x: { {Int where _ != 1} where _ != 0} = 5\nx",
-        "{{Int | __elem != 1} | __elem != 0}"
+        "{Int | __elem != 0, __elem != 1}"
     )]
     fn test_lower_refinement_annotation(#[case] code: &str, #[case] expected_ty: &str) {
         use crate::ccl::{Type, TypedExprNode};
