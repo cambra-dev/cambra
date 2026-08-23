@@ -2299,7 +2299,7 @@ mod tests {
             let mut best_compile = std::time::Duration::MAX;
             let mut best_fold = std::time::Duration::MAX;
             let mut rows = 0usize;
-            let mut rules = 0usize;
+            let mut tags = 0usize;
             // The three retained pane snapshots are unconditional — they are not
             // part of what the capture switch turns off — so their size is the
             // pane design's real memory floor, against which the logs are noise.
@@ -2309,7 +2309,7 @@ mod tests {
                 let program = compile_ok(&code);
                 best_compile = best_compile.min(t0.elapsed());
                 rows = program.provenance_table.len();
-                rules = program.provenance_table.rule_count();
+                tags = program.provenance_table.tag_count();
                 panes_nodes = collect_tree_ids(&program.pre_inference_ir).len()
                     + collect_tree_ids(&program.post_inference_ir).len()
                     + collect_tree_ids(&program.post_channelize_ir).len();
@@ -2327,7 +2327,7 @@ mod tests {
             total_fold += best_fold;
             eprintln!(
                 "[perf capture={capture}] {shape}/{n}: compile {:?} fold {:?} rows {rows} \
-                 rules {rules} pane_nodes {panes_nodes} lines {}",
+                 tags {tags} pane_nodes {panes_nodes} lines {}",
                 best_compile,
                 best_fold,
                 code.lines().count(),

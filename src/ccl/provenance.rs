@@ -587,7 +587,7 @@ impl serde::Serialize for SourceAttribution {
 /// How a rewritten node came to exist, for tooltips and display policy.
 ///
 /// `Hash`/`Eq` are what let a [`ProvenanceTable`] intern the whole triple as one
-/// [`RuleId`]. The recording site fixes `label` and `nature`, the enclosing
+/// [`TagId`]. The recording site fixes `label` and `nature`, the enclosing
 /// [`PassScope`] supplies `via`, and both are settled before a row is written,
 /// so the triple is one value rather than three columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -678,7 +678,7 @@ impl Leak {
 }
 
 /// The [`SourceAttribution`] a recorded node carries: the ordered, deduplicated
-/// union of its attribution sources' spans, tagged with the row's rule.
+/// union of its attribution sources' spans, tagged with the row's tag.
 ///
 /// **The sources are `parents` ∪ `blame`** — both channels, `parents` first and
 /// then blame's distinct additions. Parentage takes precedence in the *order*,
@@ -850,7 +850,7 @@ pub(crate) fn collapse(
     let mut attr: SourceProjection = upstream_attr.clone();
 
     for &x in &vertices {
-        let Some(tag) = table.rule_in(x, passes) else {
+        let Some(tag) = table.tag_in(x, passes) else {
             // No row among these passes: an input-pane id, reachable from itself and
             // nothing else. A node descends from itself, so the self-edge is an
             // ancestry edge. Its upstream attribution passes through unchanged.
@@ -1092,7 +1092,7 @@ pub(crate) fn collapse_lowering(
 // fold is one ascending sweep over the rows a pane relation's passes wrote.
 // ===========================================================================
 
-/// An interned [`RewriteTag`] — a [`ProvenanceTable`] row's `rule` column.
+/// An interned [`RewriteTag`] — a [`ProvenanceTable`] row's `tag` column.
 ///
 /// The whole `{via, nature, label}` triple is interned as one id because the
 /// three are settled together: `via` is the session's pass, and
@@ -1101,22 +1101,28 @@ pub(crate) fn collapse_lowering(
 /// not of the program being compiled — so one index buys all three columns and a
 /// row carries a single handle instead of three fields.
 ///
+/// A `TagId` is not the identity of a *rewrite rule*: `via` is part of the
+/// interned triple, so a shared helper recorded under whichever [`PassScope`] is
+/// open around it — `subst`'s `"subst.transport"`, `PredMemo::rebuild`'s
+/// `"predicate.rebuild"` — interns one tag per pass it runs under. The `label`
+/// alone names the rewrite.
+///
 /// Only meaningful against the table that minted it: the ids are dense indices
 /// into that table's tag vector, not global constants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct RuleId(u32);
+pub(crate) struct TagId(u32);
 
-/// One recorded node's row. Both edge kinds plus the interned rule; see
+/// One recorded node's row. Both edge kinds plus the interned tag; see
 /// [`ProvenanceTable`] for why there is no span column, and
 /// [`record`](ProvenanceTable::record) for the two invariants a row must satisfy.
 struct Row {
     parents: Vec<NodeId>,
     blame: Vec<NodeId>,
-    rule: RuleId,
+    tag: TagId,
 }
 
 /// Per-compile provenance keyed by the node each record describes: `NodeId → {
-/// parents, blame, rule }`.
+/// parents, blame, tag }`.
 ///
 /// # The two edge kinds stay separate
 ///
@@ -1143,7 +1149,7 @@ struct Row {
 /// The key space is `NodeId`, and a `NodeId` can be *addressed* without ever
 /// having been *recorded*. So every read tolerates an unknown id —
 /// [`parents`](Self::parents) and [`blame`](Self::blame) come back empty,
-/// [`rule`](Self::rule) `None` — and, the sharper half of the same rule,
+/// [`tag`](Self::tag) `None` — and, the sharper half of the same rule,
 /// [`deaths`](Self::deaths) considers **only ids a [`record`](Self::record)
 /// actually wrote**. A death is the set difference `recorded ∖ live`, so a
 /// difference taken over addressed-but-unwritten ids would report nodes that
@@ -1181,32 +1187,32 @@ struct Row {
 #[derive(Default)]
 pub(crate) struct ProvenanceTable {
     rows: HashMap<NodeId, Row>,
-    /// Tag by [`RuleId`] index — the interning table's forward direction.
-    rules: Vec<RewriteTag>,
+    /// Tag by [`TagId`] index — the interning table's forward direction.
+    tags: Vec<RewriteTag>,
     /// Tag → its already-assigned id, so equal tags share one row column.
-    interned: HashMap<RewriteTag, RuleId>,
+    interned: HashMap<RewriteTag, TagId>,
 }
 
 // The accessors are the table's whole contract and are exercised as such by this
 // module's tests; the compiler itself only ever writes rows.
 #[allow(dead_code)]
 impl ProvenanceTable {
-    /// The [`RuleId`] for `tag` in this table, assigning one on first sight.
+    /// The [`TagId`] for `tag` in this table, assigning one on first sight.
     ///
     /// Interning is separate from [`record`](Self::record) because one closing
     /// guard writes many rows under one tag: the caller interns once and hands
     /// the handle to each row.
-    pub(crate) fn intern_rule(&mut self, tag: RewriteTag) -> RuleId {
+    pub(crate) fn intern_tag(&mut self, tag: RewriteTag) -> TagId {
         if let Some(id) = self.interned.get(&tag) {
             return *id;
         }
         // u32 is not a real limit: the distinct-tag count is a source-code
         // property — one triple per label-and-nature pair the compiler writes —
         // not a function of the program being compiled.
-        let id = RuleId(
-            u32::try_from(self.rules.len()).expect("more distinct rewrite tags than a u32 indexes"),
+        let id = TagId(
+            u32::try_from(self.tags.len()).expect("more distinct rewrite tags than a u32 indexes"),
         );
-        self.rules.push(tag);
+        self.tags.push(tag);
         self.interned.insert(tag, id);
         id
     }
@@ -1240,13 +1246,7 @@ impl ProvenanceTable {
     /// path — every mint under an open guard lands here — and each one costs a
     /// hash probe or a scan. What is gated is the checking; the row written is
     /// the same row in every build.
-    pub(crate) fn record(
-        &mut self,
-        id: NodeId,
-        parents: &[NodeId],
-        blame: &[NodeId],
-        rule: RuleId,
-    ) {
+    pub(crate) fn record(&mut self, id: NodeId, parents: &[NodeId], blame: &[NodeId], tag: TagId) {
         debug_assert!(
             !self.rows.contains_key(&id),
             "node {id:?} already has a provenance row — a rewrite claims to have minted an id \
@@ -1266,7 +1266,7 @@ impl ProvenanceTable {
             Row {
                 parents: parents.to_vec(),
                 blame: blame.to_vec(),
-                rule,
+                tag,
             },
         );
     }
@@ -1286,15 +1286,15 @@ impl ProvenanceTable {
     }
 
     /// The rewrite that produced `id`, or `None` for an unrecorded id.
-    pub(crate) fn rule(&self, id: NodeId) -> Option<RewriteTag> {
+    pub(crate) fn tag(&self, id: NodeId) -> Option<RewriteTag> {
         let row = self.rows.get(&id)?;
-        Some(self.rules[row.rule.0 as usize])
+        Some(self.tags[row.tag.0 as usize])
     }
 
     /// The interned handle a recorded id's row holds, or `None` for an
     /// unrecorded id. The identity two rows share when they name one rewrite.
-    pub(crate) fn rule_id(&self, id: NodeId) -> Option<RuleId> {
-        Some(self.rows.get(&id)?.rule)
+    pub(crate) fn tag_id(&self, id: NodeId) -> Option<TagId> {
+        Some(self.rows.get(&id)?.tag)
     }
 
     /// Whether `id` has a row.
@@ -1309,8 +1309,8 @@ impl ProvenanceTable {
     /// relation, an id produced by a pass it does not span is an ordinary
     /// un-produced id, which is exactly how the input pane's own nodes have to
     /// read for the fold to bottom out there.
-    pub(crate) fn rule_in(&self, id: NodeId, passes: &[Pass]) -> Option<RewriteTag> {
-        self.rule(id).filter(|tag| passes.contains(&tag.via))
+    pub(crate) fn tag_in(&self, id: NodeId, passes: &[Pass]) -> Option<RewriteTag> {
+        self.tag(id).filter(|tag| passes.contains(&tag.via))
     }
 
     /// The ids `passes` produced, in arbitrary order.
@@ -1322,7 +1322,7 @@ impl ProvenanceTable {
     fn rows_in<'a>(&'a self, passes: &'a [Pass]) -> impl Iterator<Item = NodeId> + 'a {
         self.rows
             .iter()
-            .filter(|(_, row)| passes.contains(&self.rules[row.rule.0 as usize].via))
+            .filter(|(_, row)| passes.contains(&self.tags[row.tag.0 as usize].via))
             .map(|(id, _)| *id)
     }
 
@@ -1353,10 +1353,10 @@ impl ProvenanceTable {
         self.rows.len()
     }
 
-    /// The number of distinct rewrite tags interned — the rule column's
+    /// The number of distinct rewrite tags interned — the `tag` column's
     /// cardinality.
-    pub(crate) fn rule_count(&self) -> usize {
-        self.rules.len()
+    pub(crate) fn tag_count(&self) -> usize {
+        self.tags.len()
     }
 
     /// The distinct passes this table holds rows for, deduplicated.
@@ -1368,7 +1368,7 @@ impl ProvenanceTable {
     #[cfg(test)]
     pub(crate) fn recorded_passes(&self) -> Vec<Pass> {
         let mut out: Vec<Pass> = Vec::new();
-        for tag in &self.rules {
+        for tag in &self.tags {
             if !out.contains(&tag.via) {
                 out.push(tag.via);
             }
@@ -1500,9 +1500,9 @@ impl OpenStep {
             let mut parents = vec![origin];
             parents.extend(consumed.into_iter().filter(|c| *c != origin));
             with_table(|table| {
-                let rule = table.intern_rule(RewriteTag { via, nature, label });
+                let tag_id = table.intern_tag(RewriteTag { via, nature, label });
                 for &id in &births {
-                    table.record(id, &parents, &blame, rule);
+                    table.record(id, &parents, &blame, tag_id);
                 }
             });
         }
@@ -1516,9 +1516,9 @@ impl OpenStep {
             return;
         }
         with_table(|table| {
-            let rule = table.intern_rule(RewriteTag { via, nature, label });
+            let tag_id = table.intern_tag(RewriteTag { via, nature, label });
             for &(origin, fresh) in copies {
-                table.record(fresh, &[origin], &[], rule);
+                table.record(fresh, &[origin], &[], tag_id);
             }
         });
     }
@@ -2201,8 +2201,8 @@ mod tests {
         blame: &[NodeId],
         tag: RewriteTag,
     ) {
-        let rule = table.intern_rule(tag);
-        table.record(id, parents, blame, rule);
+        let tag_id = table.intern_tag(tag);
+        table.record(id, parents, blame, tag_id);
     }
 
     /// A table holding exactly `rows`, each `(node, parents)` with no blame.
@@ -3119,7 +3119,7 @@ mod tests {
         );
         assert_eq!(table.parents(b), &[slot]);
         assert_eq!(
-            table.rule(a),
+            table.tag(a),
             Some(RewriteTag {
                 via: TEST_PASS,
                 nature: Nature::Expansion,
@@ -3128,7 +3128,7 @@ mod tests {
             "the row's `via` is the ambient pass — the one part of the tag no \
              recording site knows",
         );
-        assert_eq!(table.rule(a), table.rule(b));
+        assert_eq!(table.tag(a), table.tag(b));
         assert!(
             !table.contains(slot),
             "the named slot is read, not produced: it gets no row of its own",
@@ -3164,8 +3164,8 @@ mod tests {
             &[outer_slot],
             "the outer recording owns the births outside the inner extent, and only those",
         );
-        assert_eq!(table.rule(inner_id).map(|t| t.label), Some("rw.inner"));
-        assert_eq!(table.rule(outer_pre).map(|t| t.label), Some("rw.outer"));
+        assert_eq!(table.tag(inner_id).map(|t| t.label), Some("rw.inner"));
+        assert_eq!(table.tag(outer_pre).map(|t| t.label), Some("rw.outer"));
     }
 
     #[test]
@@ -3595,12 +3595,12 @@ mod tests {
     fn a_row_round_trips_every_column() {
         let mut table = ProvenanceTable::default();
         let [node, parent, blamed] = ids();
-        let rule = table.intern_rule(tag("rw.one"));
-        table.record(node, &[parent], &[blamed], rule);
+        let tag_id = table.intern_tag(tag("rw.one"));
+        table.record(node, &[parent], &[blamed], tag_id);
 
         assert_eq!(table.parents(node), &[parent]);
         assert_eq!(table.blame(node), &[blamed]);
-        assert_eq!(table.rule(node), Some(tag("rw.one")));
+        assert_eq!(table.tag(node), Some(tag("rw.one")));
         assert!(table.contains(node));
     }
 
@@ -3611,8 +3611,8 @@ mod tests {
         // or reordered into a "primary".
         let mut table = ProvenanceTable::default();
         let [node, p0, p1, p2] = ids();
-        let rule = table.intern_rule(tag("rw.fuse"));
-        table.record(node, &[p0, p1, p2], &[], rule);
+        let tag_id = table.intern_tag(tag("rw.fuse"));
+        table.record(node, &[p0, p1, p2], &[], tag_id);
 
         assert_eq!(table.parents(node), &[p0, p1, p2]);
         assert!(
@@ -3627,13 +3627,13 @@ mod tests {
         // recording ever produced. Every read must have an answer for it.
         let mut table = ProvenanceTable::default();
         let [parent, recorded, never] = ids();
-        let rule = table.intern_rule(tag("rw.one"));
-        table.record(recorded, &[parent], &[], rule);
+        let tag_id = table.intern_tag(tag("rw.one"));
+        table.record(recorded, &[parent], &[], tag_id);
 
         assert!(table.parents(never).is_empty());
         assert!(table.blame(never).is_empty());
-        assert_eq!(table.rule(never), None);
-        assert_eq!(table.rule_in(never, PASSES), None);
+        assert_eq!(table.tag(never), None);
+        assert_eq!(table.tag_in(never, PASSES), None);
         assert!(!table.contains(never));
     }
 
@@ -3641,15 +3641,15 @@ mod tests {
     fn a_row_outside_the_passes_reads_as_unrecorded_to_that_relation() {
         let mut table = ProvenanceTable::default();
         let [parent, node] = ids();
-        let rule = table.intern_rule(RewriteTag {
+        let tag_id = table.intern_tag(RewriteTag {
             via: Pass::Mono,
             ..tag("rw.one")
         });
-        table.record(node, &[parent], &[], rule);
+        table.record(node, &[parent], &[], tag_id);
 
-        assert!(table.rule(node).is_some(), "the row exists");
+        assert!(table.tag(node).is_some(), "the row exists");
         assert_eq!(
-            table.rule_in(node, PASSES),
+            table.tag_in(node, PASSES),
             None,
             "but not to a pane relation whose passes exclude it",
         );
@@ -3668,9 +3668,9 @@ mod tests {
         // them did not move the death counts.
         let mut table = ProvenanceTable::default();
         let [parent, survivor, dead, never] = ids();
-        let rule = table.intern_rule(tag("rw.one"));
-        table.record(survivor, &[parent], &[], rule);
-        table.record(dead, &[parent], &[], rule);
+        let tag_id = table.intern_tag(tag("rw.one"));
+        table.record(survivor, &[parent], &[], tag_id);
+        table.record(dead, &[parent], &[], tag_id);
 
         let live: HashSet<NodeId> = set([survivor]);
         let deaths = table.deaths(&live);
@@ -3686,12 +3686,12 @@ mod tests {
     }
 
     #[test]
-    fn equal_tags_share_one_rule_id_and_distinct_tags_do_not() {
+    fn equal_tags_share_one_tag_id_and_distinct_tags_do_not() {
         let mut table = ProvenanceTable::default();
         let [parent, a, b, c] = ids();
-        let one = table.intern_rule(tag("rw.one"));
-        let one_again = table.intern_rule(tag("rw.one"));
-        let other = table.intern_rule(tag("rw.other"));
+        let one = table.intern_tag(tag("rw.one"));
+        let one_again = table.intern_tag(tag("rw.one"));
+        let other = table.intern_tag(tag("rw.other"));
         assert_eq!(one, one_again, "the tag is the interning key, by value");
         assert_ne!(one, other);
 
@@ -3699,27 +3699,27 @@ mod tests {
         table.record(b, &[parent], &[], one_again);
         table.record(c, &[parent], &[], other);
         assert_eq!(
-            table.rule_id(a),
-            table.rule_id(b),
+            table.tag_id(a),
+            table.tag_id(b),
             "two rows naming one rewrite hold one handle",
         );
-        assert_ne!(table.rule_id(a), table.rule_id(c));
-        assert_eq!(table.rule_count(), 2, "two distinct tags, two entries");
-        assert_eq!(table.rule(c), Some(tag("rw.other")));
+        assert_ne!(table.tag_id(a), table.tag_id(c));
+        assert_eq!(table.tag_count(), 2, "two distinct tags, two entries");
+        assert_eq!(table.tag(c), Some(tag("rw.other")));
     }
 
     #[test]
-    fn a_differing_nature_is_a_distinct_rule_despite_a_shared_label() {
+    fn a_differing_nature_is_a_distinct_tag_despite_a_shared_label() {
         // The triple is interned whole: one arm of a rewrite relabelled to a
-        // different nature is a different rule, which is exactly why a site that
+        // different nature is a different tag, which is exactly why a site that
         // needs two natures opens a second recording rather than mutating one.
         let mut table = ProvenanceTable::default();
-        let machinery = table.intern_rule(tag("rw.one"));
-        let expansion = table.intern_rule(RewriteTag {
+        let machinery = table.intern_tag(tag("rw.one"));
+        let expansion = table.intern_tag(RewriteTag {
             nature: Nature::Expansion,
             ..tag("rw.one")
         });
         assert_ne!(machinery, expansion);
-        assert_eq!(table.rule_count(), 2);
+        assert_eq!(table.tag_count(), 2);
     }
 }
