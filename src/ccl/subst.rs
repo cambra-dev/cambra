@@ -466,7 +466,7 @@ impl Subst {
         // just had to be fixed for.
         //
         // Recording rather than simply freshening is the load-bearing half —
-        // unbracketed, these produced 50 `DanglingParent` on `inner_join`.
+        // with nothing recording, these produced 50 `DanglingParent` on `inner_join`.
         if self.is_id() {
             let _g = crate::ccl::provenance::enter(
                 e.node_id(),

@@ -781,10 +781,10 @@ pub type Expr = TypedExpr;
 /// [`Type`] carries no identity: the only [`NodeId`]s reachable through one are
 /// the `TypedExpr`s inside a `Refinement.predicate`, which is an
 /// `Rc<TypedExpr>` — so `ty.clone()` bumps a refcount and reaches this impl not
-/// at all. That is load-bearing twice over: predicate interiors are outside the
-/// uniqueness domain (`assert_unique_node_ids` walks children only), and
-/// planning's compile memo is keyed on `Rc` identity, so splitting the sharing
-/// would compile one predicate once per copy.
+/// at all. That is load-bearing twice over: a copy shares its source's predicate
+/// terms, which is what `assert_unique_node_ids`' predicate walk dedups by `Rc`
+/// to admit, and planning's compile memo is keyed on `Rc` identity, so splitting
+/// the sharing would compile one predicate once per copy.
 ///
 /// **`NodeId::PLACEHOLDER` is not preserved.** A [`throwaway`](TypedExpr::throwaway)
 /// node is built to be rendered into a panic message, never cloned into a tree;

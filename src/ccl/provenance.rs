@@ -1872,7 +1872,7 @@ pub(crate) fn on_mint(id: NodeId) {
         captured || !rows_would_reach_the_table(),
         "{id:?} was minted with no recording open, under a phase scope that writes \
          rows: the birth reaches no row and the fold reports the node as Unrecorded. \
-         Bracket the rewrite in `provenance::enter`."
+         Open a recording over the rewrite with `provenance::enter`."
     );
 }
 
@@ -1882,7 +1882,7 @@ pub(crate) fn on_mint(id: NodeId) {
 /// Mirrors the routing in [`RecordingGuard::drop`], which is what makes it the
 /// right precondition for [`on_mint`]'s assert. Lowering is excluded because it
 /// records through the leaf channel ([`LoweringStep::Leaf`]) rather than through
-/// births, so an unbracketed mint there is the designed path and not a gap.
+/// births, so a mint with nothing recording is the designed path there, not a gap.
 ///
 /// Not `cfg(debug_assertions)`-gated: `debug_assert!` compiles its expression in
 /// every configuration and only drops the execution, so a gated helper fails the
@@ -3214,7 +3214,7 @@ mod tests {
 
     #[test]
     fn no_recording_open_records_nothing() {
-        // No phase scope: an unbracketed mint here is the legitimate case, so
+        // No phase scope: a mint with nothing recording is legitimate here, so
         // `on_mint`'s assert does not apply. Under a phase scope the same code
         // trips it, which is the point of the assert — see
         // `rows_would_reach_the_table`.

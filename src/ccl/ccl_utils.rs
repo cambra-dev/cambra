@@ -1269,8 +1269,8 @@ impl<C> PredMemo<C> {
     /// slots and a rebuild cannot mutate through it, so it builds a new `Rc` and
     /// repoints the refinement it was given. If some other type still holds the
     /// original, the two coexist — and preserving ids then puts one id-set on two
-    /// live terms, which nothing catches because predicate uniqueness is not
-    /// asserted.
+    /// live terms, which `assert_unique_node_ids`' predicate walk reports at the
+    /// next phase boundary.
     ///
     /// [`uniquify`](crate::ccl::uniquify) is the one caller entitled to this: it
     /// walks the whole tree, and asserts the resulting 1:1 correspondence

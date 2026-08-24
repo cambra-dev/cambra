@@ -805,13 +805,18 @@ impl MaterializedPanes {
     }
 }
 
-/// Ids duplicated across *distinct* predicate terms — the uniqueness question
-/// `assert_unique_node_ids` does not answer, since it walks the main tree only.
+/// Ids carried by two *distinct* predicate terms, or by a predicate term and the
+/// main tree — the half of uniqueness [`duplicate_node_ids`] cannot answer.
 ///
-/// Dedups by `Rc` pointer first — one term riding many type slots is one term
-/// and shares its ids with itself legitimately — then reports any id carried by
-/// two different terms, or by a predicate term and the main tree.
-#[cfg(test)]
+/// Dedups by `Rc` pointer first: one term riding many type slots is one term and
+/// shares its ids with itself, and that sharing is an invariant the predicate
+/// domain is built on (`design/type-inference.md`, "Sharing is an invariant, not
+/// an optimization detail"). What survives the dedup is two live terms on one
+/// id-set. A raw id-set walk over the type slots cannot report that, because it
+/// cannot tell the sharing apart from the collision — which is why the main-tree
+/// walk stays `Rc`-blind and this one does not.
+///
+/// Both walks run at every boundary, from [`assert_unique_node_ids`].
 pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)> {
     use crate::ccl::ty::Type;
     use std::collections::{HashMap, HashSet};
@@ -942,10 +947,12 @@ fn gate_leaks(leaks: &[Leak], pair: &str) {
 }
 
 /// Every duplicated [`NodeId`] over the **main tree** — the `walk_children`
-/// node-set, refinement predicates excluded — uniqueness is a narrower question
-/// than explanation, and this matches inline's blind spot, so the
-/// check does not false-fire there). Returns `(id, node kind)` for each
+/// node-set, refinement predicates excluded. Returns `(id, node kind)` for each
 /// occurrence *beyond the first*.
+///
+/// Predicates are excluded because they are reached through `Rc`s a walk visits
+/// many times over, so a second sighting of an id is not yet a collision;
+/// [`predicate_id_collisions`] answers that domain, dedupping by `Rc` first.
 fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
     fn walk(
         e: &Expr,
@@ -976,13 +983,13 @@ fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
 /// It catches the *class* of preserve-as-mint / clone-without-freshen bugs
 /// across the whole test suite, not just a crafted program.
 ///
-/// The walk is [`duplicate_node_ids`]'s main-tree `walk_children` walk, and
-/// **deliberately narrower than [`collect_tree_ids`]**, which enumerates
-/// refinement predicates too. The two answer different questions — explanation
-/// versus uniqueness (`design/provenance.md`, "Walking the ids") — and a
-/// predicate-inclusive uniqueness walk would false-fire on inline's known
-/// predicate blind spot, where a predicate interior legitimately aliases a
-/// main-tree id. Gated
+/// Uniqueness spans the same ids [`collect_tree_ids`] enumerates, and takes two
+/// walks to check because the two domains share differently.
+/// [`duplicate_node_ids`] is `Rc`-blind and covers the main tree, where a second
+/// sighting of an id is a collision outright. [`predicate_id_collisions`] dedups
+/// by `Rc` first and covers the predicate interiors, where one term riding many
+/// type slots shares its ids with itself. See `design/provenance.md`, "Walking
+/// the ids". Gated
 /// via `cfg!(...)` as an expression (not a `#[cfg]` item) so the same call site
 /// compiles under both `./ci.sh` clippy passes without a release-only
 /// gated-item-reference failure.
@@ -997,6 +1004,14 @@ pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
          (id, kind): {:?}",
         dups.len(),
         dups
+    );
+    let pred_dups = predicate_id_collisions(expr);
+    assert!(
+        pred_dups.is_empty(),
+        "predicate node-id uniqueness invariant violated at `{boundary}`: {} \
+         collision(s) (id, domains): {:?}",
+        pred_dups.len(),
+        pred_dups
     );
     // The `Default`/`mem::take` sentinel (see `NodeId::PLACEHOLDER`) is a
     // transient throwaway that must always be overwritten before it reaches a
@@ -1445,6 +1460,11 @@ pub fn compile_program(
     // beta-reduction) and preserves defer-returning generators, so the
     // post-inline wall is the relaxed `check_pre_channelize`, not strict
     // `typecheck`.
+    // Inference mints predicates (`lit_singleton`) and clones a definition per
+    // instantiation (`specialize_use`), so its output is checked before the pane
+    // is taken off it.
+    assert_unique_node_ids(&expr, "post-inference");
+
     // Retain the post-inference IR for the inspector before `inline` consumes
     // `expr`. This is the source-shaped, fully-typed anchor (lambdas intact, not
     // yet point-free; inline/transact/letrec/channelize/lambda_elim/planning have
@@ -1932,12 +1952,11 @@ mod tests {
     /// vacuous — where some node's origin is another node, so the fold had to
     /// read a row. See
     /// [`the_pane_folds_derive_a_non_vacuous_provenance_map`].
-    /// Grew from seven entries to sixteen — a strict superset, every original
-    /// retained — when monomorphization and transport-mode substitution started
-    /// recording. `pre-inference → post-inference` in particular was vacuous on
-    /// eight programs because the only phase rewriting there, `Infer`,
-    /// opened its recording *after* the clone that produced its nodes, so
-    /// nothing captured.
+    ///
+    /// Pinned rather than counted: a recording that opens after the clone that
+    /// produced its nodes captures nothing, and the fold still succeeds — it
+    /// reads the pane pair as pure identity. The pin is what makes that
+    /// difference visible, so it lists names and not a total.
     const EXERCISED_BOUNDARIES: &[&str] = &[
         "arithmetic / pre-inference → post-inference",
         "feed_loop / post-inference → post-channelize",
@@ -1963,10 +1982,10 @@ mod tests {
     /// pane pairs where the fold had to read a *row* are exactly the ones
     /// pinned above.
     ///
-    /// The non-vacuity half is what this test is for. Fifteen of the
-    /// twenty-two corpus pane pairs are pure identity: no phase inside them
-    /// minted, so the map is the input pane's self-edges and holds for
-    /// reasons that have nothing to do with the recording. A corpus edit that
+    /// The non-vacuity half is what this test is for. Six of the twenty-two
+    /// corpus pane pairs are pure identity: no phase inside them minted, so the
+    /// map is the input pane's self-edges and holds for reasons that have
+    /// nothing to do with the recording. A corpus edit that
     /// silently dropped the rewriting programs would otherwise leave a green
     /// tautology behind.
     #[test]
@@ -2175,22 +2194,21 @@ mod tests {
     }
 
     /// **Distinct predicate terms never share a `NodeId`** — with each other, or
-    /// with the main tree.
+    /// with the main tree — on the three trees the panes retain.
     ///
-    /// Predicate ids are in the explanation domain but `assert_unique_node_ids`
-    /// walks the main tree only (`design/provenance.md`, "Walking the ids"), so this
-    /// is the only thing asserting uniqueness for them. Dedup is by `Rc` pointer
-    /// first: one term riding many type slots is one term and shares ids with
-    /// itself legitimately.
+    /// [`assert_unique_node_ids`] runs the same [`predicate_id_collisions`] walk
+    /// at every phase boundary, so what this adds is the panes: `pre_inference_ir`
+    /// is snapshotted after `uniquify`, between two boundaries, and no boundary
+    /// walk reaches it.
     ///
-    /// What this catches is a rebuild that **preserves ids when it should not**. A
-    /// predicate cannot be mutated through its `Rc`, so every rewrite builds a new
-    /// `Rc` and repoints the refinement it was handed. That is a *replacement*
-    /// only if the walk reaches every occurrence; otherwise the original survives
-    /// on some type the walk missed, and preserving ids puts one id-set on two
-    /// live terms. `PredMemo::replacing` is the opt-in for walks that do reach
-    /// everything, and `uniquify` — the only one — asserts its own 1:1
-    /// correspondence separately.
+    /// What the walk catches is a rebuild that **preserves ids when it should
+    /// not**. A predicate cannot be mutated through its `Rc`, so every rewrite
+    /// builds a new `Rc` and repoints the refinement it was handed. That is a
+    /// *replacement* only if the walk reaches every occurrence; otherwise the
+    /// original survives on some type the walk missed, and preserving ids puts one
+    /// id-set on two live terms. `PredMemo::replacing` is the opt-in for walks
+    /// that do reach everything, and `uniquify` — the only one — asserts its own
+    /// 1:1 correspondence separately.
     #[test]
     fn distinct_predicate_terms_never_share_a_node_id() {
         let mut found: Vec<(String, usize, &'static str)> = Vec::new();

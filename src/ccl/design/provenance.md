@@ -98,8 +98,10 @@ Four properties define a `NodeId`.
   copies. A call site duplicating a subtree gets distinct identities without asking for them, so no
   site has to work out which of its copies is the survivor — reaching a shared id takes writing one
   through a named primitive ([Duplication](#duplication)).
-- **Uniqueness is asserted on the main tree only.** `assert_unique_node_ids` walks children and
-  stops there, so the `NodeId`s inside refinement predicates are outside the uniqueness walk.
+- **Uniqueness is asserted over the whole reachable tree, by two walks.**
+  `assert_unique_node_ids` runs an `Rc`-blind walk over the main tree and an `Rc`-dedupping walk
+  over the refinement predicates, because the two domains share differently
+  ([Walking the ids](#walking-the-ids)).
 
 `NodeId::PLACEHOLDER` is the reserved sentinel for `Default`/`mem::take` throwaways. The recorder —
 the ambient session that logs every mint and copy ([The recorder](#the-recorder)) — ignores it, and
@@ -111,24 +113,28 @@ data, as each row's `via`, and never in a type.
 
 ### Walking the ids
 
-**Two questions, two domains**, and they answer differently:
+**Two questions over one id domain.** Explanation asks *which ids must the fold
+account for*; uniqueness asks *may two live nodes share an id*. Both range over
+the main tree and its refinement predicates, and `collect_tree_ids` is the
+operative enumeration of that domain: children, plus the predicate reachable
+through a type slot, a `user_annotation`, or a `Cast` target. The fold's leak
+classes and every `SourceProjection` enumerate from it, so a node it returns is a
+node the fold must explain or report as a leak.
 
-- **Explanation** — *which ids must the fold account for?* The main tree **and
-  its refinement predicates**. `collect_tree_ids` enumerates both (children,
-  plus the predicate reachable through a type slot, a `user_annotation`, or a
-  `Cast` target) and is the operative definition: the fold's leak classes and
-  every `SourceProjection` enumerate from it, so a node it returns is a node the
-  fold must explain or report as a leak.
-- **Uniqueness** — *may two live nodes share an id?* The main tree, and nothing
-  else. `assert_unique_node_ids` walks children only, and deliberately: a
-  `NodeId` inside a refinement predicate may legitimately alias a main-tree id at
-  inline's blind spot, so a predicate-inclusive uniqueness walk would false-fire.
-  Uniqueness *across distinct predicate terms* is asserted instead, by the corpus
-  test `distinct_predicate_terms_never_share_a_node_id`.
+Uniqueness needs **two walks** over that one domain, because the main tree and
+the predicates share differently. `assert_unique_node_ids` runs both at every
+phase boundary:
 
-Refinement predicates are the one place the two domains come apart. Their ids are
-ordinary ids from the same counter, `collect_tree_ids` enumerates them, and
-`assert_unique_node_ids` does not walk them.
+- **The main tree** is walked `Rc`-blind by `duplicate_node_ids`. Each node is
+  reached once, so a second sighting of an id is a collision.
+- **The predicates** are walked by `predicate_id_collisions`, which dedups by
+  `Rc` pointer first. One term rides many type slots, so a walk reaches its ids
+  once per slot; what survives the dedup is two live terms on one id-set, or a
+  predicate id the main tree also holds. Both are defects.
+
+A raw id-set walk over the type slots would report the `Rc` sharing as a
+collision, which is why the predicate domain gets its own walk rather than a
+wider version of the main-tree one.
 
 A refinement predicate is program text the user wrote — `[x for x in xs if x > k]`
 puts `x > k` in one — so it earns the same attribution as any other node, which is
@@ -163,12 +169,17 @@ tripwire asserting **multiset preservation** across uniquify's own `PredMemo`
 rebuilds. It is neither explanation nor uniqueness, and it deliberately does not
 dedup by `PredicateId`.
 
-`distinct_predicate_terms_never_share_a_node_id` asserts the uniqueness property
-predicates can satisfy: dedup by `Rc` pointer first, then require the ids of the
-deduped set to be distinct. One term riding N slots is one term and shares its
-ids with itself legitimately, while two *different* predicate terms sharing an id
-is a defect. What it catches is a rebuild that preserves ids when the walk did not
-reach every occurrence.
+What the predicate walk catches is a rebuild that preserves ids when the walk did
+not reach every occurrence. A predicate cannot be mutated through its `Rc`, so a
+rewrite builds a new `Rc` and repoints the refinement it was handed; that is a
+replacement only if the owning walk reaches every occurrence, and otherwise the
+original survives on a type the walk missed with the rebuild's ids on both.
+`PredMemo::replacing` is the opt-in for walks entitled to preserve, and
+`uniquify` is its one caller.
+
+The corpus test `distinct_predicate_terms_never_share_a_node_id` runs the same
+check on the three retained panes, which the boundary walk does not reach: the
+`pre-inference` pane is taken after uniquify, between two boundaries.
 
 ### Duplication
 
@@ -182,14 +193,14 @@ one id, which surfaces at a boundary assert far from the site, if at all.
 Freshening removes the decision rather than answering it.
 
 `assert_unique_node_ids` enforces it at every phase boundary in `compile_program`
-— post-lowering, -inline, -transact, -letrec-run, -channelize, -as-of-read,
--lambda-elim, -planning — gated on `cfg!(any(debug_assertions, test))`. The walk
-is `O(nodes)` per phase boundary, and a release compile runs neither it nor the
-fold's leak classes: `gate_leaks` carries the same `cfg`. The check is a tree
-invariant and encodes no phase order, so a reordered phase carries its check with
-it. It also
-means a phase is implicated only at a boundary that looks at it: a clean run is
-evidence about the gates, not about the phases between them.
+— post-lowering, -inference, -inline, -transact, -letrec-run, -channelize,
+-as-of-read, -lambda-elim, -planning — gated on `cfg!(any(debug_assertions,
+test))`. The two walks are `O(nodes)` per phase boundary, and a release compile
+runs neither them nor the fold's leak classes: `gate_leaks` carries the same
+`cfg`. The check is a tree invariant and encodes no phase order, so a reordered
+phase carries its check with it. It also means a phase is implicated only at a
+boundary that looks at it: a clean run is evidence about the gates, not about the
+phases between them.
 
 Three shapes, and the choice between them is about what the copy *denotes*:
 
@@ -254,14 +265,15 @@ outcomes carry different costs.
   Construction is the only constraint: `new` mints and records, `preserve`
   carries.
 
-**A term crossing out of the predicate domain must not land aliased ids.**
-Predicate interiors are outside the *uniqueness* domain (above) and may already
-alias main-tree ids, so a phase that lifts one into the term tree owes a freshen at
-the point of entry — `planning::iterate`'s `fn_of_bare_predicate` lift does
-exactly that. A lift that *rebuilds* the term is already safe:
-`planning::groupby`'s key extraction goes through `lambda_elim::run`, which
-re-mints every node. That is the mechanism, not the requirement; the requirement
-is that nothing aliased arrives. The `groupby` site pins it with
+**A term crossing out of the predicate domain must not land aliased ids.** The
+lift is a duplication: the predicate stays on the type slot it was read from, and
+one predicate `Rc` reached from two lift sites would otherwise land twice. So a
+phase that lifts a predicate into the term tree owes a freshen at the point of
+entry — `planning::iterate`'s `fn_of_bare_predicate` lift does exactly that. A
+lift that *rebuilds* the term is already safe: `planning::groupby`'s key
+extraction goes through `lambda_elim::run`, which re-mints every node. That is
+the mechanism, not the requirement; the requirement is that nothing aliased
+arrives. The `groupby` site pins it with
 `groupby_recognition_lifts_the_key_without_aliasing`; the `iterate` lift has no
 such test.
 

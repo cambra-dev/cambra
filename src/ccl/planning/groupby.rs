@@ -183,12 +183,12 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     // Compile the pointful key function to a point-free morphism V ⇒ K, then
     // build `keys = c ≫ key : I ⇒ K` and `values = c : I ⇒ V`.
     // This lifts a term out of a *type* — the refined domain's predicate — into
-    // the term tree. A predicate interior may already alias a live main-tree id
-    // (lowering shares a comprehension's source term between the generator and
-    // the guard), so a lift can land ids that are already in use. `lambda_elim::run`
-    // rebuilds the term, re-minting every node, which is what makes the crossing
-    // safe; `groupby_recognition_lifts_the_key_without_aliasing` pins the property
-    // rather than the mechanism.
+    // the term tree, while the predicate keeps its own copy on the type. Landing
+    // the lifted ids as they are would put one id-set on two live terms, which
+    // the predicate uniqueness walk reports at the next phase boundary.
+    // `lambda_elim::run` rebuilds the term, re-minting every node, which is what
+    // makes the crossing safe; `groupby_recognition_lifts_the_key_without_aliasing`
+    // pins the property rather than the mechanism.
     let key_pf = lambda_elim::run((**key_expr).clone()).ok()?;
     let value_idx_ty = (**idx_ty).clone();
     let keys =
@@ -239,10 +239,10 @@ mod tests {
     /// tail — the pointful group-by source the recognizer matches, with the key
     /// morphism deliberately **shared** between the predicate and the tail.
     ///
-    /// That sharing is not artificial: predicate interiors are outside the
-    /// checked id domain and lowering already aliases them into the main tree
-    /// (`pred_sources = gen_sources.clone()`), so a term lifted out of a
-    /// predicate can collide with a live original.
+    /// The sharing is built by hand because it is the case the lift has to
+    /// survive, not one the pipeline hands over: a term reached through a type
+    /// carrying the ids of a live main-tree term. Recognition must re-mint rather
+    /// than assume the two are already distinct.
     fn groupby_source_sharing_its_key(key: &Expr) -> Expr {
         let idx = Type::UIntRange(4);
         let int = int_ty();
