@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ccl::{
     Builtin, Expr, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
     TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::{commit_payload_ty, count_free, strip_refinements},
+    ccl_utils::{commit_payload_ty, count_free},
     letrec::check_letrec_causal,
     mut_elim::{binding, fun_parts, tvar},
     provenance,
@@ -473,7 +473,15 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                     matches!(which, Builtin::GetPrevTxn),
                     "letrec recognition: transaction history guarded by get_prev_seq"
                 );
-                key_ty.push((b.name.clone(), strip_refinements(&init.ty)));
+                // The value type comes off the history binding, not off the seed it
+                // recovers alongside. A seed is one contribution to the value type —
+                // a keyed register seeded at two keys and written at a third has a
+                // seed narrower than what it holds — and the binding `reg_k : Txn ⇒ 𝑉`
+                // carries the join `transact_phase` stamped.
+                let value_ty =
+                    b.ty.codomain()
+                        .expect("letrec recognition: history binding is a stream");
+                key_ty.push((b.name.clone(), value_ty));
                 keys.push(TransactKey { name: b.name, init });
             }
             TxnBinding::Commit => {

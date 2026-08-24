@@ -5489,3 +5489,66 @@ fn checked_lookup_on_a_map_answers_the_value() {
         "a String key must not reach an Int-keyed map"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Keyed writes: `m[k] := v`
+// ---------------------------------------------------------------------------
+
+/// A keyed write is **application on the left of the assignment**: the collection at
+/// the key names the codomain the written value must satisfy, so `m[k]` means the same
+/// type whether it is read or written. Both sequencing domains take one, the domain
+/// being a property of the register rather than of the write.
+#[rstest]
+#[case::induction(indoc! {r#"
+    m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
+    for x in [1, 2, 3]:
+        m[x] := 99
+    0
+"#})]
+#[case::transactional(indoc! {r#"
+    m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+    for r in [1, 2, 3]:
+        with begin():
+            m["c"] := 3
+    0
+"#})]
+fn a_keyed_write_types_against_the_collection(#[case] code: &str) {
+    assert_eq!(infer_program(code).to_string(), "Int@0");
+}
+
+/// The key is checked against the collection's **key type** and the value against its
+/// **codomain**, and the two obligations are separate: each names which half of the
+/// write is wrong.
+#[rstest]
+#[case::wrong_key("m[7] := 3", "keyed write key of `m`")]
+#[case::wrong_value("m[\"c\"] := \"nope\"", "keyed write to mutable variable `m`")]
+fn a_keyed_write_checks_key_and_value_separately(#[case] write: &str, #[case] expected: &str) {
+    let code = format!(
+        "m: Mut(Map(String, Int), Txn) := box(map([(\"a\", 1), (\"b\", 2)]))\n\
+         for r in [1, 2, 3]:\n    with begin():\n        {write}\n0\n"
+    );
+    let errs = infer_program_err(&code);
+    assert!(
+        format!("{errs:?}").contains(expected),
+        "expected `{expected}` in {errs:?}"
+    );
+}
+
+/// Writing a key of something that is not a keyed collection needs the target's type,
+/// and a mutable variable's value type is still open where the rule runs. So the
+/// diagnostic names the missing resolution rather than reporting a shape mismatch —
+/// the same boundary the checked lookup has through a parameter
+/// (`checked_lookup_boundaries`).
+#[test]
+fn a_keyed_write_needs_the_collection_s_type() {
+    let errs = infer_program_err(indoc! {r#"
+        t := 0
+        for x in [1, 2, 3]:
+            t[x] := 1
+        0
+    "#});
+    assert!(
+        format!("{errs:?}").contains("is not resolved yet"),
+        "expected the unresolved-target diagnostic, got {errs:?}"
+    );
+}

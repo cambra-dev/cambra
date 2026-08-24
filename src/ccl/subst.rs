@@ -749,9 +749,10 @@ impl Subst {
             // renamed exactly like a Feed target (a discharge to a
             // non-variable term keeps the stale name for the phase's own
             // residue checks to report).
-            MutWrite { name, value } => {
+            MutWrite { name, key, value } => {
+                let key = key.as_ref().map(|k| Box::new(self.apply_expr(k)));
                 let (name, value) = self.apply_handle_use(name, value);
-                MutWrite { name, value }
+                MutWrite { name, key, value }
             }
 
             Lambda { param, body } => {
@@ -2883,6 +2884,7 @@ mod rewrite_tests {
             }),
             TypedExpr::new(TypedExprNode::MutWrite {
                 name: Name::raw("h"),
+                key: None,
                 value: Box::new(int(1)),
             }),
             var("h"),

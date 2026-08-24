@@ -1058,13 +1058,10 @@ pub(crate) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    /// `yield` without a value is rejected.
-    /// Constructs that CHL deliberately doesn't support. Each used to be
-    /// rejected by lowering (since `rustpython_parser` accepted them all);
-    /// the new CHL parser rejects them at parse time — bare `yield`,
-    /// decorators, and `for/else` because they aren't in the grammar, and
-    /// subscript / attribute assignment targets because `AssignTarget` is
-    /// restricted to bare names and tuple patterns.
+    /// Constructs that CHL deliberately doesn't support, rejected at parse time
+    /// because they aren't in the grammar: bare `yield`, decorators, `for/else`,
+    /// and an attribute assignment target (`AssignTarget` admits names, tuple
+    /// patterns, and a subscript, but no attribute).
     #[test]
     fn parser_rejects_constructs_outside_chl_grammar() {
         let cases: &[&str] = &[
@@ -1074,8 +1071,6 @@ mod tests {
             "@some_decorator\ndef f(x):\n    x + 1\nf",
             // `for/else`.
             "def bad(xs):\n    for x in xs:\n        yield x\n    else:\n        pass\nbad",
-            // Subscript augmented-assignment target.
-            "x = [1]\nx[0] += 1\nx",
             // Attribute augmented-assignment target.
             "x = 0\nx.field += 1\nx",
         ];
@@ -1084,6 +1079,27 @@ mod tests {
             assert!(
                 !result.errors.is_empty(),
                 "expected parse error for:\n{code}"
+            );
+        }
+    }
+
+    /// A subscript target parses, so the statement forms that cannot perform a keyed
+    /// write reject it at **lowering** rather than at parse time. `:=` is the only
+    /// one that can: `=` binds, and `+=` would need to read `m[k]` first, which is
+    /// the proven lookup that does not exist yet.
+    #[test]
+    fn a_subscript_target_is_rejected_by_every_form_but_mut_assign() {
+        for code in ["x = [1]\nx[0] += 1\nx", "x = [1]\nx[0] = 1\nx"] {
+            let module = crate::chl_parser::parse_module(code)
+                .into_result()
+                .expect("a subscript target parses");
+            let mut ctx = super::LoweringContext::default();
+            let errs = super::lower_stmts(&module.body, &mut ctx)
+                .into_result()
+                .expect_err("expected a lowering error");
+            assert!(
+                format!("{errs:?}").contains("keyed write"),
+                "expected the keyed-write diagnostic for:\n{code}\ngot {errs:?}"
             );
         }
     }

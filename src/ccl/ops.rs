@@ -646,8 +646,9 @@ pub enum Builtin {
     /// "`𝑐[𝑘]?` is not an application"). A dependent codomain answers at the key, its
     /// binder discharging to the key term.
     ///
-    /// Applied as a tupled argument, the convention [`Self::GetPrevTxn`] shares:
-    /// `Apply(Tuple([collection, key]), Builtin(LookupChecked))`. It never carries a
+    /// Applied as a tupled argument, the convention [`Self::Insert`] and
+    /// [`Self::GetPrevTxn`] share: `Apply(Tuple([collection, key]), Builtin(LookupChecked))`,
+    /// so the read and the write of one keyed access take the same shape. It never carries a
     /// function value, so its point-free form is an ordinary morphism from a zip. A lookup
     /// whose collection does not vary takes the partial application `𝑐 ▷ lookup?` that
     /// `simplify`'s partial-lookup rule mints — the only shape [`Self::Curry`] takes that
@@ -660,6 +661,27 @@ pub enum Builtin {
     /// and substituting into a compiled one leaves the `const` carrying the binder at the
     /// binder's type (`Typing::keyed_value_at`).
     LookupChecked,
+
+    /// `insert : (Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉, 𝐾, 𝑉) ⇒ (Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉)` — the
+    /// collection with one key's value replaced, inserting the key where it was
+    /// absent. Applied as a tupled argument, the convention [`Self::GetPrevTxn`]
+    /// shares: `Apply(Tuple([collection, key, value]), Builtin(Insert))`.
+    ///
+    /// This is what a keyed write `m[k] := v` denotes; the register's history stays
+    /// `Txn ⇒ Map(𝐾, 𝑉)` under the overwrite law and the value written is the whole
+    /// collection ([`crate::ccl::mut_elim::desugar_keyed_writes`]).
+    ///
+    /// The result's key domain is the argument's with `𝐾`'s key adjoined — the same domain
+    /// where the key was already present, which is the read-modify-write shape. Both are
+    /// members of the same [`TypeKind::SubtypesOf`](crate::ccl::TypeKind::SubtypesOf) kind, so the
+    /// type above names neither: an abstract map ranges over every key domain over `𝐾`
+    /// (`src/ccl/design/collections.md`).
+    ///
+    /// Minted by [`crate::ccl::mut_elim::desugar_keyed_writes`] *after* inference,
+    /// so it carries no scheme in [`crate::ccl::infer::OperatorSchemes`]; its type is
+    /// stamped on the node at emission and the post-phase CHECK-mode `typecheck`
+    /// validates it directly, as [`Self::BeginTxn`]'s is.
+    Insert,
 }
 
 impl Builtin {
@@ -707,6 +729,7 @@ impl Builtin {
             Self::VariantWrap(_) => "variant_wrap",
             Self::CollectionContains => "collection_contains",
             Self::LookupChecked => "lookup?",
+            Self::Insert => "insert",
         }
     }
 
