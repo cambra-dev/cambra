@@ -16,6 +16,7 @@ pub mod letrec;
 pub mod lower;
 pub mod mut_elim;
 pub mod names;
+pub mod panes;
 pub mod planning;
 pub mod provenance;
 pub mod scope;

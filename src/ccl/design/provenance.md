@@ -5,7 +5,8 @@ source the user wrote.
 
 `src/ccl/provenance.rs` holds all of it — the node id, the phase tag, the
 recorder, the table, and the folds. `src/ccl/context.rs` is where the pipeline
-opens the sessions and materializes snapshots of the AST ([The seam](#the-seam-srccclcontextrs)).
+opens the sessions, and `src/ccl/panes.rs` is where the retained AST snapshots
+are declared and folded ([The seam](#the-seam)).
 
 **Status markers.** The provenance model, the recorder, some phases' adoption of it,
 the lowering projection, the [`NodeId`-keyed table](#the-provenance-model), and the
@@ -694,23 +695,21 @@ sample is what let two recording gaps live: `transact_phase` calling
 value-position writer hoist. Both are shapes the eleven listed programs do not
 have. CI runs with it on; it costs about 4% of the test step.
 
-It gates `gated_pane_pairs()`, not both, for the reason above: the first pair spans
-monomorphization and inference, and **inference's predicate producers do not record**.
-`specialize_use` clones a definition per instantiation, and the copies of a predicate term inside
-it row against interior ids no phase produced. Inference's own rewrites do sit inside a recording
-scope, so every post-inference node carries a row and the residue there is entirely
-`DanglingParent` and never `Unrecorded`: gating it today would report a constant, not a regression,
-and an `Unrecorded` arriving there would be a missed mint and a defect now. No program count is
-recorded here: a count over an uninstrumented phase measures how little that phase records, and
-churns with every unrelated change. **Add it to `gated_pane_pairs()` in the commit that makes
-inference record**, the same way an endpoint moves.
+It gates `gated_pane_pairs()`, which is every pair whose phases record. The two
+at the bottom are not there yet: `lambda_elim` and `planning` each mint with
+nothing open, and a gate over such a pair cannot reach zero however correct the
+recording is — it would report a count of how little that phase records, a
+constant rather than a regression. No program count is pinned for them either,
+for the same reason: it churns with every unrelated change. **Flip
+`PaneSpec::gated` in the commit that instruments the last phase in the pair**,
+the same way an endpoint moves.
 
 **Move the endpoint when a phase becomes instrumented, in the commit that
 instruments it:** to `post-lambda-elim` when the elim phase records, and to
 `join-planned` when planning does. Leaving it behind understates coverage; moving
 it ahead reintroduces the unreachable zero.
 
-## The seam (`src/ccl/context.rs`)
+## The seam
 
 - **The lowering log + fold.** Lowering records a `LoweringLog` under an
   always-on `LoweringSession` (installed in every build across `lower_stmts`,

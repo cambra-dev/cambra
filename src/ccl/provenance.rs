@@ -190,8 +190,8 @@ pub type RewriteLabel = &'static str;
 /// [`Source`](Nature::Source) is listed first because it is the base case: the
 /// root of a lowered source expression. The rule for who gets it is *structural*
 /// and stated in one place — see `LoweringContext::tag_source` in
-/// `src/ccl/lower/mod.rs`, and `design/provenance.md`, "The seam
-/// (`src/ccl/context.rs`)". It is emitted **only by lowering**: [`attribute`]
+/// `src/ccl/lower/mod.rs`, and `design/provenance.md`, "The seam". It is emitted
+/// **only by lowering**: [`attribute`]
 /// debug-asserts that no *phase* rewrite carries it, and that is the one guard.
 /// On the wire a `Source`-nature tag null-compresses
 /// (serializes as

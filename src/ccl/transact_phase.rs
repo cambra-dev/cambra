@@ -161,10 +161,10 @@ fn rewrite_as_of_reads_go(expr: &mut Expr) {
     // node mints nothing, so the recording writes nothing. The walk below sits
     // outside the recording, so a nested chain attributes to its own `let`.
     //
-    // These rows reach no table in a normal compile: `compile_program` calls
-    // `rewrite_as_of_reads` outside every pass scope it opens, so they land only
-    // under an audit window (`CAMBRA_PROVENANCE_AUDIT=full`, which ends at
-    // `post-as-of-read`).
+    // `compile_program` runs this rewrite under a `Phase::AsOfRead` scope, so
+    // these rows land in the table like any other phase's. The phase is its own
+    // rather than `Transact` because a phase is declared where the rewrite runs,
+    // and this one runs below the post-channelize pane.
     {
         let _g = provenance::enter(
             expr.node_id(),
