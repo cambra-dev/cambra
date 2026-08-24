@@ -227,11 +227,21 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   a mutable variable (a pass-by-reference `Mut` parameter aside), which is what makes
   "is this binder mutable?" a question about the node rather than about a type that
   happened to survive inference.
-- `MutWrite { name, value }` — one write to a variable. Value `Unit`. Its target must be
+- `MutWrite { name, key, value }` — one write to a variable. Value `Unit`. Its target must be
   `Mut`-typed: inference peels the target's `Mut(𝑉, 𝐷)` and requires `value ⊑ 𝑉`; a write whose
   target is not `Mut` is a **type error**, never a shadowing rebind (`x += e` on a plain `x` is
   rejected, not silently turned into `x = x + e`). `x += e` lowers to `MutWrite(x, x + e)`, the
   embedded read being the in-context read.
+  `key` is `Some` for a **keyed write** `m[k] := v` — a write to one key of a mutable
+  collection — and `None` for a write of the whole variable. Its rule is application on the
+  left of the assignment: the key is checked against the collection's key type and the value
+  against the codomain that key names, a dependent codomain being discharged to the key term.
+  So `m[k]` denotes one type whether it is read or written. The membership refinement is
+  dropped as it is for `m[k]?`, because a write is what makes a key present; any other domain
+  refinement stands, an inadmissible key being an error rather than an insertion.
+  `mut_elim::desugar_keyed_writes` then rewrites it to the whole-value write it denotes,
+  `m := insert(m, k, v)`, so every phase below sees one kind of `MutWrite` and none of them
+  needs a key.
 - `Begin { body }` — one `with begin():` transaction block, made a *single* `Unit`-valued statement
   (`ExprStmt(Begin{block}, rest)`) so a loop body may freely mix a per-iteration transaction, sibling
   induction writes, and feeds. `body` is the per-transaction statement chain. The transaction phase
@@ -328,6 +338,32 @@ Typing:
   let-generalization of UDF bindings. Whether a write site requires `Txn` is the phase's structural
   check, post-inline — so one `bump` can serve an induction accumulator and a transactional
   mutable variable.
+
+#### A mutable collection's key set varies with the position
+
+`Mut(𝐶, 𝑆)` for a keyed collection denotes `𝑆 ⇒ Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, the sum sitting in
+the codomain. A value of a sum is a domain paired with a map over it, so the history yields a
+different pair at each position and the key set varies with the position. This is the
+quantifier order `∀s. ∃𝐷`, and it admits exactly the histories a register has.
+
+Every contribution injects by kind containment: the seed names one key domain, each write
+names another, and both are members of `SubtypesOf(𝐾)`. So the single value type on `Mut` needs no
+per-position reconciliation — nothing has to relate a write's domain to the seed's.
+
+**The type does not name the domain at a position, and cannot be made to.** A sum is what a
+collection type says when it forgets its domain — the same job `List(𝑇)` does for a length —
+so every use opens it to a fresh opaque domain and no sentence relates `𝐷` at two positions.
+The proven lookup `m[k]` and read-your-writes as a type fact both need `𝐷(s⁻) ⊆ 𝐷(s)`, which
+has no subject here. Reaching them replaces this type rather than extending it. Reads are the
+checked `m[k]?`, answering `Option(𝑉)` with no membership proof.
+
+Two forms that would name it were measured and rejected. A **position-indexed family**,
+`Σ (𝐷 : 𝑆 ⇒ SubtypesOf(𝐾)). ((s: 𝑆) ⇒ 𝐷(s) ⤇ 𝑉)`, needs the witness to range over functions from
+positions to domains, so it needs type-level functions and their application. A **refinement
+naming the position**, `(s: 𝑆) ⇒ ({𝐾 | present(s)} ⤇ 𝑉)`, needs only machinery that exists —
+the Pi binder and a refinement carrying a term — but needs a position term in scope where the
+register is typed, and `with begin():` binds none. The
+[transaction handle](#with-t--begin-transaction-handle) is the binder that would supply one.
 
 #### No aliasing: `Mut` values are second-class (downward-only)
 
@@ -877,10 +913,20 @@ affordable by that complete compile-time knowledge.
   domain is a new *domain*, not a new construct.
 - **Nested `for` loops** — lexicographic product domains; data-dependent bounds meet the
   refinement-types work as dependent sums.
-- **Mutable collections** — sigma types (`List[𝑇] = Σ 𝐼 . 𝐼 ⤇ 𝑇`) as letrec bindings; the
-  append-only `Appendable` case first, as a commit stream whose history is the collection. This
-  is also what first-class `Mut` (returning or storing references) needs: carrying mutable variable identity in
-  types is a sigma/index-types question. Until then the second-class discipline is the aliasing
+- **Append-only mutable collections** — an `Appendable` collection as a letrec binding, its
+  commit stream being the collection's history. A keyed write overwrites; an append needs the
+  domain to grow with the history.
+- **Per-key store keys for a mutable collection** — `m[k] := v` commits today by writing the
+  register's whole collection to one store key, so two transactions touching one map conflict
+  whatever keys they touch. The write is recoverable per key: its decision slot is
+  `` (.i, key, value) ▷ zip ≫ insert ``, whose key and value legs each compile on their own.
+  Narrowing the read footprint alongside it needs `Proposal.reads` to record *absence*, since
+  a transaction that read a missing key must conflict with a concurrent insert. Correctness
+  does not depend on the narrowing — an unrecovered write keeps whole-collection footprints —
+  so it is an optimization with a silent failure mode, and the unrecovered path needs its own
+  coverage.
+- **First-class `Mut`** (returning or storing references) — needs mutable variable identity in
+  types, a sigma/index-types question; until then the second-class discipline is the aliasing
   firewall.
 - **History access / auditing** — `get_prev_*` generalized to user-facing reads at explicit
   positions; the transaction handle (`t = begin()`) already names the position.

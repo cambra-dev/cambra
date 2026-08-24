@@ -322,6 +322,32 @@ fn read_initial_scalar(producer: &mut dyn TileProducer) -> Result<Value, InitDra
         let cv = match producer.get(guard.clone()) {
             Tile::Scalar(cv) => cv,
             tile @ Tile::Record(_) => scalar_tile_to_column_value(tile),
+            // A **collection** init — a keyed register's seed. It arrives as the
+            // function it is rather than as a scalar, and one store value is one
+            // map, so it seeds as a single [`map_to_value`] cell. The seed is
+            // acyclic and sealed, so the whole map is present on the pull that
+            // yields it.
+            Tile::SealedFunction {
+                domain,
+                codomain,
+                domain_predicate,
+                ..
+            } => {
+                // Only a **decided** domain is the whole seed. An init is acyclic, so it
+                // settles on the pull that yields it; taking an undecided one would seed the
+                // store with whichever keys had arrived, which is a partial map presented as
+                // the initial state.
+                let Tile::Scalar(values) = *codomain else {
+                    continue;
+                };
+                if !matches!(domain_predicate, Predicate::True) {
+                    continue;
+                }
+                let map: HashMap<Value, Value> = (0..domain.len())
+                    .map(|i| (domain.index_at(i), values.index_at(i)))
+                    .collect();
+                return Ok(map_to_value(&map));
+            }
             _ => continue,
         };
         if !cv.is_empty() {

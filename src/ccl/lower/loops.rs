@@ -611,7 +611,9 @@ fn lower_for_body_terminal(
 fn mutation_target_name(stmt: &Spanned<ChlStmt>) -> Option<&str> {
     match &stmt.node {
         ChlStmt::AugAssign { target, .. } => name_target_as_name(target),
-        ChlStmt::MutAssign { target, .. } => name_target_as_name(target),
+        // `write_target_name`, not `name_target_as_name`: `m[k] := v` mutates `m`, so
+        // the loop carries `m` as an accumulator even though the target binds nothing.
+        ChlStmt::MutAssign { target, .. } => write_target_name(target),
         _ => None,
     }
 }
@@ -932,13 +934,30 @@ fn lower_loop_body_chain(
             // by name (`src/ccl/design/mutability.md`, "Sequencing domains"),
             // discarding every update at the iteration boundary.
             ChlStmt::MutAssign { target, value, .. } => {
-                let name = extract_name_target(target, "mutable assignment")?;
+                let name = write_target_name(target)
+                    .ok_or_else(|| {
+                        LoweringError::unsupported(
+                            target.span,
+                            "mutable assignment: only simple name targets are supported",
+                        )
+                    })?
+                    .to_string();
                 if !acc_names.contains(&name) {
                     return Err(in_loop_mut_var_error(stmt.span, &name));
                 }
-                check_mut_write_context(&name, stmt.span, ctx)?;
-                let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+                // A keyed write writes one key of the accumulator; the unkeyed form
+                // replaces it wholesale. Both are writes to the same accumulator, so
+                // only the emitted node differs.
+                let write = match &target.node {
+                    AssignTarget::Subscript { target, index } => {
+                        lower_keyed_write(target, index, value, stmt.span, ctx)?
+                    }
+                    _ => {
+                        check_mut_write_context(&name, stmt.span, ctx)?;
+                        let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
+                        ctx.tag_image(Expr::mut_write(name, val), stmt.span)
+                    }
+                };
                 ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
             }
             // `y: T = value` — an ordinary annotated per-iteration local, the

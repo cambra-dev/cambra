@@ -395,6 +395,19 @@ pub(super) fn lower_final_stmt(
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
+        // A keyed write as the final statement, the `m[k] := v` sibling of the bare
+        // write above. `Unit`-valued like any write, so it cannot be the program's
+        // value; it falls through to the "must end in a value" error the same way.
+        ChlStmt::MutAssign {
+            target,
+            annotation: None,
+            value,
+        } if matches!(target.node, AssignTarget::Subscript { .. }) => {
+            let AssignTarget::Subscript { target, index } = &target.node else {
+                unreachable!("guarded by the match arm above")
+            };
+            lower_keyed_write(target, index, value, last.span, ctx)
+        }
         // A standalone `with begin():` as the program's final statement: one
         // transaction whose value is `Unit` (a trailing transaction produces no
         // value — its replies ride the feed, and a program that wants a committed
@@ -608,6 +621,27 @@ pub(super) fn lower_middle_stmt(
         //    stamped `Mut(V, _)` so inference binds `x` at `Mut` and reads deref
         //    (domain inferred for an induction accumulator).
         // In-loop writes are handled by `lower_direct_mirror_loop`, not here.
+        // `m[k] := v` — a write to one key, handled before the name cases because it
+        // is the one `:=` that binds nothing.
+        ChlStmt::MutAssign {
+            target,
+            annotation,
+            value,
+        } if matches!(target.node, AssignTarget::Subscript { .. }) => {
+            if annotation.is_some() {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "a keyed write `m[k] := …` takes no annotation: it writes one key \
+                     of an existing collection, and the type belongs on the \
+                     collection's introduction",
+                ));
+            }
+            let AssignTarget::Subscript { target, index } = &target.node else {
+                unreachable!("guarded by the match arm above")
+            };
+            let write = lower_keyed_write(target, index, value, stmt.span, ctx)?;
+            Ok(ctx.tag_machinery(Expr::expr_stmt(write, body), stmt.span, "lower.stmt_seq"))
+        }
         ChlStmt::MutAssign {
             target,
             annotation,
@@ -875,7 +909,63 @@ pub(super) fn extract_name_target(
             target.span,
             format!("{context}: only simple name targets are supported"),
         )),
+        // A keyed write is a write to one key of a mutable collection, so it has
+        // meaning only for `:=`, which `lower_mut_assign` handles before reaching
+        // here. Every other statement form binds, and a subscript names no binder.
+        AssignTarget::Subscript { .. } => Err(LoweringError::unsupported(
+            target.span,
+            format!(
+                "{context}: `m[k]` is a keyed write and only `:=` performs one \
+                 (write it as `m[k] := …`)"
+            ),
+        )),
     }
+}
+
+/// The mutable variable a write targets, for either spelling: `x := v` names it
+/// directly, `m[k] := v` names it as the subscript's collection.
+///
+/// Distinct from [`name_target_as_name`], which asks whether a target *binds* a simple
+/// name — a keyed write binds nothing, so the two questions have different answers on
+/// the same target and a single accessor would conflate them.
+pub(super) fn write_target_name(target: &Spanned<AssignTarget>) -> Option<&str> {
+    match &target.node {
+        AssignTarget::Name(id) => Some(id.as_str()),
+        AssignTarget::Subscript { target, .. } => match &target.node {
+            ChlExpr::Name(id) => Some(id.as_str()),
+            _ => None,
+        },
+        AssignTarget::Tuple(_) => None,
+    }
+}
+
+/// Lower a **keyed write** `m[k] := v` to a keyed [`TypedExprNode::MutWrite`].
+///
+/// Always a write, never an introduction: writing one key of a collection presumes the
+/// collection, so there is no spelling of `:=` at a subscript that declares one. That is
+/// why this takes no annotation and consults no scope — an unbound `m` surfaces as an
+/// unbound variable from inference, where every other use of a name does.
+pub(super) fn lower_keyed_write(
+    target: &Spanned<ChlExpr>,
+    index: &Spanned<ChlExpr>,
+    value: &Spanned<ChlExpr>,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    // Only a bare name resolves to a mutable variable today. A path (`a.b[k] := v`)
+    // parses, so say what is missing rather than failing on the shape.
+    let ChlExpr::Name(id) = &target.node else {
+        return Err(LoweringError::unsupported(
+            target.span,
+            "a keyed write's collection must be a variable; writing through a path \
+             (`a.b[k] := …`) is not supported",
+        ));
+    };
+    let name = id.as_str().to_string();
+    check_mut_write_context(&name, span, ctx)?;
+    let key = lower_expr(index, ctx)?;
+    let val = lower_expr(value, ctx)?;
+    Ok(ctx.tag_image(Expr::mut_write_keyed(name, key, val), span))
 }
 
 /// Infallible variant of [`extract_name_target`]: returns the name when

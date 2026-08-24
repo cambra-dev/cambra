@@ -530,7 +530,16 @@ pub enum TypedExprNode {
     MutWrite {
         /// The mutable variable being written.
         name: Name,
-        /// The written value; must be a subtype of the variable's type.
+        /// The key written, for a write to one key of a mutable collection
+        /// (`m[k] := v`); [`None`] for a whole-variable write (`x := v`).
+        ///
+        /// A scalar register's key is its variable name, which `name` already
+        /// carries, so the two write forms differ in whether a *second* key sits
+        /// below that one — which is what this option says. The store the write
+        /// eliminates to is keyed either way.
+        key: Option<Box<TypedExpr>>,
+        /// The written value. For a whole-variable write it must be a subtype of
+        /// the variable's type; for a keyed write, of the collection's codomain.
         value: Box<TypedExpr>,
     },
 
@@ -1113,10 +1122,20 @@ impl TypedExpr {
         .with_ty(ty)
     }
 
-    /// Construct a feed expression.
+    /// Construct a whole-variable write, `x := value`.
     pub fn mut_write(name: impl Into<Name>, value: Self) -> Self {
         Self::new(TypedExprNode::MutWrite {
             name: name.into(),
+            key: None,
+            value: Box::new(value),
+        })
+    }
+
+    /// Construct a keyed write, `name[key] := value`.
+    pub fn mut_write_keyed(name: impl Into<Name>, key: Self, value: Self) -> Self {
+        Self::new(TypedExprNode::MutWrite {
+            name: name.into(),
+            key: Some(Box::new(key)),
             value: Box::new(value),
         })
     }
@@ -1537,9 +1556,18 @@ impl TypedExpr {
                 f(expr.as_ref());
                 f(body.as_ref());
             }
-            TypedExprNode::Feed { value, .. }
-            | TypedExprNode::Define { value, .. }
-            | TypedExprNode::MutWrite { value, .. } => f(value.as_ref()),
+            TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+                f(value.as_ref())
+            }
+            // The key is a child like the value: it is an ordinary expression the
+            // write evaluates, so every walk has to reach it or its nodes go
+            // unvisited by uniquify, substitution, and the provenance fold.
+            TypedExprNode::MutWrite { key, value, .. } => {
+                if let Some(k) = key {
+                    f(k.as_ref());
+                }
+                f(value.as_ref());
+            }
             TypedExprNode::Begin { body } => f(body.as_ref()),
         }
     }
@@ -1716,9 +1744,15 @@ impl TypedExpr {
                 f(expr.as_mut());
                 f(body.as_mut());
             }
-            TypedExprNode::Feed { value, .. }
-            | TypedExprNode::Define { value, .. }
-            | TypedExprNode::MutWrite { value, .. } => f(value.as_mut()),
+            TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+                f(value.as_mut())
+            }
+            TypedExprNode::MutWrite { key, value, .. } => {
+                if let Some(k) = key {
+                    f(k.as_mut());
+                }
+                f(value.as_mut());
+            }
             TypedExprNode::Begin { body } => f(body.as_mut()),
         }
     }
