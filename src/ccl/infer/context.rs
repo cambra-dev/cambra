@@ -371,21 +371,39 @@ impl Typing for InferCtx {
     fn require_trait(
         &mut self,
         trait_: Trait,
-        operands: &[&Type],
+        operand_types: &[&Type],
+        operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError> {
         debug_assert_eq!(
-            operands.len(),
+            operand_types.len(),
             trait_.arity(),
             "{trait_} is over {} type(s); an operator wired to it must supply that many",
             trait_.arity(),
         );
-        let positions: Vec<Type> = operands.iter().map(|_| self.fresh()).collect();
+        let positions: Vec<Type> = operand_types.iter().map(|_| self.fresh()).collect();
         // Only a requested association gets a variable for the obligation to settle;
         // a pure requirement determines nothing and mints none.
         let wanted = assoc.map(|name| (name, self.fresh()));
-        let obligation = TraitObligation::new(trait_, wanted.clone().into_iter().collect());
+        // The recording covers two things this rule produces: the operand
+        // expressions cloned into the obligation, and the nodes a deposit reached
+        // from here mints — an instance whose association carries a
+        // `RefinementTemplate` builds its predicate out of those operands
+        // (`Refinement::born_from_template`), and a deposit fires both at
+        // construction and from the `require_sub` narrowing below. So it names the
+        // node being typed, as the `Lit` rule's singleton recording does: a mint has
+        // nowhere to attach in a recording that names nothing.
+        let _f = crate::ccl::provenance::enter(
+            self.current_node_id,
+            "infer.require_trait",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        let obligation = TraitObligation::new(
+            trait_,
+            wanted.clone().into_iter().collect(),
+            operand_exprs.iter().map(|e| (*e).clone()).collect(),
+        );
         for (i, position) in positions.iter().enumerate() {
             obligation.watch(position, i as u8);
         }
@@ -397,7 +415,7 @@ impl Typing for InferCtx {
             .map_err(|e| self.raise(map_constrain_err(e, &at())))?;
         // Operands flow in as ordinary lower bounds, refinements and all. The
         // narrowing hook peels them where the base actually arrives.
-        for (operand, position) in operands.iter().zip(&positions) {
+        for (operand, position) in operand_types.iter().zip(&positions) {
             self.require_sub(operand, position, at)?;
         }
         Ok(wanted.map(|(_, ty)| ty))

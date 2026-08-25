@@ -338,6 +338,7 @@ pub(super) fn lower_binop(
 fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
     match op {
         ChlBinOp::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
+        ChlBinOp::AddRefined => BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
         ChlBinOp::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
         ChlBinOp::Mul => BinOpKind::Arithmetic(ArithmeticKind::Mul),
         ChlBinOp::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),

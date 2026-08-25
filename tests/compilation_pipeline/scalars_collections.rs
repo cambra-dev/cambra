@@ -65,6 +65,11 @@ fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
 #[case("1 + 2 * 3 - 4", Value::Int(3))]
 #[case("1 + 2 * (3 - 4)", Value::Int(-1))]
 #[case("7 // 2", Value::Int(3))]
+// `^+` computes the sum `+` computes; the two differ only in the result type
+// (`tests/type_check.rs`, `refining_addition_records_the_sum`), and op-conversion
+// maps both to the one runtime addition.
+#[case("2 ^+ 3", Value::Int(5))]
+#[case("1 ^+ 2 * 3 - 4", Value::Int(3))]
 fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

@@ -271,6 +271,7 @@ impl OperatorSchemes {
         };
         match op {
             BinOpKind::Arithmetic(ArithmeticKind::Add) => arithmetic(Trait::Addable),
+            BinOpKind::Arithmetic(ArithmeticKind::AddRefined) => arithmetic(Trait::AddableRefined),
             BinOpKind::Arithmetic(ArithmeticKind::Sub) => arithmetic(Trait::Subtractable),
             BinOpKind::Arithmetic(ArithmeticKind::Mul) => arithmetic(Trait::Multipliable),
             BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => arithmetic(Trait::Divisible),

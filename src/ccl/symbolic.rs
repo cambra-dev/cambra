@@ -676,9 +676,10 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
         }
         BinOpKind::BoolLogic(LogicKind::And | LogicKind::Nand) => Precedence::And,
         BinOpKind::Compare(_) => Precedence::Cmp,
-        BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::Sub) | BinOpKind::Concat => {
-            Precedence::Add
-        }
+        BinOpKind::Arithmetic(
+            ArithmeticKind::Add | ArithmeticKind::AddRefined | ArithmeticKind::Sub,
+        )
+        | BinOpKind::Concat => Precedence::Add,
         BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => Precedence::Mul,
     }
 }

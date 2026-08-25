@@ -86,6 +86,14 @@ pub enum Lit {
 pub enum ArithmeticKind {
     /// Integer addition (`+`).
     Add,
+    /// Integer addition whose result type records the sum (`^+`).
+    ///
+    /// Computes exactly what [`Add`](Self::Add) computes; the two differ only in
+    /// the trait each states, and so in the type the result takes. `+` is
+    /// `Addable` — `Int`, `UInt` or `String` operands, and an unrefined result.
+    /// `^+` is `AddableRefined`, whose one row accepts `Int` operands and refines
+    /// the result by `__elem == a₁ + a₂` (`src/ccl/infer/solver/traits.rs`).
+    AddRefined,
     /// Integer subtraction (`-`).
     Sub,
     /// Integer multiplication (`*`).
@@ -150,6 +158,7 @@ impl BinOpKind {
     pub fn sym(&self) -> &'static str {
         match self {
             Self::Arithmetic(ArithmeticKind::Add) => "+",
+            Self::Arithmetic(ArithmeticKind::AddRefined) => "^+",
             Self::Arithmetic(ArithmeticKind::Sub) => "-",
             Self::Arithmetic(ArithmeticKind::Mul) => "*",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "//",
@@ -179,6 +188,7 @@ impl BinOpKind {
     pub fn fn_name(&self) -> &'static str {
         match self {
             Self::Arithmetic(ArithmeticKind::Add) => "add",
+            Self::Arithmetic(ArithmeticKind::AddRefined) => "add_refined",
             Self::Arithmetic(ArithmeticKind::Sub) => "sub",
             Self::Arithmetic(ArithmeticKind::Mul) => "mul",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "floor_div",

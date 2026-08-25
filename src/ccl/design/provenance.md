@@ -455,8 +455,9 @@ a loud failure rather than a silent misattribution):
 `enter` is the constructor a phase uses to record a rewrite. `copy_frame` is the
 one recording that names **no** node, for a duplication with nothing being
 rewritten and so no id to name: lowering's uncurry template-interior and
-compare-chain operand freshens, and inference freshening a refinement predicate
-per scheme instantiation. Each captured copy carries its own origin from the
+compare-chain operand freshens, and inference's two freshens — a refinement
+predicate per scheme instantiation, and a trait obligation's stored operand
+expressions per obligation copy. Each captured copy carries its own origin from the
 hook, so the named node is never read. A recording that names no node has nowhere
 to attach a mint or a consume, which `OpenRecording::assert_copy_only` enforces —
 which is also what keeps the two constructors apart, since a mint captured in a
@@ -466,8 +467,9 @@ copy-only recording is a site that should have named a node.
 every recording a pane pair's fold reads — each of the phases below runs inside a
 `PhaseScope` that `compile_program` opens, and sits between two retained AST
 snapshots: `infer/solve` (`mono.specialize`,
-`mono.coalesce_let`), `infer/emit` (`infer.lit_singleton`),
-`infer/solver/scheme` (`infer.freshen_predicate`), `inline`
+`mono.coalesce_let`), `infer/emit` (`infer.lit_singleton`), `infer/context`
+(`infer.require_trait`), `infer/solver/scheme` (`infer.freshen_predicate`),
+`infer/solver/traits` (`infer.freshen_obligation`), `inline`
 (`inline.alias`, `inline.udf`, `inline.beta`), `mut_elim` (`letrec.loop`,
 `letrec.bare_write`, `letrec.hoist_writer_body`, `letrec.terminalize_write`),
 `transact_phase` (strip, unwrap block, writer, commit record, history binding,

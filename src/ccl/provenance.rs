@@ -1660,9 +1660,11 @@ fn group_copies(copies: &[(NodeId, NodeId)]) -> Vec<(NodeId, Vec<NodeId>)> {
 /// This is the one recording that **names no node**, and the shape it fits is a
 /// duplication with *nothing being rewritten*, where there is no id to name:
 /// lowering's uncurry template-interior and compare-chain operand freshens, and
-/// inference freshening a refinement predicate per scheme instantiation
-/// (`infer.freshen_predicate`). Every captured copy carries its own origin from
-/// the hook, which is why this one can afford to declare nothing at all —
+/// inference's two freshens — a refinement predicate per scheme instantiation
+/// (`infer.freshen_predicate`) and a trait obligation's stored operand
+/// expressions per obligation copy (`infer.freshen_obligation`). Every captured
+/// copy carries its own origin from the hook, which is why this one can afford to
+/// declare nothing at all —
 /// [`row_per_copy`](OpenRecording::row_per_copy) never reads the named node.
 ///
 /// A duplication performed *as part of* a rewrite uses [`enter`] instead, naming

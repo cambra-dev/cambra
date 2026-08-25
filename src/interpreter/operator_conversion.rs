@@ -2287,7 +2287,9 @@ fn builtin_to_binop(b: Builtin) -> Option<InterpreterBinOp> {
         return None;
     };
     Some(match op {
-        B::Arithmetic(A::Add) => InterpreterBinOp::Arithmetic(ArithmeticKind::Add),
+        // `^+` and `+` compute the same sum, so they share one runtime operation;
+        // the refinement `^+` carries is spent by the time op-conversion runs.
+        B::Arithmetic(A::Add | A::AddRefined) => InterpreterBinOp::Arithmetic(ArithmeticKind::Add),
         B::Arithmetic(A::Sub) => InterpreterBinOp::Arithmetic(ArithmeticKind::Sub),
         B::Arithmetic(A::Mul) => InterpreterBinOp::Arithmetic(ArithmeticKind::Mul),
         B::Arithmetic(A::FloorDiv) => InterpreterBinOp::Arithmetic(ArithmeticKind::FloorDiv),
