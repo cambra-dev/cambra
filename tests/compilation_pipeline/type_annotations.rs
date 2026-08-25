@@ -1,3 +1,5 @@
+use rstest::rstest;
+
 use crate::helpers::{check_compile_error, check_scalar};
 
 use cambra::interpreter::Value;
@@ -316,4 +318,23 @@ def test(a: String, b: Int):
 ",
         "No Addable instance for BinOp: operand 2 is Int, but the only type accepted there is String",
     )
+}
+
+/// A parameter's annotation is read in the scope enclosing the binder, so a
+/// reference to a parameter resolves outward and not to the parameter. With
+/// nothing outside to resolve to it is an ordinary unbound variable, at every
+/// shape a parameter list takes: tupled siblings in either order, and the
+/// single parameter that can only be naming itself.
+///
+/// Nothing rejects these earlier. Lowering carries no scope to tell a reference
+/// to the parameter apart from one to an enclosing binder of the same name, and
+/// a name-based rejection there reports the wrong cause for the shadowing case
+/// (`type_scope_outer_shadow`).
+#[rstest]
+#[case::sibling("def f(a: Int, c: {Int where _ >= a}):\n    c\n\nf\n", "a")]
+#[case::sibling_reversed("def f(c: {Int where _ >= a}, a: Int):\n    c\n\nf\n", "a")]
+#[case::sibling_of_three("def f(a: Int, b: Int, c: {Int where _ >= b}):\n    c\n\nf\n", "b")]
+#[case::own_binder("def f(a: {Int where _ >= a}):\n    a\n\nf\n", "a")]
+fn type_annotation_naming_a_parameter_is_unbound(#[case] code: &str, #[case] name: &str) {
+    check_compile_error(code, &format!("type inference: Unbound variable: '{name}'"));
 }
