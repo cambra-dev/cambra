@@ -1652,26 +1652,31 @@ fn group_copies(copies: &[(NodeId, NodeId)]) -> Vec<(NodeId, Vec<NodeId>)> {
     out
 }
 
-/// Open a **lowering** copy-only recording: it consumes nothing, mints nothing,
-/// and exists to capture the `(origin, fresh)` pairs a clone's freshen reports,
-/// which are written as per-origin [`LoweringStep::Copy`]s (or, under a phase
-/// scope, as one row per copy).
+/// Open a copy-only recording: it consumes nothing, mints nothing, and exists to
+/// capture the `(origin, fresh)` pairs a clone's freshen reports, written as
+/// per-origin [`LoweringStep::Copy`]s under lowering or as one row per copy
+/// under a phase scope.
 ///
-/// This is the one recording that **names no node**, and lowering is where that
-/// shape fits: uncurry's template-interior freshens and the compare-chain
-/// operand freshens duplicate nodes with nothing being rewritten, so there is no
-/// id to name. Every captured copy carries its own origin from the hook, which
-/// is exactly why this one can afford to declare nothing at all. A *phase* that
-/// duplicates uses [`enter`] instead, naming the node the duplication is
-/// performed for.
+/// This is the one recording that **names no node**, and the shape it fits is a
+/// duplication with *nothing being rewritten*, where there is no id to name:
+/// lowering's uncurry template-interior and compare-chain operand freshens, and
+/// inference freshening a refinement predicate per scheme instantiation
+/// (`infer.freshen_predicate`). Every captured copy carries its own origin from
+/// the hook, which is why this one can afford to declare nothing at all —
+/// [`row_per_copy`](OpenRecording::row_per_copy) never reads the named node.
+///
+/// A duplication performed *as part of* a rewrite uses [`enter`] instead, naming
+/// the node the rewrite replaces, so the mints beside the copies have a parent.
+/// [`assert_copy_only`](OpenRecording::assert_copy_only) is what keeps the two
+/// apart: a mint captured here is a site that should have named a node.
 ///
 /// `nature` is fixed at [`Machinery`](Nature::Machinery) rather than taken as an
-/// argument because a lowering copy's nature is never read: a
+/// argument. Under lowering a copy's nature is never read — a
 /// [`LoweringStep::Copy`] mirrors the origin's already-folded attribution
-/// *verbatim*, so a nature here would be unobservable, and a wrong one (a
-/// `Nature::Source` on a copy) would look meaningful while being inert. A phase
-/// copy's row *does* carry a nature that reaches the attribution, which is one
-/// more reason a phase duplication belongs in [`enter`].
+/// *verbatim* — so a nature would be unobservable, and a wrong one (a
+/// `Nature::Source` on a copy) would look meaningful while being inert. Under a
+/// phase scope the fixed value is the honest one: a duplication that rewrites
+/// nothing is plumbing by construction.
 pub(crate) fn copy_frame(label: RewriteLabel) -> RecordingGuard {
     RECORDING_STACK.with(|s| {
         let mut stack = s.borrow_mut();
@@ -2007,16 +2012,32 @@ pub(crate) fn copy_id(origin: NodeId) -> NodeId {
 /// sides, as [`on_mint`] does: a placeholder origin would fold as
 /// [`Leak::DanglingParent`] against an id nothing ever records.
 ///
+/// Asserts the same coverage [`on_mint`] does, and for the same reason: a node
+/// reaches a tree by being minted or by being copied, so a check on one channel
+/// alone leaves the other silent. The silence was not hypothetical — copies
+/// outnumbered mints among the uncaptured nodes when the check was added.
+///
 /// [`PLACEHOLDER`]: NodeId::PLACEHOLDER
 pub(crate) fn on_copy(origin: NodeId, fresh: NodeId) {
     if origin == NodeId::PLACEHOLDER || fresh == NodeId::PLACEHOLDER {
         return;
     }
-    RECORDING_STACK.with(|s| {
+    let captured = RECORDING_STACK.with(|s| {
         if let Some(top) = s.borrow_mut().last_mut() {
             top.copies.push((origin, fresh));
+            true
+        } else {
+            false
         }
     });
+    debug_assert!(
+        captured || !rows_would_reach_the_table(),
+        "{fresh:?} was copied from {origin:?} with no recording open, under a \
+         phase scope that writes rows: the copy reaches no row and the fold \
+         reports it as Unrecorded. Open a recording over the duplication — \
+         `provenance::enter` when a rewrite is being performed, `copy_frame` \
+         when nothing is being rewritten and the copy is the whole of it."
+    );
 }
 
 /// RAII installer for **lowering's** log.

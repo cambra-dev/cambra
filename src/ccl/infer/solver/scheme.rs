@@ -470,6 +470,12 @@ fn freshen_refinement_predicate(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Refinement {
+    // A pure duplication with nothing being rewritten: the scheme's predicate
+    // stays where it is and this is a second term with the same shape. A
+    // recording that names no node is the shape for that, and each captured copy
+    // carries its own origin from the hook, so every freshened node descends
+    // from the scheme node it was copied from.
+    let _f = crate::ccl::provenance::copy_frame("infer.freshen_predicate");
     let mut pred = (*r.predicate).clone();
     freshen_expr_type_slots(&mut pred, lim, target, cache);
     Refinement::born(Rc::new(pred))

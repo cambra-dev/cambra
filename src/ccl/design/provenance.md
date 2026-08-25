@@ -411,6 +411,13 @@ sink, mirroring `infer_var::ACTIVE_ARENA`:
   recording open around a rewrite *captures* the births and copies in its dynamic
   extent, innermost first. An empty stack means recording is off, which costs one
   emptiness check on the construction hot path.
+
+  **Both hooks assert coverage**, under a phase scope that writes rows: a node
+  reaches a tree by being minted or by being copied, so a check on one channel
+  alone leaves the other silent. The silence was not hypothetical — when the
+  copy-side check was added, copies outnumbered mints among the uncaptured nodes,
+  and the one gap it found in an instrumented phase was inference freshening a
+  refinement predicate per scheme instantiation.
 - `TableSession` installs the table for a **whole compile**; `PhaseScope` names
   the phase rows are tagged with, for **one phase**. The two nest that way because a
   row's key is a process-unique `NodeId` and needs no phase set to disambiguate
@@ -444,16 +451,20 @@ a loud failure rather than a silent misattribution):
   all in the mutability phases, so `parents` alone is what recovers a source
   location for almost every node.
 
-`enter` is the only constructor a phase uses. `copy_frame` is the one recording
-that names **no** node: uncurry's template-interior freshens and the compare-chain
-operand freshens duplicate nodes with nothing being rewritten, and each captured
-copy carries its own origin from the hook. A recording that names no node has
-nowhere to attach a mint or a consume, which `OpenRecording::assert_copy_only`
-enforces.
+`enter` is the constructor a phase uses to record a rewrite. `copy_frame` is the
+one recording that names **no** node, for a duplication with nothing being
+rewritten and so no id to name: lowering's uncurry template-interior and
+compare-chain operand freshens, and inference freshening a refinement predicate
+per scheme instantiation. Each captured copy carries its own origin from the
+hook, so the named node is never read. A recording that names no node has nowhere
+to attach a mint or a consume, which `OpenRecording::assert_copy_only` enforces —
+which is also what keeps the two constructors apart, since a mint captured in a
+copy-only recording is a site that should have named a node.
 
 **Where recordings are open today.** Lowering's leaf appends and copy sinks, plus
 recordings inside the two pane pairs: `infer/solve` (`mono.specialize`,
-`mono.coalesce_let`), `infer/emit` (`infer.lit_singleton`), `inline`
+`mono.coalesce_let`), `infer/emit` (`infer.lit_singleton`),
+`infer/solver/scheme` (`infer.freshen_predicate`), `inline`
 (`inline.alias`, `inline.udf`, `inline.beta`), `mut_elim` (`letrec.loop`,
 `letrec.bare_write`, `letrec.hoist_writer_body`, `letrec.terminalize_write`),
 `transact_phase` (strip, unwrap block, writer, commit record, history binding,
