@@ -564,38 +564,56 @@ impl RewriteTag {
 pub type SourceProjection = HashMap<NodeId, SourceAttribution>;
 
 /// A history-integrity violation surfaced by a fold. The folds' error channel,
-/// and every class in it is a defect — a gate asserts the whole vector empty.
+/// and every class in it is a defect: a gate asserts the whole vector empty.
 ///
-/// A **death** is not one of them. An input id absent from the output pane is the
-/// set difference `input_ids ∖ output_ids`, which no row declares and which every
-/// ordinary rewrite produces, so [`fold`] returns the deaths as their own
-/// collection for the inspector to read.
+/// # The classes name a detection role, not two defects
 ///
-/// `Leak::Duplicate` (one id at two tree positions) is deliberately *not* here:
-/// it is a tree invariant, checked pipeline-wide by `assert_unique_node_ids`,
-/// not a fold concern. Nor is any class shaped like a claim about a *rewrite*:
-/// a row describes a node, so "two rewrites did X" has nowhere to live. The two
-/// invariants that are properties of a record — one row per id, and every row
-/// anchored through some channel — are asserted at
-/// [`ProvenanceTable::record`], at the site that would violate them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One unrecorded mint produces either class or both, according to what became
+/// of the node downstream. It surfaces as [`Leak::Unrecorded`] while it survives
+/// into the output pane, as [`Leak::DanglingParent`] once a recorded rewrite
+/// consumes it, and as both when it is copied and also survives. Neither class
+/// identifies the site to fix on its own.
+///
+/// What the split carries is which half of the recording failed across a whole
+/// fold. `Unrecorded == 0` says a recording scope was open at every mint in the
+/// span. A `DanglingParent` count over a zero `Unrecorded` count says the scopes
+/// are open and that some producer upstream of the span never rowed the ids
+/// those recordings name. That reading is what holds the first pane pair out of
+/// the gate; see `MaterializedPanes::gated_pane_pairs` in `crate::ccl::context`.
+///
+/// Each class is reported once per distinct id. [`fold`] sorts and dedups its
+/// vector, so a dangling parent that four rows name is one entry.
+///
+/// # Deaths and duplicates are not classes
+///
+/// An input id absent from the output pane **died**. That is the set difference
+/// `input_ids ∖ output_ids`, which no row declares and which every ordinary
+/// rewrite produces, so [`fold`] returns the deaths as their own collection for
+/// the inspector to read.
+///
+/// `Leak::Duplicate` (one id at two tree positions) is a tree invariant, checked
+/// pipeline-wide by `assert_unique_node_ids` rather than by a fold. Nor is any
+/// class shaped like a claim about a rewrite. A row describes a node, so "two
+/// rewrites did X" has nowhere to live. The two invariants that are properties
+/// of a record, one row per id and every row anchored through some channel, are
+/// asserted at [`ProvenanceTable::record`], at the site that would violate them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Leak {
-    /// Found walking the **output tree**: a live node with no row, absent from
-    /// the input pane — a `fresh()` where a preserve was intended. Nothing
-    /// explains why it is in the output tree, so a rewrite ran with nothing
-    /// recording it.
+    /// Found walking the **output tree**: an output-pane id with no row that the
+    /// input pane does not hold either, a `fresh()` where a preserve was
+    /// intended. Nothing explains why it is in the output tree.
     Unrecorded { output: NodeId },
     /// Found walking the **table**: a row's parent edge names an id the fold
-    /// never saw — no row it read produced that id and the input pane does not
-    /// hold it. A recorded node's ancestry stops at an id that describes
-    /// nothing, so an instrumented site is aimed at the wrong node.
+    /// never saw. No row it read produced that id and the input pane does not
+    /// hold it, so a recorded node's ancestry stops at an id that describes
+    /// nothing.
     ///
-    /// **One class for both edge shapes**, deliberately. The sole parent of a
-    /// freshened copy and one consumed id of a fusion are the identical
-    /// condition — an edge to an id outside the fold — and telling them apart
-    /// would mean recording the *shape* of the rewrite, which the `parents`
-    /// column does not and should not carry: its cardinality already expresses
-    /// 1:1, 1:many and many:1, and nothing else about the shape was ever read.
+    /// **One class for both edge shapes.** The sole parent of a freshened copy
+    /// and one consumed id of a fusion are the identical condition, an edge to
+    /// an id outside the fold. Telling them apart would mean recording the shape
+    /// of the rewrite, which the `parents` column does not carry: its
+    /// cardinality already expresses 1:1, 1:many and many:1, and nothing else
+    /// about the shape was ever read.
     DanglingParent { parent: NodeId },
 }
 
@@ -870,6 +888,13 @@ pub(crate) fn fold(
         .filter_map(|o| attr.get(o).map(|a| (*o, a.clone())))
         .collect();
 
+    // One entry per distinct defect. A dangling parent is discovered once per row
+    // that names it, so the raw vector counts rows rather than broken ancestry
+    // targets: the id every row of a specialized definition points at would be
+    // reported once per copy.
+    leaks.sort_unstable();
+    leaks.dedup();
+
     (ProvenanceMap { down, up }, projection, deaths, leaks)
 }
 
@@ -1010,6 +1035,10 @@ pub(crate) fn fold_lowering(
         .iter()
         .filter_map(|o| attr.get(o).map(|a| (*o, a.clone())))
         .collect();
+
+    // One entry per distinct defect, as in [`fold`].
+    leaks.sort_unstable();
+    leaks.dedup();
 
     (projection, leaks)
 }
@@ -2457,6 +2486,46 @@ mod tests {
             leaks.contains(&Leak::DanglingParent { parent: x2 }),
             "one of a fusion's parents is the same class: {leaks:?}",
         );
+    }
+
+    #[test]
+    fn one_unrecorded_mint_can_fire_both_classes_for_the_same_id() {
+        // Z was minted with nothing recording it; a recorded rewrite then consumed
+        // it to produce B, and Z itself also survived into the output pane. Both
+        // walks report Z, because the classes name where the fold noticed an id
+        // rather than which defect occurred. Neither localizes the missing
+        // recording.
+        let [a, z, b] = ids();
+        let table = table_of(&[(b, &[z])]);
+        let (_map, _proj, _deaths, leaks) = fold(
+            &table,
+            PHASES,
+            &set([a]),
+            &set([a, z, b]),
+            &SourceProjection::new(),
+        );
+        assert!(
+            leaks.contains(&Leak::DanglingParent { parent: z }),
+            "{leaks:?}"
+        );
+        assert!(leaks.contains(&Leak::Unrecorded { output: z }), "{leaks:?}");
+    }
+
+    #[test]
+    fn a_dangling_parent_that_many_rows_name_is_one_leak() {
+        // Three rows name the same unknown parent, the shape a specialized
+        // definition's per-instantiation copies produce. A leak count is broken
+        // ancestry targets, not the rows pointing at them.
+        let [a, x, b, c, d] = ids();
+        let table = table_of(&[(b, &[x]), (c, &[x]), (d, &[x])]);
+        let (_map, _proj, _deaths, leaks) = fold(
+            &table,
+            PHASES,
+            &set([a]),
+            &set([a, b, c, d]),
+            &SourceProjection::new(),
+        );
+        assert_eq!(leaks, vec![Leak::DanglingParent { parent: x }]);
     }
 
     // ---- the write-time invariants -----------------------------------------

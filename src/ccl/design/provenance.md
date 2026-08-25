@@ -607,18 +607,27 @@ Together, ascending `NodeId` *is* a topological order of the definition graph.
 `sweep_metrics` measures the falsifier: a non-zero backward-edge count is exactly
 the number of vertices a sweep would have to revisit.
 
-The leak taxonomy follows the set reading, and has two classes, each named after
-the walk that finds it. `Unrecorded` comes from walking the **output tree**: an
-output-pane id no row produced and the input pane does not hold, so a rewrite ran
-with nothing recording it. `DanglingParent` comes from walking the **table**: a
-parent that is neither an input-pane id nor produced by a phase the fold reads, so
-an instrumented site is aimed at the wrong node. They fail for different reasons —
-missing instrumentation against an instrumented site pointing elsewhere.
-`DanglingParent` is **one** class for both edge shapes, because a lone parent and
-one of a fusion's several are the identical condition, and telling them apart would
-mean recording the rewrite's shape. Deaths are not a class: the input-pane
-set difference is a product of the fold, so a gate asserts the whole `Leak`
-vector empty.
+The leak taxonomy follows the set reading, and has two classes, each named after the walk that
+finds it. `Unrecorded` comes from walking the **output tree**: an output-pane id no row produced
+and the input pane does not hold. `DanglingParent` comes from walking the **table**: a parent that
+is neither an input-pane id nor produced by a phase the fold reads, so a recorded node's ancestry
+stops at an id that describes nothing.
+
+The classes name where the fold noticed an id, not two distinct defects. One unrecorded mint
+produces either class or both, according to what became of the node downstream: `Unrecorded` while
+it survives into the output pane, `DanglingParent` once a recorded rewrite consumes it, and both
+when it is copied and also survives. Neither class localizes the site to fix on its own. What the
+split carries is which half of the recording failed across a whole fold. `Unrecorded == 0` says a
+recording scope was open at every mint in the span; a `DanglingParent` count over a zero
+`Unrecorded` count says the scopes are open and that some producer upstream never rowed the ids
+those recordings name. That reading is what holds the first pane pair out of the gate, in
+[Gate and audit coverage](#gate-and-audit-coverage).
+
+`DanglingParent` is **one** class for both edge shapes, because a lone parent and one of a fusion's
+several are the identical condition, and telling them apart would mean recording the rewrite's
+shape. Each class is reported once per distinct id: the fold sorts and dedups, so a dangling parent
+that four rows name is one entry rather than four. Deaths are not a class: the input-pane set
+difference is a product of the fold, so a gate asserts the whole `Leak` vector empty.
 
 The classes that are properties of a *record* rather than of a fold live at
 the write instead: one row per id, and every row anchored through consumption or
@@ -674,16 +683,16 @@ sample is what let two recording gaps live: `transact_phase` calling
 value-position writer hoist. Both are shapes the eleven listed programs do not
 have. CI runs with it on; it costs about 4% of the test step.
 
-It gates `gated_pane_pairs()`, not both, for the reason above: the first
-pair spans monomorphization and inference, and **inference's predicate
-producers do not record**. `specialize_use` clones a definition per
-instantiation, and the copies of a predicate term inside it row against interior
-ids no phase produced. The residue there is entirely `DanglingParent` and never
-`Unrecorded`, so gating it today would report a constant, not a regression. No
-program count is recorded here: a count over an uninstrumented phase measures how
-little that phase records, and churns with every unrelated change. **Add it to
-`gated_pane_pairs()` in the commit that makes inference record**, the same way an
-endpoint moves.
+It gates `gated_pane_pairs()`, not both, for the reason above: the first pair spans
+monomorphization and inference, and **inference's predicate producers do not record**.
+`specialize_use` clones a definition per instantiation, and the copies of a predicate term inside
+it row against interior ids no phase produced. Inference's own rewrites do sit inside a recording
+scope, so every post-inference node carries a row and the residue there is entirely
+`DanglingParent` and never `Unrecorded`: gating it today would report a constant, not a regression,
+and an `Unrecorded` arriving there would be a missed mint and a defect now. No program count is
+recorded here: a count over an uninstrumented phase measures how little that phase records, and
+churns with every unrelated change. **Add it to `gated_pane_pairs()` in the commit that makes
+inference record**, the same way an endpoint moves.
 
 **Move the endpoint when a phase becomes instrumented, in the commit that
 instruments it:** to `post-lambda-elim` when the elim phase records, and to

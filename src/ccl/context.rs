@@ -619,10 +619,10 @@ impl CompiledProgram {
     /// * post-channelize pane = fold the [`CHANNELIZE_PHASES`] rows against the
     ///   post-inference pane.
     ///
-    /// The leaks are **returned, not asserted**: `Unrecorded` is the capture
-    /// gate ([`gate_leaks`]) but a span is only clean once every phase inside it
-    /// records its rewrites. The deaths ride alongside them as a product, since
-    /// nothing declares a fate.
+    /// The leaks are **returned, not asserted**: a span reaches zero only once
+    /// every phase inside it records its rewrites, so [`gate_leaks`] is left to
+    /// the callers that fold an instrumented span. The deaths ride alongside them
+    /// as a product, since nothing declares a fate.
     // Cold path: the inspector's snapshot serve, which is not in this workspace.
     #[allow(dead_code)]
     pub(crate) fn materialize_panes(&self) -> MaterializedPanes {
@@ -784,20 +784,29 @@ impl MaterializedPanes {
     }
 
     /// The pane pairs a gate can hold at zero: the ones whose phases are
-    /// **instrumented**. Same discipline as an audit span's endpoint — a gate
-    /// over a pane pair whose phases do not record cannot reach zero however
-    /// correct the recording is, so it would report a constant rather than a
-    /// regression.
+    /// **instrumented**. Same discipline as an audit span's endpoint. A gate over
+    /// a pane pair whose phases do not record cannot reach zero however correct
+    /// the recording is, so it would report a constant rather than a regression.
     ///
-    /// Today that is the second pair only. The first spans monomorphization
-    /// and inference, and **inference's predicate producers do not record**:
+    /// Today that is the second pair only. The first spans monomorphization and
+    /// inference, and **inference's predicate producers do not record**:
     /// `specialize_use` clones a definition per instantiation, and the copies of
-    /// a predicate term inside it row against interior ids no phase ever produced.
-    /// The residue is entirely [`Leak::DanglingParent`] and never
-    /// [`Leak::Unrecorded`], which is what makes it a constant rather than a
-    /// regression — it is the crossing "Known prerequisites" records. No count is
-    /// pinned here, because a count over an uninstrumented phase measures how
-    /// little it records and churns with every unrelated change.
+    /// a predicate term inside it row against interior ids no phase ever
+    /// produced. It is the crossing "Known prerequisites" records.
+    ///
+    /// The residue's class signature is what makes it a constant. Inference's own
+    /// rewrites sit inside a recording scope, so every post-inference node
+    /// carries a row and [`Leak::Unrecorded`] is zero; what dangles is the
+    /// parents those rows name. Returning both pairs here and running
+    /// `CAMBRA_PROVENANCE_GATE=1` over `tests/compilation_pipeline` fails six
+    /// programs on 46 leaks, every one [`Leak::DanglingParent`] and none
+    /// [`Leak::Unrecorded`]: four UDF-with-filter or poly-wrapper shapes and two
+    /// refined-annotation shapes. A [`Leak::Unrecorded`] arriving there would be
+    /// a missed mint and a defect now, which is the reading the two classes carry
+    /// that a single class would not.
+    ///
+    /// No count is pinned here, because a count over an uninstrumented phase
+    /// measures how little it records and churns with every unrelated change.
     /// **Add the first pair here in the commit that makes inference record**,
     /// exactly as an audit span's endpoint moves with the phase that earns it.
     pub(crate) fn gated_pane_pairs(&self) -> [(&'static str, &[Leak]); 1] {
@@ -928,11 +937,11 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId>
 
 /// The leak gate: **a fold's [`Leak`] vector must be empty**.
 ///
-/// [`Leak::Unrecorded`] is the capture gate — an output-pane node with no origin
-/// means the driver missed a mint. [`Leak::DanglingParent`] is the record-integrity
-/// gate — a node's ancestry stopping at an id the fold has never heard of. A
-/// death is not a leak and reaches a caller as its own collection, so there is
-/// nothing here to filter.
+/// Both classes are asserted the same way. Each means a node reached the output
+/// pane with nothing recording where it came from, and neither localizes the site
+/// to fix on its own, so the gate reads the vector's emptiness and not its
+/// composition (see [`Leak`]). A death is not a leak and reaches a caller as its
+/// own collection, so there is nothing here to filter.
 ///
 /// Debug/test only, single code path (`cfg!`, not `#[cfg]`).
 fn gate_leaks(leaks: &[Leak], pair: &str) {
@@ -1081,7 +1090,7 @@ fn provenance_audit_span() -> Option<String> {
 /// interiors, which the narrow set omits from the input side, so those edges
 /// dangle as [`Leak::DanglingParent`] with nothing actually unrecorded. Defaulting
 /// to the narrow set made the plain invocation report ~166 folds of noise on
-/// the pipeline orpus and buried real defects in it.
+/// the pipeline corpus and buried real defects in it.
 ///
 /// [`materialize_panes`]: CompiledProgram::materialize_panes
 fn provenance_predicates_live() -> bool {
