@@ -342,10 +342,13 @@ pub(super) fn lower_list_comp(
 
 /// Hand out a tree copy of `origin` for one arm of a fan-out. Every arm is a
 /// sibling, including the first: a fan-out places the same subtree under several
-/// arms and no arm is privileged. The copy-frame records each copy as a `Copy` of
+/// arms and no arm is privileged. The copy sink records each copy as a `Copy` of
 /// the origin, so every arm's attribution mirrors the original's.
+///
+/// Keeping the first arm's ids was measured at 30 ids saved over the whole
+/// pipeline suite, max subtree 5 — which does not pay for a second code path.
 fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
-    use crate::ccl::lineage::copy_frame;
+    use crate::ccl::provenance::copy_frame;
     let _frame = copy_frame(label);
     origin.clone()
 }
@@ -434,6 +437,8 @@ fn fan_out_element_case(
     // `true → Case{…}`) into one flat partition, so each arm is a plain value.
     let branches = flatten_trailing_value_case(branches);
     let mut prior_guards: Vec<Expr> = Vec::new();
+    // The source subtree is placed once per arm in the element map and once more in
+    // that arm's gate, so every use after the first must be a freshened copy.
     let arms: Vec<Expr> = branches
         .into_iter()
         .map(|b| {
@@ -467,10 +472,10 @@ fn fan_out_element_case(
                 ),
                 Expr::lambda(iter_var, Type::Hole, gate),
             );
-            // `gate_on_source` rides the cast target's refinement predicate, so
-            // its interior is in the domain the fold must explain and nothing in
-            // the main-tree walk reaches it. Sweep it
-            // (`src/ccl/design/provenance.md`, "Walking the ids").
+            // `gate_on_source` rides the cast target's refinement predicate — a
+            // type slot outside the `walk_children` walk — so nothing else will
+            // record its interior, and `collect_tree_ids` now enumerates it.
+            // Sweep it (`design/provenance.md`, "Walking the ids", crossing 1).
             ctx.tag_predicate(&gate_on_source, span, "lower.comp_arm_gate_pred");
             let target = refined_data_fun(Type::Hole, gate_on_source, Type::Hole);
             ctx.tag_machinery(make_cast(elem_map, target), span, ec)

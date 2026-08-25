@@ -53,7 +53,7 @@
 //!
 //! This pass runs **before** [`crate::ccl::channelize`] (so the unified
 //! letrec phase can route an in-loop feed against inlined writers, and a
-//! defer-mediating UDF reaches its call site before desugar routes it), so it
+//! defer-mediating UDF reaches its call site before channelize routes it), so it
 //! *does* see [`Defer`]/[`Feed`]/[`Define`] nodes and `Type::History` (feed) domains.
 //! Beta-reduction goes through the defer-aware [`crate::ccl::subst::Subst`]
 //! engine, whose `Feed`/`Define` arms rename a fed-to handle correctly when a
@@ -69,6 +69,7 @@ use crate::ccl::{
     Expr, Lit, Name, Refinement, Type, TypedExprNode,
     ccl_utils::{PredMemo, is_free, walk_refined_predicates_mut},
     lambda_elim::substitute,
+    provenance,
 };
 
 // ---------------------------------------------------------------------------
@@ -231,6 +232,10 @@ fn inline_impl(expr: Expr) -> Expr {
                 && !is_let_bound(repl_name, &body)
                 && !is_mut_written(repl_name, &body)
             {
+                // Alias collapse: the `Let` and its `Var` bound-expr die, the
+                // body is promoted. Nothing is minted, so the recording exists
+                // only to own the substitution's copies.
+                let _g = provenance::enter(node_id, "inline.alias", provenance::Nature::Machinery);
                 return substitute(body, &binding.name, &bound_expr);
             }
 
@@ -247,6 +252,7 @@ fn inline_impl(expr: Expr) -> Expr {
                 // Let bindings (e.g. `let y = (let x = Defer in …) in …` after
                 // expanding a defer-returning UDF) are eligible for the alias
                 // and lift rewrites on the second pass.
+                let _g = provenance::enter(node_id, "inline.udf", provenance::Nature::Expansion);
                 return inline_impl(inline_and_beta_reduce(
                     body,
                     &binding.name,
@@ -389,6 +395,14 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                     param.ty,
                     argument.ty
                 );
+                // Beta reduction, recorded against the `Apply` node it
+                // collapses. It needs no `RecordingGuard::also_consumes`: the
+                // `Apply` and the `Lambda` both vanish, and neither has to be
+                // named, because the boundary difference reports both. The
+                // promoted `body` keeps its own id and is its own self-edge, and
+                // the substituted argument's copies arrive through `on_copy` as
+                // copies of the argument's own interior, which is what they are.
+                let _g = provenance::enter(node_id, "inline.beta", provenance::Nature::Expansion);
                 return substitute(*body, &param.name, &argument);
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather

@@ -722,7 +722,7 @@ fn a_bounded_variant_annotation_does_not_become_the_binders_type() {
 /// program that type-checks.
 ///
 /// So the gate asks the polarity-correct walk alone (`value_reaches` in
-/// `src/ccl/infer/solve.rs`). Asserted through `check_pre_desugar` because that
+/// `src/ccl/infer/solve.rs`). Asserted through `check_pre_channelize` because that
 /// wall is where the disagreement surfaces — inference itself reports `Int` and
 /// no error.
 #[test]
@@ -748,6 +748,6 @@ fn an_upper_bound_alone_does_not_count_as_a_value_reaching_a_payload() {
         infer(&mut e, &mut ctx).expect("two call sites type-check"),
         int()
     );
-    cambra::ccl::infer::check_pre_desugar(&e)
+    cambra::ccl::infer::check_pre_channelize(&e)
         .expect("every arm's recorded type is the join the wall recomputes");
 }

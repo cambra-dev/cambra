@@ -141,8 +141,8 @@ impl Typing for CheckCtx {
         // across the suite: it never fires.
         let bases: Option<Vec<&BaseType>> = operands.iter().map(|t| offered_base(t)).collect();
         let Some(bases) = bases else {
-            // Pre-desugar residue (a `Feed` handle, an un-eliminated `Mut`, a
-            // still-`Infer` position under `Strictness::PreDesugar`) is not something
+            // Pre-channelize residue (a `Feed` handle, an un-eliminated `Mut`, a
+            // still-`Infer` position under `Strictness::PreChannelize`) is not something
             // this rule can judge — the strictness wall decides whether a residual
             // type is tolerable at this point in the pipeline.
             return Ok(assoc.map(|_| self.fresh()));
@@ -238,8 +238,10 @@ impl Typing for CheckCtx {
         // predicates — then return the (owned) body type unchanged rather than
         // cloning `bound_expr` for a no-op discharge.
         if crate::ccl::subst::type_free_vars(&body_ty).contains(name) {
-            // A discharge template is not a tree node: it is cloned again at
-            // every read, and that read is where the sibling is minted.
+            // A type-level discharge. The template keeps its ids because a
+            // template is not a tree node — it is cloned again at every read, and
+            // that read is where the sibling is minted. (Not because predicates
+            // are out of the id domain; they are in it.)
             crate::ccl::subst::Subst::discharge(name, bound_expr.clone_preserving_ids())
                 .apply_type(&body_ty)
         } else {
@@ -267,12 +269,12 @@ impl Typing for CheckCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError> {
         // Destructure the resolved type directly (no inference vars), and —
-        // pre-desugar only — read through a transparent handle to the value it
+        // pre-channelize only — read through a transparent handle to the value it
         // wraps: a `Mut` history to its value (a `Mut`-typed collection used as a
         // for-loop source derefs to the collection), a defer's `Feed` to its
         // channel. Both mirror the solver's transparent-read rule that Emit applies
         // when it destructures the same position, so Check and Emit agree at the
-        // consistency wall; post-desugar/-erasure trees carry neither type.
+        // consistency wall; post-channelize/-erasure trees carry neither type.
         let mut peeled = t.peel_refinements();
         while let Some(value) = peeled.mut_value_type() {
             peeled = value.peel_refinements();
@@ -359,7 +361,7 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
     // records or raises is blamed on it (`Typing::raise`); restored on exit,
     // error path included. Mirrors `emit_node`'s wrapper.
     let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
-    // One frame per node over the whole tree, and the frame is sized for the union
+    // One stack frame per node over the whole tree, sized for the union
     // of `check_node_rule`'s arms, so a deep tree can outrun a test thread's stack.
     // Same guard, and same reason, as `lambda_elim`'s recursion entries.
     let out = stacker::maybe_grow(512 * 1024, 1024 * 1024, || check_node_rule(expr, ctx));
@@ -562,7 +564,7 @@ pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
         // Check-mode failures are compiler bugs (a pass produced an ill-typed
         // tree), and every caller either `.expect()`s them or renders them
         // without source context, so the blame nodes are dropped here rather
-        // than plumbed through `typecheck`/`check_pre_desugar`. They are
+        // than plumbed through `typecheck`/`check_pre_channelize`. They are
         // recorded per error, so surfacing them is a signature change away when
         // a caller wants an underlined report.
         Err(ctx.errors.into_iter().map(|e| e.error).collect())

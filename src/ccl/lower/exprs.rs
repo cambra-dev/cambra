@@ -464,11 +464,11 @@ pub(super) fn lower_compare(
 
     // Build one BinOp per (op, adjacent-operand-pair). Each middle operand is
     // placed in two pairs, and no placement is privileged, so every placement is a
-    // freshened copy taken inside a lowering copy-frame: each re-minted node lands
+    // freshened copy taken inside a lowering copy sink: each re-minted node lands
     // as a `Copy` step mirroring the original operand's (Source) image, which is
     // the attribution wanted for a duplicated operand.
     let operand = |i: usize| {
-        use crate::ccl::lineage::copy_frame;
+        use crate::ccl::provenance::copy_frame;
         let _frame = copy_frame("lower.compare_operand");
         operands[i].clone()
     };
@@ -482,6 +482,10 @@ pub(super) fn lower_compare(
             CmpOp::Gt => CompareKind::Greater,
             CmpOp::GtE => CompareKind::GreaterOrEq,
         };
+        // Operand `i` is this pair's left side and, for `i > 0`, was pair `i-1`'s
+        // right side; operand `i+1` is this pair's right side and may be the next
+        // pair's left. Every placement freshens and is recorded, so which use
+        // comes first does not matter here.
         let lhs = operand(i);
         let rhs = operand(i + 1);
         // Each pair comparison images its `<op>` in the chain, spanning its two
@@ -617,19 +621,19 @@ mod tests {
     /// Regression: a chained comparison shares each middle operand between two
     /// adjacent pairs. A bare clone would put the same `NodeId`s in the tree
     /// twice, tripping `assert_unique_node_ids` at the `"post-lowering"`
-    /// boundary. The second use is freshened inside a lowering copy-frame; the tree must be
+    /// boundary. The second use is freshened inside a lowering copy sink; the tree must be
     /// duplicate-free, and the lowering fold must explain every node with no leak
     /// (the freshened copy resolves as a `Copy` mirroring its origin's image).
     #[test]
     fn chained_compare_freshens_shared_operands() {
         use crate::ccl::context::{assert_unique_node_ids, collect_tree_ids};
-        use crate::ccl::lineage::{RecorderSession, collapse_lowering};
+        use crate::ccl::provenance::{LoweringSession, fold_lowering};
 
         let expr = parse_expr("1 < x < 3");
         let mut ctx = LoweringContext::default();
-        let session = RecorderSession::lowering();
+        let session = LoweringSession::install();
         let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
-        let log = session.into_lowering_log();
+        let log = session.into_log();
 
         // The same tripwire the pipeline runs at every pass boundary — this test
         // is the crafted program for the class it guards.
@@ -638,7 +642,7 @@ mod tests {
         // The lowering fold explains every tree node (the freshened
         // middle-operand copy included) with no leak — the successor to the
         // retired per-node coverage check.
-        let (projection, leaks) = collapse_lowering(&log, &seen);
+        let (projection, leaks) = fold_lowering(&log, &seen);
         assert!(leaks.is_empty(), "lowering fold is leak-free: {leaks:?}");
         for id in &seen {
             assert!(

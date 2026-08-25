@@ -749,7 +749,7 @@ pub(super) fn lower_middle_stmt(
             }
 
             // A feed/yield loop with no accumulator is a side-effecting
-            // `Compose` (desugar routes its feeds).
+            // `Compose` (channelize routes its feeds).
             let for_expr = lower_generator_for(target, iter, for_body, &scope, stmt.span, ctx)?;
             Ok(ctx.tag_machinery(Expr::expr_stmt(for_expr, body), stmt.span, "lower.stmt_seq"))
         }
@@ -1937,8 +1937,8 @@ x";
     #[test]
     fn lowering_tags_nodes_with_source_spans() {
         use crate::ccl::TypedExprNode;
-        use crate::ccl::lineage::{Nature, RecorderSession, collapse_lowering};
         use crate::ccl::provenance::NodeId;
+        use crate::ccl::provenance::{LoweringSession, Nature, fold_lowering};
         use crate::chl_parser::ast::Span;
         use std::collections::HashSet;
 
@@ -1954,18 +1954,18 @@ x";
         // Install the always-on lowering session, lower, then fold the log into
         // the lowering projection — the same handoff `compile_program` runs.
         let mut ctx = LoweringContext::default();
-        let session = RecorderSession::lowering();
+        let session = LoweringSession::install();
         let lowered = lower_stmts(&stmts, &mut ctx)
             .into_result()
             .expect("lowering succeeds");
-        let log = session.into_lowering_log();
+        let log = session.into_log();
         let mut output_ids: HashSet<NodeId> = HashSet::new();
         fn ids(e: &Expr, acc: &mut HashSet<NodeId>) {
             acc.insert(e.node_id());
             e.walk_children(|c| ids(c, acc));
         }
         ids(&lowered, &mut output_ids);
-        let (seed, leaks) = collapse_lowering(&log, &output_ids);
+        let (seed, leaks) = fold_lowering(&log, &output_ids);
         assert!(leaks.is_empty(), "lowering fold is leak-free: {leaks:?}");
 
         // Root node is the `let x = 1 in (x + 2)` binding, tagged with the

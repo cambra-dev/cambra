@@ -64,7 +64,7 @@
 //! # Transformation (cluster algorithm)
 //!
 //! For a cluster of consecutive `let d_i = Defer in …` bindings,
-//! `desugar` performs three steps:
+//! `channelize_expr` performs three steps:
 //!
 //! 1. **Feed extraction.**  Walk the cluster body and collect every
 //!    `Feed(d_i, V)` / `Define(d_i, V)` plus the iteration context
@@ -116,6 +116,7 @@ use crate::ccl::{
     TypedExpr, TypedExprNode,
     ccl_utils::{count_free, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
+    provenance,
 };
 
 /// `true` when `ty` carries channelization-erasable residue — a `Hole` stamped
@@ -145,7 +146,7 @@ fn has_type_residue(ty: &Type) -> bool {
     }
 }
 
-/// Errors that can arise while desugaring `Defer`/`Feed`/`Define` nodes.
+/// Errors that can arise while channelizing `Defer`/`Feed`/`Define` nodes.
 #[derive(Debug, PartialEq)]
 pub enum DeferError {
     /// A deferred binding had no corresponding `Feed` or `Define` in its scope.
@@ -213,7 +214,7 @@ impl fmt::Display for DeferError {
 }
 
 /// Recognize a guard-only `Case` that feeds `defer_name` in one or more arms —
-/// the desugar-stage counterpart of `lambda_elim`'s `is_filter_case_body`.
+/// the channelize-stage counterpart of `lambda_elim`'s `is_filter_case_body`.
 ///
 /// Shape (as lowered from `if g₀: d << v₀ elif g₁: d << v₁ … [else: d << vₑ]` in
 /// a for-loop body): `Case { None, [g₀ → body₀; …; true → bodyₜ] }`, where each
@@ -306,7 +307,7 @@ fn is_lift_shape(bound_expr: &Expr) -> bool {
 ///
 /// Rewrites to: `let y = Defer in body_x[x → y] with Var(y) replaced
 /// by body_y`.  The substitution `x → Var(y)` is done via
-/// [`desugar_substitute`], which also renames the *target* name of
+/// [`channelize_substitute`], which also renames the *target* name of
 /// `Feed`/`Define` nodes when the replacement is a `Var` — so
 /// `Feed("x", …)` becomes `Feed("y", …)` automatically.
 ///
@@ -360,7 +361,7 @@ fn lift_defer(binding_name: &Name, bound_expr: Expr, body: &Expr) -> DeferLift {
         (inner_binding.name, inner_be.ty, *inner_body);
 
     // `body_x[x → y]` — also renames Feed/Define targets named `x` to `y`.
-    let inner_subst = desugar_rename(inner_body_x, &inner_name, binding_name);
+    let inner_subst = channelize_rename(inner_body_x, &inner_name, binding_name);
 
     // Wrap `body_y` with the prefix (renaming stale feed targets to `y`).
     let mut new_outer_body = body.clone();
@@ -472,7 +473,7 @@ fn contains_defer(expr: &Expr) -> bool {
 /// `Define(target, …)` node where `target == name`, respecting shadowing
 /// by `Let`/`Lambda` bindings that rebind `name`.
 ///
-/// Debug-only: the sole caller is the `desugar` invariant assert that a
+/// Debug-only: the sole caller is the `channelize_expr` invariant assert that a
 /// bare-`Var` defer alias never survives `inline` into channelize.
 #[cfg(debug_assertions)]
 fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
@@ -505,7 +506,7 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
 /// Substitute every free `Var(name)` in `expr` with `replacement`.
 ///
 /// Replace every free occurrence of `Var(name)` with `replacement` during
-/// desugaring, renaming `Feed`/`Define` targets along the way: when
+/// channelization, renaming `Feed`/`Define` targets along the way: when
 /// `replacement` is a `Var(new_name)`, handle uses of `name` become
 /// `new_name` — the α-renaming that makes alias-inlining for defer handles
 /// correct.
@@ -513,11 +514,11 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
 /// A thin wrapper over the uniform engine's in-place mode
 /// ([`crate::ccl::subst::Subst::rewrite_expr`]). Unlike the pre-port
 /// version, the engine also rewrites type-carried refinement predicates
-/// (`Cast` targets, annotations), so a desugar rename now reaches a
+/// (`Cast` targets, annotations), so a channelize rename now reaches a
 /// predicate that closes over the renamed binder instead of leaving a stale
 /// reference; and a `Case` pattern binding correctly shadows `name` in its
 /// branch.
-fn desugar_rename(expr: Expr, from: &Name, to: &Name) -> Expr {
+fn channelize_rename(expr: Expr, from: &Name, to: &Name) -> Expr {
     let mut expr = expr;
     // A **rename**, not a discharge of a bare variable. Both rewrite the same
     // occurrences, but the species is what carries the occurrence's type onto the
@@ -529,8 +530,8 @@ fn desugar_rename(expr: Expr, from: &Name, to: &Name) -> Expr {
     expr
 }
 
-/// State threaded through the desugar walk: the channel domains it resolves.
-struct DesugarCtx {
+/// State threaded through the channelize walk: the channel domains it resolves.
+struct ChannelizeCtx {
     /// each channelized defer's concrete channel domain,
     /// keyed by its (nominal) `ChanDom` name — recorded as clusters are
     /// assembled, then closed and substituted over the whole tree by [`run`].
@@ -540,7 +541,7 @@ struct DesugarCtx {
     resolved_domains: Vec<(Name, Type)>,
 }
 
-impl DesugarCtx {
+impl ChannelizeCtx {
     fn new() -> Self {
         Self {
             resolved_domains: Vec::new(),
@@ -568,17 +569,17 @@ impl DesugarCtx {
 /// (rather than leaving it for `simplify`) means no later pass needs to
 /// pattern-match `ExprStmt`.
 pub fn run(expr: Expr) -> Result<Expr, DeferError> {
-    let mut ctx = DesugarCtx::new();
+    let mut ctx = ChannelizeCtx::new();
     // Cluster channelization.  Walks the tree, processes `let d = Defer in …`
     // clusters, extracting feeds and building each defer's channel.
     //
     // Defer-mediating UDFs (`def g(out): out << e`, `def f(n): x = defer();
     // …; x`) never reach here: `inline` beta-reduces every such function at its
-    // call site *before* this pass (it runs pre-desugar — see the `inline`
+    // call site *before* this pass (it runs pre-channelize — see the `inline`
     // module docs), leaving only the flattened `let d = Defer in …` chains this
     // walk handles. The former Phase-1 chain rewriter and the call-site smart
     // walker that existed for the un-inlined higher-order case are retired.
-    let rewritten = desugar(expr, &mut ctx)?;
+    let rewritten = channelize_expr(expr, &mut ctx)?;
     let mut rewritten = drop_expr_stmts(rewritten);
     assert_no_defer_residue(&rewritten)?;
     // With nominal channel domains, every consumer of a defer read typed
@@ -587,7 +588,7 @@ pub fn run(expr: Expr) -> Result<Expr, DeferError> {
     // whole-tree type substitution: map each `ChanDom(d)` to its assembled
     // channel's concrete domain, and erase each `Feed`-kind history to its bare
     // stream `Fun` — the exact feed-side analog of `mut_elim::erase_mut`. The
-    // strict post-desugar `typecheck` in `compile_program` backstops the
+    // strict post-channelize `typecheck` in `compile_program` backstops the
     // invariant.
     let mut map = close_chan_domains(std::mem::take(&mut ctx.resolved_domains));
     erase_chan_domains(&mut rewritten, &mut map);
@@ -809,7 +810,7 @@ fn fun_domain(ty: &Type) -> Option<Type> {
 }
 
 /// Debug-only invariant: after [`run`] on a typed input, no expression or
-/// binder slot may still carry a `Hole`, `Infer`, or `Feed` type — desugar
+/// binder slot may still carry a `Hole`, `Infer`, or `Feed` type — channelize
 /// erased the defer constructs, so their transient types must be gone too.
 /// (Refinement predicates are checked by the strict `typecheck` instead;
 /// walking them here would need the cycle guards it already has.)
@@ -882,7 +883,7 @@ fn refine_source_domain(source: &mut Expr, refinement: Refinement) {
 
 /// Collapse every `ExprStmt(e, b)` to `b`, recursing structurally.
 ///
-/// Safe to do after the main desugar walk: every remaining `e` is pure
+/// Safe to do after the main channelize walk: every remaining `e` is pure
 /// (its `Feed`/`Define` sites have been extracted, leaving `Unit`
 /// residue), so dropping it is value-preserving.
 fn drop_expr_stmts(expr: Expr) -> Expr {
@@ -1037,7 +1038,7 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
 }
 
 /// Whether the subtree contains a pre-phase marker node (`For`/`MutWrite`)
-/// that the unified letrec phase consumes downstream of desugar. Used to
+/// that the unified letrec phase consumes downstream of channelize. Used to
 /// keep marker-bearing `ExprStmt`s alive through [`drop_expr_stmts`].
 fn contains_phase_marker(expr: &Expr) -> bool {
     if matches!(
@@ -1051,7 +1052,7 @@ fn contains_phase_marker(expr: &Expr) -> bool {
     found
 }
 
-/// Confirm that no `Defer`/`Feed`/`Define` nodes remain after desugar.
+/// Confirm that no `Defer`/`Feed`/`Define` nodes remain after channelize.
 fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
     match &expr.node {
         // `mut_elim::run` (before channelize) eliminates every mutable variable
@@ -1139,13 +1140,13 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
 /// When found, processes the binding via [`channelize_defer`] (feed path) or
 /// inlines the define value directly (define path).  All other nodes are
 /// recursed into structurally.
-fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
-    // One frame per node over the whole tree; grow on demand, as the other
+fn channelize_expr(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferError> {
+    // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
-    stacker::maybe_grow(512 * 1024, 1024 * 1024, || desugar_inner(expr, ctx))
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || channelize_inner(expr, ctx))
 }
 
-fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
+fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferError> {
     if matches!(expr.node, TypedExprNode::Error) {
         crate::unexpected_error_node!();
     }
@@ -1214,7 +1215,13 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // Recurse into the body first to handle any nested
             // non-clustered defers (inner `let d = Defer in ...`
             // separated from this cluster by other lets).
-            let body_rewritten = desugar(current_body, ctx)?;
+            let body_rewritten = channelize_expr(current_body, ctx)?;
+            // The recording names the **outermost** `let d = Defer`: the cluster's
+            // whole product replaces it. A cluster's inner defers are consumed too but
+            // are not named, because naming them would assert they die, and a
+            // defer whose handle survives in a type does not.
+            let _g =
+                provenance::enter(node_id, "channelize.cluster", provenance::Nature::Expansion);
             channelize_cluster(&defer_names, &chan_names, body_rewritten, ctx)
         }
         TypedExprNode::Let {
@@ -1237,7 +1244,23 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 // Read before the lift consumes the binding.
                 let (outer, lvl) = handle_chan_dom(&binding.ty)
                     .unwrap_or_else(|| (binding.name.clone(), crate::ccl::ChanLevel(0)));
-                let lift = lift_defer(&binding.name, *bound_expr, &body);
+                // The lift *mints*: `channelize_substitute` replaces the inner
+                // scope's trailing `Var` with the outer body, and any `ExprStmt`
+                // prefix is rebuilt onto the lifted spine. Those products stand in
+                // for this `let`, which the lift consumes, so the recording names it.
+                // `Machinery` — merging two defer scopes is plumbing that undoes an
+                // inlining artifact, not anything the user wrote.
+                //
+                // The recursion below runs outside the recording, so a nested lift
+                // attributes to its own `let`.
+                let lift = {
+                    let _g = provenance::enter(
+                        node_id,
+                        "channelize.defer_lift",
+                        provenance::Nature::Machinery,
+                    );
+                    lift_defer(&binding.name, *bound_expr, &body)
+                };
                 // The lift renames the inner defer binder to the outer name,
                 // but *consumer types outside the lifted subtree* may carry
                 // the inner handle's rigid `ChanDom`. Record the alias so the
@@ -1257,7 +1280,7 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                     ctx.resolved_domains
                         .push((inner_key, Type::ChanDom(outer, lvl)));
                 }
-                return desugar(lift.expr, ctx);
+                return channelize_expr(lift.expr, ctx);
             }
             // Let-of-defer-returning-let collapse: `let y = (let z =
             // E in Var(z)) in body_y` is equivalent to `let z = E in
@@ -1273,6 +1296,15 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 && is_defer_returning(inner_body, &inner_binding.name)
                 && contains_defer(inner_be)
             {
+                // This arm rebuilds: it copies the inner scope out of the
+                // borrowed tree and splices the outer body into its tail, so the
+                // collapsed `let` and both copies are new nodes standing in for
+                // this `let`. Same parent and same reason as the lift above.
+                let _g = provenance::enter(
+                    node_id,
+                    "channelize.defer_collapse",
+                    provenance::Nature::Machinery,
+                );
                 let inner_name = inner_binding.name.clone();
                 let inner_be = (**inner_be).clone();
                 let inner_body = (**inner_body).clone();
@@ -1283,7 +1315,7 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 // Rename inner_name → binding.name in the spliced body
                 // so the inner defer is exposed under the outer let-y
                 // name for subsequent passes.
-                let renamed = desugar_rename(spliced, &inner_name, &binding.name);
+                let renamed = channelize_rename(spliced, &inner_name, &binding.name);
                 // Same alias recording as the lift above — types outside this
                 // subtree may carry the inner handle's rigid name.
                 let inner_key = handle_chan_dom(&inner_binding.ty)
@@ -1296,12 +1328,13 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                         .push((inner_key, Type::ChanDom(outer, lvl)));
                 }
                 let collapsed = Expr::let_bind(binding.name.clone(), inner_be, renamed);
-                return desugar(collapsed, ctx);
+                drop(_g);
+                return channelize_expr(collapsed, ctx);
             }
             // Recurse first so any inner aliases / UDF-inlines get
             // resolved before we check this outer binding.
-            let bound_expr = desugar(*bound_expr, ctx)?;
-            let body = desugar(*body, ctx)?;
+            let bound_expr = channelize_expr(*bound_expr, ctx)?;
+            let body = channelize_expr(*body, ctx)?;
             // Alias inlining (`let y = Var(x) in body` → `body[y → x]`) is
             // `inline`'s job, not channelize's: `inline` unconditionally collapses
             // a bare-`Var` alias before this pass runs — post-uniquify its
@@ -1346,7 +1379,7 @@ fn desugar_inner(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 user_annotation,
                 node_id,
             };
-            expr.try_map_children(|c| desugar(c, ctx))?;
+            expr.try_map_children(|c| channelize_expr(c, ctx))?;
             Ok(expr)
         }
     }
@@ -1370,7 +1403,7 @@ fn channelize_cluster(
     defer_names: &[Name],
     chan_names: &HashMap<Name, Name>,
     body: Expr,
-    ctx: &mut DesugarCtx,
+    ctx: &mut ChannelizeCtx,
 ) -> Result<Expr, DeferError> {
     // Extract feeds/defines for each defer.  `rewritten` accumulates the
     // body's Feed/Define replacements as we process each defer in turn.
@@ -2000,7 +2033,7 @@ fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
 ///
 /// `in_inner_scope` is `true` when the walk has crossed a [`TypedExprNode::Lambda`]
 /// or [`TypedExprNode::Case`] branch boundary — `Define` is disallowed in those
-/// contexts since the desugared binding would need to escape the inner scope.
+/// contexts since the channelized binding would need to escape the inner scope.
 fn extract_for_defer(
     expr: Expr,
     defer_name: &Name,
@@ -2009,7 +2042,7 @@ fn extract_for_defer(
     in_inner_scope: bool,
 ) -> Result<Expr, DeferError> {
     // Grow the stack on demand, as `lambda_elim`'s two recursion entries do. This
-    // walk descends the whole tree in one frame per node, and the frame is large
+    // walk descends the whole tree in one stack frame per node, and the frame is large
     // (one `match` over every node kind, so it is sized for the union of all arms)
     // — deep enough trees overflow a test thread's default stack. Every level goes
     // through this wrapper, so each one checks the remaining headroom.
@@ -2148,12 +2181,19 @@ fn extract_for_defer_impl(
                         // stamp the wrap at construction —
                         // the let's type is its body's, closed over the binder
                         // (the design §6.2 discharge) — there is no
-                        // re-derivation pass to fill a `Hole` in. (The discharge
-                        // clone here only feeds `apply_type`; its nodes land in
-                        // the type/predicate domain, so it is left un-freshened.)
-                        let let_ty =
-                            crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone())
-                                .apply_type(&original.ty);
+                        // re-derivation pass to fill a `Hole` in. The discharge
+                        // payload only feeds `apply_type`, so it is a *template*
+                        // rather than a tree node — it keeps its ids, and the
+                        // sibling is minted at the read inside `apply_type`.
+                        let let_ty = crate::ccl::subst::Subst::discharge(
+                            &binding.name,
+                            bound_expr.clone_preserving_ids(),
+                        )
+                        .apply_type(&original.ty);
+                        // The `Let` this walk is rebuilding keeps the original
+                        // `bound_expr` in the body, and each extracted feed that
+                        // captures the binder gets its own re-binding of the same
+                        // definition, so every wrap is a copy.
                         *feed = Expr::let_bind(binding.name.clone(), bound_expr.clone(), original)
                             .with_ty(let_ty);
                     }
@@ -2797,11 +2837,11 @@ mod tests {
         let body = Expr::expr_stmt(Expr::feed("d", lit(1)), var("d"));
         let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
         let result = run(typed(expr)).unwrap();
-        // After desugar: let __scope_out_d_0 = (Unit; Record({result: d, to_d: 1})) in
+        // After channelize: let __scope_out_d_0 = (Unit; Record({result: d, to_d: 1})) in
         //                let d = __scope_out_d_0.to_d in
         //                __scope_out_d_0.result
         let s = symbolic(&result);
-        // After desugar: `unit; let d = (λ __unused → 1) in d` — the
+        // After channelize: `unit; let d = (λ __unused → 1) in d` — the
         // scalar feed value is lifted to `Fun(Unit, T)` via the
         // `λ __unused → V` wrap, then bound to the defer name.
         assert!(s.contains("__unused"), "expected const-wrap in output: {s}");

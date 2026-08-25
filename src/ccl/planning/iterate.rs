@@ -9,6 +9,7 @@ use std::mem::take;
 
 use super::join::try_hash_join_rewrite;
 use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::provenance;
 
 use super::predicates::{compile_refinement_predicates, fn_of_bare_predicate};
 use super::*;
@@ -393,6 +394,17 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     let Some(domain_ty) = expr.ty.domain() else {
         return;
     };
+    // The recording names the site being wrapped. The predicate `fresh_copy` below lands
+    // as a `Copy` of the term it lifts out of the type.
+    //
+    // These rows reach no table in a normal compile: `compile_program` calls
+    // `planning::run` outside every pass scope it opens, so they land only under
+    // `CAMBRA_PROVENANCE_AUDIT=planning` (`recognized..join-planned`).
+    let _g = provenance::enter(
+        expr.node_id(),
+        "planning.iterate",
+        provenance::Nature::Machinery,
+    );
     // Walk every nested `Type::Refinement` layer (innermost ⊇ outermost,
     // each layer's predicate must hold), collecting the predicates
     // outer-to-inner; reverse to inner-to-outer.  Then emit a uniform
@@ -407,10 +419,16 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     let mut preds: Vec<Expr> = Vec::new();
     let mut current = &domain_ty;
     while let Type::Refinement(base, refinement) = current {
-        // Lifting a predicate out of a *type* and into the term tree: a predicate
-        // interior may already alias a live main-tree id, and one predicate `Rc`
-        // reached from two iteration sites would land twice.
-        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate).clone());
+        // Lifting a predicate out of a *type* and into the term tree: one
+        // predicate `Rc` reached from two iteration sites would otherwise land
+        // twice. `fn_of_bare_predicate` already returns an owned, freshened term
+        // on both its paths — the fast path clones the function subterm, the slow
+        // path η-expands and runs `lambda_elim` — so the lift is already a
+        // distinct node-set and needs no second copy here. (It needed one when
+        // `Clone` preserved ids; the trailing `fresh_copy()` was load-bearing
+        // then, and cloning again now would duplicate a whole tree per
+        // refinement layer for nothing.)
+        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate));
         current = base.as_ref();
     }
     preds.reverse();
@@ -447,9 +465,14 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     };
     let mut elts: Vec<Expr> = vec![source];
     match body.node {
-        TypedExprNode::Compose(existing) => {
-            elts.extend(existing);
-        }
+        // The body's own `Compose` is dissolved and its elements spliced into
+        // the new chain. Those elements keep their ids and become children, so
+        // the only node that vanishes is the `Compose` itself — which is the
+        // node this recording named (`body` is `expr`, taken above). Its fate is
+        // the boundary's live-set difference, so there is nothing to declare:
+        // `RecordingGuard::also_consumes` exists for a node the construction hooks
+        // *cannot* see, and this one is the node the recording named.
+        TypedExprNode::Compose(existing) => elts.extend(existing),
         _ => elts.push(body),
     }
     // The override is now redundant — `source`'s domain already carries

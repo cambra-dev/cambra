@@ -98,7 +98,7 @@ pub enum SyntheticKind {
     /// `Name` may itself be a `Synthetic` carrying a `SyntheticKind`, so the
     /// reference must be indirected to keep the type finite-sized.)
     Mono(Box<Name>),
-    /// A lambda/binding floated out during defer desugaring.
+    /// A lambda/binding floated out during channelization.
     FloatedDefer,
     /// The fresh binder the solver mints for a dependent application's
     /// expected Pi type (`(__arg: d) ⇒ result`), discharged to the argument.
@@ -191,7 +191,7 @@ impl Name {
         Self::synthetic(SyntheticKind::Mono(Box::new(source)))
     }
 
-    /// A lambda/binding floated out during defer desugaring.
+    /// A lambda/binding floated out during channelization.
     pub fn floated() -> Self {
         Self::synthetic(SyntheticKind::FloatedDefer)
     }

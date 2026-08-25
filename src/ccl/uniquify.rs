@@ -77,17 +77,74 @@ use std::collections::HashMap;
 use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
 
+/// Every **distinct** refinement-predicate term reachable from `expr`, as a
+/// multiset of their id-sets, deduped by `Rc` pointer.
+///
+/// One predicate term riding many type slots is one term; two entries here mean
+/// two genuinely different `Rc`s. Used to assert uniquify's predicate handling is
+/// **1:1** — see the tripwire in [`run`].
+#[cfg(debug_assertions)]
+fn distinct_predicate_terms(expr: &Expr) -> Vec<Vec<crate::ccl::provenance::NodeId>> {
+    use crate::ccl::provenance::NodeId;
+    use std::collections::{HashMap, HashSet};
+
+    fn ids_of(e: &Expr, out: &mut Vec<NodeId>) {
+        out.push(e.node_id());
+        e.walk_children(|c| ids_of(c, out));
+    }
+    fn from_ty(t: &Type, acc: &mut HashMap<usize, Vec<NodeId>>, seen: &mut HashSet<usize>) {
+        if let Type::Refinement(_, r) = t {
+            let key = std::rc::Rc::as_ptr(&r.predicate) as usize;
+            if seen.insert(key) {
+                let mut v = Vec::new();
+                ids_of(&r.predicate, &mut v);
+                v.sort_unstable();
+                acc.insert(key, v);
+                from_expr(&r.predicate, acc, seen);
+            }
+        }
+        t.walk_children(|c| from_ty(c, acc, seen));
+    }
+    fn from_expr(e: &Expr, acc: &mut HashMap<usize, Vec<NodeId>>, seen: &mut HashSet<usize>) {
+        from_ty(&e.ty, acc, seen);
+        if let Some(a) = &e.user_annotation {
+            from_ty(a, acc, seen);
+        }
+        if let TypedExprNode::Cast { target, .. } = &e.node {
+            from_ty(target, acc, seen);
+        }
+        e.walk_children(|c| from_expr(c, acc, seen));
+    }
+    let mut acc = HashMap::new();
+    let mut seen = HashSet::new();
+    from_expr(expr, &mut acc, &mut seen);
+    let mut out: Vec<Vec<NodeId>> = acc.into_values().collect();
+    out.sort();
+    out
+}
+
 /// α-uniquify every binder in `expr` (see module docs). Runs once per
-/// program, immediately after lowering and before defer desugaring.
+/// program, immediately after lowering and before channelization.
 pub fn run(mut expr: Expr) -> Expr {
     // Snapshot every node's `NodeId` before the rename so we can assert
     // it survives unchanged (collected only under debug_assertions).
     #[cfg(debug_assertions)]
     let before_ids = collect_node_ids(&expr);
+    // The **1:1 predicate** precondition. Uniquify cannot mutate through a
+    // predicate's `Rc`, so it rebuilds each one and repoints the refinement it
+    // was handed. That is only a *replacement* — and preserving the ids only
+    // honest — if the walk reaches every occurrence, so that no original term
+    // survives beside its rebuild. Asserted rather than assumed: N distinct
+    // predicate terms in, N distinct terms out, carrying the same ids.
+    #[cfg(debug_assertions)]
+    let before_preds = distinct_predicate_terms(&expr);
 
     let mut u = Uniquifier {
         env: HashMap::new(),
-        memo: PredMemo::new(),
+        // Replacing, not deriving: this walk reaches every occurrence of every
+        // predicate it rebuilds, so no original survives beside its rebuild. The
+        // tripwire below asserts that 1:1 correspondence on every compile.
+        memo: PredMemo::replacing(),
     };
     u.expr(&mut expr);
     debug_assert!(
@@ -103,6 +160,22 @@ pub fn run(mut expr: Expr) -> Expr {
             before_ids, after_ids,
             "uniquify must preserve every NodeId (1:1 in-place rename); \
              provenance ids are stable across this pass"
+        );
+        let after_preds = distinct_predicate_terms(&expr);
+        debug_assert_eq!(
+            before_preds.len(),
+            after_preds.len(),
+            "uniquify must be 1:1 on predicate terms: {} distinct terms in, {} out. \
+             A mismatch means the walk missed an occurrence, so an original term \
+             survives beside its rebuild — and then preserving their ids puts one \
+             id-set on two live terms.",
+            before_preds.len(),
+            after_preds.len(),
+        );
+        debug_assert_eq!(
+            before_preds, after_preds,
+            "uniquify's rebuilt predicate terms must carry the same ids as the \
+             terms they replace",
         );
     }
     expr

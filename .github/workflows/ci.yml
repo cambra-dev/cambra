@@ -151,7 +151,12 @@ jobs:
         # feature) in automated runs so it keeps guarding against a pass that
         # produces an ill-typed tree — it is off by default locally because it is
         # superlinear on nested comprehensions (see `ci_test` / `debug_typecheck`).
-        run: DEEP_TYPECHECK=1 ./ci.sh test
+        # `CAMBRA_PROVENANCE_GATE=1` makes every compile fold both pane pairs and
+        # gate the leak classes, so the gate's corpus is the whole test suite
+        # rather than the handful of programs `context.rs`'s `corpus()` lists. Two
+        # recording gaps lived outside that sample; measured at ~+4% on the test
+        # step, which is worth paying to keep the next one from doing the same.
+        run: DEEP_TYPECHECK=1 CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
 
         # 4. Success Signal for noops
       - name: No-op for docs

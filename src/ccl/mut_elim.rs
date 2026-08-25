@@ -50,6 +50,7 @@ use crate::ccl::{
     TypedExprNode,
     ccl_utils::{COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
+    provenance,
     subst::Subst,
     symbolic::symbolic,
 };
@@ -212,7 +213,7 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
     match writer_body.node {
         // 1:1 reparents — carry the input node's id (a preserve, not a mint): the
         // statement/binding survives at a new spine position, so its source span
-        // and lineage carry over as a self-edge rather than a fresh untracked node.
+        // and provenance carry over as a self-edge rather than a fresh untracked node.
         TypedExprNode::ExprStmt {
             expr: effect,
             body: cont,
@@ -290,7 +291,7 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
 ///
 /// The `Let`-hoist is gated on `spine_writes_mut`: only a genuine writer body
 /// is reassociated. `Feed`/`Define`-headed `ExprStmt` chains keep their nesting
-/// — desugar collects feeds outermost-first, so reassociating them would
+/// — channelize collects feeds outermost-first, so reassociating them would
 /// reorder channel contributions — and a pure `Let` (e.g. a join subplan) holds
 /// no `MutWrite` on its spine, so it is left undisturbed. After this pass the
 /// only `MutWrite`s in the tree are `ExprStmt` effects, so `rewrite` and
@@ -356,6 +357,7 @@ fn flatten_spine(mut e: Expr) -> Expr {
     if let TypedExprNode::Let { bound_expr, .. } = &e.node
         && spine_writes_mut(bound_expr)
     {
+        let let_id = e.node_id();
         let TypedExprNode::Let {
             binding,
             bound_expr,
@@ -364,12 +366,42 @@ fn flatten_spine(mut e: Expr) -> Expr {
         else {
             unreachable!()
         };
-        return flatten_spine(hoist_writer_body(binding, *bound_expr, *body));
+        // Unlike the two reassociations above, this one is not 1:1: the hoist
+        // splices `let y = ⟨terminal⟩` into the body's terminal position and
+        // wraps the lifted write in a statement, so it *mints* — the `ExprStmt`,
+        // the spliced `let`, and its `unit` value. They stand in for the `Let`
+        // being hoisted, so the recording names it. `Machinery`, because the spliced
+        // binding is plumbing that restores the flat-spine invariant rather than
+        // anything the user wrote.
+        //
+        // The recursion is outside the recording, so a nested hoist attributes to its
+        // own `Let`.
+        let hoisted = {
+            let _g = provenance::enter(
+                let_id,
+                "letrec.hoist_writer_body",
+                provenance::Nature::Machinery,
+            );
+            hoist_writer_body(binding, *bound_expr, *body)
+        };
+        return flatten_spine(hoisted);
     }
     // A bare write reached in value/terminal position: it is a `Unit`-valued
     // statement, not a value to bind.
     if is_mut_write(&e) {
-        return flatten_spine(Expr::expr_stmt(e, unit_expr()));
+        // The write keeps its own id and becomes the effect; the `ExprStmt` and
+        // the `unit` body are new, and they exist to put this write in statement
+        // position. So the recording names the write.
+        let write_id = e.node_id();
+        let terminalized = {
+            let _g = provenance::enter(
+                write_id,
+                "letrec.terminalize_write",
+                provenance::Nature::Machinery,
+            );
+            Expr::expr_stmt(e, unit_expr())
+        };
+        return flatten_spine(terminalized);
     }
     // Pass-through — recurse in place so this node's own `ty`/annotation are
     // preserved (rebuilding would drop them, corrupting e.g. join subplans).
@@ -387,13 +419,28 @@ fn flatten_spine(mut e: Expr) -> Expr {
 }
 
 fn rewrite(mut expr: Expr) -> Expr {
+    let stmt_id = expr.node_id();
     if let TypedExprNode::ExprStmt { expr: effect, body } = expr.node {
+        let effect_id = effect.node_id();
         if let TypedExprNode::For {
             target,
             iter,
             body: loop_body,
         } = effect.node
         {
+            // The recording names the statement: the causal `LetRec` replaces it.
+            //
+            // There is deliberately no drop-path test. Whether the whole loop
+            // vanishes — no accumulator, no feed, e.g. a transaction-emptied
+            // `For` — is read off the live-set difference, so this site does not
+            // predict it. Predicting it meant re-running `collect_writes` and
+            // `body_has_feed` here to guess what `transform_loop` would decide
+            // ~140 lines away.
+            //
+            // `blame` names the `For` rather than the `ExprStmt` so the products
+            // resolve to the loop keyword's span, not the statement's.
+            let g = provenance::enter(stmt_id, "letrec.loop", provenance::Nature::Expansion);
+            g.blame(&[effect_id]);
             return transform_loop(target, *iter, *loop_body, *body);
         }
         // A `MutWrite` outside any `For` is a *sequential* mutation — a
@@ -401,6 +448,12 @@ fn rewrite(mut expr: Expr) -> Expr {
         // (`bump(cnt)`) spliced between statements. There is no recurrence to
         // build; normalize it to a shadowing `let` (see `normalize_bare_write`).
         if let TypedExprNode::MutWrite { name, value } = effect.node {
+            // The shadowing `let` this mints is captured against the statement
+            // node it replaces. The `MutWrite` marker and the `ExprStmt` wrapper
+            // both vanish, but neither is named: both are absent from the output
+            // tree, so the boundary difference reports them.
+            let g = provenance::enter(stmt_id, "letrec.bare_write", provenance::Nature::Machinery);
+            g.blame(&[effect_id]);
             return normalize_bare_write(name, *value, *body);
         }
         // Not a loop/write statement: rebuild and recurse.
@@ -503,7 +556,7 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
 /// fresh record field carrying its per-iteration value, and that value
 /// (already resolved in the read-your-writes environment at the feed site).
 /// The loop's history binding computes the field alongside the recurrence;
-/// the phase hoists `Feed(defer, __hist ▷ .field)` out of the loop so desugar
+/// the phase hoists `Feed(defer, __hist ▷ .field)` out of the loop so channelize
 /// routes it as an ordinary channel contribution.
 struct FeedSite {
     defer: Name,
@@ -998,7 +1051,7 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
          `with begin():` block, so a `For` here always carries a feed"
     );
     let mut body_out = rewrite(cont);
-    // Emit in reverse so the first source feed ends up outermost — desugar
+    // Emit in reverse so the first source feed ends up outermost — channelize
     // collects feeds outermost-first into the channel union, preserving source
     // order (mirrors the accumulator path's hoist ordering).
     for (defer, value) in feeds.into_iter().rev() {
@@ -1123,7 +1176,7 @@ fn strip_trailing_unit(expr: Expr) -> Expr {
     // The rebuilt `Case` below is the same logical node with stripped branch
     // bodies, so it carries its original `NodeId`; a pass that minted here would
     // break the node's link to the source it came from. See
-    // `src/ccl/design/provenance.md`, "Node identity (`src/ccl/provenance.rs`)".
+    // `src/ccl/design/provenance.md`, "Node identity".
     let node_id = expr.node_id();
     match expr.node {
         TypedExprNode::ExprStmt { expr: effect, body }
@@ -1592,12 +1645,9 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
             body,
         } => {
             let new_body = attach_feed_fields(*body, feeds);
-            let ty = new_body.ty.clone();
             // The same logical `Let` with its feed fields attached, so it keeps its
             // own id rather than minting a replacement.
-            let mut e = Expr::let_in_preserving(node_id, binding, *bound_expr, new_body);
-            e.ty = ty;
-            e
+            Expr::let_in_preserving(node_id, binding, *bound_expr, new_body)
         }
         TypedExprNode::Record(fields) => {
             let bool_ty = Type::Base(BaseType::Bool);
@@ -1630,10 +1680,7 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
         }
         other => panic!(
             "letrec phase: a writer decision is `let* in {{commit, writes}}`, got {}",
-            symbolic(
-                &Expr::preserve(crate::ccl::provenance::NodeId::PLACEHOLDER, other)
-                    .with_ty(decision.ty)
-            )
+            symbolic(&Expr::preserve(provenance::NodeId::PLACEHOLDER, other).with_ty(decision.ty))
         ),
     }
 }
@@ -1827,7 +1874,7 @@ mod tests {
     ///
     /// Unit-test form at the letrec boundary (the plan's RT-4b fallback): the
     /// bare-writer `MutWrite` is consumed by the loop rewrite and does not survive
-    /// into `post_desugar_ir` as a span-indexable `MutWrite`, so id preservation
+    /// into `post_channelize_ir` as a span-indexable `MutWrite`, so id preservation
     /// through the phase is asserted directly here.
     #[test]
     fn flatten_spine_bare_writer_preserves_id() {

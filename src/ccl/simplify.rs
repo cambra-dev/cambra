@@ -278,9 +278,22 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
     // iteration sources, so they fire regardless of any `iterate` present.
     // (They also preserve the subtree's iteration set, so `contains_iteration`
     // — computed before they run — is still accurate at the guard below.)
-    changed |= check(try_compose_identity(expr), expr);
-    changed |= check(try_flatten_compose(expr), expr);
-    changed |= check(try_string_add_to_concat(expr), expr);
+    changed |= check(
+        ruled("simplify.compose_identity", expr, try_compose_identity),
+        expr,
+    );
+    changed |= check(
+        ruled("simplify.flatten_compose", expr, try_flatten_compose),
+        expr,
+    );
+    changed |= check(
+        ruled(
+            "simplify.string_add_to_concat",
+            expr,
+            try_string_add_to_concat,
+        ),
+        expr,
+    );
 
     // Rules that may discard or restructure sub-expressions.  Equationally
     // valid only on pure CCC morphisms, so they must not touch a sub-tree
@@ -291,19 +304,85 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
     // what lets the rule set run correctly at any point in the pipeline — the
     // invariant is a property of the *nodes*, not of pass timing.
     if !contains_iteration {
-        changed |= check(try_const_reduce(expr), expr);
-        changed |= check(try_product_beta_fst(expr), expr);
-        changed |= check(try_product_beta_snd(expr), expr);
-        changed |= check(try_literal_tuple_projection(expr), expr);
-        changed |= check(try_ccc_universal(expr), expr);
-        changed |= check(try_exponential_beta(expr), expr);
-        changed |= check(try_exponential_eta(expr), expr);
-        changed |= check(try_const_apply(expr), expr);
-        changed |= check(try_product_eta(expr), expr);
-        changed |= check(try_zip_distribute_compose(expr), expr);
+        changed |= check(ruled("simplify.const_reduce", expr, try_const_reduce), expr);
+        changed |= check(
+            ruled("simplify.product_beta_fst", expr, try_product_beta_fst),
+            expr,
+        );
+        changed |= check(
+            ruled("simplify.product_beta_snd", expr, try_product_beta_snd),
+            expr,
+        );
+        changed |= check(
+            ruled(
+                "simplify.literal_tuple_projection",
+                expr,
+                try_literal_tuple_projection,
+            ),
+            expr,
+        );
+        changed |= check(
+            ruled("simplify.ccc_universal", expr, try_ccc_universal),
+            expr,
+        );
+        changed |= check(
+            ruled("simplify.exponential_beta", expr, try_exponential_beta),
+            expr,
+        );
+        changed |= check(
+            ruled("simplify.exponential_eta", expr, try_exponential_eta),
+            expr,
+        );
+        changed |= check(ruled("simplify.const_apply", expr, try_const_apply), expr);
+        changed |= check(ruled("simplify.product_eta", expr, try_product_eta), expr);
+        changed |= check(
+            ruled(
+                "simplify.zip_distribute_compose",
+                expr,
+                try_zip_distribute_compose,
+            ),
+            expr,
+        );
     }
 
     changed
+}
+
+/// Run one rewrite rule under a recording ([`provenance::enter`](crate::ccl::provenance::enter))
+/// keyed on the node the rule is about to rewrite.
+///
+/// This is the whole of simplify's provenance instrumentation: **one combinator,
+/// applied uniformly to all thirteen rules**, and no rule body changes at all.
+/// That is possible because a recording declares nothing — it names the node in
+/// the slot and lets the construction hooks report the rest. In particular:
+///
+/// * A rule that does not fire mints nothing and the recording is a **preserve**:
+///   it records nothing, so wrapping every *attempt* rather than every *firing*
+///   costs one push/pop and no log entry. Nothing here needs to know whether the
+///   rule fired, which is why the `bool` return is not consulted.
+/// * A rule that mutates in place without minting (`try_string_add_to_concat`'s
+///   `*op = BinOpKind::Concat`) is likewise a preserve — the node keeps its
+///   identity, so its provenance is the self-edge it already had.
+/// * A rule that replaces the slot wholesale (`*expr = Expr::compose(flat)`)
+///   mints, and those mints record `expr`'s pre-rule id as their parent.
+/// * A rule that promotes an existing child into the slot
+///   (`*expr = elts.swap_remove(i)`) mints nothing and copies nothing: a
+///   preserve again, and correctly so — the promoted node keeps its own id and
+///   is its own self-edge, while the discarded siblings are dead by the live-set
+///   difference at the boundary. No site says so.
+///
+/// `Nature::Machinery`: an algebraic simplification has no source counterpart.
+fn ruled(
+    label: crate::ccl::provenance::RewriteLabel,
+    expr: &mut Expr,
+    rule: impl FnOnce(&mut Expr) -> bool,
+) -> bool {
+    let _g = crate::ccl::provenance::enter(
+        expr.node_id(),
+        label,
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    rule(expr)
 }
 
 fn check(changed: bool, expr: &Expr) -> bool {

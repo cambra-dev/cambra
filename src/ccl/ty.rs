@@ -528,9 +528,9 @@ pub fn reset_kind_var_counter() {
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
 /// | `BoundedHole(𝑇)` | Lowering | "A bounded annotation `𝑥 <: 𝑇`: infer this, subject to `<: 𝑇`" — an obligation, not a shape | Pass 1's `normalize_annotation` (flagged as `UnresolvedBoundedHole` if it survives) |
-/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); an induction accumulator's *domain* is necessarily `Infer` until the unified phase resolves it (see `Strictness::PreDesugar`) |
+/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); an induction accumulator's *domain* is necessarily `Infer` until the unified phase resolves it (see `Strictness::PreChannelize`) |
 /// | `History` (`kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
-/// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
+/// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-channelize stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 /// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its domain resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -1260,7 +1260,7 @@ impl Type {
     /// call sites (lambda elimination's type-preservation asserts) is exactly
     /// `Some` vs `None`: both compared types descend from one derivation, so
     /// when both carry a binder it is the *same* [`crate::ccl::Name`] (uids are preserved
-    /// by every copy along the lineage). What elimination does not preserve is
+    /// by every copy in the chain). What elimination does not preserve is
     /// the binder's presence — rebuilt combinator types (`fun_ty_or_hole`,
     /// [`Type::fun`]) are constructed with `name: None`. If those sites ever
     /// preserve binders on rebuilt types, this helper can retire.
